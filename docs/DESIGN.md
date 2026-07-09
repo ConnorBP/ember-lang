@@ -1,0 +1,139 @@
+# ember - design plan
+
+C-style scripting language that JIT-compiles straight to native
+x86-64, for embedding in game engines. Goal: AngelScript's binding
+ergonomics, an optimizing native-JIT language's speed.
+
+**This document is the index.** Each subsystem is fully specified in
+its own detail doc under `docs/`. Read this for the shape and
+cross-references; read the detail docs for the byte-level / rule-level
+answers. See `RESEARCH_NOTES.md` for the prior-art survey (binprotect,
+a prior native-JIT scripting language, AngelScript, Mun) that grounds every decision below.
+
+## Architecture in one page
+
+```
+source text
+  │
+  ▼
+lexer ─► parser (recursive descent) ─► AST
+  │
+  ▼
+sema: struct layout pass ─► fn-signature/slot pass ─► per-fn body check
+  │
+  ▼
+lower: AST ─► SSA-lite IR (basic blocks, no phis, slot-backed merge vars)
+  │
+  ▼
+regalloc: linear scan on IR ─► physical-assignment + frame layout
+  │
+  ▼
+emit_x64: IR + regalloc ─► machine bytes into exec-memory arena
+  │
+  ▼
+dispatch table slot[slot_index] = entry address   (HOT_RELOAD.md)
+  │
+  ▼
+host calls ember_call(context, fn_name, args) ─► indirect call through slot
+```
+
+One calling convention everywhere (Win64 fastcall, Windows-first).
+Script-to-script and host-to-script calls both go through the
+dispatch table by slot index - that single rule is what makes hot
+reload, recursion, and forward references all work without special
+cases. JIT only, no bytecode interpreter fallback.
+
+## Detail docs (read in this order for a top-down picture)
+
+| Doc | What it nails down |
+|---|---|
+| `RESEARCH_NOTES.md` | What was pulled from each surveyed codebase and why. Read first  -  every later doc references it. |
+| `TYPE_SYSTEM.md` | Primitives, struct layout (host-mapped vs script-declared), fixed arrays, slices, the no-raw-pointer rule, implicit/explicit conversion matrix, operator result types, the unsigned-index rule that makes bounds-checking a runtime-only (not signedness) concern, `void` return-path enforcement, `auto`'s narrow scope, annotation argument grammar. |
+| `COMPILER_PIPELINE.md` | Lexer token set, full BNF grammar, AST node shapes, the four sema passes in order, SSA-lite IR definition (why no phis), lowering rules per AST node, error/diagnostic model, the lower→regalloc→emit three-stage split that makes each piece independently testable. |
+| `CODEGEN_SPEC.md` | The "prove we can compile to real x86-64" doc. Win64 calling convention, frame layout, exact byte encodings for the full ISA subset (integer + SSE scalar), label/patch two-pass system, linear-scan regalloc with spill rules, prologue/epilogue, script-to-script indirect calls, script-to-native calls, bounds-check emission, div/overflow traps, >4-arg spilling. Ends with 5 concrete acceptance criteria for v0.1. |
+| `BINDING_API.md` | `TypeId`, `NativeParam`, `NativeFn` descriptor structs (descriptor-style, declaration-string parsing rejected), `TypeBuilder` fluent API (each method, what was trimmed from the surveyed native-JIT language's surface and why), `StructBuilder`, the script-type→Win64-slot mapping table, slice-as-two-C++-params convention, the host-side template-wrapper pattern. |
+| `SAFETY_AND_SANDBOX.md` | Threat/trust model stated explicitly. Instruction budget mechanism (where counters live, what trap-on-exhaustion does), stack depth guard, bounds checking policy, `PERM_FFI` compile-time gating, the single non-local-unwind primitive that all traps funnel through, what is explicitly *not* checked (documented gaps, not oversights). |
+| `HOT_RELOAD.md` | Dispatch table layout, slot-index stability invariant, single-function reload protocol (atomic slot swap, old page retired not overwritten), in-flight call behavior, recursive-function-mid-recursion reload semantics, whole-module reload, globals preserved across reload, epoch-based reclamation of retired code pages. |
+| `MEMORY_AND_GC.md` | Ownership taxonomy (frame-local / host-owned / module-global / arena), the `arr[..]`-slice escape check that's the one place ember can introduce a dangling slice, module-global storage layout, string representation (rodata in the function's own code page), arena allocator design (reserved, not built in v1), explicit v2-GC deferral rationale. |
+| `LIFECYCLE.md` | The native-JIT-language-equivalent of `main()` + `register_routine(cast(fn))` expressed ember's way: `@entry`/`@on_tick`/`@event(...)` annotation-based discovery + host name/slot lookup, no script-side function references needed (those are v2). |
+| `GAP_ANALYSIS.md` | Systematic completeness audit: every original-request requirement → where satisfied; every feature of the surveyed native-JIT language → v1 has / deferred-with-plan / out-of-scope. Includes the honest performance caveat (ember v1 is baseline JIT, won't match an optimizing native-JIT language's speed, but beats AngelScript's bytecode interpreter). |
+| `ROADMAP.md` | Every v2+ deferral with a **re-entry trigger** (the signal that says "now build this") and a **dependency** (what else must exist first). Tiered: Tier 0 standard addon set (ships v1.0), Tier 1 small lang extensions, Tier 2 function refs, Tier 3 OOP, Tier 4 GC, Tier 5 concurrency/exceptions, Tier 6 ecosystem, plus hard non-goals. |
+
+## Goals / non-goals (restated; full reasoning in detail docs)
+
+Goals:
+- Near-native execution speed for hot game-logic scripts.
+- Fast compile: JIT in microseconds-to-low-ms per function. No LLVM,
+  no temp files, no dlopen.
+- Safe-ish sandboxing: instruction budgets, bounds-checked access,
+  no raw pointer arithmetic exposed to script, `PERM_FFI` gating.
+- Simple binding API: descriptor structs, not declaration-string
+  parsing.
+- Hot-reload of individual script functions without invalidating
+  call sites.
+- JIT only.
+
+Non-goals for v1:
+- Generics / templates. Closures. A tracing GC. Multithreaded
+  execution inside one context. Arbitrary pointer casts. Script-side
+  `enum`/`switch`/`class`. Self-hosting.
+
+## Milestones
+
+- **v0.1** - hand-built IR for `fn add(i64,i64)->i64`, direct x64
+  codegen, exec-memory allocator, the IR data model (`ir.hpp`), and
+  the `.em` binary bundling/serialization format
+  (`em_file`/`em_writer`/`em_loader`). Passes the original 5
+  acceptance criteria in `CODEGEN_SPEC.md` Section 12 (int path, float path,
+  forward-label fixup, spill path, recursive-via-dispatch-table) plus
+  the expanded criteria in Section 15 (full Section 3 ISA byte-exact encoder
+  coverage, `.em` serialize→load→run round-trip). This is the "prove
+  it actually compiles to real machine code AND can be
+  bundled/reloaded" gate.
+- **v0.2** - lexer+parser+AST for control flow and multi-function
+  scripts, the IR-driven lowering pass (IrFunction → machine code,
+  replacing the v0.1 hand-built-IR-to-encoder path),
+  script-to-script calls via dispatch table. The `.em` infrastructure
+  (em_loader's name table + dispatch-table reloc repoint) is already
+  in place as the foundation for multi-function modules.
+- **v0.3** - structs, slices with bounds checks, native function
+  binding (descriptor API), calling-convention correctness host↔script.
+- **v0.4** - budgets/safety checks, annotations, hot reload of a
+  single function, stack depth guard.
+- **v0.5** - benchmark harness vs AngelScript; tune regalloc/peephole
+  only if the bench shows a need.
+- **v1.0** - stable native binding API, docs, example game-engine
+  integration (event hooks via annotations).
+
+## Explicitly skipped (YAGNI ladder - full per-item reasoning in the
+detail docs, summarized here)
+
+- No parser generator - grammar is small, hand-rolled recursive
+  descent (`COMPILER_PIPELINE.md` Section 2).
+- No LLVM/Cranelift/asmjit - own minimal encoder, ISA subset is tiny
+  (`CODEGEN_SPEC.md` Section 3, `RESEARCH_NOTES.md` on binwrite/Zydis).
+- No declaration-string binding parser - descriptor structs are a
+  one-line call site (`BINDING_API.md` Section 1-Section 2).
+- No tracing GC v1 - every reference category has a non-tracing
+  lifetime (`MEMORY_AND_GC.md` Section 1, Section 8).
+- No generics/closures/enum/switch v1 - no game-scripting use case
+  demands them yet (`DESIGN.md` non-goals, `COMPILER_PIPELINE.md` Section 1).
+- No bytecode interpreter fallback - JIT only, one execution path
+  (`RESEARCH_NOTES.md` on AngelScript's bytecode-VM-by-default being
+  the differentiator).
+- No phi nodes in IR - slot-backed merge vars instead
+  (`COMPILER_PIPELINE.md` Section 5, `CODEGEN_SPEC.md` Section 5).
+- No rel8 branch shrinking, no shared-epilogue tail, no
+  omit-frame-pointer, no block reordering - correctness-first v1,
+  all are additive later if benchmarks justify (`CODEGEN_SPEC.md` Section 4/Section 6).
+- No `goto`, no C preprocessor, no multiple inheritance / diamonds,
+  no self-hosting - hard non-goals, never added (`ROADMAP.md`).
+- No templates/classes/coroutines/exceptions/heap/lambdas/modules in v1
+  - each is a tracked deferral with a re-entry trigger in `ROADMAP.md`,
+  not a forgotten gap (`GAP_ANALYSIS.md` Section 2).
+- No script-side function references / dynamic routine registration in v1
+  - annotation-based static discovery covers the game-loop case
+  (`LIFECYCLE.md`); dynamic registration is Tier 2 (`ROADMAP.md`).
+- No builtins for arrays/maps/strings - exposed as **native addons**
+  on host-owned memory (Tier 0, ships with v1.0, `GAP_ANALYSIS.md` Section 3,
+  `ROADMAP.md`), not language builtins needing GC.

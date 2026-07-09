@@ -1,0 +1,113 @@
+# ember - lifecycle & routines
+
+The native-JIT-language-equivalent of `main()` + `register_routine(cast(fn), data)`
+
+> **Implementation status: v0.1** - this is the v1.0 design spec. The
+> current repo implements the JIT codegen proof (encoder, label/patch,
+> exec-mem, `.em` format). See `README.md` for what's shipped; see
+> `CODEGEN_SPEC.md` Section 12 + Section 15 for the acceptance suite. This doc's
+> content is the target design, not a claim of current implementation.
+(`RESEARCH_NOTES.md`), expressed ember's way: **annotation-based
+discovery + host name/slot lookup**, no script-side function references
+required (function references are v2, `ROADMAP.md` Tier 2).
+
+## 1. Entry point
+
+A module may declare a function annotated `@entry`:
+
+```
+@entry
+fn main() -> i64 {
+    // setup, register handlers via returning annotation set, etc.
+    return 1;
+}
+```
+
+- `main` is **not** a magic name - the host opts in by querying
+  `ember_get_annotated_functions(module, "@entry", out)` and calling
+  the (single) result. This keeps the entry-point convention explicit
+  and avoids a reserved-name trap. If zero functions are annotated
+  `@entry`, the host simply doesn't auto-call anything (a module that
+  only registers handlers via other annotations doesn't need a
+  `main`).
+- Return value semantics match a typical native-JIT scripting language's lifecycle
+  (`RESEARCH_NOTES.md`): `> 0` ⇒ module stays loaded; `<= 0` ⇒ module
+  unloaded (host calls `ember_module_destroy`, frees dispatch table +
+  globals + exec pages). The host decides what "unload" means for its
+  integration; ember just provides the return value.
+- `main` runs **once**, at host discretion (typically right after
+  `ember_compile`), via an ordinary `ember_call`. No special "init
+  phase" in the JIT - `@entry` is pure metadata, the call is a normal
+  dispatch-table call.
+
+## 2. Routines (per-frame / per-event callbacks)
+
+A typical native-JIT scripting language's `register_routine(cast(fn), data)` lets script dynamically
+register a function to tick each frame. ember v1's equivalent is
+**static** - the script declares the routine via annotation, the host
+discovers and drives it:
+
+```
+@on_tick
+fn update_physics(state: slice<f32>) { ... }
+
+@event("player_hit")
+fn on_player_hit(info: HitInfo) { ... }
+```
+
+- Host queries `ember_get_annotated_functions(module, "@on_tick", out)`
+  once after compile, resolves each to a slot index
+  (`HOT_RELOAD.md` Section 7 - caching the slot index is safe, indices never
+  change), and calls it per frame via `ember_call(context, name, args,
+  argc)`.
+- **Argument passing**: the host passes whatever the routine's
+  signature declares - `update_physics` takes a `slice<f32>`, so the
+  host passes `(ptr, len)` per `BINDING_API.md` Section 4. The host *knows*
+  the routine's signature because it resolved the name through the
+  module's function-info table (introspection, `DESIGN.md` Section 8), not
+  because the annotation encodes it (`TYPE_SYSTEM.md` Section 10 - annotations
+  carry literal args only, no type info; the *function signature* is
+  the type contract, queried separately).
+- **Dynamic registration** (script decides at runtime what to hook,
+  unregister later) is **not v1** - it needs function references
+  (`ROADMAP.md` Tier 2). v1's annotation model covers the common game
+  case: "this function is the physics tick, always, for this module's
+  whole loaded lifetime." Dynamic registration is for tooling/scripts
+  that hot-swap handlers at runtime - rare, deferred.
+
+## 3. Unload
+
+A module unloads when:
+- `@entry`'s `main` returns `<= 0` (Section 1), **or**
+- the host explicitly calls `ember_module_destroy(module)`.
+
+On unload: retired code pages are freed (no in-flight calls should
+exist - the host's responsibility to not unload while a call is live,
+`HOT_RELOAD.md` Section 4's in-flight-call analysis is about *reload*, not
+*unload*; unload-while-live is a host bug, documented as such),
+dispatch table freed, globals block freed. The `module_t` handle is
+invalidated.
+
+## 4. Reload interaction (`HOT_RELOAD.md`)
+
+Reloading a module preserves globals (`HOT_RELOAD.md` Section 6) and slot
+indices - so a `@on_tick` routine reloaded mid-session keeps its slot,
+the host's cached slot index stays valid, and the next per-frame call
+picks up the new body. `@entry`/`main` is **not** re-run on reload
+(it already ran at load; re-running setup code on every hot-reload
+would re-initialize state the user is iteratively tweaking, defeating
+the point of hot reload) - if the script author wants reload-time
+re-init, they annotate a separate `@on_reload` function, which the
+host opts to call after a successful `ember_reload_*`.
+
+## 5. What this deliberately does NOT cover (cross-ref)
+
+- Coroutines / `yield` (`ROADMAP.md` Tier 5) - v1 has no sequential-
+  looking-code primitive; per-frame routines + state in globals is
+  the v1 state-machine pattern (adequate for most game tick logic).
+- Exceptions caught in-script (`ROADMAP.md` Tier 5) - a routine that
+  faults aborts the whole `ember_call` via the non-local unwind
+  (`SAFETY_AND_SANDBOX.md` Section 2/Section 7); the host logs and the routine is
+  simply not rescheduled if the host decides (the host controls the
+  per-frame call loop, so "stop calling a faulting routine" is a
+  host-side policy, not an ember mechanism).

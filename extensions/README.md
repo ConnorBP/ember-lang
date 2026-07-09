@@ -1,0 +1,173 @@
+# ember extensions
+
+An **extension** is a reusable, non-cheat-specific set of
+`ember::NativeSig` registrations + `ember::OpOverloadTable` entries +
+the host C++ that backs them, shipped here so *any* ember consumer
+(prism today, a future second consumer tomorrow) can link and register
+the same addon set without re-implementing it.
+
+## What an extension is - and is not
+
+An extension is **NOT a language grammar or type-system change.**
+Adding a new statement form, a new type-construction rule, or a new
+sema pass is a `docs/ROADMAP.md` **Tier 1+ language feature**, not an
+extension. Extensions live entirely on the *host* side of the
+`NativeSig`/`OpOverloadTable` seam that already exists in
+`ember/src/sema.hpp` - they register native function pointers and
+operator overloads against ember's stable v1 binding API, nothing more.
+The language (parser/sema/codegen) is unchanged by an extension; an
+extension only makes more *natives* resolvable at sema's
+call-resolution step and more *operators* resolvable at sema's
+overload-rewrite step.
+
+This is the distinction the `docs/ROADMAP.md` Tier 0 entry draws:
+"these are not language features - they're `NativeFn` addons using
+the stable v1 binding API." Extensions are where those addons live.
+
+## What lives here (the audit)
+
+`ember/extensions/` was populated by the restructure's Section 6 audit of
+prism's `BuildScriptHostNatives` / `RegisterScriptHostOverloads`
+(in `prism/src/prism/prism_script_host.cpp`). Every `NativeSig`
+registration and `OpOverloadTable` entry was classified as either
+**cheat-specific** (stays in prism) or **general-purpose** (relocated
+here). The audit table is in `AUDIT.md` next to this file.
+
+The general-purpose extensions relocated out of prism, matching the
+`docs/ROADMAP.md` Tier 0 standard addon set:
+
+| Extension | Library | What it backs | Origin (prism) |
+|---|---|---|---|
+| `vec/` | `ember_ext_vec` | `vec2`/`vec3`/`vec4` host-store types + `Add`/`Sub`/`Mul`/`Eq` operator overloads | `prism_script_host.cpp` vec2/vec3/vec4 blocks |
+| `quat/` | `ember_ext_quat` | `quat` host-store type + `Add`/`Sub`/`Mul`(Hamilton)/`Eq` overloads | `prism_script_host.cpp` quat block |
+| `mat/` | `ember_ext_mat` | `mat4` host-store type + `Mul`(4×4 product)/`Eq` overloads | `prism_script_host.cpp` mat4 block |
+| `string/` | `ember_ext_string` | mutable `string` host-store type + `Add`(concat)/`Eq` overloads + `from_slice`/`from_i64`/`from_f32`/`from_f64`/`from_bool`/`identity`/`length`/`char_at` | `prism_script_host.cpp` string block |
+| `array/` | `ember_ext_array` | `array<T>` host-store type + `new`/`length`/`resize`/`set_u8`/`get_u8`/`set_f32`/`get_f32`/`set_i64`/`get_i64`/`push_u8` + the `GetArrayBytes` accessor | `prism_script_host.cpp` array block |
+| `math/` | `ember_ext_math` | `sqrt`/`sin`/`cos`/`tan` (f32) - pure functions, no host store | `prism_script_host.cpp` math block |
+
+Each is a self-contained C++ TU that depends only on ember's *public*
+headers (`ast.hpp`, `sema.hpp` - for `Type`/`make_prim`/`make_slice`/
+`NativeSig`/`OpOverloadTable`/`BinExpr::Op`/`Prim`) and the C++ stdlib.
+No extension includes or links any prism header or prism target.
+
+## What stayed in prism (cheat-specific, NOT here)
+
+Per the audit, these `NativeSig` registrations are tied to reading a
+game process or rendering an overlay and stay in prism:
+
+- `proc.*` - `ru64`/`ru32`/`r32`/`rf32`/`r8`/`wu64`/`wf32`/`read_bulk`/
+  `ref_process_native` (process memory read/write).
+- `render_*` / view / shader - `get_view_*`, `draw_rect_filled`,
+  `draw_text`, `create_shader`/`create_vertex_buffer`/...,
+  `load_mesh`/`load_texture`/`get_font*` (overlay rendering + the
+  `build_shader_natives` surface in `shader_api.cpp`).
+- `gui_*` / panel - `register_gui_panel`, `begin_panel`, `gui_text`,
+  `gui_slider_*`, `gui_button`, `create_subtab`, `panel_add`,
+  `ui_checkbox`/`ui_slider_*`/`ui_*`/`widget_*` (GUI panels + the
+  `build_panel_natives` surface in `prism_panel_api.cpp`).
+- host-coupled IO / process - `print_i64`/`print_f32`/`print_str`/
+  `print_string`/`assert_eq_*` (route through prism's host print sink
+  + assert-failure counter), `get_tickcount64` (host-process timer
+  used by cheat timing scripts), `aim_atan2` (cheat-named), sound /
+  font / bitmap / http / file natives, `inject_mouse_delta`.
+- numeric helpers not in the ROADMAP Tier 0 set - `clamp`/`min_max`
+  (slice-pointer ABI), `fp_to_ieee`/`ieee_to_fp` (used by GPU shader
+  scripts), `double_it`/`add_val` (test toys), `str_compare`/
+  `str_length` (raw-pointer string ops, not the mutable `string`
+  type).
+
+These are not general-purpose language addons; relocating them would
+drag cheat process/render/UI coupling into `ember/`, violating the
+language-purity goal. They are documented in `AUDIT.md`.
+
+## How a host registers an extension
+
+A host (prism, or a future second consumer) links the extension
+library and calls its registration entry points from its own native
+table builder. The pattern, as prism now does in
+`prism/src/prism/prism_script_host.cpp`:
+
+```cpp
+#include "ext_vec.hpp"      // from ember/extensions/vec/
+#include "ext_quat.hpp"
+// ... etc.
+
+std::unordered_map<std::string, ember::NativeSig> BuildScriptHostNatives() {
+    std::unordered_map<std::string, ember::NativeSig> m;
+    // ... host's own cheat-specific natives registered here ...
+    ember::ext_vec::register_natives(m);      // adds vec2_*/vec3_*/vec4_*
+    ember::ext_quat::register_natives(m);
+    ember::ext_mat::register_natives(m);
+    ember::ext_string::register_natives(m);
+    ember::ext_array::register_natives(m);
+    ember::ext_math::register_natives(m);
+    return m;
+}
+
+void RegisterScriptHostOverloads(ember::OpOverloadTable& t) {
+    ember::ext_vec::register_overloads(t);     // vec + - * ==
+    ember::ext_quat::register_overloads(t);
+    ember::ext_mat::register_overloads(t);
+    ember::ext_string::register_overloads(t);  // string + ==
+}
+
+// Host-store types keep per-run state (opaque i64 handles index into a
+// host-owned vector). A host that wants each run independent calls the
+// extension's reset() in its own per-run reset, as prism's
+// ResetScriptHostState now does:
+void ResetScriptHostState() {
+    ember::ext_vec::reset();
+    ember::ext_quat::reset();
+    ember::ext_mat::reset();
+    ember::ext_string::reset();
+    ember::ext_array::reset();
+    // math is stateless - no reset.
+    // ... host's own state reset ...
+}
+```
+
+The extension's `register_natives(map)` and `register_overloads(table)`
+only insert their own keys; they do not touch keys the host already
+registered (an `m[name] = ...` overwrites on collision, matching the
+existing merge convention `BuildScriptHostNatives` uses for the
+shader/panel native maps). A host that wants to shadow an extension
+native with its own can simply register its own after calling the
+extension's `register_natives`.
+
+## Accessors a host may need
+
+Some host-side cheat natives reach into an extension's host store by
+handle (rather than going through a registered native). Each such
+extension exposes a small accessor in its public header:
+
+- `ember::ext_array::get_bytes(int64_t handle, uint8_t** out, int64_t* len)`
+  - prism's `shader_api.cpp` (custom draw calls that receive
+  `array<u8>` handles) and prism's `n_read_bulk` (process-memory read
+  into an array) use this to read an array's backing bytes.
+- `ember::ext_string::slot(int64_t handle)` - prism's `n_print_string`
+  (the host-sink-coupled `print_string` native, which stays in prism)
+  uses this to read a `string` handle's content.
+
+The vec/quat/mat stores are entirely internal to their extension; no
+prism native reaches into them by handle outside the registered
+accessor natives, so they expose no accessor.
+
+## Build
+
+`ember/CMakeLists.txt` defines one static library per extension
+(`ember_ext_vec`, `ember_ext_quat`, `ember_ext_mat`, `ember_ext_string`,
+`ember_ext_array`, `ember_ext_math`). Each links `ember_frontend`
+PUBLIC (for `make_prim`/`make_slice`/`Type` symbols, defined in
+`ember_frontend`'s `types.cpp`) and exposes its `ext_*.hpp` header via
+a PUBLIC include directory. A consumer links whichever extensions it
+wants; prism links all six.
+
+## Purity
+
+`ember/extensions/` follows the same language-purity rule as
+`ember/src/`: no references to specific cheat products, hosts, or
+research objects by name in code, comments, or docs. The forbidden
+vocabulary is the same set `ember/docs/RESTRUCTURE_PLAN.md` Section 2 defines
+for the whole `ember/` tree (the named-product list there); an
+extension is a generic, reusable addon, so a grep for that vocabulary
+against `ember/extensions/` returns zero hits.
