@@ -1,0 +1,7 @@
+// valid for sema: reassigning a plain (non-const) `let` local must still
+// work - guards against over-broad const detection (Item B1).
+fn entry() -> i64 {
+    let mut x: i64 = 5;
+    x = 6;
+    return x;
+}

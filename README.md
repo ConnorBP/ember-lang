@@ -3,13 +3,21 @@
 C-style scripting language, JIT-compiles to native x86-64. AngelScript
 ergonomics, an optimizing native-JIT language's speed. Game-engine/modding embedding target.
 
-Status: **v0.1 PASS** - JIT codegen proof implemented and passing on both
-MSVC 19.36 (VS 2022) and MinGW g++ 15.2.0. See `src/` for the encoder,
-label/patch system, exec-memory allocator, IR data model, the `.em` binary
-bundling format (`em_file`/`em_writer`/`em_loader`), and the expanded
-acceptance-criteria runner (`CODEGEN_SPEC.md` Section 12 + Section 15). Next step: v0.2
-(lexer + parser + AST, IR-driven lowering, script-to-script calls via
-dispatch table).
+Status: **v0.2** - the full frontend is shipped: lexer, recursive-descent
+parser (full v1 grammar), 4-pass sema, and a tree-walking AST→x64 codegen.
+Script-to-script calls run through the dispatch table by slot. The `.em`
+binary bundling format (serialize→load→run round-trip) and cross-module
+textual `import "path";` inclusion both work. A standard addon set ships as
+native extensions in `extensions/` (vec/quat/mat/string/array/math). The
+canonical tree is standalone-buildable and standalone-testable - a
+prism-decoupled `ember` CLI runs `.ember` files, and a language regression
+suite (`tests/lang/` + `ember_check`/`sema_check` exes) runs under `ctest`.
+See `src/` for the frontend, `extensions/` for the addons, `examples/` for
+the CLI + check exes + sample scripts.
+
+Next milestone: **v0.3** - native binding API correctness + host↔script
+calling-convention validation (struct/annotation machinery already landed in
+the v0.2 overshot; v0.3 is the binding-correctness milestone).
 
 ## Docs (read `docs/DESIGN.md` first - it's the index)
 
@@ -48,6 +56,9 @@ dispatch table).
   optimizing pipeline, but beats AngelScript's bytecode interpreter).
 - `docs/ROADMAP.md` - every v2+ deferral with a re-entry trigger and
   dependency, tiered by likely build order; hard non-goals listed.
+- `docs/RESTRUCTURE_PLAN.md` - the (fired) plan that promoted prism's
+  in-tree ember to this canonical standalone home, so the language
+  carries no cheat references and is reusable.
 
 Every feature in the original request (C-style syntax, JIT to native
 x86-64, composable chunks via the dispatch table, safety, AngelScript-
@@ -56,55 +67,88 @@ cases spelled out. `GAP_ANALYSIS.md` is the audit confirming nothing
 the original request asked for is missing; `ROADMAP.md` is the tracked
 list of what's deliberately deferred and when each comes back.
 
-Status: **v0.1 PASS** (JIT codegen proof + `.em` bundling format shipped).
-Next step: v0.2 (lexer+parser+AST, IR-driven lowering, script-to-script
-calls via dispatch table). The spec docs are stable; `src/` contains the
-v0.1 implementation including the `.em` serializer/loader.
+Status: **v0.2** (full frontend + `.em` bundling + standard extensions +
+standalone CLI + language regression suite). The spec docs are stable;
+`src/` contains the implementation, `extensions/` the addons, `examples/`
+the CLI + check exes + sample scripts.
 
-## Building v0.1 (the JIT codegen proof)
+## Building v0.2
 
-C++17, no external deps beyond `Windows.h` (VirtualAlloc). Builds clean on
-both MSVC (VS 2022) and MinGW g++. Pick a generator with a working toolchain:
+C++17, no external deps beyond `Windows.h` (VirtualAlloc). Builds clean
+on MinGW g++ 15.2.0 + Ninja (the config this tree is tested on); MSVC
+VS 2022 also supported. The build produces three static libs, six
+extension libs, four round-trip/registration test exes, the standalone
+`ember` CLI, and two language-check exes:
 
 ```bash
 cd ember
 mkdir build && cd build
-# MinGW g++ + Ninja (fastest path on this machine):
-cmake -G Ninja -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe ..
+# MinGW g++ + Ninja:
+cmake -G Ninja -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++..exe ..
 cmake --build .          # or: ninja
-./ember_v01.exe          # runs the Section 12 acceptance criteria + ISA coverage
-ctest                    # CTest target: ember_v01_acceptance
-# MSVC: open a VS x64 developer prompt, then:
-#   cmake -G Ninja .. && cmake --build . && ember_v01.exe
+ctest                    # 5 targets: em_roundtrip, import_roundtrip,
+                         # ext_runtime, ext_registration, lang_suite
 ```
 
-`ember_v01.exe` exits 0 on full pass and prints `RESULT: PASS`. The eight
-assertions: IR model for `fn add` (test 0), the five `CODEGEN_SPEC.md` Section 12
-criteria (tests 1 - 5: int add→7, f64 add via addsd, forward-jcc fixup,
-spill path, recursive fib via dispatch table), a byte-exact ISA-encoder
-coverage check for the full Section 3 instruction subset (test 6), and a `.em`
-round-trip - JIT-build fib, serialize via `write_em_file`, reload via
-`load_em_file`, assert the loaded module runs identically to the JIT'd
-one (test 7).
+`ctest` is 5 targets and all must pass:
+- `em_roundtrip` - JIT→serialize→`load_em_file`→run round-trip on a real
+  parsed function (double_it + recursive fib), asserting the loaded
+  module matches the JIT'd one.
+- `import_roundtrip` - cross-module `.em` round-trip through the
+  `ModuleRegistry` (kind-2 registry-base reloc), proving the live-import
+  link step.
+- `ext_runtime` - a standard-extension native (math `sqrt`) runs through
+  the full parse→sema→codegen→JIT→call path.
+- `ext_registration` - all six extensions register their `NativeSig` +
+  `OpOverloadTable` entries (the binding surface the CLI/sema_check use).
+- `lang_suite` - the language regression suite (`tests/run_lang_tests.sh`)
+  classifies `tests/lang/{valid,invalid,sema_valid,sema_invalid,import_*}.ember`
+  against `ember_check` (parse-only) and `sema_check` (parse+sema) - 110
+  pass / 0 fail / 1 skip (the skip is a prism-native-surface mismatch,
+  documented in the runner output).
 
 ## CLI
 
-`ember_v01.exe` takes three flags (see `cli_main` in `src/main.cpp`):
+`ember_cli` is the standalone script runner - prism-decoupled, links only
+ember + ember_frontend + the six extension libs (no prism natives, no VFS,
+no backends):
 
-- `--run` *(default)* - runs the acceptance suite (tests 0 - 7).
-- `--emit-em <in.ember> [-o <out.em>]` - stub. v0.1 has no source parser,
-  so the source→`.em` path isn't wired; the emit path itself is proven
-  end-to-end by acceptance test #7 (JIT fib → `write_em_file` →
-  `load_em_file` → run). Wiring this to real `.ember` input is gated on
-  the v0.2 lexer/parser.
-- `--load-em <out.em>` - stub. Standalone load+invoke isn't wired yet;
-  the loader (`em_loader`) is proven by test #7's round-trip. A
-  `--load-em [--run=fn]` driver is a thin CLI wrapper, deferred until
-  there's a parser producing non-trivial modules.
+```
+ember_cli run <file.ember> [--fn <name>] [--dump]
+```
 
-The IR data model (`src/ir.hpp`) is an exercised deliverable - test 0
-builds the `IrFunction` for `fn add` and asserts the IR types represent
-it. IR-driven lowering (an `IrFunction` → machine-code lowering pass) is
-*not* implemented yet: tests 1 - 5 go straight to the Encoder per
-`CODEGEN_SPEC.md` Section 12.1's hand-built-IR wording. The IR backend is the
-v0.2 boundary.
+- `run` compiles and executes `<file.ember>`'s entry function (default
+  `main`). If the entry returns `i64`, the process exits with that code
+  (so `main()->i64 { return 42; }` exits 42); if `void`, exits 0. Exit
+  codes are 8-bit, so values >255 wrap (OS truncation, not a CLI bug).
+- `--fn <name>` overrides the entry (default `main`).
+- `--dump` prints each compiled function's slot, byte size, and reloc
+  count.
+
+`import "path";` in a script is resolved as textual inclusion before
+lexing (cycle-detected, `seen`-set deduped) - multi-file scripts work.
+Sample scripts live in `examples/scripts/` (`fib`, `control`, `struct`,
+`string`), each with a `// expect: <value>` the CLI's exit code validates.
+
+The `ember_check` (parse-only) and `sema_check` (parse+sema, full
+six-extension surface registered) exes are the language-regression
+tooling the `lang_suite` CTest target drives; they also double as a
+quick "does this script parse/sema-check?" one-shot:
+
+```
+ember_check <file.ember>     # exit 0 = parse ok, nonzero = parse error
+sema_check  <file.ember>     # exit 0 = parse+sema ok, nonzero = sema error
+```
+
+## Honest performance caveat
+
+ember v0.2 is a **baseline** JIT (tree-walking codegen, stack-spilling,
+no opt passes, no inlining, no loop opts). AngelScript is a bytecode
+interpreter; even baseline native code beats a bytecode interpreter on
+tight loops by typically 5-50×, which comfortably satisfies "much faster"
+for hot game-logic. Matching an optimizing native-JIT language's speed is
+a v2+ goal, deferred to after the v0.5 benchmark harness exists to prove
+where ember is slow and justify adding opt passes (`DESIGN.md` Section 9 -
+no speculative optimization). The codegen is correctness-first today; the
+SSA-lite IR + linear-scan regalloc in `COMPILER_PIPELINE.md` Section 5 is
+the target the tree-walker lowers toward conceptually, landed at v0.5.

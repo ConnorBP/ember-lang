@@ -1,0 +1,5 @@
+// lib2/nested_a.ember - imports a sibling (nested_b), which imports nested_c.
+// Validates recursive import resolution: nested_a -> nested_b -> nested_c,
+// each resolved relative to its OWN directory (base_dir updates on recurse).
+import "nested_b.ember";
+fn nested_a_fn() -> i64 { return nested_b_fn() + 1; }

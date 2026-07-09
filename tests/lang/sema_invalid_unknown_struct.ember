@@ -1,0 +1,6 @@
+// invalid for sema: a struct literal names a struct type that was never
+// declared. Sema reports "unknown struct type" at the literal.
+fn bad() -> i64 {
+    let p: NoSuchStruct = NoSuchStruct { x: 1 };
+    return 0;
+}

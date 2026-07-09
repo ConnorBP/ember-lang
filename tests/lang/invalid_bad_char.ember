@@ -1,0 +1,5 @@
+// invalid: bad char '$'
+fn bad() -> i64 {
+    let x = $;
+    return 0;
+}

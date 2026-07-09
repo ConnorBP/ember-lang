@@ -253,6 +253,16 @@ succeeded)
 
 ## 5. IR ("SSA-lite") design
 
+> **Implementation note (v0.2):** the shipped codegen (`src/codegen.cpp`)
+> is a correctness-first **tree-walking stack-spilling emitter** that walks
+> the AST directly and emits x86-64, not the SSA-lite IR + linear-scan
+> regalloc specified in this section. This is a deliberate deferral, not a
+> regression: `DESIGN.md` Section 9 says no speculative optimization is
+> added before the v0.5 benchmark harness exists to prove where it
+> matters. The SSA-lite IR below is the **target design** the tree-walker
+> lowers toward conceptually; the formal IR + regalloc refactor is the
+> v0.5 milestone. The spec text is preserved unchanged.
+
 Already characterized at a high level in CODEGEN_SPEC.md Section 5. Concrete
 shape:
 ```cpp

@@ -1,0 +1,6 @@
+// invalid for parser: an annotation whose name is a number, not an
+// identifier. Annotations are `@name` or `@name(args)`; `@123` is a parse
+// error. Recovery reports it and syncs to the next top-level decl.
+@123
+fn bad() -> i64 { return 0; }
+fn good_after() -> i64 { return 1; }

@@ -1,0 +1,22 @@
+// valid for sema: primitives, calls, operators, control flow (no slices/indices/structs)
+fn classify(n: i64) -> i64 {
+    if (n <= 1) { return n; }
+    else if (n > 100) { return 100; }
+    else {
+        let mut sum: i64 = 0;
+        let mut i: i64 = 0;
+        while (i < n) {
+            sum = sum + i;
+            i = i + 1;
+        }
+        return sum;
+    }
+}
+
+fn entry() -> i64 {
+    let x: u64 = ru64(0, 4096);
+    let f: f32 = rf32(0, 16);
+    let c: f32 = clamp(f, 0.0f, 1.0f);
+    let b: bool = (x > 0) && (c > 0.5f);
+    return b ? 1 : 0;
+}

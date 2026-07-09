@@ -1,0 +1,3 @@
+// invalid: a defaulted parameter cannot be followed by a non-defaulted one
+// (Item C's trailing-only rule, enforced at parse time).
+fn f(a: i64 = 1, b: i64) -> i64 { return a + b; }

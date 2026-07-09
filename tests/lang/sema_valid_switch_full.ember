@@ -1,0 +1,23 @@
+// valid for sema: a switch with a default clause and multiple case
+// literals, including fallthrough (no break between two cases). Confirms
+// sema accepts the full switch shape (case value is a literal, subject is
+// an integer) - the sema_invalid_switch_bad_case.ember counterpart.
+fn classify(x: i64) -> i64 {
+    let mut r: i64 = 0;
+    switch (x) {
+    case 1:
+        r = 10;
+        // fallthrough
+    case 2:
+        r = r + 20;
+        break;
+    default:
+        r = -1;
+        break;
+    }
+    return r;
+}
+
+fn entry() -> i64 {
+    return classify(1) + classify(2) + classify(99);
+}

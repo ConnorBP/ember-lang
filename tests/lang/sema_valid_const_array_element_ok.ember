@@ -1,0 +1,9 @@
+// valid for sema: element mutation THROUGH a const-declared array binding is
+// intentionally out of scope for v1 (is_const models "can't reassign the
+// binding", not deep immutability) - regression-locks that documented
+// decision (Item B1).
+fn entry() -> i64 {
+    const arr: i64[4];
+    arr[0] = 5;
+    return arr[0];
+}

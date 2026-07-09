@@ -1,0 +1,4 @@
+// invalid for sema: non-void function falls off the end (no return on all paths)
+fn bad(n: i64) -> i64 {
+    if (n > 0) { return n; }
+}

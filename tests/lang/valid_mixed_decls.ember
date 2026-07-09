@@ -1,0 +1,21 @@
+// valid for parser: a file with a mix of declarations (fn, struct, global,
+// const) interleaved with comments (line + block + trailing) and blank lines.
+// Exercises the top-level parse loop's tolerance of whitespace/comments and
+// its handling of every declaration kind in one file. Has no main on purpose
+// (parse-checked only).
+struct Vec3 { x: f32; y: f32; z: f32; }
+
+// a line comment between decls
+global g_counter: i64 = 0;
+const k_pi: f32 = 3.14159f;
+
+/* a block comment
+   spanning multiple lines */
+fn reset() { g_counter = 0; }
+
+fn bump() -> i64 { g_counter = g_counter + 1; return g_counter; } // trailing comment
+
+fn length(v: Vec3) -> f32 {
+    // nested block /* with a comment-like token */ inside a function
+    return v.x * v.x + v.y * v.y + v.z * v.z;
+}

@@ -1,0 +1,5 @@
+// invalid for sema: a ternary whose two branches have different types
+// (i64 vs f32). Sema requires both branches to have the same type.
+fn bad(b: bool) -> i64 {
+    return b ? 1 : 2.0f;
+}

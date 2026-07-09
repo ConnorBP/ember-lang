@@ -1,0 +1,8 @@
+// invalid for sema: unary bit-not (`~`) on a non-integer (f32). Sema
+// requires `~` to have an integer operand (it's a bitwise op); a float
+// operand errors "'~' requires integer".
+fn bad() -> i64 {
+    let x: f32 = 1.5f;
+    let y: f32 = ~x;
+    return 0;
+}

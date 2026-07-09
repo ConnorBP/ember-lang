@@ -1,0 +1,10 @@
+// import_double.ember - the same file imported twice, directly, back-to-back.
+// The second `import` is an idempotent-skip (the file is already in the `seen`
+// set after the first), so its body is NOT inlined a second time -> no
+// duplicate `fn` definitions. main calls the imported fn; result is 100.
+import "lib2/nested_c.ember";
+import "lib2/nested_c.ember";
+
+fn main() -> i64 {
+    return nested_c_fn();  // 100
+}

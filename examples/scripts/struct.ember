@@ -1,0 +1,16 @@
+// struct.ember - script-declared struct + named-field literal + field access,
+// plus the vec extension end-to-end through the JIT.
+//   struct Point { x: f32; y: f32; }  built via Point{x: 1.0f, y: 2.0f}
+//   vec3_new(10.0f, 20.0f, 30.0f) + vec3_x accessor (method-call sugar)
+//   sum = p.x + p.y + vx = 1.0 + 2.0 + 10.0 = 13.0f, cast to i64 -> 13
+// expect: 13
+
+struct Point { x: f32; y: f32; }
+
+fn main() -> i64 {
+    let p: Point = Point{x: 1.0f, y: 2.0f};
+    let v: vec3 = vec3_new(10.0f, 20.0f, 30.0f);
+    let vx: f32 = v.vec3_x();
+    let sum: f32 = p.x + p.y + vx;
+    return sum as i64;
+}

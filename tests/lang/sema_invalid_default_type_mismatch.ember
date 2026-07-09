@@ -1,0 +1,3 @@
+// invalid for sema: a default value's kind must match the param's declared
+// type (Item C's declaration-time validation).
+fn f(x: bool = 5) -> bool { return x; }

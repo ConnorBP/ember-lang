@@ -1,0 +1,7 @@
+// valid for parser: deeply nested parenthesized expression (10 levels).
+// The Pratt/expression parser must recurse without overflow and preserve
+// left-to-right associativity through the parens. Verifies the parse succeeds
+// (this file is parse-checked, not run - it has no main).
+fn deep_pare() -> i64 {
+    return ((((((((((1 + 2) + 3) + 4) + 5) + 6) + 7) + 8) + 9) + 10));
+}

@@ -1,0 +1,14 @@
+struct Point { x: i64; y: i64; }
+
+fn make_point(x: i64, y: i64) -> Point {
+    let p: Point = Point { x: x, y: y };
+    return p;
+}
+
+// A struct-returning call may only appear as a `let x: T = f(...);`
+// initializer or a `return f(...);` value - a bare expression-statement
+// (result discarded) is not one of those two shapes.
+fn main() -> i64 {
+    make_point(1, 2);
+    return 0;
+}

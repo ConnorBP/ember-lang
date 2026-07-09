@@ -1,0 +1,6 @@
+// invalid for sema: indexing a non-array, non-slice type. `x` is a scalar
+// i64; `x[0]` requires an array or slice on the left.
+fn bad() -> i64 {
+    let x: i64 = 5;
+    return x[0];
+}

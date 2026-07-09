@@ -1,0 +1,3 @@
+// lib2/nested_b.ember - imports nested_c (a sibling, relative to this dir).
+import "nested_c.ember";
+fn nested_b_fn() -> i64 { return nested_c_fn() + 10; }

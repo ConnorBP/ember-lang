@@ -1,0 +1,2 @@
+// lib/import_b.ember - imported by import_test.ember (different lib dir)
+fn import_b_fn() -> i64 { return 20; }

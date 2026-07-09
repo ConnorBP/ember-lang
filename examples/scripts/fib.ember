@@ -1,0 +1,13 @@
+// fib.ember - canonical recursion + script-to-script dispatch-call test.
+// Demonstrates that ember's dispatch table resolves a self-referential
+// script function and that the JIT can call it recursively (fib calls fib).
+// expect: 55   (fib(10) = 55)
+
+fn fib(n: i64) -> i64 {
+    if (n <= 1) { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main() -> i64 {
+    return fib(10);
+}

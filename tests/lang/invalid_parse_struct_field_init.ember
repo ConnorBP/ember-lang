@@ -1,0 +1,9 @@
+// invalid for parser: a struct field with an initializer (struct fields are
+// declared, not initialized). The recovery must report the bad field and
+// still close the struct, so the rest of the file parses. Two errors expected:
+// the bad field's '=', and the sync's "expected fn/struct/global" if recovery
+// overshoots - the point of this test is that the struct DOES error (a
+// regression where struct-field init silently parsed as a valid field would
+// let this pass, which is wrong).
+struct Bad { x: i64 = 5; }
+fn main() -> i64 { return 0; }

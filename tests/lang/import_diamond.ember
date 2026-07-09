@@ -1,0 +1,12 @@
+// import_diamond.ember - diamond-shaped import graph: main -> {b, c}, b -> d, c -> d.
+// The shared leaf diamond_d is reachable via TWO paths (through b and c).
+// The import resolver's idempotent-skip (the `seen` set) must inline d
+// EXACTLY ONCE - otherwise its `fn diamond_d_fn` would appear twice and the
+// parser would error on the duplicate. This test passes iff the dedup works.
+import "lib3/diamond_b.ember";
+import "lib3/diamond_c.ember";
+
+fn main() -> i64 {
+    // diamond_b_fn() = d()+1 = 1001; diamond_c_fn() = d()+2 = 1002; sum = 2003
+    return diamond_b_fn() + diamond_c_fn();
+}

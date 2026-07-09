@@ -1,0 +1,20 @@
+// valid: structs, array/slice types, view, field access
+struct Vec3 {
+    x: f32;
+    y: f32;
+    z: f32;
+}
+
+fn sum_arr(buf: i64[]) -> i64 {
+    let mut total: i64 = 0;
+    let mut i: u64 = 0;
+    while (i < 10) {
+        total = total + buf[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+fn make_view(arr: i64[8]) -> i64[] {
+    return arr[..];
+}

@@ -1,0 +1,14 @@
+// invalid for sema: a defer expression can't reference a block/loop-local
+// variable - it's re-evaluated at function-exit time, by which point that
+// variable's compile-time scope may already have closed. Before this was
+// rejected, it silently read whatever was last in the register (coincidental
+// garbage, not the variable's real value) instead of erroring.
+fn probe() -> i64 {
+    for (let i: i64 = 0; i < 3; i = i + 1) {
+        defer print_i64(i);
+    }
+    return 0;
+}
+fn main() -> i64 {
+    return probe();
+}

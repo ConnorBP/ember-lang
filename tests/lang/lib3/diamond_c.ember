@@ -1,0 +1,3 @@
+// lib3/diamond_c.ember - imports the SAME shared leaf d (already inlined via b).
+import "diamond_d.ember";
+fn diamond_c_fn() -> i64 { return diamond_d_fn() + 2; }

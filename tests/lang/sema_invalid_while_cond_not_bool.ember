@@ -1,0 +1,8 @@
+// invalid for sema: a `while` condition that is i64, not bool. Pairs with
+// sema_invalid_for_cond_not_bool (the for-loop case) and sema_invalid_int_as_
+// bool (the if case) - this closes the while case of the same rule.
+fn bad() -> i64 {
+    let x: i64 = 5;
+    while (x) { x = x - 1; }
+    return 0;
+}

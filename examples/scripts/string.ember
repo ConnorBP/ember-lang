@@ -1,0 +1,18 @@
+// string.ember - the string extension native-call path through the JIT,
+//   including a real string literal (exercises the StringLit -> slice<u8>
+//   -> string_from_slice rodata path, not just the i64->string formatter).
+//   string_from_slice("hello")  -> owned string "hello" (length 5)
+//   string_new()                -> empty owned string     (length 0)
+//   string_from_i64(12345)      -> owned string "12345"  (length 5)
+//   return length("hello") + length("12345") - length(empty) = 5 + 5 - 0 = 10
+// expect: 10
+
+fn main() -> i64 {
+    let a: string = string_new();
+    let b: string = string_from_slice("hello");
+    let c: string = string_from_i64(12345);
+    let la: i64 = string_length(a);
+    let lb: i64 = string_length(b);
+    let lc: i64 = string_length(c);
+    return lb + lc - la;
+}

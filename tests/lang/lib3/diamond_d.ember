@@ -1,0 +1,5 @@
+// lib3/diamond_d.ember - the shared leaf, imported by both diamond_b and diamond_c.
+// If imports were NOT idempotent, d's body would be inlined twice -> duplicate
+// fn definitions -> a parse/sema error. The idempotent-skip (seen-set) means
+// d is inlined exactly once.
+fn diamond_d_fn() -> i64 { return 1000; }

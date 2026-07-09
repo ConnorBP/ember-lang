@@ -8,7 +8,7 @@
 # ship here; prism wires the host-side natives (__str_decrypt etc.).
 
 cmake_minimum_required(VERSION 3.16)
-project(ember CXX)
+project(ember VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -108,6 +108,51 @@ target_link_libraries(ext_registration_test PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat ember_ext_string ember_ext_array ember_ext_math
     ember_frontend)
 add_test(NAME ext_registration COMMAND ext_registration_test)
+
+# ---- lang regression suite: ember_check (parse-only) + sema_check (parse+sema) +
+# the run_lang_tests.sh runner that classifies tests/lang/{valid,invalid,sema_valid,
+# sema_invalid,import_*}.ember against the two check exes. Ported from prism's
+# tests/run_lang_tests.sh (lang-suite portion only); the .ember corpus under
+# tests/lang/ is ported verbatim from prism/tests/lang/. The CLI run-via-CLI
+# block for the import_* cases soft-fails (SKIP) if ember_cli.exe isn't built
+# yet - parse/sema are the hard requirement. See tests/run_lang_tests.sh.
+add_executable(ember_check examples/ember_check.cpp)
+target_link_libraries(ember_check PRIVATE ember ember_frontend ember_import)
+
+# sema_check links all six extension libs so scripts that call array/string
+# (or any standard-addon) natives sema-check against the registered set -
+# EXACTLY the ext_registration_test registration shape (register_natives for
+# all six, register_overloads for vec/quat/mat/string), not prism's process/
+# render natives.
+add_executable(sema_check examples/sema_check.cpp)
+target_link_libraries(sema_check PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_vec ember_ext_quat ember_ext_mat ember_ext_string ember_ext_array ember_ext_math)
+
+# The suite: run the lang classifier script, passing the build dir so it finds
+# ember_check.exe / sema_check.exe / ember_cli.exe. bash is required (the script
+# is bash, not sh - it uses `local` and `[[ ]]`-style constructs via `set -u`).
+find_program(BASH_EXE bash REQUIRED)
+add_test(NAME lang_suite
+    COMMAND "${BASH_EXE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_lang_tests.sh"
+            "${CMAKE_CURRENT_BINARY_DIR}")
+
+# ---- standalone ember CLI: prism-decoupled runner ----
+# A minimal host that exercises the full parse->sema->codegen->finalize->call
+# pipeline (the em_roundtrip_test shape) with the full six-extension addon
+# surface registered (the ext_registration_test shape). Reads a .ember file,
+# resolves `import "path";` inlining, compiles, calls the entry fn (default
+# main), and exits with the i64 return code (or 0 for void). No prism linkage:
+# no VFS, no backends, no proc/shader api, no pak/assets, no print natives.
+add_executable(ember_cli examples/ember_cli.cpp)
+target_link_libraries(ember_cli PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_vec ember_ext_quat ember_ext_mat
+    ember_ext_string ember_ext_array ember_ext_math)
+# No add_test here: a smoke test needs a script asset, coordinated separately
+# (the lang_suite worker owns the script-driven tests). The target building
+# cleanly + `ember_cli run <file> --fn main` working IS the validation gate
+# (see examples/ember_cli.cpp header for the run contract).
 
 # Windows: ember's jit_memory uses VirtualAlloc/FlushInstructionCache.
 # MinGW links kernel32 by default; MSVC pulls it via the default UCRT libs.

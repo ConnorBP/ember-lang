@@ -1,0 +1,8 @@
+// invalid for parser (import stage): importing a file that does not exist.
+// The import resolver throws std::runtime_error("import: cannot open '...'")
+// on a missing file; ember_check/sema_check catch it and print IMPORT_ERROR,
+// returning non-zero. This is the only IMPORT-stage error path (the rest of
+// the pipeline errors at LEX/PARSE/SEMA, which all have source positions).
+import "this/file/does/not/exist.ember";
+
+fn main() -> i64 { return 0; }

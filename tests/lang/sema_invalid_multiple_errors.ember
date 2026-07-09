@@ -1,0 +1,15 @@
+// invalid for sema: MULTIPLE sema errors in one function, exercising sema's
+// error-recovery (it collects every error rather than stopping at the first).
+// Four distinct faults in one body:
+//   1. reassigning a const local (line 4)
+//   2. if-condition is i64, not bool (line 5)
+//   3. operator type mismatch i64 + f32 (line 6)
+//   4. return type mismatch (the bad expression is void/bool, fn wants i64)
+// All four must be reported (sema_check prints "SEMA_ERROR (N)" with N>=3).
+// A regression where sema stopped at the first error would report only one.
+fn bad() -> i64 {
+    const x: i64 = 5;
+    x = 6;
+    if (x) { return 1; }
+    return x + 1.5f;
+}

@@ -1,0 +1,2 @@
+// lib2/nested_c.ember - the leaf of the nested-import chain.
+fn nested_c_fn() -> i64 { return 100; }

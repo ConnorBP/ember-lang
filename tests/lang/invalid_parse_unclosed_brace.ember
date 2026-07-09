@@ -1,0 +1,6 @@
+// invalid for parser: an unbalanced brace - a function body opens a block
+// but never closes it before EOF. The parser must report the unclosed block
+// rather than silently accepting the truncated body.
+fn bad() -> i64 {
+    let x: i64 = 1;
+    return x;

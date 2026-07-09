@@ -1,0 +1,6 @@
+// invalid for sema: struct literal omits a required field
+struct Point { x: i32; y: i32; }
+fn bad() -> i64 {
+    let p: Point = Point { x: 1 };
+    return 0;
+}

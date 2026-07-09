@@ -90,14 +90,28 @@ Non-goals for v1:
   coverage, `.em` serialize→load→run round-trip). This is the "prove
   it actually compiles to real machine code AND can be
   bundled/reloaded" gate.
-- **v0.2** - lexer+parser+AST for control flow and multi-function
-  scripts, the IR-driven lowering pass (IrFunction → machine code,
-  replacing the v0.1 hand-built-IR-to-encoder path),
-  script-to-script calls via dispatch table. The `.em` infrastructure
-  (em_loader's name table + dispatch-table reloc repoint) is already
-  in place as the foundation for multi-function modules.
+- **v0.2** ✓ shipped - the full frontend landed: lexer, recursive-descent
+  parser (full v1 grammar - control flow, structs, slices, switch, defer,
+  ternary, compound assign, annotations), the 4-pass sema, and a
+  tree-walking AST→x64 codegen. Script-to-script calls go through the
+  dispatch table by slot. The `.em` bundling format (serialize→load→run
+  round-trip) and cross-module textual `import "path";` inclusion both
+  work. A standard addon set ships as native extensions in `extensions/`
+  (vec/quat/mat/string/array/math). The canonical tree is standalone-
+  buildable and standalone-testable: a prism-decoupled `ember` CLI runs
+  `.ember` files, and a language regression suite (`tests/lang/` +
+  `ember_check`/`sema_check` exes) runs under `ctest`.
+  Honest divergence from the spec above: codegen is currently a
+  correctness-first **tree-walking stack-spilling emitter**, not the
+  SSA-lite IR + linear-scan regalloc specified in `COMPILER_PIPELINE.md`
+  Section 5. That refactor is deliberately deferred to v0.5 (benchmark-
+  driven, per Section 9 below - no speculative optimization before the
+  bench harness exists).
 - **v0.3** - structs, slices with bounds checks, native function
   binding (descriptor API), calling-convention correctness host↔script.
+  (Note: struct decl/literal/field-access and the annotation machinery
+  already landed in the v0.2 overshot; v0.3 is the binding-API correctness
+  and host↔script calling-convention validation milestone.)
 - **v0.4** - budgets/safety checks, annotations, hot reload of a
   single function, stack depth guard.
 - **v0.5** - benchmark harness vs AngelScript; tune regalloc/peephole

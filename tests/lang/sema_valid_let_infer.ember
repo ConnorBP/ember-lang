@@ -1,0 +1,11 @@
+// valid for sema: `let`/`const`/`auto` with no ':TYPE' all infer from the
+// initializer via the same path (Item A - Rust-style optional annotation).
+fn entry() -> i64 {
+    let x = 5;
+    let s = "hi";
+    const c = 10;
+    auto a = 20;
+    let f = 1.5f;
+    let b = true;
+    return x + c + a + (f > 1.0f ? 1 : 0) + (b ? 1 : 0);
+}

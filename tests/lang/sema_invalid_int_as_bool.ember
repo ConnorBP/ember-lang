@@ -1,0 +1,5 @@
+// invalid for sema: if condition is i64, not bool (no int-as-bool)
+fn bad(x: i64) -> i64 {
+    if (x) { return 1; }
+    return 0;
+}

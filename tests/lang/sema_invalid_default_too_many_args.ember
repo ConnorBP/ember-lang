@@ -1,0 +1,7 @@
+// invalid for sema: calling with MORE args than the total (required +
+// defaulted) parameter count must still be rejected - the upper bound of
+// Item C's range check.
+fn greet(name: i64, times: i64 = 1) -> i64 { return times; }
+fn entry() -> i64 {
+    return greet(1, 2, 3);
+}

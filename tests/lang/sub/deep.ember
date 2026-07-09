@@ -1,0 +1,9 @@
+// sub/deep.ember - a file in a subdirectory that imports a sibling of its
+// PARENT directory using `../`. Validates relative-path resolution with a
+// dotdot segment: from tests/lang/sub/, `../lib2/nested_c.ember` resolves to
+// tests/lang/lib2/nested_c.ember. This is the import-resolver corner case
+// for non-flat directory layouts (a script in a sub-folder pulling a shared
+// lib from the parent's lib folder).
+import "../lib2/nested_c.ember";
+
+fn deep_fn() -> i64 { return nested_c_fn() + 1; }

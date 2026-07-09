@@ -1,0 +1,15 @@
+struct Point { x: i64; y: i64; }
+
+fn make_point(x: i64, y: i64) -> Point {
+    let p: Point = Point { x: x, y: y };
+    return p;
+}
+fn sum_point(p: Point) -> i64 { return p.x + p.y; }
+
+// A struct-returning call used directly as another call's argument is
+// neither a `let`-initializer nor a `return` value - not allowed, even
+// though the argument's type matches the parameter.
+fn main() -> i64 {
+    let r: i64 = sum_point(make_point(1, 2));
+    return r;
+}
