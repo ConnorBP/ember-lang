@@ -238,4 +238,24 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/sdk/angelscript/source/as_atomi
     endif()
     add_test(NAME bench_ember_vs_as COMMAND bench_ember_vs_as)
     set_tests_properties(bench_ember_vs_as PROPERTIES TIMEOUT 300)
+
+    # v0.6 lifecycle + tick-mode tests (annotation discovery + tick loop).
+    add_executable(v0_6_lifecycle_test examples/v0_6_lifecycle_test.cpp)
+    target_link_libraries(v0_6_lifecycle_test PRIVATE
+        ember ember_frontend ember_import
+        ember_ext_vec ember_ext_math)
+    if(WIN32)
+        target_link_libraries(v0_6_lifecycle_test PRIVATE kernel32)
+    endif()
+    add_test(NAME v0_6_lifecycle COMMAND v0_6_lifecycle_test)
+
+    # v0.6 single-function hot reload tests (HOT_RELOAD.md §3).
+    add_executable(v0_6_hot_reload_test examples/v0_6_hot_reload_test.cpp)
+    target_link_libraries(v0_6_hot_reload_test PRIVATE
+        ember ember_frontend ember_import
+        ember_ext_vec ember_ext_math)
+    if(WIN32)
+        target_link_libraries(v0_6_hot_reload_test PRIVATE kernel32)
+    endif()
+    add_test(NAME v0_6_hot_reload COMMAND v0_6_hot_reload_test)
 endif()

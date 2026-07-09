@@ -40,6 +40,7 @@
 #include "../src/codegen.hpp"     // CodeGenCtx, compile_func, g_globals_for_codegen, GlobalsBlock
 #include "../src/import.hpp"      // resolve_imports
 #include "../src/jit_memory.hpp"  // free_executable
+#include "../src/lifecycle.hpp"    // v0.6 get_annotated_functions (@on_tick discovery)
 #include "../src/context.hpp"     // context_t, TrapStub, TrapReason (v0.4 safe execution)
 #include "../src/module_registry.hpp" // v0.5 live modules (ModuleRegistry)
 #include "../src/module_linker.hpp"  // v0.5 live modules (link_em_file, build_*_exports)
@@ -56,6 +57,10 @@
 
 #include <cstdio>
 #include <csetjmp>   // setjmp/longjmp (v0.4 safe-execution checkpoint)
+#include <thread>    // v0.6 --tick tick thread
+#include <atomic>     // v0.6 --tick stop flag
+#include <chrono>     // v0.6 --tick interval
+#include <conio.h>     // v0.6 --tick keybind (Windows _kbhit/_getch)
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -122,6 +127,9 @@ int main(int argc, char** argv) {
     std::string fn_name = "main";
     bool dump = false;
     std::string emit_em_path;   // v0.5: --emit-em <out> pre-compiles to a .em bundle
+    bool tick_mode = false;     // v0.6: --tick runs @on_tick fns on a thread until a keybind
+    int tick_interval_ms = 16;  // v0.6: --tick-interval (default ~60fps)
+    int tick_max = 0;           // v0.6: --tick-count N auto-stop after N ticks (0 = until keybind; for tests/non-interactive)
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--fn") {
@@ -132,6 +140,15 @@ int main(int argc, char** argv) {
         } else if (a == "--emit-em") {
             if (++i >= argc) { std::fprintf(stderr, "ember: --emit-em needs a path\n"); return 2; }
             emit_em_path = argv[i];
+        } else if (a == "--tick") {
+            tick_mode = true;
+        } else if (a == "--tick-interval") {
+            if (++i >= argc) { std::fprintf(stderr, "ember: --tick-interval needs ms\n"); return 2; }
+            tick_interval_ms = std::atoi(argv[i]);
+            if (tick_interval_ms <= 0) tick_interval_ms = 16;
+        } else if (a == "--tick-count") {
+            if (++i >= argc) { std::fprintf(stderr, "ember: --tick-count needs N\n"); return 2; }
+            tick_max = std::atoi(argv[i]);
         } else if (a == "-h" || a == "--help") {
             usage(stdout); return 0;
         } else if (a.size() > 0 && a[0] == '-') {
@@ -410,6 +427,76 @@ int main(int argc, char** argv) {
         exit_code = int(r & 0x7fffffff);   // clamp to a usable exit code
     }
     ectx.has_checkpoint = false;
+
+    // ---- v0.6 --tick mode: run @on_tick fns on a thread until a keybind ----
+    // (user suggestion: a tick lifecycle that works on the terminal runtime,
+    // shared shape with prism's runtime). After @entry, start a tick thread
+    // calling every @on_tick fn at --tick-interval; the main thread shows a
+    // minimal TUI + waits for 'q' to stop, unload, and exit. If @entry returned
+    // <= 0 the module asked to unload — don't tick.
+    if (tick_mode && exit_code != 70) {
+        // @entry return <= 0 = unload (LIFECYCLE.md §1). exit_code holds it only
+        // when @entry is `main`; if --fn pointed elsewhere this is approximate.
+        bool entry_says_stay = (entry_decl && entry_decl->ret && !entry_decl->ret->is_void())
+                               ? (exit_code > 0) : true;
+        auto ticks = ember::get_annotated_functions(pr.program, "@on_tick");
+        if (!entry_says_stay) {
+            std::printf("ember: @entry returned <= 0, module unloaded (no tick)\n");
+        } else if (ticks.empty()) {
+            std::printf("ember: --tick mode but no @on_tick functions; nothing to tick\n");
+        } else {
+            std::printf("ember: --tick mode — %zu @on_tick fn(s), %dms interval. Press 'q' to unload + exit.\n",
+                        ticks.size(), tick_interval_ms);
+            std::atomic<bool> stop{false};
+            std::atomic<uint64_t> tick_count{0};
+            // The tick thread calls each @on_tick fn via the dispatch table.
+            // Safety: each tick runs under a fresh checkpoint (a trap in a tick
+            // stops the tick thread + sets a flag, not a process crash).
+            std::atomic<bool> tick_trapped{false};
+            std::thread tick_thread([&]() {
+                using F0 = int64_t(*)();
+                while (!stop.load(std::memory_order_relaxed)) {
+                    if (tick_max > 0 && tick_count.load(std::memory_order_relaxed) >= (uint64_t)tick_max) { stop.store(true); break; }
+                    for (auto& af : ticks) {
+                        void* f = table.get(af.slot);
+                        if (f) {
+                            // per-tick checkpoint: a trap stops THIS tick, not the process.
+                            context_t tctx; tctx.has_checkpoint = true; tctx.max_call_depth = 512;
+                            tctx.budget_remaining = 100000000;
+                            // NB: the trap stub is process-wide (ember_cli_trap); it longjmps
+                            // to tctx.checkpoint. We pass &tctx as trap_ctx for this tick.
+                            // (ember_cli_trap uses __builtin_longjmp on the passed ctx.)
+                            extern void ember_cli_trap(ember::context_t*, int, const char*);
+                            // The JIT'd code baked ctx.trap_ctx = &ectx at compile time, so a
+                            // trap in a tick longjmps to ECTX's checkpoint (already cleared).
+                            // For tick-safety we instead catch via a wrapper: run the tick in a
+                            // try via the existing ectx checkpoint re-arm. Simpler: re-arm ectx.
+                            ectx.has_checkpoint = true;
+                            if (__builtin_setjmp(ectx.checkpoint)) {
+                                tick_trapped.store(true); stop.store(true); break;
+                            }
+                            reinterpret_cast<F0>(f)();
+                            ectx.has_checkpoint = false;
+                        }
+                    }
+                    tick_count.fetch_add(1, std::memory_order_relaxed);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(tick_interval_ms));
+                }
+            });
+            // Minimal TUI: show tick count, poll for 'q'.
+            while (!stop.load(std::memory_order_relaxed)) {
+                std::printf("\r ember tick: %llu ticks   [q to quit]   ",
+                            (unsigned long long)tick_count.load());
+                std::fflush(stdout);
+                if (_kbhit()) { int c = _getch(); if (c == 'q' || c == 'Q') stop.store(true); }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            tick_thread.join();
+            std::printf("\nember: stopped after %llu ticks%s\n",
+                        (unsigned long long)tick_count.load(),
+                        tick_trapped.load() ? " (a tick trapped — runtime error, see above)" : "");
+        }
+    }
 
     // ---- cleanup ----
     for (auto& fn : fns) if (fn.exec) free_executable(fn.exec);
