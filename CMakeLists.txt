@@ -124,6 +124,21 @@ if(WIN32)
 endif()
 add_test(NAME v0_4_hardening COMMAND v0_4_hardening_test)
 
+# v0.5 live-modules stress matrix: bidirectional script<->.em cross-module
+# linking through the real grammar (link directive + mod::fn calls). Covers
+# the user's ask: scripts and .em bundles both able to use either form,
+# compiled modules referencing others at runtime. Stresses the .em binary
+# type in every direction. Links all six extensions + the module/em libs.
+add_executable(v0_5_live_modules_test examples/v0_5_live_modules_test.cpp)
+target_link_libraries(v0_5_live_modules_test PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_vec ember_ext_quat ember_ext_mat
+    ember_ext_string ember_ext_array ember_ext_math)
+if(WIN32)
+    target_link_libraries(v0_5_live_modules_test PRIVATE kernel32)
+endif()
+add_test(NAME v0_5_live_modules COMMAND v0_5_live_modules_test)
+
 # ---- lang regression suite: ember_check (parse-only) + sema_check (parse+sema) +
 # the run_lang_tests.sh runner that classifies tests/lang/{valid,invalid,sema_valid,
 # sema_invalid,import_*}.ember against the two check exes. Ported from prism's

@@ -41,6 +41,11 @@
 #include "../src/import.hpp"      // resolve_imports
 #include "../src/jit_memory.hpp"  // free_executable
 #include "../src/context.hpp"     // context_t, TrapStub, TrapReason (v0.4 safe execution)
+#include "../src/module_registry.hpp" // v0.5 live modules (ModuleRegistry)
+#include "../src/module_linker.hpp"  // v0.5 live modules (link_em_file, build_*_exports)
+#include "../src/em_loader.hpp"      // v0.5 live modules (LoadedModule, for linked .em modules)
+#include "../src/em_file.hpp"        // v0.5 --emit-em (EmModule/EmFunctionRecord)
+#include "../src/em_writer.hpp"       // v0.5 --emit-em (write_em_file)
 
 #include "ext_vec.hpp"
 #include "ext_quat.hpp"
@@ -116,6 +121,7 @@ int main(int argc, char** argv) {
     std::string file;
     std::string fn_name = "main";
     bool dump = false;
+    std::string emit_em_path;   // v0.5: --emit-em <out> pre-compiles to a .em bundle
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--fn") {
@@ -123,6 +129,9 @@ int main(int argc, char** argv) {
             fn_name = argv[i];
         } else if (a == "--dump") {
             dump = true;
+        } else if (a == "--emit-em") {
+            if (++i >= argc) { std::fprintf(stderr, "ember: --emit-em needs a path\n"); return 2; }
+            emit_em_path = argv[i];
         } else if (a == "-h" || a == "--help") {
             usage(stdout); return 0;
         } else if (a.size() > 0 && a[0] == '-') {
@@ -135,7 +144,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "ember: unexpected argument '%s'\n", a.c_str()); return 2;
         }
     }
-    if (action != "run") { usage(stderr); return 2; }
+    if (action != "run" && action != "emit-em") { usage(stderr); return 2; }
     if (file.empty()) { std::fprintf(stderr, "ember: missing <file.ember>\n"); usage(stderr); return 2; }
     if (!fs::exists(file)) { std::fprintf(stderr, "ember: no such file: %s\n", file.c_str()); return 2; }
 
@@ -206,7 +215,49 @@ int main(int argc, char** argv) {
     // sets a nonzero key); a standalone language CLI has no such host, so it
     // must leave encryption off.
     pr.program.string_xor_key = 0;
-    auto sr = sema(pr.program, natives, slots, 0, &overloads, &struct_layouts);
+
+    // ---- v0.5 live-module link resolution (MODULES.md §5) ----
+    // Resolve each `link "..." as alias;` directive: a .em target is loaded +
+    // registered; a bare name links to an already-registered module (the host
+    // must have registered it). Build the ModuleExportTable sema resolves
+    // `mod::fn` against. Unresolvable links are deferred (sema marks those
+    // calls cross_module_unresolved -> trap at runtime, not a hard error).
+    ModuleRegistry registry(64);  // capacity 64 modules per process (generous)
+    std::vector<LoadedModule> linked_ems;  // own the .em modules (keep alive for registry's lifetime)
+    linked_ems.reserve(pr.program.links.size());  // no realloc: registry holds dispatch.data() ptrs (dangling if the vector grows)
+    ModuleExportTable module_exports;
+    for (const auto& ld : pr.program.links) {
+        if (ld.is_file) {
+            // resolve a relative .em path against the importing file's directory
+            // (matches `import`'s textual resolver convention).
+            std::string path = ld.target;
+            if (!path.empty() && !(path[0]=='/' || path[0]=='\\') && (path.size()<2 || path[1]!=':')) {
+                fs::path p = fs::path(base_dir) / path;
+                path = fs::weakly_canonical(p).string();
+            }
+            linked_ems.emplace_back();
+            std::string lerr;
+            if (!link_em_file(registry, path.c_str(), ld.alias, linked_ems.back(), &lerr)) {
+                std::fprintf(stderr, "ember: link '%s' failed: %s\n", ld.target.c_str(), lerr.c_str());
+                return 2;
+            }
+            uint32_t id = registry.find_by_name(ld.alias);
+            add_exports(module_exports, ld.alias, build_em_exports(linked_ems.back(), id));
+        } else {
+            // `link "foo" as foo;` -> link to an already-registered module.
+            // (In the standalone CLI nothing pre-registers, so this is unresolved
+            // unless the host wired it; sema will mark calls to it as deferred traps.)
+            uint32_t id = registry.find_by_name(ld.target);
+            if (id != UINT32_MAX) {
+                // already registered by a prior link (e.g. a .em that exports it);
+                // expose under the alias. Exports aren't available without a LoadedModule/Program
+                // here, so this form is host-driven in practice; leave deferred.
+            }
+            // else: unresolved — sema marks mod::fn calls as deferred traps.
+        }
+    }
+
+    auto sr = sema(pr.program, natives, slots, 0, &overloads, &struct_layouts, &module_exports);
     if (!sr.ok) {
         std::fprintf(stderr, "ember: sema errors (%zu):\n", sr.errors.size());
         for (auto& e : sr.errors) std::fprintf(stderr, "  line %u: %s\n", e.line, e.msg.c_str());
@@ -235,6 +286,12 @@ int main(int argc, char** argv) {
     ctx.natives = &natives;
     ctx.script_slots = &slots;
     ctx.structs = &struct_layouts;
+    // v0.5 cross-module: bake the registry base into kind-2 call sites. Also
+    // register THIS module so a linked .em could call back into it (bidirectional).
+    ctx.registry_base = int64_t(registry.base());
+    std::string reg_err;
+    uint32_t self_id = registry.register_module("__main__", table.base(), &reg_err);
+    (void)self_id;  // registered so others can link "__main__"; not referenced here
     // str_decrypt_fn stays null: key=0 above means string literals never
     // emit a decrypt call, so no __str_decrypt native is needed.
 
@@ -267,6 +324,42 @@ int main(int argc, char** argv) {
         table.set(fn.slot, cf.entry);
         fns.push_back(std::move(cf));
     }
+
+    // ---- v0.5 --emit-em: pre-compile the parsed module to a .em bundle ----
+    // (BUNDLING_AND_EM_MODULES.md). Serializes the JIT'd per-function bytes +
+    // relocs + the globals block + a name->slot table. The resulting .em is
+    // loadable by ember_cli's `link "x.em"` path or any host using em_loader.
+    if (!emit_em_path.empty()) {
+        EmModule mod;
+        mod.functions.reserve(fns.size());
+        std::vector<uint8_t> globals_bytes(pr.program.globals.size() * 8, 0);
+        for (const auto& cf : fns) {
+            EmFunctionRecord rec;
+            rec.name = cf.name;
+            auto sit = slots.find(cf.name);
+            rec.slot_index = (sit != slots.end()) ? uint32_t(sit->second) : 0xFFFFFFFFu;
+            rec.code = cf.bytes;
+            for (const auto& af : cf.abs_fixups) { EmReloc r; r.offset = af.code_offset; r.kind = uint8_t(af.kind); rec.relocs.push_back(r); }
+            mod.functions.push_back(std::move(rec));
+        }
+        mod.globals = globals_bytes;
+        // entry slot = the @entry fn if present, else `main` if present.
+        uint32_t entry_slot = EM_NO_ENTRY;
+        for (const auto& fn : pr.program.funcs) for (const auto& a : fn.annotations) if (a.name == "entry") { entry_slot = uint32_t(fn.slot); break; }
+        if (entry_slot == EM_NO_ENTRY) { auto sit = slots.find("main"); if (sit != slots.end()) entry_slot = uint32_t(sit->second); }
+        mod.entry_slot = entry_slot;
+        mod.name_table.reserve(pr.program.funcs.size());
+        for (const auto& fn : pr.program.funcs) mod.name_table.push_back({fn.name, uint32_t(fn.slot)});
+        std::string werr;
+        if (!write_em_file(mod, emit_em_path.c_str(), &werr)) {
+            std::fprintf(stderr, "ember: --emit-em write failed: %s\n", werr.c_str());
+            return 2;
+        }
+        std::printf("ember: wrote %s (%zu fns, %zu globals, entry slot %u)\n",
+                    emit_em_path.c_str(), mod.functions.size(), mod.globals.size()/8, mod.entry_slot);
+        return 0;  // pre-compile mode: do not run
+    }
+
 
     // ---- optional dump (reloc capture print, em_roundtrip style) ----
     if (dump) {

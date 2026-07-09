@@ -105,6 +105,15 @@ struct CallExpr : Expr { std::string name; std::vector<ExprPtr> args;
                          // sema-resolved target (native fn ptr or script slot)
                          bool is_native = false; void* native_fn = nullptr;
                          int script_slot = -1;
+                         // v0.5 cross-module: non-empty module_alias = a `mod::fn()` call.
+                         // Sema resolves it against the linked-module export table; if the
+                         // module/fn is not yet registered it's an unresolved external (deferred
+                         // trap, MODULES.md §5). codegen stamps cross_module_id/slot when
+                         // resolved (kind-2 call site); unresolved stays -1 (trap stub).
+                         std::string module_alias;       // empty = same-module call
+                         int cross_module_id = -1;        // registry module_id (resolved)
+                         int cross_module_slot = -1;     // target fn's slot in that module
+                         bool cross_module_unresolved = false; // sema couldn't resolve (deferred trap)
                          // method-call sugar: obj.method(args) desugars to
                          // method(obj, args) - receiver becomes arg[0]. Null
                          // for free-function calls. (BINDING_API.md Section 3)
@@ -203,10 +212,23 @@ struct GlobalDecl {
     Loc loc;
 };
 
+// v0.5 live-module link declaration (MODULES.md §6). `link "foo.em" as foo;`
+// loads+registers a .em bundle at init; `link "foo" as foo;` links to an
+// already-registered module. `as alias` is optional sugar (defaults to the
+// module name / the file stem). Distinct from textual `import "path";` which
+// inlines source before lexing (BUNDLING_AND_EM_MODULES.md §1.1).
+struct LinkDecl {
+    std::string target;      // module name OR .em file path
+    std::string alias;       // the name scripts use (foo in foo::bar())
+    bool is_file = false;     // true = target is a .em path (load it); false = link to registered
+    Loc loc;
+};
+
 struct Program {
     std::vector<StructDecl> structs;
     std::vector<GlobalDecl> globals;
     std::vector<FuncDecl> funcs;
+    std::vector<LinkDecl> links;   // v0.5 live-module link declarations (MODULES.md §6)
     // type store: owns synthesized Types created by sema (slices, adapted
     // literal types) so the raw `ty` pointers stashed on AST nodes survive
     // until codegen finishes (sema's local Checker would otherwise free them).

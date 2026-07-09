@@ -195,6 +195,7 @@ struct Checker {
     Program* prog = nullptr;
     const OpOverloadTable* overloads = nullptr;
     const StructLayoutTable* structs = nullptr;
+    const ModuleExportTable* module_exports = nullptr;  // v0.5 cross-module exports (mod::fn resolution)
 
     // scope stack for locals/params
     struct Var { std::string name; const Type* ty; bool is_const; };
@@ -423,6 +424,58 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
             c->is_native = true;
             c->native_fn = cit->second.fn_ptr;
             e.ty = intern(cit->second.ret);
+            return e.ty;
+        }
+        // v0.5 cross-module call `mod::fn(args)` (MODULES.md §6). Resolve against
+        // the host-provided module export table. Resolved -> stamp the call's
+        // cross_module_id/slot + ret type (so the arg/return type-check below
+        // still works). Unresolved -> deferred trap (NOT a hard error — the
+        // module may register later, §5 step 1/3); ret type is i64 (the handle/
+        // int default — arg checking is skipped, codegen emits a trap stub).
+        if (!c->module_alias.empty()) {
+            c->cross_module_unresolved = true;  // assume unresolved until found
+            if (module_exports) {
+                auto mit = module_exports->find(c->module_alias);
+                if (mit != module_exports->end()) {
+                    for (const auto& exp : mit->second) {
+                        if (exp.fn_name == c->name) {
+                            c->cross_module_unresolved = false;
+                            c->cross_module_id = int(exp.module_id);
+                            c->cross_module_slot = exp.slot;
+                            if (exp.unknown_sig) {
+                                // .em export: signature not in the name table (the .em was
+                                // type-checked at compile time). Skip arity/return checks;
+                                // still type-check each arg standalone (no expected hint) so
+                                // malformed args surface. Default ret to i64.
+                                for (auto& a : c->args) check_expr(*a);
+                                e.ty = intern(type_i64());
+                                return e.ty;
+                            }
+                            // JIT export: type the call from the export's ret; check arity.
+                            size_t nargs = c->args.size() + (c->receiver ? 1 : 0);
+                            if (nargs != exp.params.size()) {
+                                err("cross-module call '" + c->module_alias + "::" + c->name +
+                                    "' expects " + std::to_string(exp.params.size()) +
+                                    " args, got " + std::to_string(nargs),
+                                    c->loc.line, c->loc.col);
+                            }
+                            // check each arg's type against the export's param types
+                            for (size_t i = 0; i < c->args.size() && i < exp.params.size(); ++i) {
+                                const Type* got = check_expr(*c->args[i], &exp.params[i]);
+                                if (!got->same(exp.params[i]) && !(got->is_int() && exp.params[i].is_int()))
+                                    err("cross-module arg " + std::to_string(i) + " type mismatch (expected " +
+                                        exp.params[i].to_string() + ", got " + got->to_string() + ")",
+                                        c->loc.line, c->loc.col);
+                            }
+                            e.ty = intern(exp.ret);
+                            return e.ty;
+                        }
+                    }
+                }
+            }
+            // unresolved: deferred trap. Default ret type to i64 so the call
+            // is usable in i64 contexts (the most common cross-module return).
+            e.ty = intern(type_i64());
             return e.ty;
         }
         // resolve: native first, then script function
@@ -1049,13 +1102,15 @@ SemaResult sema(Program& prog,
                 const std::unordered_map<std::string, int>& script_slots,
                 uint32_t module_permissions,
                 const OpOverloadTable* overloads,
-                const StructLayoutTable* structs) {
+                const StructLayoutTable* structs,
+                const ModuleExportTable* module_exports) {
     Checker c;
     c.natives = &natives;
     c.script_slots = &script_slots;
     c.perms = module_permissions;
     c.overloads = overloads;
     c.structs = structs;
+    c.module_exports = module_exports;
     c.prog = &prog;
 
     // register globals (stable type pointers via intern)

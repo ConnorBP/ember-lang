@@ -308,6 +308,30 @@ struct CG {
         e.byte(0x49); e.byte(0xFF); e.byte(0x0A);  // dec dword ptr [r10]  (REX.B=1, /1, rm=r10)
     }
 
+    // v0.5 cross-module call (MODULES.md §3). The kind-2 sequence: one registry
+    // hop then the same indirect call as intra-module. `mod_id` and `slot` are
+    // baked as displacements; only `registry_base` is a reloc (kind 2, filled
+    // with ctx.registry_base at JIT time / patched at .em load). If the call
+    // was unresolved at sema (the module/fn not yet registered), emit a trap
+    // stub call instead — the call traps gracefully until a relink resolves it
+    // (MODULES.md §5 step 3). Args are already stashed by the caller; this only
+    // replaces the final `call [r11+slot*8]` with the registry-hop + call.
+    void emit_cross_module_call(const CallExpr& c) {
+        if (c.cross_module_unresolved) {
+            // deferred trap (module/fn not registered yet). Args are stashed;
+            // the trap longjmps (never returns) so the stashed args + the sub
+            // rsp,total are harmless. rax=trap_ctx, etc. handled by emit_trap.
+            emit_trap(int(TrapReason::None), "cross-module call unresolved: module or function not registered");
+            return;
+        }
+        // mov r11, [registry_base + mod_id*8]  ; r11 = target module's DispatchTable base
+        e.mov_reg_imm64_external(Reg::r11, AbsFixup::ModuleRegistryBase);  // kind-2 reloc
+        e.load_reg_mem(Reg::r11, Reg::r11, int32_t(c.cross_module_id) * 8);  // registry hop
+        // mov r11, [r11 + slot*8]  ; r11 = callee's entry address
+        e.load_reg_mem(Reg::r11, Reg::r11, int32_t(c.cross_module_slot) * 8);
+        e.call_reg(Reg::r11);
+    }
+
     int32_t alloc_local(const std::string& n, const Type* t) {
         int32_t width = local_width_bytes(t, ctx.structs);
         next_local_off += width;
@@ -616,6 +640,11 @@ struct CG {
         if (c.is_native) {
             e.mov_reg_imm64(Reg::rax, int64_t(c.native_fn));
             e.call_reg(Reg::rax);
+        } else if (!c.module_alias.empty()) {
+            // v0.5 cross-module call (mod::fn): kind-2 registry-hop sequence.
+            emit_depth_check();
+            emit_cross_module_call(c);
+            emit_depth_leave();
         } else {
             // dispatch-table base is a relocatable imm64 (BUNDLING_AND_EM_MODULES
             // .md Section 2.4): emit 8 zero placeholders + a DispatchTableBase AbsFixup;
@@ -1515,6 +1544,11 @@ void CG::eval(const Expr& ex) {
             // mov rax, imm64(native_fn); call rax
             e.mov_reg_imm64(Reg::rax, int64_t(c->native_fn));
             e.call_reg(Reg::rax);
+        } else if (!c->module_alias.empty()) {
+            // v0.5 cross-module call (mod::fn): kind-2 registry-hop sequence.
+            emit_depth_check();
+            emit_cross_module_call(*c);
+            emit_depth_leave();
         } else {
             // call [dispatch_base + slot*8] - dispatch-table base is a
             // relocatable imm64 (BUNDLING_AND_EM_MODULES.md Section 2.4): emit 8 zero
@@ -2239,7 +2273,7 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
         switch (af.kind) {
             case AbsFixup::DispatchTableBase:  v = uint64_t(ctx.dispatch_base); break;
             case AbsFixup::GlobalsBase:       v = uint64_t(ctx.globals_base); break;
-            case AbsFixup::ModuleRegistryBase: v = 0; break; // reserved, unused in v1
+            case AbsFixup::ModuleRegistryBase: v = uint64_t(ctx.registry_base); break; // v0.5 cross-module (ModuleRegistry::base())
         }
         for (int i = 0; i < 8; ++i) p[i] = uint8_t(v >> (8 * i));
     }

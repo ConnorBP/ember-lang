@@ -18,12 +18,13 @@ enum class Tk : uint16_t {
     Kw_break, Kw_continue, Kw_return, Kw_as, Kw_auto,
     Kw_true, Kw_false,
     Kw_sizeof, Kw_offsetof,
+    Kw_link,
     // primitive types
     Kw_bool, Kw_i8, Kw_i16, Kw_i32, Kw_i64,
     Kw_u8, Kw_u16, Kw_u32, Kw_u64, Kw_f32, Kw_f64, Kw_void,
     // punctuation
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
-    Comma, Semicolon, Colon, Arrow, Dot, DotDot,
+    Comma, Semicolon, Colon, DoubleColon, Arrow, Dot, DotDot,
     // operators
     Plus, Minus, Star, Slash, Percent, Assign,
     Eq, Neq, Lt, Le, Gt, Ge, AndAnd, OrOr, Not,

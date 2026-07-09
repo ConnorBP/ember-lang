@@ -13,6 +13,24 @@ namespace ember {
 
 struct SemaError { std::string msg; uint32_t line; uint32_t col; };
 
+// v0.5 cross-module export entry (MODULES.md §5). A linked module exposes its
+// functions by name + signature + slot. The host builds this table from the
+// ModuleRegistry's registered modules; sema resolves `mod::fn` against it.
+// `module_id` is the registry id (baked into the call site by codegen); `slot`
+// is the fn's slot in that module's dispatch table. If a module/fn isn't in the
+// table, sema marks the call `cross_module_unresolved` (deferred trap — the
+// module may register later, MODULES.md §5 step 1/3).
+struct ModuleExport {
+    std::string fn_name;
+    Type ret;
+    std::vector<Type> params;
+    uint32_t module_id = 0;
+    int slot = -1;
+    bool unknown_sig = false;  // v0.5: true for .em exports (name table has no sigs); sema skips arg/return checks
+};
+// module_alias -> list of exported fns. Host populates from the registry.
+using ModuleExportTable = std::unordered_map<std::string, std::vector<ModuleExport>>;
+
 // A registered native function signature (host-side; mirrors NativeFn
 // from BINDING_API.md but sema only needs the type info + fn ptr).
 struct NativeSig {
@@ -84,6 +102,7 @@ SemaResult sema(Program& prog,
                 const std::unordered_map<std::string, int>& script_slots,
                 uint32_t module_permissions,
                 const OpOverloadTable* overloads = nullptr,
-                const StructLayoutTable* structs = nullptr);
+                const StructLayoutTable* structs = nullptr,
+                const ModuleExportTable* module_exports = nullptr);
 
 } // namespace ember

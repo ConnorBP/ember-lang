@@ -193,6 +193,38 @@ struct P {
         return g;
     }
 
+    // v0.5 live-module link declaration (MODULES.md §6):
+    //   link "foo.em" as foo;    -> load+register the .em bundle (is_file=true)
+    //   link "foo" as foo;       -> link to an already-registered module (is_file=false)
+    //   link "foo.em";           -> alias defaults to the file stem
+    //   link "foo";              -> alias defaults to the module name
+    // Distinct from textual `import "path";` (which inlines source pre-lex).
+    std::unique_ptr<LinkDecl> parse_link() {
+        auto ld = std::make_unique<LinkDecl>();
+        const Token& t = peek();
+        ld->loc = loc(t);
+        expect(Tk::Kw_link, "'link'");
+        const Token& target = expect(Tk::StringLit, "module name or .em path");
+        ld->target = target.text;   // StringLit.text holds the decoded literal
+        ld->is_file = ld->target.size() >= 3 &&
+                      ld->target.compare(ld->target.size()-3, 3, ".em") == 0;
+        if (accept(Tk::Kw_as)) {
+            ld->alias = expect(Tk::Ident, "module alias").text;
+        } else {
+            // default alias: file stem (strip .em) or the module name itself
+            if (ld->is_file) {
+                auto pos = ld->target.find_last_of("/\\");
+                std::string stem = (pos == std::string::npos) ? ld->target : ld->target.substr(pos+1);
+                if (stem.size() >= 3 && stem.compare(stem.size()-3,3,".em")==0) stem.resize(stem.size()-3);
+                ld->alias = stem;
+            } else {
+                ld->alias = ld->target;
+            }
+        }
+        expect(Tk::Semicolon, "';'");
+        return ld;
+    }
+
     // --- expressions (precedence climbing) ---
     ExprPtr parse_expr() { return parse_assign(); }
 
@@ -330,17 +362,38 @@ struct P {
         ExprPtr e = parse_primary();
         for (;;) {
             Tk k = peek().kind;
+            if (k==Tk::DoubleColon) {
+                // v0.5 cross-module selector `mod::fn`. The base `e` must be an
+                // Ident (the module alias); build a CallExpr with module_alias
+                // set + the fn name, args filled by the following `(` case.
+                auto id = dynamic_cast<Ident*>(e.get());
+                if (!id) throw ParseError("'::' must follow a module alias name", peek().line, peek().col);
+                adv(); // '::'
+                const Token& fn = expect(Tk::Ident, "function name after '::'");
+                auto c = std::make_unique<CallExpr>();
+                c->loc = e->loc;
+                c->module_alias = id->name;
+                c->name = fn.text;
+                e = std::move(c);
+                continue;  // the next iteration handles '(' (args) or anything else
+            }
             if (k==Tk::LParen) {
-                // call: e(args). Two forms:
+                // call: e(args). Three forms:
                 //   name(args)            - free function call (name is an Ident)
                 //   obj.method(args)      - method-call sugar; e is a FieldExpr,
                 //                          desugars to method(obj, args) with the
                 //                          receiver as arg[0] (BINDING_API.md Section 3)
-                auto c = std::make_unique<CallExpr>();
-                if (auto id = dynamic_cast<Ident*>(e.get())) {
+                //   mod::fn(args)         - cross-module call; e is already a CallExpr
+                //                          with module_alias set (built by the '::' case above)
+                std::unique_ptr<CallExpr> c;
+                if (auto existing = dynamic_cast<CallExpr*>(e.get())) {
+                    // mod::fn(args): take the half-built CallExpr, fill its args.
+                    c = std::unique_ptr<CallExpr>(static_cast<CallExpr*>(e.release()));
+                } else if (auto id = dynamic_cast<Ident*>(e.get())) {
+                    c = std::make_unique<CallExpr>();
                     c->name = id->name; c->loc = e->loc;
                 } else if (auto fld = dynamic_cast<FieldExpr*>(e.get())) {
-                    // obj.method(args) -> CallExpr{ receiver=base, name=field }
+                    c = std::make_unique<CallExpr>();
                     c->name = fld->field; c->loc = e->loc;
                     c->receiver = std::move(fld->base);
                 } else {
@@ -706,6 +759,9 @@ struct P {
                     expect(Tk::Semicolon, "';'");
                     (void)is_const; // const-ness recorded at sema; storage identical (TYPE_SYSTEM Section 11.5)
                     prog.globals.push_back(std::move(*g));
+                } else if (at(Tk::Kw_link)) {
+                    if (!anns.empty()) throw ParseError("annotations on link not supported", peek().line, peek().col);
+                    prog.links.push_back(std::move(*parse_link()));
                 } else if (at(Tk::Semicolon)) {
                     adv(); // empty top-level stmt
                 } else {

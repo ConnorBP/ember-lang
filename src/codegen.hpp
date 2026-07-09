@@ -43,6 +43,10 @@ int64_t current_cpuid_signature();
 struct CodeGenCtx {
     int64_t globals_base = 0;
     int64_t dispatch_base = 0;
+    // v0.5 cross-module: the per-process ModuleRegistry base address, baked into
+    // kind-2 cross-module call sites (mov r11,[reg_base+mod_id*8]). Required when
+    // a module uses `mod::fn()` calls; null/0 if no cross-module calls. MODULES.md §3.
+    int64_t registry_base = 0;
     const std::unordered_map<std::string, NativeSig>* natives = nullptr;
     const std::unordered_map<std::string, int>* script_slots = nullptr;
     ObfOptions obf;   // host-set defaults; @obf annotations layer on top

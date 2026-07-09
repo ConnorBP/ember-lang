@@ -17,6 +17,7 @@ static const std::unordered_map<std::string, Tk>& keywords() {
         {"as",Tk::Kw_as},{"auto",Tk::Kw_auto},
         {"true",Tk::Kw_true},{"false",Tk::Kw_false},
         {"sizeof",Tk::Kw_sizeof},{"offsetof",Tk::Kw_offsetof},
+        {"link",Tk::Kw_link},
         {"bool",Tk::Kw_bool},
         {"i8",Tk::Kw_i8},{"i16",Tk::Kw_i16},{"i32",Tk::Kw_i32},{"i64",Tk::Kw_i64},
         {"u8",Tk::Kw_u8},{"u16",Tk::Kw_u16},{"u32",Tk::Kw_u32},{"u64",Tk::Kw_u64},
@@ -36,7 +37,7 @@ const char* tok_spelling(Tk k) {
     case Tk::LBrace: return "{"; case Tk::RBrace: return "}";
     case Tk::LBracket: return "["; case Tk::RBracket: return "]";
     case Tk::Comma: return ","; case Tk::Semicolon: return ";";
-    case Tk::Colon: return ":"; case Tk::Arrow: return "->";
+    case Tk::Colon: return ":"; case Tk::DoubleColon: return "::"; case Tk::Arrow: return "->";
     case Tk::Dot: return "."; case Tk::DotDot: return "..";
     case Tk::Plus: return "+"; case Tk::Minus: return "-";
     case Tk::Star: return "*"; case Tk::Slash: return "/";
@@ -314,7 +315,7 @@ LexResult tokenize(std::string_view src, const char*) {
         case ']': push(Tk::RBracket,"]"); adv(1); continue;
         case ',': push(Tk::Comma,","); adv(1); continue;
         case ';': push(Tk::Semicolon,";"); adv(1); continue;
-        case ':': push(Tk::Colon,":"); adv(1); continue;
+        case ':': if (two(':',':',Tk::DoubleColon)) continue; push(Tk::Colon,":"); adv(1); continue;
         case '?': push(Tk::Question,"?"); adv(1); continue;
         case '~': push(Tk::Tilde,"~"); adv(1); continue;
         case '.': if (two('.','.',Tk::DotDot)) continue; push(Tk::Dot,"."); adv(1); continue;
