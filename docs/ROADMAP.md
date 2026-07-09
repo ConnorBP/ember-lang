@@ -8,7 +8,7 @@ deferral is a tracked decision, not a forgotten one.
 
 ## Shipped ahead of plan (between v0.1 and v0.2)
 
-The `.em` binary bundling format shipped between v0.1 and v0.2 (user-requested, see `BUNDLING_AND_EM_MODULES.md`, `MODULES.md`). It is a single-module pre-compile format: a JIT'd function's post-resolve code + rodata + relocs serialize to a `.em` file, and `load_em_file` repoints the relocs at the loaded module's own dispatch table/globals block and runs the loaded code identically to the JIT'd version (one execution path, proven by `CODEGEN_SPEC.md` Section 15 test 7). This is not a Tier 6 feature - single-module, no live multi-module linking - but `em_loader`'s reloc and name-table infrastructure is a foundation for the eventual live-`import` path below.
+The `.em` binary bundling format shipped between v0.1 and v0.2 (user-requested, see `BUNDLING_AND_EM_MODULES.md`, `MODULES.md`). It is a single-module pre-compile format: a JIT'd function's post-resolve code + rodata + relocs serialize to a `.em` file, and `load_em_file` repoints the relocs at the loaded module's own dispatch table/globals block and runs the loaded code identically to the JIT'd version (one execution path, proven by `CODEGEN_SPEC.md` Section 15 test 7). The `em_loader` reloc and name-table infrastructure it established became the foundation for the live-modules feature that shipped in **v0.5** (Tier 6, below — bidirectional script↔`.em` cross-module linking via `link "foo.em" as foo;` + `foo::bar()`).
 
 ## Tier 0 - standard addon set (ships with v1.0, host C++ side)
 
@@ -126,16 +126,9 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
 
 ## Tier 6 - language ecosystem (never strictly required)
 
-- **Modules / `import`** - multi-file linking. Trigger: a mod is big
-  enough that one file is unmaintainable. Dep: a linker stage
-  (resolve cross-module names → cross-module slot indices; the
-  dispatch table is already per-module, so cross-module calls need a
-  module-level dispatch indirection - moderate). The `em_loader`
-  reloc/name-table infrastructure shipped in v0.1 (see "Shipped ahead of
-  plan" above) is a foundation for the linker stage; the remaining work
-  is cross-module name resolution, not the load/serialize mechanics.
+- **Modules / live `link`** ✓ shipped in v0.5 — bidirectional script↔`.em` cross-module linking. `link "foo.em" as foo;` loads+registers a pre-compiled `.em` (or `link "foo" as foo;` links to an already-registered module); `foo::bar(args)` is the cross-module call. The runtime half (ModuleRegistry + kind-2 reloc) was built earlier; v0.5 added the source half (grammar, sema resolution, codegen emission, a linker/loader, an `--emit-em` pre-compile CLI mode). See `MODULES.md` (now implemented, not just a design sketch) + `examples/v0_5_live_modules_test.cpp`. The *textual* `import "path";` (parse-time source merge into one module) is unchanged and remains the one-file-bundle mechanism. Open: the `link` to an already-registered module (bare-name form) is host-driven in v0.5 (a host pre-registers); a future linker could resolve bare-name links against a module search path.
 - **Namespaces** - name scoping within a module. Trigger: module
-  size makes flat scope crowded. Dep: modules, or usable standalone.
+  size makes flat scope crowded. Dep: modules (now shipped), or usable standalone.
 - **Preprocessor** - deliberately never; `engine.define(name,value)`
   (`DESIGN.md` Section 8) + `const`/`constexpr` cover the legitimate
   compile-time-conditional needs without C-preprocessor footguns.

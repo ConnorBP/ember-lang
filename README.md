@@ -3,17 +3,27 @@
 C-style scripting language, JIT-compiles to native x86-64. AngelScript
 ergonomics, an optimizing native-JIT language's speed. Game-engine/modding embedding target.
 
-Status: **v0.2** - the full frontend is shipped: lexer, recursive-descent
-parser (full v1 grammar), 4-pass sema, and a tree-walking AST→x64 codegen.
-Script-to-script calls run through the dispatch table by slot. The `.em`
-binary bundling format (serialize→load→run round-trip) and cross-module
-textual `import "path";` inclusion both work. A standard addon set ships as
-native extensions in `extensions/` (vec/quat/mat/string/array/math). The
-canonical tree is standalone-buildable and standalone-testable - a
-prism-decoupled `ember` CLI runs `.ember` files, and a language regression
-suite (`tests/lang/` + `ember_check`/`sema_check` exes) runs under `ctest`.
-See `src/` for the frontend, `extensions/` for the addons, `examples/` for
-the CLI + check exes + sample scripts.
+Status: **v0.5** - the full frontend + binding API + safe execution + live modules.
+  v0.2: lexer/parser/sema/tree-walking codegen, `.em` bundling, standard
+  extensions (vec/quat/mat/string/array/math), standalone `ember` CLI +
+  language regression suite. v0.3: binding-ABI correctness suite +
+  `BindingBuilder` ergonomic registration. v0.4: safe execution — W^X JIT
+  memory, per-frame byte budget, `context_t` non-local abort + instruction
+  budget + stack-depth guard + PERM_FFI gating + unified trap surface (all
+  recoverable, not process death); a red-team writeup ships at the workspace
+  root. v0.5: live modules — bidirectional script↔`.em` cross-module linking
+  (`link "foo.em" as foo;` + `foo::bar()`) through the real grammar.
+  Script-to-script calls run through the dispatch table by slot; the `.em`
+  binary bundling format (serialize→load→run round-trip) and cross-module
+  textual `import "path";` inclusion both work. The canonical tree is
+  standalone-buildable and standalone-testable. See `src/` for the frontend,
+  `extensions/` for the addons, `examples/` for the CLI + check exes +
+  sample scripts.
+
+  Next milestone: **v0.6** - benchmark harness vs AngelScript (the gate the
+  SSA-lite IR + linear-scan regalloc refactor is deferred to). Open v0.4
+  items (lifecycle annotation runtime effect, single-function hot reload)
+  have complete specs (`LIFECYCLE.md`, `HOT_RELOAD.md`) and may land first.
 
 Next milestone: **v0.3** - native binding API correctness + host↔script
 calling-convention validation (struct/annotation machinery already landed in
@@ -67,7 +77,7 @@ cases spelled out. `GAP_ANALYSIS.md` is the audit confirming nothing
 the original request asked for is missing; `ROADMAP.md` is the tracked
 list of what's deliberately deferred and when each comes back.
 
-Status: **v0.2** (full frontend + `.em` bundling + standard extensions +
+Status: **v0.5** (full frontend + binding API + safe execution + live modules).
 standalone CLI + language regression suite). The spec docs are stable;
 `src/` contains the implementation, `extensions/` the addons, `examples/`
 the CLI + check exes + sample scripts.

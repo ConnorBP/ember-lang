@@ -104,9 +104,9 @@ Non-goals for v1:
   Honest divergence from the spec above: codegen is currently a
   correctness-first **tree-walking stack-spilling emitter**, not the
   SSA-lite IR + linear-scan regalloc specified in `COMPILER_PIPELINE.md`
-  Section 5. That refactor is deliberately deferred to v0.5 (benchmark-
-  driven, per Section 9 below - no speculative optimization before the
-  bench harness exists).
+  Section 5. That refactor is deliberately deferred until the benchmark
+  harness exists to prove it matters (per Section 9 below - no
+  speculative optimization before the bench harness exists).
 - **v0.3** - the binding-correctness milestone. Three pieces:
   (a) a binding-ABI test suite that pins the Win64 script→native call
   ABI (struct-by-value arg/return, >4-arg spill, `f32` in xmm
@@ -129,12 +129,47 @@ Non-goals for v1:
   decl/literal/field-access and the annotation machinery already landed
   in the v0.2 overshot; v0.3 is the binding-API correctness and
   host↔script calling-convention validation milestone.)
-- **v0.4** - budgets/safety checks, annotations, hot reload of a
-  single function, stack depth guard.
-- **v0.5** - benchmark harness vs AngelScript; tune regalloc/peephole
-  only if the bench shows a need.
-- **v1.0** - stable native binding API, docs, example game-engine
-  integration (event hooks via annotations).
+- **v0.4** ✓ shipped (first hardening + safe execution) - two commits.
+  First: W^X JIT memory (`VirtualAlloc RW → memcpy → VirtualProtect RX`,
+  the red-team V5 latent shellcode backstop), per-frame byte budget (V6-DoS
+  stack-exhaustion fix), int32 struct-sizing overflow rejection (V6-overflow).
+  Second: the non-local abort primitive + quantity budgets from
+  `SAFETY_AND_SANDBOX.md` §2-§4 — `context_t` (setjmp/`__builtin_longjmp`
+  checkpoint), instruction budget (sub+jg at loop back-edges only),
+  stack-depth guard (inc/cmp/jcc at script-to-script calls), PERM_FFI
+  sema gating, and trap-surface unification (all traps route through a
+  host trap-stub → longjmp, fixing red-team V7 `@obf_keyed` forced
+  SIGILL). Performance: budget+depth are compile-flag gated — zero
+  overhead when off, one sub+jg per loop iteration / one inc+cmp+jcc
+  per call when on. A red-team writeup (`EMBER_REDSHELL_WRITEUP.md` at
+  the workspace root) documents the full attack-surface study + 8
+  prioritized mitigations.
+  **NOT shipped** (the original v0.4 prose listed these; they slipped to
+  later work): lifecycle annotation *runtime effect* (`@on_tick`/`@event`
+  are parsed but do nothing — only `@obf`/`@obf_keyed` have codegen
+  effect) and single-function hot reload (the slot-stability *machinery*
+  exists + whole-module load works, but no atomic-slot-swap + page-retire
+  + epoch-reclaim path). Both have complete specs (`LIFECYCLE.md`,
+  `HOT_RELOAD.md`); both are open.
+- **v0.5** ✓ shipped - live modules (the Tier 6 ROADMAP item, pulled
+  forward): bidirectional script↔`.em` cross-module linking through the
+  real grammar. `link "foo.em" as foo;` + `foo::bar(args)`; a
+  pre-compiled `.em` callee is callable from a JIT'd script and vice
+  versa via the provenance-agnostic `ModuleRegistry` (MODULES.md §2.6).
+  Built on the pre-existing runtime half (registry + kind-2 reloc); this
+  added the source half (grammar, sema, codegen, linker/loader, an
+  `--emit-em` CLI pre-compile mode). `--tick` lifecycle mode (a tick
+  thread + TUI unload keybind, shared between the terminal CLI and the
+  prism runtime) is a suggested follow-on once `@on_tick` has runtime
+  effect.
+- **v0.6** - benchmark harness vs AngelScript; tune regalloc/peephole
+  only if the bench shows a need. This is the gate the SSA-lite IR +
+  linear-scan regalloc refactor (COMPILER_PIPELINE.md §5) is deferred to
+  — no speculative optimization before the bench proves it matters.
+- **v1.0** - stable native binding API (the fluent `TypeBuilder`/
+  `StructBuilder`/`engine_t` surface — see v0.3's deferred-binding
+  analysis `docs/v0.3_DEFERRED_BINDING_ANALYSIS.md`), docs, example
+  game-engine integration (event hooks via annotations).
 
 ## Explicitly skipped (YAGNI ladder - full per-item reasoning in the
 detail docs, summarized here)
