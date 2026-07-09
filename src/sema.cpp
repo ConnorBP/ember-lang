@@ -69,6 +69,13 @@ StructLayoutTable build_struct_layouts(const Program& prog) {
 
 namespace {
 
+// Close the anonymous namespace so the three const-folders below are
+// ember::-scope (declared in sema.hpp for global-initializer evaluation).
+// An anon-namespace function would be a separate symbol from the declared
+// one, making the recursive calls inside ambiguous. The rest of sema.cpp's
+// internals reopen the anon namespace after the folders.
+} // namespace
+
 // literal adaptation: if one side is an IntLit/FloatLit (untyped) and the
 // other has a concrete numeric type, the literal adopts the concrete type
 // (if its value fits). This is the one ergonomic exception to the strict
@@ -186,6 +193,8 @@ bool try_eval_const_bool(const Expr& e, bool& out) {
     }
     return false;
 }
+
+namespace {  // reopen anonymous namespace for the rest of sema.cpp's internals
 
 struct Checker {
     const std::unordered_map<std::string, NativeSig>* natives;

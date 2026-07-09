@@ -11,6 +11,7 @@
 #include "engine.hpp"
 #include "dispatch_table.hpp"
 #include "binding_builder.hpp"
+#include "globals.hpp"
 
 #include <cstdio>
 #include <cstdint>
@@ -44,6 +45,7 @@ static std::unique_ptr<M> compile(const std::string& src) {
     m->gbs.assign(m->prog.globals.size()*8, 0); m->gb.base = int64_t(m->gbs.data());
     { uint32_t gi=0; for (auto& g : m->prog.globals) { m->gb.index[g.name]=gi++; m->gb.types[g.name]=g.ty.get(); } }
     g_globals_for_codegen = &m->gb;
+    eval_global_initializers(m->prog, GlobalInitCtx{m->gbs, m->gb.index, m->gb.types});  // v1.0: seed const inits
     m->table = std::make_unique<DispatchTable>(m->prog.funcs.size());
     CodeGenCtx ctx; ctx.globals_base=m->gb.base; ctx.dispatch_base=int64_t(m->table->base());
     ctx.natives=&nt.natives; ctx.script_slots=&m->slots; ctx.structs=&layouts;
@@ -68,6 +70,18 @@ int main() {
       int64_t r=call(*m,"main"); ck(r==42 && g_i64(*m,0)==42, "(4) i64 global write/read still works (int path unbroken)"); }
     { auto m=compile("global g : f32 = 0.0f;\nglobal out : f32 = 0.0f;\nfn seed() -> i64 { g = 10.0f; return 1; }\nfn use() -> i64 { out = g * 3.0f; return 1; }\nfn main() -> i64 { seed(); use(); return 1; }\n");
       call(*m,"main"); ck(g_f32(*m,1)==30.0f, "(5) f32 global read in expr: out = g*3 = 10*3 = 30"); }
+    // (6) const initializer IS seeded at load — no @entry needed (the v1.0 gap fix).
+    { auto m=compile("global g : f32 = 7.5f;\nfn main() -> i64 { return 1; }\n");
+      ck(g_f32(*m,0)==7.5f, "(6) f32 global initializer seeded at load (g=7.5f -> 7.5, no @entry)"); }
+    // (7) i64 const initializer seeded (incl. a foldable expr 6*7)
+    { auto m=compile("global n : i64 = 42;\nglobal m2 : i64 = 6 * 7;\nfn main() -> i64 { return 1; }\n");
+      ck(g_i64(*m,0)==42 && g_i64(*m,1)==42, "(7) i64 global initializers seeded (n=42, m2=6*7=42)"); }
+    // (8) bool global initializer seeded
+    { auto m=compile("global b : bool = true;\nfn main() -> i64 { return 1; }\n");
+      ck(g_i64(*m,0)==1, "(8) bool global initializer seeded (b=true -> 1)"); }
+    // (9) zero-initialized globals (no init / init=0) stay zero — not falsely baked
+    { auto m=compile("global g : f32 = 0.0f;\nglobal n : i64 = 0;\nfn main() -> i64 { return 1; }\n");
+      ck(g_f32(*m,0)==0.0f && g_i64(*m,1)==0, "(9) zero-init globals stay zero (no false baking)"); }
     std::printf("\nfloat-global regression: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail;
 }

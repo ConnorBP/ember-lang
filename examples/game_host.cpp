@@ -24,6 +24,7 @@
 #include "dispatch_table.hpp"
 #include "binding_builder.hpp"
 #include "lifecycle.hpp"
+#include "globals.hpp"
 #include "hot_reload.hpp"
 #include "context.hpp"
 
@@ -94,6 +95,7 @@ static std::unique_ptr<GameModule> compile_game(const std::string& src, const Na
     m->gbs.assign(m->prog.globals.size()*8, 0); m->gb.base = int64_t(m->gbs.data());
     { uint32_t gi=0; for (auto& g : m->prog.globals) { m->gb.index[g.name]=gi++; m->gb.types[g.name]=g.ty.get(); } }
     g_globals_for_codegen = &m->gb;
+    eval_global_initializers(m->prog, GlobalInitCtx{m->gbs, m->gb.index, m->gb.types});  // v1.0: seed const global inits
     m->table = std::make_unique<DispatchTable>(m->prog.funcs.size());
     CodeGenCtx ctx; ctx.globals_base=m->gb.base; ctx.dispatch_base=int64_t(m->table->base());
     ctx.natives=&natives.natives; ctx.script_slots=&m->slots; ctx.structs=&layouts;

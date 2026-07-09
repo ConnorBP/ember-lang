@@ -85,6 +85,15 @@ using StructLayoutTable = std::unordered_map<std::string, StructLayout>;
 // exist before either runs.
 StructLayoutTable build_struct_layouts(const Program& prog);
 
+// Const-expression folders (used by sema's bounds/assert folding; exported for
+// global-initializer evaluation at load). Each returns true + sets `out` if `e`
+// folds to a literal constant of the matching type; false if it's a genuine
+// runtime value (Ident/CallExpr/etc). Mirrors codegen's fold exactly so a
+// folded value matches what the runtime path would compute (sema.cpp comment).
+bool try_eval_const_i64(const Expr& e, int64_t& out);
+bool try_eval_const_f32(const Expr& e, float& out);
+bool try_eval_const_bool(const Expr& e, bool& out);
+
 struct SemaResult {
     bool ok = true;
     std::vector<SemaError> errors;

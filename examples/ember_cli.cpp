@@ -41,6 +41,7 @@
 #include "../src/import.hpp"      // resolve_imports
 #include "../src/jit_memory.hpp"  // free_executable
 #include "../src/lifecycle.hpp"    // v0.6 get_annotated_functions (@on_tick discovery)
+#include "../src/globals.hpp"      // v1.0 eval_global_initializers (seed const globals at load)
 #include "../src/context.hpp"     // context_t, TrapStub, TrapReason (v0.4 safe execution)
 #include "../src/module_registry.hpp" // v0.5 live modules (ModuleRegistry)
 #include "../src/module_linker.hpp"  // v0.5 live modules (link_em_file, build_*_exports)
@@ -294,6 +295,11 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> gb_store(pr.program.globals.size() * 8, 0);
     gb.base = int64_t(gb_store.data());
     g_globals_for_codegen = &gb;
+    // v1.0: seed const global initializers into the block (global g = 10; starts
+    // at 10, not 0). Non-const inits (g = some_fn();) stay zero — a host or
+    // @entry seeds those. The v1.0 integration found this gap; see
+    // docs/v0.6_INTEGRATION_NOTES.md.
+    eval_global_initializers(pr.program, GlobalInitCtx{gb_store, gb.index, gb.types});
 
     // ---- dispatch table + codegen ctx (mirrors em_roundtrip_test) ----
     DispatchTable table(pr.program.funcs.size());
