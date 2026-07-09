@@ -208,3 +208,34 @@ add_test(NAME binding_abi COMMAND binding_abi_test)
 if(WIN32)
     target_link_libraries(ember PUBLIC kernel32)
 endif()
+
+# ---- v0.6 benchmark harness: ember (native JIT) vs AngelScript (bytecode interpreter) ----
+# Fetches/builds the AngelScript SDK (thirdparty/sdk/, fetched separately), compiles its
+# 41 source files into a static lib, then links the bench harness that runs the same
+# workload in both and reports the ratio. The categorical difference under test:
+# ember compiles to native x86-64 (no dispatch-decode loop), AngelScript interprets
+# bytecode. DESIGN.md §9's gate for the SSA-lite IR + linear-scan regalloc refactor.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/sdk/angelscript/source/as_atomic.cpp)
+    file(GLOB AS_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/sdk/angelscript/source/*.cpp)
+    add_library(angelscript STATIC ${AS_SOURCES})
+    target_include_directories(angelscript PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/sdk/angelscript/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/sdk/angelscript/source)
+    if(MSVC)
+        target_compile_options(angelscript PRIVATE /wd4100 /wd4456 /wd4244 /wd4267)
+    else()
+        target_compile_options(angelscript PRIVATE -w)
+    endif()
+
+    add_executable(bench_ember_vs_as examples/bench_ember_vs_as.cpp)
+    target_link_libraries(bench_ember_vs_as PRIVATE
+        ember ember_frontend ember_import
+        ember_ext_vec ember_ext_math
+        angelscript)
+    if(WIN32)
+        target_link_libraries(bench_ember_vs_as PRIVATE kernel32)
+    endif()
+    add_test(NAME bench_ember_vs_as COMMAND bench_ember_vs_as)
+    set_tests_properties(bench_ember_vs_as PROPERTIES TIMEOUT 300)
+endif()
