@@ -145,6 +145,12 @@ struct AssignExpr: Expr { ExprPtr target; std::optional<BinExpr::Op> compound; E
 struct TernaryExpr: Expr { ExprPtr cond, then_e, else_e; };
 struct SizeofExpr: Expr { std::shared_ptr<Type> ty; };
 struct StructLit : Expr { std::string type_name; std::vector<std::pair<std::string,ExprPtr>> fields; };
+// E::A - enum-variant access. Exists only between parse and sema's check_expr:
+// sema rewrites this node IN PLACE to an IntLit carrying the variant's i32
+// value (see plan_ENUMS.md Section 5 - the switch case-value literal-check
+// at sema.cpp's SwitchStmt requires an IntLit by the time check_expr
+// returns, so the rewrite happens in sema, not as a codegen pre-pass).
+struct EnumAccessExpr : Expr { std::string enum_name; std::string variant; };
 
 // statements
 struct Stmt : Node {};
@@ -224,11 +230,33 @@ struct LinkDecl {
     Loc loc;
 };
 
+// Tier 1 script-side `enum` (plan_ENUMS.md). An enum is a set of named i32
+// compile-time constants; an enum value IS an i32 (no new Type shape).
+// `explicit_value` is nullptr iff the variant has no `= value` (auto-
+// increment from the previous variant). It is a constexpr-foldable integer
+// expression (IntLit / -IntLit / BinExpr-of-literals - the restricted set
+// try_eval_const_i64 already folds); the parser stores the raw expr, sema
+// folds + range-checks + fills `resolved`. `resolved` is the variant's final
+// i32 value, available to EnumAccessExpr resolution (sema's enum-resolution
+// pass runs before any function body is checked).
+struct EnumVariant {
+    std::string name;
+    ExprPtr explicit_value;
+    Loc loc;
+    int64_t resolved = 0;
+};
+struct EnumDecl {
+    std::string name;
+    std::vector<EnumVariant> variants;
+    Loc loc;
+};
+
 struct Program {
     std::vector<StructDecl> structs;
     std::vector<GlobalDecl> globals;
     std::vector<FuncDecl> funcs;
     std::vector<LinkDecl> links;   // v0.5 live-module link declarations (MODULES.md §6)
+    std::vector<EnumDecl> enums;   // Tier 1 script-side enums (plan_ENUMS.md)
     // type store: owns synthesized Types created by sema (slices, adapted
     // literal types) so the raw `ty` pointers stashed on AST nodes survive
     // until codegen finishes (sema's local Checker would otherwise free them).

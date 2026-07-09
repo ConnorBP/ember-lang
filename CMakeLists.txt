@@ -72,6 +72,7 @@ ember_add_extension(mat       extensions/mat/ext_mat.cpp)
 ember_add_extension(string   extensions/string/ext_string.cpp)
 ember_add_extension(array    extensions/array/ext_array.cpp)
 ember_add_extension(math     extensions/math/ext_math.cpp)
+ember_add_extension(sync     extensions/sync/ext_sync.cpp)
 
 # ---- tests: .em pre-compile round-trip + live import cross-module round-trip ----
 # These link only ember + ember_frontend (no prism/prism_script_host) so they
@@ -95,6 +96,16 @@ add_test(NAME import_roundtrip COMMAND import_roundtrip_test)
 add_executable(ext_runtime_test examples/ext_runtime_test.cpp)
 target_link_libraries(ext_runtime_test PRIVATE ember ember_frontend ember_ext_math)
 add_test(NAME ext_runtime COMMAND ext_runtime_test)
+
+# ext_sync_test: cross-thread sync primitives (atomics, swap buffer, SPSC/MPSC/MPMC
+# queues) per docs/plan_SYNC_QUEUES.md. Tier-1 single-thread functional coverage
+# (each primitive through the full lex->parse->sema->codegen->JIT->call path) +
+# Tier-2 multi-thread stress using the _host accessors (only the script thread
+# calls ember; host threads produce/consume via C++ accessors -- the U2 shape,
+# never two ember-calling threads on one context). Links ember_ext_sync directly.
+add_executable(ext_sync_test examples/ext_sync_test.cpp)
+target_link_libraries(ext_sync_test PRIVATE ember ember_frontend ember_ext_sync)
+add_test(NAME ext_sync COMMAND ext_sync_test)
 
 # Extension registration smoke test (RESTRUCTURE_PLAN.md Section 6): validates the
 # relocated non-cheat extensions (vec/quat/mat/string/array/math) register

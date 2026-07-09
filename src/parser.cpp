@@ -225,6 +225,35 @@ struct P {
         return ld;
     }
 
+    // Tier 1 script-side enum (plan_ENUMS.md Section 3.3):
+    //   enum_decl := 'enum' IDENT '{' (variant (',' variant)* ','?)? '}'
+    //   variant   := IDENT ('=' constexpr_int_expr)?
+    // The explicit-value expr is parsed as a full parse_expr(); the
+    // restriction to a compile-time integer constant is enforced by sema
+    // (try_eval_const_i64), identical to how GlobalDecl::init and array
+    // sizes are handled - the parser stays dumb. Trailing comma allowed.
+    std::unique_ptr<EnumDecl> parse_enum() {
+        auto e = std::make_unique<EnumDecl>();
+        expect(Tk::Kw_enum, "'enum'");
+        e->name = expect(Tk::Ident, "enum name").text;
+        e->loc = loc(toks[i-1]);
+        expect(Tk::LBrace, "'{'");
+        if (!at(Tk::RBrace) && !at(Tk::Eof)) {
+            do {
+                const Token& v = expect(Tk::Ident, "enum variant name");
+                EnumVariant ev;
+                ev.name = v.text;
+                ev.loc = loc(v);
+                if (accept(Tk::Assign)) {
+                    ev.explicit_value = parse_expr();
+                }
+                e->variants.push_back(std::move(ev));
+            } while (accept(Tk::Comma) && !at(Tk::RBrace) && !at(Tk::Eof));
+        }
+        expect(Tk::RBrace, "'}'");
+        return e;
+    }
+
     // --- expressions (precedence climbing) ---
     ExprPtr parse_expr() { return parse_assign(); }
 
@@ -366,16 +395,34 @@ struct P {
                 // v0.5 cross-module selector `mod::fn`. The base `e` must be an
                 // Ident (the module alias); build a CallExpr with module_alias
                 // set + the fn name, args filled by the following `(` case.
+                //
+                // Tier 1 enums (plan_ENUMS.md Section 3.5): `E::A` (a value, no
+                // parens) is a NEW postfix `::` outcome that is NOT a call. The
+                // one-token lookahead split is: `::` + Ident + not-`(` = enum
+                // variant access (EnumAccessExpr); `::` + Ident + `(` = the
+                // existing `mod::fn(args)` cross-module call path, unchanged.
                 auto id = dynamic_cast<Ident*>(e.get());
                 if (!id) throw ParseError("'::' must follow a module alias name", peek().line, peek().col);
                 adv(); // '::'
-                const Token& fn = expect(Tk::Ident, "function name after '::'");
-                auto c = std::make_unique<CallExpr>();
-                c->loc = e->loc;
-                c->module_alias = id->name;
-                c->name = fn.text;
-                e = std::move(c);
-                continue;  // the next iteration handles '(' (args) or anything else
+                const Token& fn = expect(Tk::Ident, "name after '::'");
+                if (at(Tk::LParen)) {
+                    // mod::fn(args) - cross-module call. Hand the half-built
+                    // CallExpr to the next iteration's '(' case below.
+                    auto c = std::make_unique<CallExpr>();
+                    c->loc = e->loc;
+                    c->module_alias = id->name;
+                    c->name = fn.text;
+                    e = std::move(c);
+                    continue;  // the next iteration handles '(' (args)
+                }
+                // E::A - enum variant access (a value, no call). sema rewrites
+                // this to an IntLit in place (plan_ENUMS.md Section 4.2/5).
+                auto ea = std::make_unique<EnumAccessExpr>();
+                ea->loc = e->loc;
+                ea->enum_name = id->name;
+                ea->variant = fn.text;
+                e = std::move(ea);
+                continue;
             }
             if (k==Tk::LParen) {
                 // call: e(args). Three forms:
@@ -762,6 +809,9 @@ struct P {
                 } else if (at(Tk::Kw_link)) {
                     if (!anns.empty()) throw ParseError("annotations on link not supported", peek().line, peek().col);
                     prog.links.push_back(std::move(*parse_link()));
+                } else if (at(Tk::Kw_enum)) {
+                    if (!anns.empty()) throw ParseError("annotations on enums not supported v1", peek().line, peek().col);
+                    prog.enums.push_back(std::move(*parse_enum()));
                 } else if (at(Tk::Semicolon)) {
                     adv(); // empty top-level stmt
                 } else {

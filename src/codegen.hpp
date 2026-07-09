@@ -84,6 +84,20 @@ struct CodeGenCtx {
     int32_t* depth_ptr = nullptr;
     int32_t max_call_depth = 512;
     bool emit_depth_checks = false;
+
+    // v1.0 thread-safety (Option B1, plan_CONTEXT_THREADSAFETY.md): when true,
+    // the budget/depth/trap emit reads context_t fields through a context register
+    // (r14 = context_t*, host-set at entry, callee-saved so preserved across
+    // script-to-script calls) instead of baked imm64 pointers. Lets ONE compiled
+    // body serve N per-thread context_t's (no per-context recompile). Default
+    // false = baked-ptr behavior unchanged (backward compat).
+    bool use_context_reg = false;
+    // v1.0 thread-safety: the globals index/types threaded through CodeGenCtx so
+    // compile_func no longer reads the process-wide g_globals_for_codegen pointer
+    // (which races under parallel compilation). If null, falls back to the legacy
+    // process-wide pointer (backward compat for hosts that haven't migrated).
+    const std::unordered_map<std::string, uint32_t>* globals_index = nullptr;
+    const std::unordered_map<std::string, const Type*>* globals_types = nullptr;
 };
 
 // Compile one function. Returns the JIT'd bytes + (after finalize) entry.

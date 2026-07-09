@@ -2,6 +2,8 @@
 #include "binding_builder.hpp"  // PERM_FFI constant (v0.4 sema gating)
 #include <cassert>
 #include <climits>
+#include <unordered_set>
+#include <string>
 
 namespace ember {
 
@@ -213,6 +215,16 @@ struct Checker {
     // global table: name -> type (pointer into a stable type store)
     std::unordered_map<std::string, const Type*> globals;
 
+    // Tier 1 enums (plan_ENUMS.md Section 4): (enum_name -> (variant -> i32 value)),
+    // built by the enum-resolution pass (pass 1.5, before any function body is
+    // checked). `enum_names` is the set of registered enum names, used by the
+    // type-position enum-name rejection (Section 4.5: `let x: Color = ...` is a
+    // clean error in v1, the hook the typed-enum upgrade later flips).
+    std::unordered_map<std::string, std::unordered_map<std::string, int64_t>> enum_values;
+    std::unordered_set<std::string> enum_names;
+
+    bool is_enum_name(const std::string& n) const { return enum_names.count(n) != 0; }
+
     // script function signatures: name -> (ret type, param types)
     struct ScriptSig {
         const Type* ret;
@@ -279,6 +291,152 @@ struct Checker {
         err("a struct-by-value argument (type '" + want->struct_name + "') must be a plain "
             "local variable, not a general expression", arg.loc.line, arg.loc.col);
     }
+
+    // --- Tier 1 enums (plan_ENUMS.md) ---
+    //
+    // Pass 1.5 (Section 4.1): resolve every enum variant's i32 value. First
+    // variant defaults to 0; each variant without an explicit `= value` is
+    // prev+1; an explicit `= constexpr_int` sets the next base. Explicit
+    // values are restricted to what try_eval_const_i64 already folds
+    // (IntLit / -IntLit / BinExpr-of-literals) - no new evaluator. Values are
+    // i32-range-checked (reusing the bound from adapt_int_lit) and duplicate
+    // values / duplicate variant names within one enum are errors (stricter
+    // than C - the one footgun C allows that v1 rejects). Builds the
+    // (enum_name -> (variant -> i32)) table for EnumAccessExpr resolution and
+    // the enum_names set for the type-position rejection (Section 4.5).
+    void resolve_enums() {
+        std::unordered_set<std::string> seen_enum_names;
+        for (auto& e : prog->enums) {
+            if (!seen_enum_names.insert(e.name).second)
+                err("duplicate enum declaration '" + e.name + "'", e.loc.line, e.loc.col);
+            enum_names.insert(e.name);
+            int64_t next = 0;
+            std::unordered_set<int32_t> seen_values;
+            std::unordered_set<std::string> seen_variant_names;
+            for (auto& v : e.variants) {
+                if (!seen_variant_names.insert(v.name).second)
+                    err("enum '" + e.name + "' has duplicate variant '" + v.name + "'",
+                        v.loc.line, v.loc.col);
+                if (v.explicit_value) {
+                    int64_t ev = 0;
+                    if (!try_eval_const_i64(*v.explicit_value, ev)) {
+                        err("enum variant '" + e.name + "::" + v.name +
+                            "' explicit value must be a compile-time integer constant",
+                            v.loc.line, v.loc.col);
+                    } else if (ev < -2147483648LL || ev > 2147483647LL) {
+                        err("enum variant '" + e.name + "::" + v.name +
+                            "' value " + std::to_string(ev) + " out of i32 range",
+                            v.loc.line, v.loc.col);
+                    } else {
+                        next = ev;
+                    }
+                }
+                v.resolved = next;
+                if (!seen_values.insert(int32_t(next)).second)
+                    err("enum '" + e.name + "' has duplicate value " + std::to_string(next) +
+                        " (variant '" + v.name + "')", v.loc.line, v.loc.col);
+                enum_values[e.name][v.name] = next;
+                ++next;
+            }
+        }
+    }
+
+    // Pass 1.6 (Section 4.5 follow-through): reject an enum name used in a
+    // type position (`let x: Color = ...`, `fn f(p: Color)`, a struct field,
+    // a global, a return type). In v1 an enum is untyped (its values ARE
+    // i32); the hook flips from reject to accept when typed enums land (Tier 2).
+    void check_type_not_enum(const Type* t, const Loc& loc) {
+        if (t && !t->struct_name.empty() && is_enum_name(t->struct_name))
+            err("enum '" + t->struct_name + "' is not a type in v1; declare the binding as `i32`",
+                loc.line, loc.col);
+    }
+    // Walk every declared type in the program (struct fields, func params,
+    // func returns, globals) and reject enum-named ones. `let` types live in
+    // function bodies and are checked lazily in check_stmt's LetStmt.
+    void check_declared_types_not_enum() {
+        for (auto& sd : prog->structs)
+            for (auto& fd : sd.fields) check_type_not_enum(fd.ty.get(), sd.loc);  // FieldDecl carries no Loc; report at the struct
+        for (auto& f : prog->funcs) {
+            for (auto& p : f.params) check_type_not_enum(p.ty.get(), p.loc);
+            check_type_not_enum(f.ret.get(), f.loc);
+        }
+        for (auto& g : prog->globals) check_type_not_enum(g.ty.get(), g.loc);
+    }
+
+    // Pass 1.7 (Section 5, the central design move): rewrite every
+    // EnumAccessExpr node IN PLACE to an IntLit carrying the variant's i32
+    // value, so that by the time check_expr runs there are NO EnumAccessExpr
+    // nodes left anywhere in the program. This is what lets codegen, the
+    // const-folder (try_eval_const_i64), the switch case-value literal-check
+    // (sema.cpp's SwitchStmt `dynamic_cast<IntLit*>`), and globals.hpp's
+    // initializer evaluator all treat an enum variant as an ordinary i32
+    // literal - they never see an EnumAccessExpr. Running this as a sema-
+    // internal pass (NOT deferred to codegen) is what makes the rewrite visible
+    // to sema's own switch check (plan_ENUMS.md Section 5 point 1), and is
+    // why codegen stays untouched (codegen's eval() has no EnumAccessExpr
+    // case and silently emits nothing for one - Section 5 point 3).
+    void lower_enum_access_expr(ExprPtr& slot) {
+        if (!slot) return;
+        if (auto* ea = dynamic_cast<EnumAccessExpr*>(slot.get())) {
+            auto eit = enum_values.find(ea->enum_name);
+            if (eit == enum_values.end()) {
+                err("unknown enum '" + ea->enum_name + "'", ea->loc.line, ea->loc.col);
+                // rewrite to a placeholder IntLit anyway so check_expr doesn't
+                // double-report via its catch-all (the error is already recorded).
+                auto lit = std::make_unique<IntLit>();
+                lit->loc = ea->loc; lit->v = 0;
+                lit->ty = intern(make_prim(Prim::I32));
+                slot = std::move(lit);
+                return;
+            }
+            auto vit = eit->second.find(ea->variant);
+            if (vit == eit->second.end()) {
+                err("enum '" + ea->enum_name + "' has no variant '" + ea->variant + "'",
+                    ea->loc.line, ea->loc.col);
+                auto lit = std::make_unique<IntLit>();
+                lit->loc = ea->loc; lit->v = 0;
+                lit->ty = intern(make_prim(Prim::I32));
+                slot = std::move(lit);
+                return;
+            }
+            auto lit = std::make_unique<IntLit>();
+            lit->loc = ea->loc;
+            lit->v = vit->second;       // the resolved i32 value, sign-extended into i64
+            // ty is finalized by check_expr's IntLit case (adapt_int_lit to the
+            // expected context, defaulting to i32 here per Section 1.4).
+            lit->ty = intern(make_prim(Prim::I32));
+            slot = std::move(lit);
+            return;
+        }
+        // recurse into every child ExprPtr slot of compound nodes
+        if (auto* b = dynamic_cast<BinExpr*>(slot.get())) {
+            lower_enum_access_expr(b->lhs); lower_enum_access_expr(b->rhs);
+        } else if (auto* u = dynamic_cast<UnaryExpr*>(slot.get())) {
+            lower_enum_access_expr(u->operand);
+        } else if (auto* c = dynamic_cast<CastExpr*>(slot.get())) {
+            lower_enum_access_expr(c->operand);
+        } else if (auto* c = dynamic_cast<CallExpr*>(slot.get())) {
+            if (c->receiver) lower_enum_access_expr(c->receiver);
+            for (auto& a : c->args) lower_enum_access_expr(a);
+        } else if (auto* ix = dynamic_cast<IndexExpr*>(slot.get())) {
+            lower_enum_access_expr(ix->base); lower_enum_access_expr(ix->index);
+        } else if (auto* fl = dynamic_cast<FieldExpr*>(slot.get())) {
+            lower_enum_access_expr(fl->base);
+        } else if (auto* v = dynamic_cast<ViewExpr*>(slot.get())) {
+            lower_enum_access_expr(v->base);
+        } else if (auto* a = dynamic_cast<AssignExpr*>(slot.get())) {
+            lower_enum_access_expr(a->target); lower_enum_access_expr(a->value);
+        } else if (auto* t = dynamic_cast<TernaryExpr*>(slot.get())) {
+            lower_enum_access_expr(t->cond);
+            lower_enum_access_expr(t->then_e);
+            lower_enum_access_expr(t->else_e);
+        } else if (auto* sl = dynamic_cast<StructLit*>(slot.get())) {
+            for (auto& kv : sl->fields) lower_enum_access_expr(kv.second);
+        }
+        // leaves (IntLit/FloatLit/BoolLit/StringLit/Ident/SizeofExpr): no children
+    }
+    void lower_enum_access_block(Block& b);
+    void lower_enum_access_stmt(Stmt& s);
 
     void push_scope() { scopes.emplace_back(); }
     void pop_scope()  { scopes.pop_back(); }
@@ -921,6 +1079,10 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
                     " bytes); reduce the array/struct size",
                     ls->loc.line, ls->loc.col);
             }
+            // enum name used as a let type is a v1 error (plan_ENUMS.md Section 4.5):
+            // enums are untyped (their values ARE i32). The hook the typed-enum
+            // upgrade (Tier 2) flips from reject to accept.
+            check_type_not_enum(ls->ty.get(), ls->loc);
         }
         if (!ls->init) {
             // no initializer (parser only allows this for explicitly-typed
@@ -1104,6 +1266,66 @@ void Checker::check_func(FuncDecl& f) {
     pop_scope();
 }
 
+// Pass 1.7 (plan_ENUMS.md Section 5): rewrite every EnumAccessExpr to an
+// IntLit before check_expr runs, walking the statement tree in parallel
+// with check_stmt/check_block's own traversal. After this pass there are no
+// EnumAccessExpr nodes anywhere - codegen, the const-folder, the switch
+// case-value literal-check, and globals.hpp's initializer evaluator all see
+// ordinary IntLits. A mirror of check_stmt/check_block's structure, kept
+// separate so check_expr's 600-line body stays byte-for-byte unchanged
+// (the plan's headline "codegen untouched" + "no edit to the switch block"
+// claims hold because by the time check_stmt runs, the rewrite is done).
+void Checker::lower_enum_access_stmt(Stmt& s) {
+    if (auto* ls = dynamic_cast<LetStmt*>(&s)) {
+        if (ls->init) lower_enum_access_expr(ls->init);
+        return;
+    }
+    if (auto* es = dynamic_cast<ExprStmt*>(&s)) { lower_enum_access_expr(es->expr); return; }
+    if (auto* rs = dynamic_cast<ReturnStmt*>(&s)) {
+        if (rs->value) lower_enum_access_expr(rs->value);
+        return;
+    }
+    if (auto* is = dynamic_cast<IfStmt*>(&s)) {
+        lower_enum_access_expr(is->cond);
+        lower_enum_access_block(is->then_b);
+        if (is->has_else) lower_enum_access_block(is->else_b);
+        return;
+    }
+    if (auto* ws = dynamic_cast<WhileStmt*>(&s)) {
+        lower_enum_access_expr(ws->cond);
+        lower_enum_access_block(ws->body);
+        return;
+    }
+    if (dynamic_cast<BreakStmt*>(&s)) return;
+    if (dynamic_cast<ContinueStmt*>(&s)) return;
+    if (auto* bs = dynamic_cast<BlockStmt*>(&s)) { lower_enum_access_block(bs->block); return; }
+    if (auto* ds = dynamic_cast<DeferStmt*>(&s)) { lower_enum_access_expr(ds->expr); return; }
+    if (auto* fs = dynamic_cast<ForStmt*>(&s)) {
+        if (fs->init) lower_enum_access_stmt(*fs->init);
+        if (fs->cond) lower_enum_access_expr(fs->cond);
+        if (fs->step) lower_enum_access_expr(fs->step);
+        lower_enum_access_block(fs->body);
+        return;
+    }
+    if (auto* ds = dynamic_cast<DoWhileStmt*>(&s)) {
+        lower_enum_access_block(ds->body);
+        if (ds->cond) lower_enum_access_expr(ds->cond);
+        return;
+    }
+    if (auto* sw = dynamic_cast<SwitchStmt*>(&s)) {
+        lower_enum_access_expr(sw->subject);
+        for (auto& c : sw->cases) {
+            if (!c.is_default) lower_enum_access_expr(c.value);
+            lower_enum_access_block(c.body);
+        }
+        return;
+    }
+}
+
+void Checker::lower_enum_access_block(Block& b) {
+    for (auto& s : b.stmts) lower_enum_access_stmt(*s);
+}
+
 } // namespace
 
 SemaResult sema(Program& prog,
@@ -1125,6 +1347,21 @@ SemaResult sema(Program& prog,
     // register globals (stable type pointers via intern)
     for (auto& g : prog.globals) {
         c.globals[g.name] = c.intern(*g.ty);
+    }
+    // Tier 1 enums (plan_ENUMS.md Section 4): pass 1.5 resolve variant values
+    // + build the (enum,variant)->i32 table and the enum_names set; pass 1.6
+    // reject enum names used in type positions (the untyped v1 hook); pass 1.7
+    // rewrite every EnumAccessExpr to an IntLit BEFORE any function body is
+    // checked, so check_expr / the const-folder / the switch case-value
+    // literal-check / globals.hpp's initializer evaluator / codegen never see
+    // an EnumAccessExpr at all (Section 5: codegen stays untouched).
+    c.resolve_enums();
+    c.check_declared_types_not_enum();
+    for (auto& g : prog.globals) {
+        if (g.init) c.lower_enum_access_expr(g.init);
+    }
+    for (auto& f : prog.funcs) {
+        c.lower_enum_access_block(f.body);
     }
     // register script function signatures (pass 2 of COMPILER_PIPELINE.md Section 4:
     // all signatures resolved before any body is checked, so forward calls work)

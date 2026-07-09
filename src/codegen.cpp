@@ -947,14 +947,20 @@ void CG::eval(const Expr& ex) {
             else load_rbp_to_rax(*this, it->second);
             return;
         }
-        // global?
-        if (g_globals_for_codegen) {
-            auto gi = g_globals_for_codegen->index.find(id->name);
-            if (gi != g_globals_for_codegen->index.end()) {
+        // global? (v1.0: prefer ctx.globals_index/types threaded through CodeGenCtx —
+        // avoids the process-wide g_globals_for_codegen pointer which races under
+        // parallel compile. Fall back to it for backward compat if ctx fields null.)
+        const auto* gidx = ctx.globals_index ? ctx.globals_index : (g_globals_for_codegen ? &g_globals_for_codegen->index : nullptr);
+        const auto* gtypes = ctx.globals_types ? ctx.globals_types : (g_globals_for_codegen ? &g_globals_for_codegen->types : nullptr);
+        const int64_t gbase = ctx.globals_base;
+        if (gidx && gtypes) {
+            auto gi = gidx->find(id->name);
+            if (gi != gidx->end()) {
                 int32_t off = int32_t(gi->second) * 8;
-                const Type* t = g_globals_for_codegen->types[id->name];
-                load_global_to_rax(*this, g_globals_for_codegen->base, off);
-                if (t->is_float()) {
+                auto tit = gtypes->find(id->name);
+                const Type* t = (tit != gtypes->end()) ? tit->second : nullptr;
+                load_global_to_rax(*this, gbase, off);
+                if (t && t->is_float()) {
                     // movd xmm0, eax: 66 0F 6E C0
                     e.byte(0x66); e.byte(0x0F); e.byte(0x6E); e.byte(0xC0);
                 }
@@ -1357,12 +1363,16 @@ void CG::eval(const Expr& ex) {
                     store_rax_to_rbp(*this, it->second);
                 }
             } else {
-                if (g_globals_for_codegen) {
-                    auto gi = g_globals_for_codegen->index.find(id->name);
-                    if (gi != g_globals_for_codegen->index.end()) {
-                        const Type* gt = g_globals_for_codegen->types[id->name];
-                        if (gt && gt->is_float()) store_xmm0_to_global(*this, g_globals_for_codegen->base, int32_t(gi->second)*8);
-                        else store_rax_to_global(*this, g_globals_for_codegen->base, int32_t(gi->second)*8);
+                // v1.0: prefer ctx.globals_index/types (parallel-compile-safe).
+                const auto* gidx = ctx.globals_index ? ctx.globals_index : (g_globals_for_codegen ? &g_globals_for_codegen->index : nullptr);
+                const auto* gtypes = ctx.globals_types ? ctx.globals_types : (g_globals_for_codegen ? &g_globals_for_codegen->types : nullptr);
+                if (gidx && gtypes) {
+                    auto gi = gidx->find(id->name);
+                    if (gi != gidx->end()) {
+                        auto tit = gtypes->find(id->name);
+                        const Type* gt = (tit != gtypes->end()) ? tit->second : nullptr;
+                        if (gt && gt->is_float()) store_xmm0_to_global(*this, ctx.globals_base, int32_t(gi->second)*8);
+                        else store_rax_to_global(*this, ctx.globals_base, int32_t(gi->second)*8);
                     }
                 }
             }

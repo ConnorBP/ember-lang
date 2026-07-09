@@ -1,0 +1,6 @@
+// sema_invalid_enum_unknown_variant.ember - referencing a variant that
+// doesn't exist in the named enum must fail at sema.
+enum E { A, B }
+fn main() -> i64 {
+    return E::C;   // 'C' is not a variant of E -> sema error
+}

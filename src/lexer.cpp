@@ -18,6 +18,7 @@ static const std::unordered_map<std::string, Tk>& keywords() {
         {"true",Tk::Kw_true},{"false",Tk::Kw_false},
         {"sizeof",Tk::Kw_sizeof},{"offsetof",Tk::Kw_offsetof},
         {"link",Tk::Kw_link},
+        {"enum",Tk::Kw_enum},
         {"bool",Tk::Kw_bool},
         {"i8",Tk::Kw_i8},{"i16",Tk::Kw_i16},{"i32",Tk::Kw_i32},{"i64",Tk::Kw_i64},
         {"u8",Tk::Kw_u8},{"u16",Tk::Kw_u16},{"u32",Tk::Kw_u32},{"u64",Tk::Kw_u64},
@@ -56,6 +57,7 @@ const char* tok_spelling(Tk k) {
     case Tk::PercentAssign: return "%="; case Tk::At: return "@";
     case Tk::AmpAssign: return "&="; case Tk::PipeAssign: return "|=";
     case Tk::CaretAssign: return "^="; case Tk::ShlAssign: return "<<="; case Tk::ShrAssign: return ">>=";
+    case Tk::Kw_enum: return "enum";
     default: return "kw";
     }
 }
