@@ -300,9 +300,9 @@ bool load_em_file(const char* path, LoadedModule& out, std::string* err,
         combined.insert(combined.end(), f.code.begin(),   f.code.end());
         combined.insert(combined.end(), f.rodata.begin(), f.rodata.end());
 
-        void* page_base = alloc_executable(combined); // RWX page, memcpy in
+        void* page_base = alloc_executable_rw(combined); // RW page, memcpy in (W^X: writable, NOT yet executable)
         if (!page_base) {
-            if (err) *err = "em_loader: alloc_executable failed for \"" + f.name + "\"";
+            if (err) *err = "em_loader: alloc_executable_rw failed for \"" + f.name + "\"";
             return false;
         }
         out.pages.push_back(page_base); // track for free_executable on unload
@@ -371,6 +371,14 @@ bool load_em_file(const char* path, LoadedModule& out, std::string* err,
                                     ") in \"" + f.name + "\"";
                     return false;
             }
+        }
+
+        // W^X seal: all reloc patches are in the page; flip RW -> RX so the
+        // page is executable and NOT writable before it is published. After
+        // this point no code path may write into the page (red-team V5).
+        if (!seal_executable(page_base, combined.size())) {
+            if (err) *err = "em_loader: seal_executable (VirtualProtect RW->RX) failed for \"" + f.name + "\"";
+            return false;
         }
 
         // Stamp the dispatch slot with the function's entry (page base,

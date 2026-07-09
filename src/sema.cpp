@@ -1,21 +1,66 @@
 #include "sema.hpp"
 #include <cassert>
+#include <climits>
 
 namespace ember {
+
+// Per-frame byte budget (red-team V6-DoS mitigation): a single local or the
+// running frame total must not exceed this, or a script can declare a huge
+// fixed array and exhaust the host stack (the confirmed u8[65536] SIGSEGV).
+// Host-configurable later (DESIGN.md v0.4 budgets); a fixed default now.
+// 32 KB is generous for real game-logic scripts and well under a guard page.
+static constexpr int64_t MAX_FRAME_BYTES = 32 * 1024;
+// Max fixed-array length (red-team V6-overflow mitigation): array_len is a
+// uint32_t set by the parser with no bound; a field/local like i64[1073741824]
+// makes byte_size() overflow int32 and wrap to a 0-byte frame slot. Cap the
+// declared length so the product length*elem_size cannot overflow int32.
+static constexpr int64_t MAX_ARRAY_LEN = INT32_MAX / 8; // any elem <= 8 bytes
+
+// Frame byte width of a local, mirroring codegen's local_width_bytes so the
+// sema-time budget check matches the actual emitted frame layout. Returns
+// the byte size of one local slot (16 for a slice, N*elem for a fixed array,
+// the struct layout size for a registered struct, 8 for a scalar/handle).
+// Used only for the per-local frame-budget check (V6-DoS).
+static int64_t frame_byte_width(const Type& t, const StructLayoutTable* structs) {
+    if (t.is_slice) return 16;
+    if (t.array_len > 0) {
+        if (int64_t(t.array_len) > MAX_ARRAY_LEN) return INT64_MAX; // overflow -> reject
+        const Type* e = t.elem.get();
+        int64_t eb = e ? int64_t(e->byte_size()) : 1;
+        if (eb < 1) eb = 8;
+        return int64_t(t.array_len) * eb;
+    }
+    if (!t.struct_name.empty() && structs) {
+        auto it = structs->find(t.struct_name);
+        if (it != structs->end()) return int64_t(it->second.size);
+    }
+    return 8;
+}
 
 StructLayoutTable build_struct_layouts(const Program& prog) {
     StructLayoutTable out;
     for (auto& sd : prog.structs) {
         StructLayout layout;
-        int32_t off = 0;
+        int64_t off = 0;
         for (auto& fd : sd.fields) {
-            int32_t sz = int32_t(fd.ty->byte_size());
+            int64_t sz = int64_t(fd.ty->byte_size());
             if (sz < 1) sz = 8; // defensive fallback (v1 fields are primitives, always sized)
-            layout.fields[fd.name] = StructFieldLayout{fd.ty.get(), off};
+            // V6-overflow: a field whose byte_size overflows int32 (e.g.
+            // i64[1073741824] = 8.6GB) must NOT silently become a 0-byte frame
+            // slot (the confirmed latent arbitrary-write path). Force the field
+            // to a size that exceeds the per-frame budget so any `let` of this
+            // struct is rejected by the LetStmt budget check. The struct is
+            // also unreachable for legitimate use at this size anyway.
+            if (sz > INT32_MAX) {
+                sz = MAX_FRAME_BYTES + 1; // guarantees rejection at any `let`
+            }
+            layout.fields[fd.name] = StructFieldLayout{fd.ty.get(), int32_t(off)};
             layout.field_names.push_back(fd.name);
             off += sz;
         }
-        layout.size = off;
+        // cap the struct's total size at int32 (a struct bigger than the frame
+        // budget is rejected by the per-local check at the LetStmt).
+        layout.size = off > INT32_MAX ? INT32_MAX : int32_t(off);
         out[sd.name] = std::move(layout);
     }
     return out;
@@ -798,6 +843,19 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
 
 void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
     if (auto* ls = dynamic_cast<LetStmt*>(&s)) {
+        // V6-DoS mitigation: reject any local whose frame width exceeds the
+        // per-frame byte budget BEFORE codegen emits a `sub rsp, <huge>`.
+        // The confirmed exploit was `let a: u8[65536];` -> SIGSEGV (no cap).
+        // Also catches V6-overflow (array_len so large byte_size wraps).
+        if (ls->ty) {
+            int64_t w = frame_byte_width(*ls->ty, structs);
+            if (w > MAX_FRAME_BYTES) {
+                err("local '" + ls->name + "' frame size (" + std::to_string(w) +
+                    " bytes) exceeds the per-frame budget (" + std::to_string(MAX_FRAME_BYTES) +
+                    " bytes); reduce the array/struct size",
+                    ls->loc.line, ls->loc.col);
+            }
+        }
         if (!ls->init) {
             // no initializer (parser only allows this for explicitly-typed
             // let/const, never auto): declare at the stated type, default
