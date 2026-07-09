@@ -1,0 +1,45 @@
+// game_logic.ember - the example game-engine integration script.
+// Proves ember works as a game-logic embedding target: a host compiles+runs
+// this with @entry / @on_tick / @event, the script drives host-owned entity
+// state through registered natives.
+//
+// NOTE: ember does not evaluate global *initializers* at load (a known gap —
+// the globals block is zero-initialized; a host or @entry seeds them). And a
+// separate codegen bug in float-global WRITES was found by this integration
+// (see docs/v0.6_INTEGRATION_NOTES.md); to keep the integration focused on the
+// embeddability seams (lifecycle, natives, hot reload), speed is held in the
+// HOST (get_speed/set_speed) rather than a script f32 global. The float-global-
+// write bug is tracked separately.
+
+@entry
+fn main() -> i64 {
+    // setup: report loaded. return > 0 = stay loaded (LIFECYCLE.md §1).
+    log(100);
+    return 1;
+}
+
+// per-frame: move every entity right by speed * dt. Speed + entity state are
+// host-owned; the script reads/writes them through natives.
+@on_tick
+fn update() -> i64 {
+    let n : i64 = get_entity_count();
+    let dt : f32 = get_delta_time();
+    let speed : f32 = get_speed();
+    let mut i : i64 = 0;
+    while (i < n) {
+        let x : f32 = get_entity_x(i);
+        set_entity_x(i, x + speed * dt);
+        i = i + 1;
+    }
+    return n;
+}
+
+// event: a simulated "player_input" — double the host's speed. The host fires
+// this via get_event_handlers("player_input").
+@event("player_input")
+fn on_input() -> i64 {
+    let s : f32 = get_speed();
+    set_speed(s * 2.0f);
+    log(200);
+    return 1;
+}

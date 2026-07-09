@@ -888,6 +888,15 @@ void store_rax_to_global(CG& cg, int64_t /*base*/, int32_t off) {
     cg.e.byte(0x49); cg.e.byte(0x89); cg.e.byte(0x83); cg.e.imm32(off);
 }
 
+// store xmm0 (a float) to a global slot [globals_base + off]. Mirrors
+// store_xmm0_to_rbp but through the relocatable globals base. movss [r11+disp32],
+// xmm0: r11 is reg 11, so the rm field needs REX.B (0x41) to extend rm=011 -> r11.
+// F3 0F 11 /r: REX.B (41) + F3 0F 11 + modrm(10, xmm0=0, r11=3)=0x83 + disp32.
+void store_xmm0_to_global(CG& cg, int64_t /*base*/, int32_t off) {
+    cg.e.mov_reg_imm64_external(Reg::r11, AbsFixup::GlobalsBase);
+    cg.e.byte(0x41); cg.e.byte(0xF3); cg.e.byte(0x0F); cg.e.byte(0x11); cg.e.byte(0x83); cg.e.imm32(off);
+}
+
 void CG::eval(const Expr& ex) {
     if (auto* lit = dynamic_cast<const IntLit*>(&ex)) {
         e.mov_reg_imm64(Reg::rax, lit->v);
@@ -1348,7 +1357,9 @@ void CG::eval(const Expr& ex) {
                 if (g_globals_for_codegen) {
                     auto gi = g_globals_for_codegen->index.find(id->name);
                     if (gi != g_globals_for_codegen->index.end()) {
-                        store_rax_to_global(*this, g_globals_for_codegen->base, int32_t(gi->second)*8);
+                        const Type* gt = g_globals_for_codegen->types[id->name];
+                        if (gt && gt->is_float()) store_xmm0_to_global(*this, g_globals_for_codegen->base, int32_t(gi->second)*8);
+                        else store_rax_to_global(*this, g_globals_for_codegen->base, int32_t(gi->second)*8);
                     }
                 }
             }

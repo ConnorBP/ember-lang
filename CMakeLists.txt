@@ -258,4 +258,17 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/sdk/angelscript/source/as_atomi
         target_link_libraries(v0_6_hot_reload_test PRIVATE kernel32)
     endif()
     add_test(NAME v0_6_hot_reload COMMAND v0_6_hot_reload_test)
+
+    # v1.0 example game-engine integration (the embeddability proof). A minimal
+    # host that compiles+runs game_logic.ember with @entry/@on_tick/@event, drives
+    # host-owned entity state through BindingBuilder natives, and hot-reloads a
+    # gameplay fn mid-loop. The first real 'ember as embedding target' end-to-end
+    # proof; also the test that decides whether the fluent TypeBuilder is needed.
+    add_executable(game_host examples/game_host.cpp)
+    target_link_libraries(game_host PRIVATE ember ember_frontend ember_import)
+    if(WIN32)
+        target_link_libraries(game_host PRIVATE kernel32)
+    endif()
+    add_test(NAME game_host_integration COMMAND game_host
+        "${CMAKE_CURRENT_SOURCE_DIR}/examples/scripts/game_logic.ember")
 endif()
