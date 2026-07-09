@@ -891,10 +891,13 @@ void store_rax_to_global(CG& cg, int64_t /*base*/, int32_t off) {
 // store xmm0 (a float) to a global slot [globals_base + off]. Mirrors
 // store_xmm0_to_rbp but through the relocatable globals base. movss [r11+disp32],
 // xmm0: r11 is reg 11, so the rm field needs REX.B (0x41) to extend rm=011 -> r11.
-// F3 0F 11 /r: REX.B (41) + F3 0F 11 + modrm(10, xmm0=0, r11=3)=0x83 + disp32.
+// Prefix order matters: REX must come LAST (immediately before the opcode 0F 11),
+// AFTER the mandatory F3 prefix. Wrong order (41 F3 0F 11) drops REX -> stores to
+// rbx instead of r11 (the bug that broke float-global writes in the heap case).
+// Correct: F3 41 0F 11 + modrm(10, xmm0=0, r11=3)=0x83 + disp32.
 void store_xmm0_to_global(CG& cg, int64_t /*base*/, int32_t off) {
     cg.e.mov_reg_imm64_external(Reg::r11, AbsFixup::GlobalsBase);
-    cg.e.byte(0x41); cg.e.byte(0xF3); cg.e.byte(0x0F); cg.e.byte(0x11); cg.e.byte(0x83); cg.e.imm32(off);
+    cg.e.byte(0xF3); cg.e.byte(0x41); cg.e.byte(0x0F); cg.e.byte(0x11); cg.e.byte(0x83); cg.e.imm32(off);
 }
 
 void CG::eval(const Expr& ex) {

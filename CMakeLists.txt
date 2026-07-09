@@ -271,4 +271,13 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/sdk/angelscript/source/as_atomi
     endif()
     add_test(NAME game_host_integration COMMAND game_host
         "${CMAKE_CURRENT_SOURCE_DIR}/examples/scripts/game_logic.ember")
+
+    # float-global regression: pins the v1.0-integration-found float-global-write
+    # bug fix (store_xmm0_to_global, movss with correct REX-after-F3 prefix order).
+    add_executable(float_global_regression examples/float_global_regression.cpp)
+    target_link_libraries(float_global_regression PRIVATE ember ember_frontend ember_import)
+    if(WIN32)
+        target_link_libraries(float_global_regression PRIVATE kernel32)
+    endif()
+    add_test(NAME float_global_regression COMMAND float_global_regression)
 endif()
