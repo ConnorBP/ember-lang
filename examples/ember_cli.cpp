@@ -40,6 +40,7 @@
 #include "../src/codegen.hpp"     // CodeGenCtx, compile_func, g_globals_for_codegen, GlobalsBlock
 #include "../src/import.hpp"      // resolve_imports
 #include "../src/jit_memory.hpp"  // free_executable
+#include "../src/context.hpp"     // context_t, TrapStub, TrapReason (v0.4 safe execution)
 
 #include "ext_vec.hpp"
 #include "ext_quat.hpp"
@@ -49,6 +50,7 @@
 #include "ext_math.hpp"
 
 #include <cstdio>
+#include <csetjmp>   // setjmp/longjmp (v0.4 safe-execution checkpoint)
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -71,6 +73,30 @@ static std::string read_file(const char* path) {
     if (!f) return std::string();
     std::stringstream ss; ss << f.rdbuf();
     return ss.str();
+}
+
+// v0.4 safe-execution trap stub: the JIT calls this (Win64: rcx=context_t*,
+// edx=TrapReason, r8=const char* detail) when a trap fires (bounds, budget,
+// stack-overflow, @obf_keyed). It records the reason + detail on the context,
+// then longjmps back to the ember_call checkpoint so the trap becomes a
+// recoverable error (printed + nonzero exit) instead of process death
+// (REDSHELL V6-DoS / V7: pre-v0.4 these were SIGSEGV/SIGILL -> crash).
+// `ctx` is the process-wide ember context (CLI is single-call; nested
+// ember_call checkpoints are v1.0).
+extern "C" void ember_cli_trap(ember::context_t* ctx, int reason, const char* detail) {
+    if (ctx) {
+        ctx->last_trap = static_cast<ember::TrapReason>(reason);
+        ctx->last_error = detail ? detail : "<no detail>";
+        if (ctx->has_checkpoint) {
+            // __builtin_longjmp (not std::longjmp): restores saved rsp/rbp/ip
+            // WITHOUT walking SEH/unwind tables. JIT'd frames have no .pdata,
+            // so std::longjmp's table walk faults; the builtin is a direct
+            // register restore (matches the spec's "directly, not libc setjmp/longjmp").
+            __builtin_longjmp(ctx->checkpoint, 1);
+        }
+    }
+    std::fprintf(stderr, "ember: unhandled trap (no checkpoint): %s\n", detail ? detail : "?");
+    std::abort();
 }
 
 static void usage(FILE* out) {
@@ -212,6 +238,22 @@ int main(int argc, char** argv) {
     // str_decrypt_fn stays null: key=0 above means string literals never
     // emit a decrypt call, so no __str_decrypt native is needed.
 
+    // ---- v0.4 safe-execution context (SAFETY_AND_SANDBOX.md §2-§4) ----
+    // The CLI runs untrusted .ember input, so enable BOTH budgets + route
+    // all traps through the stub (longjmp to a checkpoint). Trusted-tool
+    // hosts leave these off/null for zero JIT overhead (see context.hpp).
+    context_t ectx;
+    ectx.budget_remaining = 100000000;   // 100M coarse instructions per call (~ generous)
+    ectx.max_call_depth = 512;
+    ectx.has_checkpoint = false;
+    ctx.trap_stub = reinterpret_cast<void*>(&ember_cli_trap);
+    ctx.trap_ctx  = &ectx;
+    ctx.budget_ptr = &ectx.budget_remaining;
+    ctx.emit_budget_checks = true;
+    ctx.depth_ptr  = &ectx.call_depth;
+    ctx.max_call_depth = ectx.max_call_depth;
+    ctx.emit_depth_checks = true;
+
     // ---- compile + finalize each function ----
     std::vector<CompiledFn> fns;
     fns.reserve(pr.program.funcs.size());
@@ -257,13 +299,24 @@ int main(int argc, char** argv) {
     // ---- call the entry (Win64: main takes no args; return in rax) ----
     // main() -> i64   : exit with that code (the validation signal)
     // main() -> void  : exit 0
+    //
+    // v0.4: the call runs under a setjmp checkpoint. Any trap (bounds,
+    // budget exhaustion, stack overflow, @obf_keyed mismatch) longjmps back
+    // here instead of crashing the process (REDSHELL V6-DoS / V7).
     int exit_code = 0;
     bool returns_void = entry_decl && entry_decl->ret && entry_decl->ret->is_void();
-    if (!returns_void) {
+    ectx.has_checkpoint = true;
+    if (__builtin_setjmp(ectx.checkpoint)) {
+        // A trap fired during the call: recoverable error, not a crash.
+        std::fprintf(stderr, "ember: RUNTIME TRAP: %s (%s)\n",
+                     ectx.last_error.c_str(), ember::trap_reason_str(ectx.last_trap));
+        exit_code = 70;   // distinct from valid script return codes + parse/sema exit 2
+    } else if (!returns_void) {
         using F0 = int64_t(*)();   // 0-arg, returns i64 in rax
         int64_t r = reinterpret_cast<F0>(entry)();
         exit_code = int(r & 0x7fffffff);   // clamp to a usable exit code
     }
+    ectx.has_checkpoint = false;
 
     // ---- cleanup ----
     for (auto& fn : fns) if (fn.exec) free_executable(fn.exec);

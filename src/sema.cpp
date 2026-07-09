@@ -1,4 +1,5 @@
 #include "sema.hpp"
+#include "binding_builder.hpp"  // PERM_FFI constant (v0.4 sema gating)
 #include <cassert>
 #include <climits>
 
@@ -434,9 +435,12 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
         const Type* ret_ty;
         const std::vector<Type>* params;
         if (nit != natives->end()) {
-            // permission gate (SAFETY_AND_SANDBOX.md Section 6)
-            if ((nit->second.permission & 0x01 /*PERM_FFI*/) && !(perms & 0x01)) {
-                err("function '" + c->name + "' requires PERM_FFI", c->loc.line, c->loc.col);
+            // permission gate (SAFETY_AND_SANDBOX.md Section 6): a native
+            // flagged PERM_FFI is only callable from a module compiled with the
+            // FFI permission bit. Compile-time check (zero runtime cost).
+            if ((nit->second.permission & PERM_FFI) && !(perms & PERM_FFI)) {
+                err("function '" + c->name + "' requires PERM_FFI permission",
+                    c->loc.line, c->loc.col);
             }
             c->is_native = true; c->native_fn = nit->second.fn_ptr;
             ret_ty = &nit->second.ret; params = &nit->second.params;

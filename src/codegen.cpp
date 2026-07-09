@@ -1,5 +1,6 @@
 #include "codegen.hpp"
 #include "engine.hpp"
+#include "context.hpp"   // TrapReason (unified trap surface, v0.4)
 #include <cassert>
 #include <cstring>
 #include <algorithm>
@@ -198,7 +199,7 @@ struct CG {
         e.cmp_reg_reg(idx_reg, len_reg); // sets flags from idx-len
         Label ok = e.alloc_label();
         e.jcc(Cond::b, ok); // idx < len (unsigned) -> in bounds, continue
-        e.byte(0x0F); e.byte(0x0B); // ud2
+        emit_trap(int(TrapReason::BoundsCheck), "bounds check: index out of range");
         e.bind(ok);
     }
     // Same idea, but against a compile-time-known length (a fixed array's N).
@@ -213,8 +214,98 @@ struct CG {
         e.cmp_reg_imm32(idx_reg, int32_t(len));
         Label ok = e.alloc_label();
         e.jcc(Cond::b, ok);
-        e.byte(0x0F); e.byte(0x0B); // ud2
+        emit_trap(int(TrapReason::BoundsCheck), "bounds check: index out of range");
         e.bind(ok);
+    }
+
+    // --- v0.4 unified trap surface (SAFETY_AND_SANDBOX.md §2-§4, REDSHELL V7) ---
+    // Emit a trap call. If ctx.trap_stub is set, calls it via Win64 ABI:
+    //   rcx = ctx.trap_ctx (context_t*), edx = reason (TrapReason), r8 = detail (const char*)
+    // The stub longjmps to the checkpoint (never returns). If trap_stub is null,
+    // falls back to ud2 (pre-v0.4 behavior — backward compatible, process death
+    // unless the host installed a VEH). `detail` is baked as a rodata imm64
+    // (a string literal's address) or null.
+    //
+    // Caller must preserve rax/any live value-register across this: traps never
+    // return when a stub is set (longjmp), so live values are irrelevant; when
+    // the stub is null the ud2 kills the process, also irrelevant. So we can
+    // freely clobber rax/rcx/rdx/r8 here.
+    void emit_trap(int reason_ord, const char* detail) {
+        if (ctx.trap_stub) {
+            // Win64: the stub is a normal C function — needs 16-byte-aligned
+            // rsp at the call + 32-byte shadow space. At a trap site rsp is at
+            // the frame base (16-aligned by the prologue), so a raw `call`
+            // would misalign to 8 and fault. Reserve 0x28 (40 = 32 shadow + 8
+            // align) before the call; the stub longjmps (never returns) so the
+            // reserved space is never restored by us — longjmp handles rsp.
+            e.byte(0x48); e.byte(0x83); e.byte(0xEC); e.byte(0x28); // sub rsp, 0x28
+            e.mov_reg_imm64(Reg::rcx, int64_t(ctx.trap_ctx));
+            e.mov_reg_imm64(Reg::rdx, int64_t(reason_ord));
+            e.mov_reg_imm64(Reg::r8,  int64_t(reinterpret_cast<uintptr_t>(detail)));
+            e.mov_reg_imm64(Reg::rax, int64_t(ctx.trap_stub));
+            e.call_reg(Reg::rax);
+            // stub does not return (longjmps); if it ever did, fall through.
+            e.byte(0x48); e.byte(0x83); e.byte(0xC4); e.byte(0x28); // add rsp, 0x28
+        } else {
+            e.byte(0x0F); e.byte(0x0B); // ud2 (raises #UD, pre-v0.4 trap)
+        }
+    }
+
+    // v0.4 instruction budget (SAFETY_AND_SANDBOX.md §3). Emitted at LOOP
+    // BACK-EDGES ONLY (the actual runaway-loop catch point), gated by
+    // ctx.emit_budget_checks + ctx.budget_ptr. Zero emitted when off.
+    //   mov rax, budget_ptr
+    //   sub qword [rax], body_cost   ; coarse per-iteration instruction count
+    //   jg  .continue                ; budget_remaining > 0, keep looping
+    //   emit_trap(BudgetExceeded)   ; else trap (longjmp to checkpoint)
+    //   .continue:
+    // body_cost is a coarse statement count of the loop body (the spec's
+    // "how much work happened" proxy — not cycle-accurate, just enough that
+    // a true infinite loop drives it to zero in finite iterations). A bare
+    // `while(true){}` floors at 1 so even an empty infinite loop is caught.
+    void emit_budget_check(int64_t body_cost) {
+        if (!ctx.emit_budget_checks || !ctx.budget_ptr || body_cost <= 0) return;
+        e.mov_reg_imm64(Reg::rax, int64_t(ctx.budget_ptr));
+        // sub qword ptr [rax], imm32 : REX.W (48) + opcode 81 /5 + imm32
+        e.byte(0x48); e.byte(0x81); e.byte(0x28); e.imm32(int32_t(body_cost));
+        Label cont = e.alloc_label();
+        e.jcc(Cond::g, cont);              // budget_remaining > 0 -> continue
+        emit_trap(int(TrapReason::BudgetExceeded), "budget exceeded at loop back-edge");
+        e.bind(cont);
+    }
+
+    // Coarse per-iteration cost of a loop body: count statements (each ~a few
+    // emitted instructions). Floors at 1 so an empty infinite loop is caught.
+    int64_t block_cost(const Block& b);
+    int64_t stmt_cost(const Stmt& s);
+
+    // v0.4 stack-depth guard (SAFETY_AND_SANDBOX.md §4). Emitted at
+    // SCRIPT-TO-SCRIPT call entry only (not native calls — natives have
+    // their own stacks), gated by ctx.emit_depth_checks + ctx.depth_ptr.
+    // Zero emitted when off. Pairs with emit_depth_leave() after the call.
+    //   mov rax, depth_ptr
+    //   inc dword [rax]            ; ++call_depth
+    //   cmp dword [rax], max       ; depth >= max?
+    //   jge .trap                  ; yes -> overflow
+    //   .ok:
+    //   <the call>
+    //   ... emit_depth_leave() after the call returns: dec dword [rax]
+    void emit_depth_check() {
+        if (!ctx.emit_depth_checks || !ctx.depth_ptr) return;
+        e.mov_reg_imm64(Reg::rax, int64_t(ctx.depth_ptr));
+        e.byte(0xFF); e.byte(0x00);                  // inc dword ptr [rax]
+        e.byte(0x81); e.byte(0x38); e.imm32(int32_t(ctx.max_call_depth)); // cmp dword [rax], imm32
+        Label ok = e.alloc_label();
+        e.jcc(Cond::l, ok);                          // depth < max -> ok
+        emit_trap(int(TrapReason::StackOverflow), "stack overflow: call depth exceeded");
+        e.bind(ok);
+    }
+    void emit_depth_leave() {
+        if (!ctx.emit_depth_checks || !ctx.depth_ptr) return;
+        // After the call returns, rax HOLDS THE RESULT — must not clobber it.
+        // Use r10 (caller-saved scratch, not a return/arg reg) for the ptr load.
+        e.mov_reg_imm64(Reg::r10, int64_t(ctx.depth_ptr));
+        e.byte(0x49); e.byte(0xFF); e.byte(0x0A);  // dec dword ptr [r10]  (REX.B=1, /1, rm=r10)
     }
 
     int32_t alloc_local(const std::string& n, const Type* t) {
@@ -530,8 +621,10 @@ struct CG {
             // .md Section 2.4): emit 8 zero placeholders + a DispatchTableBase AbsFixup;
             // compile_func fills the placeholder with ctx.dispatch_base after
             // emit (byte-identical to the old raw mov_reg_imm64).
+            emit_depth_check();                        // v0.4 stack-depth guard (SAFETY §4)
             e.mov_reg_imm64_external(Reg::r11, AbsFixup::DispatchTableBase);
             e.call_mem(Reg::r11, int32_t(c.script_slot) * 8);
+            emit_depth_leave();
         }
         e.byte(0x48); e.byte(0x81); e.byte(0xC4); e.imm32(total); // add rsp,total
         // no result in rax/xmm0 to propagate - the callee wrote the struct
@@ -566,7 +659,12 @@ struct CG {
         e.pop(Reg::rbx);                        // restore rbx, continue
         e.jmp(ok);
         e.bind(trap);
-        e.byte(0x0F); e.byte(0x0B);             // ud2 (raises #UD, crashes)
+        // v0.4: route through the trap stub (longjmp to checkpoint) instead of
+        // ud2 -> recoverable, not process death (REDSHELL V7). On the trap path
+        // rbx is still pushed, but the stub longjmps (never returns, rsp
+        // restored by longjmp) so the unbalanced push is harmless; with a null
+        // stub the ud2 kills the process regardless.
+        emit_trap(int(TrapReason::IllegalInstruction), "@obf_keyed: CPUID gate mismatch");
         e.bind(ok);
     }
 
@@ -1423,8 +1521,10 @@ void CG::eval(const Expr& ex) {
             // placeholders + a DispatchTableBase AbsFixup; compile_func fills
             // the placeholder with ctx.dispatch_base after emit (byte-identical
             // to the old raw mov_reg_imm64).
+            emit_depth_check();                        // v0.4 stack-depth guard (SAFETY §4)
             e.mov_reg_imm64_external(Reg::r11, AbsFixup::DispatchTableBase);
             e.call_mem(Reg::r11, int32_t(c->script_slot) * 8);
+            emit_depth_leave();
         }
         // add rsp, total
         e.byte(0x48); e.byte(0x81); e.byte(0xC4); e.imm32(total);
@@ -1788,6 +1888,7 @@ void CG::exec_stmt(const Stmt& s) {
         exec_block(ws->body);
         loops.pop_back();
         if (set_pin_here) active_pin.reset();
+        emit_budget_check(block_cost(ws->body));   // v0.4 budget (SAFETY §3): back-edge only
         e.jmp(top);
         e.bind(end);
         return;
@@ -1831,6 +1932,7 @@ void CG::exec_stmt(const Stmt& s) {
         loops.pop_back();
         e.bind(step_l);
         if (fs->step) eval(*fs->step);
+        emit_budget_check(block_cost(fs->body));   // v0.4 budget (SAFETY §3): back-edge only
         e.jmp(cond_top);
         e.bind(end_l);
         if (set_pin_here) active_pin.reset();
@@ -1881,6 +1983,27 @@ void CG::exec_stmt(const Stmt& s) {
         }
         return;
     }
+}
+
+// v0.4 instruction-budget cost estimator (SAFETY_AND_SANDBOX.md §3).
+// Coarse statement count of a block/stmt — the spec's "how much work happened"
+// proxy. Not cycle-accurate; just enough that a true infinite loop drives
+// budget_remaining to zero in finite iterations. Recurses into nested blocks.
+int64_t CG::block_cost(const Block& b) {
+    int64_t n = 0;
+    for (auto& s : b.stmts) n += 1 + stmt_cost(*s);
+    return n < 1 ? 1 : n;  // floor at 1: empty infinite loop is still caught
+}
+int64_t CG::stmt_cost(const Stmt& s) {
+    if (auto* bs = dynamic_cast<const BlockStmt*>(&s))  return block_cost(bs->block);
+    if (auto* is = dynamic_cast<const IfStmt*>(&s))   return block_cost(is->then_b) + (is->has_else ? block_cost(is->else_b) : 0);
+    if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) return block_cost(ws->body);
+    if (auto* fs = dynamic_cast<const ForStmt*>(&s))  return block_cost(fs->body);
+    if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) return block_cost(ds->body);
+    if (auto* sw = dynamic_cast<const SwitchStmt*>(&s)) {
+        int64_t n = 0; for (auto& c : sw->cases) n += block_cost(c.body); return n;
+    }
+    return 1;
 }
 
 } // namespace

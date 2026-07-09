@@ -15,6 +15,11 @@
 #include "lexer.hpp"
 #include "parser.hpp"
 #include "sema.hpp"
+#include "codegen.hpp"     // compile_func, CodeGenCtx, g_globals_for_codegen (safe-trap runner)
+#include "context.hpp"     // context_t, TrapReason
+#include "engine.hpp"      // CompiledFn, finalize, free_executable
+#include "dispatch_table.hpp"
+#include "binding_builder.hpp"
 #include "jit_memory.hpp"
 
 #include "ext_vec.hpp"
@@ -69,6 +74,50 @@ static bool sema_ok(const std::string& src) {
     return sr.ok;
 }
 
+// Run a script under the v0.4 safe-execution surface (context_t + trap stub +
+// budget + depth), calling `main`. Returns the TrapReason that fired, or
+// TrapReason::None if the script completed. Mirrors ember_cli's wiring.
+extern "C" void test_trap(ember::context_t* ctx, int reason, const char* detail) {
+    if (ctx) {
+        ctx->last_trap = static_cast<ember::TrapReason>(reason);
+        ctx->last_error = detail ? detail : "";
+        if (ctx->has_checkpoint) __builtin_longjmp(ctx->checkpoint, 1);
+    }
+    std::abort();
+}
+static ember::TrapReason run_under_safetrap(const std::string& src, int64_t budget = 100'000'000) {
+    std::unordered_set<std::string> seen; std::string resolved;
+    try { resolved = resolve_imports(src, "./", seen); } catch (...) { return ember::TrapReason::None; }
+    auto lr = tokenize(resolved, "<t>"); if (!lr.ok) return ember::TrapReason::None;
+    auto pr = parse(std::move(lr.toks)); if (!pr.ok) return ember::TrapReason::None;
+    std::unordered_map<std::string,int> slots; int si=0;
+    for(auto&fn:pr.program.funcs){slots[fn.name]=si++;fn.slot=slots[fn.name];}
+    std::unordered_map<std::string,ember::NativeSig> natives; ember::OpOverloadTable ov;
+    ext_vec::register_natives(natives);ext_quat::register_natives(natives);ext_mat::register_natives(natives);
+    ext_string::register_natives(natives);ext_array::register_natives(natives);ext_math::register_natives(natives);
+    ext_vec::register_overloads(ov);ext_quat::register_overloads(ov);ext_mat::register_overloads(ov);ext_string::register_overloads(ov);
+    auto layouts=build_struct_layouts(pr.program); pr.program.string_xor_key=0;
+    if(!sema(pr.program,natives,slots,0,&ov,&layouts).ok) return ember::TrapReason::None;
+    ember::GlobalsBlock gb; std::vector<uint8_t> gbs(0); gb.base=int64_t(gbs.data()); ember::g_globals_for_codegen=&gb;
+    ember::DispatchTable table(pr.program.funcs.size()); ember::CodeGenCtx ctx;
+    ctx.globals_base=gb.base; ctx.dispatch_base=int64_t(table.base());
+    ctx.natives=&natives; ctx.script_slots=&slots; ctx.structs=&layouts;
+    ember::context_t ectx; ectx.budget_remaining=budget; ectx.max_call_depth=8;
+    ctx.trap_stub=(void*)&test_trap; ctx.trap_ctx=&ectx;
+    ctx.budget_ptr=&ectx.budget_remaining; ctx.emit_budget_checks=true;
+    ctx.depth_ptr=&ectx.call_depth; ctx.max_call_depth=8; ctx.emit_depth_checks=true;
+    std::vector<ember::CompiledFn> fns;
+    for(auto&fn:pr.program.funcs){auto cf=compile_func(fn,ctx); finalize(cf); table.set(fn.slot,cf.entry); fns.push_back(std::move(cf));}
+    auto sit=slots.find("main"); if(sit==slots.end()) return ember::TrapReason::None;
+    void* entry=table.get(sit->second); if(!entry) return ember::TrapReason::None;
+    ectx.has_checkpoint=true;
+    if (__builtin_setjmp(ectx.checkpoint)) { return ectx.last_trap; }  // trap fired
+    using F0=int64_t(*)(); reinterpret_cast<F0>(entry)();
+    ectx.has_checkpoint=false;
+    for(auto&fn:fns) if(fn.exec) free_executable(fn.exec);
+    return ember::TrapReason::None;
+}
+
 int main() {
     std::printf("=== v0.4 hardening regression (red-team V5 + V6) ===\n");
 
@@ -112,6 +161,37 @@ int main() {
               "V5: JIT page is NOT PAGE_EXECUTE_READWRITE (RWX eliminated)");
     }
     if (page) free_executable(page);
+
+    // --- V7: @obf_keyed forced crash is now a RECOVERABLE trap, not SIGILL ---
+    // Red-team V7: @obf_keyed + call -> ud2 -> SIGILL (exit 132), process death.
+    // Post-fix: the gate routes through the trap stub -> longjmp to checkpoint
+    // -> recoverable error (TrapReason::IllegalInstruction), no crash.
+    check(run_under_safetrap("@obf_keyed\nfn b() -> i64 { return 0; }\n"
+                            "fn main() -> i64 { return b(); }\n")
+          == ember::TrapReason::IllegalInstruction,
+          "V7: @obf_keyed traps recoverably (was SIGILL 132 process death)");
+
+    // --- Instruction budget: a runaway loop TRAPS, does not hang ---
+    // A tight `while(true){...}` with a tiny budget must exhaust at a back-edge
+    // and trap (TrapReason::BudgetExceeded), not loop forever. Pre-fix: hang.
+    check(run_under_safetrap("fn main() -> i64 { while (true) { let x: i64 = 1+1+1+1+1; } return 0; }\n",
+                            1000)  // tiny budget -> traps within ~200 iters
+          == ember::TrapReason::BudgetExceeded,
+          "Instruction budget: runaway loop traps (was infinite hang)");
+
+    // --- Stack-depth guard: infinite recursion TRAPS, does not SIGSEGV ---
+    // `r(){ return r(); }` with max_call_depth=8 must hit the depth guard and
+    // trap (TrapReason::StackOverflow), not overflow the native stack (SIGSEGV).
+    check(run_under_safetrap("fn r() -> i64 { return r(); }\n"
+                            "fn main() -> i64 { return r(); }\n")
+          == ember::TrapReason::StackOverflow,
+          "Stack-depth guard: infinite recursion traps (was SIGSEGV)");
+
+    // --- negative control: a well-behaved script completes with NO trap ---
+    check(run_under_safetrap("fn fib(n: i64) -> i64 { if (n <= 1) { return n; } return fib(n-1)+fib(n-2); }\n"
+                            "fn main() -> i64 { return fib(6); }\n")
+          == ember::TrapReason::None,
+          "Safe-execution negative control: fib(6) completes with no trap");
 
     std::printf("\nv0.4 hardening test: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail;
