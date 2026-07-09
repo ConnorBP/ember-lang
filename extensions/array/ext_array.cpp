@@ -7,8 +7,11 @@
 // natives are unchanged.
 #include "ext_array.hpp"
 #include "ast.hpp"
+#include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
 #include <cstring>
 #include <vector>
+
+using namespace ember;  // bind_handle, BindingBuilder, type_* singletons
 
 namespace ember::ext_array {
 
@@ -52,21 +55,23 @@ bool get_bytes(int64_t handle, uint8_t** out_data, int64_t* out_len) {
     return true;
 }
 
+// Registered surface is byte-identical to the old I/H/add lambda form
+// (ext_registration_test asserts array_new -> i64 2 params; array_length
+//  -> i64 1 param; array_get_u8 -> u8; array_push_u8 -> void 2 params).
 void register_natives(std::unordered_map<std::string, NativeSig>& m) {
-    auto I = [](Prim p){ return Type(make_prim(p)); };
-    auto add = [&](const char* n, void* fn, Type r, std::vector<Type> ps) {
-        m[n] = NativeSig{n, fn, std::move(r), std::move(ps), 0};
-    };
-    add("array_new",   (void*)&n_array_new,   I(Prim::I64), {I(Prim::I64),I(Prim::I64)});
-    add("array_length",(void*)&n_array_length,I(Prim::I64), {I(Prim::I64)});
-    add("array_resize",(void*)&n_array_resize,I(Prim::Void), {I(Prim::I64),I(Prim::I64)});
-    add("array_set_u8",(void*)&n_array_set_u8,I(Prim::Void), {I(Prim::I64),I(Prim::I64),I(Prim::I64)});
-    add("array_get_u8",(void*)&n_array_get_u8,I(Prim::U8),  {I(Prim::I64),I(Prim::I64)});
-    add("array_set_f32",(void*)&n_array_set_f32,I(Prim::Void), {I(Prim::I64),I(Prim::I64),I(Prim::F32)});
-    add("array_get_f32",(void*)&n_array_get_f32,I(Prim::F32), {I(Prim::I64),I(Prim::I64)});
-    add("array_set_i64",(void*)&n_array_set_i64,I(Prim::Void), {I(Prim::I64),I(Prim::I64),I(Prim::I64)});
-    add("array_get_i64",(void*)&n_array_get_i64,I(Prim::I64), {I(Prim::I64),I(Prim::I64)});
-    add("array_push_u8",(void*)&n_array_push_u8,I(Prim::Void), {I(Prim::I64),I(Prim::I64)});
+    BindingBuilder b;
+    b.add("array_new",   type_i64(), {type_i64(),type_i64()}, (void*)&n_array_new);
+    b.add("array_length",type_i64(), {type_i64()},             (void*)&n_array_length);
+    b.add("array_resize",type_void(), {type_i64(),type_i64()}, (void*)&n_array_resize);
+    b.add("array_set_u8",type_void(), {type_i64(),type_i64(),type_i64()}, (void*)&n_array_set_u8);
+    b.add("array_get_u8",bind_prim(Prim::U8),  {type_i64(),type_i64()}, (void*)&n_array_get_u8);
+    b.add("array_set_f32",type_void(), {type_i64(),type_i64(),type_f32()}, (void*)&n_array_set_f32);
+    b.add("array_get_f32",type_f32(), {type_i64(),type_i64()}, (void*)&n_array_get_f32);
+    b.add("array_set_i64",type_void(), {type_i64(),type_i64(),type_i64()}, (void*)&n_array_set_i64);
+    b.add("array_get_i64",type_i64(), {type_i64(),type_i64()}, (void*)&n_array_get_i64);
+    b.add("array_push_u8",type_void(), {type_i64(),type_i64()}, (void*)&n_array_push_u8);
+    NativeTable t = b.build();
+    for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }
 
 void reset() {

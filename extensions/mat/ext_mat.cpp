@@ -4,7 +4,10 @@
 // unchanged; only namespace + registration entry points changed.
 #include "ext_mat.hpp"
 #include "ast.hpp"
+#include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
 #include <vector>
+
+using namespace ember;  // bind_handle, BindingBuilder, type_* singletons
 
 namespace ember::ext_mat {
 
@@ -51,28 +54,28 @@ extern "C" {
     }
 }
 
+// Registered surface is byte-identical to the old I/H/add lambda form
+// (ext_registration_test asserts mat4_new -> struct "mat4", 0 params;
+//  mat4_get -> f32 3 params; mat4_set -> void 4 params).
 void register_natives(std::unordered_map<std::string, NativeSig>& m) {
-    auto I = [](Prim p){ return Type(make_prim(p)); };
-    auto H = [](const char* name){ Type t; t.prim = Prim::I64; t.struct_name = name; return t; };
-    auto add = [&](const char* n, void* fn, Type r, std::vector<Type> ps) {
-        m[n] = NativeSig{n, fn, std::move(r), std::move(ps), 0};
-    };
-    add("mat4_new",      (void*)&n_mat4_new,      H("mat4"), {});
-    add("mat4_identity", (void*)&n_mat4_identity, H("mat4"), {});
-    add("mat4_get", (void*)&n_mat4_get, I(Prim::F32), {I(Prim::I64),I(Prim::I64),I(Prim::I64)});
-    add("mat4_set", (void*)&n_mat4_set, I(Prim::Void),{I(Prim::I64),I(Prim::I64),I(Prim::I64),I(Prim::F32)});
+    BindingBuilder b;
+    b.add("mat4_new",      bind_handle("mat4"), {},                   (void*)&n_mat4_new);
+    b.add("mat4_identity", bind_handle("mat4"), {},                   (void*)&n_mat4_identity);
+    b.add("mat4_get", type_f32(), {type_i64(),type_i64(),type_i64()}, (void*)&n_mat4_get);
+    b.add("mat4_set", type_void(), {type_i64(),type_i64(),type_i64(),type_f32()}, (void*)&n_mat4_set);
+    NativeTable t = b.build();
+    for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }
 
+// Overload (type,op) entries preserved exactly. mat4's `*` is the standard
+// 4x4 matrix product; addition isn't commonly meaningful here, so (unlike
+// vec/quat) it's omitted.
 void register_overloads(OpOverloadTable& overloads) {
-    auto I = [](Prim p){ return Type(make_prim(p)); };
-    auto H = [](const char* name){ Type t; t.prim = Prim::I64; t.struct_name = name; return t; };
-    auto reg_op = [&](const char* type_name, int op, void* fn, Type ret) {
-        overloads.register_op(type_name, op, {fn, "", ret, {I(Prim::I64),I(Prim::I64)}});
-    };
-    // mat4's `*` is the standard 4x4 matrix product; addition isn't a
-    // commonly meaningful op here, so (unlike vec/quat) it's omitted.
-    reg_op("mat4", int(BinExpr::Op::Mul), (void*)&n_mat4_mul, H("mat4"));
-    reg_op("mat4", int(BinExpr::Op::Eq),  (void*)&n_mat4_eq,  I(Prim::Bool));
+    BindingBuilder b;
+    b.add_overload("mat4", int(BinExpr::Op::Mul), bind_handle("mat4"), (void*)&n_mat4_mul);
+    b.add_overload("mat4", int(BinExpr::Op::Eq),  type_bool(),          (void*)&n_mat4_eq);
+    NativeTable t = b.build();
+    for (auto& kv : t.overloads.entries) overloads.entries[kv.first] = std::move(kv.second);
 }
 
 void reset() {

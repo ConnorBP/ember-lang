@@ -6,7 +6,10 @@
 // (e.g. prism/examples/scripts/vector_math_demo.ember) behave identically.
 #include "ext_vec.hpp"
 #include "ast.hpp"       // ember public: Type, make_prim, make_slice, Prim
+#include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
 #include <vector>
+
+using namespace ember;  // bind_handle, BindingBuilder, type_* singletons
 
 namespace ember::ext_vec {
 
@@ -67,55 +70,59 @@ extern "C" {
     static int64_t n_vec4_eq(int64_t a, int64_t b) { auto* x=v4_slot(a); auto* y=v4_slot(b); return (x->x==y->x && x->y==y->y && x->z==y->z && x->w==y->w) ? 1 : 0; }
 }
 
+// Registered surface is byte-identical to the old I/H/add lambda form:
+// bind_handle("vec3") == old H("vec3"); type_f32() == old I(Prim::F32).
+// (ext_registration_test asserts the names/arity/ret/struct_name.)
 void register_natives(std::unordered_map<std::string, NativeSig>& m) {
-    auto I = [](Prim p){ return Type(make_prim(p)); };
-    auto H = [](const char* name){ Type t; t.prim = Prim::I64; t.struct_name = name; return t; };
-    auto add = [&](const char* n, void* fn, Type r, std::vector<Type> ps) {
-        m[n] = NativeSig{n, fn, std::move(r), std::move(ps), 0};
-    };
-    add("vec3_new", (void*)&n_vec3_new, H("vec3"), {I(Prim::F32),I(Prim::F32),I(Prim::F32)});
-    add("vec3_x",   (void*)&n_vec3_x,   I(Prim::F32), {I(Prim::I64)});
-    add("vec3_y",   (void*)&n_vec3_y,   I(Prim::F32), {I(Prim::I64)});
-    add("vec3_z",   (void*)&n_vec3_z,   I(Prim::F32), {I(Prim::I64)});
-    add("vec3_set_x",(void*)&n_vec3_set_x,I(Prim::Void),{I(Prim::I64),I(Prim::F32)});
-    add("vec3_set_y",(void*)&n_vec3_set_y,I(Prim::Void),{I(Prim::I64),I(Prim::F32)});
-    add("vec3_set_z",(void*)&n_vec3_set_z,I(Prim::Void),{I(Prim::I64),I(Prim::F32)});
-    add("vec2_new", (void*)&n_vec2_new, H("vec2"), {I(Prim::F32),I(Prim::F32)});
-    add("vec2_x",   (void*)&n_vec2_x,   I(Prim::F32), {I(Prim::I64)});
-    add("vec2_y",   (void*)&n_vec2_y,   I(Prim::F32), {I(Prim::I64)});
-    add("vec2_set_x",(void*)&n_vec2_set_x,I(Prim::Void),{I(Prim::I64),I(Prim::F32)});
-    add("vec2_set_y",(void*)&n_vec2_set_y,I(Prim::Void),{I(Prim::I64),I(Prim::F32)});
-    add("vec4_new", (void*)&n_vec4_new, H("vec4"), {I(Prim::F32),I(Prim::F32),I(Prim::F32),I(Prim::F32)});
-    add("vec4_x",   (void*)&n_vec4_x,   I(Prim::F32), {I(Prim::I64)});
-    add("vec4_y",   (void*)&n_vec4_y,   I(Prim::F32), {I(Prim::I64)});
-    add("vec4_z",   (void*)&n_vec4_z,   I(Prim::F32), {I(Prim::I64)});
-    add("vec4_w",   (void*)&n_vec4_w,   I(Prim::F32), {I(Prim::I64)});
-    add("vec4_set_x",(void*)&n_vec4_set_x,I(Prim::Void),{I(Prim::I64),I(Prim::F32)});
-    add("vec4_set_y",(void*)&n_vec4_set_y,I(Prim::Void),{I(Prim::I64),I(Prim::F32)});
-    add("vec4_set_z",(void*)&n_vec4_set_z,I(Prim::Void),{I(Prim::I64),I(Prim::F32)});
-    add("vec4_set_w",(void*)&n_vec4_set_w,I(Prim::Void),{I(Prim::I64),I(Prim::F32)});
+    BindingBuilder b;
+    b.add("vec3_new", bind_handle("vec3"), {type_f32(),type_f32(),type_f32()}, (void*)&n_vec3_new);
+    b.add("vec3_x",   type_f32(), {type_i64()}, (void*)&n_vec3_x);
+    b.add("vec3_y",   type_f32(), {type_i64()}, (void*)&n_vec3_y);
+    b.add("vec3_z",   type_f32(), {type_i64()}, (void*)&n_vec3_z);
+    b.add("vec3_set_x",type_void(),{type_i64(),type_f32()}, (void*)&n_vec3_set_x);
+    b.add("vec3_set_y",type_void(),{type_i64(),type_f32()}, (void*)&n_vec3_set_y);
+    b.add("vec3_set_z",type_void(),{type_i64(),type_f32()}, (void*)&n_vec3_set_z);
+    b.add("vec2_new", bind_handle("vec2"), {type_f32(),type_f32()}, (void*)&n_vec2_new);
+    b.add("vec2_x",   type_f32(), {type_i64()}, (void*)&n_vec2_x);
+    b.add("vec2_y",   type_f32(), {type_i64()}, (void*)&n_vec2_y);
+    b.add("vec2_set_x",type_void(),{type_i64(),type_f32()}, (void*)&n_vec2_set_x);
+    b.add("vec2_set_y",type_void(),{type_i64(),type_f32()}, (void*)&n_vec2_set_y);
+    b.add("vec4_new", bind_handle("vec4"), {type_f32(),type_f32(),type_f32(),type_f32()}, (void*)&n_vec4_new);
+    b.add("vec4_x",   type_f32(), {type_i64()}, (void*)&n_vec4_x);
+    b.add("vec4_y",   type_f32(), {type_i64()}, (void*)&n_vec4_y);
+    b.add("vec4_z",   type_f32(), {type_i64()}, (void*)&n_vec4_z);
+    b.add("vec4_w",   type_f32(), {type_i64()}, (void*)&n_vec4_w);
+    b.add("vec4_set_x",type_void(),{type_i64(),type_f32()}, (void*)&n_vec4_set_x);
+    b.add("vec4_set_y",type_void(),{type_i64(),type_f32()}, (void*)&n_vec4_set_y);
+    b.add("vec4_set_z",type_void(),{type_i64(),type_f32()}, (void*)&n_vec4_set_z);
+    b.add("vec4_set_w",type_void(),{type_i64(),type_f32()}, (void*)&n_vec4_set_w);
+    NativeTable t = b.build();
+    for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }
 
+// Overload (type,op) entries preserved exactly; BindingBuilder builds
+// the same OpOverload (fn_ptr, ret, {i64,i64} params) the old reg_op did.
+// OpOverload::fn_name is unused by sema/codegen, so the builder's
+// "<type>_op" naming (vs the old "") changes no observable behavior.
 void register_overloads(OpOverloadTable& overloads) {
-    auto I = [](Prim p){ return Type(make_prim(p)); };
-    auto H = [](const char* name){ Type t; t.prim = Prim::I64; t.struct_name = name; return t; };
-    auto reg_op = [&](const char* type_name, int op, void* fn, Type ret) {
-        overloads.register_op(type_name, op, {fn, "", ret, {I(Prim::I64),I(Prim::I64)}});
-    };
-    reg_op("vec3", int(BinExpr::Op::Add), (void*)&n_vec3_add, H("vec3"));
-    reg_op("vec3", int(BinExpr::Op::Sub), (void*)&n_vec3_sub, H("vec3"));
-    reg_op("vec3", int(BinExpr::Op::Mul), (void*)&n_vec3_mul, H("vec3"));
-    reg_op("vec3", int(BinExpr::Op::Eq),  (void*)&n_vec3_eq,  I(Prim::Bool));
+    BindingBuilder b;
+    b.add_overload("vec3", int(BinExpr::Op::Add), bind_handle("vec3"), (void*)&n_vec3_add);
+    b.add_overload("vec3", int(BinExpr::Op::Sub), bind_handle("vec3"), (void*)&n_vec3_sub);
+    b.add_overload("vec3", int(BinExpr::Op::Mul), bind_handle("vec3"), (void*)&n_vec3_mul);
+    b.add_overload("vec3", int(BinExpr::Op::Eq),  type_bool(),          (void*)&n_vec3_eq);
 
-    reg_op("vec2", int(BinExpr::Op::Add), (void*)&n_vec2_add, H("vec2"));
-    reg_op("vec2", int(BinExpr::Op::Sub), (void*)&n_vec2_sub, H("vec2"));
-    reg_op("vec2", int(BinExpr::Op::Mul), (void*)&n_vec2_mul, H("vec2"));
-    reg_op("vec2", int(BinExpr::Op::Eq),  (void*)&n_vec2_eq,  I(Prim::Bool));
+    b.add_overload("vec2", int(BinExpr::Op::Add), bind_handle("vec2"), (void*)&n_vec2_add);
+    b.add_overload("vec2", int(BinExpr::Op::Sub), bind_handle("vec2"), (void*)&n_vec2_sub);
+    b.add_overload("vec2", int(BinExpr::Op::Mul), bind_handle("vec2"), (void*)&n_vec2_mul);
+    b.add_overload("vec2", int(BinExpr::Op::Eq),  type_bool(),          (void*)&n_vec2_eq);
 
-    reg_op("vec4", int(BinExpr::Op::Add), (void*)&n_vec4_add, H("vec4"));
-    reg_op("vec4", int(BinExpr::Op::Sub), (void*)&n_vec4_sub, H("vec4"));
-    reg_op("vec4", int(BinExpr::Op::Mul), (void*)&n_vec4_mul, H("vec4"));
-    reg_op("vec4", int(BinExpr::Op::Eq),  (void*)&n_vec4_eq,  I(Prim::Bool));
+    b.add_overload("vec4", int(BinExpr::Op::Add), bind_handle("vec4"), (void*)&n_vec4_add);
+    b.add_overload("vec4", int(BinExpr::Op::Sub), bind_handle("vec4"), (void*)&n_vec4_sub);
+    b.add_overload("vec4", int(BinExpr::Op::Mul), bind_handle("vec4"), (void*)&n_vec4_mul);
+    b.add_overload("vec4", int(BinExpr::Op::Eq),  type_bool(),          (void*)&n_vec4_eq);
+
+    NativeTable t = b.build();
+    for (auto& kv : t.overloads.entries) overloads.entries[kv.first] = std::move(kv.second);
 }
 
 void reset() {

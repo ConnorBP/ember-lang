@@ -5,7 +5,10 @@
 // entry point changed.
 #include "ext_math.hpp"
 #include "ast.hpp"
+#include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
 #include <cmath>
+
+using namespace ember;  // bind_handle, BindingBuilder, type_* singletons
 
 namespace ember::ext_math {
 
@@ -16,15 +19,17 @@ extern "C" {
     static float n_tan(float v) { return std::tanf(v); }
 }
 
+// Registered surface is byte-identical to the old I/H/add lambda form
+// (ext_registration_test asserts sqrt/sin/cos/tan -> f32, 1 f32 param;
+//  ext_runtime_test JIT-calls sqrt through the full pipeline).
 void register_natives(std::unordered_map<std::string, NativeSig>& m) {
-    auto I = [](Prim p){ return Type(make_prim(p)); };
-    auto add = [&](const char* n, void* fn, Type r, std::vector<Type> ps) {
-        m[n] = NativeSig{n, fn, std::move(r), std::move(ps), 0};
-    };
-    add("sqrt", (void*)&n_sqrt, I(Prim::F32), {I(Prim::F32)});
-    add("sin", (void*)&n_sin, I(Prim::F32), {I(Prim::F32)});
-    add("cos", (void*)&n_cos, I(Prim::F32), {I(Prim::F32)});
-    add("tan", (void*)&n_tan, I(Prim::F32), {I(Prim::F32)});
+    BindingBuilder b;
+    b.add("sqrt", type_f32(), {type_f32()}, (void*)&n_sqrt);
+    b.add("sin",  type_f32(), {type_f32()}, (void*)&n_sin);
+    b.add("cos",  type_f32(), {type_f32()}, (void*)&n_cos);
+    b.add("tan",  type_f32(), {type_f32()}, (void*)&n_tan);
+    NativeTable t = b.build();
+    for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }
 
 } // namespace ember::ext_math

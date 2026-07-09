@@ -9,6 +9,71 @@ Detail doc for DESIGN.md Section 4. Full descriptor structs, TypeBuilder,
 > content is the target design, not a claim of current implementation.
 calling-convention mapping, error reporting across the boundary.
 
+---
+
+> **Honest annotation (v0.3) — what actually ships vs. what this spec
+> describes.** The host-facing `TypeBuilder` / `StructBuilder` /
+> `EnumBuilder` / `engine_t` / `NativeFn` / `NativeParam` / `TypeId`
+> surface in Sections 1–7 below is the **v1.0 ergonomic TARGET**, not
+> the current implementation. v0.3 ships the **working binding API**:
+> `src/binding_builder.hpp`'s `BindingBuilder` + the existing
+> `NativeSig`/`OpOverload` map that `sema()` already consumes, used by
+> the six standard extensions in `extensions/`. The spec text below is
+> the target design those extensions move toward; it is preserved
+> unchanged. The call-ABI mapping in Section 4 **IS implemented and
+> proven** in the v0.3 `binding_abi_test` suite (script→native
+> struct-by-value arg/return, >4-arg spill, `f32` in xmm slot-parallel,
+> slice as `ptr+len` two words — all pinned by tests, all matching the
+> table as written). `PERM_FFI` is **defined** in v0.3 (the constant in
+> `binding_builder.hpp`); full permission **gating in codegen** is
+> deferred to the v0.4 safety milestone — v0.3 stores the bit on the
+> `NativeSig` and does not yet check-and-refuse before marshalling.
+> This mirrors the same honest-divergence pattern as
+> `COMPILER_PIPELINE.md` Section 5's v0.2 note: the spec is the target,
+> the shipped code is annotated against it.
+
+## v0.3 working binding API
+
+What you actually include and call today (`src/binding_builder.hpp`):
+
+```cpp
+#include "binding_builder.hpp"
+
+using namespace ember;
+
+BindingBuilder b;
+b.add("sqrt",     type_f32(), {type_f32()},                    &my_sqrt);
+b.add("vec3_new", struct_t("vec3"), {type_f32(),type_f32(),type_f32()}, &vec3_new);
+b.add_struct_ret("vec3_x", "vec3", {type_i64()},                 &vec3_x); // alt form
+b.add_overload("vec3", BinExpr::Op::Add, struct_t("vec3"),      &vec3_add);
+NativeTable t = b.build();
+SemaResult sr = sema(prog, t.natives, slots, 0, &t.overloads, &layouts);
+```
+
+- **`BindingBuilder::add(name, ret, {params...}, fn, permission=0)`** —
+  one declarative call per native. This is the "bindings like
+  AngelScript" floor: `RegisterGlobalFunction("sig", &fn)` shape over
+  the direct `NativeSig` map. Replaces the per-extension I/H/add
+  boilerplate the six extensions each redefined (six copies deduped).
+- **`add_overload(type_name, int(BinExpr::Op::X), ret, fn)`** —
+  registers an operator overload for a struct-tagged opaque-handle type.
+- **`bind_prim(Prim)` / `bind_handle("struct")`** — convenience `Type`
+  builders for a primitive and an opaque `i64` struct-name-tagged handle.
+- **`PERM_FFI`** — permission bit constant (v0.3). Pass it as the
+  `permission` arg to `add()` for natives that should be gated behind
+  the FFI flag. v0.3 stores it on the `NativeSig`; codegen-level
+  **gating is v0.4** (v0.3 does not yet refuse to marshal a `PERM_FFI`
+  native called from a non-FFI-permission context — it only records
+  the bit). See `SAFETY_AND_SANDBOX.md` Section 6 for the gate's intended
+  semantics.
+- **`NativeTable b.build()`** — moves out the filled `natives` map +
+  `overloads` table; call once after all `add()`s.
+
+The fluent `TypeBuilder`/`StructBuilder`/`engine_t` surface below
+(Sections 1–7) is the target that this builder is the interim floor of.
+
+---
+
 ## 1. `TypeId` (all values, v1)
 
 ```cpp

@@ -4,7 +4,10 @@
 // unchanged; only namespace + registration entry points changed.
 #include "ext_quat.hpp"
 #include "ast.hpp"
+#include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
 #include <vector>
+
+using namespace ember;  // bind_handle, BindingBuilder, type_* singletons
 
 namespace ember::ext_quat {
 
@@ -38,35 +41,33 @@ extern "C" {
     static int64_t n_quat_eq(int64_t a, int64_t b) { auto* x=q_slot(a); auto* y=q_slot(b); return (x->x==y->x && x->y==y->y && x->z==y->z && x->w==y->w) ? 1 : 0; }
 }
 
+// Registered surface is byte-identical to the old I/H/add lambda form
+// (ext_registration_test asserts quat_new -> struct "quat", 4 f32 params).
 void register_natives(std::unordered_map<std::string, NativeSig>& m) {
-    auto I = [](Prim p){ return Type(make_prim(p)); };
-    auto H = [](const char* name){ Type t; t.prim = Prim::I64; t.struct_name = name; return t; };
-    auto add = [&](const char* n, void* fn, Type r, std::vector<Type> ps) {
-        m[n] = NativeSig{n, fn, std::move(r), std::move(ps), 0};
-    };
-    add("quat_new", (void*)&n_quat_new, H("quat"), {I(Prim::F32),I(Prim::F32),I(Prim::F32),I(Prim::F32)});
-    add("quat_x",   (void*)&n_quat_x,   I(Prim::F32), {I(Prim::I64)});
-    add("quat_y",   (void*)&n_quat_y,   I(Prim::F32), {I(Prim::I64)});
-    add("quat_z",   (void*)&n_quat_z,   I(Prim::F32), {I(Prim::I64)});
-    add("quat_w",   (void*)&n_quat_w,   I(Prim::F32), {I(Prim::I64)});
-    add("quat_set_x",(void*)&n_quat_set_x,I(Prim::Void),{I(Prim::I64),I(Prim::F32)});
-    add("quat_set_y",(void*)&n_quat_set_y,I(Prim::Void),{I(Prim::I64),I(Prim::F32)});
-    add("quat_set_z",(void*)&n_quat_set_z,I(Prim::Void),{I(Prim::I64),I(Prim::F32)});
-    add("quat_set_w",(void*)&n_quat_set_w,I(Prim::Void),{I(Prim::I64),I(Prim::F32)});
+    BindingBuilder b;
+    b.add("quat_new", bind_handle("quat"), {type_f32(),type_f32(),type_f32(),type_f32()}, (void*)&n_quat_new);
+    b.add("quat_x",   type_f32(), {type_i64()}, (void*)&n_quat_x);
+    b.add("quat_y",   type_f32(), {type_i64()}, (void*)&n_quat_y);
+    b.add("quat_z",   type_f32(), {type_i64()}, (void*)&n_quat_z);
+    b.add("quat_w",   type_f32(), {type_i64()}, (void*)&n_quat_w);
+    b.add("quat_set_x",type_void(),{type_i64(),type_f32()}, (void*)&n_quat_set_x);
+    b.add("quat_set_y",type_void(),{type_i64(),type_f32()}, (void*)&n_quat_set_y);
+    b.add("quat_set_z",type_void(),{type_i64(),type_f32()}, (void*)&n_quat_set_z);
+    b.add("quat_set_w",type_void(),{type_i64(),type_f32()}, (void*)&n_quat_set_w);
+    NativeTable t = b.build();
+    for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }
 
+// Overload (type,op) entries preserved exactly. quat's `*` is the Hamilton
+// product (n_quat_mul) - the mathematically meaningful "multiply" for a quat.
 void register_overloads(OpOverloadTable& overloads) {
-    auto I = [](Prim p){ return Type(make_prim(p)); };
-    auto H = [](const char* name){ Type t; t.prim = Prim::I64; t.struct_name = name; return t; };
-    auto reg_op = [&](const char* type_name, int op, void* fn, Type ret) {
-        overloads.register_op(type_name, op, {fn, "", ret, {I(Prim::I64),I(Prim::I64)}});
-    };
-    // quat's `*` is the Hamilton product (n_quat_mul), not component-wise -
-    // the mathematically meaningful "multiply" for a quaternion.
-    reg_op("quat", int(BinExpr::Op::Add), (void*)&n_quat_add, H("quat"));
-    reg_op("quat", int(BinExpr::Op::Sub), (void*)&n_quat_sub, H("quat"));
-    reg_op("quat", int(BinExpr::Op::Mul), (void*)&n_quat_mul, H("quat"));
-    reg_op("quat", int(BinExpr::Op::Eq),  (void*)&n_quat_eq,  I(Prim::Bool));
+    BindingBuilder b;
+    b.add_overload("quat", int(BinExpr::Op::Add), bind_handle("quat"), (void*)&n_quat_add);
+    b.add_overload("quat", int(BinExpr::Op::Sub), bind_handle("quat"), (void*)&n_quat_sub);
+    b.add_overload("quat", int(BinExpr::Op::Mul), bind_handle("quat"), (void*)&n_quat_mul);
+    b.add_overload("quat", int(BinExpr::Op::Eq),  type_bool(),         (void*)&n_quat_eq);
+    NativeTable t = b.build();
+    for (auto& kv : t.overloads.entries) overloads.entries[kv.first] = std::move(kv.second);
 }
 
 void reset() {

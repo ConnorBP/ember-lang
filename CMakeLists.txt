@@ -149,6 +149,24 @@ target_link_libraries(ember_cli PRIVATE
     ember ember_frontend ember_import
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math)
+
+# ---- binding ABI correctness suite (BINDING_API.md Sec 4) ----
+# Pins the script->native Win64 call ABI (struct-by-value arg <=8B,
+# struct-by-value return >8B hidden-pointer, >4-arg stack spill, f32 in xmm
+# slot-parallel, slice as ptr+len two words, mixed int+float slot-parallel)
+# so a future tree-walker->SSA-IR refactor cannot silently break it. The
+# codegen is already correct; this is the regression net. Registers FRESH
+# host fns via BindingBuilder (src/binding_builder.hpp) + links all six
+# ember_ext_* (the vec extension's vec3_new handle-return is exercised as a
+# struct-return-path comparison in test [2b], and the math extension's sqrt
+# as a second f32 pin in test [4b]). Independent of the parallel extension
+# refactor: ABI-under-test natives are registered here, not in extension .cpp.
+add_executable(binding_abi_test examples/binding_abi_test.cpp)
+target_link_libraries(binding_abi_test PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_vec ember_ext_quat ember_ext_mat
+    ember_ext_string ember_ext_array ember_ext_math)
+add_test(NAME binding_abi COMMAND binding_abi_test)
 # No add_test here: a smoke test needs a script asset, coordinated separately
 # (the lang_suite worker owns the script-driven tests). The target building
 # cleanly + `ember_cli run <file> --fn main` working IS the validation gate

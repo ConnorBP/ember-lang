@@ -6,9 +6,12 @@
 // type, handle ABI, from_* converters, concat/eq overloads are unchanged.
 #include "ext_string.hpp"
 #include "ast.hpp"
+#include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
 #include <cstdio>
 #include <cstring>
 #include <vector>
+
+using namespace ember;  // bind_handle, BindingBuilder, type_* singletons
 
 namespace ember::ext_string {
 
@@ -55,36 +58,43 @@ const std::string* slot(int64_t handle) {
     return str_slot(handle);
 }
 
+// Registered surface is byte-identical to the old I/H/add lambda form
+// (ext_registration_test asserts string_new -> struct "string" 0 params;
+//  string_from_slice -> struct "string" 1 param; string_length -> i64;
+//  string_from_i64 / string_identity -> struct "string").
+//
+// U8S: BindingBuilder has no slice helper (it covers prim + opaque handle,
+// the two forms these six extensions use everywhere else), so the one slice
+// parameter (string_from_slice's u8[]) is built inline with make_slice - the
+// exact same expression the old U8S lambda used. Not a BindingBuilder spec
+// change; flagged in the refactor report as the one local helper retained.
 void register_natives(std::unordered_map<std::string, NativeSig>& m) {
-    auto I = [](Prim p){ return Type(make_prim(p)); };
     auto U8S = [](){ return make_slice(std::make_shared<Type>(make_prim(Prim::U8))); };
-    auto H = [](const char* name){ Type t; t.prim = Prim::I64; t.struct_name = name; return t; };
-    auto add = [&](const char* n, void* fn, Type r, std::vector<Type> ps) {
-        m[n] = NativeSig{n, fn, std::move(r), std::move(ps), 0};
-    };
-    add("string_new",        (void*)&n_string_new,        H("string"), {});
-    add("string_from_slice", (void*)&n_string_from_slice, H("string"), {U8S()});
-    add("string_length",     (void*)&n_string_length,     I(Prim::I64), {H("string")});
-    add("string_char_at",    (void*)&n_string_char_at,    I(Prim::I64), {H("string"),I(Prim::I64)});
-    add("string_from_i64",   (void*)&n_string_from_i64,   H("string"), {I(Prim::I64)});
-    add("string_from_f32",   (void*)&n_string_from_f32,   H("string"), {I(Prim::F32)});
-    add("string_from_f64",   (void*)&n_string_from_f64,   H("string"), {I(Prim::F64)});
-    add("string_from_bool",  (void*)&n_string_from_bool,  H("string"), {I(Prim::Bool)});
-    add("string_identity",   (void*)&n_string_identity,   H("string"), {H("string")});
+    BindingBuilder b;
+    b.add("string_new",        bind_handle("string"), {},                   (void*)&n_string_new);
+    b.add("string_from_slice", bind_handle("string"), {U8S()},             (void*)&n_string_from_slice);
+    b.add("string_length",     type_i64(), {bind_handle("string")},         (void*)&n_string_length);
+    b.add("string_char_at",    type_i64(), {bind_handle("string"),type_i64()}, (void*)&n_string_char_at);
+    b.add("string_from_i64",   bind_handle("string"), {type_i64()},        (void*)&n_string_from_i64);
+    b.add("string_from_f32",   bind_handle("string"), {type_f32()},        (void*)&n_string_from_f32);
+    b.add("string_from_f64",   bind_handle("string"), {type_f64()},        (void*)&n_string_from_f64);
+    b.add("string_from_bool",  bind_handle("string"), {type_bool()},       (void*)&n_string_from_bool);
+    b.add("string_identity",   bind_handle("string"), {bind_handle("string")}, (void*)&n_string_identity);
+    NativeTable t = b.build();
+    for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
     // NOTE: print_string stays in the host (it routes through the host
     // print sink). The host registers it itself, calling ext_string::slot()
     // to read the handle's content.
 }
 
+// Overload (type,op) entries preserved exactly. string: `+` concatenates,
+// `==` compares content (not handle identity).
 void register_overloads(OpOverloadTable& overloads) {
-    auto I = [](Prim p){ return Type(make_prim(p)); };
-    auto H = [](const char* name){ Type t; t.prim = Prim::I64; t.struct_name = name; return t; };
-    auto reg_op = [&](const char* type_name, int op, void* fn, Type ret) {
-        overloads.register_op(type_name, op, {fn, "", ret, {I(Prim::I64),I(Prim::I64)}});
-    };
-    // string: `+` concatenates, `==` compares content (not handle identity).
-    reg_op("string", int(BinExpr::Op::Add), (void*)&n_string_concat, H("string"));
-    reg_op("string", int(BinExpr::Op::Eq),  (void*)&n_string_eq,     I(Prim::Bool));
+    BindingBuilder b;
+    b.add_overload("string", int(BinExpr::Op::Add), bind_handle("string"), (void*)&n_string_concat);
+    b.add_overload("string", int(BinExpr::Op::Eq),  type_bool(),           (void*)&n_string_eq);
+    NativeTable t = b.build();
+    for (auto& kv : t.overloads.entries) overloads.entries[kv.first] = std::move(kv.second);
 }
 
 void reset() {

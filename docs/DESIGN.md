@@ -107,11 +107,28 @@ Non-goals for v1:
   Section 5. That refactor is deliberately deferred to v0.5 (benchmark-
   driven, per Section 9 below - no speculative optimization before the
   bench harness exists).
-- **v0.3** - structs, slices with bounds checks, native function
-  binding (descriptor API), calling-convention correctness host↔script.
-  (Note: struct decl/literal/field-access and the annotation machinery
-  already landed in the v0.2 overshot; v0.3 is the binding-API correctness
-  and host↔script calling-convention validation milestone.)
+- **v0.3** - the binding-correctness milestone. Three pieces:
+  (a) a binding-ABI test suite that pins the Win64 script→native call
+  ABI (struct-by-value arg/return, >4-arg spill, `f32` in xmm
+  slot-parallel, slice as `ptr+len` two words — the mapping table in
+  `BINDING_API.md` Section 4, now test-proven not just spec-asserted);
+  (b) `BindingBuilder` (`src/binding_builder.hpp`), the ergonomic
+  registration helper that dedupes the I/H/add boilerplate the six
+  standard extensions each redefined — the "bindings like AngelScript"
+  floor (`b.add("name", ret, {params...}, &fn)`, one call per native);
+  (c) the `BINDING_API.md` truth-fix annotating that the fluent
+  `TypeBuilder`/`StructBuilder`/`engine_t` surface is the v1.0 target,
+  not current code, while `BindingBuilder` + the `NativeSig` map is the
+  working API the extensions ship on. `PERM_FFI` is defined as a
+  constant (stored on `NativeSig`) but **permission gating in codegen
+  is deferred to v0.4** (v0.3 records the bit, does not yet refuse to
+  marshal). `TypeBuilder`/`StructBuilder`/`engine_t` deferred to **v1.0**
+  — re-entry trigger: a real host wants script-visible C++ struct types
+  (the extensions use opaque `i64` handles + `StructLayoutTable`, which
+  is sufficient until that trigger fires). (Note: struct
+  decl/literal/field-access and the annotation machinery already landed
+  in the v0.2 overshot; v0.3 is the binding-API correctness and
+  host↔script calling-convention validation milestone.)
 - **v0.4** - budgets/safety checks, annotations, hot reload of a
   single function, stack depth guard.
 - **v0.5** - benchmark harness vs AngelScript; tune regalloc/peephole
