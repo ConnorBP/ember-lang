@@ -1,0 +1,36 @@
+// dynamic_registration.ember — v1.0 dynamic routine registration demo
+// (plan_FUNCTION_REFS.md §6). This is the pattern LIFECYCLE.md §2 flagged as
+// "needs function references, ROADMAP Tier 2" — now shipped.
+//
+// A script chooses AT RUNTIME what the host should call per frame, instead
+// of only the static @on_tick annotation. @entry registers a routine via
+// register_routine(&fn, data); the host's --tick loop drives it (the host
+// calls fn(data) each frame via the dispatch table — the SAME call mechanism
+// as @on_tick, just discovered by the script at runtime).
+//
+// Run:  ember run dynamic_registration.ember --tick --tick-count 5 --tick-interval 50
+// (the host ticks the dynamically-registered routine 5 times, then stops).
+
+global g_ticks: i64 = 0;
+
+// The routine the script registers. The host calls it per frame with the
+// `data` arg (100) the script passed to register_routine.
+fn on_frame(data: i64) -> i64 {
+    g_ticks = g_ticks + 1;
+    return data + g_ticks;   // 100+1, 100+2, ... (the running tally)
+}
+
+@entry
+fn main() -> i64 {
+    let h = &on_frame;                 // take a function handle (&fn)
+    let id = register_routine(h, 100); // register it for per-frame calls; id >= 1
+    // (a real script would store `id` in a global to unregister_routine(id)
+    //  later — e.g. on a @on_unload or when the condition that triggered the
+    //  registration no longer holds.)
+    return 1;   // >0 = stay loaded (LIFECYCLE.md §1) so the host ticks
+}
+
+// Note: there is NO @on_tick annotation here. The host still ticks this module
+// because @entry registered a routine — the dynamic path. Contrast with
+// lifecycle_example.ember (the static @on_tick path): there the host discovers
+// @on_tick at load; here the script decides at runtime.
