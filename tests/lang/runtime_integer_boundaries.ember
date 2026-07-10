@@ -18,5 +18,17 @@ fn main() -> i64 {
     if (!(i16_min < 0 as i16) || (i16_min >> (15 as i16)) != -1 as i16 || (32767 as i16) + (1 as i16) != i16_min) { return 6; }
     if (!(i32_min < 0 as i32) || (i32_min >> (31 as i32)) != -1 as i32 || (2147483647 as i32) + (1 as i32) != i32_min) { return 7; }
     if (!(i64_min < 0) || (i64_min >> 63) != -1 || 9223372036854775807 + 1 != i64_min) { return 8; }
+
+    // The hex literal has the i64 bit pattern for -3 and takes codegen's
+    // folded path; variables force the emitted x64 path. Both must agree.
+    let negative: i64 = 0xFFFFFFFFFFFFFFFD;
+    let count: i64 = 62;
+    let unfolded: i64 = negative << count;
+    if (!(negative < 0) || (0xFFFFFFFFFFFFFFFD << 62) != 4611686018427387904 || unfolded != (0xFFFFFFFFFFFFFFFD << 62)) { return 9; }
+
+    // This constant array index also exercises sema's recursive evaluator.
+    let a: i64[1];
+    a[(-1 << 1) + 2] = 17;
+    if (a[0] != 17) { return 10; }
     return 79;
 }

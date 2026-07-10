@@ -254,12 +254,10 @@ Section 1.1). The flow:
      for cross-module name lookup - same data, no duplicate).
    - Look up `fn_name` in the target's directory. Absent → unmet
      import, trap stub stays.
-   - **Signature handling:** JIT-module exports carry signatures and sema
-     verifies them. v1 `.em` exports do not serialize signatures, so
-     `build_em_exports` marks them `unknown_sig`; those imports are
-     ABI-trusted and skip arity/type/return verification. The host/caller must
-     know the exact ABI. Canonical signatures require a versioned format
-     update (H14).
+   - **Signature handling:** JIT-module and v2 `.em` exports carry canonical
+     `Type` signatures and sema verifies arity, ordered parameter types, and
+     return type. Historical v1 `.em` exports remain `unknown_sig`; those
+     imports are ABI-trusted and skip signature verification.
    - On success → **bake `(target_module_id, target_slot_index)`
      into the call site**, rewriting the `module_id` and `slot_index`
      displacements in the Section 3 sequence from trap-stub placeholders to
@@ -358,10 +356,9 @@ verification applies only to JIT exports.
   "for embedding in game engines"). Out of scope forever, not just
   for v1 of this feature.
 - **No dynamic unloading / module-registry-entry removal.**
-  `HOT_RELOAD.md` Section 5's caller-managed retirement covers *code pages*
-  only after the host establishes quiescence; no epoch scheme ships. It does
-  not remove
-  a `module_t` from the registry once registered. A `module_id` baked
+  `HOT_RELOAD.md` Section 5's guarded epoch retirement covers replaced *code
+  pages* only; it does not remove a `module_t` from the registry once
+  registered. A `module_id` baked
   into a call site (`Section 3`) must remain valid for the caller's lifetime
   - unregistering a module would orphan every cross-module call site
   that cached its id, turning them into registry reads of a stale

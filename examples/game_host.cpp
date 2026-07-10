@@ -75,6 +75,7 @@ static void     n_log(int64_t code) { g_last_log_code = int(code); }
 struct GameModule {
     std::vector<CompiledFn> fns;
     std::unique_ptr<DispatchTable> table;
+    HotReloadDomain reload_domain;
     std::unordered_map<std::string,int> slots;
     GlobalsBlock gb; std::vector<uint8_t> gbs;
     Program prog;
@@ -103,6 +104,7 @@ static std::unique_ptr<GameModule> compile_game(const std::string& src, const Na
     return m;
 }
 static int64_t call_void(GameModule& m, const std::string& fn) {
+    auto guard = m.reload_domain.guard();
     void* e = m.table->get(m.slots[fn]); using F=int64_t(*)(); return reinterpret_cast<F>(e)();
 }
 
@@ -187,15 +189,17 @@ int main(int argc, char** argv) {
         "fn update() -> i64 { let n : i64 = get_entity_count(); let dt : f32 = get_delta_time();"
         " let speed : f32 = get_speed(); let mut i : i64 = 0; while (i < n) { let x : f32 = get_entity_x(i);"
         " set_entity_x(i, x - speed * dt); i = i + 1; } return n; }\n",
-        m->prog, *m->table, ctx, natives.natives, &ov, &layouts);
+        m->prog, *m->table, m->reload_domain, ctx, natives.natives, &ov, &layouts);
     ck(rr.ok, "hot reload of `update` succeeded (mid-loop)");
     if (!rr.ok) std::printf("  [reload error] %s\n", rr.error.c_str());
     if (rr.ok) {
         // 5 more frames, now moving LEFT by 20*1 = 20/frame (speed is 20 after the event)
         for (int f = 0; f < 5; ++f) for (auto& af : ticks) call_void(*m, af.name);
         ck(g_entities[0].x == x0_before_reload - 100.0f, "post-reload: 5 frames moved entity[0] LEFT by 100 (20/frame, new body)");
-        if (rr.old_entry) free_executable(rr.old_entry);
-        m->fns.push_back({rr.new_fn.name, std::move(rr.new_fn.bytes), rr.new_fn.exec, rr.new_fn.entry, {}});
+        // The domain owns the retired page; the host retains only the new page.
+        for (auto& fn : m->fns) if (fn.name == rr.new_fn.name) { fn.exec = nullptr; fn.entry = nullptr; }
+        m->fns.push_back(std::move(rr.new_fn));
+        ck(m->reload_domain.quiesce() == 1, "retired update page reclaimed at host quiescence");
     }
 
     std::printf("\n=== binding API friction check (v1.0 fluent-API decision) ===\n");

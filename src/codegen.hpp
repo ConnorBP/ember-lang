@@ -52,13 +52,16 @@ struct CodeGenCtx {
     ObfOptions obf;   // host-set defaults; @obf annotations layer on top
     const StructLayoutTable* structs = nullptr;  // struct value types (task 1.6)
     void* str_decrypt_fn = nullptr;  // __str_decrypt native (string encryption)
+    std::string str_decrypt_name = "__str_decrypt"; // exact portable binding key
 
     // --- v0.4 safety: non-local trap + budgets (SAFETY_AND_SANDBOX.md §2-§4) ---
     // All compile-flag GATED for zero overhead when disabled. A host running
     // trusted tool scripts leaves these off/null -> no new JIT instructions.
-    // A host running untrusted mods sets them -> one sub+jg per loop
-    // back-edge (budget), one inc+cmp+jcc per script-to-script call (depth),
-    // and traps route through the stub instead of ud2.
+    // A host running untrusted mods sets them -> one coarse sub+jg at each
+    // function entry plus existing loop back-edges (budget), one balanced
+    // inc+cmp+jcc/dec around every script-issued script or native invocation
+    // (combined call-stack depth), and traps route through the stub instead
+    // of ud2.
 
     // Host-provided trap stub (context.hpp TrapStub). When set, EVERY trap
     // site (bounds, budget, depth, @obf_keyed) emits `mov rax,stub; call rax`
@@ -69,18 +72,20 @@ struct CodeGenCtx {
     // stub can record the reason + longjmp. Required when trap_stub is set.
     void* trap_ctx = nullptr;
 
-    // Loop budget (§3): the context pointer is available to generated code;
-    // each loop back-edge does sub [ptr],body_cost +
-    // jg continue / else trap. emit_budget must be true for the checks to
-    // be emitted. budget_remaining starts INT64_MAX (context.hpp) so a host
-    // that enables checks but sets no budget gets no false traps.
+    // Coarse execution budget (§3): each function entry charges the existing
+    // recursive block_cost(body) after frame/parameter setup; loop back-edges
+    // retain their body-cost charges for repeated work. Costs are saturated
+    // to positive imm32 before encoding. emit_budget_checks gates all checks.
+    // budget_remaining starts INT64_MAX (context.hpp), so an enabled host that
+    // sets no budget gets no false traps.
     int64_t* budget_ptr = nullptr;
     bool emit_budget_checks = false;
 
-    // Script-call depth guard (§4): if non-null, each script-to-script call does
-    // inc [ptr] + cmp max + trap-before-call / dec after. emit_depth gates
-    // emission. The depth counter + max live in context_t; codegen needs the
-    // counter address + the max to compare against.
+    // Combined call-stack depth guard (§4): every script-issued invocation,
+    // script or native, does inc [ptr] + cmp max + trap-before-call / dec after
+    // normal return. This counts simultaneous nesting (including native code
+    // that re-enters script), never cumulative sequential calls. Non-local trap
+    // recovery must call context_t::reset_for_call() before the next entry.
     int32_t* depth_ptr = nullptr;
     int32_t max_call_depth = 512;
     bool emit_depth_checks = false;

@@ -31,9 +31,9 @@ can touch them concurrently without ember-side synchronization:
   pointer is explicitly unsafe, `HOT_RELOAD.md §7`). Script→script calls go
   through `call [dispatch_base + slot*8]` (`src/codegen.cpp:647`, `:656`),
   re-reading the slot on every call. → **multi-thread reads of the dispatch
-  table are safe today.** The only caveat is retired-page reclamation:
-  `HOT_RELOAD.md §5` ships caller-managed single-thread retirement and defers
-  any concurrent epoch/quiescence protocol; see §1.3 below.
+  table are safe today.** Retired-page reclamation subsequently shipped as
+  the host-visible guarded epoch protocol in `HOT_RELOAD.md §5`; every outer
+  host invocation must participate in that domain.
 
 - **JIT'd code bytes after `finalize`.** `alloc_executable` commits the page
   (the REDSHELL writeup flagged RWX as a latent V5 catastrophe; v0.4 hardened
@@ -192,11 +192,11 @@ confessed bug.
 > multi-context parallelism covers most real cases without in-context
 > threading."*
 
-`HOT_RELOAD.md §5` now explicitly defers concurrent epoch/quiescence
-reclamation. If a future implementation chooses epochs, per-thread contexts
-are a plausible observation point, but no epoch field or registry is part of
-the shipped model. The context remains the per-call/per-thread unit for the
-mutable execution state that actually exists.
+`HOT_RELOAD.md §5` subsequently shipped concurrent epoch/quiescence
+reclamation without adding epoch fields to per-thread contexts: hosts wrap
+outer calls in a domain `ExecutionGuard`, and the domain tracks active entry
+epochs. There is still no global context registry. The context remains the
+per-call/per-thread unit for mutable execution state.
 
 **Bottom line of §1:** the dispatch table, the JIT'd code, and the registry
 are already shareable. The five things in §1.2 (checkpoint, budget, depth,
@@ -439,8 +439,8 @@ question is handled explicitly (§3 below).
 this: *"a host runs multiple `context_t`s on multiple threads against the
 same `module_t` (allowed — the dispatch table and JIT'd code are read-only
 after compilation except during a hot-reload slot swap, HOT_RELOAD.md §5)."*
-`HOT_RELOAD.md §5` ships caller-owned retirement and defers any concurrent
-quiescence design. D is therefore about context safety, not page reclamation.
+`HOT_RELOAD.md §5` now ships a separate host-owned quiescence domain. Option D
+remains about context safety; a context does not itself own reclamation state.
 
 **What changes.**
 - **Host API.** A host wanting N concurrent caller threads allocates N
@@ -673,10 +673,9 @@ to the `aint*` batch — U2).
   Nested (a native calling back into `ember_call` from within a call) ships
   later, building on the now-safe single-`jmp_buf`.
 
-- **Concurrent hot-reload reclamation** (`HOT_RELOAD §5`) — remains a later
-  host epoch/quiescence task. This plan does not add speculative epoch fields
-  to `context_t`; single-threaded caller-owned retirement remains the shipped
-  path.
+- **Concurrent hot-reload reclamation** (`HOT_RELOAD §5`) — subsequently
+  shipped as a separate host epoch/quiescence domain. It intentionally adds no
+  epoch fields to `context_t`; the outer host invocation owns an RAII guard.
 
 - **Cross-thread forced unwind / preemptible wall-clock timeout**
   (`SAFETY §3` explicit deferral: "cross-thread forced unwind of running JIT
@@ -774,6 +773,6 @@ test. Those are later batches.
 | CLI calls JIT'd entry via raw fn-ptr (no `ember_call`) | `examples/ember_cli.cpp:432` (raw `reinterpret_cast<F0>(entry)()`); `src/engine.hpp`/`engine.cpp` have no `ember_call` |
 | Trap stub `__builtin_longjmp`s the passed ctx | `examples/ember_cli.cpp:97`–`110` |
 | Spec: per-`context_t` parallelism allowed, in-context not | `docs/SAFETY_AND_SANDBOX.md §8` |
-| Hot reload: caller-managed retirement; concurrent epochs deferred | `docs/HOT_RELOAD.md §5` |
+| Hot reload: outer-call guards + concurrent epoch reclamation | `docs/HOT_RELOAD.md §5` |
 | ROADMAP: `aint*`/`thread` deferred; multi-context covers most | `docs/ROADMAP.md` Tier 5 (`:119`–`125`) |
 | REDSHELL: trap-surface / budgets / checkpoint spec | `EMBER_REDSHELL_WRITEUP.md` §0, V6-DoS, V7 (workspace root) |

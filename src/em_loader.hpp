@@ -26,15 +26,12 @@
 // cross-module call site with no registry to bind to would execute a wild
 // jump on the first call, which is worse than a loud load-time reject.
 //
-// TRUST/PORTABILITY NOTE: v1 `.em` is ABI/process-trusted native code. It can
-// embed process-local native-function, trap-stub, function-reference allowlist,
-// and string-storage pointers for which v1 has no relocation/binding record.
-// Consequently it is not a portable cross-process artifact and is not an
-// untrusted-code container. `.em` imports likewise have no serialized canonical
-// signatures in v1 and must be treated as ABI-trusted rather than link-verified.
-// TODO(v2): symbolic bindings, canonical import/export signatures, and optional
-// signature/authentication support require a versioned format; do not silently
-// change or reinterpret v1.
+// COMPATIBILITY: historical v1 remains ABI/process-trusted and exposes unknown
+// signatures. v2 is cross-process bindable: it checks deterministic compiler/
+// target identities before allocation, carries canonical export signatures,
+// function-local rodata relocations, and resolves symbolic natives exclusively
+// through the host allowlist. This is still native code, not a sandbox or an
+// authenticated untrusted-code container.
 //
 // prism port note (RESTRUCTURE_PLAN.md Section 5): the standalone loader used an
 // RAII `ExecArena` per function (owning a VirtualAlloc page); prism's
@@ -51,6 +48,9 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <unordered_map>
+
+#include "sema.hpp"
 
 #include "em_file.hpp"          // EM_MAGIC, EM_VERSION, EM_NO_ENTRY, EM_HEADER_SIZE, EmReloc
 #include "jit_memory.hpp"       // alloc_executable / free_executable
@@ -81,6 +81,11 @@ struct LoadedModule {
     std::vector<void*>                             pages;        // owns the exec pages (one per function)
     std::vector<std::pair<std::string, uint32_t>>   name_table;  // name -> slot (for ember_call by name)
     uint32_t                                       entry_slot = EM_NO_ENTRY;
+    uint32_t                                       format_version = EM_VERSION_V1;
+    // v2 canonical signatures indexed by dispatch slot. Name-directory aliases
+    // resolve to a slot first, so duplicate/aliased names cannot lose metadata.
+    // Empty for v1 (whose signatures are intentionally ABI-trusted unknown).
+    std::vector<EmSignature>                       signatures_by_slot;
 
     LoadedModule() = default;
     ~LoadedModule();
@@ -118,6 +123,7 @@ struct LoadedModule {
 // standard-library exceptions all surface as `false` plus a categorized
 // `*err` message. Disk-controlled counts/sizes are bounded before allocation.
 bool load_em_file(const char* path, LoadedModule& out, std::string* err,
-                  ModuleRegistry* registry = nullptr);
+                  ModuleRegistry* registry = nullptr,
+                  const std::unordered_map<std::string, NativeSig>* native_bindings = nullptr);
 
 } // namespace ember

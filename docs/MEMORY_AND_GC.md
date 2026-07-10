@@ -122,8 +122,8 @@ void* arena_alloc(Arena*, size_t size, size_t align); // bump offset up, aligned
 void  arena_reset(Arena*, size_t mark = 0);            // rewind offset, invalidates everything allocated after `mark`
 ```
 - One arena per `context_t` (matching checkpoint/depth-counter scoping in
-  SAFETY_AND_SANDBOX.md Section 2/Section 4; no epoch field ships) is the
-  proposed natural per-execution-session
+  SAFETY_AND_SANDBOX.md Section 2/Section 4; hot-reload epochs live separately
+  in `HotReloadDomain`) is the proposed natural per-execution-session
   scope for all of these).
 - **Reset point**: an explicit `arena_reset` called by the host between
   logical units of work (e.g. once per game frame, or once per
@@ -155,8 +155,8 @@ source (`"hello"`) is emitted as a `RipFixup`-referenced rodata blob
 (CODEGEN_SPEC.md Section 4) embedded in the *literal's containing function's*
 compiled code - i.e. string literals are function-local rodata, valid
 for exactly as long as that function's code page is alive (which, per
-HOT_RELOAD.md Section 5's caller-owned retirement (and deferred concurrent reclamation), is at least as long as any
-in-flight call into that function version - so a literal's lifetime
+HOT_RELOAD.md Section 5's guarded epoch retirement is at least as long as any
+in-flight outer call that could execute that function version - so a literal's lifetime
 is never shorter than any code that could reference it). A slice
 value derived from a literal follows the same "cannot escape via
 return/global-store from a *different* code page than the one holding

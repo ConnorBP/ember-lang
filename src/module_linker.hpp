@@ -45,12 +45,9 @@ inline std::vector<ModuleExport> build_jit_exports(const Program& prog, uint32_t
     return out;
 }
 
-// Build the ModuleExportTable entry for a v1 .em-loaded module: one export per
-// name_table entry. v1 stores name+slot only, so these are explicitly
-// ABI-TRUSTED UNKNOWN signatures: sema cannot verify arity, argument types, or
-// return type, and the host/caller must supply the exact original ABI.
-// TODO(format v2): version the format and serialize canonical export/import
-// signatures before enabling link-time verification. Do not reinterpret v1.
+// Build one export per name-directory entry. v2 looks up its canonical
+// signature by slot, so aliases remain typed and duplicate names cannot shadow
+// metadata. v1 stores no signatures and remains ABI-TRUSTED UNKNOWN.
 inline std::vector<ModuleExport> build_em_exports(const LoadedModule& mod, uint32_t module_id) {
     std::vector<ModuleExport> out;
     out.reserve(mod.name_table.size());
@@ -59,9 +56,13 @@ inline std::vector<ModuleExport> build_em_exports(const LoadedModule& mod, uint3
         exp.fn_name = name;
         exp.module_id = module_id;
         exp.slot = int(slot);
-        exp.unknown_sig = true;  // v1 ABI-trusted unknown signature
-        // ret/params left default; sema deliberately skips all signature
-        // checking because the v1 file contains no data with which to verify.
+        if (mod.format_version >= EM_VERSION && slot < mod.signatures_by_slot.size()) {
+            exp.ret = mod.signatures_by_slot[slot].ret;
+            exp.params = mod.signatures_by_slot[slot].params;
+            exp.unknown_sig = false;
+        } else {
+            exp.unknown_sig = true;  // v1 ABI-trusted unknown signature
+        }
         out.push_back(std::move(exp));
     }
     return out;
@@ -81,8 +82,9 @@ inline uint32_t register_jit_module(ModuleRegistry& reg, const std::string& name
 // lifetime, since the registry holds a pointer to its dispatch table).
 // On failure returns false + sets *err (out is partially filled; discard it).
 inline bool link_em_file(ModuleRegistry& reg, const char* path, const std::string& name,
-                        LoadedModule& out, std::string* err = nullptr) {
-    if (!load_em_file(path, out, err, &reg)) return false;
+                        LoadedModule& out, std::string* err = nullptr,
+                        const std::unordered_map<std::string, NativeSig>* natives = nullptr) {
+    if (!load_em_file(path, out, err, &reg, natives)) return false;
     uint32_t id = reg.register_module(name, out.dispatch.data(), err);
     if (id == UINT32_MAX) return false;
     return true;

@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -161,6 +162,28 @@ int main() {
     std::printf("=== Win64 ABI regression (H3-H5) ===\n");
     constexpr uint64_t seed13 = 0x1122334455667788ull;
     constexpr uint64_t seed14 = 0x8877665544332211ull;
+
+    {
+        X64Emitter emitter;
+        Label target = emitter.alloc_label();
+        emitter.jmp(target);
+        emitter.byte(0x90);
+        emitter.bind(target);
+        emitter.resolve_fixups();
+        bool normal_ok = emitter.code.size() == 6 && emitter.code[0] == 0xE9 &&
+                         emitter.code[1] == 1 && emitter.code[2] == 0 &&
+                         emitter.code[3] == 0 && emitter.code[4] == 0;
+        check(normal_ok, "emitter label resolves normally");
+
+        bool duplicate_ice = false;
+        try {
+            emitter.bind(target);
+        } catch (const std::logic_error& e) {
+            duplicate_ice = std::string(e.what()).find(
+                "internal compiler error: duplicate label") != std::string::npos;
+        }
+        check(duplicate_ice, "emitter duplicate label raises deterministic ICE");
+    }
 
     {
         Module m;

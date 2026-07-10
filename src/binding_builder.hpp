@@ -77,7 +77,28 @@ public:
     BindingBuilder& add_overload(const char* type_name, int op, Type ret, void* fn) {
         OpOverload o;
         o.fn_ptr = fn;
-        o.fn_name = std::string(type_name) + "_op";
+        const char* suffix = "op";
+        switch (static_cast<BinExpr::Op>(op)) {
+        case BinExpr::Op::Add: suffix = "add"; break;
+        case BinExpr::Op::Sub: suffix = "sub"; break;
+        case BinExpr::Op::Mul: suffix = "mul"; break;
+        case BinExpr::Op::Div: suffix = "div"; break;
+        case BinExpr::Op::Mod: suffix = "mod"; break;
+        case BinExpr::Op::And: suffix = "and"; break;
+        case BinExpr::Op::Or: suffix = "or"; break;
+        case BinExpr::Op::Xor: suffix = "xor"; break;
+        case BinExpr::Op::Shl: suffix = "shl"; break;
+        case BinExpr::Op::Shr: suffix = "shr"; break;
+        case BinExpr::Op::Eq: suffix = "eq"; break;
+        case BinExpr::Op::Neq: suffix = "neq"; break;
+        case BinExpr::Op::Lt: suffix = "lt"; break;
+        case BinExpr::Op::Le: suffix = "le"; break;
+        case BinExpr::Op::Gt: suffix = "gt"; break;
+        case BinExpr::Op::Ge: suffix = "ge"; break;
+        case BinExpr::Op::LAnd: suffix = "land"; break;
+        case BinExpr::Op::LOr: suffix = "lor"; break;
+        }
+        o.fn_name = std::string(type_name) + "_" + suffix;
         o.ret = std::move(ret);
         o.params = {bind_prim(Prim::I64), bind_prim(Prim::I64)};
         overloads_.register_op(type_name, op, std::move(o));

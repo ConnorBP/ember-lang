@@ -1,0 +1,15 @@
+// Valid M5 regression: defer cleanup occurs at lexical block exit while
+// declaration-before-use locals are still live and addressable.
+global trace: i64 = 0;
+fn mark(v: i64) -> i64 { trace = trace * 10 + v; return 0; }
+fn probe() -> i64 {
+    let local: i64 = 7;
+    defer mark(local);
+    return 0;
+}
+fn main() -> i64 {
+    trace = 0;
+    probe();
+    if (trace != 7) { return 1; }
+    return 94;
+}

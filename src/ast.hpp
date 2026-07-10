@@ -99,6 +99,7 @@ struct StringLit: Expr { std::string s;            // slice<u8> to host rodata
     // ITS result (an i64 string handle) as this expression's value instead.
     bool implicit_to_string = false;
     void* to_string_native_fn = nullptr;
+    std::string to_string_native_name;
 };
 struct Ident    : Expr { std::string name; };
 struct BinExpr  : Expr { enum class Op {
@@ -110,6 +111,12 @@ struct BinExpr  : Expr { enum class Op {
     // call instead of inline arithmetic.
     bool is_overload = false;
     void* overload_fn = nullptr;
+    // Sema preserves the exact symbolic overload binding selected from the
+    // OpOverloadTable. Codegen must not reverse-map overload_fn: aliases can
+    // share an address, and overload-only symbols need not exist in natives.
+    std::string overload_name;
+    Type overload_ret;
+    std::vector<Type> overload_params;
 };
 struct UnaryExpr: Expr { enum class Op { Neg,Not,BitNot } op; ExprPtr operand; };
 struct CastExpr : Expr { ExprPtr operand; std::shared_ptr<Type> to; };
@@ -121,6 +128,9 @@ struct FnHandleExpr : Expr { ExprPtr operand; int slot = -1; };
 struct CallExpr : Expr { std::string name; std::vector<ExprPtr> args;
                          // sema-resolved target (native fn ptr or script slot)
                          bool is_native = false; void* native_fn = nullptr;
+                         // Exact native-table key selected by sema. This is the
+                         // portable .em identity; never recover it from fn_ptr.
+                         std::string native_binding_name;
                          int script_slot = -1;
                          // v0.5 cross-module: non-empty module_alias = a `mod::fn()` call.
                          // Sema resolves it against the linked-module export table; if the

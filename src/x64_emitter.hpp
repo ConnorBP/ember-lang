@@ -50,8 +50,15 @@ struct AbsFixup {
     enum Kind : uint8_t {
         DispatchTableBase  = 0,  // patch with &module_dispatch_table
         GlobalsBase        = 1,  // patch with &module_globals_block
-        ModuleRegistryBase = 2,  // reserved; cross-module import (unused in v1)
+        ModuleRegistryBase = 2,  // cross-module registry
+        FunctionRodataBase = 3,  // patch with function code-end + addend
     } kind = DispatchTableBase;
+    uint32_t addend = 0;
+};
+
+struct NativeFixup {
+    uint32_t code_offset = 0;
+    std::string name;
 };
 
 class X64Emitter {
@@ -79,7 +86,11 @@ public:
     // Two-pass: branches emit a rel32 placeholder + record a fixup;
     // resolve_fixups() backpatches once all labels are bound.
     Label alloc_label() { return {next_label++}; }
-    void bind(Label l) { bound[l.id] = uint32_t(code.size()); }
+    void bind(Label l) {
+        if (bound.find(l.id) != bound.end())
+            throw std::logic_error("internal compiler error: duplicate label");
+        bound[l.id] = uint32_t(code.size());
+    }
 
     // --- low-level byte emission ---
     void byte(uint8_t b) { code.push_back(b); }
@@ -126,17 +137,26 @@ public:
     // serializer records the reloc; at `.em`-load time the loader patches it.
     // The existing mov_reg_imm64(dst, imm) with a real immediate is left
     // unchanged for genuinely-constant pointers (native fn ptrs, etc.).
-    void mov_reg_imm64_external(Reg dst, AbsFixup::Kind kind) {
+    void mov_reg_imm64_external(Reg dst, AbsFixup::Kind kind, uint32_t addend = 0) {
         byte(rex(true, false, false, is_extended(dst)));
         byte(uint8_t(0xB8 + (uint8_t(dst) & 7)));
         uint32_t imm_off = uint32_t(code.size()); // imm64 placeholder lives here
         for (int i = 0; i < 8; ++i) code.push_back(0); // 8 zero placeholder bytes
-        abs_fixups_.push_back({imm_off, kind});
+        abs_fixups_.push_back({imm_off, kind, addend});
+    }
+
+    void mov_reg_native(Reg dst, const std::string& name) {
+        byte(rex(true, false, false, is_extended(dst)));
+        byte(uint8_t(0xB8 + (uint8_t(dst) & 7)));
+        uint32_t imm_off = uint32_t(code.size());
+        for (int i = 0; i < 8; ++i) code.push_back(0);
+        native_fixups_.push_back({imm_off, name});
     }
 
     // Read-only view of the absolute-imm64 fixups for the `.em` serializer
     // (BUNDLING_AND_EM_MODULES.md Section 2.4). Not consumed by resolve_fixups.
     const std::vector<AbsFixup>& abs_fixups() const { return abs_fixups_; }
+    const std::vector<NativeFixup>& native_fixups() const { return native_fixups_; }
 
     // add r64, r64  -> REX.W 01 /r (mod=11, reg=src, rm=dst)
     void add_reg_reg(Reg dst, Reg src) {
@@ -448,6 +468,7 @@ private:
     struct Fixup { uint32_t code_offset; uint32_t label_id; bool is_rel8; };
     std::vector<Fixup> pending;
     std::vector<AbsFixup> abs_fixups_;
+    std::vector<NativeFixup> native_fixups_;
 };
 
 } // namespace ember

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <algorithm>
 #include <array>
+#include <limits>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -50,8 +51,43 @@ struct CG {
     int32_t frame_size = 0;
     bool makes_calls = false;
     int max_args = 0;
+    std::vector<uint8_t> rodata;
+    std::string non_serializable_reason;
+    struct PendingNative {
+        CompiledNativeBinding binding;
+        void* target = nullptr; // JIT-only; never serialized
+    };
+    std::vector<PendingNative> pending_natives;
 
     CG(const CodeGenCtx& c, const FuncDecl& fn) : ctx(c), f(fn) {}
+
+    void emit_native(Reg dst, void* ptr, const std::string& name,
+                     const Type* ret, const std::vector<Type>* params,
+                     const char* feature) {
+        if (name.empty() || !ret || !params) {
+            if (non_serializable_reason.empty()) non_serializable_reason = std::string(feature) + " has no complete symbolic NativeSig binding";
+            e.mov_reg_imm64(dst, int64_t(ptr));
+            return;
+        }
+        e.mov_reg_native(dst, name);
+        PendingNative pending;
+        pending.binding.code_offset = e.native_fixups().back().code_offset;
+        pending.binding.name = name;
+        pending.binding.ret = *ret;
+        pending.binding.params = *params;
+        pending.target = ptr;
+        pending_natives.push_back(std::move(pending));
+    }
+    const NativeSig* native_named(const std::string& name) const {
+        if (!ctx.natives || name.empty()) return nullptr;
+        auto it = ctx.natives->find(name);
+        return it == ctx.natives->end() ? nullptr : &it->second;
+    }
+    uint32_t append_rodata(const uint8_t* data, size_t size) {
+        uint32_t off = uint32_t(rodata.size());
+        rodata.insert(rodata.end(), data, data + size);
+        return off;
+    }
 
     // Exact byte width of an Ember-layout value. Struct fields are tightly
     // packed and fixed arrays recurse through their element type, so neither
@@ -233,6 +269,8 @@ struct CG {
     // freely clobber rax/rcx/rdx/r8 here.
     void emit_trap(int reason_ord, const char* detail) {
         if (ctx.trap_stub) {
+            if (non_serializable_reason.empty())
+                non_serializable_reason = "trap stub/context/detail pointers require a host runtime binding";
             // Emitter invariant: rsp must be 16-byte aligned immediately
             // before every Win64 call.  Reserve exactly the mandatory 32-byte
             // shadow space plus only the padding required by the tracked
@@ -256,49 +294,53 @@ struct CG {
         }
     }
 
-    // v0.4 instruction budget (SAFETY_AND_SANDBOX.md §3). Emitted at LOOP
-    // BACK-EDGES ONLY (the actual runaway-loop catch point), gated by
+    // v0.4/M4 instruction budget (SAFETY_AND_SANDBOX.md §3). Emitted at
+    // function entry and preserved at loop back-edges, gated by
     // ctx.emit_budget_checks + ctx.budget_ptr. Zero emitted when off.
     //   mov rax, budget_ptr
-    //   sub qword [rax], body_cost   ; coarse per-iteration instruction count
-    //   jg  .continue                ; budget_remaining > 0, keep looping
+    //   sub qword [rax], body_cost   ; coarse entry/per-iteration cost
+    //   jg  .continue                ; budget_remaining > 0, keep executing
     //   emit_trap(BudgetExceeded)   ; else trap (longjmp to checkpoint)
     //   .continue:
-    // body_cost is a coarse statement count of the loop body (the spec's
-    // "how much work happened" proxy — not cycle-accurate, just enough that
-    // a true infinite loop drives it to zero in finite iterations). A bare
-    // `while(true){}` floors at 1 so even an empty infinite loop is caught.
-    void emit_budget_check(int64_t body_cost) {
+    // body_cost is a coarse recursive statement count (the spec's "how much
+    // work happened" proxy — not cycle-accurate). A bare block floors at 1.
+    // x64 `sub r/m64, imm32` sign-extends its immediate, so never cast a large
+    // legal estimator result directly: clamp to the largest positive imm32.
+    void emit_budget_check(int64_t body_cost, const char* detail) {
         if (!ctx.emit_budget_checks || body_cost <= 0) return;
+        const int32_t encoded_cost = body_cost > std::numeric_limits<int32_t>::max()
+            ? std::numeric_limits<int32_t>::max() : int32_t(body_cost);
         if (!ctx.use_context_reg && !ctx.budget_ptr) return;  // baked mode needs a ptr
+        if (!ctx.use_context_reg && non_serializable_reason.empty())
+            non_serializable_reason = "instruction-budget storage is process-local";
         if (ctx.use_context_reg) {
             // B1: sub qword [r14 + off_budget], imm32. r14 = context_t*, budget_remaining is a field.
             // sub r/m,imm32 = opcode 81 /5 (modrm.reg=5). rm=r14 (low3=6, REX.B).
             // REX.WB (49: W=64, B=r14) + 81 + modrm(10,reg=101,rm=110)=0xAE + disp32 + imm32.
-            e.byte(0x49); e.byte(0x81); e.byte(0xAE); e.imm32(context_offsets::budget()); e.imm32(int32_t(body_cost));
+            e.byte(0x49); e.byte(0x81); e.byte(0xAE); e.imm32(context_offsets::budget()); e.imm32(encoded_cost);
         } else {
             e.mov_reg_imm64(Reg::rax, int64_t(ctx.budget_ptr));
             // sub qword ptr [rax], imm32 : REX.W (48) + opcode 81 /5 + imm32
-            e.byte(0x48); e.byte(0x81); e.byte(0x28); e.imm32(int32_t(body_cost));
+            e.byte(0x48); e.byte(0x81); e.byte(0x28); e.imm32(encoded_cost);
         }
         Label cont = e.alloc_label();
         e.jcc(Cond::g, cont);              // budget_remaining > 0 -> continue
-        emit_trap(int(TrapReason::BudgetExceeded), "budget exceeded at loop back-edge");
+        emit_trap(int(TrapReason::BudgetExceeded), detail);
         e.bind(cont);
     }
 
-    // Coarse per-iteration cost of a loop body: count statements (each ~a few
-    // emitted instructions). Floors at 1 so an empty infinite loop is caught.
+    // Coarse recursive function/block cost: count statements (each ~a few
+    // emitted instructions). Floors at 1 and saturates at positive imm32 max.
     int64_t block_cost(const Block& b);
     int64_t stmt_cost(const Stmt& s);
 
-    // v0.4 stack-depth guard (SAFETY_AND_SANDBOX.md §4). Emitted at
-    // SCRIPT-TO-SCRIPT call entry only (not native calls — natives have
-    // their own stacks), gated by ctx.emit_depth_checks + ctx.depth_ptr.
+    // v0.4/M4 combined call-depth guard (SAFETY_AND_SANDBOX.md §4). Emitted
+    // for every script-issued script or native call. Native re-entry therefore
+    // remains nested while the earlier native invocation is active.
     // Zero emitted when off. Pairs with emit_depth_leave() after the call.
     //   mov rax, depth_ptr
     //   inc dword [rax]            ; ++call_depth
-    //   cmp dword [rax], max       ; depth >= max?
+    //   cmp dword [rax], max       ; depth reached max?
     //   jge .trap                  ; yes -> overflow
     //   .ok:
     //   <the call>
@@ -306,6 +348,8 @@ struct CG {
     void emit_depth_check() {
         if (!ctx.emit_depth_checks) return;
         if (!ctx.use_context_reg && !ctx.depth_ptr) return;
+        if (!ctx.use_context_reg && non_serializable_reason.empty())
+            non_serializable_reason = "call-depth storage is process-local";
         if (ctx.use_context_reg) {
             // B1: inc dword [r14+off_depth]; cmp dword [r14+off_depth], max.
             // inc r/m = FF /0 (modrm.reg=0). rm=r14(low3=6, REX.B). modrm(10,000,110)=0x86.
@@ -336,6 +380,23 @@ struct CG {
             e.byte(0x49); e.byte(0xFF); e.byte(0x0A);  // dec dword ptr [r10]
         }
     }
+    // All script-issued native paths use this wrapper, including ordinary
+    // calls, hidden-pointer struct returns, overloads, and string helpers.
+    // The check precedes target materialization because baked-pointer depth
+    // checks use rax as scratch; leave preserves integer and SSE returns.
+    void emit_counted_native_call(void* ptr, const std::string& name,
+                                  const Type* ret, const std::vector<Type>* params,
+                                  const char* feature) {
+        emit_depth_check();
+        emit_native(Reg::rax, ptr, name, ret, params, feature);
+        e.call_reg(Reg::rax);
+        emit_depth_leave();
+    }
+    void emit_counted_named_native(void* ptr, const std::string& name, const char* feature) {
+        const NativeSig* sig = native_named(name);
+        emit_counted_native_call(ptr, name, sig ? &sig->ret : nullptr,
+                                 sig ? &sig->params : nullptr, feature);
+    }
 
     // v1.0 Tier 2 REDSHELL guard #6 (plan_FUNCTION_REFS.md §5.2): validate that
     // the i64 in rax is a registered script-fn slot before it's used as a
@@ -351,6 +412,8 @@ struct CG {
     // fn-slot-count-0 case — function refs unused, e.g. all existing modules).
     void emit_call_target_guard() {
         if (ctx.fn_slot_count <= 0 || ctx.fn_allowlist_base == 0) return;  // no allowlist = no indirect calls = no guard
+        if (non_serializable_reason.empty())
+            non_serializable_reason = "function-reference allowlist storage is process-local";
         Label trap = e.alloc_label();
         // 1. Range: cmp rax, slot_count; jae .trap (unsigned). cmp r64,imm32: REX.W 81 /7.
         e.byte(0x48); e.byte(0x81); e.byte(0xF8); e.imm32(int32_t(ctx.fn_slot_count));  // cmp rax, imm32
@@ -697,7 +760,12 @@ struct CG {
     // is_switch: a switch pushes a frame too (so `break` can exit it via the
     // same mechanism) but `continue` must skip past it to the nearest real
     // loop - switch is a break-only construct, not a loop.
-    struct LoopCtx { Label cont; Label brk; bool is_switch = false; };
+    struct LoopCtx {
+        Label cont;
+        Label brk;
+        bool is_switch = false;
+        size_t cleanup_depth = 0; // lexical cleanup scopes retained by this transfer
+    };
     std::vector<LoopCtx> loops;
 
     // Item E ("hot local pinning"): at most one pin active at a time,
@@ -711,30 +779,64 @@ struct CG {
     // reloading from [rbp+off] - but the stack slot stays the always-synced
     // backing store (write-through on every write), so nothing outside
     // those two fast paths needs to know pinning exists at all.
-    struct PinState { std::string name; Reg reg; };
+    struct PinState { std::string name; int32_t offset; Reg reg; };
     std::optional<PinState> active_pin;
 
-    // --- defer (function-scoped, LIFO at every return/fall-off-end) ---
-    // v1 semantic: each textual `defer EXPR;` site gets one runtime flag,
-    // set when control reaches it. At every function exit, flags are checked
-    // in reverse (LIFO) order and each set flag's EXPR runs once. Known
-    // simplification vs. Go: a defer inside a loop body fires at most once
-    // per call regardless of iteration count (a static flag, not a dynamic
-    // per-iteration stack) - correct for the common "conditional cleanup"
-    // pattern (`if (opened) { defer close(f); }`), not for loop-accumulated
-    // defers. Populated by compile_func's collect_defers pass before the
-    // body is walked (DeferStmt codegen needs its flag's offset up front).
-    std::vector<const DeferStmt*> defer_sites;
-    std::vector<int32_t> defer_flag_offsets;
-    void emit_defers() {
-        for (int i = int(defer_sites.size()) - 1; i >= 0; --i) {
-            e.load_reg_mem(Reg::rax, Reg::rbp, defer_flag_offsets[size_t(i)]);
-            e.cmp_reg_imm32(Reg::rax, 0);
-            Label skip = e.alloc_label();
-            e.jcc(Cond::e, skip);
-            eval(*defer_sites[size_t(i)]->expr); // side effect only; result discarded
-            e.bind(skip);
-        }
+    // --- lexical defer cleanup scopes ---
+    // Every lexical Block pushes one cleanup scope while it is emitted. A
+    // textual defer site owns a frame flag plus the local binding environment
+    // visible at its declaration. The flag is reset whenever the owning block
+    // is entered, set when the statement is reached, and cleared immediately
+    // before its expression runs. This makes loop-body sites per-iteration and
+    // prevents a conditional cleanup edge followed by fallthrough from firing
+    // the same activation twice.
+    struct DeferSite {
+        const DeferStmt* stmt = nullptr;
+        int32_t flag_offset = 0;
+        std::unordered_map<std::string, int32_t> locals_at_decl;
+        std::unordered_map<std::string, const Type*> types_at_decl;
+    };
+    struct CleanupScope { std::vector<size_t> reached_sites; };
+    std::vector<DeferSite> defer_sites;
+    std::unordered_map<const DeferStmt*, size_t> defer_site_indices;
+    std::vector<CleanupScope> cleanup_scopes;
+
+    void emit_defer_site(size_t index) {
+        DeferSite& site = defer_sites[index];
+        e.load_reg_mem(Reg::rax, Reg::rbp, site.flag_offset);
+        e.cmp_reg_imm32(Reg::rax, 0);
+        Label skip = e.alloc_label();
+        e.jcc(Cond::e, skip);
+        // Clear first: this activation executes at most once even when another
+        // generated edge later reaches the same cleanup code.
+        e.mov_reg_imm64(Reg::rax, 0);
+        e.store_reg_mem(Reg::rbp, site.flag_offset, Reg::rax);
+        auto saved_locals = locals;
+        auto saved_types = local_types;
+        auto saved_pin = active_pin;
+        active_pin.reset();
+        locals = site.locals_at_decl;
+        local_types = site.types_at_decl;
+        eval(*site.stmt->expr);
+        locals = std::move(saved_locals);
+        local_types = std::move(saved_types);
+        if (saved_pin) e.load_reg_mem(saved_pin->reg, Reg::rbp, saved_pin->offset);
+        active_pin = std::move(saved_pin);
+        e.bind(skip);
+    }
+    void emit_cleanup_scope(size_t index) {
+        const auto& reached = cleanup_scopes[index].reached_sites;
+        for (auto it = reached.rbegin(); it != reached.rend(); ++it)
+            emit_defer_site(*it);
+    }
+    void emit_cleanups_to(size_t retained_depth) {
+        for (size_t n = cleanup_scopes.size(); n > retained_depth; --n)
+            emit_cleanup_scope(n - 1);
+    }
+    bool has_active_cleanups() const {
+        for (const auto& scope : cleanup_scopes)
+            if (!scope.reached_sites.empty()) return true;
+        return false;
     }
 
     // --- struct-by-value return (hidden pointer) ---
@@ -811,8 +913,7 @@ struct CG {
             e.store_reg_mem(Reg::rsp, dst, Reg::rax);
         }
         if (c.is_native) {
-            e.mov_reg_imm64(Reg::rax, int64_t(c.native_fn));
-            e.call_reg(Reg::rax);
+            emit_counted_named_native(c.native_fn, c.native_binding_name, "native call");
         } else if (!c.module_alias.empty()) {
             // v0.5 cross-module call (mod::fn): kind-2 registry-hop sequence.
             emit_depth_check();
@@ -1160,8 +1261,9 @@ void CG::eval(const Expr& ex) {
             e.byte(0x48); e.byte(0x8B); e.byte(0x0C); e.byte(0x24);
             e.byte(0x48); e.byte(0x8B); e.byte(0x54); e.byte(0x24); e.byte(0x08);
             // call overload_fn
-            e.mov_reg_imm64(Reg::rax, int64_t(b->overload_fn));
-            e.call_reg(Reg::rax);
+            emit_counted_native_call(b->overload_fn, b->overload_name,
+                                     &b->overload_ret, &b->overload_params,
+                                     "operator overload");
             e.add_reg_imm32(Reg::rsp, 48);
             return;
         }
@@ -1196,7 +1298,7 @@ void CG::eval(const Expr& ex) {
                 case BinExpr::Op::Xor: result = li->v ^ ri->v; break;
                 // x86 shl/sar mask the shift count to 0-63 for a 64-bit
                 // operand; replicate that so folded and unfolded code agree.
-                case BinExpr::Op::Shl: result = li->v << (ri->v & 63); break;
+                case BinExpr::Op::Shl: result = int64_t(uint64_t(li->v) << (ri->v & 63)); break;
                 case BinExpr::Op::Shr: result = li->v >> (ri->v & 63); break;
                 default: folded = false; break;
                 }
@@ -1791,15 +1893,16 @@ void CG::eval(const Expr& ex) {
             e.store_reg_mem(Reg::rsp, dst, Reg::rax);
         }
         if (c->is_native) {
-            // mov rax, imm64(native_fn); call rax
-            e.mov_reg_imm64(Reg::rax, int64_t(c->native_fn));
-            e.call_reg(Reg::rax);
+            // mov rax, native target; call rax, with combined depth accounting
+            emit_counted_named_native(c->native_fn, c->native_binding_name, "native call");
         } else if (!c->module_alias.empty()) {
             // v0.5 cross-module call (mod::fn): kind-2 registry-hop sequence.
             emit_depth_check();
             emit_cross_module_call(*c);
             emit_depth_leave();
         } else if (c->is_indirect) {
+            if (non_serializable_reason.empty())
+                non_serializable_reason = "function-reference call requires process-local allowlist storage";
             // v1.0 Tier 2 first-class call (plan_FUNCTION_REFS.md §5.1): dispatch
             // through the runtime handle. emit_depth_check may clobber rax
             // (non-B1 mode), so RELOAD the handle from [rsp+stash_size] AFTER it
@@ -1828,6 +1931,7 @@ void CG::eval(const Expr& ex) {
         return;
     }
     if (auto* lit = dynamic_cast<const StringLit*>(&ex)) {
+        const uint32_t string_off = append_rodata(lit->baked_ptr, size_t(lit->baked_len));
         // slice ABI: rax=ptr, rdx=len.
         // String encryption (default): if the string is XOR-encrypted in
         // rodata, emit a __str_decrypt(enc_ptr, len, key) call instead of
@@ -1841,14 +1945,14 @@ void CG::eval(const Expr& ex) {
             int32_t call_sz = 32; // shadow space for 3-arg call
             e.sub_reg_imm32(Reg::rsp, call_sz);
             // mov rcx, enc_ptr
-            e.mov_reg_imm64(Reg::rcx, int64_t(lit->baked_ptr));
+            e.mov_reg_imm64_external(Reg::rcx, AbsFixup::FunctionRodataBase, string_off);
             // mov rdx, len
             e.mov_reg_imm64(Reg::rdx, lit->baked_len);
             // mov r8, key
             e.mov_reg_imm64(Reg::r8, int64_t(lit->baked_key));
             // call __str_decrypt (host-provided native)
-            e.mov_reg_imm64(Reg::rax, int64_t(ctx.str_decrypt_fn));
-            e.call_reg(Reg::rax);
+            emit_counted_named_native(ctx.str_decrypt_fn, ctx.str_decrypt_name,
+                                      "string decrypt native");
             // add rsp, shadow
             e.add_reg_imm32(Reg::rsp, call_sz);
             // rax = decrypted ptr (from native), rdx = len (preserved by callee? no -
@@ -1856,7 +1960,7 @@ void CG::eval(const Expr& ex) {
             e.mov_reg_imm64(Reg::rdx, lit->baked_len);
         } else {
             // unencrypted: raw pointer (backward compat / key=0)
-            e.mov_reg_imm64(Reg::rax, int64_t(lit->baked_ptr));
+            e.mov_reg_imm64_external(Reg::rax, AbsFixup::FunctionRodataBase, string_off);
             e.mov_reg_imm64(Reg::rdx, lit->baked_len);
         }
         // Implicit conversion to a `string` handle (see sema.cpp's StringLit
@@ -1877,8 +1981,9 @@ void CG::eval(const Expr& ex) {
             e.mov_reg_reg(Reg::rcx, Reg::rax);
             int32_t call_sz = 32; // shadow space for a 2-arg call
             e.sub_reg_imm32(Reg::rsp, call_sz);
-            e.mov_reg_imm64(Reg::rax, int64_t(lit->to_string_native_fn));
-            e.call_reg(Reg::rax);
+            emit_counted_named_native(lit->to_string_native_fn,
+                                      lit->to_string_native_name,
+                                      "string conversion native");
             e.add_reg_imm32(Reg::rsp, call_sz);
             // rax = string handle (i64) - already the correct convention
         }
@@ -1996,11 +2101,28 @@ void CG::eval(const Expr& ex) {
 }
 
 void CG::exec_block(const Block& b) {
-    // snapshot locals/local_types so inner-scope `let` shadowing restores on exit
-    // (a flat map would let an inner `let x` clobber the outer x permanently).
+    // Snapshot bindings so inner-block shadowing restores on exit, and align
+    // one runtime cleanup scope exactly with this lexical Block.
     auto saved_locals = locals;
     auto saved_types = local_types;
+    CleanupScope scope;
+    for (auto& s : b.stmts) {
+        if (auto* ds = dynamic_cast<const DeferStmt*>(s.get())) {
+            auto it = defer_site_indices.find(ds);
+            if (it != defer_site_indices.end()) scope.reached_sites.push_back(it->second);
+        }
+    }
+    cleanup_scopes.push_back(std::move(scope));
+    // A loop re-enters the same generated block. Reset all direct sites here,
+    // not once in the function prologue, so each iteration has fresh state.
+    if (!cleanup_scopes.back().reached_sites.empty()) {
+        e.mov_reg_imm64(Reg::rax, 0);
+        for (size_t site : cleanup_scopes.back().reached_sites)
+            e.store_reg_mem(Reg::rbp, defer_sites[site].flag_offset, Reg::rax);
+    }
     for (auto& s : b.stmts) exec_stmt(*s);
+    emit_cleanup_scope(cleanup_scopes.size() - 1); // normal fallthrough
+    cleanup_scopes.pop_back();
     locals = std::move(saved_locals);
     local_types = std::move(saved_types);
 }
@@ -2088,20 +2210,18 @@ void CG::exec_stmt(const Stmt& s) {
     }
     if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { eval(*es->expr); return; }
     if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) {
-        // mark this defer site as "reached" (runtime flag; see emit_defers).
-        // Found by pointer identity - defer_sites was populated from the same
-        // AST by compile_func's collect_defers pass before codegen began.
-        for (size_t i = 0; i < defer_sites.size(); ++i) {
-            if (defer_sites[i] == ds) {
-                e.mov_reg_imm64(Reg::rax, 1);
-                e.store_reg_mem(Reg::rbp, defer_flag_offsets[i], Reg::rax);
-                break;
-            }
+        auto it = defer_site_indices.find(ds);
+        if (it != defer_site_indices.end()) {
+            DeferSite& site = defer_sites[it->second];
+            site.locals_at_decl = locals;
+            site.types_at_decl = local_types;
+            e.mov_reg_imm64(Reg::rax, 1);
+            e.store_reg_mem(Reg::rbp, site.flag_offset, Reg::rax);
         }
         return;
     }
     if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) {
-        bool has_defers = !defer_sites.empty();
+        bool has_defers = has_active_cleanups();
         if (returns_struct_by_ptr()) {
             // struct-by-value return: no register-based result to stash
             // across defers (the callee writes through the hidden pointer
@@ -2120,7 +2240,10 @@ void CG::exec_stmt(const Stmt& s) {
                     eval_struct_returning_call(*call);
                 }
             }
-            if (has_defers) emit_defers();
+            if (has_defers) emit_cleanups_to(0);
+            // Cleanup calls may clobber rax; the hidden-pointer ABI requires
+            // the destination pointer to be returned there as well.
+            e.load_reg_mem(Reg::rax, Reg::rbp, struct_ret_ptr_offset);
             emit_epilogue();
             return;
         }
@@ -2133,31 +2256,30 @@ void CG::exec_stmt(const Stmt& s) {
             if (has_defers) {
                 // stash the return value(s) across defer evaluation - a
                 // defer's own expression may clobber rax/xmm0/rdx.
+                // Keep rsp 16-byte aligned while cleanup expressions run:
+                // they may make arbitrary script/native calls. A one-word
+                // push (or 8-byte SSE spill) would leave rsp%16 == 8 at those
+                // call sites and violate Win64 even though the value itself
+                // only occupies one word. Use one uniform 16-byte temporary.
+                e.sub_reg_imm32(Reg::rsp, 16);
                 if (is_float_ret) {
-                    e.sub_reg_imm32(Reg::rsp, 8);
                     if(is_f64_ret)e.movsd_mem_xmm(Reg::rsp,0,Xmm::xmm0);else e.movss_mem_xmm(Reg::rsp,0,Xmm::xmm0);
-                } else if (is_slice_ret) {
-                    e.sub_reg_imm32(Reg::rsp, 16);
-                    e.store_reg_mem(Reg::rsp, 0, Reg::rax);
-                    e.store_reg_mem(Reg::rsp, 8, Reg::rdx);
                 } else {
-                    e.push(Reg::rax);
+                    e.store_reg_mem(Reg::rsp, 0, Reg::rax);
+                    if (is_slice_ret) e.store_reg_mem(Reg::rsp, 8, Reg::rdx);
                 }
             }
         }
         if (has_defers) {
-            emit_defers();
+            emit_cleanups_to(0);
             if (rs->value) {
                 if (is_float_ret) {
                     if(is_f64_ret)e.movsd_xmm_mem(Xmm::xmm0,Reg::rsp,0);else e.movss_xmm_mem(Xmm::xmm0,Reg::rsp,0);
-                    e.add_reg_imm32(Reg::rsp,8);
-                } else if (is_slice_ret) {
-                    e.load_reg_mem(Reg::rax, Reg::rsp, 0);
-                    e.load_reg_mem(Reg::rdx, Reg::rsp, 8);
-                    e.add_reg_imm32(Reg::rsp, 16);
                 } else {
-                    e.pop(Reg::rax);
+                    e.load_reg_mem(Reg::rax, Reg::rsp, 0);
+                    if (is_slice_ret) e.load_reg_mem(Reg::rdx, Reg::rsp, 8);
                 }
+                e.add_reg_imm32(Reg::rsp, 16);
             }
         }
         emit_epilogue();
@@ -2197,15 +2319,15 @@ void CG::exec_stmt(const Stmt& s) {
                 // backward jump below) - still a net win per Task 2's N=2
                 // floor: N memory loads become 1 load + N register reads.
                 e.load_reg_mem(Reg::rbx, Reg::rbp, locals[*pin_name]);
-                active_pin = PinState{*pin_name, Reg::rbx};
+                active_pin = PinState{*pin_name, locals[*pin_name], Reg::rbx};
                 set_pin_here = true;
             }
         }
-        loops.push_back({top, end});
+        loops.push_back({top, end, false, cleanup_scopes.size()});
         exec_block(ws->body);
         loops.pop_back();
         if (set_pin_here) active_pin.reset();
-        emit_budget_check(block_cost(ws->body));   // v0.4 budget (SAFETY §3): back-edge only
+        emit_budget_check(block_cost(ws->body), "budget exceeded at loop back-edge");
         e.jmp(top);
         e.bind(end);
         return;
@@ -2215,12 +2337,12 @@ void CG::exec_stmt(const Stmt& s) {
         // budget is charged only on the taken back edge.
         Label body = e.alloc_label(), cond = e.alloc_label(), end = e.alloc_label();
         e.bind(body);
-        loops.push_back({cond, end});
+        loops.push_back({cond, end, false, cleanup_scopes.size()});
         exec_block(ds->body);
         loops.pop_back();
         e.bind(cond);
         eval(*ds->cond); e.cmp_reg_imm32(Reg::rax, 0); e.jcc(Cond::e, end);
-        emit_budget_check(block_cost(ds->body));
+        emit_budget_check(block_cost(ds->body), "budget exceeded at loop back-edge");
         e.jmp(body);
         e.bind(end);
         return;
@@ -2255,16 +2377,16 @@ void CG::exec_stmt(const Stmt& s) {
                 // per-iteration cond check - same reasoning as WhileStmt
                 // above. Stays active through the step clause below too.
                 e.load_reg_mem(Reg::rbx, Reg::rbp, locals[*pin_name]);
-                active_pin = PinState{*pin_name, Reg::rbx};
+                active_pin = PinState{*pin_name, locals[*pin_name], Reg::rbx};
                 set_pin_here = true;
             }
         }
-        loops.push_back({step_l, end_l});
+        loops.push_back({step_l, end_l, false, cleanup_scopes.size()});
         exec_block(fs->body);
         loops.pop_back();
         e.bind(step_l);
         if (fs->step) eval(*fs->step);
-        emit_budget_check(block_cost(fs->body));   // v0.4 budget (SAFETY §3): back-edge only
+        emit_budget_check(block_cost(fs->body), "budget exceeded at loop back-edge");
         e.jmp(cond_top);
         e.bind(end_l);
         if (set_pin_here) active_pin.reset();
@@ -2299,7 +2421,7 @@ void CG::exec_stmt(const Stmt& s) {
         e.jmp(default_idx >= 0 ? case_labels[size_t(default_idx)] : end_label);
         for (size_t i = 0; i < sw->cases.size(); ++i) {
             e.bind(case_labels[i]);
-            loops.push_back({Label{0}, end_label, true}); // is_switch=true: continue skips this frame
+            loops.push_back({Label{0}, end_label, true, cleanup_scopes.size()}); // continue skips switch frames
             exec_block(sw->cases[i].body);
             loops.pop_back();
         }
@@ -2308,36 +2430,48 @@ void CG::exec_stmt(const Stmt& s) {
     }
     if (auto* bs = dynamic_cast<const BlockStmt*>(&s)) { exec_block(bs->block); return; }
     if (dynamic_cast<const BreakStmt*>(&s)) {
-        if (!loops.empty()) e.jmp(loops.back().brk);
+        if (!loops.empty()) {
+            emit_cleanups_to(loops.back().cleanup_depth);
+            e.jmp(loops.back().brk);
+        }
         return;
     }
     if (dynamic_cast<const ContinueStmt*>(&s)) {
         // skip past any enclosing switch frame(s) - continue always targets
         // the nearest real loop, never a switch (which is break-only).
         for (int i = int(loops.size()) - 1; i >= 0; --i) {
-            if (!loops[size_t(i)].is_switch) { e.jmp(loops[size_t(i)].cont); break; }
+            if (!loops[size_t(i)].is_switch) {
+                emit_cleanups_to(loops[size_t(i)].cleanup_depth);
+                e.jmp(loops[size_t(i)].cont);
+                break;
+            }
         }
         return;
     }
 }
 
-// v0.4 instruction-budget cost estimator (SAFETY_AND_SANDBOX.md §3).
+// v0.4/M4 instruction-budget cost estimator (SAFETY_AND_SANDBOX.md §3).
 // Coarse statement count of a block/stmt — the spec's "how much work happened"
-// proxy. Not cycle-accurate; just enough that a true infinite loop drives
-// budget_remaining to zero in finite iterations. Recurses into nested blocks.
+// proxy. It now feeds function-entry charges as well as loop back-edges.
+// Saturating arithmetic keeps arbitrarily large legal ASTs encodable as the
+// positive imm32 consumed by emit_budget_check (never truncate/wrap negative).
+static int64_t cost_add(int64_t a, int64_t b) {
+    const int64_t cap = std::numeric_limits<int32_t>::max();
+    return a >= cap - b ? cap : a + b;
+}
 int64_t CG::block_cost(const Block& b) {
     int64_t n = 0;
-    for (auto& s : b.stmts) n += 1 + stmt_cost(*s);
-    return n < 1 ? 1 : n;  // floor at 1: empty infinite loop is still caught
+    for (auto& s : b.stmts) n = cost_add(n, cost_add(1, stmt_cost(*s)));
+    return n < 1 ? 1 : n;  // floor at 1: empty functions/loops still charge
 }
 int64_t CG::stmt_cost(const Stmt& s) {
     if (auto* bs = dynamic_cast<const BlockStmt*>(&s))  return block_cost(bs->block);
-    if (auto* is = dynamic_cast<const IfStmt*>(&s))   return block_cost(is->then_b) + (is->has_else ? block_cost(is->else_b) : 0);
+    if (auto* is = dynamic_cast<const IfStmt*>(&s))   return cost_add(block_cost(is->then_b), is->has_else ? block_cost(is->else_b) : 0);
     if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) return block_cost(ws->body);
     if (auto* fs = dynamic_cast<const ForStmt*>(&s))  return block_cost(fs->body);
     if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) return block_cost(ds->body);
     if (auto* sw = dynamic_cast<const SwitchStmt*>(&s)) {
-        int64_t n = 0; for (auto& c : sw->cases) n += block_cost(c.body); return n;
+        int64_t n = 0; for (auto& c : sw->cases) n = cost_add(n, block_cost(c.body)); return n;
     }
     return 1;
 }
@@ -2401,12 +2535,15 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
         }
     };
     sum_bytes(f.body);
-    // collect_defers: gather all `defer EXPR;` sites in program order (see
-    // CG::emit_defers for the runtime-flag LIFO semantics) and reserve one
-    // 8-byte flag slot per site in the frame-size budget.
+    // Collect textual sites once for frame layout. Runtime cleanup ownership
+    // is established later by exec_block's lexical cleanup-scope stack.
     std::function<void(const Block&)> collect_defers = [&](const Block& b) {
         for (auto& s : b.stmts) {
-            if (auto* ds = dynamic_cast<const DeferStmt*>(s.get())) cg.defer_sites.push_back(ds);
+            if (auto* ds = dynamic_cast<const DeferStmt*>(s.get())) {
+                size_t index = cg.defer_sites.size();
+                cg.defer_sites.push_back(CG::DeferSite{ds});
+                cg.defer_site_indices[ds] = index;
+            }
             if (auto* is = dynamic_cast<const IfStmt*>(s.get())) { collect_defers(is->then_b); if (is->has_else) collect_defers(is->else_b); }
             if (auto* ws = dynamic_cast<const WhileStmt*>(s.get())) collect_defers(ws->body);
             if (auto* ds = dynamic_cast<const DoWhileStmt*>(s.get())) collect_defers(ds->body);
@@ -2535,16 +2672,20 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
         param_word += wcount;
     }
 
-    // reserve + zero-init the defer flags (see collect_defers above and
-    // CG::emit_defers) - after param spilling so they get distinct offsets.
-    for (size_t i = 0; i < cg.defer_sites.size(); ++i) {
+    // Reserve one activation flag per textual site. Each owning Block resets
+    // its direct flags at runtime entry, including every loop iteration.
+    for (auto& site : cg.defer_sites) {
         cg.next_local_off += 8;
-        cg.defer_flag_offsets.push_back(-cg.next_local_off);
+        site.flag_offset = -cg.next_local_off;
     }
-    if (!cg.defer_sites.empty()) {
-        cg.e.mov_reg_imm64(Reg::rax, 0);
-        for (int32_t off : cg.defer_flag_offsets) cg.e.store_reg_mem(Reg::rbp, off, Reg::rax);
-    }
+
+    // M4: charge the complete recursive body estimate once per function
+    // invocation after the frame, hidden pointer, and parameters are safely
+    // established, and before annotation gates or body execution. Loop
+    // back-edge charges remain in place for repeated work. In portable `.em`
+    // CLI mode budget checks are disabled, so this emits no process-local
+    // address or rejection metadata.
+    cg.emit_budget_check(cg.block_cost(f.body), "budget exceeded at function entry");
 
     // @obf: layer on top of ctx.obf defaults, then emit the CPUID-keyed gate
     // (AFTER param spilling so cpuid's rcx/rdx clobber is safe) + opaque junk.
@@ -2564,8 +2705,8 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
     // body
     cg.exec_block(f.body);
 
-    // implicit void return (in case function falls off end)
-    if (!cg.defer_sites.empty()) cg.emit_defers();
+    // Implicit void return. exec_block already emitted the function body's
+    // normal-fallthrough lexical cleanup before returning to us.
     cg.emit_epilogue();
 
     cg.e.resolve_fixups();
@@ -2589,6 +2730,7 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
             case AbsFixup::DispatchTableBase:  v = uint64_t(ctx.dispatch_base); break;
             case AbsFixup::GlobalsBase:       v = uint64_t(ctx.globals_base); break;
             case AbsFixup::ModuleRegistryBase: v = uint64_t(ctx.registry_base); break; // v0.5 cross-module (ModuleRegistry::base())
+            case AbsFixup::FunctionRodataBase: v = uint64_t(cg.rodata.data() + af.addend); break;
         }
         for (int i = 0; i < 8; ++i) p[i] = uint8_t(v >> (8 * i));
     }
@@ -2596,6 +2738,17 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
     CompiledFn out;
     out.name = f.name;
     out.abs_fixups = cg.e.abs_fixups(); // capture for .em serialization (Section 2.4)
+    // Symbol/signature comes from the exact sema resolution, not reverse
+    // lookup by pointer. This covers overload-only symbols and pointer aliases.
+    for (const auto& pending : cg.pending_natives) {
+        out.native_fixups.push_back(pending.binding);
+        if (pending.binding.code_offset + 8 > cg.e.code.size()) continue;
+        uint64_t v = reinterpret_cast<uintptr_t>(pending.target);
+        for (int i = 0; i < 8; ++i)
+            cg.e.code[pending.binding.code_offset + i] = uint8_t(v >> (8 * i));
+    }
+    out.rodata = std::move(cg.rodata);
+    out.non_serializable_reason = std::move(cg.non_serializable_reason);
     out.bytes = std::move(cg.e.code);
     return out;
 }

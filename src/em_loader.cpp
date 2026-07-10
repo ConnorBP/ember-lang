@@ -94,9 +94,11 @@ void write_u64_le(uint8_t* p, uint64_t v) {
 struct ParsedFn {
     std::string name;
     uint32_t slot_index = 0;
+    EmSignature signature;
     std::vector<uint8_t> code;
     std::vector<uint8_t> rodata;
     std::vector<EmReloc> relocs;
+    std::vector<EmNativeBinding> native_bindings;
 };
 
 struct ParsedModule {
@@ -105,6 +107,7 @@ struct ParsedModule {
     std::vector<std::pair<std::string, uint32_t>> names;
     uint32_t entry_slot = EM_NO_ENTRY;
     size_t dispatch_size = 0;
+    uint32_t version = EM_VERSION_V1;
 };
 
 // Owns pages until the complete module has been sealed and committed to `out`.
@@ -115,6 +118,8 @@ struct StagedModule {
     std::vector<void*> pages;
     std::vector<std::pair<std::string, uint32_t>> names;
     uint32_t entry_slot = EM_NO_ENTRY;
+    uint32_t version = EM_VERSION_V1;
+    std::vector<EmSignature> signatures_by_slot;
 
     ~StagedModule() {
         for (void* page : pages) free_executable(page);
@@ -125,7 +130,9 @@ struct StagedModule {
         globals.swap(out.globals);
         pages.swap(out.pages);
         names.swap(out.name_table);
+        signatures_by_slot.swap(out.signatures_by_slot);
         std::swap(entry_slot, out.entry_slot);
+        std::swap(version, out.format_version);
         // This object now owns the old contents of `out`; its destructor frees
         // any old pages after the new module has been atomically assembled.
     }
@@ -151,8 +158,39 @@ bool parse_name(Reader& rd, std::string& out, const char* field,
     return true;
 }
 
+bool parse_type(Reader& rd, Type& t, unsigned depth, std::string* err) {
+    if (depth > 16) { set_error(err, "em_loader: limit: type nesting too deep"); return false; }
+    uint8_t prim=0, flags=0; uint32_t array_len=0; uint16_t name_len=0;
+    if(!rd.u8(prim)||!rd.u8(flags)||!rd.u32(array_len)||!rd.u16(name_len)) { set_error(err,"em_loader: format: truncated canonical type"); return false; }
+    if(prim>static_cast<uint8_t>(Prim::F64)||(flags&~uint8_t(31))||name_len>MAX_NAME_SIZE) { set_error(err,"em_loader: format: invalid canonical type"); return false; }
+    const uint8_t* name=nullptr; if(!rd.take(name_len,name)) { set_error(err,"em_loader: format: truncated type name"); return false; }
+    t.prim=static_cast<Prim>(prim); t.is_slice=(flags&1)!=0; t.array_len=array_len;
+    t.struct_name.assign(reinterpret_cast<const char*>(name),name_len); t.is_fn_handle=(flags&8)!=0; t.has_recorded_sig=(flags&16)!=0;
+    if(t.is_slice&&t.array_len) { set_error(err,"em_loader: format: type is both slice and array"); return false; }
+    if(t.is_slice||t.array_len) { t.elem=std::make_shared<Type>(); if(!parse_type(rd,*t.elem,depth+1,err))return false; }
+    if(t.is_fn_handle&&t.has_recorded_sig) { uint32_t n=0; if(!rd.u32(n)||n>1024){set_error(err,"em_loader: limit: function type parameter count");return false;} for(uint32_t i=0;i<n;++i){auto p=std::make_shared<Type>();if(!parse_type(rd,*p,depth+1,err))return false;t.recorded_params.push_back(std::move(p));}t.recorded_ret=std::make_shared<Type>();if(!parse_type(rd,*t.recorded_ret,depth+1,err))return false; }
+    return true;
+}
+
+bool canonical_type_same(const Type& a,const Type& b) {
+    if(a.prim!=b.prim||a.struct_name!=b.struct_name||a.is_slice!=b.is_slice||a.array_len!=b.array_len||a.is_fn_handle!=b.is_fn_handle||a.has_recorded_sig!=b.has_recorded_sig)return false;
+    if(bool(a.elem)!=bool(b.elem)||(a.elem&&!canonical_type_same(*a.elem,*b.elem)))return false;
+    if(a.recorded_params.size()!=b.recorded_params.size()||bool(a.recorded_ret)!=bool(b.recorded_ret))return false;
+    for(size_t i=0;i<a.recorded_params.size();++i)if(bool(a.recorded_params[i])!=bool(b.recorded_params[i])||(a.recorded_params[i]&&!canonical_type_same(*a.recorded_params[i],*b.recorded_params[i])))return false;
+    return !a.recorded_ret||canonical_type_same(*a.recorded_ret,*b.recorded_ret);
+}
+
+bool parse_signature(Reader& rd, EmSignature& sig, std::string* err) {
+    if(!parse_type(rd,sig.ret,0,err))return false;
+    uint32_t n=0;
+    if(!rd.u32(n)||n>1024){set_error(err,"em_loader: limit: signature parameter count");return false;}
+    sig.params.resize(n); for(Type& t:sig.params)if(!parse_type(rd,t,0,err))return false; return true;
+}
+
 bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
-                ModuleRegistry* registry, std::string* err) {
+                ModuleRegistry* registry,
+                const std::unordered_map<std::string, NativeSig>* natives,
+                std::string* err) {
     Reader rd{file};
     uint32_t magic = 0, version = 0, flags = 0, function_count = 0;
     uint32_t global_size = 0, rodata_total = 0;
@@ -169,13 +207,16 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
         set_error(err, "em_loader: format: bad magic");
         return false;
     }
-    if (version != EM_VERSION) {
-        set_error(err, "em_loader: format: unsupported version " + std::to_string(version));
-        return false;
+    if (version != EM_VERSION_V1 && version != EM_VERSION) {
+        set_error(err, "em_loader: format: unsupported version " + std::to_string(version)); return false;
     }
-    if (flags != 0 || reserved[0] != 0 || reserved[1] != 0 || reserved[2] != 0) {
-        set_error(err, "em_loader: format: unsupported flags/reserved fields");
-        return false;
+    mod.version = version;
+    if(flags!=0){set_error(err,"em_loader: format: unsupported flags");return false;}
+    if(version==EM_VERSION_V1) {
+        if(reserved[0]||reserved[1]||reserved[2]){set_error(err,"em_loader: format: unsupported v1 reserved fields");return false;}
+    } else {
+        uint64_t build=uint64_t(reserved[0])|(uint64_t(reserved[1])<<32);
+        if(build!=EM_BUILD_ID||reserved[2]!=EM_TARGET_ABI_HASH){set_error(err,"em_loader: compatibility: compiler/build ID or target ABI hash mismatch");return false;}
     }
     if (function_count > MAX_FUNCTIONS) {
         set_error(err, "em_loader: limit: function_count exceeds MAX_FUNCTIONS");
@@ -261,13 +302,14 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
             return false;
         }
         uint64_t reloc_bytes = 0;
-        if (!checked_mul(reloc_count, 5u, reloc_bytes) || reloc_bytes > rd.remaining()) {
+        const uint64_t reloc_record_size = version == EM_VERSION_V1 ? 5u : 9u;
+        if (!checked_mul(reloc_count, reloc_record_size, reloc_bytes) || reloc_bytes > rd.remaining()) {
             set_error(err, "em_loader: format: relocation records cannot fit in file");
             return false;
         }
         f.relocs.resize(reloc_count);
         for (EmReloc& r : f.relocs) {
-            if (!rd.u32(r.offset) || !rd.u8(r.kind)) {
+            if (!rd.u32(r.offset) || !rd.u8(r.kind) || (version == EM_VERSION && !rd.u32(r.addend))) {
                 set_error(err, "em_loader: format: truncated relocation");
                 return false;
             }
@@ -278,14 +320,31 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
                                f.name + "\"");
                 return false;
             }
-            if (r.kind > EmReloc::ModuleRegistryBase) {
+            const uint8_t max_kind = version == EM_VERSION_V1 ? EmReloc::ModuleRegistryBase : EmReloc::FunctionRodataBase;
+            if (r.kind > max_kind) {
                 set_error(err, "em_loader: format: invalid relocation kind " +
                                std::to_string(static_cast<unsigned>(r.kind)));
                 return false;
             }
+            if(r.kind!=EmReloc::FunctionRodataBase&&r.addend!=0){set_error(err,"em_loader: format: relocation addend only valid for function rodata");return false;}
+            if(r.kind==EmReloc::FunctionRodataBase&&r.addend>f.rodata.size()){set_error(err,"em_loader: format: rodata relocation addend out of range");return false;}
             if (r.kind == EmReloc::ModuleRegistryBase && !registry) {
                 set_error(err, "em_loader: binding: ModuleRegistryBase relocation requires a registry");
                 return false;
+            }
+        }
+        if(version==EM_VERSION) {
+            if(!parse_signature(rd,f.signature,err))return false;
+            uint32_t binding_count=0;if(!rd.u32(binding_count)){set_error(err,"em_loader: format: truncated native binding count");return false;}
+            if(binding_count>MAX_RELOCS_PER_FN){set_error(err,"em_loader: limit: native binding count");return false;}
+            f.native_bindings.resize(binding_count);
+            for(auto& b:f.native_bindings){
+                if(!rd.u32(b.offset)||!parse_name(rd,b.name,"native binding name",err)||!parse_signature(rd,b.signature,err))return false;
+                if(uint64_t(b.offset)+8>f.code.size()){set_error(err,"em_loader: format: native binding offset out of range");return false;}
+                if(!natives){set_error(err,"em_loader: binding: v2 module requires a host native allowlist");return false;}
+                auto it=natives->find(b.name);if(it==natives->end()||!it->second.fn_ptr){set_error(err,"em_loader: binding: missing native \""+b.name+"\"");return false;}
+                if(!canonical_type_same(it->second.ret,b.signature.ret)||it->second.params.size()!=b.signature.params.size()){set_error(err,"em_loader: binding: signature mismatch for native \""+b.name+"\"");return false;}
+                for(size_t pi=0;pi<b.signature.params.size();++pi)if(!canonical_type_same(it->second.params[pi],b.signature.params[pi])){set_error(err,"em_loader: binding: signature mismatch for native \""+b.name+"\"");return false;}
             }
         }
         mod.functions.push_back(std::move(f));
@@ -352,7 +411,8 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
 }
 
 bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
-                       ModuleRegistry* registry) {
+                       ModuleRegistry* registry,
+                       const std::unordered_map<std::string, NativeSig>* natives) {
     if (!path) {
         set_error(err, "em_loader: argument: null path");
         return false;
@@ -390,7 +450,7 @@ bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
     }
 
     ParsedModule parsed;
-    if (!parse_file(file, parsed, registry, err)) return false;
+    if (!parse_file(file, parsed, registry, natives, err)) return false;
 
     // All structure, all functions, and all relocations are validated above.
     // Only now establish the stable dispatch/globals backing stores and begin
@@ -400,6 +460,12 @@ bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
     staged.globals = std::move(parsed.globals);
     staged.names = std::move(parsed.names);
     staged.entry_slot = parsed.entry_slot;
+    staged.version = parsed.version;
+    if(parsed.version==EM_VERSION) {
+        staged.signatures_by_slot.resize(parsed.dispatch_size);
+        for(const auto& f:parsed.functions)
+            staged.signatures_by_slot[f.slot_index]=f.signature;
+    }
     staged.pages.reserve(parsed.functions.size());
     std::vector<void*> entries(parsed.functions.size(), nullptr);
 
@@ -434,11 +500,18 @@ bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
                 case EmReloc::ModuleRegistryBase:
                     address = reinterpret_cast<uintptr_t>(registry->base());
                     break;
+                case EmReloc::FunctionRodataBase:
+                    address = reinterpret_cast<uintptr_t>(bytes + f.code.size() + r.addend);
+                    break;
                 default: // validated before allocation
                     set_error(err, "em_loader: internal: unvalidated relocation kind");
                     return false;
             }
             write_u64_le(bytes + r.offset, address);
+        }
+        for(const auto& b:f.native_bindings) {
+            const auto it=natives->find(b.name); // validated before allocation
+            write_u64_le(bytes+b.offset,reinterpret_cast<uintptr_t>(it->second.fn_ptr));
         }
         if (!seal_executable(page, static_cast<size_t>(combined_size))) {
             set_error(err, "em_loader: allocation: executable page sealing failed");
@@ -463,7 +536,8 @@ LoadedModule::~LoadedModule() {
 LoadedModule::LoadedModule(LoadedModule&& other) noexcept
     : dispatch(std::move(other.dispatch)), globals(std::move(other.globals)),
       pages(std::move(other.pages)), name_table(std::move(other.name_table)),
-      entry_slot(other.entry_slot) {
+      entry_slot(other.entry_slot), format_version(other.format_version),
+      signatures_by_slot(std::move(other.signatures_by_slot)) {
     other.pages.clear();
     other.entry_slot = EM_NO_ENTRY;
 }
@@ -476,6 +550,8 @@ LoadedModule& LoadedModule::operator=(LoadedModule&& other) noexcept {
     pages = std::move(other.pages);
     name_table = std::move(other.name_table);
     entry_slot = other.entry_slot;
+    format_version = other.format_version;
+    signatures_by_slot = std::move(other.signatures_by_slot);
     other.pages.clear();
     other.entry_slot = EM_NO_ENTRY;
     return *this;
@@ -496,11 +572,12 @@ void* LoadedModule::entry() const {
 }
 
 bool load_em_file(const char* path, LoadedModule& out, std::string* err,
-                  ModuleRegistry* registry) {
+                  ModuleRegistry* registry,
+                  const std::unordered_map<std::string, NativeSig>* native_bindings) {
     // Complete public no-throw boundary: malformed input and allocation/library
     // failures are always reported as false plus a categorized error.
     try {
-        return load_em_file_impl(path, out, err, registry);
+        return load_em_file_impl(path, out, err, registry, native_bindings);
     } catch (const std::bad_alloc&) {
         set_error(err, "em_loader: allocation: std::bad_alloc");
     } catch (const std::length_error&) {

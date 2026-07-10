@@ -100,10 +100,9 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
     for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }
 
-// Overload (type,op) entries preserved exactly; BindingBuilder builds
-// the same OpOverload (fn_ptr, ret, {i64,i64} params) the old reg_op did.
-// OpOverload::fn_name is unused by sema/codegen, so the builder's
-// "<type>_op" naming (vs the old "") changes no observable behavior.
+// Overload (type,op) entries preserve the same target/signature. BindingBuilder
+// also assigns the stable symbolic names (vec3_add, vec3_eq, ...) that sema
+// carries into v2 .em native-binding records.
 void register_overloads(OpOverloadTable& overloads) {
     BindingBuilder b;
     b.add_overload("vec3", int(BinExpr::Op::Add), bind_handle("vec3"), (void*)&n_vec3_add);

@@ -53,17 +53,23 @@ is not recoverable.
 
 ## 3. Instruction budget
 
-- **Mechanism (implemented v1 model)**: `context_t` holds a single
-  `int64_t budget_remaining` counter. A unit charge/check is emitted on
-  taken loop back-edges (`while`, `for`, and `do-while`). Function entry,
-  straight-line statements, and native calls are not budget-charged. The
-  model is a loop-iteration budget, not a total instruction counter.
+- **Mechanism (implemented M4 model)**: `context_t` holds a single
+  `int64_t budget_remaining` counter. Codegen's recursive
+  `block_cost(function.body)` estimator is charged once at every function
+  entry, after the frame, hidden return pointer, and parameters are safely
+  established and before annotations/body execution. Existing
+  body-cost charges on taken loop back-edges (`while`, `for`, and
+  `do-while`) remain, so repeated work continues to consume budget. This is
+  a coarse static statement-cost model, not a cycle or exact instruction
+  count; native function bodies are trusted and are not assigned a cost.
   ```
-  sub  [budget_ptr], body_cost_imm
+  sub  [budget_ptr], coarse_cost_imm32
   jg   .continue            ; budget_remaining > 0, keep going
   call [ember_trap_budget_slot]   ; does not return (checkpoint unwind, Section 2)
   .continue:
   ```
+  The recursive estimator and encoding saturate at `INT32_MAX`; a large
+  legal function can never truncate into a negative or small `imm32` charge.
   In B1 mode the counter is addressed through the per-call `r14` context.
 - **Exhaustion behavior**: traps via the shared budget-trap stub,
   same non-local unwind as bounds/div-by-zero (Section 2). The host's
@@ -75,10 +81,11 @@ is not recoverable.
 - **No budget set (default)**: `budget_remaining` starts at
   `INT64_MAX` (or budget checks are simply compiled out entirely if
   the module was compiled with budgeting disabled - a module-level
-  compile flag, since baking the check in always costs a `sub`+`jg`
-  per loop iteration even when unused; hosts that don't need budgets
+  compile flag, since baking the checks in costs a `sub`+`jg` at entry
+  and per loop iteration; hosts that don't need budgets
   at all, e.g. a fully-trusted internal tool script, can compile
-  without the checks for zero overhead - explicit opt-in cost).
+  without the checks for zero overhead - explicit opt-in cost). The entry
+  charge and every back-edge charge are both omitted when disabled.
   Enabling/disabling is decided at `ember_compile` time via an engine
   flag, not per-call, since it changes what code is emitted.
 - **Wall-clock budget** (optional, in addition to instruction count):
@@ -95,22 +102,29 @@ is not recoverable.
   cost; instruction budgets are the v1 answer, documented as an
   approximation of time.
 
-## 4. Stack depth guard
+## 4. Combined script/native call-stack depth guard
 
-- **Mechanism (implemented v1 model)**: `context_t` holds `int32_t
-  call_depth` and a configured `max_call_depth`. Script-to-script calls
-  increment before the call and decrement after. Native calls are not
-  charged to this counter. Together with budget charges at loop back-edges
-  (not every instruction or function entry), the shipped safety model is
-  precisely **loop budget + script-call depth**. Straight-line/native-heavy
-  work remains a trusted-host concern; broader accounting is deferred.
+- **Mechanism (implemented M4 model)**: `context_t` holds `int32_t
+  call_depth` and a configured `max_call_depth`. Every script-issued call
+  increments/checks before invocation and decrements after normal return:
+  ordinary and indirect script calls, cross-module script calls, ordinary
+  native calls, hidden-pointer struct-return native helpers, native operator
+  overloads, and emitted string decrypt/conversion helpers. A native remains
+  counted while it runs. If that native re-enters script and the re-entered
+  script calls another native, those active edges compose into one combined
+  stack depth. Sequential calls that return are therefore never mistaken for
+  nesting or accumulated as a lifetime call count.
   ```
   inc  [call_depth_ptr]
   cmp  [call_depth_ptr], max_call_depth_imm
-  jg   .depth_trap          ; does not return
+  jge  .depth_trap          ; does not return
   call ...
   dec  [call_depth_ptr]
   ```
+  Combined with Section 3, the shipped model is **coarse function-entry plus
+  loop-back-edge budget + combined script/native active-call depth**.
+  Native bodies remain trusted; this counter bounds nesting across their
+  script-visible boundary, not their internal C++ stack usage.
 - **Why not just rely on OS guard-page stack-overflow (SEH) instead**:
   catching a real stack overflow via SEH on Windows is possible but
   leaves the stack in a state where you cannot reliably continue
@@ -125,7 +139,11 @@ is not recoverable.
   absurdly high relative to actual stack size - that's a host
   misconfiguration, not an ember bug).
 - **Exhaustion behavior**: same shared-trap/non-local-unwind pattern
-  as Section 3.
+  as Section 3. A non-local trap necessarily skips decrement instructions
+  on abandoned frames. Before a later outer entry, the host must call
+  `context_t::reset_for_call()` (or equivalently reset `call_depth`); that
+  method explicitly clears the combined depth while preserving the host-owned
+  budget. Normal returns remain balanced without host intervention.
 
 ## 5. Bounds checking
 
@@ -303,7 +321,7 @@ threads, each with its own `context_t`. Two pieces (plan:
 
 - **Option D — one `context_t` per thread.** Each concurrent caller
   thread allocates its own `context_t` (private `checkpoint` /
-  `budget_remaining` / `call_depth` / `last_trap`); they share the
+  `budget_remaining` / combined `call_depth` / `last_trap`); they share the
   dispatch table, JIT'd code, and module registry, all of which are
   read-only after compile. A trap on thread B longjmps to thread B's own
   checkpoint — no cross-thread checkpoint corruption. `context_t`
@@ -315,7 +333,8 @@ threads, each with its own `context_t`. Two pieces (plan:
   `context_offsets()` gives the exact byte offsets the codegen bakes
   into `[r14 + off]`.
 - **Option B1 — the per-call context register.** With
-  `CodeGenCtx::use_context_reg = true`, the budget/depth/trap emits
+  `CodeGenCtx::use_context_reg = true`, the entry/back-edge budget and
+  combined-depth/trap emits
   (`emit_budget_check`, `emit_depth_check`, `emit_depth_leave`,
   `emit_trap` in `src/codegen.cpp`) read `context_t` fields through `r14`
   — the per-call context register, set by the host at entry and

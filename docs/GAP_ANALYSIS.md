@@ -145,10 +145,10 @@ patches landed in the noted docs:
   `offsetof` expressions only, no full compile-time fn eval - that's
   v2 `static_assert` territory).
 - **`defer`** - `CODEGEN_SPEC.md` Section 13, `COMPILER_PIPELINE.md` Section 6
-  (implemented v1 is function-exit LIFO. Nested lexical block cleanup and
-  `break`/`continue` cleanup edges remain deferred; trap unwind also skips
-  defers. Sema restricts references to parameters/globals that survive until
-  function exit).
+  (implemented M5 is lexical-block-exit LIFO: normal fallthrough and cleanup
+  edges before `break`, `continue`, and `return`; block-entry activation reset
+  gives loop sites per-iteration behavior; lexical locals are valid in defer
+  expressions. Existing trap/longjmp unwind still bypasses defers).
 - **`sizeof`/`offsetof`** - `TYPE_SYSTEM.md` Section 11 (compile-time
   constants, usable in `constexpr` contexts; `offsetof` only on
   registered/script struct fields).

@@ -1,9 +1,4 @@
-// v0.6_hot_reload_test - single-function hot reload (HOT_RELOAD.md §3).
-//
-// Verifies the reload protocol: recompile one function, atomically swap its
-// dispatch slot, callers see the new behavior, the old page is retired. Tests
-// the per-function-independence property (a reloaded fn's callers keep working
-// because they go through the dispatch table, not baked addresses).
+// v0.6_hot_reload_test - single-function hot reload + epoch reclamation.
 #include "lexer.hpp"
 #include "parser.hpp"
 #include "sema.hpp"
@@ -16,12 +11,15 @@
 #include "ext_vec.hpp"
 #include "ext_math.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
-#include <memory>
 
 using namespace ember;
 static int g_fail = 0;
@@ -31,8 +29,11 @@ static void check(bool cond, const char* msg) {
 }
 
 struct Mod {
-    std::vector<CompiledFn> fns;          // owns the live pages (retired ones freed explicitly)
+    // Each current page stays here. When it is replaced, reload_function moves
+    // page ownership logically to domain; disown_retired prevents double-free.
+    std::vector<CompiledFn> fns;
     std::unique_ptr<DispatchTable> table;
+    HotReloadDomain domain;
     std::unordered_map<std::string,int> slots;
     GlobalsBlock gb; std::vector<uint8_t> gbs;
     Program prog;
@@ -40,6 +41,20 @@ struct Mod {
     OpOverloadTable ov;
     StructLayoutTable layouts;
     Mod() : table(std::make_unique<DispatchTable>(0)) {}
+    ~Mod() { for (auto& fn : fns) if (fn.exec) free_executable(fn.exec); }
+
+    void disown_retired(const std::string& name, void* new_entry) {
+        for (auto& fn : fns) {
+            if (fn.name == name && fn.exec && fn.entry != new_entry) {
+                fn.exec = nullptr;
+                fn.entry = nullptr;
+            }
+        }
+    }
+    void accept(ReloadResult&& rr) {
+        disown_retired(rr.new_fn.name, rr.new_fn.entry);
+        fns.push_back(std::move(rr.new_fn));
+    }
 };
 
 static std::unique_ptr<Mod> compile(const std::string& src) {
@@ -58,90 +73,126 @@ static std::unique_ptr<Mod> compile(const std::string& src) {
     m->table = std::make_unique<DispatchTable>(m->prog.funcs.size());
     CodeGenCtx ctx; ctx.globals_base=m->gb.base; ctx.dispatch_base=int64_t(m->table->base());
     ctx.natives=&m->natives; ctx.script_slots=&m->slots; ctx.structs=&m->layouts;
-    for (auto& fn : m->prog.funcs) { auto cf=compile_func(fn,ctx); finalize(cf); m->table->set(fn.slot,cf.entry); m->fns.push_back(std::move(cf)); }
+    for (auto& fn : m->prog.funcs) {
+        auto cf=compile_func(fn,ctx);
+        if (!finalize(cf)) return nullptr;
+        m->table->set(fn.slot,cf.entry);
+        m->fns.push_back(std::move(cf));
+    }
     return m;
 }
 static int64_t call_void(Mod& m, const std::string& fn) {
-    void* e = m.table->get(m.slots[fn]); using F=int64_t(*)(); return reinterpret_cast<F>(e)();
+    auto guard = m.domain.guard();
+    void* e = m.table->get(m.slots[fn]);
+    using F=int64_t(*)(); return reinterpret_cast<F>(e)();
 }
 static int64_t call_i64(Mod& m, const std::string& fn, int64_t a) {
-    void* e = m.table->get(m.slots[fn]); using F=int64_t(*)(int64_t); return reinterpret_cast<F>(e)(a);
+    auto guard = m.domain.guard();
+    void* e = m.table->get(m.slots[fn]);
+    using F=int64_t(*)(int64_t); return reinterpret_cast<F>(e)(a);
 }
 static CodeGenCtx make_ctx(Mod& m) {
     CodeGenCtx ctx; ctx.globals_base=m.gb.base; ctx.dispatch_base=int64_t(m.table->base());
     ctx.natives=&m.natives; ctx.script_slots=&m.slots; ctx.structs=&m.layouts;
     return ctx;
 }
+static ReloadResult reload(Mod& m, const std::string& source) {
+    auto ctx = make_ctx(m);
+    return reload_function(source, m.prog, *m.table, m.domain, ctx,
+                           m.natives, &m.ov, &m.layouts);
+}
+static void accept(Mod& m, ReloadResult&& rr) { m.accept(std::move(rr)); }
 
 int main() {
     std::printf("=== v0.6 single-function hot reload tests ===\n");
 
-    // (1) reload a fn, caller sees new behavior
+    // (1) Repeated publication: epochs increase, every newest page executes,
+    // all replaced pages are reclaimed, and the current page remains callable.
     {
         auto m = compile("fn val() -> i64 { return 10; }\nfn main() -> i64 { return val(); }\n");
         check(m != nullptr, "compile module");
-        check(call_void(*m,"main")==10, "(1) pre-reload: main()->val()==10");
-        auto ctx = make_ctx(*m);
-        auto rr = reload_function("fn val() -> i64 { return 99; }\n", m->prog, *m->table, ctx, m->natives, &m->ov, &m->layouts);
-        check(rr.ok, "(1) reload succeeded");
-        check(call_void(*m,"main")==99, "(1) post-reload: main()->val()==99 (caller saw new behavior via dispatch table)");
-        if (rr.old_entry) free_executable(rr.old_entry);
-        m->fns.push_back({rr.new_fn.name, std::move(rr.new_fn.bytes), rr.new_fn.exec, rr.new_fn.entry, {}});  // keep alive
+        check(call_void(*m,"main")==10, "(1) initial entry callable");
+        const int values[] = {20, 30, 40, 50, 60};
+        uint64_t prior_epoch = 0;
+        for (int value : values) {
+            auto rr = reload(*m, "fn val() -> i64 { return " + std::to_string(value) + "; }\n");
+            check(rr.ok, "(1) repeated reload succeeded");
+            check(rr.publication_epoch > prior_epoch && rr.old_page_retired &&
+                  rr.retirement_epoch == rr.publication_epoch,
+                  "(1) successful publication reports monotonic retirement epoch");
+            prior_epoch = rr.publication_epoch;
+            check(call_void(*m,"main") == value, "(1) newest entry callable after publication");
+            accept(*m, std::move(rr));
+        }
+        check(m->domain.retired_page_count() == 5, "(1) all five replaced pages tracked by domain");
+        check(m->domain.quiesce() == 5, "(1) single-threaded quiesce freed all replaced pages");
+        check(m->domain.retired_page_count() == 0 && m->domain.reclaimed_page_count() == 5,
+              "(1) retired set empty and freed-page counter proves reclamation");
+        check(call_void(*m,"main") == 60, "(1) newest entry remains callable after reclamation");
     }
-    // (2) reload a recursive fn (fib) — self-call goes through dispatch, picks up new body
+
+    // (2) Recursive/caller dispatch still observes the replacement.
     {
         auto m = compile("fn fib(n: i64) -> i64 { if (n <= 1) { return n; } return fib(n-1)+fib(n-2); }\nfn main() -> i64 { return fib(5); }\n");
         check(call_void(*m,"main")==5, "(2) pre-reload fib(5)==5");
-        // reload fib to a broken-but-valid version: fib(n) = n*2
-        auto ctx = make_ctx(*m);
-        auto rr = reload_function("fn fib(n: i64) -> i64 { return n * 2; }\n", m->prog, *m->table, ctx, m->natives, &m->ov, &m->layouts);
+        auto rr = reload(*m, "fn fib(n: i64) -> i64 { return n * 2; }\n");
         check(rr.ok, "(2) reload fib succeeded");
-        check(call_i64(*m,"fib",5)==10, "(2) post-reload: fib(5)==10 (self-call picked up new body via dispatch slot)");
-        if (rr.old_entry) free_executable(rr.old_entry);
-        m->fns.push_back({rr.new_fn.name, std::move(rr.new_fn.bytes), rr.new_fn.exec, rr.new_fn.entry, {}});
+        check(call_i64(*m,"fib",5)==10, "(2) caller observes replacement through stable slot");
+        accept(*m, std::move(rr));
+        check(m->domain.quiesce() == 1, "(2) old recursive page reclaimed");
     }
-    // (3) reload FAILURE leaves the module untouched (old code keeps running)
-    {
-        auto m = compile("fn val() -> i64 { return 7; }\nfn main() -> i64 { return val(); }\n");
-        auto ctx = make_ctx(*m);
-        // reload with a type error (return type mismatch) -> must fail, module unchanged
-        auto rr = reload_function("fn val() -> i64 { return 1.5f; }\n", m->prog, *m->table, ctx, m->natives, &m->ov, &m->layouts);
-        check(!rr.ok, "(3) reload with type error failed (ok=false)");
-        check(call_void(*m,"main")==7, "(3) module untouched after failed reload: main()==7 (old code still running)");
-    }
-    // (4) reload a fn called from a loop (the hot-path case)
-    {
-        auto m = compile("fn step(x: i64) -> i64 { return x + 1; }\nfn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; while (i < 100) { s = s + step(i); i = i + 1; } return s; }\n");
-        check(call_void(*m,"main")==5050, "(4) pre-reload: sum of step(i)=i+1 i=0..99 == 5050");
-        auto ctx = make_ctx(*m);
-        auto rr = reload_function("fn step(x: i64) -> i64 { return x * 2; }\n", m->prog, *m->table, ctx, m->natives, &m->ov, &m->layouts);
-        check(rr.ok, "(4) reload step succeeded");
-        // sum of 2i for i=0..99 = 2 * 4950 = 9900
-        check(call_void(*m,"main")==9900, "(4) post-reload: sum of step(i)=2i == 9900 (loop caller saw new behavior)");
-        if (rr.old_entry) free_executable(rr.old_entry);
-        m->fns.push_back({rr.new_fn.name, std::move(rr.new_fn.bytes), rr.new_fn.exec, rr.new_fn.entry, {}});
-    }
-    // (5) reload a fn not in the module -> error
-    {
-        auto m = compile("fn main() -> i64 { return 1; }\n");
-        auto ctx = make_ctx(*m);
-        auto rr = reload_function("fn nope() -> i64 { return 1; }\n", m->prog, *m->table, ctx, m->natives, &m->ov, &m->layouts);
-        check(!rr.ok, "(5) reload of absent fn fails (not in module)");
-    }
-    // (6) ABI signature changes are rejected before Program/slot mutation.
+
+    // (3) Failed parse/sema/signature reloads do not publish or advance epoch.
     {
         auto m = compile("fn val(x: i64) -> i64 { return x + 1; }\nfn main() -> i64 { return val(6); }\n");
-        auto ctx = make_ctx(*m);
-        auto arity = reload_function("fn val() -> i64 { return 9; }\n", m->prog, *m->table, ctx, m->natives, &m->ov, &m->layouts);
-        check(!arity.ok && call_void(*m, "main") == 7, "(6a) changed arity rejected; old body remains live");
-        auto param = reload_function("fn val(x: f32) -> i64 { return 9; }\n", m->prog, *m->table, ctx, m->natives, &m->ov, &m->layouts);
-        check(!param.ok && call_void(*m, "main") == 7, "(6b) changed parameter type rejected; old body remains live");
-        auto ret = reload_function("fn val(x: i64) -> f32 { return 9.0f; }\n", m->prog, *m->table, ctx, m->natives, &m->ov, &m->layouts);
-        check(!ret.ok && call_void(*m, "main") == 7, "(6c) changed return type rejected; old body remains live");
-        auto same = reload_function("fn val(x: i64) -> i64 { return x + 3; }\n", m->prog, *m->table, ctx, m->natives, &m->ov, &m->layouts);
-        check(same.ok && call_void(*m, "main") == 9, "(6d) unchanged canonical signature reload succeeds");
-        if (same.old_entry) free_executable(same.old_entry);
-        if (same.ok) m->fns.push_back({same.new_fn.name, std::move(same.new_fn.bytes), same.new_fn.exec, same.new_fn.entry, {}});
+        const uint64_t before = m->domain.epoch();
+        auto type_error = reload(*m, "fn val(x: i64) -> i64 { return 1.5f; }\n");
+        check(!type_error.ok && m->domain.epoch() == before && call_void(*m,"main")==7,
+              "(3a) sema failure leaves body and epoch untouched");
+        auto arity = reload(*m, "fn val() -> i64 { return 9; }\n");
+        check(!arity.ok && m->domain.epoch() == before && call_void(*m,"main")==7,
+              "(3b) changed arity rejected without publication");
+        auto param = reload(*m, "fn val(x: f32) -> i64 { return 9; }\n");
+        check(!param.ok && m->domain.epoch() == before, "(3c) changed parameter rejected without epoch advance");
+        auto ret = reload(*m, "fn val(x: i64) -> f32 { return 9.0f; }\n");
+        check(!ret.ok && m->domain.epoch() == before, "(3d) changed return rejected without epoch advance");
+        auto absent = reload(*m, "fn nope() -> i64 { return 1; }\n");
+        check(!absent.ok && m->domain.epoch() == before, "(3e) absent function rejected without epoch advance");
+    }
+
+    // (4) A pre-publication guard pins the old page. Nonblocking reclamation
+    // must refuse it; blocking quiesce must wait until that guard leaves.
+    {
+        auto m = compile("fn val() -> i64 { return 111; }\n");
+        auto held = std::make_unique<HotReloadDomain::ExecutionGuard>(m->domain.guard());
+        void* old_entry = m->table->get(m->slots["val"]); // valid only under held
+        auto rr = reload(*m, "fn val() -> i64 { return 222; }\n");
+        check(rr.ok && rr.publication_epoch == 1, "(4) publish while old execution guard active");
+        accept(*m, std::move(rr));
+        check(m->domain.reclaim() == 0 && m->domain.retired_page_count() == 1,
+              "(4) nonblocking reclaim refuses page pinned by in-flight guard");
+        using F=int64_t(*)();
+        check(reinterpret_cast<F>(old_entry)() == 111,
+              "(4) old page remains executable while its guard is active");
+
+        std::atomic<bool> started{false};
+        std::atomic<bool> finished{false};
+        size_t freed = 0;
+        std::thread waiter([&] {
+            started.store(true, std::memory_order_release);
+            freed = m->domain.quiesce();
+            finished.store(true, std::memory_order_release);
+        });
+        while (!started.load(std::memory_order_acquire)) std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        check(!finished.load(std::memory_order_acquire),
+              "(4) blocking quiesce waits while old guard is active");
+        held.reset();
+        waiter.join();
+        check(finished.load(std::memory_order_acquire) && freed == 1 &&
+              m->domain.retired_page_count() == 0,
+              "(4) quiesce frees old page after guard drains");
+        check(call_void(*m,"val") == 222, "(4) newest page callable after concurrent quiescence");
     }
 
     std::printf("\nv0.6 hot reload test: %s\n", g_fail ? "FAIL" : "PASS");

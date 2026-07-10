@@ -42,6 +42,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -59,25 +61,30 @@ static int64_t call_i64_i64(void* entry, int64_t a) {
 // compile_func from the emitter's mov_reg_imm64_external records).
 static ember::EmModule build_em_module(
         const std::vector<ember::CompiledFn>& fns,
-        const std::unordered_map<std::string, int>& slots,
+        const ember::Program& program,
         const std::vector<uint8_t>& globals_bytes,
         uint32_t entry_slot) {
     ember::EmModule mod;
     mod.functions.reserve(fns.size());
-    for (const auto& cf : fns) {
+    for (size_t i=0;i<fns.size();++i) {
+        const auto& cf=fns[i];
+        const auto& decl=program.funcs[i];
         ember::EmFunctionRecord rec;
         rec.name = cf.name;
-        auto sit = slots.find(cf.name);
-        rec.slot_index = (sit != slots.end()) ? uint32_t(sit->second) : 0xFFFFFFFFu;
+        rec.slot_index = uint32_t(decl.slot);
         rec.code = cf.bytes; // post-resolve_fixups, pre-finalize (raw bytes)
-        // rodata is empty for prism's codegen (string literals bake raw
-        // imm64 pointers, not in-page RIP-relative rodata).
+        rec.rodata = cf.rodata;
+        rec.non_serializable_reason = cf.non_serializable_reason;
+        rec.signature.ret = decl.ret ? *decl.ret : ember::Type{};
+        for(const auto& p:decl.params)rec.signature.params.push_back(p.ty?*p.ty:ember::Type{});
+        for(const auto& nf:cf.native_fixups){ember::EmNativeBinding b;b.offset=nf.code_offset;b.name=nf.name;b.signature.ret=nf.ret;b.signature.params=nf.params;rec.native_bindings.push_back(std::move(b));}
         // relocs: one per AbsFixup, mapping Kind -> EmReloc::Kind 1:1.
         rec.relocs.reserve(cf.abs_fixups.size());
         for (const auto& af : cf.abs_fixups) {
             ember::EmReloc r;
             r.offset = af.code_offset;
             r.kind = static_cast<uint8_t>(af.kind);
+            r.addend = af.addend;
             rec.relocs.push_back(r);
         }
         mod.functions.push_back(std::move(rec));
@@ -85,12 +92,9 @@ static ember::EmModule build_em_module(
     mod.globals = globals_bytes;
     mod.entry_slot = entry_slot;
     // name table = name -> slot (for ember_call by name).
-    mod.name_table.reserve(slots.size());
-    for (auto& cf : fns) {
-        auto sit = slots.find(cf.name);
-        if (sit != slots.end())
-            mod.name_table.emplace_back(cf.name, uint32_t(sit->second));
-    }
+    mod.name_table.reserve(program.funcs.size());
+    for (const auto& fn : program.funcs)
+        mod.name_table.emplace_back(fn.name, uint32_t(fn.slot));
     return mod;
 }
 
@@ -188,8 +192,11 @@ int main() {
     if (!jit_ok) failures++;
 
     // ---- serialize to a temp .em ----
-    auto mod = build_em_module(fns, slots, gb_store,
+    auto mod = build_em_module(fns, pr.program, gb_store,
                                uint32_t(slots["double_it"])); // entry = double_it
+    // A second directory name for the same slot must retain the slot's v2
+    // signature (name-keyed metadata would incorrectly make this unknown).
+    mod.name_table.emplace_back("double_alias",uint32_t(slots["double_it"]));
     // sanity: the module's relocs match the captured AbsFixups.
     bool mod_relocs_ok = (mod.functions[1].relocs.size() == fib_relocs) &&
                         (mod.functions[0].relocs.size() == double_relocs);
@@ -209,7 +216,7 @@ int main() {
     // ---- load it back ----
     LoadedModule lm;
     std::string lerr;
-    if (!load_em_file(tmp.string().c_str(), lm, &lerr)) {
+    if (!load_em_file(tmp.string().c_str(), lm, &lerr, nullptr, &natives)) {
         std::printf("FAIL: load_em_file: %s\n", lerr.c_str());
         for (auto& fn : fns) if (fn.exec) free_executable(fn.exec);
         return 1;
@@ -217,16 +224,18 @@ int main() {
     std::printf("loaded: %zu funcs, dispatch=%zu slots, entry_slot=%u\n",
                 lm.pages.size(), lm.dispatch.size(), lm.entry_slot);
 
-    // v1 carries names/slots but no signatures. Pin the intentional H14
+    // v2 carries canonical signatures and must reject an ABI-mismatched call.
     // behavior: exports are marked unknown_sig and sema treats calls as
     // ABI-trusted (standalone args are checked, but arity/return cannot be).
     // Do not execute the deliberately wrong-arity probe.
     auto trusted_exports = build_em_exports(lm, 7);
-    bool unknown_sig_ok = trusted_exports.size() == 2;
-    for (const auto& exp : trusted_exports) unknown_sig_ok &= exp.unknown_sig;
+    bool unknown_sig_ok = trusted_exports.size() == 3;
+    for (const auto& exp : trusted_exports)
+        unknown_sig_ok &= !exp.unknown_sig && exp.ret.prim==Prim::I64 &&
+                          exp.params.size()==1 && exp.params[0].prim==Prim::I64;
     ModuleExportTable mt;
     add_exports(mt, "trusted", trusted_exports);
-    auto ulr = tokenize("link \"trusted\"; fn main() -> i64 { return trusted::double_it(); }", "<unknown-sig>");
+    auto ulr = tokenize("link \"trusted\"; fn main() -> i64 { return trusted::double_it(1.0f); }", "<known-sig>");
     bool trusted_sema_ok = ulr.ok;
     if (trusted_sema_ok) {
         auto upr = parse(std::move(ulr.toks));
@@ -235,13 +244,49 @@ int main() {
             std::unordered_map<std::string, int> uslots{{"main", 0}};
             upr.program.funcs[0].slot = 0;
             auto ulayouts = build_struct_layouts(upr.program);
-            trusted_sema_ok = sema(upr.program, natives, uslots, 0, nullptr,
-                                   &ulayouts, &mt).ok;
+            trusted_sema_ok = !sema(upr.program, natives, uslots, 0, nullptr,
+                                    &ulayouts, &mt).ok;
         }
     }
     bool h14_contract_ok = unknown_sig_ok && trusted_sema_ok;
-    std::printf("[4] v1 unknown_sig ABI-trusted contract: %s\n", passfail(h14_contract_ok));
+    std::printf("[4] v2 signature mismatch rejected before execution: %s\n", passfail(h14_contract_ok));
     if (!h14_contract_ok) failures++;
+
+    // Mutating either v2 identity word must reject before executable allocation.
+    auto bad = tmp; bad += ".bad";
+    { std::ifstream is(tmp, std::ios::binary); std::vector<char> bytes((std::istreambuf_iterator<char>(is)), {}); bytes[28] ^= 1; std::ofstream os(bad, std::ios::binary); os.write(bytes.data(), bytes.size()); }
+    LoadedModule bad_mod; std::string bad_err;
+    bool identity_rejected = !load_em_file(bad.string().c_str(), bad_mod, &bad_err, nullptr, &natives) && bad_mod.pages.empty() && bad_err.find("compatibility") != std::string::npos;
+    std::filesystem::remove(bad);
+    std::printf("[4b] mutated build/ABI identity rejected: %s\n", passfail(identity_rejected));
+    if (!identity_rejected) failures++;
+
+    // Native bindings are explicit symbolic slots. Missing and incompatible
+    // host allowlists must fail during parse/validation, before page allocation.
+    auto bind_path=tmp;bind_path += ".bindings";
+    EmModule bind_mod; EmFunctionRecord bind_fn;bind_fn.name="bound";bind_fn.slot_index=0;
+    bind_fn.code={0x48,0xB8,0,0,0,0,0,0,0,0,0xC3};bind_fn.signature.ret=make_prim(Prim::I64);
+    EmNativeBinding bind;bind.offset=2;bind.name="host_bound";bind.signature.ret=make_prim(Prim::I64);bind.signature.params.push_back(make_prim(Prim::I64));bind_fn.native_bindings.push_back(bind);
+    bind_mod.functions.push_back(bind_fn);bind_mod.entry_slot=0;bind_mod.name_table={{"bound",0}};
+    std::string bind_werr;bool bind_written=write_em_file(bind_mod,bind_path.string().c_str(),&bind_werr);
+    LoadedModule missing_mod;std::string missing_err;std::unordered_map<std::string,NativeSig> empty_allowlist;
+    bool missing_rejected=bind_written&&!load_em_file(bind_path.string().c_str(),missing_mod,&missing_err,nullptr,&empty_allowlist)&&missing_mod.pages.empty()&&missing_err.find("missing native")!=std::string::npos;
+    NativeSig wrong;wrong.name="host_bound";wrong.fn_ptr=reinterpret_cast<void*>(uintptr_t(1));wrong.ret=make_prim(Prim::F32);wrong.params={make_prim(Prim::I64)};
+    std::unordered_map<std::string,NativeSig> wrong_allowlist{{wrong.name,wrong}};LoadedModule wrong_mod;std::string wrong_err;
+    bool incompatible_rejected=bind_written&&!load_em_file(bind_path.string().c_str(),wrong_mod,&wrong_err,nullptr,&wrong_allowlist)&&wrong_mod.pages.empty()&&wrong_err.find("signature mismatch")!=std::string::npos;
+    std::filesystem::remove(bind_path);bool binding_rejection_ok=missing_rejected&&incompatible_rejected;
+    std::printf("[4c] missing/incompatible native bindings rejected: %s\n",passfail(binding_rejection_ok));if(!binding_rejection_ok)failures++;
+
+    // Explicit v1 compatibility: rewrite the v2 source artifact is not valid
+    // because record layouts differ, so construct the minimal historical v1.
+    auto v1 = tmp; v1 += ".v1";
+    { std::vector<uint8_t> b; auto u16=[&](uint16_t v){b.push_back(uint8_t(v));b.push_back(uint8_t(v>>8));}; auto u32=[&](uint32_t v){for(int i=0;i<4;++i)b.push_back(uint8_t(v>>(8*i)));};
+      u32(EM_MAGIC);u32(EM_VERSION_V1);u32(0);u32(1);u32(0);u32(0);u32(0);u32(0);u32(0);u32(0);
+      u16(1);b.push_back('f');u32(0);u32(1);u32(0);b.push_back(0xc3);u32(0);u32(1);u16(1);b.push_back('f');u32(0);
+      std::ofstream os(v1,std::ios::binary);os.write(reinterpret_cast<const char*>(b.data()),b.size()); }
+    LoadedModule v1_mod; std::string v1_err; bool v1_ok=load_em_file(v1.string().c_str(),v1_mod,&v1_err);
+    auto v1_exports=build_em_exports(v1_mod,8); bool v1_contract=v1_ok&&v1_mod.format_version==EM_VERSION_V1&&v1_exports.size()==1&&v1_exports[0].unknown_sig;
+    std::filesystem::remove(v1); std::printf("[4d] v1 unknown-signature compatibility: %s\n",passfail(v1_contract)); if(!v1_contract)failures++;
 
     // ---- call the loaded functions (same args as the JIT ground truth) ----
     void* loaded_double = lm.entry_by_name("double_it");

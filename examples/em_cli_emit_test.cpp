@@ -21,7 +21,14 @@ int main(int argc, char** argv) {
     const auto module = base.string() + ".em";
     {
         std::ofstream os(source, std::ios::binary);
-        os << "global answer : i64 = 42;\nfn main() -> i64 { return answer; }\n";
+        os << "global answer : i64 = 33;\n"
+              "fn main() -> i64 {\n"
+              "  let local_string: string = \"cross-process rodata\";\n"
+              "  let joined: string = local_string + \"!\";\n"
+              "  let v: vec3 = vec3_new(1.0f, 2.0f, 3.0f) + vec3_new(4.0f, 5.0f, 6.0f);\n"
+              "  if (string_length(joined) == 0 || vec3_x(v) == 0.0f) { return 1; }\n"
+              "  return answer + (sqrt(81.0f) as i64);\n"
+              "}\n";
     }
 
     // cmd.exe strips one enclosing quote pair before parsing a command whose
@@ -30,24 +37,19 @@ int main(int argc, char** argv) {
                                 source + "\" \"" + module + "\"\"";
     const int cli_rc = std::system(command.c_str());
 
-    LoadedModule loaded;
-    std::string err;
-    const bool ok = cli_rc == 0 && load_em_file(module.c_str(), loaded, &err);
-    uint64_t value = 0;
-    if (ok && loaded.globals.size() >= 8) {
-        for (unsigned i = 0; i < 8; ++i)
-            value |= uint64_t(loaded.globals[i]) << (8 * i);
-    }
+    const std::string run_command = std::string("\"\"") + argv[1] + "\" run --load-em \"" +
+                                    module + "\" --fn main\"";
+    const int run_rc = cli_rc == 0 ? std::system(run_command.c_str()) : -1;
+    const bool ok = cli_rc == 0 && run_rc == 42;
 
     std::filesystem::remove(source);
     std::filesystem::remove(module);
-    if (!ok || loaded.globals.size() != 8 || value != 42 || !loaded.entry()) {
+    if (!ok) {
         std::fprintf(stderr,
-                     "CLI emit-em global regression failed: cli_rc=%d load=%d globals=%zu value=%llu err=%s\n",
-                     cli_rc, int(ok), loaded.globals.size(),
-                     static_cast<unsigned long long>(value), err.c_str());
+                     "CLI cross-process emit/load/native/global regression failed: emit_rc=%d run_rc=%d\n",
+                     cli_rc, run_rc);
         return 1;
     }
-    std::puts("CLI emit-em initialized-global regression: PASS");
+    std::puts("CLI cross-process v2 native/overload/string-rodata/global regression: PASS");
     return 0;
 }

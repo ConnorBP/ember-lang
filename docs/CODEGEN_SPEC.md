@@ -617,14 +617,33 @@ the entire Duff-device-style fallthrough machinery C requires.
 
 ## 13. `defer` emission
 
-The implemented v1 shape is deliberately narrower than lexical RAII:
-codegen gathers deferred expressions at function level and emits them LIFO at
-ordinary function exit. Nested block fallthrough and loop `break`/`continue`
-do not trigger cleanup, and trap unwind bypasses defers. A defer in a loop is
-therefore emitted at most once by the current static lowering. Sema restricts
-references to parameters and globals so values remain addressable at function
-exit. Per-block lists and lexical cleanup-edge architecture are deferred; they
-must not be assumed by hosts or scripts.
+The implemented M5 semantics are lexical-block-exit LIFO cleanup:
+
+- Every lexical `Block` pushes a codegen cleanup scope. Its direct defer sites
+  each have an activation flag reset whenever runtime control enters that
+  block. Reaching `defer EXPR;` sets the site flag; leaving the block checks
+  direct sites in reverse declaration/reach order, clears each active flag,
+  then evaluates its expression once. Reset-on-entry makes a loop-body defer
+  run on every reached iteration, while clear-before-evaluate prevents a
+  generated cleanup edge followed by normal fallthrough from running it twice.
+- Normal block fallthrough emits that block's cleanup. `break` emits cleanup
+  only for scopes crossed on the way to the selected nearest loop or switch
+  break target. `continue` skips intervening switch frames, cleans through the
+  nearest loop-body scope, then jumps to that loop's condition (`while`),
+  bottom condition (`do`), or step (`for`). `return` cleans all active scopes
+  from innermost through the function body.
+- Return values are evaluated before cleanup and preserved across cleanup
+  expressions in a 16-byte-aligned stack temporary: scalars and f32/f64 occupy
+  its first word, while slices preserve both pointer and length. Keeping the
+  temporary 16 bytes wide preserves Win64 call-site alignment when a cleanup
+  expression calls script or native code. Hidden-pointer aggregate returns
+  retain/reload the incoming destination pointer after cleanup.
+- A defer expression is resolved in the binding environment visible at its
+  declaration and executes before those lexical locals cease being live.
+  Normal declaration-before-use and scope checks therefore apply; locals are
+  permitted.
+- Runtime traps use the existing non-local longjmp path and still bypass
+  defers. M5 does not add exception/trap unwinding.
 
 ## 14. What "prove it compiles" means for v0.1 (acceptance criteria)
 

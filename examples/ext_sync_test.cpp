@@ -197,17 +197,38 @@ int main() {
         check(ok, "T2 atomic width masking (8/16/32/64)");
     }
 
-    // Test 2b: aint8 fetch_add wraps modulo 256 (the CAS-loop width path).
+    // Test 2b: narrow CAS paths retain modulo behavior for every width.
     {
         auto A_new   = native_ptr<int64_t(*)(int64_t,int64_t)>(NATIVES,"atomic_new");
         auto A_fa    = native_ptr<int64_t(*)(int64_t,int64_t)>(NATIVES,"atomic_fetch_add");
+        auto A_fs    = native_ptr<int64_t(*)(int64_t,int64_t)>(NATIVES,"atomic_fetch_sub");
         auto A_load  = native_ptr<int64_t(*)(int64_t)>(NATIVES,"atomic_load");
         auto A_free  = native_ptr<void(*)(int64_t)>(NATIVES,"atomic_free");
-        int64_t h = A_new(8, 250);          // aint8, init 250
-        int64_t old = A_fa(h, 10);          // 250+10 wraps to 4 mod 256
-        bool ok = (old == 250) && (A_load(h) == 4);
+        bool ok = true;
+        const int widths[] = {8, 16, 32};
+        const int64_t maxima[] = {0xFF, 0xFFFF, 0xFFFFFFFFLL};
+        for (int i = 0; i < 3; ++i) {
+            int64_t h = A_new(widths[i], maxima[i]);
+            ok &= (A_fa(h, 1) == maxima[i]) && (A_load(h) == 0);
+            ok &= (A_fs(h, 1) == 0) && (A_load(h) == maxima[i]);
+            A_free(h);
+        }
+        check(ok, "T2b aint8/16/32 fetch add/sub wrap modulo width");
+    }
+
+    // Test 2c: full-width RMWs wrap in the unsigned representation while the
+    // script API observes the same signed two's-complement bit patterns.
+    {
+        auto A_new   = native_ptr<int64_t(*)(int64_t,int64_t)>(NATIVES,"atomic_new");
+        auto A_fa    = native_ptr<int64_t(*)(int64_t,int64_t)>(NATIVES,"atomic_fetch_add");
+        auto A_fs    = native_ptr<int64_t(*)(int64_t,int64_t)>(NATIVES,"atomic_fetch_sub");
+        auto A_load  = native_ptr<int64_t(*)(int64_t)>(NATIVES,"atomic_load");
+        auto A_free  = native_ptr<void(*)(int64_t)>(NATIVES,"atomic_free");
+        int64_t h = A_new(64, INT64_MAX);
+        bool ok = (A_fa(h, 1) == INT64_MAX) && (A_load(h) == INT64_MIN);
+        ok &= (A_fs(h, 1) == INT64_MIN) && (A_load(h) == INT64_MAX);
         A_free(h);
-        check(ok, "T2b aint8 fetch_add wraps modulo 256");
+        check(ok, "T2c aint64 INT64_MAX+1 and INT64_MIN-1 wrap");
     }
 
     // Test 3: swapbuf write/swap/read double-swap frame ordering (JIT).

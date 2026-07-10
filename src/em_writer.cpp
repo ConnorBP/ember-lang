@@ -22,6 +22,7 @@
 
 #include "em_writer.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <fstream>
 #include <string>
@@ -85,6 +86,30 @@ bool name_fits_u16(const std::string& s, std::string* err, const char* ctx) {
     return true;
 }
 
+void emit_type(std::ostream& ofs, const Type& t) {
+    uint8_t prim = static_cast<uint8_t>(t.prim);
+    uint8_t flags = uint8_t((t.is_slice ? 1 : 0) | (t.array_len ? 2 : 0) |
+                            (!t.struct_name.empty() ? 4 : 0) | (t.is_fn_handle ? 8 : 0) |
+                            (t.has_recorded_sig ? 16 : 0));
+    ofs.write(reinterpret_cast<const char*>(&prim), 1);
+    ofs.write(reinterpret_cast<const char*>(&flags), 1);
+    emit_u32_le(ofs, t.array_len);
+    emit_u16_le(ofs, static_cast<uint16_t>(t.struct_name.size()));
+    emit_string(ofs, t.struct_name);
+    if ((t.is_slice || t.array_len) && t.elem) emit_type(ofs, *t.elem);
+    if (t.is_fn_handle && t.has_recorded_sig) {
+        emit_u32_le(ofs, static_cast<uint32_t>(t.recorded_params.size()));
+        for (const auto& p : t.recorded_params) emit_type(ofs, p ? *p : Type{});
+        emit_type(ofs, t.recorded_ret ? *t.recorded_ret : Type{});
+    }
+}
+
+void emit_signature(std::ostream& ofs, const EmSignature& sig) {
+    emit_type(ofs, sig.ret);
+    emit_u32_le(ofs, static_cast<uint32_t>(sig.params.size()));
+    for (const Type& p : sig.params) emit_type(ofs, p);
+}
+
 bool count_fits_u32(size_t n, std::string* err, const char* ctx) {
     if (n > 0xFFFFFFFFu) {
         if (err) *err = std::string("em_writer: count exceeds u32 for ") + ctx +
@@ -111,10 +136,21 @@ bool write_em_file(const EmModule& mod, const char* path, std::string* err) {
     // rodata_total = sum of per-fn rodata_size (informational, Section 2.2).
     uint64_t rodata_total_acc = 0;
     for (const auto& f : mod.functions) {
+        if (!f.non_serializable_reason.empty()) {
+            if (err) *err = "em_writer: function \"" + f.name + "\" is not portable: " + f.non_serializable_reason;
+            return false;
+        }
         if (!name_fits_u16(f.name, err, "function name")) return false;
         if (!count_fits_u32(f.code.size(),   err, "code_size"))   return false;
         if (!count_fits_u32(f.rodata.size(), err, "rodata_size")) return false;
         if (!count_fits_u32(f.relocs.size(),  err, "reloc_count")) return false;
+        if (!count_fits_u32(f.native_bindings.size(), err, "native_binding_count")) return false;
+        if (!count_fits_u32(f.signature.params.size(), err, "signature param_count")) return false;
+        for (const auto& b : f.native_bindings) {
+            if (b.name.empty()) { if (err) *err = "em_writer: native binding has no symbolic name"; return false; }
+            if (!name_fits_u16(b.name, err, "native binding")) return false;
+            if (uint64_t(b.offset) + 8 > f.code.size()) { if (err) *err = "em_writer: native binding offset out of range"; return false; }
+        }
         rodata_total_acc += f.rodata.size();
     }
     if (rodata_total_acc > 0xFFFFFFFFull) {
@@ -130,9 +166,9 @@ bool write_em_file(const EmModule& mod, const char* path, std::string* err) {
     emit_u32_le(ofs, static_cast<uint32_t>(mod.globals.size()));
     emit_u32_le(ofs, static_cast<uint32_t>(rodata_total_acc));
     emit_u32_le(ofs, mod.entry_slot);
-    emit_u32_le(ofs, /*reserved[0]=*/0u);
-    emit_u32_le(ofs, /*reserved[1]=*/0u);
-    emit_u32_le(ofs, /*reserved[2]=*/0u);
+    emit_u32_le(ofs, static_cast<uint32_t>(EM_BUILD_ID));
+    emit_u32_le(ofs, static_cast<uint32_t>(EM_BUILD_ID >> 32));
+    emit_u32_le(ofs, EM_TARGET_ABI_HASH);
 
     // ---- 2. Per-function records ----
     for (const auto& f : mod.functions) {
@@ -141,7 +177,14 @@ bool write_em_file(const EmModule& mod, const char* path, std::string* err) {
         emit_u32_le(ofs, f.slot_index);
         emit_u32_le(ofs, static_cast<uint32_t>(f.code.size()));
         emit_u32_le(ofs, static_cast<uint32_t>(f.rodata.size()));
-        emit_bytes(ofs, f.code);
+        std::vector<uint8_t> portable_code = f.code;
+        for (const auto& r : f.relocs) {
+            if (uint64_t(r.offset) + 8 > portable_code.size()) { if (err) *err = "em_writer: relocation offset out of range"; return false; }
+            std::fill(portable_code.begin() + r.offset, portable_code.begin() + r.offset + 8, 0);
+        }
+        for (const auto& b : f.native_bindings)
+            std::fill(portable_code.begin() + b.offset, portable_code.begin() + b.offset + 8, 0);
+        emit_bytes(ofs, portable_code);
         emit_bytes(ofs, f.rodata);
         emit_u32_le(ofs, static_cast<uint32_t>(f.relocs.size()));
         for (const auto& r : f.relocs) {
@@ -150,6 +193,15 @@ bool write_em_file(const EmModule& mod, const char* path, std::string* err) {
             // values (0/1), already stored as uint8_t.
             uint8_t kb = r.kind;
             ofs.write(reinterpret_cast<const char*>(&kb), 1);
+            emit_u32_le(ofs, r.addend);
+        }
+        emit_signature(ofs, f.signature);
+        emit_u32_le(ofs, static_cast<uint32_t>(f.native_bindings.size()));
+        for (const auto& b : f.native_bindings) {
+            emit_u32_le(ofs, b.offset);
+            emit_u16_le(ofs, static_cast<uint16_t>(b.name.size()));
+            emit_string(ofs, b.name);
+            emit_signature(ofs, b.signature);
         }
     }
 

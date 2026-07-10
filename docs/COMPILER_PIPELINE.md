@@ -83,7 +83,7 @@ prim_type    := 'bool'|'i8'|'i16'|'i32'|'i64'
 block        := '{' stmt* '}'
 stmt         := 'let' IDENT (':' type)? '=' expr ';'      // local decl
                | 'const' IDENT ':' type '=' expr ';'       // immutable local
-               | 'defer' expr ';'                          // function-exit LIFO cleanup (Section 6, CODEGEN_SPEC.md Section 13)
+               | 'defer' expr ';'                          // lexical-block-exit LIFO cleanup (Section 6, CODEGEN_SPEC.md Section 13)
                | 'auto' IDENT '=' expr ';'                 // TYPE_SYSTEM.md Section 9
                | 'if' '(' expr ')' block ('else' (block|stmt))?
                | 'while' '(' expr ')' block
@@ -487,12 +487,19 @@ struct IrFunction {
   rejection actually happens (stated once here for clarity: lowering
   never sees an escaping case because sema already turned it into a
   compile error before lowering runs).
-- **`defer` statement (implemented v1)**: codegen records deferred
-  expressions per function and emits them in reverse order at ordinary
-  function exit. It does not synthesize lexical cleanup edges for nested-block
-  fallthrough, `break`, or `continue`, and trap unwind bypasses defers. Sema
-  therefore restricts references to parameters/globals whose storage survives
-  until function exit. Per-block cleanup-edge architecture remains deferred.
+- **`defer` statement (implemented M5)**: every lexical `Block` owns a
+  cleanup scope. Reached defer sites execute once in reverse declaration/reach
+  order when that block exits normally. Codegen also emits cleanup edges before
+  `break`, `continue`, and `return`: break cleans only scopes crossed to its
+  selected loop/switch target; continue skips switch frames and cleans through
+  the nearest loop-body scope before its condition/step target; return cleans
+  every active scope through the function body while preserving all return ABI
+  forms. Direct site flags reset whenever a block is entered, so loop-body
+  defers activate once per iteration, and cleanup clears a flag before running
+  its expression to prevent a later fallthrough edge from running it twice.
+  Cleanup runs while lexical locals remain live, so ordinary scope and
+  declaration-before-use checks permit local references. Trap/longjmp remains
+  non-local and bypasses defer cleanup; no exception unwinding is implemented.
 - **`switch` statement**: scrutinee is a compile-time-known integer
   type (signed or unsigned, any width) - non-integer scrutinee is a
   compile error. Case labels must be `constexpr` integer literals

@@ -22,7 +22,7 @@ static void u32(std::vector<uint8_t>& b, uint32_t v) {
 }
 static void header(std::vector<uint8_t>& b, uint32_t fns, uint32_t globals,
                    uint32_t rodata, uint32_t entry) {
-    u32(b, EM_MAGIC); u32(b, EM_VERSION); u32(b, 0); u32(b, fns);
+    u32(b, EM_MAGIC); u32(b, EM_VERSION_V1); u32(b, 0); u32(b, fns);
     u32(b, globals); u32(b, rodata); u32(b, entry);
     u32(b, 0); u32(b, 0); u32(b, 0);
 }

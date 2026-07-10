@@ -105,29 +105,6 @@ namespace {
 // same-type rule (TYPE_SYSTEM.md Section 6: literals are context-influenced).
 // Variables never implicitly promote (Section 7).
 
-// Collect every Ident referenced inside an expression (for the defer
-// scope-safety check below). Deliberately conservative about what it
-// recurses into - StructLit field values and SizeofExpr's type aren't
-// expression-shaped in the same way and don't need it for this check.
-void collect_idents(const Expr& e, std::vector<const Ident*>& out) {
-    if (auto* id = dynamic_cast<const Ident*>(&e)) { out.push_back(id); return; }
-    if (auto* b = dynamic_cast<const BinExpr*>(&e)) { collect_idents(*b->lhs, out); collect_idents(*b->rhs, out); return; }
-    if (auto* u = dynamic_cast<const UnaryExpr*>(&e)) { collect_idents(*u->operand, out); return; }
-    if (auto* c = dynamic_cast<const CastExpr*>(&e)) { collect_idents(*c->operand, out); return; }
-    if (auto* t = dynamic_cast<const TernaryExpr*>(&e)) {
-        collect_idents(*t->cond, out); collect_idents(*t->then_e, out); collect_idents(*t->else_e, out); return;
-    }
-    if (auto* c = dynamic_cast<const CallExpr*>(&e)) {
-        if (c->receiver) collect_idents(*c->receiver, out);
-        for (auto& a : c->args) collect_idents(*a, out);
-        return;
-    }
-    if (auto* a = dynamic_cast<const AssignExpr*>(&e)) { collect_idents(*a->target, out); collect_idents(*a->value, out); return; }
-    if (auto* ix = dynamic_cast<const IndexExpr*>(&e)) { collect_idents(*ix->base, out); collect_idents(*ix->index, out); return; }
-    if (auto* fl = dynamic_cast<const FieldExpr*>(&e)) { collect_idents(*fl->base, out); return; }
-    if (auto* v = dynamic_cast<const ViewExpr*>(&e)) { collect_idents(*v->base, out); return; }
-}
-
 // --- compile-time integer constant evaluation (used by both the array/slice
 // bounds-folding below and assert_eq_* constant folding). Mirrors codegen.cpp's
 // CG::eval BinExpr constant-folding EXACTLY (same op set, same uint64_t-wrap
@@ -169,7 +146,7 @@ bool try_eval_const_i64(const Expr& e, int64_t& out) {
         case BinExpr::Op::And: out = l & r; return true;
         case BinExpr::Op::Or:  out = l | r; return true;
         case BinExpr::Op::Xor: out = l ^ r; return true;
-        case BinExpr::Op::Shl: out = l << (r & 63); return true;
+        case BinExpr::Op::Shl: out = int64_t(uint64_t(l) << (r & 63)); return true;
         case BinExpr::Op::Shr: out = l >> (r & 63); return true;
         // Div/Mod excluded on purpose (see comment above) - a literal-zero
         // divisor must still hit the real runtime trap, never a compile-time
@@ -287,16 +264,6 @@ struct Checker {
         auto it = globals.find(n);
         if (it != globals.end()) return it->second.ty;
         return nullptr;
-    }
-
-    // true iff `n` is a function parameter or a global - the only bindings
-    // guaranteed to still be valid wherever `emit_defers()` ends up running
-    // (see the DeferStmt check below). scopes[0] is always exactly the
-    // parameter scope (check_func pushes it before check_block pushes the
-    // function body's own scope), so this is a cheap, precise check.
-    bool is_param_or_global(const std::string& n) const {
-        if (!scopes.empty()) for (auto& v : scopes[0]) if (v.name == n) return true;
-        return globals.count(n) != 0;
     }
 
     // true iff `t` names a script-declared `struct Name {...}` (as opposed to
@@ -699,6 +666,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
             if (nit != natives->end()) {
                 lit->implicit_to_string = true;
                 lit->to_string_native_fn = nit->second.fn_ptr;
+                lit->to_string_native_name = nit->first;
                 // `expected` is null in the "no context at all" case this
                 // branch now also covers - build the `string` Type directly
                 // rather than reusing `expected` itself (which would just
@@ -827,6 +795,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
             c->name = conv;
             c->is_native = true;
             c->native_fn = cit->second.fn_ptr;
+            c->native_binding_name = cit->first;
             e.ty = intern(cit->second.ret);
             return e.ty;
         }
@@ -949,6 +918,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                     c->loc.line, c->loc.col);
             }
             c->is_native = true; c->native_fn = nit->second.fn_ptr;
+            c->native_binding_name = nit->first;
             ret_ty = &nit->second.ret; params = &nit->second.params;
             // arity + arg type check (method call: receiver is arg[0])
             size_t nargs = c->args.size() + (c->receiver ? 1 : 0);
@@ -1141,6 +1111,9 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                 if (oo) {
                     b->is_overload = true;
                     b->overload_fn = oo->fn_ptr;
+                    b->overload_name = oo->fn_name;
+                    b->overload_ret = oo->ret;
+                    b->overload_params = oo->params;
                     e.ty = intern(oo->ret);
                     return e.ty;
                 }
@@ -1538,27 +1511,10 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
         push_scope(); check_block(bs->block, ret_ty, returns); pop_scope(); return;
     }
     if (auto* ds = dynamic_cast<DeferStmt*>(&s)) {
-        // type-check for side effects (native/script call resolution etc.) -
-        // the result is discarded (codegen runs it at function exit, LIFO).
+        // Cleanup runs while this lexical Block's locals remain live, so the
+        // ordinary left-to-right declaration-before-use and scope lookup are
+        // sufficient. The expression result is discarded.
         check_expr(*ds->expr);
-        // Scope-safety check: a defer's expression is re-evaluated at
-        // function-exit time (CG::emit_defers), which may be well after a
-        // block/loop-local variable's compile-time scope has closed. Codegen
-        // has no error path for "identifier not found" at that point - it's
-        // a silent no-op that leaves whatever was last in the register,
-        // which is NOT the variable's real value (verified: `for (...) {
-        // defer note(i); }` read back whatever eval() had just loaded to
-        // check the defer flag, not i's actual last value). Only params and
-        // globals are guaranteed to still resolve wherever the defer fires.
-        std::vector<const Ident*> idents;
-        collect_idents(*ds->expr, idents);
-        for (auto* id : idents) {
-            if (!is_param_or_global(id->name))
-                err("defer expression references '" + id->name + "', a local variable - "
-                    "only function parameters and globals may be referenced in a defer "
-                    "expression (a block/loop-local may already be out of scope by the "
-                    "time the defer actually runs, at function exit)", id->loc.line, id->loc.col);
-        }
         return;
     }
     if (auto* fs = dynamic_cast<ForStmt*>(&s)) {
@@ -1606,8 +1562,9 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
             pop_scope();
             if (!c.body.stmts.empty()) {
                 Stmt* last = c.body.stmts.back().get();
-                if (!dynamic_cast<BreakStmt*>(last) && !dynamic_cast<ReturnStmt*>(last))
-                    err("nonempty switch case must end with break or return; implicit fallthrough is not allowed",
+                if (!dynamic_cast<BreakStmt*>(last) && !dynamic_cast<ReturnStmt*>(last) &&
+                    !dynamic_cast<ContinueStmt*>(last))
+                    err("nonempty switch case must end with break, continue, or return; implicit fallthrough is not allowed",
                         last->loc.line, last->loc.col);
             }
         }

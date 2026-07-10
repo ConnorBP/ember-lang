@@ -6,6 +6,7 @@
 #include "x64_emitter.hpp"
 #include "jit_memory.hpp"
 #include "context.hpp"   // context_t (v1.0 ember_call ctx-reg indirection)
+#include "ast.hpp"
 #include <cstdint>
 #include <vector>
 #include <string>
@@ -19,12 +20,22 @@ namespace ember {
 // table base and globals base loads that a `.em` serializer must repoint at
 // load time. Populated by compile_func; empty for the hand-built engine.cpp
 // proofs (which bake real addresses via raw mov_reg_imm64).
+struct CompiledNativeBinding {
+    uint32_t code_offset = 0;
+    std::string name;
+    Type ret;
+    std::vector<Type> params;
+};
+
 struct CompiledFn {
     std::string name;
     std::vector<uint8_t> bytes;   // emitted bytes (kept for inspection/debug)
     void* exec = nullptr;         // alloc_executable result
     void* entry = nullptr;        // == exec (alias for clarity at call sites)
     std::vector<AbsFixup> abs_fixups; // relocatable imm64 slots (for .em serialization)
+    std::vector<CompiledNativeBinding> native_fixups; // symbolic host-native binding slots
+    std::vector<uint8_t> rodata;      // function-local bytes appended to loaded page
+    std::string non_serializable_reason;
 };
 
 // v0.1: build the compiled form of `fn add(a: i64, b: i64) -> i64 { return a + b; }`

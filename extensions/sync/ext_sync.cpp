@@ -70,7 +70,7 @@ static std::recursive_mutex g_store_mutex;
 //    loop is bounded by the instruction budget (SAFETY S3).
 // ============================================================================
 struct AtomicSlot {
-    std::atomic<int64_t> v{0};
+    std::atomic<uint64_t> v{0};
     int width = 64;            // 8/16/32/64 -- store/fetch_add mask to this
 };
 static std::vector<std::shared_ptr<AtomicSlot>> g_atomics;
@@ -89,34 +89,37 @@ static std::shared_ptr<AtomicSlot> atom_slot(int64_t h) {
 // 0xFFFFFFFF, so we mask to the unsigned range, not the signed two's-complement
 // range. (Signed atomics would be a different, narrower contract; this matches
 // the plan + the test expectations.)
-static int64_t atom_mask(int64_t v, int width) {
-    uint64_t u = uint64_t(v);
+static uint64_t atom_mask_bits(uint64_t v, int width) {
     switch (width) {
-        case 8:  return int64_t(u & 0xFFull);
-        case 16: return int64_t(u & 0xFFFFull);
-        case 32: return int64_t(u & 0xFFFFFFFFull);
+        case 8:  return v & 0xFFull;
+        case 16: return v & 0xFFFFull;
+        case 32: return v & 0xFFFFFFFFull;
         default: return v;          // 64: no masking
     }
+}
+
+static uint64_t atom_mask(int64_t v, int width) {
+    return atom_mask_bits(uint64_t(v), width);
 }
 
 static int64_t atom_alloc(int width, int64_t init) {
     std::lock_guard<std::recursive_mutex> guard(g_store_mutex);
     if (width != 8 && width != 16 && width != 32 && width != 64) width = 64;
-    init = atom_mask(init, width);
+    uint64_t init_bits = atom_mask(init, width);
     if (!g_atomics_free.empty()) {
         int64_t idx = g_atomics_free.back();
         g_atomics_free.pop_back();
         auto& slot = g_atomics[size_t(idx - 1)];
         slot = std::make_shared<AtomicSlot>();
         slot->width = width;
-        slot->v.store(init, std::memory_order_relaxed);  // slot is exclusively ours
+        slot->v.store(init_bits, std::memory_order_relaxed);  // slot is exclusively ours
         return idx;
     }
     if (g_atomics.size() >= MAX_STORE_SLOTS) return 0;
     g_atomics.push_back(std::make_shared<AtomicSlot>());
     auto& s = g_atomics.back();
     s->width = width;
-    s->v.store(init, std::memory_order_relaxed);
+    s->v.store(init_bits, std::memory_order_relaxed);
     return int64_t(g_atomics.size());
 }
 
@@ -128,26 +131,26 @@ extern "C" {
     }
     static int64_t n_atomic_load(int64_t h) {
         auto s = atom_slot(h);
-        return s ? s->v.load(std::memory_order_acquire) : 0;
+        return s ? int64_t(s->v.load(std::memory_order_acquire)) : 0;
     }
     static void n_atomic_store(int64_t h, int64_t v) {
         auto s = atom_slot(h);
         if (s) s->v.store(atom_mask(v, s->width), std::memory_order_release);
     }
-    // fetch_add: for width<64 wrap modulo 2^width via a CAS loop (the
-    // standard fetch_add would overflow the int64_t, not the width). For
-    // width==64 a plain fetch_add is fine. Returns the OLD value. Plan S2.3.
+    // fetch_add: for width<64 wrap modulo 2^width via a CAS loop. The
+    // representation and every intermediate are unsigned, so both 64-bit
+    // and narrow-width wrapping are defined. Returns the OLD value. Plan S2.3.
     static int64_t n_atomic_fetch_add(int64_t h, int64_t delta) {
         auto s = atom_slot(h); if (!s) return 0;
         if (s->width == 64) {
-            return s->v.fetch_add(delta, std::memory_order_acq_rel);
+            return int64_t(s->v.fetch_add(uint64_t(delta), std::memory_order_acq_rel));
         }
-        int64_t old = s->v.load(std::memory_order_acquire);
+        uint64_t old = s->v.load(std::memory_order_acquire);
         for (;;) {
-            int64_t nev = atom_mask(old + delta, s->width);
+            uint64_t nev = atom_mask_bits(old + uint64_t(delta), s->width);
             if (s->v.compare_exchange_weak(old, nev,
                     std::memory_order_acq_rel, std::memory_order_acquire)) {
-                return old;   // old is the pre-swap value
+                return int64_t(old);   // old is the pre-swap value
             }
             // compare_exchange_weak updated `old` to the current value on
             // failure; retry. (Host-local var, invisible to the script.)
@@ -156,14 +159,14 @@ extern "C" {
     static int64_t n_atomic_fetch_sub(int64_t h, int64_t delta) {
         auto s = atom_slot(h); if (!s) return 0;
         if (s->width == 64) {
-            return s->v.fetch_sub(delta, std::memory_order_acq_rel);
+            return int64_t(s->v.fetch_sub(uint64_t(delta), std::memory_order_acq_rel));
         }
-        int64_t old = s->v.load(std::memory_order_acquire);
+        uint64_t old = s->v.load(std::memory_order_acquire);
         for (;;) {
-            int64_t nev = atom_mask(old - delta, s->width);
+            uint64_t nev = atom_mask_bits(old - uint64_t(delta), s->width);
             if (s->v.compare_exchange_weak(old, nev,
                     std::memory_order_acq_rel, std::memory_order_acquire)) {
-                return old;
+                return int64_t(old);
             }
         }
     }
@@ -172,18 +175,19 @@ extern "C" {
     // returning i64 even for a u8). Plan S2.2.
     static int64_t n_atomic_cas(int64_t h, int64_t expected, int64_t desired) {
         auto s = atom_slot(h); if (!s) return 0;
-        desired = atom_mask(desired, s->width);
-        // compare_exchange_strong modifies `expected` on failure to the
+        uint64_t expected_bits = uint64_t(expected);
+        uint64_t desired_bits = atom_mask(desired, s->width);
+        // compare_exchange_strong modifies `expected_bits` on failure to the
         // current value -- that's a host-local var, not a script-visible
         // out-param, so it's invisible to the script (the script gets only
         // the bool; it re-reads via load if it wants the current value).
-        bool ok = s->v.compare_exchange_strong(expected, desired,
+        bool ok = s->v.compare_exchange_strong(expected_bits, desired_bits,
                     std::memory_order_acq_rel, std::memory_order_acquire);
         return ok ? 1 : 0;
     }
     static int64_t n_atomic_swap(int64_t h, int64_t v) {
         auto s = atom_slot(h); if (!s) return 0;
-        return s->v.exchange(atom_mask(v, s->width), std::memory_order_acq_rel);
+        return int64_t(s->v.exchange(atom_mask(v, s->width), std::memory_order_acq_rel));
     }
     static void n_atomic_free(int64_t h) {
         try {
@@ -199,7 +203,7 @@ extern "C" {
 
 bool atomic_load_host(int64_t handle, int64_t* out_val) {
     auto s = atom_slot(handle); if (!s) return false;
-    *out_val = s->v.load(std::memory_order_acquire);
+    *out_val = int64_t(s->v.load(std::memory_order_acquire));
     return true;
 }
 bool atomic_store_host(int64_t handle, int64_t val) {
@@ -209,8 +213,9 @@ bool atomic_store_host(int64_t handle, int64_t val) {
 }
 bool atomic_cas_host(int64_t handle, int64_t expected, int64_t desired, bool* out_swapped) {
     auto s = atom_slot(handle); if (!s) return false;
-    desired = atom_mask(desired, s->width);
-    *out_swapped = s->v.compare_exchange_strong(expected, desired,
+    uint64_t expected_bits = uint64_t(expected);
+    uint64_t desired_bits = atom_mask(desired, s->width);
+    *out_swapped = s->v.compare_exchange_strong(expected_bits, desired_bits,
                     std::memory_order_acq_rel, std::memory_order_acquire);
     return true;
 }

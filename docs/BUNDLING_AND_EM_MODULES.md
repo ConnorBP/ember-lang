@@ -222,15 +222,11 @@ code pages and fixes up absolute addresses.
   (portable IR) doesn't apply.
 - *Con:* larger file than IR (raw x64 is less dense). Acceptable  - 
   `.em` files ship with a game, not downloaded per-call.
-- *Con:* needs a relocation table for every absolute-imm64 the
-  codegen bakes in. Today that is two kinds: the dispatch-table base
-  (`mov r11, <table base imm64>`, `CODEGEN_SPEC.md` Section 7) and the
-  globals block base (`mov reg, [globals_base + offset]`,
-  `MEMORY_AND_GC.md` Section 4). Both are baked as raw `imm64` with **no
-  fixup entry today** (verified in `label_patch.hpp`: only branch
-  `rel32` and rodata `RipFixup` disp32 exist; absolute-imm64 has no
-  capture path). So part of the work is *adding* that capture path
-  (Section 2.4). This is a small, contained change to the encoder.
+- *Con:* every process-dependent absolute immediate needs explicit metadata.
+  The implemented format records dispatch, globals, module-registry, and
+  function-rodata base relocations plus separate symbolic native binding
+  slots. The emitter captures these while generating instructions; neither
+  writer nor loader scans x64 bytes.
 
 **Option C - a bytecode interpreter.** Explicitly rejected. This is
 the `DESIGN.md` non-goal: "JIT only, no bytecode interpreter fallback  - 
@@ -254,7 +250,7 @@ and the existing encoder's `emit32`/`emit64`).
 ```
 Header (40 bytes):
   magic           : u32   = 0x454D424C   ("EMBL"  -  ember bundle, loadable)
-  version         : u32   = 1
+  version         : u32   = 2             (loader also accepts historical v1)
   flags           : u32   = 0            (bit 0 reserved: "contains source"
                                            for future embed-source reload)
   function_count  : u32
@@ -262,7 +258,8 @@ Header (40 bytes):
   rodata_total    : u32                  (bytes of all per-function rodata,
                                            sum of per-fn rodata_size)
   entry_slot      : u32                  (slot of @entry fn, or 0xFFFFFFFF)
-  reserved        : u32[3] = 0
+  v2_build_id     : u64                  (stable compiler/format identity)
+  v2_target_abi   : u32                  (target/calling-convention hash)
 
 Per-function (repeated function_count times):
   name_len        : u16
@@ -277,19 +274,35 @@ Per-function (repeated function_count times):
                                           RIP-relative from code, same page)
   reloc_count     : u32
   relocs          : reloc[reloc_count]
-    reloc:
-      offset      : u32                   (byte offset within `code` of the
-                                          imm64 to patch)
+    v2 reloc:
+      offset      : u32                   (byte offset within `code` of imm64)
       kind        : u8
-        0 = dispatch_table_base   (patch imm64 -> &this module's DispatchTable)
-        1 = globals_base          (patch imm64 -> &this module's globals block)
-        2 = slot_index_load       (patch imm64 -> &DispatchTable itself, then
-                                   the [r11 + slot*8] load is already correct
-                                   since slot*8 is a compile-time const disp32;
-                                   this reloc exists only if codegen emitted
-                                   a raw slot-pointer load rather than the
-                                   base+disp form  -  v1 uses base+disp, so
-                                   kind 2 is reserved/unused in v1)
+        0 = dispatch_table_base
+        1 = globals_base
+        2 = module_registry_base
+        3 = function_rodata_base          (loaded code end + addend)
+      addend      : u32                   (nonzero only for kind 3)
+    v1 reloc:
+      offset      : u32
+      kind        : u8                    (kinds 0..2 only; no addend)
+  export_signature (v2):
+    return_type   : canonical Type
+    param_count   : u32
+    params        : canonical Type[param_count]
+  native_binding_count : u32              (v2)
+  native_bindings:
+    code_offset   : u32                   (8-byte zeroed imm64 slot)
+    name_len/name : u16 + UTF-8 bytes     (exact host allowlist key)
+    signature     : return Type + ordered parameter Types
+
+Canonical Type encoding (recursive, based directly on `ast.hpp::Type`):
+  prim            : u8                    (`Prim` enum ordinal)
+  flags           : u8                    (slice, array, struct, fn handle,
+                                           recorded fn signature)
+  array_len       : u32
+  struct_name     : u16 + UTF-8 bytes
+  elem            : canonical Type        (slice/fixed array only)
+  recorded fn signature                    (typed function handles only)
 
 Globals block:
   bytes[global_size]                     (initial values, copied verbatim
@@ -300,25 +313,19 @@ Function-name directory (for ember_call by name, HOT_RELOAD.md Section 7):
   entries: [ { name_len: u16, name: bytes, slot_index: u32 } ... ]
 ```
 
-**Why rodata is per-function, not a shared section.** `MEMORY_AND_GC.md`
-Section 6 specifies string literals as *function-local rodata in the code
-page*, with `RipFixup` disp32 already resolved intra-page by
-`LabelPatch::resolve_fixups`. Keeping rodata per-function in the
-`.em` (appended right after each function's code, same page) means
-the existing RIP-relative disp32 values are **already correct** after
-a straight `memcpy` - no rodata relocation needed. This is the design
-choice that minimizes relocation kinds to just the two absolute
-imm64s (dispatch base, globals base). A shared rodata section would
-require a third reloc kind and break the "string literals live in
-their function's page" invariant for no benefit.
+**Why rodata is per-function, not a shared section.** String bytes are copied
+from sema-owned `Program::rodata_store` into `CompiledFn::rodata`. Codegen emits
+an explicit `FunctionRodataBase` imm64 relocation with the byte offset as its
+addend; the loader patches it to `loaded_page + code_size + addend`. Thus no
+`StringLit::baked_ptr` survives serialization. Keeping rodata next to its code
+also gives one allocation and one W^X transition per function.
 
 **Why no cross-function `rel32` reloc.** `CODEGEN_SPEC.md` Section 4
 explicitly forbids cross-function `rel32` references - script-to-
 script calls go through the dispatch table, never same-image direct
-calls. So the only fixups are within a function (branches + rodata,
-already resolved by `resolve_fixups` before serialization) and the
-two absolute imm64s (new reloc table). The serialized bytes are
-otherwise position-independent.
+calls. Branch labels are resolved before serialization; absolute external
+bases, function-rodata addresses, and native targets use the explicit v2
+records above. The serialized bytes are otherwise position-independent.
 
 ### 2.3 Serializer (compile-time, after `emit_x64`)
 
@@ -330,35 +337,40 @@ the dispatch table + the globals block). For each function:
    trailing `rodata` blob.
 2. Emit the per-function record: name, `slot_index`, `code_size`,
    `rodata_size`, the code bytes, the rodata bytes.
-3. Emit the reloc list: every absolute-imm64 the codegen baked,
-   captured during emit (Section 2.4). For v1, that is the dispatch-table
-   base load(s) and the globals-base load(s) per function.
-4. After all functions: the globals block (raw initial-value bytes)
-   and the name→slot directory.
+3. Emit every explicit base/rodata relocation (including v2 addends), the
+   canonical signature copied from the real `FuncDecl`, and each symbolic
+   native binding copied from sema/codegen metadata. Relocation/native imm64
+   bytes are zeroed in the file; the writer never scans machine bytes.
+4. Reject exact generated functions that contain unsupported process state
+   (trap stub/context/detail, baked budget/depth storage, or function-reference
+   allowlist storage), with the codegen feature-specific diagnostic.
+5. After all functions: the already-evaluated globals bytes and name→slot
+   directory.
 
 The serializer needs the slot table (name→index) and the globals
 block address/size, both of which the compile pipeline already
 produces. No new compile-time state.
 
-### 2.4 Relocation capture - the one encoder change
+### 2.4 Relocation and native-binding capture
 
-Today (`encoder.hpp` / `label_patch.hpp`) there is **no fixup path for
-absolute-imm64**. `mov_r_imm64` (`48 B8+r <imm64>`) writes the 8
-bytes raw. The dispatch-table base and globals base are baked as raw
-`imm64` in `main.cpp`'s `build_fib` (`enc.mov_r_imm64(Gp::r11,
-reinterpret_cast<uintptr_t>(dispatch_table_base))`). There is no way
-for a serializer to find these after the fact without scanning bytes
-(brittle).
+`X64Emitter::mov_reg_imm64_external` emits an eight-byte placeholder and an
+`AbsFixup`; `mov_reg_native` emits a separate symbolic native placeholder.
+Codegen preserves the exact name selected by sema, including
+`OpOverload::fn_name`, so aliases and overload-only targets never require
+ambiguous pointer reverse lookup.
 
-**Fix: add a third fixup kind to `LabelPatch`.**
+The base relocation shape is:
 
 ```cpp
 struct AbsFixup {
     uint32_t code_offset = 0;   // offset of the imm64 within `code`
     enum Kind : uint8_t {
-        DispatchTableBase = 0,  // patch with &module_dispatch_table
-        GlobalsBase       = 1,  // patch with &module_globals_block
+        DispatchTableBase = 0,
+        GlobalsBase = 1,
+        ModuleRegistryBase = 2,
+        FunctionRodataBase = 3,
     } kind;
+    uint32_t addend = 0;
 };
 std::vector<AbsFixup> abs_fixups_;
 void add_abs_fixup(AbsFixup f) { abs_fixups_.push_back(f); }
@@ -383,15 +395,15 @@ mechanical change localized to the call-site and globals-access
 emission. Branches and rodata keep using the existing `rel32` /
 `RipFixup` paths unchanged.
 
-This is the **only** change to existing code the `.em` feature
-requires, and it is additive (a new encoder method + a new fixup
-vector; the existing `mov_r_imm64` with a real address still works
-for genuinely-constant pointers if any exist).
+Raw `mov_reg_imm64` remains for genuine numeric constants. Process pointers
+must use one of these explicit records or make the generated function
+non-serializable.
 
 ### 2.5 Loader (`load_em_file`)
 
-`src/em_loader.hpp/.cpp` exposes `bool load_em_file(const char* path,
-LoadedModule& out, std::string* error, ModuleRegistry* registry)`. It stages
+`src/em_loader.hpp/.cpp` exposes `load_em_file(path, out, error, registry,
+native_allowlist)`. The final allowlist argument is additive/default-null for
+source compatibility. It stages
 and validates the complete file before publication:
 
 1. Read + validate header (magic, version).
@@ -404,11 +416,10 @@ and validates the complete file before publication:
      `ExecArena` already does one allocation per fn, `main.cpp`'s
      `CompiledFn`).
    - `memcpy` code bytes, then rodata bytes right after.
-   - Apply the relocs: for each `reloc` in the record, read `kind`:
-     - `DispatchTableBase` → write `&dispatch_table` as imm64 at
-       `code_offset`.
-     - `GlobalsBase` → write `&globals_block` as imm64 at
-       `code_offset`.
+   - Apply dispatch/globals/registry/function-rodata relocations.
+   - Resolve every v2 native name only through the supplied
+     `unordered_map<string, NativeSig>` and require canonical signature equality;
+     missing names, null targets, and mismatches are load errors.
    - Make the page executable (`ExecArena::publish` already does
      `mmap`/`VirtualProtect` RX).
    - Stamp `dispatch_table.slots[slot_index] = page_base` (the
@@ -425,12 +436,25 @@ core payoff.
 
 - Source compilation is assembled from the public lexer/parser/sema/codegen
   APIs (there is no shipped `ember_compile` facade).
-- `load_em_file(path, LoadedModule&, error, registry)` is the implemented
-  host loader; `link_em_file` additionally registers the loaded dispatch table.
-  v1 `.em` is ABI/process trusted: it contains native code and may contain
-  embedded process-local pointers. It is not promised portable across a new
-  process/build. Symbolic native/trap/string/allowlist relocations plus build
-  identity require a versioned format redesign (H12).
+### 2.5.1 Format v2 portability and v1 compatibility
+
+The writer emits version 2. The loader explicitly accepts versions 1 and 2.
+Version 1 retains its historical ABI-trusted `unknown_sig` behavior. Version 2
+rejects compiler/build or target-ABI identity mismatches before executable
+allocation, stores canonical `Type`-based export signatures, and resolves each
+native immediate by symbolic name and signature through a host-supplied
+`unordered_map<string, NativeSig>` allowlist. Function string bytes live in the
+function rodata payload and use an explicit code-plus-rodata relocation; no
+`Program::rodata_store` pointer is serialized. Generated trap-stub/context/detail
+and function-reference allowlist state has no portable binding yet, so the v2
+writer rejects those exact functions with a feature-specific error rather than
+baking a process pointer.
+
+- `load_em_file(path, LoadedModule&, error, registry, native_allowlist)` is the
+  implemented host loader; `link_em_file` additionally registers the loaded
+  dispatch table. v1 remains ABI/process trusted and exposes unknown export
+  signatures. v2 verifies stable build/target identities before executable
+  allocation and uses explicit symbolic native and function-rodata bindings.
 - **Reloading code originally loaded from `.em`:** `.em` carries no source.
   The host may compile a source replacement and use the existing
   single-function machinery only if it also retains the corresponding Program,
@@ -440,52 +464,36 @@ core payoff.
   - `ember_cli emit-em input.ember output.em`, or
     `ember_cli run input.ember --emit-em output.em`, runs the full pipeline,
     serializes initialized globals, and does not execute.
-  - No `--load-em` action ships. Loading is via the host APIs above or a
-    source `link "file.em" as alias;` directive. The latter exposes v1 exports
-    as ABI-trusted unknown signatures because v1 serializes no signatures
-    (H14); exact arity/types/return ABI are the host/caller's responsibility.
+  - `ember_cli run --load-em file.em [--fn name]` registers the same standard
+    native and overload-symbol allowlist, loads in a fresh process, and invokes
+    the selected export. Source `link "file.em" as alias;` uses the same loader.
+    v2 exports are type-checked from slot-indexed canonical signatures; only v1
+    exports remain ABI-trusted unknown.
 
 ### 2.7 Versioning and forward-compat
 
-- The `version` field is 1. A loader checks `magic` + `version` and
-  rejects unknown versions outright (no guessing). Bumping the
+- The writer emits version 2. The loader accepts exactly v1 and v2 and
+  rejects other versions outright (no guessing). Bumping the
   version on any format change is mandatory - a `.em` is a
   de-facto ABI, and silent misreads are worse than loud rejects.
 - The `flags` field reserves bit 0 for "embeds source" (future
   reload-from-`.em`) and leaves the rest zero. Unused bits are not
   repurposed without a version bump.
-- The reloc `kind` space is small (2 used, 1 reserved) and a new
-  kind requires a version bump. This is fine - the format is meant
+- v2 relocation kinds 0..3 and their addend semantics are pinned above;
+  adding a kind or changing a record requires a version bump. The format is meant
   to be regenerated by the toolchain, not hand-edited.
 
 ---
 
-## Part 3 - Implementation order (gated on milestones)
+## Part 3 - Implemented status
 
-The two features have different dependencies on the existing
-milestone plan (`DESIGN.md` Section 9):
-
-1. **`.em` serializer + loader** - **buildable now against v0.1.**
-   The v0.1 codegen already produces everything the format needs
-   (`CompiledFn` with raw bytes + `ExecArena`, the dispatch table,
-   the globals block). The only prerequisite is the relocation-
-   capture encoder change (Section 2.4), which is self-contained. This can
-   ship as a v0.1.1 / v0.2 companion to the existing `ember_v01.exe`
-   proof and *proves the pre-compile path end to end* before the
-   parser even exists.
-2. **`include` resolver + AST merge** - **blocked on v0.2's parser.**
-   `include` is a parse-time directive that merges `Program`s; v0.1
-   has no parser (hand-built IR, `COMPILER_PIPELINE.md` Section 12.1). The
-   resolver is cheap once the parser exists (an `unordered_set` +
-   a recursive parse-and-merge walk), so it lands with or just
-   after v0.2.
-3. **`import` / modules** - **future, `ROADMAP.md` Tier 6.** Design
-   only (`docs/MODULES.md`); no grammar, no implementation. The
-   re-entry trigger is a real runtime mod-loading use case.
-
-**Recommended sequence:** `.em` first (unblocked, proves the format),
-`include` with v0.2 (unblocks real multi-file scripts), `import`
-whenever Tier 6's trigger fires.
+1. **`.em` v2 serializer + loader:** implemented by `em_writer` / `em_loader`,
+   including v1 compatibility, W^X staging, identities, signatures, symbolic
+   natives, rodata, globals, and hardened limits.
+2. **Textual imports:** implemented by `src/import.cpp` and used by the CLI.
+3. **Live modules:** implemented by `ModuleRegistry`, kind-2 relocations,
+   `module_linker.hpp`, and the `link` grammar. JIT and loaded modules share the
+   same export and dispatch model.
 
 ---
 
@@ -495,15 +503,10 @@ whenever Tier 6's trigger fires.
   non-goal, `GAP_ANALYSIS.md` Section 4).
 - **No new execution path.** `.em` loads native x64; the runtime
   executes it exactly as it executes JIT'd code. One path.
-- **No cross-module linking in v1.** `import` is spec'd, not built
-  (Tier 6). Bundling (`include`) covers the "split a big script across
-  files" need without runtime modules.
-- **No embedded-source `.em` in v1.** Reload of a loaded `.em`
-  requires separate source (Section 2.6). Embedding source is a `flags` bit
-  reserved for later.
-- **No include root / search path in v1.** `include` resolves relative
-  to the current file only (Section 1.2). A host-configured include root is
-  a v2 addition with no current use case.
+- **No source embedded in `.em` v2.** Reload from source still requires the
+  source to be supplied separately; header flag bit 0 remains reserved.
+- **No host-configured textual-import search path.** Imports resolve relative
+  to the current file.
 - **No namespace/visibility on `include`.** All included names land in
   one flat module scope (`COMPILER_PIPELINE.md` Section 4). `pub`/`priv` is a
   language extension, not a bundling concern.
@@ -512,16 +515,15 @@ whenever Tier 6's trigger fires.
 
 ## Part 5 - Open questions to resolve at implementation time
 
-1. **`@entry` discovery in `.em`.** The writer stores the annotated entry
-   slot, falling back to `main`, or `0xFFFFFFFF` if neither exists. The v1 CLI
-   emits this metadata but has no direct load/run action; hosts decide how to
-   invoke a loaded slot.
-2. **Concurrent reclamation of loaded pages (deferred).** `HOT_RELOAD.md`
-   Section 5 ships caller-owned retirement only. A `.em`-loaded module that
-   never reloads never retires pages. A concurrent host that reloads must keep
-   old pages until it establishes host-level quiescence; no epoch scheme ships
-   in v1. Verify the `module_t` carries the page list for both JIT'd and loaded
-   modules.
+1. **`@entry` discovery in `.em`.** The CLI writer stores the annotated entry
+   slot, falling back to `main`, or `0xFFFFFFFF` if neither exists. The load/run
+   action accepts `--fn` and otherwise uses the stored entry.
+2. **Reloading `.em`-loaded functions (deferred).** `HOT_RELOAD.md` Section 5
+   ships guarded epoch reclamation for pages replaced through the source-level
+   `reload_function` path. A `.em`-loaded module that never reloads never
+   retires pages, but replacing loaded functions is not yet exposed as a
+   dedicated loader transaction. Verify a future loaded-module reload path
+   transfers its page records into the same domain without double ownership.
 3. **`mov_r_imm64_external` vs raw `mov_r_imm64` in v0.1 tests.** The
    five `Section 12` acceptance tests bake real addresses via raw
    `mov_r_imm64`. Switching to the external form means the JIT driver

@@ -83,7 +83,7 @@ static RunResult run_script(const std::string& src, ModuleRegistry& registry,
         if (ld.is_file) {
             keep_alive->emplace_back();
             std::string lerr;
-            bool ok = link_em_file(registry, ld.target.c_str(), ld.alias, keep_alive->back(), &lerr);
+            bool ok = link_em_file(registry, ld.target.c_str(), ld.alias, keep_alive->back(), &lerr, &natives);
             if (!ok) { rr.trapped=true; return rr; }
             uint32_t id = registry.find_by_name(ld.alias);
             add_exports(local_exports, ld.alias, build_em_exports(keep_alive->back(), id));
@@ -127,8 +127,11 @@ static std::string emit_em(const std::string& src, const std::string& name) {
     std::vector<CompiledFn> fns;
     for(auto&fn:pr.program.funcs){auto cf=compile_func(fn,ctx); finalize(cf); table.set(fn.slot,cf.entry); fns.push_back(std::move(cf));}
     EmModule mod;
-    for(const auto& cf:fns){EmFunctionRecord rec; rec.name=cf.name; rec.slot_index=uint32_t(slots[cf.name]);
-        rec.code=cf.bytes; for(const auto& af:cf.abs_fixups){EmReloc r; r.offset=af.code_offset; r.kind=uint8_t(af.kind); rec.relocs.push_back(r);}
+    for(size_t i=0;i<fns.size();++i){const auto& cf=fns[i];const auto& decl=pr.program.funcs[i];EmFunctionRecord rec; rec.name=cf.name; rec.slot_index=uint32_t(decl.slot);
+        rec.code=cf.bytes;rec.rodata=cf.rodata;rec.non_serializable_reason=cf.non_serializable_reason;
+        rec.signature.ret=decl.ret?*decl.ret:Type{};for(const auto&p:decl.params)rec.signature.params.push_back(p.ty?*p.ty:Type{});
+        for(const auto& af:cf.abs_fixups){EmReloc r; r.offset=af.code_offset; r.kind=uint8_t(af.kind);r.addend=af.addend;rec.relocs.push_back(r);}
+        for(const auto&nf:cf.native_fixups){EmNativeBinding b;b.offset=nf.code_offset;b.name=nf.name;b.signature.ret=nf.ret;b.signature.params=nf.params;rec.native_bindings.push_back(std::move(b));}
         mod.functions.push_back(std::move(rec));}
     mod.globals=gbs; mod.entry_slot=EM_NO_ENTRY;
     for(const auto&fn:pr.program.funcs) mod.name_table.push_back({fn.name,uint32_t(fn.slot)});

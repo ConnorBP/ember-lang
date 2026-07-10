@@ -70,6 +70,7 @@ static int64_t call_i64_i64(void* entry, int64_t a) {
 // =====================================================================
 struct CalleeModule {
     ember::CompiledFn fn;                                   // double_it
+    ember::EmSignature signature;                           // copied from real FuncDecl
     ember::DispatchTable table;                              // B's own dispatch table (slot 0 = double_it)
     std::unordered_map<std::string, int> slots;              // name -> slot
     std::vector<uint8_t> globals_store;                      // empty (no globals)
@@ -78,7 +79,7 @@ struct CalleeModule {
 
 static CalleeModule build_callee_double_it(const std::string& src) {
     using namespace ember;
-    CalleeModule m{ {}, DispatchTable(1), {}, {}, {} };
+    CalleeModule m{ {}, {}, DispatchTable(1), {}, {}, {} };
 
     // ---- lex ----
     auto lr = tokenize(src, "<callee>");
@@ -121,6 +122,8 @@ static CalleeModule build_callee_double_it(const std::string& src) {
     ctx.structs = &struct_layouts;
 
     // ---- compile + finalize double_it ----
+    m.signature.ret=pr.program.funcs[0].ret?*pr.program.funcs[0].ret:Type{};
+    for(const auto& p:pr.program.funcs[0].params)m.signature.params.push_back(p.ty?*p.ty:Type{});
     m.fn = compile_func(pr.program.funcs[0], ctx);
     if (!finalize(m.fn)) { std::printf("FAIL callee: alloc_executable\n"); std::exit(1); }
     m.table.set(pr.program.funcs[0].slot, m.fn.entry);
@@ -238,18 +241,24 @@ static CallerModule build_caller_cross_module(uint32_t module_id, uint32_t slot,
 // `CompiledFn::abs_fixups`. Mirrors em_roundtrip_test's build_em_module for the
 // single-function case.
 static ember::EmModule build_em_module_single(const ember::CompiledFn& fn,
-                                              uint32_t slot) {
+                                              uint32_t slot,
+                                              const ember::EmSignature& signature) {
     using namespace ember;
     EmModule mod;
     EmFunctionRecord rec;
     rec.name = fn.name;
     rec.slot_index = slot;
     rec.code = fn.bytes;
+    rec.rodata = fn.rodata;
+    rec.non_serializable_reason=fn.non_serializable_reason;
+    rec.signature = signature;
+    for(const auto& nf:fn.native_fixups){EmNativeBinding b;b.offset=nf.code_offset;b.name=nf.name;b.signature.ret=nf.ret;b.signature.params=nf.params;rec.native_bindings.push_back(std::move(b));}
     rec.relocs.reserve(fn.abs_fixups.size());
     for (const auto& af : fn.abs_fixups) {
         EmReloc r;
         r.offset = af.code_offset;
         r.kind = static_cast<uint8_t>(af.kind);
+        r.addend = af.addend;
         rec.relocs.push_back(r);
     }
     mod.functions.push_back(std::move(rec));
@@ -424,10 +433,11 @@ int main() {
 
         // callee B: real parsed double_it -> bytes from b.fn.bytes (post-fill),
         // relocs from b.fn.abs_fixups (empty for double_it). slot 0.
-        EmModule mod_B = build_em_module_single(b.fn, /*slot=*/0);
+        EmModule mod_B = build_em_module_single(b.fn, /*slot=*/0, b.signature);
         // caller A: hand-assembled -> bytes from a.fn.bytes, relocs from
         // a.fn.abs_fixups (one kind-2). slot 0.
-        EmModule mod_A = build_em_module_single(a.fn, /*slot=*/0);
+        EmSignature caller_signature; caller_signature.ret=make_prim(Prim::I64); caller_signature.params.push_back(make_prim(Prim::I64));
+        EmModule mod_A = build_em_module_single(a.fn, /*slot=*/0, caller_signature);
 
         std::filesystem::path tmp_dir = std::filesystem::temp_directory_path();
         std::filesystem::path path_A = tmp_dir / "import_roundtrip_A.em";
@@ -464,8 +474,9 @@ int main() {
             // has none).
             LoadedModule loaded_B;
             std::string lerr_B;
+            std::unordered_map<std::string,NativeSig> no_natives;
             bool loaded_B_ok = load_em_file(path_B.string().c_str(), loaded_B, &lerr_B,
-                                            /*registry=*/nullptr);
+                                            /*registry=*/nullptr, &no_natives);
             std::printf("[B7] %s: load_em_file module B (no registry needed)\n", passfail(loaded_B_ok));
             if (!loaded_B_ok) { std::printf("    load_em_file(B) error: %s\n", lerr_B.c_str()); failures++; }
             else if (loaded_B.entry() == nullptr) { std::printf("    [B7] FAIL: loaded B entry null\n"); failures++; }
@@ -475,7 +486,7 @@ int main() {
             LoadedModule loaded_A;
             std::string lerr_A;
             bool loaded_A_ok = load_em_file(path_A.string().c_str(), loaded_A, &lerr_A,
-                                            /*registry=*/&fresh_registry);
+                                            /*registry=*/&fresh_registry, &no_natives);
             std::printf("[B8] %s: load_em_file module A (kind-2 reloc -> fresh registry base)\n", passfail(loaded_A_ok));
             if (!loaded_A_ok) { std::printf("    load_em_file(A) error: %s\n", lerr_A.c_str()); failures++; }
 

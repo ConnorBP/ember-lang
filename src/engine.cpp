@@ -155,6 +155,23 @@ CompiledFn compile_fib_i64(int64_t table_base, uint32_t slot) {
 }
 
 bool finalize(CompiledFn& fn) {
+    std::vector<uint8_t> image = fn.bytes;
+    image.insert(image.end(), fn.rodata.begin(), fn.rodata.end());
+    if (!fn.rodata.empty()) {
+        for (const auto& af : fn.abs_fixups) if (af.kind == AbsFixup::FunctionRodataBase && uint64_t(af.code_offset)+8 <= image.size()) {
+            uint64_t v = 0; // patched after RW allocation below
+            for(int i=0;i<8;++i) image[af.code_offset+i]=uint8_t(v>>(8*i));
+        }
+        void* page = alloc_executable_rw(image);
+        if (!page) return false;
+        uint8_t* bytes=static_cast<uint8_t*>(page);
+        for(const auto& af:fn.abs_fixups) if(af.kind==AbsFixup::FunctionRodataBase) {
+            uint64_t v=reinterpret_cast<uintptr_t>(bytes+fn.bytes.size()+af.addend);
+            for(int i=0;i<8;++i)bytes[af.code_offset+i]=uint8_t(v>>(8*i));
+        }
+        if(!seal_executable(page,image.size())){free_executable(page);return false;}
+        fn.exec=fn.entry=page; return true;
+    }
     fn.exec = alloc_executable(fn.bytes);
     fn.entry = fn.exec;
     return fn.exec != nullptr;

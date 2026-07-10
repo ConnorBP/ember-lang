@@ -70,8 +70,7 @@ Status: **v1.0** - the full frontend + binding API + safe execution + live
   Tier 1 `enum` / Tier 2 function refs / Tier 5 sync queues + context
   thread-safety all marked ✓ shipped v1.0 with their open items.
 - `docs/HOT_RELOAD.md` - dispatch table, slot stability, reload
-  protocol, in-flight calls, caller-owned retirement, and the deferred
-  concurrent epoch/quiescence requirement.
+  protocol, host execution guards, and shipped epoch/quiescence reclamation.
 - `docs/MEMORY_AND_GC.md` - ownership taxonomy, slice-escape check,
   globals, strings, arena (reserved), v2-GC deferral rationale.
 - `docs/LIFECYCLE.md` - `@entry`/`@on_tick`/`@event(...)` annotation-based

@@ -14,6 +14,7 @@
 //   ember run <file.ember> [--fn <name>] [--dump] [--emit-em <output.em>]
 //                           [--tick [--tick-count N] [--tick-interval MS]]
 //   ember emit-em <input.ember> <output.em>
+//   ember run --load-em <file.em> [--fn <name>]
 //
 //   run        compiles <file.ember> and calls the entry function unless
 //              --emit-em selects precompile-only output.
@@ -116,6 +117,28 @@ extern "C" void ember_cli_trap(ember::context_t* ctx, int reason, const char* de
     std::abort();
 }
 
+static void register_standard_bindings(
+        std::unordered_map<std::string, ember::NativeSig>& natives,
+        ember::OpOverloadTable* overloads_out=nullptr) {
+    using namespace ember;
+    ext_vec::register_natives(natives); ext_quat::register_natives(natives);
+    ext_mat::register_natives(natives); ext_string::register_natives(natives);
+    ext_array::register_natives(natives); ext_math::register_natives(natives);
+    ember::ext_sync::register_natives(natives); ember::ext_lifecycle::register_natives(natives);
+    OpOverloadTable overloads;
+    ext_vec::register_overloads(overloads); ext_quat::register_overloads(overloads);
+    ext_mat::register_overloads(overloads); ext_string::register_overloads(overloads);
+    // Overloads are semantically separate from ordinary source-call natives,
+    // but .em loader binding uses one symbolic host allowlist. Publish every
+    // exact sema-resolved overload name/signature into that allowlist.
+    for(const auto& item:overloads.entries){
+        const OpOverload& o=item.second;
+        NativeSig sig;sig.name=o.fn_name;sig.fn_ptr=o.fn_ptr;sig.ret=o.ret;sig.params=o.params;
+        natives[o.fn_name]=std::move(sig);
+    }
+    if(overloads_out)*overloads_out=std::move(overloads);
+}
+
 static void usage(FILE* out) {
     std::fprintf(out,
         "ember - standalone ember language runner\n"
@@ -123,6 +146,7 @@ static void usage(FILE* out) {
         "  ember run <input.ember> [--fn NAME] [--dump] [--emit-em OUTPUT.em]\n"
         "                          [--tick [--tick-count N] [--tick-interval MS]]\n"
         "  ember emit-em <input.ember> <output.em>\n"
+        "  ember run --load-em <input.em> [--fn NAME]\n"
         "\n"
         "  run                 compile and call the entry function\n"
         "  emit-em             compile without running and write <output.em>\n"
@@ -143,6 +167,7 @@ int main(int argc, char** argv) {
     std::string fn_name = "main";
     bool dump = false;
     std::string emit_em_path;   // v0.5: --emit-em <out> pre-compiles to a .em bundle
+    std::string load_em_path;
     bool tick_mode = false;     // v0.6: --tick runs @on_tick fns on a thread until a keybind
     int tick_interval_ms = 16;  // v0.6: --tick-interval (default ~60fps)
     int tick_max = 0;           // v0.6: --tick-count N auto-stop after N ticks (0 = until keybind; for tests/non-interactive)
@@ -156,6 +181,9 @@ int main(int argc, char** argv) {
         } else if (a == "--emit-em") {
             if (++i >= argc) { std::fprintf(stderr, "ember: --emit-em needs a path\n"); return 2; }
             emit_em_path = argv[i];
+        } else if (a == "--load-em") {
+            if (++i >= argc) { std::fprintf(stderr, "ember: --load-em needs a path\n"); return 2; }
+            load_em_path = argv[i];
         } else if (a == "--tick") {
             tick_mode = true;
         } else if (a == "--tick-interval") {
@@ -180,9 +208,21 @@ int main(int argc, char** argv) {
         }
     }
     if (action != "run" && action != "emit-em") { usage(stderr); return 2; }
-    if (file.empty()) { std::fprintf(stderr, "ember: missing <input.ember>\n"); usage(stderr); return 2; }
+    if (file.empty() && load_em_path.empty()) { std::fprintf(stderr, "ember: missing <input.ember>\n"); usage(stderr); return 2; }
     if (action == "emit-em" && emit_em_path.empty()) {
         std::fprintf(stderr, "ember: emit-em needs <output.em>\n"); usage(stderr); return 2;
+    }
+    if (!load_em_path.empty()) {
+        std::unordered_map<std::string, NativeSig> load_natives;
+        register_standard_bindings(load_natives);
+        LoadedModule loaded; std::string lerr;
+        if(!load_em_file(load_em_path.c_str(),loaded,&lerr,nullptr,&load_natives)){std::fprintf(stderr,"ember: load failed: %s\n",lerr.c_str());return 2;}
+        void* entry=loaded.entry_by_name(fn_name.c_str()); if(!entry)entry=loaded.entry();
+        if(!entry){std::fprintf(stderr,"ember: loaded entry '%s' not found\n",fn_name.c_str());return 2;}
+        uint32_t selected_slot=loaded.entry_slot;
+        for(const auto& item:loaded.name_table)if(item.first==fn_name){selected_slot=item.second;break;}
+        bool is_void=selected_slot<loaded.signatures_by_slot.size()&&loaded.signatures_by_slot[selected_slot].ret.is_void();
+        int64_t result=call_i64_i64(entry); return is_void?0:int(result);
     }
     if (!fs::exists(file)) { std::fprintf(stderr, "ember: no such file: %s\n", file.c_str()); return 2; }
 
@@ -229,20 +269,8 @@ int main(int argc, char** argv) {
 
     // ---- register ALL eight extensions: natives + overloads ----
     std::unordered_map<std::string, NativeSig> natives;
-    ext_vec::register_natives(natives);
-    ext_quat::register_natives(natives);
-    ext_mat::register_natives(natives);
-    ext_string::register_natives(natives);
-    ext_array::register_natives(natives);
-    ext_math::register_natives(natives);
-    ember::ext_sync::register_natives(natives);
-    ember::ext_lifecycle::register_natives(natives);
-
     OpOverloadTable overloads;
-    ext_vec::register_overloads(overloads);
-    ext_quat::register_overloads(overloads);
-    ext_mat::register_overloads(overloads);
-    ext_string::register_overloads(overloads);
+    register_standard_bindings(natives,&overloads);
     // array, math, sync, and lifecycle expose natives but no operators.
 
     // ---- struct layouts + string key + sema ----
@@ -277,7 +305,7 @@ int main(int argc, char** argv) {
             }
             linked_ems.emplace_back();
             std::string lerr;
-            if (!link_em_file(registry, path.c_str(), ld.alias, linked_ems.back(), &lerr)) {
+            if (!link_em_file(registry, path.c_str(), ld.alias, linked_ems.back(), &lerr, &natives)) {
                 std::fprintf(stderr, "ember: link '%s' failed: %s\n", ld.target.c_str(), lerr.c_str());
                 return 2;
             }
@@ -358,20 +386,22 @@ int main(int argc, char** argv) {
     ectx.budget_remaining = 100000000;   // 100M coarse instructions per call (~ generous)
     ectx.max_call_depth = 512;
     ectx.has_checkpoint = false;
-    ctx.trap_stub = reinterpret_cast<void*>(&ember_cli_trap);  // host fn (constant) — still baked
+    if (emit_em_path.empty()) ctx.trap_stub = reinterpret_cast<void*>(&ember_cli_trap);
     // B1: budget/depth/trap_ctx are NOT baked — read through r14 per call. So we
     // do NOT set ctx.budget_ptr/depth_ptr/trap_ctx; the JIT'd code loads them from
     // [r14 + context_offsets::*] at each check.
-    ctx.use_context_reg = true;
-    ctx.emit_budget_checks = true;
+    ctx.use_context_reg = emit_em_path.empty();
+    ctx.emit_budget_checks = emit_em_path.empty();
     ctx.max_call_depth = ectx.max_call_depth;
-    ctx.emit_depth_checks = true;
+    ctx.emit_depth_checks = emit_em_path.empty();
     // v1.0 Tier 2: build + wire the fn allowlist so a CLI-loaded script that uses
     // &fn / handle(args) works (the guard validates runtime handles; no-op when
     // the script doesn't use function refs — fn_slot_count reflects the slots).
     std::vector<uint8_t> fn_allowlist = build_fn_allowlist(slots, int(slots.size()));
-    ctx.fn_allowlist_base = int64_t(fn_allowlist.data());
-    ctx.fn_slot_count = int64_t(slots.size());
+    if (emit_em_path.empty()) {
+        ctx.fn_allowlist_base = int64_t(fn_allowlist.data());
+        ctx.fn_slot_count = int64_t(slots.size());
+    }
 
     // ---- compile + finalize each function ----
     std::vector<CompiledFn> fns;
@@ -397,13 +427,19 @@ int main(int argc, char** argv) {
         // Serialize the already-evaluated initial-value block. Constructing a
         // fresh zero-filled block here would silently discard const globals.
         const std::vector<uint8_t>& globals_bytes = gb_store;
-        for (const auto& cf : fns) {
+        for (size_t fi=0; fi<fns.size(); ++fi) {
+            const auto& cf=fns[fi];
+            const auto& decl=pr.program.funcs[fi];
             EmFunctionRecord rec;
             rec.name = cf.name;
-            auto sit = slots.find(cf.name);
-            rec.slot_index = (sit != slots.end()) ? uint32_t(sit->second) : 0xFFFFFFFFu;
+            rec.slot_index = uint32_t(decl.slot);
             rec.code = cf.bytes;
-            for (const auto& af : cf.abs_fixups) { EmReloc r; r.offset = af.code_offset; r.kind = uint8_t(af.kind); rec.relocs.push_back(r); }
+            rec.rodata = cf.rodata;
+            rec.non_serializable_reason = cf.non_serializable_reason;
+            rec.signature.ret=decl.ret?*decl.ret:Type{};
+            for(const auto& p:decl.params)rec.signature.params.push_back(p.ty?*p.ty:Type{});
+            for (const auto& af : cf.abs_fixups) { EmReloc r; r.offset = af.code_offset; r.kind = uint8_t(af.kind); r.addend=af.addend; rec.relocs.push_back(r); }
+            for(const auto& nf:cf.native_fixups){EmNativeBinding b;b.offset=nf.code_offset;b.name=nf.name;b.signature.ret=nf.ret;b.signature.params=nf.params;rec.native_bindings.push_back(std::move(b));}
             mod.functions.push_back(std::move(rec));
         }
         mod.globals = globals_bytes;

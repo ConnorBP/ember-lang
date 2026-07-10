@@ -41,6 +41,14 @@
 using namespace ember;
 
 static int g_fail = 0;
+static void* g_reenter_entry = nullptr;
+static bool g_reenter_enabled = true;
+extern "C" int64_t test_native_reenter(int64_t n) {
+    if (!g_reenter_enabled) return 7;
+    using ScriptFn = int64_t(*)(int64_t);
+    return reinterpret_cast<ScriptFn>(g_reenter_entry)(n);
+}
+
 static void check(bool cond, const char* msg) {
     std::printf("[%s] %s\n", cond ? "PASS" : "FAIL", msg);
     if (!cond) g_fail = 1;
@@ -118,6 +126,91 @@ static ember::TrapReason run_under_safetrap(const std::string& src, int64_t budg
     return ember::TrapReason::None;
 }
 
+// Prove native depth is simultaneous nesting, not a sequential call count:
+// main makes two completed native->script calls, then native -> script bounce
+// -> native -> ... remains nested until the deepest native returns. The first
+// run traps at a tiny combined-depth limit; after longjmp, reset_for_call
+// discards abandoned depth and the same entry completes three sequential native
+// calls with re-entry disabled (which would trap if calls accumulated).
+static bool native_reentry_depth_test() {
+    const std::string src =
+        "fn bounce(n: i64) -> i64 { if (n <= 0) { return 0; } return reenter(n - 1); }\n"
+        "fn main() -> i64 { let a = reenter(0); let b = reenter(0); return reenter(6); }\n";
+    auto lr = tokenize(src, "<native-depth>"); if (!lr.ok) return false;
+    auto pr = parse(std::move(lr.toks)); if (!pr.ok) return false;
+    std::unordered_map<std::string,int> slots; int si=0;
+    for(auto&fn:pr.program.funcs){slots[fn.name]=si++;fn.slot=slots[fn.name];}
+    std::unordered_map<std::string,ember::NativeSig> natives;
+    ember::NativeSig reenter;
+    reenter.name="reenter"; reenter.fn_ptr=(void*)&test_native_reenter;
+    reenter.ret=make_prim(Prim::I64); reenter.params.push_back(make_prim(Prim::I64));
+    natives[reenter.name]=reenter;
+    ember::OpOverloadTable ov; auto layouts=build_struct_layouts(pr.program);
+    pr.program.string_xor_key=0;
+    if(!sema(pr.program,natives,slots,0,&ov,&layouts).ok) return false;
+    ember::GlobalsBlock gb; std::vector<uint8_t> gbs; gb.base=int64_t(gbs.data());
+    ember::g_globals_for_codegen=&gb;
+    ember::DispatchTable table(pr.program.funcs.size()); ember::context_t ectx;
+    ectx.budget_remaining=1'000'000; ectx.max_call_depth=3;
+    ember::CodeGenCtx ctx; ctx.globals_base=gb.base; ctx.dispatch_base=int64_t(table.base());
+    ctx.natives=&natives; ctx.script_slots=&slots; ctx.structs=&layouts;
+    ctx.trap_stub=(void*)&test_trap; ctx.trap_ctx=&ectx;
+    ctx.budget_ptr=&ectx.budget_remaining; ctx.emit_budget_checks=true;
+    ctx.depth_ptr=&ectx.call_depth; ctx.max_call_depth=3; ctx.emit_depth_checks=true;
+    ctx.use_context_reg=true; // B1: native re-entry inherits callee-saved r14
+    std::vector<ember::CompiledFn> fns;
+    for(auto&fn:pr.program.funcs){auto cf=compile_func(fn,ctx);finalize(cf);table.set(fn.slot,cf.entry);fns.push_back(std::move(cf));}
+    g_reenter_entry=table.get(slots["bounce"]); void* main_entry=table.get(slots["main"]);
+    g_reenter_enabled=true; ectx.has_checkpoint=true;
+    bool trapped=false;
+    if (__builtin_setjmp(ectx.checkpoint)) {
+        trapped=ectx.last_trap==ember::TrapReason::StackOverflow;
+    } else {
+        (void)ember_call_void(main_entry, &ectx);
+    }
+    ectx.has_checkpoint=false;
+    const bool abandoned_depth_observed = ectx.call_depth > 0;
+    ectx.reset_for_call();
+    const bool reset = ectx.call_depth == 0 && ectx.last_trap == ember::TrapReason::None;
+    g_reenter_enabled=false; ectx.budget_remaining=1'000'000; ectx.has_checkpoint=true;
+    int64_t recovered=-1;
+    if (__builtin_setjmp(ectx.checkpoint) == 0) {
+        recovered=ember_call_void(main_entry, &ectx);
+    }
+    ectx.has_checkpoint=false; g_reenter_entry=nullptr;
+    for(auto&fn:fns)if(fn.exec)free_executable(fn.exec);
+    return trapped && abandoned_depth_observed && reset && recovered==7 && ectx.call_depth==0;
+}
+
+// Safety instrumentation is an explicit compile profile. Supplying all legacy
+// baked pointers while leaving both flags false must produce byte-identical code
+// to a context with no safety state at all; enabling the flags must add code.
+static bool disabled_safety_checks_are_zero_overhead() {
+    const std::string src =
+        "fn main() -> i64 { let x = reenter(0); while (false) { let y = 1; } return x; }\n";
+    auto lr = tokenize(src, "<safety-flags>"); if (!lr.ok) return false;
+    auto pr = parse(std::move(lr.toks)); if (!pr.ok || pr.program.funcs.size()!=1) return false;
+    std::unordered_map<std::string,int> slots{{"main",0}}; pr.program.funcs[0].slot=0;
+    std::unordered_map<std::string,ember::NativeSig> natives;
+    ember::NativeSig reenter; reenter.name="reenter"; reenter.fn_ptr=(void*)&test_native_reenter;
+    reenter.ret=make_prim(Prim::I64); reenter.params.push_back(make_prim(Prim::I64));
+    natives[reenter.name]=reenter;
+    ember::OpOverloadTable ov; auto layouts=build_struct_layouts(pr.program);
+    pr.program.string_xor_key=0;
+    if(!sema(pr.program,natives,slots,0,&ov,&layouts).ok) return false;
+    ember::CodeGenCtx base; base.natives=&natives; base.script_slots=&slots; base.structs=&layouts;
+    auto plain=compile_func(pr.program.funcs[0],base);
+    ember::context_t ectx;
+    ember::CodeGenCtx disabled=base;
+    disabled.trap_stub=(void*)&test_trap; disabled.trap_ctx=&ectx;
+    disabled.budget_ptr=&ectx.budget_remaining; disabled.depth_ptr=&ectx.call_depth;
+    disabled.max_call_depth=3;
+    auto flags_off=compile_func(pr.program.funcs[0],disabled);
+    disabled.emit_budget_checks=true; disabled.emit_depth_checks=true;
+    auto flags_on=compile_func(pr.program.funcs[0],disabled);
+    return plain.bytes==flags_off.bytes && flags_on.bytes.size()>flags_off.bytes.size();
+}
+
 int main() {
     std::printf("=== v0.4 hardening regression (red-team V5 + V6) ===\n");
 
@@ -179,6 +272,13 @@ int main() {
           == ember::TrapReason::BudgetExceeded,
           "Instruction budget: runaway loop traps (was infinite hang)");
 
+    // M4: no loop and no call are involved. The recursive body estimator is
+    // charged at function entry, so this formerly unaccounted straight-line
+    // work exhausts a budget smaller than its body cost.
+    check(run_under_safetrap("fn main() -> i64 { let a=1; let b=2; let c=3; let d=4; return a+b+c+d; }\n", 3)
+          == ember::TrapReason::BudgetExceeded,
+          "Instruction budget: straight-line function traps at entry");
+
     // --- Stack-depth guard: infinite recursion TRAPS, does not SIGSEGV ---
     // `r(){ return r(); }` with max_call_depth=8 must hit the depth guard and
     // trap (TrapReason::StackOverflow), not overflow the native stack (SIGSEGV).
@@ -186,6 +286,12 @@ int main() {
                             "fn main() -> i64 { return r(); }\n")
           == ember::TrapReason::StackOverflow,
           "Stack-depth guard: infinite recursion traps (was SIGSEGV)");
+
+    check(native_reentry_depth_test(),
+          "Combined depth: nested native re-entry traps recoverably and resets");
+
+    check(disabled_safety_checks_are_zero_overhead(),
+          "Safety compile flags: disabled budget/depth checks add zero code");
 
     // --- negative control: a well-behaved script completes with NO trap ---
     check(run_under_safetrap("fn fib(n: i64) -> i64 { if (n <= 1) { return n; } return fib(n-1)+fib(n-2); }\n"

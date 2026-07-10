@@ -52,7 +52,7 @@ cases. JIT only, no bytecode interpreter fallback.
 | `CODEGEN_SPEC.md` | Win64 calling convention, frame/code emission, exact encoder subset, fixups, calls, bounds/div traps, and the deferred linear-scan design clearly labeled. |
 | `BINDING_API.md` | Shipped `BindingBuilder`/`NativeSig`, script-type→Win64 mapping and slice convention; fluent builders/descriptors are labeled deferred. |
 | `SAFETY_AND_SANDBOX.md` | Threat/trust model stated explicitly. Instruction budget mechanism (where counters live, what trap-on-exhaustion does), stack depth guard, bounds checking policy, `PERM_FFI` compile-time gating, the single non-local-unwind primitive that all traps funnel through, what is explicitly *not* checked (documented gaps, not oversights). |
-| `HOT_RELOAD.md` | Shipped atomic single-function replacement and caller-owned single-thread retirement; epochs, whole-module reload, and removed-function traps are deferred. |
+| `HOT_RELOAD.md` | Shipped atomic single-function replacement, host execution guards, and epoch/quiescence reclamation; whole-module reload and removed-function traps are deferred. |
 | `MEMORY_AND_GC.md` | Ownership taxonomy (frame-local / host-owned / module-global / arena), the `arr[..]`-slice escape check that's the one place ember can introduce a dangling slice, module-global storage layout, string representation (rodata in the function's own code page), arena allocator design (reserved, not built in v1), explicit v2-GC deferral rationale. |
 | `LIFECYCLE.md` | The native-JIT-language-equivalent of `main()` + `register_routine(cast(fn))` expressed ember's way: `@entry`/`@on_tick`/`@event(...)` annotation-based discovery + host name/slot lookup. (Script-side first-class function references — `&fn` / `handle(args)` / the `fn` type — shipped in v1.0; see `ROADMAP.md` Tier 2 and `SAFETY_AND_SANDBOX.md` §7a.) |
 | `GAP_ANALYSIS.md` | Systematic completeness audit: every original-request requirement → where satisfied; every feature of the surveyed native-JIT language → v1 has / deferred-with-plan / out-of-scope. Includes the honest performance caveat (ember v1 is baseline JIT, won't match an optimizing native-JIT language's speed, but beats AngelScript's bytecode interpreter). |
@@ -150,7 +150,8 @@ Non-goals for v1:
   effect) and single-function hot reload (the slot-stability *machinery*
   exists + whole-module load works, but no atomic-slot-swap + page-retire
   + concurrent reclamation path). Both have design docs (`LIFECYCLE.md`,
-  `HOT_RELOAD.md`); concurrent epoch/quiescence reclamation remains open.
+  `HOT_RELOAD.md`). This historical v0.4 status was closed later: guarded
+  epoch/quiescence reclamation now ships; whole-module reload remains open.
 - **v0.5** ✓ shipped - live modules (the Tier 6 ROADMAP item, pulled
   forward): bidirectional script↔`.em` cross-module linking through the
   real grammar. `link "foo.em" as foo;` + `foo::bar(args)`; a
