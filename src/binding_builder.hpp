@@ -4,7 +4,7 @@
 // extension redefined into one shared header (six copies deduped). This is
 // the "bindings like AngelScript" floor: RegisterGlobalFunction("sig", &fn)
 // shape, one declarative call per native, over the direct NativeSig map.
-// The fluent TypeBuilder/StructBuilder/engine_t surface in BINDING_API.md is
+// The fluent TypeBuilder/StructBuilder/engine_t surface in docs/spec/BINDING_API.md is
 // the v1.0 ergonomic target, deferred until a real host wants script-visible
 // C++ struct types (these extensions use opaque i64 handles + StructLayoutTable).
 //

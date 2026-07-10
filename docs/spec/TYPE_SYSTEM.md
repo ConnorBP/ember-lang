@@ -1,6 +1,6 @@
 # ember - type system spec
 
-Detail doc for DESIGN.md Section 2. Formalizes the shipped v1 types, Ember
+Detail doc for ../planning/DESIGN.md Section 2. Formalizes the shipped v1 types, Ember
 layout, conversions, and ABI limits; future extensions are labeled inline.
 
 ## 1. Primitive types
@@ -94,7 +94,7 @@ post-v1 nicety, not needed yet).
 two-word value: `{ T* ptr; i64 len; }`, always passed and stored as
 that pair - never a single pointer. This is the **only** way script
 code can reference a variable-length or host-owned range of memory;
-there is no separate raw-pointer type (DESIGN.md Section 5 requirement,
+there is no separate raw-pointer type (../planning/DESIGN.md Section 5 requirement,
 enforced structurally here: the grammar has no pointer-dereference or
 pointer-arithmetic syntax at all, so there's nothing to type-check
 against - it's not "pointers exist but are checked," pointers as a
@@ -230,7 +230,7 @@ memory-indirection concept in the whole language.
 
 - A function's type is `(param_types...) -> return_type`. No function
   values / function pointers as script-visible values in v1 (no
-  first-class functions, no closures - DESIGN.md non-goals) - a
+  first-class functions, no closures - ../planning/DESIGN.md non-goals) - a
   function name in an expression position other than a direct call is
   a compile error. (Callback-style native APIs, e.g. "register this
   script function as an event handler," are handled via the
@@ -268,28 +268,28 @@ smallest possible inference rule - full bidirectional type inference
 (Mun/Rust-style) is explicitly out of scope; `auto` here is pure
 syntactic sugar to avoid repeating a type name, resolved trivially
 during sema's single left-to-right pass with no unification/solver
-needed (matches "monomorphic types only so simple," DESIGN.md Section 3).
+needed (matches "monomorphic types only so simple," ../planning/DESIGN.md Section 3).
 
 ## 10. Annotation argument types
 
-`@event("player_hit")` / `@on_tick` style annotations (DESIGN.md Section 2)
+`@event("player_hit")` / `@on_tick` style annotations (../planning/DESIGN.md Section 2)
 take a fixed, small argument grammar: zero args, or a comma-separated
 list of literal values only (string/int/float/bool literals - no
 expressions, no identifiers). Annotations are metadata consumed by
-`get_annotations`/`get_annotated_functions` (DESIGN.md Section 8) at the
+`get_annotations`/`get_annotated_functions` (../planning/DESIGN.md Section 8) at the
 sema/introspection level; they carry **no** runtime type-checking
 requirement against how the host later interprets them (e.g. the host
 deciding `@event("player_hit")` means "call with a `HitInfo` slice
 arg" is a host-side convention, not something ember's type system
 verifies) - this mirrors the surveyed native-JIT language's `annotation_info` being untyped
-name+args (RESEARCH_NOTES.md), and keeps the annotation feature purely
+name+args (../RESEARCH_NOTES.md), and keeps the annotation feature purely
 declarative metadata, not a second type-checked calling-convention
 layer.
 
 ## 11. v1 feature additions (this spec pass)
 
 The small C-style conveniences added in the completeness pass
-(`GAP_ANALYSIS.md` Section 5). Each is cheap and C-expected; semantics here
+(`../planning/GAP_ANALYSIS.md` Section 5). Each is cheap and C-expected; semantics here
 keep them consistent with the rules above (same-type-required, no
 implicit promotion, debug-checked overflow).
 
@@ -365,7 +365,7 @@ pass 1, COMPILER_PIPELINE.md Section 4).
   must be literals, `constexpr` lets a *named* compile-time value be
   used, `const N: u32 = 256; let buf: [u8; N]`), `switch` case
   labels, `offsetof`/`sizeof` arg contexts. Full const-eval (recursive
-  `constexpr fn`s, `static_assert`) is v2 (`ROADMAP.md` Tier 1).
+  `constexpr fn`s, `static_assert`) is v2 (`../ROADMAP.md` Tier 1).
 
 ### 11.6 `do-while` / `switch` / `defer` (semantics, grammar in
 COMPILER_PIPELINE.md Section 2)
@@ -379,7 +379,7 @@ COMPILER_PIPELINE.md Section 2)
   `e`'s type. **No fallthrough**: each case must end in
   `break` or `return` (sema rejects falling off a case
   body - eliminates the entire C-fallthrough footgun class at the
-  grammar level, GAP_ANALYSIS.md Section 5). `default` optional. Lowering
+  grammar level, ../planning/GAP_ANALYSIS.md Section 5). `default` optional. Lowering
   and jump-table vs cascade decision in CODEGEN_SPEC.md Section 12.
 - `defer expr;` - the shipped v1 implementation is **lexical-block-exit LIFO**;
   deferred expressions run in reverse declaration/reach order on block
@@ -506,7 +506,7 @@ initialized in a fn (`v3_up()`, `make_config()`).
   fields/elements. A handle-typed global (e.g. a sync `spsc` handle) still
   needs a call initializer for the type-check and still starts at 0 until
   `@entry` reassigns it (the aggregate-globals pass did not add a handle
-  literal — see `demo/concurrency/NOTES.md` K4 for that adjacent, still-open
+  literal — see `../../demo/concurrency/NOTES.md` K4 for that adjacent, still-open
   shape).
 - **`.em` round-trip behavior.** A struct or fixed-array global round-trips
   through `.em` serialize → load → run identically: the typed globals block is

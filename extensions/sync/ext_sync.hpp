@@ -10,7 +10,7 @@
 // ONE structural difference is the host store is internally synchronized
 // (std::atomic / lock-free ring / host-internal std::mutex for MPMC).
 //
-// === SCOPE (plan_SYNC_QUEUES.md S0 -- read this first) =================
+// === SCOPE (docs/planning/plan_SYNC_QUEUES.md S0 -- read this first) =================
 //
 // These primitives let a script coordinate with host threads on
 // HOST-OWNED SHARED STATE behind i64 handles -- a producer on host
@@ -22,14 +22,14 @@
 //
 // If two threads call ember fns into the same context -- even through
 // these primitives -- the context races exactly as documented in
-// plan_CONTEXT_THREADSAFETY.md S1.2, and a trap on one thread can longjmp
+// docs/planning/plan_CONTEXT_THREADSAFETY.md S1.2, and a trap on one thread can longjmp
 // to the other thread's checkpoint (the S1.4 --tick bug, generalized).
 // The context-thread-safety work is SEPARATE and ships in its own batch;
 // this addon is usable the moment the host arranges that only one thread
 // at a time calls ember into a given context (which is the U2 shape:
 // script side stays single-threaded per context; the host threads that
 // produce/consume the queues do not call ember at all, or call it on
-// their OWN context_t per plan_CONTEXT_THREADSAFETY.md Option D).
+// their OWN context_t per docs/planning/plan_CONTEXT_THREADSAFETY.md Option D).
 //
 // Use under the U2 contract: the script side is single-threaded per
 // context; host threads touch only the queue/swap-buffer/atomic HOST
@@ -40,7 +40,7 @@
 // No operator overloads (these are method-call natives, like ext_array),
 // so no register_overloads(). No script-visible mutex -- deferred per the
 // plan (couples to the function-ref / scoped_with_lock decision, see
-// plan_FUNCTION_REFS.md). MPMC uses a HOST-INTERNAL std::mutex held only
+// docs/planning/plan_FUNCTION_REFS.md). MPMC uses a HOST-INTERNAL std::mutex held only
 // across a short ring-index critical section, never across an ember call;
 // it is not exposed to the script and cannot deadlock the script or host.
 //

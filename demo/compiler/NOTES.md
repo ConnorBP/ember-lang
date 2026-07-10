@@ -94,8 +94,8 @@ mismatch (so a wrong result is harness-observable, not a silent 0). Run:
    global pool through reentrant parse/eval helpers would still be a design
    question, not a language limitation), but a `struct`/`array`/`slice` global is
    no longer rejected by sema. Pinned by the non-circular `aggregate_global_test`
-   ctest probes [1]-[8]. Documented in `docs/TYPE_SYSTEM.md` §12.2 and
-   `docs/CODEGEN_SPEC.md` §16.
+   ctest probes [1]-[8]. Documented in `../../docs/spec/TYPE_SYSTEM.md` §12.2 and
+   `../../docs/spec/CODEGEN_SPEC.md` §16.
 
 2. **Slice globals are aggregate globals** — the same M11 rejection. An
    `i64[]` global can't be initialized (or even declared). So the pool
@@ -111,8 +111,8 @@ mismatch (so a wrong result is harness-observable, not a silent 0). Run:
    shape this demo uses (the pools live in the driving fn), but a slice
    global is no longer rejected. Pinned by `aggregate_global_test` probes
    [3] (slice global element read) and [8] (slice global `.em` round-trip
-   with relative-ptr relocation). Documented in `docs/TYPE_SYSTEM.md` §12.2
-   and `docs/CODEGEN_SPEC.md` §16.
+   with relative-ptr relocation). Documented in `../../docs/spec/TYPE_SYSTEM.md` §12.2
+   and `../../docs/spec/CODEGEN_SPEC.md` §16.
 
 3. **`struct`-return-via-local ABI** (the documented Win64 hidden-pointer
    restriction). ~~`lex_one`/`lex_word`/`blank_token`/`tok`/`tok_err` each
@@ -133,7 +133,7 @@ mismatch (so a wrong result is harness-observable, not a silent 0). Run:
    helper was added to `lex.ember` so the punctuation switch can be
    `case 43: return tok(Tok::Plus as i64);` rather than a block that builds
    a `Token` inline. (Same kink the multi-file demo's `flag_label` switch
-   hits — see `demo/NOTES.md` #7.)
+   hits — see `../NOTES.md` #7.)
 
 5. **Switch `default:return` is not recognized exhaustive.** Every switch
    that returns from every case still needs a trailing `return` after the

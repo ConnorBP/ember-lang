@@ -1,7 +1,7 @@
 // ember x86-64 emitter (v0.1 subset + v0.2 control flow).
 // Minimal but real: emits correct Win64 bytes for the instructions
-// needed by the v0.1-v0.2 acceptance criteria (CODEGEN_SPEC.md Section 3/Section 4/Section 7/Section 12).
-// Grows into the full encoder from CODEGEN_SPEC.md Section 3 incrementally.
+// needed by the v0.1-v0.2 acceptance criteria (docs/spec/CODEGEN_SPEC.md Section 3/Section 4/Section 7/Section 12).
+// Grows into the full encoder from docs/spec/CODEGEN_SPEC.md Section 3 incrementally.
 #pragma once
 #include <cstdint>
 #include <cstddef>
@@ -14,7 +14,7 @@
 namespace ember {
 
 // x86-64 register encoding numbers (0-15), shared by GP and XMM
-// (REX bit logic is identical per CODEGEN_SPEC.md Section 3).
+// (REX bit logic is identical per docs/spec/CODEGEN_SPEC.md Section 3).
 enum class Reg : uint8_t {
     rax = 0, rcx = 1, rdx = 2, rbx = 3, rsp = 4, rbp = 5, rsi = 6, rdi = 7,
     r8  = 8, r9  = 9, r10=10, r11=11, r12=12, r13=13, r14=14, r15=15,
@@ -28,7 +28,7 @@ enum class Cond : uint8_t {
 };
 
 // XMM register encoding (0-15); REX bit logic identical to GP regs
-// (CODEGEN_SPEC.md Section 3 - register number is always 0-15 regardless of class).
+// (docs/spec/CODEGEN_SPEC.md Section 3 - register number is always 0-15 regardless of class).
 enum class Xmm : uint8_t {
     xmm0=0, xmm1=1, xmm2=2, xmm3=3, xmm4=4, xmm5=5, xmm6=6, xmm7=7,
     xmm8=8, xmm9=9, xmm10=10, xmm11=11, xmm12=12, xmm13=13, xmm14=14, xmm15=15,
@@ -36,7 +36,7 @@ enum class Xmm : uint8_t {
 
 struct Label { uint32_t id; };
 
-// A pending absolute-imm64 fixup (BUNDLING_AND_EM_MODULES.md Section 2.4). Unlike the
+// A pending absolute-imm64 fixup (docs/BUNDLING_AND_EM_MODULES.md Section 2.4). Unlike the
 // label fixups (rel32 branch) held in `pending`, this captures a raw 8-byte
 // absolute address baked by an imm64 load (mov r, imm64). The `.em` serializer
 // records one of these per baked absolute so a loader can repoint it at the
@@ -82,7 +82,7 @@ public:
         if (rsp_mod16_ != 0)
             throw std::logic_error("ember: x64 emitter call site is not 16-byte aligned");
     }
-    // --- label/patch system (CODEGEN_SPEC.md Section 4) ---
+    // --- label/patch system (docs/spec/CODEGEN_SPEC.md Section 4) ---
     // Two-pass: branches emit a rel32 placeholder + record a fixup;
     // resolve_fixups() backpatches once all labels are bound.
     Label alloc_label() { return {next_label++}; }
@@ -128,7 +128,7 @@ public:
         imm64(imm);
     }
 
-    // BUNDLING_AND_EM_MODULES.md Section 2.4 - external-base imm64 load (relocatable).
+    // docs/BUNDLING_AND_EM_MODULES.md Section 2.4 - external-base imm64 load (relocatable).
     // Emits the SAME byte sequence as mov_reg_imm64 (REX.W + 0xB8+reg + 8
     // bytes), but the 8 bytes are zero placeholders and an AbsFixup
     // {imm64_offset, kind} is recorded for the `.em` serializer. At JIT time
@@ -154,7 +154,7 @@ public:
     }
 
     // Read-only view of the absolute-imm64 fixups for the `.em` serializer
-    // (BUNDLING_AND_EM_MODULES.md Section 2.4). Not consumed by resolve_fixups.
+    // (docs/BUNDLING_AND_EM_MODULES.md Section 2.4). Not consumed by resolve_fixups.
     const std::vector<AbsFixup>& abs_fixups() const { return abs_fixups_; }
     const std::vector<NativeFixup>& native_fixups() const { return native_fixups_; }
 
@@ -308,7 +308,7 @@ public:
         rsp_mod16_ = uint8_t((rsp_mod16_ + 8) & 15);
     }
 
-    // --- v0.2 control flow (label/patch, CODEGEN_SPEC.md Section 4) ---
+    // --- v0.2 control flow (label/patch, docs/spec/CODEGEN_SPEC.md Section 4) ---
 
     // jmp Label -> E9 rel32 (placeholder, backpatched)
     void jmp(Label l) {
@@ -324,7 +324,7 @@ public:
         imm32(0);
     }
 
-    // --- v0.2 calls (CODEGEN_SPEC.md Section 7/Section 8) ---
+    // --- v0.2 calls (docs/spec/CODEGEN_SPEC.md Section 7/Section 8) ---
 
     // call r/m64 (indirect) -> FF /2 with mod=11, rm=reg
     void call_reg(Reg r) {
@@ -341,7 +341,7 @@ public:
         imm32(disp);
     }
 
-    // v1.0 Tier 2 (plan_FUNCTION_REFS.md §5.3/§9.1): lea r64, [base + index*scale]
+    // v1.0 Tier 2 (docs/planning/plan_FUNCTION_REFS.md §5.3/§9.1): lea r64, [base + index*scale]
     // — the indirect-call dispatch uses `lea r11,[r11+rax*8]` to compute the
     // dispatch-table slot address from a runtime handle. Centralized here so the
     // SIB/REX bytes are built in ONE place (the §9.1 highest-risk detail).
@@ -368,7 +368,7 @@ public:
     // nop (pad)
     void nop() { byte(0x90); }
 
-    // --- SSE scalar float (CODEGEN_SPEC.md Section 3) ---
+    // --- SSE scalar float (docs/spec/CODEGEN_SPEC.md Section 3) ---
     // movss xmm, xmm  (F3 0F 10 /r, mod=11, reg=dst, rm=src)
     void movss_xmm_xmm(Xmm dst, Xmm src) {
         byte(0xF3);
@@ -458,7 +458,7 @@ public:
 
     // Resolve all pending label fixups. Must be called after all labels
     // are bound. Throws std::runtime_error on unbound label (codegen
-    // internal error, CODEGEN_SPEC.md Section 4).
+    // internal error, docs/spec/CODEGEN_SPEC.md Section 4).
     void resolve_fixups();
 
 private:

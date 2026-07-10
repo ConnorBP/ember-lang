@@ -1,5 +1,5 @@
 // ext_lifecycle.hpp - ember extension: dynamic routine registration
-// (plan_FUNCTION_REFS.md §6). The Tier 2 function-ref feature enables this:
+// (docs/planning/plan_FUNCTION_REFS.md §6). The Tier 2 function-ref feature enables this:
 // a script passes `&fn` (a dispatch-table slot handle) to a host native that
 // stores it keyed by a routine id; the host later calls the routine per frame
 // via the dispatch table (the SAME call mechanism as the static @on_tick
@@ -10,7 +10,7 @@
 // clears it. Mirrors ext_sync's shape (1-based ids, id(h) bounds check,
 // register_natives/reset, public accessor for host-side reach-in).
 //
-// === SCOPE (plan_FUNCTION_REFS.md §6.2/§6.3) ===
+// === SCOPE (docs/planning/plan_FUNCTION_REFS.md §6.2/§6.3) ===
 // register_routine(handle, data) -> id: stores (slot=handle, data). The handle
 //   is a fn-typed i64 whose provenance sema already validated at the &fn site
 //   (plan §4.2) — so it's a registered slot by construction. The host trusts it

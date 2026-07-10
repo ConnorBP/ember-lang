@@ -1,6 +1,6 @@
 # ember - native binding API spec
 
-Detail doc for DESIGN.md Section 4. The shipped `BindingBuilder`/`NativeSig`
+Detail doc for ../planning/DESIGN.md Section 4. The shipped `BindingBuilder`/`NativeSig`
 API comes first; later fluent descriptor sketches are labeled deferred inline.
 Calling-convention mapping and boundary error responsibilities are normative.
 
@@ -86,10 +86,10 @@ enum class TypeId : uint16_t {
 
 No `t_array`/`t_map`/`t_class`/`t_enum`/`t_lambda`/`t_pointer`/`t_auto`
 /`t_null`/`t_custom_base` (present in the surveyed native-JIT language's
-enum, RESEARCH_NOTES.md) - v1 deliberately has a much smaller type
+enum, ../RESEARCH_NOTES.md) - v1 deliberately has a much smaller type
 surface: fixed arrays are a compile-time-sized variant of struct
 layout (TYPE_SYSTEM.md Section 3) not a distinct *binding*-visible kind,
-maps/classes/lambdas are non-goals (DESIGN.md Section 1), script-side
+maps/classes/lambdas are non-goals (../planning/DESIGN.md Section 1), script-side
 `enum` **shipped in v1.0** but as plain `i32`/`i64`-typed values (an enum
 variant is an `IntLit` post-sema, no new `TypeId` kind — see
 `COMPILER_PIPELINE.md` Section 2a), so no `t_enum` belongs in this table
@@ -146,7 +146,7 @@ void register_native(engine_t* engine, const NativeFn& fn);
   `fn_ptr` signature is not detectable by ember** (C++ function
   pointers are type-erased to `void*` at the registration API) - this
   is a documented host responsibility, exactly like the surveyed
-  native-JIT language's and AngelScript's registration APIs (RESEARCH_NOTES.md); a mismatch
+  native-JIT language's and AngelScript's registration APIs (../RESEARCH_NOTES.md); a mismatch
   produces silently-wrong argument placement at the call site, not a
   crash-on-registration. Mitigation is host-side: wrap registration in
   a macro/helper that derives `NativeFn` from the real C++ function
@@ -172,7 +172,7 @@ public:
     ~TypeBuilder(); // calls finish() if not already called, so a builder
                      // that goes out of scope without an explicit finish()
                      // still registers (RAII convenience) - matches a typical
-                     // native-JIT scripting language's constructor/destructor pattern (RESEARCH_NOTES.md)
+                     // native-JIT scripting language's constructor/destructor pattern (../RESEARCH_NOTES.md)
 
     TypeBuilder& field(const char* name, uint32_t offset, TypeId type,
                         const char* type_name = nullptr);
@@ -199,7 +199,7 @@ public:
 };
 ```
 
-Trimmed from the surveyed native-JIT language's surface (RESEARCH_NOTES.md)  - 
+Trimmed from the surveyed native-JIT language's surface (../RESEARCH_NOTES.md)  - 
 dropped: `subscript`/`iterable`/`kv_iterable`/`factory`/`init_push`/
 `hash`/`convert`/`destructor`. Rationale per item:
 - `subscript`/`iterable`/`kv_iterable`: these back script-visible
@@ -213,7 +213,7 @@ dropped: `subscript`/`iterable`/`kv_iterable`/`factory`/`init_push`/
   in the v1 grammar (script can only get a struct instance by value
   from a native call return or by constructing a script-declared
   struct via field-literal syntax) - same YAGNI reasoning.
-- `hash`: no script-visible map/set type exists (DESIGN.md non-goal).
+- `hash`: no script-visible map/set type exists (../planning/DESIGN.md non-goal).
 - `convert`: implicit/explicit struct-to-struct conversion isn't a
   language feature (TYPE_SYSTEM.md Section 6 - struct types never convert).
   An explicit `as`-cast hook for host types is a plausible future
@@ -293,10 +293,10 @@ Strictly a convenience subset of `TypeBuilder` (no operator/method
 support) - kept as a separate class rather than folded into
 `TypeBuilder` with optional method calls because "this is a plain
 data struct, no behavior" is a useful declared intent, matching
-a typical native-JIT scripting language's data-vs-behavior split (RESEARCH_NOTES.md).
+a typical native-JIT scripting language's data-vs-behavior split (../RESEARCH_NOTES.md).
 
 `EnumBuilder`: **not needed / still dropped.** Script-side `enum E { A, B, C }`
-**shipped in v1.0** (`ROADMAP.md` Tier 1 ✓, `COMPILER_PIPELINE.md` Section 2a),
+**shipped in v1.0** (`../ROADMAP.md` Tier 1 ✓, `COMPILER_PIPELINE.md` Section 2a),
 but it is a pure source-text feature — an enum variant is rewritten to an
 `IntLit` at sema (no new `TypeId`, no host-side state, no binding surface),
 so there is nothing for an `EnumBuilder` to build. Host-side named constants
@@ -334,6 +334,6 @@ pointer's signature, e.g. usage looks like:
 register_native_fn<&host_set_health>(engine, "set_health");
 ```
 This wrapper is a **v1.0-milestone-adjacent nicety**, not required for
-the core binding mechanism to work (DESIGN.md Section 9's milestones don't
+the core binding mechanism to work (../planning/DESIGN.md Section 9's milestones don't
 block on it) - the raw descriptor-struct API is what actually needs
 to exist and be correct first; the template sugar is additive.

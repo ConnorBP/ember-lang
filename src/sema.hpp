@@ -1,6 +1,6 @@
-// ember sema - name resolution + type check (COMPILER_PIPELINE.md Section 4).
+// ember sema - name resolution + type check (docs/spec/COMPILER_PIPELINE.md Section 4).
 // Scoped for the first running version: primitives, calls, operators
-// with literal-type-adaptation (TYPE_SYSTEM.md Section 6 - literals adopt the
+// with literal-type-adaptation (docs/spec/TYPE_SYSTEM.md Section 6 - literals adopt the
 // other operand's type if the value fits; variables stay strict per Section 7).
 #pragma once
 #include "ast.hpp"
@@ -13,13 +13,13 @@ namespace ember {
 
 struct SemaError { std::string msg; uint32_t line; uint32_t col; };
 
-// v0.5 cross-module export entry (MODULES.md §5). A linked module exposes its
+// v0.5 cross-module export entry (docs/MODULES.md §5). A linked module exposes its
 // functions by name + signature + slot. The host builds this table from the
 // ModuleRegistry's registered modules; sema resolves `mod::fn` against it.
 // `module_id` is the registry id (baked into the call site by codegen); `slot`
 // is the fn's slot in that module's dispatch table. If a module/fn isn't in the
 // table, sema marks the call `cross_module_unresolved` (deferred trap — the
-// module may register later, MODULES.md §5 step 1/3).
+// module may register later, docs/MODULES.md §5 step 1/3).
 struct ModuleExport {
     std::string fn_name;
     Type ret;
@@ -32,7 +32,7 @@ struct ModuleExport {
 using ModuleExportTable = std::unordered_map<std::string, std::vector<ModuleExport>>;
 
 // A registered native function signature (host-side; mirrors NativeFn
-// from BINDING_API.md but sema only needs the type info + fn ptr).
+// from docs/spec/BINDING_API.md but sema only needs the type info + fn ptr).
 struct NativeSig {
     std::string name;
     void* fn_ptr = nullptr;
@@ -44,7 +44,7 @@ struct NativeSig {
 // Operator-overload registry: (type_name, operator) -> native fn ptr + sig.
 // Host registers overloads for a type (e.g. "vec3" + Add -> vec3_add).
 // Sema rewrites `v1 + v2` (where v1/v2 are typed as the registered type)
-// into a native call to the overload fn. (BINDING_API.md Section 3 / TYPE_SYSTEM.md Section 7)
+// into a native call to the overload fn. (docs/spec/BINDING_API.md Section 3 / docs/spec/TYPE_SYSTEM.md Section 7)
 struct OpOverload {
     void* fn_ptr = nullptr;
     std::string fn_name;

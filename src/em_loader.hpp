@@ -1,4 +1,4 @@
-// ember `.em` loader API (BUNDLING_AND_EM_MODULES.md Section 2.5)
+// ember `.em` loader API (docs/BUNDLING_AND_EM_MODULES.md Section 2.5)
 //
 // The load-side counterpart to em_writer.{hpp,cpp}. Reads the on-disk
 // binary defined in em_file.hpp / Section 2.2 and produces a `LoadedModule` the
@@ -17,7 +17,7 @@
 // → name directory) and its LE-by-shifts style. See em_loader.cpp for the
 // matching read helpers.
 //
-// Cross-module relocs (kind 2, MODULES.md Section 3) require a ModuleRegistry to be
+// Cross-module relocs (kind 2, docs/MODULES.md Section 3) require a ModuleRegistry to be
 // supplied to the loader: a module that contains a `mov r11, [registry_base +
 // ...]` call site was serialized against some registry's base, and on load into
 // a fresh process that base is at a different address. The loader patches the
@@ -33,7 +33,7 @@
 // through the host allowlist. This is still native code, not a sandbox or an
 // authenticated untrusted-code container.
 //
-// prism port note (RESTRUCTURE_PLAN.md Section 5): the standalone loader used an
+// prism port note (docs/planning/RESTRUCTURE_PLAN.md Section 5): the standalone loader used an
 // RAII `ExecArena` per function (owning a VirtualAlloc page); prism's
 // `jit_memory` is simpler - `alloc_executable`/`free_executable` return/own
 // raw `void*` pages with no RAII wrapper. `LoadedModule` therefore holds
@@ -54,7 +54,7 @@
 
 #include "em_file.hpp"          // EM_MAGIC, EM_VERSION, EM_NO_ENTRY, EM_HEADER_SIZE, EmReloc
 #include "jit_memory.hpp"       // alloc_executable / free_executable
-#include "module_registry.hpp"  // ModuleRegistry (kind-2 reloc target, MODULES.md Section 3)
+#include "module_registry.hpp"  // ModuleRegistry (kind-2 reloc target, docs/MODULES.md Section 3)
 
 namespace ember {
 
@@ -112,7 +112,7 @@ struct LoadedModule {
 // function and relocation has validated, patched, and sealed successfully.
 //
 // `registry` is optional (additive, default nullptr): when non-null, kind-2
-// (ModuleRegistryBase) relocs are patched with `registry->base()` (MODULES.md
+// (ModuleRegistryBase) relocs are patched with `registry->base()` (docs/MODULES.md
 // Section 3 - the cross-module call site's registry hop). When null, encountering a
 // kind-2 reloc is a load error (the module has a cross-module call site but
 // no registry was supplied to bind it). Kinds 0/1 (DispatchTableBase /

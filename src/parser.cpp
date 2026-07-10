@@ -58,7 +58,7 @@ struct P {
         case Tk::Kw_u32: prim(Prim::U32); break; case Tk::Kw_u64: prim(Prim::U64); break;
         case Tk::Kw_f32: prim(Prim::F32); break; case Tk::Kw_f64: prim(Prim::F64); break;
         case Tk::Kw_fn:
-            // v1.0 Tier 2 (plan_FUNCTION_REFS.md §2): a bare `fn` is the
+            // v1.0 Tier 2 (docs/planning/plan_FUNCTION_REFS.md §2): a bare `fn` is the
             // function-handle type (i64 with is_fn_handle=true). A parameterized
             // `fn(i64)->i64` form is v2+; Tier 2's bare `fn` accepts any fn (the
             // call-target guard validates the handle at the call site, §5).
@@ -203,7 +203,7 @@ struct P {
         return g;
     }
 
-    // v0.5 live-module link declaration (MODULES.md §6):
+    // v0.5 live-module link declaration (docs/MODULES.md §6):
     //   link "foo.em" as foo;    -> load+register the .em bundle (is_file=true)
     //   link "foo" as foo;       -> link to an already-registered module (is_file=false)
     //   link "foo.em";           -> alias defaults to the file stem
@@ -235,7 +235,7 @@ struct P {
         return ld;
     }
 
-    // Tier 1 script-side enum (plan_ENUMS.md Section 3.3):
+    // Tier 1 script-side enum (docs/planning/plan_ENUMS.md Section 3.3):
     //   enum_decl := 'enum' IDENT '{' (variant (',' variant)* ','?)? '}'
     //   variant   := IDENT ('=' constexpr_int_expr)?
     // The explicit-value expr is parsed as a full parse_expr(); the
@@ -383,7 +383,7 @@ struct P {
             u->operand = std::move(e);
             return u;
         }
-        // v1.0 Tier 2 (plan_FUNCTION_REFS.md §3.1): prefix `&` takes a function
+        // v1.0 Tier 2 (docs/planning/plan_FUNCTION_REFS.md §3.1): prefix `&` takes a function
         // handle. `&fn_name` is a compile-time reification (sema bakes the slot
         // as an i64 literal), not a runtime deref. Parse the operand as unary so
         // `&&fib`-style nesting is structurally parseable then rejected by sema.
@@ -418,7 +418,7 @@ struct P {
                 // Ident (the module alias); build a CallExpr with module_alias
                 // set + the fn name, args filled by the following `(` case.
                 //
-                // Tier 1 enums (plan_ENUMS.md Section 3.5): `E::A` (a value, no
+                // Tier 1 enums (docs/planning/plan_ENUMS.md Section 3.5): `E::A` (a value, no
                 // parens) is a NEW postfix `::` outcome that is NOT a call. The
                 // one-token lookahead split is: `::` + Ident + not-`(` = enum
                 // variant access (EnumAccessExpr); `::` + Ident + `(` = the
@@ -438,7 +438,7 @@ struct P {
                     continue;  // the next iteration handles '(' (args)
                 }
                 // E::A - enum variant access (a value, no call). sema rewrites
-                // this to an IntLit in place (plan_ENUMS.md Section 4.2/5).
+                // this to an IntLit in place (docs/planning/plan_ENUMS.md Section 4.2/5).
                 auto ea = std::make_unique<EnumAccessExpr>();
                 ea->loc = e->loc;
                 ea->enum_name = id->name;
@@ -451,7 +451,7 @@ struct P {
                 //   name(args)            - free function call (name is an Ident)
                 //   obj.method(args)      - method-call sugar; e is a FieldExpr,
                 //                          desugars to method(obj, args) with the
-                //                          receiver as arg[0] (BINDING_API.md Section 3)
+                //                          receiver as arg[0] (docs/spec/BINDING_API.md Section 3)
                 //   mod::fn(args)         - cross-module call; e is already a CallExpr
                 //                          with module_alias set (built by the '::' case above)
                 std::unique_ptr<CallExpr> c;
@@ -466,7 +466,7 @@ struct P {
                     c->name = fld->field; c->loc = e->loc;
                     c->receiver = std::move(fld->base);
                 } else {
-                    // v1.0 Tier 2 first-class call (plan_FUNCTION_REFS.md §3.2):
+                    // v1.0 Tier 2 first-class call (docs/planning/plan_FUNCTION_REFS.md §3.2):
                     // <expr>(args) where <expr> is none of the three named forms
                     // above — a call through a RUNTIME i64 handle. Sema types the
                     // target as a fn handle; codegen validates it against the
@@ -487,7 +487,7 @@ struct P {
             } else if (k==Tk::LBracket) {
                 adv(); // '['
                 if (at(Tk::DotDot)) {
-                    // arr[..] whole-array view (COMPILER_PIPELINE.md Section 2 view_suffix)
+                    // arr[..] whole-array view (docs/spec/COMPILER_PIPELINE.md Section 2 view_suffix)
                     adv(); // '..'
                     expect(Tk::RBracket, "']'");
                     auto v = std::make_unique<ViewExpr>(); v->loc = e->loc; v->base = std::move(e);

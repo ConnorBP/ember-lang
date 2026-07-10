@@ -1,4 +1,4 @@
-// valid_enums.ember - Tier 1 enums (plan_ENUMS.md Section 3).
+// valid_enums.ember - Tier 1 enums (docs/planning/plan_ENUMS.md Section 3).
 // C-style untyped enums: auto-increment from 0, optional explicit values,
 // E::A qualified access rewrites to an IntLit at sema (no codegen change).
 // Enums are top-level declarations (the parser accepts them at program scope).

@@ -1,5 +1,5 @@
 // lifecycle_entry_unload.ember — regression for the @entry return-sign bug
-// surfaced by demo/game. @entry returning <= 0 means UNLOAD (LIFECYCLE.md
+// surfaced by demo/game. @entry returning <= 0 means UNLOAD (docs/LIFECYCLE.md
 // §1): the host must NOT start the --tick loop. Before the fix, the CLI's
 // `exit_code = int(r & 0x7fffffff)` clamp turned a negative return (e.g. -1)
 // into a large positive (0x7fffffff), so `entry_says_stay = exit_code > 0`

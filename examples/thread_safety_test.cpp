@@ -1,4 +1,4 @@
-// thread_safety_test - v1.0 context thread-safety (plan_CONTEXT_THREADSAFETY.md,
+// thread_safety_test - v1.0 context thread-safety (docs/planning/plan_CONTEXT_THREADSAFETY.md,
 // Option D + B1). Proves the per-call context-register (r14) indirection lets
 // ONE compiled body serve N per-thread context_t's, with each thread's trap
 // longjmp'ing to ITS OWN checkpoint (not a sibling's).

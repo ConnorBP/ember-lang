@@ -1,5 +1,5 @@
 // ember dispatch table (v0.2 minimal).
-// CODEGEN_SPEC.md Section 7 / HOT_RELOAD.md Section 1: one pointer slot per script
+// docs/spec/CODEGEN_SPEC.md Section 7 / docs/HOT_RELOAD.md Section 1: one pointer slot per script
 // function; script-to-script and host-to-script calls go through
 // `call [table_base + slot*8]`.
 #pragma once

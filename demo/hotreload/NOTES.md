@@ -1,16 +1,16 @@
 # hotreload demo — notes & kinks surfaced
 
 A live-module hot-reload demo (`hotreload_demo.cpp`) that exercises the THREE
-runtime features the prior demo (demo/NOTES.md) skipped:
+runtime features the prior demo (../NOTES.md) skipped:
 
 1. **the `.em` bundler** — `write_em_file` / `load_em_file`
-   (BUNDLING_AND_EM_MODULES.md). The harness compiles `render_v1.ember`,
+   (../../docs/BUNDLING_AND_EM_MODULES.md). The harness compiles `render_v1.ember`,
    serializes it to a temp `.em`, loads it back in a fresh code path, and calls
    the loaded renderer to prove the bundle round-trips the same behavior as the
    JIT'd page (the em_roundtrip_test shape, applied to a reloadable renderer).
 
 2. **HotReloadDomain (M3 epoch reclamation)** — `reload_function` +
-   `ExecutionGuard` + `publish` + `reclaim`/`quiesce` (HOT_RELOAD.md). The
+   `ExecutionGuard` + `publish` + `reclaim`/`quiesce` (../../docs/HOT_RELOAD.md). The
    harness swaps the `renderer` function body live, mid-tick-loop, from
    v1 → v2 → v3, and asserts each reload publishes a monotonic epoch, the new
    page is callable immediately after publication, and the old page is safely
@@ -63,7 +63,7 @@ end-to-end live-reload demonstration.
    natives via `BindingBuilder` (both append to a host output buffer — the
    deterministic signal).
 2. Compile `render_v1.ember` into a `LiveModule` with a persistent
-   `HotReloadDomain` beside the `DispatchTable` (HOT_RELOAD.md §0 step 1).
+   `HotReloadDomain` beside the `DispatchTable` (../../docs/HOT_RELOAD.md §0 step 1).
 3. **Feature 1 — bundler round-trip:** emit the v1 module to a temp `.em` via
    `write_em_file`, load it back via `load_em_file`, call the loaded renderer,
    assert it produces `"11 "` (same as the JIT'd v1). Remove the temp file.
@@ -80,7 +80,7 @@ end-to-end live-reload demonstration.
 6. Assert the full sequence string equals the expected deterministic output.
 
 Every outer host-to-script call is wrapped in a `domain.guard()` before
-loading the slot (HOT_RELOAD.md §0 step 2). On a successful reload the harness
+loading the slot (../../docs/HOT_RELOAD.md §0 step 2). On a successful reload the harness
 disowns the old `CompiledFn` (nulls `exec`/`entry`) so the destructor does not
 double-free it (the domain owns the retired page).
 

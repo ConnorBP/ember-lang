@@ -1,5 +1,5 @@
 // ember `.em` binary format: shared constants + on-disk structs
-// (BUNDLING_AND_EM_MODULES.md Section 2.2)
+// (docs/BUNDLING_AND_EM_MODULES.md Section 2.2)
 //
 // This header is the contract between the serializer (em_writer.{hpp,cpp})
 // and the loader (em_loader.{hpp,cpp}) and the CLI. The names below are a
@@ -44,7 +44,7 @@
 // DispatchTableBase (patch imm64 -> &this module's DispatchTable), 1 =
 // GlobalsBase (patch imm64 -> &this module's globals block), 2 =
 // ModuleRegistryBase (reserved; used only if cross-module import lands). The
-// `kind` space is versioned with the format (BUNDLING_AND_EM_MODULES.md Section 2.7);
+// `kind` space is versioned with the format (docs/BUNDLING_AND_EM_MODULES.md Section 2.7);
 // a new kind requires a version bump.
 //
 // COMPATIBILITY NOTE: v1 remains ABI/process-trusted. v2 records canonical
@@ -217,7 +217,7 @@ struct EmFunctionRecord {
 // post-initializer bytes rather than manufacturing a fresh zero-filled block.
 // `entry_slot` is
 // `EM_NO_ENTRY` if the module has no @entry function. `name_table` is the
-// name->slot directory (for `ember_call` by name, HOT_RELOAD.md Section 7).
+// name->slot directory (for `ember_call` by name, docs/HOT_RELOAD.md Section 7).
 struct EmModule {
     std::vector<EmFunctionRecord>                functions;
     std::vector<uint8_t>                         globals;

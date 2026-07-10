@@ -7,5 +7,5 @@ add_on removed to keep the tree small; re-fetch the full SDK from the URL above
 if you need them.
 
 Used by `examples/bench_ember_vs_as.cpp` (the v0.6 benchmark harness) — ember
-(native JIT) vs AngelScript (bytecode interpreter). See `v0.6_BENCHMARK_RESULTS.md`
-(generated) for results.
+(native JIT) vs AngelScript (bytecode interpreter). Run `ember bench` (the
+live microbenchmark CLI, ctest target `bench_ember_vs_as`) for results.

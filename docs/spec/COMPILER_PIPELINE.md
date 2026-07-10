@@ -1,6 +1,6 @@
 # ember - compiler pipeline spec
 
-Detail doc for DESIGN.md Section 3. Lexer tokens, grammar, AST, shipped sema
+Detail doc for ../planning/DESIGN.md Section 3. Lexer tokens, grammar, AST, shipped sema
 and tree-walking lowering, plus explicitly deferred IR/regalloc design.
 
 ## 1. Lexer token set
@@ -17,7 +17,7 @@ Keywords:   fn struct global enum if else while do for switch case
             (v1.0: `enum` + `link`/`switch`/`case`/`default`/`do`/`defer`/
             `const`/`constexpr`/`sizeof`/`offsetof` were all added as the frontend
             grew past the v0.1 spec this list was written against; see the
-            v0.2–v1.0 milestones in `DESIGN.md`. The `fn` keyword is
+            v0.2–v1.0 milestones in `../planning/DESIGN.md`. The `fn` keyword is
             overloaded: a *declaration* (`fn name(...) -> ret`) starts at
             `parse_top`, a *type* (`fn`, in `parse_type`) is the v1.0
             function-handle type — i64 with `is_fn_handle=true`, a bare
@@ -35,9 +35,9 @@ Annotation: @ (starts an annotation, followed by IDENT and optional
 ```
 - No `class`, `goto`, `do`-while-top-level, `typedef`/`using`, `template`,
   `namespace`, `#include`/preprocessor - none exist in v1 grammar (matches
-  DESIGN.md non-goals). (`switch`/`case`/`default`/`do` shipped v0.2–v0.5;
+  ../planning/DESIGN.md non-goals). (`switch`/`case`/`default`/`do` shipped v0.2–v0.5;
   `enum` shipped v1.0 — the original v0.1 spec's "no enum/switch" note is
-  superseded, see DESIGN.md non-goals.)
+  superseded, see ../planning/DESIGN.md non-goals.)
 - Comments: `//` line and `/* */` block, stripped by the lexer,
   never reach the parser (no doc-comment/attribute-comment special
   handling in v1).
@@ -56,7 +56,7 @@ Annotation: @ (starts an annotation, followed by IDENT and optional
   cascade errors (not worth building a sophisticated error-recovery
   lexer for a v1 scripting language - YAGNI, most real usage will fix
   the first reported error and recompile anyway given sub-millisecond
-  compile times, DESIGN.md Section 1).
+  compile times, ../planning/DESIGN.md Section 1).
 
 ## 2. Grammar (informal BNF)
 
@@ -239,7 +239,7 @@ integer literal. `FnHandleExpr` bakes the slot as an i64 literal and records
 the source fn's signature on the type for arg checking. The indirect
 `CallExpr` path checks args against the recorded signature when present
 (bare `fn`-typed targets accept any args at the type level — the runtime
-guard is the backstop; documented as an open item in `ROADMAP.md` Tier 2).
+guard is the backstop; documented as an open item in `../ROADMAP.md` Tier 2).
 **i64 ↔ fn assignment is forbidden either direction** (closes forging at the
 type level). Codegen validates the runtime i64 against a host-built bitset
 allowlist before dispatch (REDSHELL guard #6, `SAFETY_AND_SANDBOX.md` §7a).
@@ -261,7 +261,7 @@ succeeded)
 2. **Function signature registration pass**: for every `FuncDecl` (and
    every registered `NativeFn`), resolve param/return `TypeRef`s to
    finalized types, assign a dispatch-table slot index
-   (HOT_RELOAD.md Section 1), and insert into a module-wide symbol table  - 
+   (../HOT_RELOAD.md Section 1), and insert into a module-wide symbol table  - 
    **before** any function body is examined, so forward calls
    (calling a function declared later in the file) resolve correctly
    (CODEGEN_SPEC.md Section 7's forward-reference handling depends on this
@@ -288,7 +288,7 @@ succeeded)
      `check_expr` doesn't double-report via its catch-all).
 3. **Per-function body check** (name resolution + type check,
    single pass, left-to-right, no unification/solver - matches
-   "monomorphic types only so simple," DESIGN.md Section 3):
+   "monomorphic types only so simple," ../planning/DESIGN.md Section 3):
    - Scope stack: one scope per block (`Block`), locals resolved by
      walking the scope stack innermost-out; shadowing a name from an
      outer scope is **allowed** (matches common C-family expectation,
@@ -347,7 +347,7 @@ succeeded)
 > is a correctness-first **tree-walking stack-spilling emitter** that walks
 > the AST directly and emits x86-64, not the SSA-lite IR + linear-scan
 > regalloc specified in this section. This is a deliberate deferral, not a
-> regression: `DESIGN.md` Section 9 says no speculative optimization is
+> regression: `../planning/DESIGN.md` Section 9 says no speculative optimization is
 > added before the v0.5 benchmark harness exists to prove where it
 > matters. The SSA-lite IR below is the **target design** the tree-walker
 > lowers toward conceptually; the formal IR + regalloc refactor is the
@@ -369,7 +369,7 @@ struct IrInstr {
               Move, ConstInt, ConstFloat, ConstStringRef } op;
     vector<IrValue> operands;
     optional<IrValue> result;
-    SourceLoc loc;   // preserved for runtime error messages / debug hook (DESIGN.md Section 8)
+    SourceLoc loc;   // preserved for runtime error messages / debug hook (../planning/DESIGN.md Section 8)
 };
 
 struct BasicBlock {
@@ -462,7 +462,7 @@ struct IrFunction {
   slice args lower to two consecutive IR operands (ptr value, len
   value) matching BINDING_API.md Section 2's two-C++-param convention.
 - **CallExpr (script)**: emit `CallScript` with the resolved slot
-  index (HOT_RELOAD.md Section 1) attached - never a direct-address call IR
+  index (../HOT_RELOAD.md Section 1) attached - never a direct-address call IR
   shape, keeping the "only one way to call a script function" rule
   (CODEGEN_SPEC.md Section 7) true starting from the IR level, not just as a
   codegen-time decision.
@@ -509,7 +509,7 @@ struct IrFunction {
   `cmp`+`je`-per-case cascade. Each case body's `break` lowers to
   `Jmp(switch_exit_bb)`; falling off a case body without `break`/
   `return`/`continue`/trap is a **compile error** (no fallthrough,
-  `GAP_ANALYSIS.md` Section 5) - checked at sema, so lowering never emits a
+  `../planning/GAP_ANALYSIS.md` Section 5) - checked at sema, so lowering never emits a
   fallthrough path. `default` missing + no case matched = fall
   through to `switch_exit_bb` (no-op, equivalent to an empty
   switch). See `CODEGEN_SPEC.md` Section 12 for the jump-table encoding.
@@ -530,7 +530,7 @@ struct IrFunction {
   or `switch` case label) is **folded at sema** to a literal - v1
   `constexpr` expressions are restricted to literals, `sizeof`/
   `offsetof`, and integer arithmetic on other `constexpr` values; no
-  function calls, no full const-eval interpreter (`ROADMAP.md` Tier 1
+  function calls, no full const-eval interpreter (`../ROADMAP.md` Tier 1
   for the broadened version).
 
 ## 7. Error reporting
@@ -547,8 +547,8 @@ struct Diagnostic {
 ```
 - **Compile errors** (lexer/parser/sema) accumulate into a
   `vector<Diagnostic>` on the `engine_t`'s last-compile result, mirrors
-  `error_info`/`last_error`/`last_error_message` (DESIGN.md Section 8,
-  native-JIT-language-shaped surface per RESEARCH_NOTES.md) - `ember_compile` returns
+  `error_info`/`last_error`/`last_error_message` (../planning/DESIGN.md Section 8,
+  native-JIT-language-shaped surface per ../RESEARCH_NOTES.md) - `ember_compile` returns
   `nullptr` for the `module_t` if any `Error`-severity diagnostic was
   produced (warnings don't block compilation).
 - **Runtime errors** (bounds/budget/depth/div-zero/overflow/
@@ -562,7 +562,7 @@ struct Diagnostic {
   time, tied to a `context_t` not a `module_t`). Keeping them
   structurally distinct matches how a surveyed native-JIT language's
   API separates `error_info` (engine/compile-level) from the exception functions
-  (module/context-level), RESEARCH_NOTES.md.
+  (module/context-level), ../RESEARCH_NOTES.md.
 - **Parser error recovery**: on a syntax error, the parser
   synchronizes to the next statement boundary (`;` or matching `}`) at
   the current nesting depth and continues parsing, so a typo in one

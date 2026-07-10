@@ -13,7 +13,7 @@
 
 @entry
 fn main() -> i64 {
-    // setup: report loaded. return > 0 = stay loaded (LIFECYCLE.md §1).
+    // setup: report loaded. return > 0 = stay loaded (docs/LIFECYCLE.md §1).
     log(100);
     return 1;
 }

@@ -1,6 +1,6 @@
 # ember extensions - prism native-registration audit
 
-The Section 6 audit (`ember/docs/RESTRUCTURE_PLAN.md`): classify every
+The Section 6 audit (`../docs/planning/RESTRUCTURE_PLAN.md`): classify every
 `ember::NativeSig` registration and `ember::OpOverloadTable` entry in
 prism as **cheat-specific** (stays in prism) or **general-purpose**
 (relocates to `ember/extensions/`). Source of the registrations:
@@ -11,7 +11,7 @@ prism as **cheat-specific** (stays in prism) or **general-purpose**
 
 Classification rule: a registration is **general-purpose** iff it is
 (a) unambiguously non-cheat - not tied to reading/writing a game
-process or rendering an overlay/GUI, and (b) in the `docs/ROADMAP.md`
+process or rendering an overlay/GUI, and (b) in the `../docs/ROADMAP.md`
 Tier 0 standard addon set (`array<T>`, `map<K,V>`, `string`, `math`
 (sin/cos/sqrt/floor/ceil/abs/min/max/pow), `vec2/3/4`/`quat`/`mat4`).
 Anything else stays in prism. No new addons are authored (YAGNI).

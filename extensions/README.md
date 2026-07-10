@@ -10,7 +10,7 @@ the same addon set without re-implementing it.
 
 An extension is **NOT a language grammar or type-system change.**
 Adding a new statement form, a new type-construction rule, or a new
-sema pass is a `docs/ROADMAP.md` **Tier 1+ language feature**, not an
+sema pass is a `../docs/ROADMAP.md` **Tier 1+ language feature**, not an
 extension. Extensions live entirely on the *host* side of the
 `NativeSig`/`OpOverloadTable` seam that already exists in
 `ember/src/sema.hpp` - they register native function pointers and
@@ -20,7 +20,7 @@ extension only makes more *natives* resolvable at sema's
 call-resolution step and more *operators* resolvable at sema's
 overload-rewrite step.
 
-This is the distinction the `docs/ROADMAP.md` Tier 0 entry draws:
+This is the distinction the `../docs/ROADMAP.md` Tier 0 entry draws:
 "these are not language features - they're `NativeFn` addons using
 the stable v1 binding API." Extensions are where those addons live.
 
@@ -34,7 +34,7 @@ registration and `OpOverloadTable` entry was classified as either
 here). The audit table is in `AUDIT.md` next to this file.
 
 The general-purpose extensions relocated out of prism, matching the
-`docs/ROADMAP.md` Tier 0 standard addon set:
+`../docs/ROADMAP.md` Tier 0 standard addon set:
 
 | Extension | Library | What it backs | Origin (prism) |
 |---|---|---|---|
@@ -45,7 +45,7 @@ The general-purpose extensions relocated out of prism, matching the
 | `array/` | `ember_ext_array` | `array<T>` host-store type + `new`/`length`/`resize`/`set_u8`/`get_u8`/`set_f32`/`get_f32`/`set_i64`/`get_i64`/`push_u8` + the `GetArrayBytes` accessor | `prism_script_host.cpp` array block |
 | `math/` | `ember_ext_math` | `sqrt`/`sin`/`cos`/`tan` (f32) - pure functions, no host store | `prism_script_host.cpp` math block |
 | `sync/` | `ember_ext_sync` | cross-thread sync primitives: `aint8/16/32/64` atomics (load/store/fetch_add/cas/swap), swap buffer (double-buffer + atomic flip), SPSC/MPSC/MPMC queues — all behind opaque i64 handles, internally synchronized host storage (`std::atomic` / lock-free ring / host-internal `std::mutex` for MPMC). No operator overloads. | new (v1.0); no prism origin — added for the host↔script coordination pattern |
-| `lifecycle/` | `ember_ext_lifecycle` | dynamic routine registration: `register_routine(fn h, i64 data) -> id` / `unregister_routine(id)` — the Tier 2 fn-refs feature's host-native half. The `fn` param is typed (`is_fn_handle`) so sema rejects a forged plain i64; the host calls a stored routine via the dispatch table (the SAME call mechanism as the static `@on_tick` path, just discovered by the script at runtime). No operator overloads. | new (v1.0 follow-on); no prism origin — added once Tier 2 fn-refs shipped (`LIFECYCLE.md` §2) |
+| `lifecycle/` | `ember_ext_lifecycle` | dynamic routine registration: `register_routine(fn h, i64 data) -> id` / `unregister_routine(id)` — the Tier 2 fn-refs feature's host-native half. The `fn` param is typed (`is_fn_handle`) so sema rejects a forged plain i64; the host calls a stored routine via the dispatch table (the SAME call mechanism as the static `@on_tick` path, just discovered by the script at runtime). No operator overloads. | new (v1.0 follow-on); no prism origin — added once Tier 2 fn-refs shipped (`../docs/LIFECYCLE.md` §2) |
 
 Each is a self-contained C++ TU that depends only on ember's *public*
 headers (`ast.hpp`, `sema.hpp` - for `Type`/`make_prim`/`make_slice`/
@@ -170,7 +170,7 @@ extension exposes a small accessor in its public header:
   via the dispatch table per frame (the SAME call mechanism as the static
   `@on_tick` path, just discovered by the script at runtime). The slot came
   from a `&fn` sema-validated at the take-handle site, so the host trusts it
-  the way it trusts any sema-resolved slot. See `LIFECYCLE.md` §2.
+  the way it trusts any sema-resolved slot. See `../docs/LIFECYCLE.md` §2.
 
 The vec/quat/mat stores are entirely internal to their extension; no
 prism native reaches into them by handle outside the registered
@@ -193,7 +193,7 @@ the wiring; the standalone `ember` CLI links all eight).
 `ember/extensions/` follows the same language-purity rule as
 `ember/src/`: no references to specific cheat products, hosts, or
 research objects by name in code, comments, or docs. The forbidden
-vocabulary is the same set `ember/docs/RESTRUCTURE_PLAN.md` Section 2 defines
+vocabulary is the same set `../docs/planning/RESTRUCTURE_PLAN.md` Section 2 defines
 for the whole `ember/` tree (the named-product list there); an
 extension is a generic, reusable addon, so a grep for that vocabulary
 against `ember/extensions/` returns zero hits.

@@ -1,4 +1,4 @@
-// ember `.em` loader impl (BUNDLING_AND_EM_MODULES.md Section 2.5)
+// ember `.em` loader impl (docs/BUNDLING_AND_EM_MODULES.md Section 2.5)
 //
 // v1 `.em` contains native x86-64. In addition to the three relocations the
 // format records, generated code may contain process-local native/trap/

@@ -193,7 +193,7 @@ CompiledFn compile_native_passthrough_2arg(void* native_fn) {
     // in rcx/rdx - both already in place from the wrapper's own args, so
     // just mov the native ptr into rax and call.
     //
-    // CODEGEN_SPEC.md Section 1/Section 2: must reserve 32 bytes of shadow space below
+    // docs/spec/CODEGEN_SPEC.md Section 1/Section 2: must reserve 32 bytes of shadow space below
     // the call (even though native takes <=4 args) - the C++-compiled
     // callee may spill rcx/rdx into it. Without this, the spills corrupt
     // our frame (observed crash).

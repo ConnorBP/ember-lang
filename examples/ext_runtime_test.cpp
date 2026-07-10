@@ -1,5 +1,5 @@
 // ext_runtime_test - runtime coverage for the relocated ember extensions
-// (RESTRUCTURE_PLAN.md Section 6). em_roundtrip_test and import_roundtrip_test prove
+// (docs/planning/RESTRUCTURE_PLAN.md Section 6). em_roundtrip_test and import_roundtrip_test prove
 // the .em + cross-module paths but call NO relocated extension native; this
 // test closes that gap by exercising the math extension's `sqrt` through the
 // full lex→parse→sema→codegen→JIT→call path and asserting the result.

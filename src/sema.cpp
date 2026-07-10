@@ -21,7 +21,7 @@ static int64_t bit_cast_i64(uint64_t u) {
 // Per-frame byte budget (red-team V6-DoS mitigation): a single local or the
 // running frame total must not exceed this, or a script can declare a huge
 // fixed array and exhaust the host stack (the confirmed u8[65536] SIGSEGV).
-// Host-configurable later (DESIGN.md v0.4 budgets); a fixed default now.
+// Host-configurable later (docs/planning/DESIGN.md v0.4 budgets); a fixed default now.
 // 32 KB is generous for real game-logic scripts and well under a guard page.
 static constexpr int64_t MAX_FRAME_BYTES = 32 * 1024;
 // Max fixed-array length (red-team V6-overflow mitigation): array_len is a
@@ -113,7 +113,7 @@ namespace {
 // literal adaptation: if one side is an IntLit/FloatLit (untyped) and the
 // other has a concrete numeric type, the literal adopts the concrete type
 // (if its value fits). This is the one ergonomic exception to the strict
-// same-type rule (TYPE_SYSTEM.md Section 6: literals are context-influenced).
+// same-type rule (docs/spec/TYPE_SYSTEM.md Section 6: literals are context-influenced).
 // Variables never implicitly promote (Section 7).
 
 // --- compile-time integer constant evaluation (used by both the array/slice
@@ -240,7 +240,7 @@ struct Checker {
     int switch_depth = 0;
     const Expr* aggregate_cast_init = nullptr;
 
-    // Tier 1 enums (plan_ENUMS.md Section 4): (enum_name -> (variant -> i32 value)),
+    // Tier 1 enums (docs/planning/plan_ENUMS.md Section 4): (enum_name -> (variant -> i32 value)),
     // built by the enum-resolution pass (pass 1.5, before any function body is
     // checked). `enum_names` is the set of registered enum names, used by the
     // type-position enum-name rejection (Section 4.5: `let x: Color = ...` is a
@@ -388,7 +388,7 @@ struct Checker {
                 "aggregate arguments only through 8 bytes", loc.line, loc.col);
     }
 
-    // --- Tier 1 enums (plan_ENUMS.md) ---
+    // --- Tier 1 enums (docs/planning/plan_ENUMS.md) ---
     //
     // Pass 1.5 (Section 4.1): resolve every enum variant's i32 value. First
     // variant defaults to 0; each variant without an explicit `= value` is
@@ -519,7 +519,7 @@ struct Checker {
     // initializer evaluator all treat an enum variant as an ordinary i32
     // literal - they never see an EnumAccessExpr. Running this as a sema-
     // internal pass (NOT deferred to codegen) is what makes the rewrite visible
-    // to sema's own switch check (plan_ENUMS.md Section 5 point 1), and is
+    // to sema's own switch check (docs/planning/plan_ENUMS.md Section 5 point 1), and is
     // why codegen stays untouched (codegen's eval() has no EnumAccessExpr
     // case and silently emits nothing for one - Section 5 point 3).
     void lower_enum_access_expr(ExprPtr& slot) {
@@ -669,7 +669,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
     }
     if (auto* lit = dynamic_cast<BoolLit*>(&e)) { e.ty = lit->ty = &type_bool(); return e.ty; }
     if (auto* lit = dynamic_cast<StringLit*>(&e)) {
-        // string literal -> slice<u8> (rodata, MEMORY_AND_GC.md Section 6). Bake a
+        // string literal -> slice<u8> (rodata, docs/spec/MEMORY_AND_GC.md Section 6). Bake a
         // stable-address copy into the Program's rodata store so codegen can
         // emit an absolute pointer immediate (same lifetime contract as the
         // type_store above - must outlive codegen/JIT execution).
@@ -733,7 +733,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
         if (!t) { err("undefined name '" + id->name + "'", id->loc.line, id->loc.col); e.ty = intern(type_void()); return e.ty; }
         e.ty = t; return t;
     }
-    // v1.0 Tier 2 (plan_FUNCTION_REFS.md §4.2): `&fn_name` takes a function handle.
+    // v1.0 Tier 2 (docs/planning/plan_FUNCTION_REFS.md §4.2): `&fn_name` takes a function handle.
     // The operand must be an Ident naming a script function of this module.
     // The handle IS the slot index, baked as an i64 literal — a COMPILE-TIME
     // reification, not a runtime value. We stash the slot on the AST node for
@@ -767,7 +767,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
         e.ty = intern(t); return e.ty;
     }
     if (auto* c = dynamic_cast<CallExpr*>(&e)) {
-        // v1.0 Tier 2 first-class call (plan_FUNCTION_REFS.md §4.3): handle(args).
+        // v1.0 Tier 2 first-class call (docs/planning/plan_FUNCTION_REFS.md §4.3): handle(args).
         // The target is a RUNTIME i64 fn handle, not a compile-time-known name.
         // Type the target; it must be a fn handle. If it carries a recorded sig,
         // check args against it; if bare `fn` (no recorded sig, e.g. a param),
@@ -849,7 +849,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
             e.ty = intern(cit->second.ret);
             return e.ty;
         }
-        // v0.5 cross-module call `mod::fn(args)` (MODULES.md §6). Resolve against
+        // v0.5 cross-module call `mod::fn(args)` (docs/MODULES.md §6). Resolve against
         // the host-provided module export table. Resolved -> stamp the call's
         // cross_module_id/slot + ret type (so the arg/return type-check below
         // still works). Unresolved -> deferred trap (NOT a hard error — the
@@ -905,7 +905,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
         auto nit = natives->find(c->name);
         auto sit = script_slots->find(c->name);
         if (nit == natives->end() && sit == script_slots->end()) {
-            // v1.0 Tier 2 (plan_FUNCTION_REFS.md §4.3): `name(args)` where `name`
+            // v1.0 Tier 2 (docs/planning/plan_FUNCTION_REFS.md §4.3): `name(args)` where `name`
             // is neither a native nor a script fn — but it might be a LOCAL
             // VARIABLE of fn-handle type (the `let h = &fn; h(args);` case, which
             // parses identically to a named call). Promote it to an indirect call:
@@ -960,7 +960,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
         const Type* ret_ty;
         const std::vector<Type>* params;
         if (nit != natives->end()) {
-            // permission gate (SAFETY_AND_SANDBOX.md Section 6): a native
+            // permission gate (docs/spec/SAFETY_AND_SANDBOX.md Section 6): a native
             // flagged PERM_FFI is only callable from a module compiled with the
             // FFI permission bit. Compile-time check (zero runtime cost).
             if ((nit->second.permission & PERM_FFI) && !(perms & PERM_FFI)) {
@@ -1136,7 +1136,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
         const Type* lt = check_expr(*b->lhs);
         const Type* rt = check_expr(*b->rhs, lt); // give rhs a chance to adapt to lhs
         // re-check a literal lhs with rhs's type so `200.0f * s` (s:f32) adapts lhs to f32,
-        // and `500 + u64var` adapts lhs int literal to u64 (TYPE_SYSTEM.md Section 6 literal adaptation).
+        // and `500 + u64var` adapts lhs int literal to u64 (docs/spec/TYPE_SYSTEM.md Section 6 literal adaptation).
         // StringLit is included here too so `"prefix: " + report` (literal on
         // the left) adapts the same way `report + "\n"` already does via the
         // rhs-gets-lhs's-type path above - without this, string
@@ -1154,7 +1154,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                 err("logical operator requires bool operands", b->loc.line, b->loc.col);
             e.ty = &type_bool(); return e.ty;
         }
-        // operator-overload dispatch (TYPE_SYSTEM.md section 7): if both operands
+        // operator-overload dispatch (docs/spec/TYPE_SYSTEM.md section 7): if both operands
         // are a registered type with an overload for this op, stamp the BinExpr
         // as a native call (codegen emits call instead of inline arithmetic).
         // Checked BEFORE the is_cmp default-handling below - a handle type
@@ -1186,7 +1186,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
             e.ty = &type_bool(); return e.ty;
         }
         // arithmetic/bitwise: require same numeric type (literal adaptation already applied)
-        // EXCEPTION (TYPE_SYSTEM.md Section 7): shift rhs may be any unsigned integer type
+        // EXCEPTION (docs/spec/TYPE_SYSTEM.md Section 7): shift rhs may be any unsigned integer type
         bool is_shift = (b->op==BinExpr::Op::Shl || b->op==BinExpr::Op::Shr);
         if (is_shift) {
             if (!lt->is_int() || !rt->is_int())
@@ -1385,7 +1385,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
     if (auto* fl = dynamic_cast<FieldExpr*>(&e)) {
         // struct field read (base.field). Note: obj.method(args) never
         // reaches here - the parser desugars that to a CallExpr with
-        // `receiver` set (BINDING_API.md sec 3) before sema ever sees a bare
+        // `receiver` set (docs/spec/BINDING_API.md sec 3) before sema ever sees a bare
         // FieldExpr for a method call; only a genuine field access lands here.
         const Type* bt = check_expr(*fl->base);
         const StructLayout* layout = (structs && bt && !bt->struct_name.empty())
@@ -1549,7 +1549,7 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
                     " bytes); reduce the array/struct size",
                     ls->loc.line, ls->loc.col);
             }
-            // enum name used as a let type is a v1 error (plan_ENUMS.md Section 4.5):
+            // enum name used as a let type is a v1 error (docs/planning/plan_ENUMS.md Section 4.5):
             // enums are untyped (their values ARE i32). The hook the typed-enum
             // upgrade (Tier 2) flips from reject to accept.
             check_type_not_enum(ls->ty.get(), ls->loc);
@@ -1743,7 +1743,10 @@ void Checker::check_block(Block& b, const Type* ret_ty, bool& returns) {
 void Checker::check_func(FuncDecl& f) {
     scopes.clear();
     push_scope();
-    // Struct-by-value params/returns are supported (REMAINING_WORK.md 1.6) -
+    // Struct-by-value params/returns are supported (shipped; see
+    // docs/spec/TYPE_SYSTEM.md §2 struct layout + docs/spec/CODEGEN_SPEC.md
+    // for the Win64 word-based param convention and hidden-pointer return
+    // convention) -
     // codegen has a real word-based param convention and a hidden-pointer
     // return convention. The only restrictions live at call sites, not here:
     // check_struct_arg_shape (a by-value argument must be a bare local) and
@@ -1759,7 +1762,7 @@ void Checker::check_func(FuncDecl& f) {
     pop_scope();
 }
 
-// Pass 1.7 (plan_ENUMS.md Section 5): rewrite every EnumAccessExpr to an
+// Pass 1.7 (docs/planning/plan_ENUMS.md Section 5): rewrite every EnumAccessExpr to an
 // IntLit before check_expr runs, walking the statement tree in parallel
 // with check_stmt/check_block's own traversal. After this pass there are no
 // EnumAccessExpr nodes anywhere - codegen, the const-folder, the switch
@@ -1841,7 +1844,7 @@ SemaResult sema(Program& prog,
     for (auto& g : prog.globals) {
         if (!c.globals.count(g.name)) c.globals[g.name] = {c.intern(*g.ty), g.is_const};
     }
-    // Tier 1 enums (plan_ENUMS.md Section 4): pass 1.5 resolve variant values
+    // Tier 1 enums (docs/planning/plan_ENUMS.md Section 4): pass 1.5 resolve variant values
     // + build the (enum,variant)->i32 table and the enum_names set; pass 1.6
     // reject enum names used in type positions (the untyped v1 hook); pass 1.7
     // rewrite every EnumAccessExpr to an IntLit BEFORE any function body is
@@ -1857,7 +1860,7 @@ SemaResult sema(Program& prog,
     for (auto& f : prog.funcs) {
         c.lower_enum_access_block(f.body);
     }
-    // register script function signatures (pass 2 of COMPILER_PIPELINE.md Section 4:
+    // register script function signatures (pass 2 of docs/spec/COMPILER_PIPELINE.md Section 4:
     // all signatures resolved before any body is checked, so forward calls work)
     for (auto& f : prog.funcs) {
         Checker::ScriptSig ss;

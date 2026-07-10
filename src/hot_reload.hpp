@@ -1,4 +1,4 @@
-// ember single-function hot reload (HOT_RELOAD.md §3/§5).
+// ember single-function hot reload (docs/HOT_RELOAD.md §3/§5).
 //
 // A HotReloadDomain serializes guard entry with publication, assigns one
 // monotonic epoch to every successful slot publication, and owns replaced

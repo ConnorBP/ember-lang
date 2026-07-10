@@ -12,9 +12,9 @@ Detail plan for two related additions the user asked for:
 
 This is a **plan**, not a spec amendment. It respects every existing
 invariant - dispatch-table slot stability (`HOT_RELOAD.md` Section 1), "JIT
-only, no bytecode interpreter fallback" (`DESIGN.md` non-goal),
+only, no bytecode interpreter fallback" (`planning/DESIGN.md` non-goal),
 globals-block-by-absolute-address and string-literals-as-function-
-local-rodata (`MEMORY_AND_GC.md` Section 4/Section 6) - and re-uses the existing
+local-rodata (`spec/MEMORY_AND_GC.md` Section 4/Section 6) - and re-uses the existing
 pipeline rather than adding a second execution path.
 
 ---
@@ -48,7 +48,7 @@ splitting*, which `include` provides. True runtime module separation
 larger subsystem with no demonstrated need yet.
 
 **Decision:** ship `include` (bundle) now. Spec `import` (live) in
-`docs/MODULES.md` as future work, do not implement it. The two
+`MODULES.md` as future work, do not implement it. The two
 keywords are named to make the semantics obvious and to match the
 user's own phrasing ("one of them forcing non bundle so it imports it
 live"): `include` is the C `#include` analog (merged before
@@ -57,7 +57,7 @@ compilation, one output), `import` is the Rust/Python `import` analog
 
 ### 1.2 `include` - design
 
-**Grammar** (added to `COMPILER_PIPELINE.md` Section 2, top-level):
+**Grammar** (added to `spec/COMPILER_PIPELINE.md` Section 2, top-level):
 
 ```
 program      := (include_stmt | annotation* func_decl | struct_decl | global_decl)*
@@ -107,7 +107,7 @@ had been one file: one dispatch table, one globals block, one module. The
 shipped single-function reload can replace an existing function from that
 merged program; whole-module include re-resolution is deferred.
 
-**`SourceLoc.file`**: the `SourceLoc` struct (`COMPILER_PIPELINE.md`
+**`SourceLoc.file`**: the `SourceLoc` struct (`spec/COMPILER_PIPELINE.md`
 Section 7) already carries `const char* file`. The resolver must ensure each
 parsed file's tokens carry that file's own name so diagnostics point
 at the right file. This is a property of the lexer being told which
@@ -117,7 +117,7 @@ across the whole merge."
 ### 1.3 What `include` does *not* need
 
 - No namespace / module-name concept. All included names land in one
-  flat module scope (matches `COMPILER_PIPELINE.md` Section 4's existing
+  flat module scope (matches `spec/COMPILER_PIPELINE.md` Section 4's existing
   flat module scope; namespaces are `ROADMAP.md` Tier 6).
 - No visibility / `pub` / `export` - everything included is visible
   (matches C `#include`; a private-include model is a language
@@ -125,7 +125,7 @@ across the whole merge."
 - No include guards / `#pragma once` - the `seen` set is the guard.
 - No conditional includes - `include` is unconditional; conditional
   composition is `engine.define` + `const`/`constexpr` territory
-  (`DESIGN.md` Section 8, `ROADMAP.md` hard non-goal "no preprocessor").
+  (`planning/DESIGN.md` Section 8, `ROADMAP.md` hard non-goal "no preprocessor").
 
 ### 1.4 Interaction with hot reload
 
@@ -137,7 +137,7 @@ merged `Program`, but reload remains per-function:
   (breaking source-API bump). The helper now takes a `HotReloadDomain&` as its
   fourth argument and `ReloadResult` no longer returns a caller-owned
   `old_entry` pointer; the domain owns the replaced page from publication and
-  frees it after a guarded quiescent point. See `docs/HOT_RELOAD.md` Section 0
+  frees it after a guarded quiescent point. See `HOT_RELOAD.md` Section 0
   for the migration recipe (persistent domain beside the table; guard before
   every outer call; disown the old `CompiledFn`; `reclaim()`/`quiesce()`; drain
   guards then quiesce before freeing current pages). The host still hands the
@@ -153,7 +153,7 @@ merged `Program`, but reload remains per-function:
 
 ### 1.5 `import` (live) - design sketch only, not implemented
 
-For completeness, the Tier 6 design lives in a new `docs/MODULES.md`
+For completeness, the Tier 6 design lives in a new `MODULES.md`
 (not written in this pass - it's future work). The load-bearing
 design point, recorded here so it isn't lost:
 
@@ -163,7 +163,7 @@ design point, recorded here so it isn't lost:
   codegen emits one extra indirection vs intra-module calls: load
   registry base → load `registry[module_id].slots` → load
   `slots[slot_index]` → `call r11`. That is one more `mov` than the
-  intra-module form (`CODEGEN_SPEC.md` Section 7), the cost of true runtime
+  intra-module form (`spec/CODEGEN_SPEC.md` Section 7), the cost of true runtime
   linking.
 - **Slot stability still holds within each module**; cross-module
   calls go through the registry, so a foreign module's slot table can
@@ -190,7 +190,7 @@ for the `.em` format. There are three real options:
 **Option A - serialized IR (dense intermediary).** Serialize the
 `IrFunction` (blocks, instrs, vreg types, params) + dispatch slot
 table + globals layout. The loader re-runs `run_linear_scan` +
-`emit_x64` (`COMPILER_PIPELINE.md` Section 8) to produce machine code at load
+`emit_x64` (`spec/COMPILER_PIPELINE.md` Section 8) to produce machine code at load
 time.
 
 - *Pro:* smaller file than raw machine code (IR is denser than x64);
@@ -216,14 +216,14 @@ code pages and fixes up absolute addresses.
   loader is tiny (a header reader + a fixup applier). This is the
   maximal pre-compile win.
 - *Pro:* **exactly one execution path** - native x64, same as JIT.
-  The `DESIGN.md` non-goal is "no bytecode interpreter fallback,"
+  The `planning/DESIGN.md` non-goal is "no bytecode interpreter fallback,"
   meaning *one* execution path, and that path is native. Serialized
   native code is not a second path; it's the same path with the
   regalloc+emit step moved earlier. This is the MCJIT-vs-ORC
   distinction: pre-compiled object code with relocations is not
   "bytecode." Fully consistent with the spec's stance.
 - *Pro:* the file is target-specific (Win64 x86-64), but ember is
-  Windows-first x86-64-only (`CODEGEN_SPEC.md` Section 1), so cross-platform
+  Windows-first x86-64-only (`spec/CODEGEN_SPEC.md` Section 1), so cross-platform
   `.em` is not a real concern. Option A's only theoretical advantage
   (portable IR) doesn't apply.
 - *Con:* larger file than IR (raw x64 is less dense). Acceptable  - 
@@ -235,11 +235,11 @@ code pages and fixes up absolute addresses.
   writer nor loader scans x64 bytes.
 
 **Option C - a bytecode interpreter.** Explicitly rejected. This is
-the `DESIGN.md` non-goal: "JIT only, no bytecode interpreter fallback  - 
+the `planning/DESIGN.md` non-goal: "JIT only, no bytecode interpreter fallback  - 
 one execution path." A bytecode `.em` would create a second execution
 path (the interpreter) alongside the JIT, which is exactly what the
 spec refuses. It would also reintroduce the "5-50× interpreter
-overhead" `GAP_ANALYSIS.md` Section 4 deliberately avoids. Not considered
+overhead" `planning/GAP_ANALYSIS.md` Section 4 deliberately avoids. Not considered
 further.
 
 **Decision: Option B.** It maximizes the pre-compile win, keeps one
@@ -326,7 +326,7 @@ addend; the loader patches it to `loaded_page + code_size + addend`. Thus no
 `StringLit::baked_ptr` survives serialization. Keeping rodata next to its code
 also gives one allocation and one W^X transition per function.
 
-**Why no cross-function `rel32` reloc.** `CODEGEN_SPEC.md` Section 4
+**Why no cross-function `rel32` reloc.** `spec/CODEGEN_SPEC.md` Section 4
 explicitly forbids cross-function `rel32` references - script-to-
 script calls go through the dispatch table, never same-image direct
 calls. Branch labels are resolved before serialization; absolute external
@@ -505,8 +505,8 @@ baking a process pointer.
 
 ## Part 4 - What this plan deliberately does *not* do
 
-- **No bytecode interpreter.** Option C rejected outright (`DESIGN.md`
-  non-goal, `GAP_ANALYSIS.md` Section 4).
+- **No bytecode interpreter.** Option C rejected outright (`planning/DESIGN.md`
+  non-goal, `planning/GAP_ANALYSIS.md` Section 4).
 - **No new execution path.** `.em` loads native x64; the runtime
   executes it exactly as it executes JIT'd code. One path.
 - **No source embedded in `.em` v2.** Reload from source still requires the
@@ -514,7 +514,7 @@ baking a process pointer.
 - **No host-configured textual-import search path.** Imports resolve relative
   to the current file.
 - **No namespace/visibility on `include`.** All included names land in
-  one flat module scope (`COMPILER_PIPELINE.md` Section 4). `pub`/`priv` is a
+  one flat module scope (`spec/COMPILER_PIPELINE.md` Section 4). `pub`/`priv` is a
   language extension, not a bundling concern.
 
 ---
@@ -535,7 +535,7 @@ baking a process pointer.
    `mov_r_imm64`. Switching to the external form means the JIT driver
    fills the placeholder - the tests' behavior is unchanged, but the
    encoder's byte output now has zero placeholders until the driver
-   fills them. The byte-exact test #6 (`COMPILER_PIPELINE.md` Section 8)
+   fills them. The byte-exact test #6 (`spec/COMPILER_PIPELINE.md` Section 8)
    will need its expected bytes updated for the dispatch-table-base
    `mov r11, imm64` lines. This is a test-only change, not a
    behavior change.

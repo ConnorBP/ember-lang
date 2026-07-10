@@ -134,7 +134,7 @@ done
 # --- --tick lifecycle regressions (surfaced by demo/game) ---
 # Two CLI fixes the game-entity sim surfaced, each with its own regression:
 #  1. lifecycle_entry_unload: @entry returning <= 0 must NOT start the tick
-#     loop (LIFECYCLE.md §1). Before the fix the return-sign clamp misread a
+#     loop (docs/LIFECYCLE.md §1). Before the fix the return-sign clamp misread a
 #     negative unload signal as stay-loaded. Assert: no "stopped after" line
 #     (no tick ran) + the "module unloaded (no tick)" line is printed.
 #  2. lifecycle_tick_trap_exit: a tick-time trap must exit 70 (the recoverable-
@@ -154,7 +154,7 @@ else
 fi
 
 # Doc-consistency regression: the shipped defer implementation is
-# lexical-block-exit LIFO (CODEGEN_SPEC.md Section 13). Catch a future
+# lexical-block-exit LIFO (docs/spec/CODEGEN_SPEC.md Section 13). Catch a future
 # reintroduction of the stale "function-exit" + defer framing in non-audit
 # docs (audit .md files legitimately quote the stale text when reporting it).
 if grep -rn 'function-exit' docs/ --exclude='AUDIT_*' | grep -i defer; then

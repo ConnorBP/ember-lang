@@ -1,6 +1,6 @@
 # ember - safety & sandbox spec
 
-Detail doc for DESIGN.md Section 5. Every "what happens when X goes wrong"
+Detail doc for ../planning/DESIGN.md Section 5. Every "what happens when X goes wrong"
 case, the shipped safety boundary, and explicitly deferred mechanisms.
 
 ## 1. Threat/trust model (explicit, so nothing is assumed)
@@ -15,7 +15,7 @@ case, the shipped safety boundary, and explicitly deferred mechanisms.
   **not**: defending against a script author who has also compromised
   the host binary, or side-channel/speculative-execution-class attacks.
   This scope matches the surveyed native-JIT language's and AngelScript's actual guarantees
-  (RESEARCH_NOTES.md) - we are not claiming a stronger sandbox than
+  (../RESEARCH_NOTES.md) - we are not claiming a stronger sandbox than
   either.
 - **Native functions are trusted.** Once a host registers a
   `NativeFn`, ember assumes it behaves per its declared signature
@@ -93,7 +93,7 @@ is not recoverable.
   checkpoint wrapper resumes and observes "budget exceeded" through
   `last_error`/`last_trap`.
   Script does **not** get a chance to catch this - no in-language
-  exception handling exists (DESIGN.md Section 2), matches "abort, don't try
+  exception handling exists (../planning/DESIGN.md Section 2), matches "abort, don't try
   to let a runaway script gracefully handle its own runaway-ness."
 - **No budget set (default)**: `budget_remaining` starts at
   `INT64_MAX` (or budget checks are simply compiled out entirely if
@@ -178,7 +178,7 @@ Summary of the safety-relevant policy decisions:
 - Always checked, in both debug and release builds - unlike overflow
   checks (Section 6), bounds checks are **never** compile-flag-disabled,
   because an out-of-bounds access is a direct host-memory-corruption
-  vector (the actual security-relevant property DESIGN.md Section 5
+  vector (the actual security-relevant property ../planning/DESIGN.md Section 5
   promises: "no raw pointer arithmetic exposed to script" is only
   true if every indexed access is actually checked, always).
 - Trap, not clamp/saturate - an out-of-bounds index aborts via the
@@ -195,13 +195,13 @@ Summary of the safety-relevant policy decisions:
 
 - Every `NativeFn` registration carries a `permission` bitfield
   (BINDING_API.md Section 1); `PERM_FFI` (value `0x01`, matches the surveyed native-JIT language's
-  constant, RESEARCH_NOTES.md) marks a native function as requiring
+  constant, ../RESEARCH_NOTES.md) marks a native function as requiring
   explicit per-module opt-in to call.
 - **Enforcement point**: compile time, at the call-site sema check
   (CODEGEN_SPEC.md Section 8) - if script code calls a `PERM_FFI`-gated
   native function and the compiling module wasn't granted that
   permission (`set_permissions`/`get_permissions`, mirroring the surveyed native-JIT language's
-  API, DESIGN.md Section 8), it's a **compile error**, not a runtime
+  API, ../planning/DESIGN.md Section 8), it's a **compile error**, not a runtime
   check. Rationale restated from CODEGEN_SPEC.md Section 8: this makes
   permission-checking genuinely zero-cost at runtime (no branch ever
   emitted for it) while still being a real gate - a module that
@@ -231,14 +231,14 @@ Native-triggerable runtime errors (a native binding decides mid-call
 that something is wrong - e.g. an engine API rejecting invalid game
 state) use the same non-local-unwind machinery (Section 2) via two
 host-callable functions (mirrors the surveyed native-JIT language's `runtime_error`/
-`runtime_exception`, RESEARCH_NOTES.md/DESIGN.md Section 8):
+`runtime_exception`, ../RESEARCH_NOTES.md/DESIGN.md Section 8):
 - `runtime_error(context_t*, const char* msg)` - records the message,
   triggers the same checkpoint-unwind as Section 3/Section 4/Section 5's traps. Intended
   for "this is definitely a bug, abort this call" situations
   (equivalent severity to a bounds-check trap).
 - `runtime_exception(context_t*, const char* msg)` - same unwind
   mechanism, but recorded distinctly (`exception_pending`/
-  `exception_value`/`exception_type`/`exception_clear`, DESIGN.md
+  `exception_value`/`exception_type`/`exception_clear`, ../planning/DESIGN.md
   Section 8-style surface) so host code that called `ember_call` can
   distinguish "a hard internal-invariant trap happened" (bounds,
   budget, depth, div-by-zero - arguably an ember/engine bug or
@@ -259,7 +259,7 @@ host-callable functions (mirrors the surveyed native-JIT language's `runtime_err
 ### 7a. Call-target provenance (first-class function refs — REDSHELL guard #6, shipped v1.0)
 
 First-class function references (`&fn` / `handle(args)` / the `fn` type
-keyword, `ROADMAP.md` Tier 2 ✓ shipped) open a new runtime surface: a
+keyword, `../ROADMAP.md` Tier 2 ✓ shipped) open a new runtime surface: a
 script can carry an i64 around and later use it as a call target. The
 i64-as-call-target surface (the V2 vector the REDSHELL writeup names)
 gets two guards, one at each layer:
@@ -295,7 +295,7 @@ compiling. The guard is a **no-op (zero emitted)** when no allowlist is
 configured (`fn_slot_count == 0`), so every existing module that doesn't use
 function refs pays nothing. See `examples/function_refs_test.cpp` (ctest
 target `function_refs`) for the out-of-range and in-range-unregistered
-handle trap tests. Two open items are documented at `ROADMAP.md` Tier 2:
+handle trap tests. Two open items are documented at `../ROADMAP.md` Tier 2:
 the **bare-`fn` signature hole** (a `fn`-typed param with no recorded sig
 does not type-check args — a type-soundness hole, not a sandbox violation;
 the guard still validates the handle, the called code still obeys all
@@ -312,13 +312,13 @@ is per-module).
   guarantees the *shape* of the call (right number of args, right
   types, matches CODEGEN_SPEC.md's calling-convention placement), not
   domain-level validity of the values.
-- **Aliasing/data-race safety across threads.** DESIGN.md non-goals
+- **Aliasing/data-race safety across threads.** ../planning/DESIGN.md non-goals
   already exclude multithreaded execution **inside one `context_t`**;
   v1.0 adds the multi-context model (Option D + B1, see Section 8a
   below) so a host may run **one `context_t` per worker thread** against
   shared compiled code — the dispatch table and JIT'd code are read-only
   after compilation except during a hot-reload slot swap
-  (`HOT_RELOAD.md` Section 5); that slot-swap's atomicity is the only
+  (`../HOT_RELOAD.md` Section 5); that slot-swap's atomicity is the only
   thread-safety guarantee made on that shared state. Script-visible global
   mutable state shared across contexts is a host-design question, not
   something ember arbitrates. There is no script-level primitive to create
@@ -343,7 +343,7 @@ depth counter lived on one `context_t`, and a trap longjmp'd to that
 context's checkpoint. v1.0 makes the per-`ember_call` state
 **per-thread** so one compiled module can serve N concurrent caller
 threads, each with its own `context_t`. Two pieces (plan:
-`docs/plan_CONTEXT_THREADSAFETY.md`):
+`../planning/plan_CONTEXT_THREADSAFETY.md`):
 
 - **Option D — one `context_t` per thread.** Each concurrent caller
   thread allocates its own `context_t` (private `checkpoint` /
@@ -389,10 +389,10 @@ generalized). The CLI `--tick` path is the first host to consume B1: commit
 call `@entry` via `ember_call_void(entry, &ectx)`, and run the tick thread on
 its **own** `context_t` (`tick_ctx`) via `ember_call_void(f, &tick_ctx)` —
 fully isolated from the main thread's `ectx`, so a tick trap stops the tick
-thread, never the main thread. See `docs/v1.0_INTEGRATION_NOTES.md` §1/§5.
+thread, never the main thread. See `../planning/v1.0_INTEGRATION_NOTES.md` §1/§5.
 
 **What this does NOT change.** The shared compiled code is read-only
-after compile except during a hot-reload slot swap (`HOT_RELOAD.md` Section 5);
+after compile except during a hot-reload slot swap (`../HOT_RELOAD.md` Section 5);
 in-context multithreaded execution (two ember-calling threads on one
 `context_t`) is still a non-goal and still races — the model is
 one-context-per-thread, not in-context threading. The sync-queue primitives

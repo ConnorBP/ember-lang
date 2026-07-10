@@ -7,11 +7,11 @@
 
 ## 0. What this is
 
-ROADMAP Tier 1's first bullet (`docs/ROADMAP.md:34-38`):
+ROADMAP Tier 1's first bullet (`../ROADMAP.md:34-38`):
 
 > **`enum`** — script-side `enum E { A, B, C }` declaring named i32
 >  constants. Grammar + `EnumBuilder` (already noted as deferred in
->  `BINDING_API.md` Section 5). Trigger: a real script wants more than ~5
+>  `../spec/BINDING_API.md` Section 5). Trigger: a real script wants more than ~5
 >  related constants and the global-flat hurts readability. Dep: none.
 
 Today ember has no `enum`. The constant mechanism is `const` locals +
@@ -40,7 +40,7 @@ and `codegen.cpp:2010` — see §5. Everything else falls out of honoring it.
   existing `::` postfix handling (which currently hard-requires the base to
   be a module alias and builds a `CallExpr` expecting a following `(`) to
   also accept `EnumName::Variant` as a value expression. See §3.5.
-- ember already uses `::` for modules (`mod::fn()`, `MODULES.md §6`,
+- ember already uses `::` for modules (`mod::fn()`, `../MODULES.md §6`,
   `sema.hpp ModuleExportTable`). Using `::` for enum variants keeps one
   scoped-name operator for both — a reader who knows `mod::fn` immediately
   reads `Color::Red` the same way. Bare `A` (C-style) would collide with
@@ -65,12 +65,12 @@ exists to produce i32 constants, not to introduce a new type.
 **Rationale:**
 - The `Type` struct (`src/ast.hpp:22-32`) has `Prim` + `struct_name` +
   `is_slice`/`array_len`/`elem` and **no enum variant**. The spec
-  (`docs/TYPE_SYSTEM.md §1`) deliberately lists exactly the primitives that
-  exist; `BINDING_API.md §1`'s `TypeId` enum comment explicitly says
+  (`../spec/TYPE_SYSTEM.md §1`) deliberately lists exactly the primitives that
+  exist; `../spec/BINDING_API.md §1`'s `TypeId` enum comment explicitly says
   "no `t_enum`... enums are deferred." Adding a typed enum means a new
   `Type` shape, new `TypeId`, sema enforcement that a `let x: Color` only
   accepts `Color::` variants (a per-enum-type compatibility rule that
-  doesn't exist today — `TYPE_SYSTEM.md §6` only has nominal struct
+  doesn't exist today — `../spec/TYPE_SYSTEM.md §6` only has nominal struct
   equality and numeric widening), and an "is this i32 or is it a tag"
   question at every integer operation site. That's a real subsystem, not a
   Tier-1 nicety.
@@ -108,7 +108,7 @@ exists to produce i32 constants, not to introduce a new type.
   offending pair in the message). This is the one place v1 enums are
   stricter than C — C allows it and it's a classic footgun; rejecting it
   costs one `unordered_set<int32_t>` per enum and matches ember's
-  "same-type-required, no silent footguns" stance (`TYPE_SYSTEM.md §6/§7`).
+  "same-type-required, no silent footguns" stance (`../spec/TYPE_SYSTEM.md §6/§7`).
   (If a real flags enum later wants deliberate aliasing, that's the typed
   enum Tier 2 work; v1 untyped enums rejecting duplicates is the safe
   default.)
@@ -165,14 +165,14 @@ struct Program {
 expression means the parser does zero value resolution (consistent with how
 it treats `GlobalDecl::init` — `src/parser.cpp` `parse_global` stores the
 raw `parse_expr()`, sema folds it). This keeps "parser builds shape, sema
-folds values" — the existing layering (`COMPILER_PIPELINE.md §4` pass
+folds values" — the existing layering (`../spec/COMPILER_PIPELINE.md §4` pass
 ordering). `resolved` is filled by sema in a dedicated enum-resolution
 sub-pass before any function body is checked (see §4.1), so that
 `E::A`-as-a-value resolution in function bodies already has a finalized
 value table to consult.
 
 **No new `Type` shape.** An enum value is an `IntLit` after sema; the
-`Type` it carries is `Prim::I32`. `docs/TYPE_SYSTEM.md` gets one new
+`Type` it carries is `Prim::I32`. `../spec/TYPE_SYSTEM.md` gets one new
 sub-section (§11.8 or a §12 "enum") stating "enums are named i32
 constants; an enum-typed value is an i32" — no `Type`/`Prim` change.
 
@@ -216,7 +216,7 @@ Add:
 
 (Mirrors the `Kw_struct` branch exactly, including the annotations-not-
 supported guard that `struct`/`global`/`link` already enforce — consistent
-with v1 not annotating anything but functions, `TYPE_SYSTEM.md §10`.)
+with v1 not annotating anything but functions, `../spec/TYPE_SYSTEM.md §10`.)
 
 ### 3.3 New `parse_enum()`
 
@@ -253,7 +253,7 @@ later, with the parser already doing the right thing.
 
 (Alternative considered: resolve enum names in `parse_type`. Rejected —
 the parser has no symbol table today; struct-name resolution is deferred to
-sema by design, `COMPILER_PIPELINE.md §4` pass 1. Enum names should follow
+sema by design, `../spec/COMPILER_PIPELINE.md §4` pass 1. Enum names should follow
 the same rule.)
 
 ### 3.5 `parse_postfix` `::` — extend for enum variant values
@@ -381,7 +381,7 @@ expression node an `EnumAccessExpr` occupied must BE an `IntLit` (so that
 sema's own switch case-value check at `sema.cpp:1057` sees an `IntLit`).
 Mechanism (a) — threading `ExprPtr&` through the child-recurse sites — is
 the one that satisfies this without a second AST pass. (This is the same
-"sema mutates AST in place" contract `COMPILER_PIPELINE.md §3` already
+"sema mutates AST in place" contract `../spec/COMPILER_PIPELINE.md §3` already
 states; the only wrinkle is that an in-place identity swap needs the owning
 `unique_ptr`, not just a `Node&`.)
 
@@ -467,14 +467,14 @@ anchors make it airtight:
 codegen time. The only files that change are `src/lexer.{hpp,cpp}`,
 `src/parser.cpp`, `src/ast.hpp`, `src/sema.{hpp,cpp}` (the new pass + the
 `check_expr` case + the enum-name-not-a-type check), and the docs
-(`COMPILER_PIPELINE.md §1/§2` grammar, `TYPE_SYSTEM.md` new enum section,
-`BINDING_API.md §5` un-defer `EnumBuilder` if §6 is in scope).
+(`../spec/COMPILER_PIPELINE.md §1/§2` grammar, `../spec/TYPE_SYSTEM.md` new enum section,
+`../spec/BINDING_API.md §5` un-defer `EnumBuilder` if §6 is in scope).
 
 ---
 
-## 6. Host-side `EnumBuilder` (BINDING_API.md §5) — **defer to v2-of-enums**
+## 6. Host-side `EnumBuilder` (../spec/BINDING_API.md §5) — **defer to v2-of-enums**
 
-`docs/BINDING_API.md §5` currently says:
+`../spec/BINDING_API.md §5` currently says:
 
 > `EnumBuilder`: **dropped from v1** — no `enum` keyword in the v1
 >  grammar... Host-side named constants use `set_global`. Revisit if
@@ -491,7 +491,7 @@ host-side `EnumBuilder` in the same change.
 - The script-side path (§2-§5) needs no `EnumBuilder` — the enum table is
   built by sema from `Program::enums` (§4.1). A host that wants an enum
   today can still expose named constants via `set_global` (the existing
-  mechanism, `BINDING_API.md §5`'s own fallback), and a script can
+  mechanism, `../spec/BINDING_API.md §5`'s own fallback), and a script can
   `import`/`link` a module that declares the enum if it must be shared.
   Neither needs a host-side builder.
 - `EnumBuilder` is a *host→script* direction: a host registers an enum so
@@ -507,13 +507,13 @@ host-side `EnumBuilder` in the same change.
   trigger (a host wanting to expose a flags enum to scripts), not named in
   the Tier 1 bullet, and not yet demonstrated by a real binding.
 - Deferring keeps the change small and the surface matched 1:1 to a
-  reachable feature (the `BINDING_API.md §3` rationale pattern: "a builder
+  reachable feature (the `../spec/BINDING_API.md §3` rationale pattern: "a builder
   method with no corresponding language feature to drive it is dead API
   surface"). The script feature is the language feature; `EnumBuilder` is
   the binding feature — they can land together but don't have to, and the
   smaller change is easier to validate against the test matrix in §7.
 
-**What the doc edit looks like instead:** `BINDING_API.md §5`'s note is
+**What the doc edit looks like instead:** `../spec/BINDING_API.md §5`'s note is
 updated from "dropped from v1 — no `enum` keyword" to "script-side `enum`
 lands in Tier 1 (see `plan_ENUMS.md`); `EnumBuilder` (host→script enum
 registration) remains deferred — host enums use `set_global` until a real
@@ -536,7 +536,7 @@ following the existing `sema_valid_*` / `sema_invalid_*` / `invalid_*` /
 | `valid_enum_explicit.ember` | `enum F { A = 1, B = 2, C = 4 }` packed flags |
 | `valid_enum_mixed.ember` | `enum M { A, B = 5, C, D = 10, E }` (C=6, E=11) |
 | `valid_enum_trailing_comma.ember` | `enum E { A, B, C, }` trailing comma accepted |
-| `valid_enum_empty.ember` | `enum E {}` (zero variants) — decide: allow or reject? **Recommend allow** (matches empty struct `struct Empty{}` in `TYPE_SYSTEM.md §2`; a zero-variant enum is just a name with no constants, harmless) |
+| `valid_enum_empty.ember` | `enum E {}` (zero variants) — decide: allow or reject? **Recommend allow** (matches empty struct `struct Empty{}` in `../spec/TYPE_SYSTEM.md §2`; a zero-variant enum is just a name with no constants, harmless) |
 | `valid_enum_use.ember` | `E::A` in expression position, in a `let`, in a `return`, as a `global const` initializer, as a `switch` case value, in a `BinExpr` (`Flags::A \| Flags::B`) |
 
 ### 7.2 Sema-valid (must sema OK) — `sema_valid_enum_*.ember`
@@ -610,11 +610,11 @@ needed a change, this is where it would surface.
 
 ## 9. Doc edits (no source, but the spec docs must move with the code)
 
-- `docs/COMPILER_PIPELINE.md §1` token set: add `enum` to Keywords. §2 grammar: add `enum_decl`/`variant` productions; add `enum_decl` to `program`. §3 AST: add `EnumDecl`/`EnumVariant`/`EnumAccessExpr`. §4 sema passes: insert the §4.1 enum-resolution pass between pass 1 (struct layout) and pass 2 (function sig registration); note the §4.2 in-place rewrite. (Note: the spec's `program := (annotation* func_decl | struct_decl | global_decl)*` line and the "No `enum`... none exist in v1 grammar" line both need updating — they currently *deny* this feature by name.)
-- `docs/TYPE_SYSTEM.md`: add a §11.8 (or §12) "enum" subsection stating the §1.2/§1.3/§1.4 decisions — named i32 constants, auto-increment + optional explicit, untyped, underlying i32. Cross-link to the §11.6 `switch` semantics (enum case values are i32 literals).
-- `docs/BINDING_API.md §5`: un-defer the *note* but keep `EnumBuilder` deferred per §6 — update the text from "dropped from v1 — no `enum` keyword" to "script-side `enum` lands in Tier 1 (see `plan_ENUMS.md`); `EnumBuilder` remains deferred."
-- `docs/ROADMAP.md` Tier 1: mark the `enum` bullet as "planned — see `docs/plan_ENUMS.md`" (or, after implementation, "done").
-- `docs/MODULES.md`: no change (enums are per-module like structs; a `link`ed module's enum is reachable as `alias::EnumName::Variant` via the existing `::` + `module_alias` machinery — but confirm during impl whether cross-module enum access needs the same deferred-trap handling `mod::fn` uses, `sema.hpp ModuleExport`. **Open question for impl**: does `mod::Enum::V` parse under the §3.5 lookahead split (base `Ident` `mod`, `::`, `Ident` `Enum`, then `::` again `V`)? The current `::` handler only does one level. Likely needs the `EnumAccessExpr` base to also accept an existing `EnumAccessExpr`/module-qualified base — verify, possibly defer cross-module enum access to v2-of-enums and error on it in v1.)
+- `../spec/COMPILER_PIPELINE.md §1` token set: add `enum` to Keywords. §2 grammar: add `enum_decl`/`variant` productions; add `enum_decl` to `program`. §3 AST: add `EnumDecl`/`EnumVariant`/`EnumAccessExpr`. §4 sema passes: insert the §4.1 enum-resolution pass between pass 1 (struct layout) and pass 2 (function sig registration); note the §4.2 in-place rewrite. (Note: the spec's `program := (annotation* func_decl | struct_decl | global_decl)*` line and the "No `enum`... none exist in v1 grammar" line both need updating — they currently *deny* this feature by name.)
+- `../spec/TYPE_SYSTEM.md`: add a §11.8 (or §12) "enum" subsection stating the §1.2/§1.3/§1.4 decisions — named i32 constants, auto-increment + optional explicit, untyped, underlying i32. Cross-link to the §11.6 `switch` semantics (enum case values are i32 literals).
+- `../spec/BINDING_API.md §5`: un-defer the *note* but keep `EnumBuilder` deferred per §6 — update the text from "dropped from v1 — no `enum` keyword" to "script-side `enum` lands in Tier 1 (see `plan_ENUMS.md`); `EnumBuilder` remains deferred."
+- `../ROADMAP.md` Tier 1: mark the `enum` bullet as "planned — see `plan_ENUMS.md`" (or, after implementation, "done").
+- `../MODULES.md`: no change (enums are per-module like structs; a `link`ed module's enum is reachable as `alias::EnumName::Variant` via the existing `::` + `module_alias` machinery — but confirm during impl whether cross-module enum access needs the same deferred-trap handling `mod::fn` uses, `sema.hpp ModuleExport`. **Open question for impl**: does `mod::Enum::V` parse under the §3.5 lookahead split (base `Ident` `mod`, `::`, `Ident` `Enum`, then `::` again `V`)? The current `::` handler only does one level. Likely needs the `EnumAccessExpr` base to also accept an existing `EnumAccessExpr`/module-qualified base — verify, possibly defer cross-module enum access to v2-of-enums and error on it in v1.)
 
 ---
 

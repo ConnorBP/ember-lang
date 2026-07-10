@@ -63,10 +63,10 @@ fn on_player_hit(info: HitInfo) { ... }
   routine's arguments through the dispatch table.
 - **Argument passing**: the host passes whatever the routine's
   signature declares - `update_physics` takes a `slice<f32>`, so the
-  host passes `(ptr, len)` per `BINDING_API.md` Section 4. The host *knows*
+  host passes `(ptr, len)` per `spec/BINDING_API.md` Section 4. The host *knows*
   the routine's signature because it resolved the name through the
-  module's function-info table (introspection, `DESIGN.md` Section 8), not
-  because the annotation encodes it (`TYPE_SYSTEM.md` Section 10 - annotations
+  module's function-info table (introspection, `planning/DESIGN.md` Section 8), not
+  because the annotation encodes it (`spec/TYPE_SYSTEM.md` Section 10 - annotations
   carry literal args only, no type info; the *function signature* is
   the type contract, queried separately).
 - **Dynamic registration** (script decides at runtime what to hook,
@@ -122,7 +122,7 @@ for the `HotReloadDomain`-based migration recipe).
   the v1 state-machine pattern (adequate for most game tick logic).
 - Exceptions caught in-script (`ROADMAP.md` Tier 5) - a routine that
   faults aborts the whole `ember_call_void`/`ember_call_i64` invocation via the non-local unwind
-  (`SAFETY_AND_SANDBOX.md` Section 2/Section 7); the host logs and the routine is
+  (`spec/SAFETY_AND_SANDBOX.md` Section 2/Section 7); the host logs and the routine is
   simply not rescheduled if the host decides (the host controls the
   per-frame call loop, so "stop calling a faulting routine" is a
   host-side policy, not an ember mechanism).

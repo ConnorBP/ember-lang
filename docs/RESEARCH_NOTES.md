@@ -58,7 +58,7 @@ scope DOWN for v1):**
 **Takeaway / scoping decision.** The surveyed language's *embedding API
 shape* (`engine/module/context`, `type_builder`, `register_native`, budget,
 annotations, hot reload, exceptions-as-data) is our north star for ergonomics
-and is mirrored in `BINDING_API.md` / `SAFETY_AND_SANDBOX.md` /
+and is mirrored in `spec/BINDING_API.md` / `spec/SAFETY_AND_SANDBOX.md` /
 `HOT_RELOAD.md`. Its *language feature surface* (templates, classes, vtables,
 coroutines, exceptions, heap, modules, preprocessor) is **deliberately not
 v1** - each is a large subsystem that would make v1 unshippable and none is
@@ -68,7 +68,7 @@ per-feature deferral rationale and re-entry triggers. Several small C-style
 conveniences the surveyed language has that *are* cheap and expected in a
 C-style language (ternary, `++`/`--`, `switch`, `do-while`, `const`/`constexpr`,
 `defer`, `sizeof`/`offsetof`, string interpolation, compound-assign
-semantics) **are** added to v1 in this spec pass - see `GAP_ANALYSIS.md` for
+semantics) **are** added to v1 in this spec pass - see `planning/GAP_ANALYSIS.md` for
 the audit.
 
 The surveyed language's implementation is closed, so ember's internals
@@ -122,7 +122,7 @@ available) and Mun (source available, AOT/ABI shape).
   dispatch-table-base reloc at the loaded module's own table). The `.em`
   reloc system (`AbsFixup` → `EmReloc`, `em_file.hpp`) is ember's own design
   - informed by Mun's ABI shape but not copied; see `BUNDLING_AND_EM_MODULES.md`
-  Section 2 and `CODEGEN_SPEC.md` Section 15.
+  Section 2 and `spec/CODEGEN_SPEC.md` Section 15.
 
 ## Conclusion driving the design doc
 No new external dependency is needed. Own minimal x86-64 encoder (subset of
@@ -133,5 +133,5 @@ native+hot-reload binding. AngelScript's decl-string parsing and Mun's LLVM
 backend are both explicitly skipped as overkill for the performance and
 compile-latency goals here. The v0.1 implementation (encoder, label/patch,
 exec-mem, IR data model, `.em` serializer/loader) is the first concrete
-realization of this conclusion; see `CODEGEN_SPEC.md` Section 14 + Section 15 for the
+realization of this conclusion; see `spec/CODEGEN_SPEC.md` Section 14 + Section 15 for the
 acceptance suite that proves it.

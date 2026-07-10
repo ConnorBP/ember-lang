@@ -1,5 +1,5 @@
 // import_roundtrip_test - live `import` cross-module runtime proof
-// (RESTRUCTURE_PLAN.md step 1.5 / MODULES.md Section 2 Section 3 Section 4 Section 5).
+// (docs/planning/RESTRUCTURE_PLAN.md step 1.5 / docs/MODULES.md Section 2 Section 3 Section 4 Section 5).
 //
 // This is the additive, in-place port of the standalone tree's tests #8 (JIT
 // cross-module) and #9 (.em cross-module round-trip) into prism's live ember.
@@ -9,7 +9,7 @@
 //
 // DESIGN PATH (documented per the task spec):
 //   prism's parser has no `::` / `import` / cross-module call grammar yet
-//   (the live-`import` *call* form is MODULES.md Section 6 Tier-6 future work; this
+//   (the live-`import` *call* form is docs/MODULES.md Section 6 Tier-6 future work; this
 //   port lands the *runtime registry + cross-module call sequence + .em kind-2
 //   reloc*, not the surface syntax). So the test uses the REAL parser for the
 //   callee's function body and hand-assembles ONLY the caller's cross-module
@@ -133,7 +133,7 @@ static CalleeModule build_callee_double_it(const std::string& src) {
 // =====================================================================
 // CALLER (Module A): fn caller(x: i64) -> i64 { return double_it(x); }
 // HAND-ASSEMBLED via prism's X64Emitter primitives (the parser has no
-// cross-module call form yet - MODULES.md Section 6 is Tier-6 future syntax; this
+// cross-module call form yet - docs/MODULES.md Section 6 is Tier-6 future syntax; this
 // port lands the runtime mechanism, not the surface grammar). The function
 // body is the Section 3 cross-module call sequence composed from existing primitives:
 //   mov  r11, <registry_base>          ; mov_reg_imm64_external - kind 2
@@ -142,7 +142,7 @@ static CalleeModule build_callee_double_it(const std::string& src) {
 //   mov  r11, [r11 + module_id*8]      ; load_reg_mem - callee's DispatchTable*
 //   mov  r11, [r11 + slot*8]           ; load_reg_mem - callee's slots[slot]
 //   call r11                            ; call_reg - same final step as intra-
-//                                       ;   module (CODEGEN_SPEC.md Section 7)
+//                                       ;   module (docs/spec/CODEGEN_SPEC.md Section 7)
 // `module_id` and `slot` are compile-time displacements (constants post-link);
 // only `registry_base` is position-dependent and gets the kind-2 reloc.
 //
@@ -191,7 +191,7 @@ static CallerModule build_caller_cross_module(uint32_t module_id, uint32_t slot,
     e.mov_reg_reg(Reg::rbp, Reg::rsp);          // mov rbp, rsp
     e.sub_reg_imm32(Reg::rsp, 32);              // sub rsp, 32 (shadow space)
 
-    // ---- cross-module call sequence (MODULES.md Section 3) ----
+    // ---- cross-module call sequence (docs/MODULES.md Section 3) ----
     // mov r11, <registry_base> - external-reloc form (kind 2). 8 zero
     // placeholder bytes + AbsFixup{imm_off, ModuleRegistryBase} on e.
     e.mov_reg_imm64_external(Reg::r11, AbsFixup::ModuleRegistryBase);
@@ -237,7 +237,7 @@ static CallerModule build_caller_cross_module(uint32_t module_id, uint32_t slot,
 // (finalize_from_bytes is defined above build_caller_cross_module.)
 
 // Build the EmModule from a single CompiledFn + its slot, the way a host
-// serializer would (BUNDLING_AND_EM_MODULES.md Section 2.3). `relocs` are filled from
+// serializer would (docs/BUNDLING_AND_EM_MODULES.md Section 2.3). `relocs` are filled from
 // `CompiledFn::abs_fixups`. Mirrors em_roundtrip_test's build_em_module for the
 // single-function case.
 static ember::EmModule build_em_module_single(const ember::CompiledFn& fn,
@@ -274,7 +274,7 @@ int main() {
     auto passfail = [&](bool ok) { return ok ? "PASS" : "FAIL"; };
 
     // =====================================================================
-    // Test A: JIT cross-module call through the registry (MODULES.md Section 2/Section 3).
+    // Test A: JIT cross-module call through the registry (docs/MODULES.md Section 2/Section 3).
     // Caller's caller(21) must return 42 (callee doubled it), resolved at call
     // time via registry[module_id_B] -> B's DispatchTable* -> slots[0] -> double_it.
     // =====================================================================

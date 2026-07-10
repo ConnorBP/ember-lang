@@ -1,5 +1,5 @@
 // dynamic_registration.ember — v1.0 dynamic routine registration demo
-// (plan_FUNCTION_REFS.md §6). This is the pattern LIFECYCLE.md §2 flagged as
+// (docs/planning/plan_FUNCTION_REFS.md §6). This is the pattern docs/LIFECYCLE.md §2 flagged as
 // "needs function references, ROADMAP Tier 2" — now shipped.
 //
 // A script chooses AT RUNTIME what the host should call per frame, instead
@@ -27,7 +27,7 @@ fn main() -> i64 {
     // (a real script would store `id` in a global to unregister_routine(id)
     //  later — e.g. on a @on_unload or when the condition that triggered the
     //  registration no longer holds.)
-    return 1;   // >0 = stay loaded (LIFECYCLE.md §1) so the host ticks
+    return 1;   // >0 = stay loaded (docs/LIFECYCLE.md §1) so the host ticks
 }
 
 // Note: there is NO @on_tick annotation here. The host still ticks this module

@@ -1,4 +1,4 @@
-// ember lexer - full v1 token set per COMPILER_PIPELINE.md Section 1.
+// ember lexer - full v1 token set per docs/spec/COMPILER_PIPELINE.md Section 1.
 #pragma once
 #include <cstdint>
 #include <string>
@@ -64,7 +64,7 @@ struct LexResult {
 };
 
 // Tokenize `src`. On error, returns ok=false with an error message and
-// the tokens parsed so far (best-effort continuation, COMPILER_PIPELINE.md Section 1).
+// the tokens parsed so far (best-effort continuation, docs/spec/COMPILER_PIPELINE.md Section 1).
 LexResult tokenize(std::string_view src, const char* filename = "<script>");
 
 const char* tok_spelling(Tk k);

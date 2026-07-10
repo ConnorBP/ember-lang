@@ -1,6 +1,6 @@
 # ember - memory & ownership spec
 
-Detail doc for DESIGN.md Section 7. Frame ownership, host-object references,
+Detail doc for ../planning/DESIGN.md Section 7. Frame ownership, host-object references,
 string/array representation, and explicitly deferred arena/GC designs.
 
 ## 1. Ownership taxonomy (every byte a script touches falls into
@@ -24,7 +24,7 @@ exactly one of these)
 
 There is deliberately **no** category for "script-owned heap object
 with unknown lifetime" - that category is what a GC would exist to
-manage, and DESIGN.md Section 1 excludes a GC from v1. Every category above
+manage, and ../planning/DESIGN.md Section 1 excludes a GC from v1. Every category above
 has a lifetime that's either lexically scoped (1), externally owned
 (2), or engine-object-scoped (3/4) - no case requires tracing.
 
@@ -142,9 +142,9 @@ void  arena_reset(Arena*, size_t mark = 0);            // rewind offset, invalid
   to spot rather than accidentally-plausible leftover data)  - 
   matches the existing debug/release safety-check split pattern
   (SAFETY_AND_SANDBOX.md Section 3/Section 6, CODEGEN_SPEC.md Section 10).
-- This section is written now so DESIGN.md Section 7's deferral has a
+- This section is written now so ../planning/DESIGN.md Section 7's deferral has a
   concrete answer ready, **not** an instruction to build it as part
-  of the current spec-only pass - no milestone in DESIGN.md Section 9
+  of the current spec-only pass - no milestone in ../planning/DESIGN.md Section 9
   requires it yet.
 
 ## 6. String representation
@@ -155,7 +155,7 @@ source (`"hello"`) is emitted as a `RipFixup`-referenced rodata blob
 (CODEGEN_SPEC.md Section 4) embedded in the *literal's containing function's*
 compiled code - i.e. string literals are function-local rodata, valid
 for exactly as long as that function's code page is alive (which, per
-HOT_RELOAD.md Section 5's guarded epoch retirement is at least as long as any
+../HOT_RELOAD.md Section 5's guarded epoch retirement is at least as long as any
 in-flight outer call that could execute that function version - so a literal's lifetime
 is never shorter than any code that could reference it). A slice
 value derived from a literal follows the same "cannot escape via
@@ -177,7 +177,7 @@ frame-local (category 1) or embedded fields of a host/global struct
 slices never own memory (category 2 pointer, or category-1-derived
 via the checked `arr[..]` path in Section 3, or category-6 rodata-derived).
 No array representation in this language ever implies heap ownership
- -  consistent with "no script-managed heap" (DESIGN.md Section 7) holding all
+ -  consistent with "no script-managed heap" (../planning/DESIGN.md Section 7) holding all
 the way down.
 
 ## 8. v2 GC deferral - explicit rationale (not just "later")
@@ -187,7 +187,7 @@ needed only if script code could create heap references with
 lifetimes that (a) outlive the frame that created them, (b) aren't
 owned by the host, and (c) have statically-unknowable extent (so an
 arena reset point can't be chosen safely). No feature in the v1
-language surface (TYPE_SYSTEM.md, DESIGN.md Section 2) creates that
+language surface (TYPE_SYSTEM.md, ../planning/DESIGN.md Section 2) creates that
 situation - every reference type is either host-owned, frame-scoped,
 or global/module-scoped. A GC becomes necessary only if a future
 feature explicitly wants script-side heap-allocated, reference-
@@ -196,4 +196,4 @@ structures, closures capturing heap state) - at which point it's a
 deliberate, scoped addition with its own design pass, not a
 retrofit onto the current model. Until then, building GC
 infrastructure would be speculative complexity with no consumer
-(YAGNI, DESIGN.md Section 10).
+(YAGNI, ../planning/DESIGN.md Section 10).

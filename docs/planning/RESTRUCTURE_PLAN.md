@@ -7,7 +7,7 @@ surface stays in prism. This plan is grounded in the verified state
 of both trees as of this writing - see "Ground truth" at the end.
 
 This plan **fired** - it superseded the former `ember/`-vs.-vendored-
-`src/ember/`-in-prism split described in `prism/docs/PRISM_DESIGN.md`
+`src/ember/`-in-prism split described in `../../../prism/docs/PRISM_DESIGN.md`
 ("ember lives under prism's `src/ember/`... promote to a standalone lib
 later if a second consumer appears"). A second consumer became the
 stated goal (reusability), the YAGNI deferral lifted, and the promotion
@@ -60,8 +60,8 @@ hyper_workspace/
 │   ├── CMakeLists.txt             # builds ember_core (static lib) + ember_cli + tests
 │   ├── docs/                      # the language spec (unchanged home)
 │   │   ├── ... (existing 13 docs)
-│   │   ├── BUNDLING_AND_EM_MODULES.md   # already here
-│   │   ├── MODULES.md                   # already here
+│   │   ├── ../BUNDLING_AND_EM_MODULES.md   # already here
+│   │   ├── ../MODULES.md                   # already here
 │   │   └── RESTRUCTURE_PLAN.md          # this doc
 │   ├── src/                       # pure language, ZERO cheat refs
 │   │   ├── ast.hpp                 # at ember/src/ (relocated from prism) - string_xor_key REMOVED (Section 4)
@@ -121,7 +121,7 @@ the name-dropping goes.
 
 `ember/src/import.{hpp,cpp}` is a **textual-inclusion** resolver
 (inlines file contents before lexing, `seen`-set cycle detection). Per
-`BUNDLING_AND_EM_MODULES.md` Section 1, that *mechanism* is what the bundling
+`../BUNDLING_AND_EM_MODULES.md` Section 1, that *mechanism* is what the bundling
 plan called `include` (bundle: parse-time merge), not live `import`
 (runtime multi-module linking).
 
@@ -135,12 +135,12 @@ include graph for no semantic gain.
 Decision: **keep the `import` keyword, the `resolve_imports`
 function name, and the `import.{hpp,cpp}` filename.** The header
 comment was cleaned (the `unc_faceit` reference is gone; it now
-accurately cites `BUNDLING_AND_EM_MODULES.md` Section 1.2). The naming
+accurately cites `../BUNDLING_AND_EM_MODULES.md` Section 1.2). The naming
 tension between this textual `import` and a future *live* `import`
-(MODULES.md Tier 6) is resolved by noting that a live mechanism - if
+(../MODULES.md Tier 6) is resolved by noting that a live mechanism - if
 it ever ships - uses a *different* surface keyword (e.g. `link` or a
 qualified `import live "..."`), since `import "path";` is already
-taken for textual inclusion. This is a MODULES.md doc note, not a
+taken for textual inclusion. This is a ../MODULES.md doc note, not a
 code change.
 
 This means the user's "make the parser" and "make include" are
@@ -168,8 +168,8 @@ sibling project at the generic facility instead. No code moves to
 | `StringLit::baked_key`/`encrypted` | `ast.hpp` | KEEP | Stays - encrypted-rodata fields. Rewrite the comment to drop "OLLVM-style string obfuscation" (OLLVM is a named project) → describe it generically as "encrypted rodata; codegen emits a `__str_decrypt` call so raw strings don't appear in the JIT'd exec memory." |
 | String XOR in `sema.cpp` | `sema.cpp` | KEEP | Stays. Rewrite the "OLLVM-style" comment to a neutral description. |
 | `ObfuscationOptions` + `str_decrypt_fn` in `codegen.hpp` | `codegen.hpp` | KEEP | Stays - the `ObfuscationOptions` struct and `str_decrypt_fn` field are generic. Rewrite the header comment to drop "binprotect integration" / "reuse binprotect's algorithms" → describe them as language codegen options any host can set. |
-| CPUID-keyed entry gate, MBA identities in `codegen.cpp` | `codegen.cpp` | KEEP | Stays - generic obfuscation transforms. Rewrite comments to drop "mirrors binprotect/src/licensing/licensing.cpp" and "binprotect-inspired" → cite `ember/docs/CODEGEN_SPEC.md`'s obfuscation section generically. |
-| `unc_faceit` ref in `import.hpp` | `import.hpp` | REWRITE | Strip "the only multi-file mechanism unc_faceit's `#include` actually uses" → neutral reference to `BUNDLING_AND_EM_MODULES.md` Section 1.2. |
+| CPUID-keyed entry gate, MBA identities in `codegen.cpp` | `codegen.cpp` | KEEP | Stays - generic obfuscation transforms. Rewrite comments to drop "mirrors binprotect/src/licensing/licensing.cpp" and "binprotect-inspired" → cite `../spec/CODEGEN_SPEC.md`'s obfuscation section generically. |
+| `unc_faceit` ref in `import.hpp` | `import.hpp` | REWRITE | Strip "the only multi-file mechanism unc_faceit's `#include` actually uses" → neutral reference to `../BUNDLING_AND_EM_MODULES.md` Section 1.2. |
 
 **The principle, restated:** the user's bar is "no cheat-related
 references in comments and docs." A reference to a *named product*
@@ -228,10 +228,10 @@ the canonical tree.
 
 ## 6. `ember/extensions/` - what goes there
 
-Created with a `README.md` explaining: an extension is a set of
+Created with a `../../extensions/README.md` explaining: an extension is a set of
 `NativeFn` registrations + `OpOverloadTable` entries + any host C++
 backing them, **not** a language grammar/type-system change (those
-are `docs/ROADMAP.md` Tier 1+ language features, not extensions).
+are `../ROADMAP.md` Tier 1+ language features, not extensions).
 Extensions are how a host ships reusable non-cheat-specific addons.
 
 **Audit prism for existing non-cheat extensions to relocate.** The
@@ -319,7 +319,7 @@ move is the known-good rollback point.
   thing being refactored.
 - **Hot-reload semantics, dispatch-table invariants, `.em` format.**
   Unchanged by this restructure (the `.em` port preserves the format;
-  `HOT_RELOAD.md`/`BUNDLING_AND_EM_MODULES.md` stand as-is).
+  `../HOT_RELOAD.md`/`../BUNDLING_AND_EM_MODULES.md` stand as-is).
 
 ## 8a. Post-restructure fix: prism_script_host / prism_gui_lib decoupling
 
@@ -373,7 +373,7 @@ works; the prior failure was a link-time coupling, not a hot-reload bug.
 - `.em` port is mechanical: prism `X64Emitter::mov_reg_imm64(Reg,
   int64_t)` raw-bakes at `codegen.cpp:529`/`:1412` (dispatch_base);
   `jit_memory` has `alloc_executable`/`free_executable`.
-- `prism/docs/PRISM_DESIGN.md` documents the vendor-in-prism decision
+- `../../../prism/docs/PRISM_DESIGN.md` documents the vendor-in-prism decision
   and its YAGNI deferral of promotion; this plan fires that deferral.
 
 ---

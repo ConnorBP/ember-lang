@@ -1,6 +1,6 @@
 # ember - x86-64 codegen spec
 
-Detail doc for DESIGN.md Section 3/Section 6. This is the "prove we can actually
+Detail doc for ../planning/DESIGN.md Section 3/Section 6. This is the "prove we can actually
 compile to native machine code" layer. Target: Windows x64 first
 (workspace is Windows-centric); SysV V1.1 port noted where it differs.
 
@@ -206,7 +206,7 @@ struct RipFixup {
 - **rel8 shrink pass (optional, v1 skips it):** since every branch
   starts as rel32 (5 or 6 bytes with the 0F prefix), code is
   correct but not size-minimal. A shrink-to-rel8 peephole pass is
-  explicitly deferred - see DESIGN.md Section 10 YAGNI list extension below;
+  explicitly deferred - see ../planning/DESIGN.md Section 10 YAGNI list extension below;
   correctness first, this only affects icache footprint at the margin
   and is trivial to bolt on later once benchmarks (v0.5) show it
   matters.
@@ -365,9 +365,9 @@ Edge cases:
   time (first-compile order; stable across recompiles of *other*
   functions in the same module - only the reloaded function's own
   slot content changes, indices never get reassigned, see
-  HOT_RELOAD.md).
+  ../HOT_RELOAD.md).
 - Dispatch table is a flat `void*[]` (or `std::atomic<void*>[]` for the
-  reload-safety story - see HOT_RELOAD.md Section 5) owned by the `module_t`.
+  reload-safety story - see ../HOT_RELOAD.md Section 5) owned by the `module_t`.
 - Call sequence emitted at every script-to-script call site:
   ```
   mov  r11, [dispatch_table_base + slot*8]   ; absolute addr of table, baked in
@@ -394,11 +394,11 @@ Edge cases:
   one indirect call** - no rel32 patching, no cross-function code
   dependency, and hot-reloading any function (including the callee)
   never requires touching the caller's code bytes at all. This is the
-  entire point of the indirection (DESIGN.md Section 6).
+  entire point of the indirection (../planning/DESIGN.md Section 6).
 - **Recursive calls** (function calling itself) go through the same
   dispatch-table indirection, not a direct rel32 self-call - keeps the
   rule uniform (a function can be hot-reloaded while it's on the call
-  stack recursing; see HOT_RELOAD.md Section 4 for what that means for
+  stack recursing; see ../HOT_RELOAD.md Section 4 for what that means for
   in-flight frames).
 - **Forward-referenced functions** (calling a function declared later
   in the source, or not yet compiled) are resolved by slot index at
@@ -544,7 +544,7 @@ jmp  .after
   .overflow_trap; .safe: <idiv>`. Same shared-trap-stub pattern as
   bounds checks.
 - Signed integer add/sub/mul overflow: **checked only in debug builds**
-  (compile flag, per DESIGN.md Section 5) via `jo`/`jc` immediately after the
+  (compile flag, per ../planning/DESIGN.md Section 5) via `jo`/`jc` immediately after the
   arithmetic op (x86 sets OF on signed overflow for
   add/sub/imul-single-operand-form automatically - zero extra
   instructions needed beyond the conditional jump, `jo .overflow_trap`
@@ -691,7 +691,7 @@ The implemented M5 semantics are lexical-block-exit LIFO cleanup:
 
 ## 14. What "prove it compiles" means for v0.1 (acceptance criteria)
 
-Concrete, testable claims the v0.1 milestone (DESIGN.md Section 9) must
+Concrete, testable claims the v0.1 milestone (../planning/DESIGN.md Section 9) must
 satisfy before moving on, restated here in codegen terms:
 1. A hand-built IR for `fn add(a: i64, b: i64) -> i64 { return a + b;
    }` produces a byte sequence that, when copied into an
@@ -718,7 +718,7 @@ satisfy before moving on, restated here in codegen terms:
 These five are the actual measurable definition of "fully compile our
 scripts into actual x86-64" for the purposes of this pass; anything
 not listed here (structs, slices, natives) is proven in later
-milestones per DESIGN.md Section 9, using the same encoder and fixup
+milestones per ../planning/DESIGN.md Section 9, using the same encoder and fixup
 machinery specified above (no new mechanism needed for those, only
 new IR shapes lowering into the instructions already defined in Section 3).
 
@@ -752,7 +752,7 @@ the subset the five Section 14 tests touch.
 
 ### 15.7 `.em` serialize → load → run round-trip
 
-Proves the bundling path (`BUNDLING_AND_EM_MODULES.md` Section 2): a
+Proves the bundling path (`../BUNDLING_AND_EM_MODULES.md` Section 2): a
 JIT-built function is serialized to a `.em` file, reloaded, and the
 loaded code runs identically to the JIT'd version - one execution
 path, no interpreter fallback.
@@ -781,16 +781,16 @@ losslessly through the file. v0.1 coverage is single-function (fib),
 no globals, no rodata; the GlobalsBase reloc path, multi-function
 dispatch tables, and rodata RIP-relative on a loaded page are
 code-complete in `em_loader.cpp` but untested pending the v0.2 parser
-(correct by inspection; see `BUNDLING_AND_EM_MODULES.md` Section 2.5).
+(correct by inspection; see `../BUNDLING_AND_EM_MODULES.md` Section 2.5).
 
 ## 16. First-class struct / aggregate lowering (2026-07-10)
 
-The 2026-07-10 first-class struct / aggregate pass (`ROADMAP.md` SHIPPED)
+The 2026-07-10 first-class struct / aggregate pass (`../ROADMAP.md` SHIPPED)
 added four codegen features that remove the Win64 hidden-pointer struct ABI
 restrictions and add the array-literal and aggregate-global surfaces. Each is a
 lowering into the instructions and frame/global machinery already specified
 above (no new instruction class); each is pinned by a non-circular regression
-(see the test pointers in `ROADMAP.md`'s SHIPPED entry). This section specifies
+(see the test pointers in `../ROADMAP.md`'s SHIPPED entry). This section specifies
 the lowering contract; the type-system contract is in `TYPE_SYSTEM.md` §12.
 
 ### 16.1 Struct-literal return hidden-temp lowering

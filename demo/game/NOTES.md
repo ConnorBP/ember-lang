@@ -72,7 +72,7 @@ The spawner grew `entity_count` from 3 to 6 (dynamic-routine path fired).
 `exit_code = int(r & 0x7fffffff)` then `entry_says_stay = (exit_code > 0)`. The
 clamp turns a **negative** unload return (e.g. `-2`) into a **large positive**
 (`0x7ffffffe`), so `> 0` was TRUE and `--tick` started ticking a module that had
-asked to unload (LIFECYCLE.md §1: `<= 0 ⇒ unload`). The demo hit this directly:
+asked to unload (../../docs/LIFECYCLE.md §1: `<= 0 ⇒ unload`). The demo hit this directly:
 `probe_extensions` initially failed (see G3) and `@entry` returned `-2`, which
 the clamp read as `254 > 0` → stay-loaded → the tick thread ran with **0 dynamic
 routines** (the spawner was never registered because main returned early at the
@@ -141,7 +141,7 @@ workarounds (stashing every struct return in a local, passing only locals as
 struct args) still work but are no longer required; pinned by the non-circular
 `binding_abi_test` probes [2c] (struct-literal return), [2d] (`v3_dot(v3_up(),
 v3_up())` — struct-ret-call as arg), and [2e] (nested struct-ret-call arg).
-These were the same restrictions `demo/NOTES.md` (the prior demo) recorded
+These were the same restrictions `../NOTES.md` (the prior demo) recorded
 (M10-adjacent).
 
 **L5. No aggregate global initialization (audit M11).** Globals accept only
@@ -157,8 +157,8 @@ offsets/sizes (slices 16 bytes ptr+len, structs/arrays their full layout). The
 for this sim (the SoA store handles are host-created `array<T>` extension
 handles, not script aggregate literals), but a struct/array/slice *value* global
 is no longer rejected. Pinned by the non-circular `aggregate_global_test` ctest
-probes [1]-[8]. Documented in `docs/TYPE_SYSTEM.md` §12.2 and
-`docs/CODEGEN_SPEC.md` §16.
+probes [1]-[8]. Documented in `../../docs/spec/TYPE_SYSTEM.md` §12.2 and
+`../../docs/spec/CODEGEN_SPEC.md` §16.
 
 **L6. `let` bindings are immutable; `let mut` opts into reassignment.** The
 `bounce` locals (`px`, `py`, `vx`, `vy`) and the `approx_eq` slack (`d`) must be

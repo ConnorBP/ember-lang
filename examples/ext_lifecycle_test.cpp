@@ -1,5 +1,5 @@
 // ext_lifecycle_test - runtime coverage for the dynamic-registration extension
-// (plan_FUNCTION_REFS.md §6). Proves the full round-trip: a script passes
+// (docs/planning/plan_FUNCTION_REFS.md §6). Proves the full round-trip: a script passes
 // `&fn` to register_routine(fn, data) -> id; the host's host_routines()
 // accessor returns the (slot, data) pairs; the host calls a routine via the
 // dispatch table (table.get(slot) with arg=data); unregister_routine drops it.

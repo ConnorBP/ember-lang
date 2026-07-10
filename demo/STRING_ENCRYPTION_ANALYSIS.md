@@ -178,7 +178,7 @@ lifetime annotation, no `__str_decrypt_free`, no stack-alloca alternative.
 is **only ever read** by codegen (`src/codegen.cpp:2135`). It is set to null (or
 left null) in every in-tree host (`examples/ember_cli.cpp:399`,
 `examples/em_roundtrip_test.cpp:155`,
-`examples/binding_abi_test.cpp:163`, etc.). `extensions/AUDIT.md:97` classifies
+`examples/binding_abi_test.cpp:163`, etc.). `../extensions/AUDIT.md:97` classifies
 it as a "language-feature host contract", explicitly NOT a `NativeSig`-registered
 native.
 
@@ -447,7 +447,7 @@ was never intended to — right now it neither delivers nor disclaims.
 ## Appendix: files touched / not touched
 
 - **Created by this investigation (the only new files):**
-  - `demo/STRING_ENCRYPTION_ANALYSIS.md` (this doc)
+  - `STRING_ENCRYPTION_ANALYSIS.md` (this doc)
   - `tmp_edit/enc/probe.cpp`, `tmp_edit/enc/probe_build.sh`,
     `tmp_edit/enc/probe_output.txt` (all gitignored under `tmp_edit/`)
 - **Not modified by this investigation:** `src/`, `extensions/`, `examples/`,
@@ -469,7 +469,7 @@ was never intended to — right now it neither delivers nor disclaims.
   `src/sema.cpp:N` citations in this doc reference the **current working-tree**
   line numbers so a reader can find the code as it actually is; every other
   file cited (`src/ast.hpp`, `src/codegen.hpp`, `extensions/string/ext_string.cpp`,
-  `examples/*`, `extensions/AUDIT.md`, `src/parser.cpp`) is unmodified vs
+  `examples/*`, `../extensions/AUDIT.md`, `src/parser.cpp`) is unmodified vs
   `HEAD`, so its citations are stable.
 - **Gate:** `ninja -C buildt` → clean ("no work to do" on entry; the final
   rebuild only relinked `game_host.exe` against unchanged objects); `ctest`

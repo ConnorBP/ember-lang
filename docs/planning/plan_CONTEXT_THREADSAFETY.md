@@ -6,7 +6,7 @@
 > option unblocks "two host threads call ember fns at once" vs which only
 > helps the narrower "script coordinates with host threads via queues on
 > host state" case (the `aint*`/`thread` addon, ROADMAP Tier 5, which
-> `SAFETY_AND_SANDBOX.md` §8 already defers).
+> `../spec/SAFETY_AND_SANDBOX.md` §8 already defers).
 
 This is the gate for the rest of a concurrency batch: every later item
 (per-thread arena, sync primitives, hot-reload-vs-concurrent-call audit) takes
@@ -24,20 +24,20 @@ can touch them concurrently without ember-side synchronization:
 - **The dispatch table slots.** `src/dispatch_table.hpp:6` declares
   `std::vector<std::atomic<void*>> slots`; `set` does `store(...,
   memory_order_release)` (`:9`), `get` does `load(memory_order_acquire)` (`:12`).
-  `HOT_RELOAD.md §1` states the invariant ("a slot write during reload must be
+  `../HOT_RELOAD.md §1` states the invariant ("a slot write during reload must be
   observed atomically by any thread concurrently executing a `call [slot]`"),
   and §4 ("slot indices never change for the lifetime of the `module_t`")
   means a host may cache a **slot index** across threads safely (caching a raw
-  pointer is explicitly unsafe, `HOT_RELOAD.md §7`). Script→script calls go
+  pointer is explicitly unsafe, `../HOT_RELOAD.md §7`). Script→script calls go
   through `call [dispatch_base + slot*8]` (`src/codegen.cpp:647`, `:656`),
   re-reading the slot on every call. → **multi-thread reads of the dispatch
   table are safe today.** Retired-page reclamation subsequently shipped as
-  the host-visible guarded epoch protocol in `HOT_RELOAD.md §5`; every outer
+  the host-visible guarded epoch protocol in `../HOT_RELOAD.md §5`; every outer
   host invocation must participate in that domain.
 
 - **JIT'd code bytes after `finalize`.** `alloc_executable` commits the page
   (the REDSHELL writeup flagged RWX as a latent V5 catastrophe; v0.4 hardened
-  it to RW→memcpy→RX, per `docs/DESIGN.md` v0.4 entry). After finalize the
+  it to RW→memcpy→RX, per `DESIGN.md` v0.4 entry). After finalize the
   page is RX; multiple threads executing the same function body
   simultaneously is fine (it's pure code, no embedded mutable state in the
   body itself — all mutable state the body touches is reached through
@@ -138,7 +138,7 @@ Two distinct races, both real, both named in the user's brief:
   matching store (`store_rax_to_global`, `:885`–`888`; float variant
   `:891`–`900`). If two threads run functions that read/write the **same**
   globals block, the writes race (a non-atomic `mov [r11+off], rax`).
-  `SAFETY_AND_SANDBOX.md §8` puts this squarely on the host: *"script-visible
+  `../spec/SAFETY_AND_SANDBOX.md §8` puts this squarely on the host: *"script-visible
   global mutable state shared across contexts is a host-design question, not
   something ember arbitrates."* So this is a **run-path question the host
   answers per use case**, not something ember can settle unilaterally — but
@@ -175,27 +175,27 @@ confessed bug.
 
 ### 1.5 What the spec already says (so the options don't fight the spec)
 
-`SAFETY_AND_SANDBOX.md §8` (the explicit non-goals section) says:
+`../spec/SAFETY_AND_SANDBOX.md §8` (the explicit non-goals section) says:
 
 > *"DESIGN.md non-goals already exclude multithreaded execution inside one
 > context; if a host runs multiple `context_t`s on multiple threads against
 > the same `module_t` (allowed — the dispatch table and JIT'd code are
 > read-only after compilation except during a hot-reload slot swap,
-> HOT_RELOAD.md §5), that slot-swap's atomicity is the only thread-safety
+> ../HOT_RELOAD.md §5), that slot-swap's atomicity is the only thread-safety
 > guarantee made; script-visible global mutable state shared across contexts
 > is a host-design question, not something ember arbitrates (there is no
 > script-level threading primitive to even create a race from script's own
 > perspective in v1)."*
 
-`ROADMAP.md` Tier 5 ("Threads (`thread` addon, `aint*` atomics)") says:
+`../ROADMAP.md` Tier 5 ("Threads (`thread` addon, `aint*` atomics)") says:
 
 > *"multithreaded script execution inside one context is a v1 non-goal
-> (SAFETY_AND_SANDBOX.md §8). … Dep: GC thread-safety, per-context arena, the
+> (../spec/SAFETY_AND_SANDBOX.md §8). … Dep: GC thread-safety, per-context arena, the
 > whole memory model gets harder. Large; defer as long as possible —
 > multi-context parallelism covers most real cases without in-context
 > threading."*
 
-`HOT_RELOAD.md §5` subsequently shipped concurrent epoch/quiescence
+`../HOT_RELOAD.md §5` subsequently shipped concurrent epoch/quiescence
 reclamation without adding epoch fields to per-thread contexts: hosts wrap
 outer calls in a domain `ExecutionGuard`, and the domain tracks active entry
 epochs. There is still no global context registry. The context remains the
@@ -227,7 +227,7 @@ of each, an explicit verdict on the two cases the user named:
 ### Option A — per-call context state (each `ember_call` gets its OWN checkpoint + budget + depth)
 
 **Idea.** The spec's nested-`ember_call` checkpoint **stack**
-(`SAFETY_AND_SANDBOX.md §2`: *"each call pushes its own checkpoint onto a small
+(`../spec/SAFETY_AND_SANDBOX.md §2`: *"each call pushes its own checkpoint onto a small
 stack of checkpoints on the `context_t`; a trap unwinds to the innermost
 checkpoint only"*) is today shipped as a single `jmp_buf` (`context.hpp:8`–`11`
 comment: *"v0.4 ships the single-call checkpoint … the spec's nested
@@ -441,8 +441,8 @@ question is handled explicitly (§3 below).
 **This is the spec's already-stated model.** `SAFETY §8` (§1.5) says exactly
 this: *"a host runs multiple `context_t`s on multiple threads against the
 same `module_t` (allowed — the dispatch table and JIT'd code are read-only
-after compilation except during a hot-reload slot swap, HOT_RELOAD.md §5)."*
-`HOT_RELOAD.md §5` now ships a separate host-owned quiescence domain. Option D
+after compilation except during a hot-reload slot swap, ../HOT_RELOAD.md §5)."*
+`../HOT_RELOAD.md §5` now ships a separate host-owned quiescence domain. Option D
 remains about context safety; a context does not itself own reclamation state.
 
 **What changes.**
@@ -771,11 +771,11 @@ test. Those are later batches.
 | Globals emit-time decision reads process-wide ptr | `src/codegen.cpp:1253`–`1254` (load), `:1695`–`1696` (store) |
 | Globals run-time address via `AbsFixup::GlobalsBase` | `src/codegen.cpp:1169`–`1196` (helpers), `:2875`–`2885` (reloc fill) |
 | Dispatch table is `std::atomic<void*>` release/acquire | `src/dispatch_table.hpp:14` |
-| Slot indices stable; cache index not pointer | `docs/HOT_RELOAD.md §1`, `§4`, `§7` |
+| Slot indices stable; cache index not pointer | `../HOT_RELOAD.md §1`, `§4`, `§7` |
 | `--tick` spawns a thread reusing one `ectx` (the live bug; **remediated in v1.0**) | `examples/ember_cli.cpp:542`–`589`, esp. `:549`–`:571` — the tick thread now uses its OWN `tick_ctx` (`context_t tick_ctx;` at `:549`) via `ember_call_void`/`ember_call_i64`, isolated from the main thread's `ectx`; the pre-B1 shared-`ectx` bug this plan flagged is fixed |
 | CLI calls JIT'd entry (v1.0 via `ember_call_void`, not raw fn-ptr) | `examples/ember_cli.cpp:511` (`ember::ember_call_void(entry, &ectx)`); the pre-B1 raw `reinterpret_cast<F0>(entry)()` is gone — `src/engine.hpp:97`–`98` declares `ember_call_void`/`ember_call_i64` |
 | Trap stub `__builtin_longjmp`s the passed ctx | `examples/ember_cli.cpp:99`–`113` |
-| Spec: per-`context_t` parallelism allowed, in-context not | `docs/SAFETY_AND_SANDBOX.md §8` |
-| Hot reload: outer-call guards + concurrent epoch reclamation | `docs/HOT_RELOAD.md §5` |
-| ROADMAP: `aint*`/`thread` deferred; multi-context covers most | `docs/ROADMAP.md` Tier 5 (`:119`–`125`) |
-| REDSHELL: trap-surface / budgets / checkpoint spec | `EMBER_REDSHELL_WRITEUP.md` §0, V6-DoS, V7 (workspace root) |
+| Spec: per-`context_t` parallelism allowed, in-context not | `../spec/SAFETY_AND_SANDBOX.md §8` |
+| Hot reload: outer-call guards + concurrent epoch reclamation | `../HOT_RELOAD.md §5` |
+| ROADMAP: `aint*`/`thread` deferred; multi-context covers most | `../ROADMAP.md` Tier 5 (`:119`–`125`) |
+| REDSHELL: trap-surface / budgets / checkpoint spec | `../../../EMBER_REDSHELL_WRITEUP.md` §0, V6-DoS, V7 (workspace root) |

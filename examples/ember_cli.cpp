@@ -1,4 +1,4 @@
-// ember_cli - standalone ember language runner (RESTRUCTURE_PLAN.md).
+// ember_cli - standalone ember language runner (docs/planning/RESTRUCTURE_PLAN.md).
 //
 // A minimal, prism-decoupled CLI that exercises the full
 // parse -> sema -> codegen -> finalize -> call pipeline against the
@@ -366,7 +366,7 @@ int main(int argc, char** argv) {
     // must leave encryption off.
     pr.program.string_xor_key = 0;
 
-    // ---- v0.5 live-module link resolution (MODULES.md §5) ----
+    // ---- v0.5 live-module link resolution (docs/MODULES.md §5) ----
     // Resolve each `link "..." as alias;` directive: a .em target is loaded +
     // registered; a bare name links to an already-registered module (the host
     // must have registered it). Build the ModuleExportTable sema resolves
@@ -491,7 +491,7 @@ int main(int argc, char** argv) {
     // str_decrypt_fn stays null: key=0 above means string literals never
     // emit a decrypt call, so no __str_decrypt native is needed.
 
-    // ---- v0.4/v1.0 safe-execution context (SAFETY_AND_SANDBOX.md §2-§4) ----
+    // ---- v0.4/v1.0 safe-execution context (docs/spec/SAFETY_AND_SANDBOX.md §2-§4) ----
     // The CLI runs untrusted .ember input, so enable BOTH budgets + route
     // all traps through the stub (longjmp to a checkpoint). Trusted-tool
     // hosts leave these off/null for zero JIT overhead (see context.hpp).
@@ -537,7 +537,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- v0.5 --emit-em: pre-compile the parsed module to a .em bundle ----
-    // (BUNDLING_AND_EM_MODULES.md). Serializes the JIT'd per-function bytes +
+    // (docs/BUNDLING_AND_EM_MODULES.md). Serializes the JIT'd per-function bytes +
     // relocs + the globals block + a name->slot table. The resulting .em is
     // loadable by ember_cli's `link "x.em"` path or any host using em_loader.
     if (!emit_em_path.empty()) {
@@ -697,7 +697,7 @@ int main(int argc, char** argv) {
         // Clamp to a usable PROCESS exit code (POSIX exit codes are 0-255). The
         // clamp intentionally drops the sign for the *process* code, but the
         // SIGNED value (entry_ret) is what the lifecycle decision below uses —
-        // @entry returning <= 0 means unload (LIFECYCLE.md §1), and a negative
+        // @entry returning <= 0 means unload (docs/LIFECYCLE.md §1), and a negative
         // return must NOT be misread as stay-loaded by the clamp turning it
         // into a large positive. (The demo/game sim surfaced this: a probe
         // failure returned -2, the clamp made it 254 > 0, and --tick started
@@ -717,7 +717,7 @@ run_tick:
     // minimal TUI + waits for 'q' to stop, unload, and exit. If @entry returned
     // <= 0 the module asked to unload — don't tick.
     if (tick_mode && exit_code != 70) {
-        // @entry return <= 0 = unload (LIFECYCLE.md §1). Use the SIGNED return
+        // @entry return <= 0 = unload (docs/LIFECYCLE.md §1). Use the SIGNED return
         // (entry_ret), NOT the clamped process exit_code — the clamp turns a
         // negative unload signal into a large positive (e.g. -2 -> 254), which
         // would incorrectly satisfy `> 0` and start ticking a module that asked

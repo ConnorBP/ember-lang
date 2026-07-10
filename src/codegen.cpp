@@ -303,7 +303,7 @@ struct CG {
         e.bind(ok);
     }
 
-    // --- v0.4 unified trap surface (SAFETY_AND_SANDBOX.md §2-§4, REDSHELL V7) ---
+    // --- v0.4 unified trap surface (docs/spec/SAFETY_AND_SANDBOX.md §2-§4, REDSHELL V7) ---
     // Emit a trap call. If ctx.trap_stub is set, calls it via Win64 ABI:
     //   rcx = ctx.trap_ctx (context_t*), edx = reason (TrapReason), r8 = detail (const char*)
     // The stub longjmps to the checkpoint (never returns). If trap_stub is null,
@@ -342,7 +342,7 @@ struct CG {
         }
     }
 
-    // v0.4/M4 instruction budget (SAFETY_AND_SANDBOX.md §3). Emitted at
+    // v0.4/M4 instruction budget (docs/spec/SAFETY_AND_SANDBOX.md §3). Emitted at
     // function entry and preserved at loop back-edges, gated by
     // ctx.emit_budget_checks + ctx.budget_ptr. Zero emitted when off.
     //   mov rax, budget_ptr
@@ -388,7 +388,7 @@ struct CG {
     int64_t stmt_cost(const Stmt& s);
     int64_t expr_cost(const Expr& e);
 
-    // v0.4/M4 combined call-depth guard (SAFETY_AND_SANDBOX.md §4). Emitted
+    // v0.4/M4 combined call-depth guard (docs/spec/SAFETY_AND_SANDBOX.md §4). Emitted
     // for every script-issued script or native call. Native re-entry therefore
     // remains nested while the earlier native invocation is active.
     // Zero emitted when off. Pairs with emit_depth_leave() after the call.
@@ -461,7 +461,7 @@ struct CG {
                                  sig ? &sig->params : nullptr, feature);
     }
 
-    // v1.0 Tier 2 REDSHELL guard #6 (plan_FUNCTION_REFS.md §5.2): validate that
+    // v1.0 Tier 2 REDSHELL guard #6 (docs/planning/plan_FUNCTION_REFS.md §5.2): validate that
     // the i64 in rax is a registered script-fn slot before it's used as a
     // dispatch-table index. Two checks, both before any arg-stash clobber of
     // rcx/rdx/r8/r9 (the guard runs BEFORE the stash; rcx + r11 are its scratch):
@@ -505,13 +505,13 @@ struct CG {
         e.bind(after);
     }
 
-    // v0.5 cross-module call (MODULES.md §3). The kind-2 sequence: one registry
+    // v0.5 cross-module call (docs/MODULES.md §3). The kind-2 sequence: one registry
     // hop then the same indirect call as intra-module. `mod_id` and `slot` are
     // baked as displacements; only `registry_base` is a reloc (kind 2, filled
     // with ctx.registry_base at JIT time / patched at .em load). If the call
     // was unresolved at sema (the module/fn not yet registered), emit a trap
     // stub call instead — the call traps gracefully until a relink resolves it
-    // (MODULES.md §5 step 3). Args are already stashed by the caller; this only
+    // (docs/MODULES.md §5 step 3). Args are already stashed by the caller; this only
     // replaces the final `call [r11+slot*8]` with the registry-hop + call.
     void emit_cross_module_call(const CallExpr& c) {
         if (c.cross_module_unresolved) {
@@ -968,7 +968,7 @@ struct CG {
         e.ret();
     }
 
-    // loop context for break/continue (CODEGEN_SPEC.md). v0.x codegen had these
+    // loop context for break/continue (docs/spec/CODEGEN_SPEC.md). v0.x codegen had these
     // as silent no-ops (fall-through bug surfaced by the spectator_list port).
     // is_switch: a switch pushes a frame too (so `break` can exit it via the
     // same mechanism) but `continue` must skip past it to the nearest real
@@ -1226,7 +1226,7 @@ struct CG {
         emit_trap(int(TrapReason::IllegalInstruction), "internal: struct-by-value arg is not a local/literal/call");
     }
 
-    // --- obfuscation helpers (CODEGEN_SPEC.md Section obf) ---
+    // --- obfuscation helpers (docs/spec/CODEGEN_SPEC.md Section obf) ---
     ObfOptions obf;
 
     // CPUID-keyed entry gate:
@@ -1259,7 +1259,7 @@ struct CG {
     // dst=lhs (rax) and src=rhs (rcx); rdx is a scratch that the BinExpr path
     // never keeps live across the eval, so it's free to clobber.
     //
-    // Identities used (see CODEGEN_SPEC.md Section obf MBA pass):
+    // Identities used (see docs/spec/CODEGEN_SPEC.md Section obf MBA pass):
     //   add: x + y  =  x - (-y)         -> mov rdx,y; neg rdx; sub x,rdx
     //   sub: x - y  =  x + (-y)         -> mov rdx,y; neg rdx; add x,rdx
     //   xor: x ^ y  =  (x|y) & ~(x&y)  -> or rax,rcx; andn-style via not+and
@@ -1426,7 +1426,7 @@ void load_rbp_to_rax(CG& cg, int32_t off) {
     cg.e.byte(0x48); cg.e.byte(0x8B); cg.e.byte(0x85); cg.e.imm32(off);
 }
 // load [imm64 + disp32] -> rax  (for globals: mov rax, [globals_base + off])
-// The globals base is a relocatable imm64 (BUNDLING_AND_EM_MODULES.md Section 2.4):
+// The globals base is a relocatable imm64 (docs/BUNDLING_AND_EM_MODULES.md Section 2.4):
 // emit 8 zero placeholders + a GlobalsBase AbsFixup; compile_func fills the
 // placeholder with ctx.globals_base after emit (byte-identical to the old raw
 // mov_reg_imm64(Reg::r11, base), since ctx.globals_base == the base that was
@@ -1801,7 +1801,7 @@ void CG::eval(const Expr& ex) {
         }
         return;
     }
-    // v1.0 Tier 2 (plan_FUNCTION_REFS.md §4.2): `&fn_name` is a compile-time
+    // v1.0 Tier 2 (docs/planning/plan_FUNCTION_REFS.md §4.2): `&fn_name` is a compile-time
     // reification — sema baked the slot as an i64 literal. Emit mov rax, imm64(slot).
     // The first-class-ness is at the CALL site (handle(args)), not here: this is
     // just a constant load. (The advisor flagged making sure this eval case exists
@@ -2255,7 +2255,7 @@ void CG::eval(const Expr& ex) {
         } else if (c->is_indirect) {
             if (non_serializable_reason.empty())
                 non_serializable_reason = "function-reference call requires process-local allowlist storage";
-            // v1.0 Tier 2 first-class call (plan_FUNCTION_REFS.md §5.1): dispatch
+            // v1.0 Tier 2 first-class call (docs/planning/plan_FUNCTION_REFS.md §5.1): dispatch
             // through the runtime handle. emit_depth_check may clobber rax
             // (non-B1 mode), so RELOAD the handle from [rsp+stash_size] AFTER it
             // (the advisor's ordering correction), then lea+load+call the slot.
@@ -2268,7 +2268,7 @@ void CG::eval(const Expr& ex) {
             emit_depth_leave();
         } else {
             // call [dispatch_base + slot*8] - dispatch-table base is a
-            // relocatable imm64 (BUNDLING_AND_EM_MODULES.md Section 2.4): emit 8 zero
+            // relocatable imm64 (docs/BUNDLING_AND_EM_MODULES.md Section 2.4): emit 8 zero
             // placeholders + a DispatchTableBase AbsFixup; compile_func fills
             // the placeholder with ctx.dispatch_base after emit (byte-identical
             // to the old raw mov_reg_imm64).
@@ -2959,7 +2959,7 @@ void CG::exec_stmt(const Stmt& s) {
     }
 }
 
-// v0.4/M4 instruction-budget cost estimator (SAFETY_AND_SANDBOX.md §3).
+// v0.4/M4 instruction-budget cost estimator (docs/spec/SAFETY_AND_SANDBOX.md §3).
 // Reach-aware recursive cost: counts statements PLUS the emitted work they
 // reach - expression nodes (each lowered operand emits real instructions),
 // native-call setup + arg marshalling, aggregate byte copies, switch compare
@@ -3082,7 +3082,7 @@ int64_t CG::stmt_cost(const Stmt& s) {
 
 GlobalsBlock* g_globals_for_codegen = nullptr;
 
-// v1.0 Tier 2 (plan_FUNCTION_REFS.md §5.2): build the registered-fn allowlist.
+// v1.0 Tier 2 (docs/planning/plan_FUNCTION_REFS.md §5.2): build the registered-fn allowlist.
 std::vector<uint8_t> build_fn_allowlist(
     const std::unordered_map<std::string, int>& script_slots, int slot_count) {
     std::vector<uint8_t> bits((size_t(slot_count) + 7) / 8, 0);
@@ -3333,7 +3333,7 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
     cg.e.resolve_fixups();
 
     // Fill the absolute-imm64 placeholders recorded by mov_reg_imm64_external
-    // (BUNDLING_AND_EM_MODULES.md Section 2.4). resolve_fixups does not touch these  - 
+    // (docs/BUNDLING_AND_EM_MODULES.md Section 2.4). resolve_fixups does not touch these  - 
     // absolute relocation is deferred to the `.em` loader, but at JIT time we
     // still need the real addresses baked so the JIT'd code runs identically to
     // before. This writes the 8-byte imm64 at each AbsFixup's code_offset, the

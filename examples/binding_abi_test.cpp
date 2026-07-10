@@ -3,7 +3,7 @@
 // Pins the Win64 script->native calling convention implemented in
 // src/codegen.cpp's generic CallExpr path (the word-placement logic in
 // eval() ~line 1334-1427) and the struct-returning-call hidden-pointer
-// path (eval_struct_returning_call ~line 467-536) per BINDING_API.md
+// path (eval_struct_returning_call ~line 467-536) per docs/spec/BINDING_API.md
 // Section 4. The codegen is already correct; this suite exists so a
 // future tree-walker->SSA-IR refactor cannot silently break it.
 //

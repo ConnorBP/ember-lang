@@ -1,4 +1,4 @@
-// ember codegen - tree-walking AST -> x86-64 (CODEGEN_SPEC.md).
+// ember codegen - tree-walking AST -> x86-64 (docs/spec/CODEGEN_SPEC.md).
 // v1-of-frontend: a simple stack-spilling tree-walker (correctness first;
 // the formal SSA-lite IR + linear-scan regalloc is a later refactor once
 // v0.5 benchmarks say it matters - YAGNI). Handles bomb_timer's subset.
@@ -31,7 +31,7 @@ struct GlobalsBlock {
     std::unordered_map<std::string, const Type*> types;
 };
 
-// Obfuscation options (CODEGEN_SPEC.md Section obf).
+// Obfuscation options (docs/spec/CODEGEN_SPEC.md Section obf).
 // Applied at emission time (correct-by-construction, no post-JIT disassembly).
 // These emitter-level transforms (MBA identities, opaque-predicate pattern,
 // CPUID-keyed gate) operate directly on the X64Emitter. The full PE-pass
@@ -53,7 +53,7 @@ struct CodeGenCtx {
     int64_t dispatch_base = 0;
     // v0.5 cross-module: the per-process ModuleRegistry base address, baked into
     // kind-2 cross-module call sites (mov r11,[reg_base+mod_id*8]). Required when
-    // a module uses `mod::fn()` calls; null/0 if no cross-module calls. MODULES.md §3.
+    // a module uses `mod::fn()` calls; null/0 if no cross-module calls. docs/MODULES.md §3.
     int64_t registry_base = 0;
     const std::unordered_map<std::string, NativeSig>* natives = nullptr;
     const std::unordered_map<std::string, int>* script_slots = nullptr;
@@ -62,7 +62,7 @@ struct CodeGenCtx {
     void* str_decrypt_fn = nullptr;  // __str_decrypt native (string encryption)
     std::string str_decrypt_name = "__str_decrypt"; // exact portable binding key
 
-    // --- v0.4 safety: non-local trap + budgets (SAFETY_AND_SANDBOX.md §2-§4) ---
+    // --- v0.4 safety: non-local trap + budgets (docs/spec/SAFETY_AND_SANDBOX.md §2-§4) ---
     // All compile-flag GATED for zero overhead when disabled. A host running
     // trusted tool scripts leaves these off/null -> no new JIT instructions.
     // A host running untrusted mods sets them -> one coarse sub+jg at each
@@ -98,7 +98,7 @@ struct CodeGenCtx {
     int32_t max_call_depth = 512;
     bool emit_depth_checks = false;
 
-    // v1.0 thread-safety (Option B1, plan_CONTEXT_THREADSAFETY.md): when true,
+    // v1.0 thread-safety (Option B1, docs/planning/plan_CONTEXT_THREADSAFETY.md): when true,
     // the budget/depth/trap emit reads context_t fields through a context register
     // (r14 = context_t*, host-set at entry, callee-saved so preserved across
     // script-to-script calls) instead of baked imm64 pointers. Lets ONE compiled
@@ -112,7 +112,7 @@ struct CodeGenCtx {
     const std::unordered_map<std::string, uint32_t>* globals_index = nullptr;
     const std::unordered_map<std::string, uint32_t>* globals_offsets = nullptr; // c3: typed byte offsets (null -> fall back to index*8)
     const std::unordered_map<std::string, const Type*>* globals_types = nullptr;
-    // v1.0 Tier 2 (plan_FUNCTION_REFS.md §5.2): the registered-fn allowlist — a
+    // v1.0 Tier 2 (docs/planning/plan_FUNCTION_REFS.md §5.2): the registered-fn allowlist — a
     // host-allocated byte array of length ceil(fn_slot_count/8), one bit per
     // script-fn slot (set by the host from script_slots at compile time). The
     // provenance guard (emit_call_target_guard) validates a runtime i64 handle
@@ -132,7 +132,7 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx);
 // engine). Defined in codegen.cpp.
 extern GlobalsBlock* g_globals_for_codegen;
 
-// v1.0 Tier 2 (plan_FUNCTION_REFS.md §5.2): build the registered-fn allowlist —
+// v1.0 Tier 2 (docs/planning/plan_FUNCTION_REFS.md §5.2): build the registered-fn allowlist —
 // a byte array of length ceil(slot_count/8), one bit per slot, set iff that
 // slot is a registered script function of this module (derived from
 // script_slots). Returned as a std::vector<uint8_t> the host owns; the host

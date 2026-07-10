@@ -8,7 +8,7 @@ deferral is a tracked decision, not a forgotten one.
 
 ## Shipped ahead of plan (between v0.1 and v0.2)
 
-The `.em` binary bundling format shipped between v0.1 and v0.2 (user-requested, see `BUNDLING_AND_EM_MODULES.md`, `MODULES.md`). It is a single-module pre-compile format: a JIT'd function's post-resolve code + rodata + relocs serialize to a `.em` file, and `load_em_file` repoints the relocs at the loaded module's own dispatch table/globals block and runs the loaded code identically to the JIT'd version (one execution path, proven by `CODEGEN_SPEC.md` Section 15 test 7). The `em_loader` reloc and name-table infrastructure it established became the foundation for the live-modules feature that shipped in **v0.5** (Tier 6, below — bidirectional script↔`.em` cross-module linking via `link "foo.em" as foo;` + `foo::bar()`).
+The `.em` binary bundling format shipped between v0.1 and v0.2 (user-requested, see `BUNDLING_AND_EM_MODULES.md`, `MODULES.md`). It is a single-module pre-compile format: a JIT'd function's post-resolve code + rodata + relocs serialize to a `.em` file, and `load_em_file` repoints the relocs at the loaded module's own dispatch table/globals block and runs the loaded code identically to the JIT'd version (one execution path, proven by `spec/CODEGEN_SPEC.md` Section 15 test 7). The `em_loader` reloc and name-table infrastructure it established became the foundation for the live-modules feature that shipped in **v0.5** (Tier 6, below — bidirectional script↔`.em` cross-module linking via `link "foo.em" as foo;` + `foo::bar()`).
 
 ## Shipped v1.0 (the concurrency + Tier 2 batch, commit e5d1814 + follow-ons)
 
@@ -38,7 +38,7 @@ registration (`extensions/lifecycle/`, `register_routine`/`unregister_routine` �
 the Tier 2 dynamic-registration entry below, now ✓ shipped), the CLI `--tick`
 wiring to the B1 model (the `--tick` thread-safety bug, fixed), and a demo
 script (`examples/scripts/dynamic_registration.ember`). See
-`docs/v1.0_INTEGRATION_NOTES.md` §5.
+`planning/v1.0_INTEGRATION_NOTES.md` §5.
 
 The current tree configures 20 CTest tests when the AngelScript SDK is present
 and 19 when it is absent (only the benchmark is conditional). The four
@@ -49,7 +49,7 @@ in the main docs take precedence where those plans describe earlier states.
 
 These are not language features - they're `NativeFn` addons using the
 stable v1 binding API, delivered as part of a v1.0 release so mods are
-actually writable (`GAP_ANALYSIS.md` Section 3):
+actually writable (`planning/GAP_ANALYSIS.md` Section 3):
 
 - **`array`** ✓ limited v1 API — opaque i64 buffer handle with new/length/
   resize, typed u8/f32/i64 get/set, and `array_push_u8`. Generic push,
@@ -85,7 +85,7 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
   Pinned by `tests/lang/{valid_enums,sema_valid_enums,
   sema_invalid_enum_unknown_enum,sema_invalid_enum_unknown_variant}.ember`.
   **No `EnumBuilder`** — the host-binding-side `EnumBuilder` sketched in
-  `BINDING_API.md` Section 5 stays dropped: script enums need no host-side
+  `spec/BINDING_API.md` Section 5 stays dropped: script enums need no host-side
   builder (the variants live entirely in the script). Typed enums (`enum E : i32`)
   and `enum`-from-expr remain a later refinement.
 - **`for-each`** + `iterable()` TypeBuilder hook - `for (x in coll)`
@@ -128,9 +128,9 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
   handle (`fib` via `&fib`), and the REDSHELL guard #6 (out-of-range and
   in-range-unregistered handles both trap). **No GC needed** — handles
   are slot indices into the existing dispatch table, not heap objects,
-  exactly as the original Tier 2 entry predicted. Spec/plan: `docs/plan_FUNCTION_REFS.md`.
+  exactly as the original Tier 2 entry predicted. Spec/plan: `planning/plan_FUNCTION_REFS.md`.
 
-  **Two documented open items** (from `plan_FUNCTION_REFS.md` §9.3/§9.5):
+  **Two documented open items** (from `planning/plan_FUNCTION_REFS.md` §9.3/§9.5):
   - **The bare-`fn` signature hole.** A `fn`-typed *parameter* (`fn h`,
     with no recorded signature) accepts any args at the call site — sema
     does not type-check them, the runtime guard still validates the handle
@@ -154,7 +154,7 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
 
 - **`register_routine`-style dynamic registration** ✓ shipped v1.0 (follow-on
   commits) — the host-native half of the surveyed native-JIT language's
-  `register_routine(cast(my_draw), data)` model (`GAP_ANALYSIS.md` Section 6).
+  `register_routine(cast(my_draw), data)` model (`planning/GAP_ANALYSIS.md` Section 6).
   v1 uses static annotation discovery (`LIFECYCLE.md`); the first-class `&fn`
   handle shipped above is the script-side prerequisite a host native needs to
   accept a handle argument. The dynamic-registration extension
@@ -166,7 +166,7 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
   the slot's provenance was validated at the `&fn` site. Pinned by
   `examples/ext_lifecycle_test.cpp` (ctest target `ext_lifecycle`); demo
   `examples/scripts/dynamic_registration.ember`; see `LIFECYCLE.md` §2 and
-  `docs/v1.0_INTEGRATION_NOTES.md` §5. (This was the reference host native the
+  `planning/v1.0_INTEGRATION_NOTES.md` §5. (This was the reference host native the
   original Tier 2 entry described as "trigger-gated on a real mod needing
   runtime-decided callbacks" — the v0.6 integration + the Tier 2 fn-refs
   batch together fired that trigger, so it shipped in-tree as an extension.)
@@ -191,12 +191,12 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
 ## Tier 4 - heap + GC
 
 - **Tracing GC** - the v2 feature that unlocks classes, lambdas,
-  dynamic object graphs. `MEMORY_AND_GC.md` Section 8 has the deferral
+  dynamic object graphs. `spec/MEMORY_AND_GC.md` Section 8 has the deferral
   rationale. Trigger: Tier 3 (classes) lands, requiring managed
   reference-object lifetimes. Dep: a write-barrier or
   safepoint-based GC (mark-sweep or incremental), root scanning
   across JIT frames (needs frame-layout metadata retained per
-  function - `CODEGEN_SPEC.md` Section 2 already specifies the frame layout
+  function - `spec/CODEGEN_SPEC.md` Section 2 already specifies the frame layout
   in a GC-friendly shape, so the metadata is derivable). Significant
   subsystem; only build when Tier 3 forces it.
 - **`new`/`delete` + lambdas with capture** - depend on GC. Lambdas
@@ -213,16 +213,16 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
   suspended frame storage (Tier 4). Moderate.
 - **Exceptions `try`/`catch`/`throw`** - v1's `runtime_error`/
   `runtime_exception` host-signal + non-local unwind
-  (`SAFETY_AND_SANDBOX.md` Section 7) covers host→script abort. In-language
+  (`spec/SAFETY_AND_SANDBOX.md` Section 7) covers host→script abort. In-language
   `try`/`catch` is a different thing (script catches script-thrown
   errors at specific frames). Trigger: real script wants
   local recovery rather than whole-call abort. Dep: per-frame
   catch-handler registration (extends the checkpoint stack in
-  `SAFETY_AND_SANDBOX.md` Section 2). Moderate, but complicates the
+  `spec/SAFETY_AND_SANDBOX.md` Section 2). Moderate, but complicates the
   unwind machinery - only if there's real demand.
 - **Threads (`thread` addon, `aint*` atomics)** - multithreaded
   script execution inside one context is a v1 non-goal
-  (`SAFETY_AND_SANDBOX.md` Section 8). Trigger: a compute-heavy mod needs
+  (`spec/SAFETY_AND_SANDBOX.md` Section 8). Trigger: a compute-heavy mod needs
   parallelism beyond running multiple `context_t`s. Dep: GC
   thread-safety, per-context arena, the whole memory model gets
   harder. Large; defer as long as possible - multi-context
@@ -249,8 +249,8 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
     true`, calls `@entry` via `ember_call_void(entry, &ectx)`, and runs the tick
     thread on its own `context_t` (`tick_ctx`) via `ember_call_void(f,
     &tick_ctx)`, fully isolated from the main thread — the `--tick` thread-
-    safety bug, fixed. Spec/plan: `docs/plan_CONTEXT_THREADSAFETY.md`,
-    `docs/v1.0_INTEGRATION_NOTES.md` §1.
+    safety bug, fixed. Spec/plan: `planning/plan_CONTEXT_THREADSAFETY.md`,
+    `planning/v1.0_INTEGRATION_NOTES.md` §1.
   - **Sync queue primitives (`extensions/sync/`).** Atomics
     (`aint8/16/32/64`: load/store/fetch_add/cas/swap with width masking),
     a swap buffer (double-buffer + atomic flip), and SPSC/MPSC/MPMC queues
@@ -265,7 +265,7 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
     script cannot deadlock on any primitive here. Pinned by
     `examples/ext_sync_test.cpp` (ctest target `ext_sync`): 16 tests incl.
     multi-thread stress (10k SPSC, MPMC contention, no lost/dup).
-    Spec/plan: `docs/plan_SYNC_QUEUES.md`.
+    Spec/plan: `planning/plan_SYNC_QUEUES.md`.
 
   These two pieces together cover the **multi-context parallelism** case
   the original entry names as covering "most real cases": a host runs one
@@ -273,7 +273,7 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
   primitives let those workers (and host producer/consumer threads) coordinate
   on host-owned shared state. **In-context multithreaded script execution**
   (two ember-calling threads on one `context_t`) remains a non-goal and still
-  races exactly as `plan_CONTEXT_THREADSAFETY.md` S1.2 documents — the sync
+  races exactly as `planning/plan_CONTEXT_THREADSAFETY.md` S1.2 documents — the sync
   addon does not make a `context_t` safe for concurrent calls; the U2 contract
   is the discipline that keeps the queues correct.
 
@@ -283,7 +283,7 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
 - **Namespaces** - name scoping within a module. Trigger: module
   size makes flat scope crowded. Dep: modules (now shipped), or usable standalone.
 - **Preprocessor** - deliberately never; `engine.define(name,value)`
-  (`DESIGN.md` Section 8) + `const`/`constexpr` cover the legitimate
+  (`planning/DESIGN.md` Section 8) + `const`/`constexpr` cover the legitimate
   compile-time-conditional needs without C-preprocessor footguns.
   A `#include`-equivalent is just module `import`.
 
@@ -297,6 +297,29 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
   removal: using it emits a non-fatal sema warning (the program still
   compiles and runs). Migrate any `auto x = e;` to `let x = e;`. Removed
   from the in-tree tests; remove from the language after a grace period.
+
+## Investigation-backed candidate changes
+
+Changes recommended by a completed investigation, not yet slated for a
+specific milestone — listed here so the decision and its evidence have a
+tracked home.
+
+- **Runtime string encryption — replace the `__str_decrypt` heap-ptr
+  contract with an inline-stack-XOR lowering.** The current string-
+  encryption feature is a half-feature: it defeats *static* literal
+  extraction from the JIT'd executable pages (the `__str_decrypt` call
+  site + its argument are what appears in code memory, not the plaintext
+  literal), but on the *runtime-memory* axis it does the opposite of
+  transience — the decrypted plaintext is resident on the host heap in
+  N copies (one per decryption site) with no cleanup, so a live-memory
+  probe recovers every string trivially. Recommendation: replace the
+  `__str_decrypt`-decrypt-heap-ptr native contract with an inline-
+  stack-XOR lowering for `const`/transient literals, where the plaintext
+  lives only on the stack frame for the expression's lifetime (no heap
+  residency, no residual copy after the statement); retire the
+  `__str_decrypt` native contract entirely. See
+  `../demo/STRING_ENCRYPTION_ANALYSIS.md` for the full analysis + the
+  probe that demonstrates the heap-residency leak.
 
 ## What will never be added (hard non-goals)
 
@@ -313,7 +336,7 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
 ## Re-evaluation cadence
 
 This roadmap was originally revisited after the v0.5 benchmark milestone
-(`DESIGN.md` Section 9) — the first point with real performance data and
+(`planning/DESIGN.md` Section 9) — the first point with real performance data and
 real usage to tell which deferrals were actually blocking real scripts
 vs. speculative. The v1.0 concurrency + Tier 2 batch (commit e5d1814)
 followed exactly that re-evaluation: `enum`, first-class function refs, sync
@@ -333,8 +356,8 @@ writing real ember programs — every non-trivial module fought it. The pass
 closed all four concrete gaps in a single coordinated chunk (c1 struct-literal
 return + struct-by-value-arg temps; c2 array literals; c3 aggregate globals),
 then validated the result by marking each demo's workaround kinks RESOLVED,
-documenting the four features in `docs/TYPE_SYSTEM.md` §12 and
-`docs/CODEGEN_SPEC.md` §16, and re-running all four demos (game / compiler /
+documenting the four features in `spec/TYPE_SYSTEM.md` §12 and
+`spec/CODEGEN_SPEC.md` §16, and re-running all four demos (game / compiler /
 hot-reload / concurrency) green.
 
 **Shipped (2026-07-10), four sub-features:**
@@ -343,28 +366,28 @@ hot-reload / concurrency) green.
    Codegen materializes the struct literal into a compiler-hidden temp frame
    slot, then copies it through the Win64 hidden return pointer. Regression:
    `binding_abi_test` probe [2c] (`V3{1,2,3}.x+y+z==6.0`, host reads fields
-   directly — non-circular). Docs: `docs/CODEGEN_SPEC.md` §16.
+   directly — non-circular). Docs: `spec/CODEGEN_SPEC.md` §16.
 2. **Struct-by-value-arg temporaries** — a struct-by-value arg may now be a
    struct literal, a struct-returning fn call, or a bare local. Codegen
    materializes a general-expr struct arg into a distinct compiler-hidden
    temp frame slot (one distinct temp per arg, never reused within a call) and
    copies bytes into the arg-stash slot. `v3_dot(v3_up(), v3_up())` now works.
    Regression: `binding_abi_test` probes [2d] (`v3_dot(v3_up(),v3_up())==1.0`)
-   and [2e] (nested `v3_shift(v3_up())==(1,1,0)`). Docs: `docs/CODEGEN_SPEC.md` §16.
+   and [2e] (nested `v3_shift(v3_up())==(1,1,0)`). Docs: `spec/CODEGEN_SPEC.md` §16.
 3. **Array literals** — `[a, b, c]` is a first-class expression constructing a
    fixed array (`let arr: i64[3] = [10, 20, 30];`) or a slice (`let s: i64[] =
    [1, 2, 3];` — allocates a backing store, yields ptr/len). Declared type
    required (no inference); count and element type checked; empty `[]` rejected.
    Regression: `array_lit_test` probes [1]-[8] (fixed-array + slice construction,
    full-i64 storage pinned via the direct C read path). Docs:
-   `docs/TYPE_SYSTEM.md` §12.1, `docs/CODEGEN_SPEC.md` §16.
+   `spec/TYPE_SYSTEM.md` §12.1, `spec/CODEGEN_SPEC.md` §16.
 4. **Aggregate globals** — `struct`/`array`/`slice` globals ship with typed
    per-global offsets/sizes (slices 16 bytes ptr+len, structs/arrays their full
    layout, 8-byte alignment), const-foldable struct/array/slice initializers
    baked at load, and correct `.em` round-trip (slice relative-ptr relocation).
    Regression: `aggregate_global_test` probes [1]-[8] (struct/array/slice global
-   read + by-value arg/return + `.em` round-trip). Docs: `docs/TYPE_SYSTEM.md`
-   §12.2, `docs/CODEGEN_SPEC.md` §16.
+   read + by-value arg/return + `.em` round-trip). Docs: `spec/TYPE_SYSTEM.md`
+   §12.2, `spec/CODEGEN_SPEC.md` §16.
 
 **Verification (the synthesizer's final gate):** full `ninja` rebuild clean
 (c1+c2+c3 compile together); ctest 22/22 (was 20, +1 `array_lit`, +1

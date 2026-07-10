@@ -1,11 +1,11 @@
-// ember lifecycle host-discovery API (LIFECYCLE.md §1-§2).
+// ember lifecycle host-discovery API (docs/LIFECYCLE.md §1-§2).
 //
 // Annotation-based discovery: the host queries a compiled module's annotated
 // functions and drives them. @entry runs once at load; @on_tick runs per frame
 // (host-controlled loop); @event("name") runs when the host dispatches that
 // event. This is the static v1 model — no script-side function references
 // (those are ROADMAP Tier 2), no dynamic registration. The host resolves a
-// name to a slot (HOT_RELOAD.md §7: caching the slot is safe, indices never
+// name to a slot (docs/HOT_RELOAD.md §7: caching the slot is safe, indices never
 // change) and calls it via the dispatch table.
 //
 // Pure introspection over Program::funcs[].annotations — no JIT change.
@@ -18,8 +18,8 @@
 namespace ember {
 
 // A discovered annotated function: its name, dispatch slot (stable across
-// reloads — HOT_RELOAD.md §4), and signature (the host passes args per the
-// signature, LIFECYCLE.md §2). The host caches the slot and calls per frame.
+// reloads — docs/HOT_RELOAD.md §4), and signature (the host passes args per the
+// signature, docs/LIFECYCLE.md §2). The host caches the slot and calls per frame.
 struct AnnotatedFn {
     std::string name;
     int slot = -1;
@@ -68,7 +68,7 @@ inline std::vector<AnnotatedFn> get_event_handlers(const Program& prog,
     return out;
 }
 
-// The @entry function, if any (LIFECYCLE.md §1). Returns nullptr if the module
+// The @entry function, if any (docs/LIFECYCLE.md §1). Returns nullptr if the module
 // has no @entry. A module should have at most one (sema could enforce; the
 // host takes the first if multiple, matching "spec does not reserve a name").
 inline const AnnotatedFn* get_entry_function(const Program& prog) {

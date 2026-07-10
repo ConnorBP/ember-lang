@@ -1,7 +1,7 @@
 // ember include resolver - textual file inclusion (the `include`/bundle
-// mechanism per BUNDLING_AND_EM_MODULES.md Section 1.2; not a C preprocessor -
+// mechanism per docs/BUNDLING_AND_EM_MODULES.md Section 1.2; not a C preprocessor -
 // no #define/#ifdef, just `include "path";` inlined before lexing).
-// ROADMAP.md Tier 6 live `import` (runtime multi-module linking) is a
+// docs/ROADMAP.md Tier 6 live `import` (runtime multi-module linking) is a
 // future refinement; this is the v1 single-module bundle shape.
 #pragma once
 #include <string>

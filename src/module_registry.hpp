@@ -1,5 +1,5 @@
-// ember module registry - per-process module_id -> DispatchTable* (MODULES.md Section 2).
-// The runtime half of live `import` (MODULES.md Section 2/Section 3). A single per-process
+// ember module registry - per-process module_id -> DispatchTable* (docs/MODULES.md Section 2).
+// The runtime half of live `import` (docs/MODULES.md Section 2/Section 3). A single per-process
 // registry maps a small dense `module_id` (assigned once at registration) to
 // the *current* DispatchTable base of that module. Both JIT-compiled modules
 // (the test's hand-built/hand-parsed functions) and `.em`-loaded modules
@@ -53,7 +53,7 @@
 
 namespace ember {
 
-// A per-process module registry (MODULES.md Section 2). One per process; module_id is
+// A per-process module registry (docs/MODULES.md Section 2). One per process; module_id is
 // a small dense integer assigned once at registration. The registry's
 // `base()` is the address baked into cross-module call sites as the
 // ModuleRegistryBase reloc (AbsFixup kind 2 / EmReloc kind 2).
@@ -99,7 +99,7 @@ public:
     // a corrupt caller - Section 8 says ids are never recycled, so an out-of-range
     // id is a host bug, not a registry state; we return nullptr rather than
     // throw so a host can surface it as a runtime error per SAFETY_AND_SANDBOX
-    // Section 7, matching CODEGEN_SPEC.md Section 7's "slots are never literally null"
+    // Section 7, matching docs/spec/CODEGEN_SPEC.md Section 7's "slots are never literally null"
     // stance lifted to the registry).
     void* resolve(uint32_t module_id) const;
 

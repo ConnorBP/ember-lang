@@ -1,4 +1,4 @@
-// v0.5_live_modules_test - stress test matrix for live modules (MODULES.md).
+// v0.5_live_modules_test - stress test matrix for live modules (docs/MODULES.md).
 //
 // Every case goes through the REAL grammar (link directive + mod::fn calls),
 // NOT hand-assembled. Covers the user's bidirectional ask: scripts and .em

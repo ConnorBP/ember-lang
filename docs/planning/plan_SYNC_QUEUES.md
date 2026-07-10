@@ -16,7 +16,7 @@
 ## 0. The scope-honesty statement (read this first)
 
 This is the load-bearing framing for the whole document. The parallel
-`docs/plan_CONTEXT_THREADSAFETY.md` defines two use cases; this addon is the
+`plan_CONTEXT_THREADSAFETY.md` defines two use cases; this addon is the
 mechanism for one of them and explicitly **not** the other:
 
 - **U1 (broad, NOT this addon's job).** *"Two host threads call ember fns
@@ -85,7 +85,7 @@ That is U2.
 
 This addon is a Tier-0-shaped extension exactly like the six that already
 ship (`extensions/{array,string,vec,quat,mat,math}/`). It is **not** a
-language/grammar/sema change (per `extensions/README.md`'s "what an
+language/grammar/sema change (per `../../extensions/README.md`'s "what an
 extension is — and is not" rule and ROADMAP Tier 0's "not language features"
 framing). The pattern to mirror, read firsthand:
 
@@ -225,7 +225,7 @@ immediately (success or failure); `atomic_fetch_add` returns immediately.
 on. The only failure mode is livelock (a CAS loop in script code that
 retries forever under contention) — that's a script-author responsibility
 (the same way a `while (true) { }` loop is), and the instruction budget
-(`SAFETY_AND_SANDBOX.md §3`) catches runaway loops at the ember level anyway.
+(`../spec/SAFETY_AND_SANDBOX.md §3`) catches runaway loops at the ember level anyway.
 
 ---
 
@@ -574,7 +574,7 @@ handles are 1-based indices, `slot(h)` bounds-checks. Differences from
   slot (and, for queues, the ring buffer's heap). This is **documented,
   not prevented** — mirroring `ext_array`'s "leaks if the script forgets
   to drop the handle, host store grows until `reset()`" posture. The host's
-  `ResetScriptHostState` (per `extensions/README.md`) calls `ext_sync::reset()`
+  `ResetScriptHostState` (per `../../extensions/README.md`) calls `ext_sync::reset()`
   which clears all stores + the free-list. **Per-context arena reset on
   module unload** (the user's suggestion): `reset()` is the mechanism for
   this exactly as it is for `ext_array`; a host that wants per-unload
@@ -601,7 +601,7 @@ Mirrors `extensions/array/` exactly. One TU per the convention (array,
 string, vec are each one `.cpp`; this addon is one `.cpp` too — it's not
 large enough to split, and keeping it one TU matches the "self-contained
 TU depending only on ember public headers + stdlib" purity rule from
-`extensions/README.md`).
+`../../extensions/README.md`).
 
 ```
 ember/extensions/sync/
@@ -613,9 +613,9 @@ ember/extensions/sync/
 
 ```cpp
 // ext_sync.hpp - ember extension: cross-thread sync primitives (atomics,
-// swap buffer, SPSC/MPSC/MPMC queues). See docs/plan_SYNC_QUEUES.md.
+// swap buffer, SPSC/MPSC/MPMC queues). See plan_SYNC_QUEUES.md.
 //
-// An ember *extension* (see ember/extensions/README.md): a reusable,
+// An ember *extension* (see ../../extensions/README.md): a reusable,
 // non-cheat-specific addon. Host-owned, internally-synchronized storage
 // behind opaque i64 handles. Each primitive's store is a separate host
 // std::vector of slots; reset() clears them all.
@@ -716,7 +716,7 @@ symbols from `ember_frontend`, same as the other six). A consumer (prism,
 or a future second consumer) links it and calls
 `ember::ext_sync::register_natives(m)` + `ember::ext_sync::reset()` from
 its own host native-table builder + per-run reset, exactly as it does for
-the other six extensions (`extensions/README.md` "How a host registers an
+the other six extensions (`../../extensions/README.md` "How a host registers an
 extension").
 
 **Test-target wiring** (see §6): a new `ext_sync_test` executable linking
@@ -860,7 +860,7 @@ Tests:
 
 ## 7. Red-team guard #8 compliance — backing-store isolation
 
-`EMBER_REDSHELL_WRITEUP.md` (workspace root) Section 3, mitigation #8:
+`../../../EMBER_REDSHELL_WRITEUP.md` (workspace root) Section 3, mitigation #8:
 
 > **Backing-store isolation invariant:** array/string host stores must
 > never be co-located with exec memory or the dispatch table (make today's
@@ -938,7 +938,7 @@ isolation invariant.
 
 The spec-line to add (mirroring the writeup's recommendation that the V4
 invariant become an explicit rule, not an accident): in
-`docs/SAFETY_AND_SANDBOX.md` §5, add or affirm — *"extension host stores
+`../spec/SAFETY_AND_SANDBOX.md` §5, add or affirm — *"extension host stores
 (array, string, vec, quat, mat, **sync atomics/swap-buffers/queues**) are
 host heap (`std::vector`/`std::atomic`/`std::mutex`), never co-located
 with executable JIT memory or the dispatch table. Handles are 1-based
@@ -982,5 +982,5 @@ The decision points the user makes from this plan:
    free-list (O(1), bounded growth to high-water mark).
 6. **Scope-honesty placement:** the §0 statement goes verbatim into the
    addon's `ext_sync.hpp` header comment + a section in
-   `docs/SAFETY_AND_SANDBOX.md` (§8 update), so a future reader of the code
+   `../spec/SAFETY_AND_SANDBOX.md` (§8 update), so a future reader of the code
    or the spec sees the boundary without re-reading this plan.

@@ -9,7 +9,7 @@ or a *compile-time-known* host native fn ptr (`c->native_fn`). This plan adds
 a third kind: a call whose target is an i64 that the program produced at
 runtime, validated against a registered-fn allowlist before dispatch.
 
-**Why the guard is load-bearing.** `EMBER_REDSHELL_WRITEUP.md` Section 3 item
+**Why the guard is load-bearing.** `../../../EMBER_REDSHELL_WRITEUP.md` Section 3 item
 #6 ("call-target provenance invariant, forward guard") fires the instant this
 feature lands: V2 ("i64-as-call-target") is currently STOPPED at sema only
 because there is *no* syntax to call an i64 and *no* `call rax`-by-value path.
@@ -30,11 +30,11 @@ most important part of the plan and the part that is genuinely new.
 ### The choice
 
 Two ways to obtain a handle were on the table, both names-checked by
-`docs/ROADMAP.md` Tier 2 and `docs/GAP_ANALYSIS.md` §6:
+`../ROADMAP.md` Tier 2 and `GAP_ANALYSIS.md` §6:
 
 | Form | Example | Status in ember today |
 |---|---|---|
-| `cast(fn)` | `let h = cast(fib)` | **Does not exist.** `docs/ROADMAP.md` Tier 2 and `docs/GAP_ANALYSIS.md` §6 use this *spelling*, but it is aspirational text — `GAP_ANALYSIS.md` §2 row "Function references / `cast(fn)`" marks it ✗ v1 (deliberate), and ember **diverged** from the surveyed language's `cast<T>()` to `expr as T` (`GAP_ANALYSIS.md` §2: "ember uses `expr as T` (C/Rust style)"). There is no `Kw_cast` token (`src/lexer.hpp` enum `Tk` has no `Kw_cast`); `src/parser.cpp` ~322 `parse_cast` only handles `as`. So "cast(fn)" would require either (a) adding a `cast` keyword that contradicts the established `as` divergence, or (b) treating `cast` as an ordinary native name — which is exactly what the dynamic-registration host would do anyway, but then it's not first-class syntax, it's a native call, and you cannot *type* a `fn` parameter that way. |
+| `cast(fn)` | `let h = cast(fib)` | **Does not exist.** `../ROADMAP.md` Tier 2 and `GAP_ANALYSIS.md` §6 use this *spelling*, but it is aspirational text — `GAP_ANALYSIS.md` §2 row "Function references / `cast(fn)`" marks it ✗ v1 (deliberate), and ember **diverged** from the surveyed language's `cast<T>()` to `expr as T` (`GAP_ANALYSIS.md` §2: "ember uses `expr as T` (C/Rust style)"). There is no `Kw_cast` token (`src/lexer.hpp` enum `Tk` has no `Kw_cast`); `src/parser.cpp` ~322 `parse_cast` only handles `as`. So "cast(fn)" would require either (a) adding a `cast` keyword that contradicts the established `as` divergence, or (b) treating `cast` as an ordinary native name — which is exactly what the dynamic-registration host would do anyway, but then it's not first-class syntax, it's a native call, and you cannot *type* a `fn` parameter that way. |
 | `&fn` | `let h = &fib` | **New, but cheap.** `&` already lexes (`Tk::Amp`, `src/lexer.cpp` ~344). A prefix `&` on an `Ident` that resolves to a script function is unambiguous: ember has no reference types today (`GAP_ANALYSIS.md` §2 row "Reference `&`/`out` params ✗ v1"), so prefix `&` is currently used only... nowhere as a prefix operator. `parse_unary` (`src/parser.cpp` ~336) handles `Minus`/`Not`/`Tilde` only. Adding an `&` prefix case is one branch. |
 
 **Decision: `&fn_name` to take a handle, `handle(args)` to call it.**
@@ -42,7 +42,7 @@ Two ways to obtain a handle were on the table, both names-checked by
 ### Rationale
 
 1. **`&` is the established C/Rust/Golang address-of operator.** ember's
-   syntax is C-family (`COMPILER_PIPELINE.md` §2 grammar, C precedence).
+   syntax is C-family (`../spec/COMPILER_PIPELINE.md` §2 grammar, C precedence).
    `&fib` reads to a C/Rust programmer as "a reference to fib." The handle is
    literally the slot index — a small integer that *stands for* the function
    the way a C function pointer stands for the function. `&` is the honest
@@ -431,12 +431,12 @@ so the runtime guard is mandatory regardless of type-tagging.
 the runtime guard):** an assignment / `let` init from a plain `i64` to a
 `fn`-typed variable is a *compile error* (closes V3-style forging at the type
 level, the same way `let s: u8[] = forged_ptr;` is already a sema error,
-`EMBER_REDSHELL_WRITEUP.md` V3). Only `&fn` and a `fn`-typed source produce a
+`../../../EMBER_REDSHELL_WRITEUP.md` V3). Only `&fn` and a `fn`-typed source produce a
 `fn`-typed value. A host native may *return* a `fn`-typed i64
 (`register
 _routine` returns the handle it stored; §6) — that's the one
 runtime source, and it's trusted because the native is host-trusted
-(`SAFETY_AND_SANDBOX.md` §1: natives are trusted by design). This still does
+(`../spec/SAFETY_AND_SANDBOX.md` §1: natives are trusted by design). This still does
 not relieve the runtime guard: a host native is trusted, but the *script*
 could pass a forged i64 to a `fn`-typed variable via a yet-unregistered
 native — the guard is the last line, not the first.
@@ -572,7 +572,7 @@ Rejected because:
   where the JIT'd code is about to make an untrusted indirect call — the
   native's return value would be trusted to decide whether to trap, adding a
   trust hop where the bitset has none.
-- It is what `EMBER_REDSHELL_WRITEUP.md` V2's "defensive pairing" explicitly
+- It is what `../../../EMBER_REDSHELL_WRITEUP.md` V2's "defensive pairing" explicitly
   does *not* want: "dispatch must validate an i64 used as a call target
   against a registered-fn allowlist; never raw call rax of a script value."
   A bitset the JIT reads directly *is* the allowlist; a native is an
@@ -640,9 +640,9 @@ than hand-emitting bytes in codegen.
 
 ## 6. Dynamic registration — the `register_routine` host native
 
-`docs/LIFECYCLE.md` §2: "Dynamic registration (script decides at runtime what
+`../LIFECYCLE.md` §2: "Dynamic registration (script decides at runtime what
 to hook, unregister later) is not v1 — it needs function references
-(`ROADMAP.md` Tier 2). This is it."
+(`../ROADMAP.md` Tier 2). This is it."
 
 ### 6.1 The native's signature
 
@@ -684,7 +684,7 @@ script passing `&fn` instead of the host querying `@on_tick`. The guard
 The guard (§5.2) is in the **JIT'd code path** (script → script via
 `handle(args)`). When the *host* calls a routine it stored from
 `register_routine`, the host does `table.get(slot)` directly in C++ — the host
-is trusted (`SAFETY_AND_SANDBOX.md` §1) and the slot came from a `&fn` that
+is trusted (`../spec/SAFETY_AND_SANDBOX.md` §1) and the slot came from a `&fn` that
 sema validated, so the host's `table.get(slot)` is safe by the same
 reasoning that `table.get(entry_slot)` is safe today. The guard is not
 duplicated on the host side. (If a host wanted to call a handle whose
@@ -705,7 +705,7 @@ recursion. No new recursion hazard.
 
 ## 7. REDSHELL guard #6 compliance — how the guard prevents raw-call-rax-of-script-value
 
-The guard's job, stated in `EMBER_REDSHELL_WRITEUP.md` §2 (V2 defensive
+The guard's job, stated in `../../../EMBER_REDSHELL_WRITEUP.md` §2 (V2 defensive
 pairing) and §3 item #6: "when first-class function references are ever added,
 dispatch must validate an i64 used as a call target against a registered-fn
 allowlist; never raw call rax of a script value."
@@ -762,14 +762,14 @@ with no validation. The i64 could be:
   concern) is not crossed.
 
 - **A host native returning a `fn` handle the script then calls:** the host
-  is trusted (`SAFETY_AND_SANDBOX.md` §1). The handle the host returns is
+  is trusted (`../spec/SAFETY_AND_SANDBOX.md` §1). The handle the host returns is
   trusted by the same trust that `array_new`'s returned handle is trusted.
   The guard still runs on it (it's a runtime i64 at the call site) and
   validates it — defense-in-depth, not a trust shortcut.
 
-### The one-line invariant for SAFETY_AND_SANDBOX.md
+### The one-line invariant for ../spec/SAFETY_AND_SANDBOX.md
 
-Add to `docs/SAFETY_AND_SANDBOX.md` (the REDSHELL §3 item #6 forward guard,
+Add to `../spec/SAFETY_AND_SANDBOX.md` (the REDSHELL §3 item #6 forward guard,
 now realized):
 
 > **Call-target provenance (Tier 2).** A first-class function handle is an
@@ -837,7 +837,7 @@ code / trap reason). New file: `examples/v0_7_function_refs_test.cpp`
 | # | Setup | Asserts |
 |---|---|---|
 | E1 | A handle passed cross-module: `mod::fn` returning a handle, the importer calls it. (Cross-module fn handles are §9's open question; this test may be deferred.) | TBD — see §9. |
-| E2 | Hot-reload: a module with a `&fib` handle is reloaded; the handle (slot index) stays valid (slot indices never change, `HOT_RELOAD.md` §7). `fib`'s new body runs on the next `handle(args)`. | Asserts slot stability lifts to handles (it should, free of charge). |
+| E2 | Hot-reload: a module with a `&fib` handle is reloaded; the handle (slot index) stays valid (slot indices never change, `../HOT_RELOAD.md` §7). `fib`'s new body runs on the next `handle(args)`. | Asserts slot stability lifts to handles (it should, free of charge). |
 | E3 | Budget trap during a handle call: a handle call to a fn that loops forever hits the budget trap. | `TrapReason::BudgetExceeded` (the budget check is at loop back-edges inside the callee; the handle call's depth check + the callee's budget check compose). |
 
 ---
@@ -912,7 +912,7 @@ args against the target's actual signature. This means:
 params to carry a signature — `fn(i64,i64)->i64` syntax) is a v2+ type-system
 expansion (parameterized types, signature equality). Tier 2's goal is the
 first-class call + the guard, not a full function-type system. The hole is
-documented in `ROADMAP.md` as the v2+ refinement: "`fn(i64)->i64` parameterized
+documented in `../ROADMAP.md` as the v2+ refinement: "`fn(i64)->i64` parameterized
 function types for compile-time arg checking." The guard ensures the *call
 target* is always safe; the *args* are the caller's responsibility at the
 bare-`fn` type, same as a C function pointer with no prototype.
@@ -946,7 +946,7 @@ index, which is meaningless against this module's dispatch table. Cross-module
 handles need either (a) a global handle space (a `(module_id, slot)` pair
 encoded into one i64), or (b) per-module allowlists and a guard that knows
 which module a handle is for. This is real work and is **Tier 2.5 / v0.8**,
-documented in `ROADMAP.md` as the cross-module extension. Tier 2 ships
+documented in `../ROADMAP.md` as the cross-module extension. Tier 2 ships
 intra-module handles only. The `register_routine` native's handle is always
 this module's (the script passes `&my_fn`, not `&mod::their_fn`).
 
@@ -1032,8 +1032,8 @@ hosts today.
 | `src/context.hpp` | `TrapReason::BadCallTarget`; `trap_reason_str` case | edits |
 | host (`examples/ember_cli.cpp` / `game_host.cpp` / a new `ext_lifecycle`) | build the allowlist (bitset from `script_slots`); `register_routine`/`unregister_routine`/`forge_fn_handle`(test-only) natives via `BindingBuilder::add` | new natives |
 | `examples/v0_7_function_refs_test.cpp` | the test matrix (§8) | new file |
-| `docs/SAFETY_AND_SANDBOX.md` | the call-target-provenance invariant (§7 one-liner) | edit |
-| `docs/ROADMAP.md` | mark Tier 2 function references shipped; note the bare-`fn` signature hole (§9.3) and cross-module deferral (§9.5) as v2+ | edit |
+| `../spec/SAFETY_AND_SANDBOX.md` | the call-target-provenance invariant (§7 one-liner) | edit |
+| `../ROADMAP.md` | mark Tier 2 function references shipped; note the bare-`fn` signature hole (§9.3) and cross-module deferral (§9.5) as v2+ | edit |
 
 ---
 

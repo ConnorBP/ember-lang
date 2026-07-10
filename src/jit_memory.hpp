@@ -1,5 +1,5 @@
 // ember executable-memory allocator.
-// CODEGEN_SPEC.md Section jit_memory: W^X - VirtualAlloc RW, copy code,
+// docs/spec/CODEGEN_SPEC.md Section jit_memory: W^X - VirtualAlloc RW, copy code,
 // VirtualProtect to RX. The page is never simultaneously writable and
 // executable (v0.4 hardening, red-team V5 mitigation: a write primitive
 // that ever lands in a JIT page must not also be an execute page).

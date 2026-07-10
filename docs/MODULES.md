@@ -57,7 +57,7 @@ another mod's `.em` at runtime, this is YAGNI - spec'd, not built.
 
 A per-process map from `module_id` to the current `DispatchTable*`
 of that module. Both flavors of module register here: JIT-compiled
-modules (`ember_compile`, `DESIGN.md` Section 8) and `.em`-loaded modules
+modules (`ember_compile`, `planning/DESIGN.md` Section 8) and `.em`-loaded modules
 (`ember_load_em`, `BUNDLING_AND_EM_MODULES.md` Section 2.5). They share the
 same `module_t` shape by construction (Section 2.6 of the bundling doc: "the
 runtime cannot tell a loaded module from a JIT'd one"), so the
@@ -101,7 +101,7 @@ struct ModuleRegistry {
   is the one indirection that buys cross-module reload transparency.
 - **Both `table` and `globals_block` are in the entry** because a
   cross-module call may also touch the callee's globals
-  (`MEMORY_AND_GC.md` Section 4 - globals are per-module). The cross-module
+  (`spec/MEMORY_AND_GC.md` Section 4 - globals are per-module). The cross-module
   globals access path mirrors the call path: `registry[module_id]
   .globals_block` → offset. Carrying both in one entry avoids a
   second lookup; the shape has to carry both.
@@ -128,7 +128,7 @@ mov  r11, [r11 + slot_index*8]            ; load slots[slot_index]  -  the
 call r11                                  ; same final step as intra-module
 ```
 
-**Intra-module form (`CODEGEN_SPEC.md` Section 7, for contrast):**
+**Intra-module form (`spec/CODEGEN_SPEC.md` Section 7, for contrast):**
 
 ```asm
 mov  r11, [dispatch_table_base + slot*8] ; this module's own table base,
@@ -210,7 +210,7 @@ indirection up: the registry slot plays for modules the role the
 dispatch slot plays for functions. The cost is the one extra `mov`
 from Section 3; the benefit is that cross-module reload needs no
 cross-module caller recompilation - exactly the goal that motivated
-the dispatch table in the first place (`CODEGEN_SPEC.md` Section 7: "hot-
+the dispatch table in the first place (`spec/CODEGEN_SPEC.md` Section 7: "hot-
 reloading any function ... never requires touching the caller's code
 bytes at all").
 
@@ -234,7 +234,7 @@ Section 1.1). The flow:
    becomes an unresolved-symbol record: `(target_module_name, fn_name,
    expected signature, call site location)`. The call site is emitted
    with a **trap stub** as its operands initially (same pattern as
-   `HOT_RELOAD.md` Section 2 / `CODEGEN_SPEC.md` Section 7 edge case: "slot points
+   `HOT_RELOAD.md` Section 2 / `spec/CODEGEN_SPEC.md` Section 7 edge case: "slot points
    at a shared trap stub rather than a null/garbage pointer"), so the
    module is *runnable* before linking but any cross-module call
    traps.
@@ -245,7 +245,7 @@ Section 1.1). The flow:
      module trap - see "unresolved at call time" below). Whether an
      unmet import is a hard error or a deferred trap is a host policy
      decision; this design makes it a deferred trap, matching
-     `CODEGEN_SPEC.md` Section 7's "slots are never literally null during
+     `spec/CODEGEN_SPEC.md` Section 7's "slots are never literally null during
      normal operation" stance (a missing module is the cross-module
      analog of a not-yet-compiled function).
    - If registered → retrieve the target's `DispatchTable*` and its
@@ -288,7 +288,7 @@ call_external := IDENT '::' IDENT '(' arg_list? ')'     // modname::fn
   module already in the registry. The alias is required by the grammar.
 - `modname::fn(args)` - a call into `fn` of the imported module. The
   `::` is the cross-module selector; an unqualified `fn(args)` is the
-  existing intra-module call (`CODEGEN_SPEC.md` Section 7). The `::` makes
+  existing intra-module call (`spec/CODEGEN_SPEC.md` Section 7). The `::` makes
   the distinction visible at the call site, which matters for reading
   code and makes the IR op choice (`CallScript` vs
   `CallScriptExternal`, Section 3) a trivial parse-time decision rather than
@@ -297,7 +297,7 @@ call_external := IDENT '::' IDENT '(' arg_list? ')'     // modname::fn
   function in a registered module is callable cross-module, matching
   C `#include`'s "everything included is visible" stance
   (`BUNDLING_AND_EM_MODULES.md` Section 1.3) and the existing flat module
-  scope (`COMPILER_PIPELINE.md` Section 4).
+  scope (`spec/COMPILER_PIPELINE.md` Section 4).
 
 ---
 
@@ -354,7 +354,7 @@ compatibility contract, not a live gap.
 - **No cross-process modules.** The registry is per-process (`Section 2`).
   A mod in process A cannot call a mod in process B through this
   mechanism; that is an IPC problem, not a linking problem, and ember
-  is an in-process embedded scripting language (`DESIGN.md` goals:
+  is an in-process embedded scripting language (`planning/DESIGN.md` goals:
   "for embedding in game engines"). Out of scope forever, not just
   for v1 of this feature.
 - **No dynamic unloading / module-registry-entry removal.**

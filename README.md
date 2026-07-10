@@ -17,7 +17,7 @@ Status: **v1.0** - the full frontend + binding API + safe execution + live
   v0.6: lifecycle annotation runtime effect + single-function hot reload +
   the example game-engine integration (`examples/game_host.cpp`) that proved
   embeddability, the float-global-write bug fix, and const global
-  initializer evaluation at load (see `docs/v0.6_INTEGRATION_NOTES.md`).
+  initializer evaluation at load (see `docs/planning/v0.6_INTEGRATION_NOTES.md`).
   v1.0: the concurrency + Tier 2 batch (commit e5d1814) — **context
   thread-safety** (Option D + B1: per-thread `context_t`, `r14` context
   register, one compiled body serves N contexts), **enums** (`enum E {...}` +
@@ -32,7 +32,7 @@ Status: **v1.0** - the full frontend + binding API + safe execution + live
   the B1 per-call context model (the `--tick` thread-safety bug, fixed; the
   CLI is now a B1 host). See `src/` for the
   frontend, `extensions/` for the addons (now eight: +`sync` +`lifecycle`), `examples/`
-  for the CLI + check exes + sample scripts, and `docs/v1.0_INTEGRATION_NOTES.md`
+  for the CLI + check exes + sample scripts, and `docs/planning/v1.0_INTEGRATION_NOTES.md`
   for the batch + follow-on notes.
 
   Next milestone: **v1.0+** - SSA-lite IR + linear-scan allocation remain
@@ -41,27 +41,27 @@ Status: **v1.0** - the full frontend + binding API + safe execution + live
   `StructBuilder`/`engine_t` surface stays trigger-gated on a host wanting
   script-visible C++ struct types (the v0.6 integration didn't fire it).
 
-## Docs (read `docs/DESIGN.md` first - it's the index)
+## Docs (read `docs/planning/DESIGN.md` first - it's the index)
 
 - `docs/RESEARCH_NOTES.md` - prior-art survey: binprotect, a prior native-JIT scripting language,
   AngelScript, Mun, and what each contributed.
-- `docs/DESIGN.md` - top-level plan, architecture diagram, milestone
+- `docs/planning/DESIGN.md` - top-level plan, architecture diagram, milestone
   list, links to every detail doc.
-- `docs/TYPE_SYSTEM.md` - primitives, struct layout, slices, the
+- `docs/spec/TYPE_SYSTEM.md` - primitives, struct layout, slices, the
   no-raw-pointer rule, conversion matrix, operator types.
-- `docs/COMPILER_PIPELINE.md` - lexer tokens, BNF grammar, AST, sema
+- `docs/spec/COMPILER_PIPELINE.md` - lexer tokens, BNF grammar, AST, sema
   passes, shipped tree-walking lowering, deferred SSA-lite design, error model.
-- `docs/CODEGEN_SPEC.md` - the x86-64 backend: calling convention,
+- `docs/spec/CODEGEN_SPEC.md` - the x86-64 backend: calling convention,
   exact instruction encodings, regalloc, label/patch system, call
   emission, trap stubs, v0.1 acceptance criteria.
 - `docs/BUNDLING_AND_EM_MODULES.md` - the `.em` binary bundling format:
   the `EMBL` container contract (`em_file.hpp`), relocations
   (DispatchTableBase / GlobalsBase), the writer/loader pair, and the
   module round-trip that acceptance test #7 exercises.
-- `docs/BINDING_API.md` - shipped `BindingBuilder`/`NativeSig` API,
+- `docs/spec/BINDING_API.md` - shipped `BindingBuilder`/`NativeSig` API,
   script-type→Win64-slot mapping, slice convention, and clearly deferred
   fluent builder sketches.
-- `docs/SAFETY_AND_SANDBOX.md` - threat model, budgets, stack-depth
+- `docs/spec/SAFETY_AND_SANDBOX.md` - threat model, budgets, stack-depth
   guard, bounds checks, `PERM_FFI`, the single non-local-unwind
   primitive, the v1.0 call-target-provenance guard (#6) + context
   thread-safety (§7a/§8a), documented gaps.
@@ -71,31 +71,31 @@ Status: **v1.0** - the full frontend + binding API + safe execution + live
   thread-safety all marked ✓ shipped v1.0 with their open items.
 - `docs/HOT_RELOAD.md` - dispatch table, slot stability, reload
   protocol, host execution guards, and shipped epoch/quiescence reclamation.
-- `docs/MEMORY_AND_GC.md` - ownership taxonomy, slice-escape check,
+- `docs/spec/MEMORY_AND_GC.md` - ownership taxonomy, slice-escape check,
   globals, strings, arena (reserved), v2-GC deferral rationale.
 - `docs/LIFECYCLE.md` - `@entry`/`@on_tick`/`@event(...)` annotation-based
   discovery, the ember-equivalent of a native-JIT language's `main()` + `register_routine`.
 - `docs/MODULES.md` - the module model: how a `.em` bundle maps to a
   dispatch table + globals block, slot stability across reloads, and
   how `EmModule`/`EmFunctionRecord` feed the JIT re-build on load.
-- `docs/GAP_ANALYSIS.md` - systematic completeness audit: original-request
+- `docs/planning/GAP_ANALYSIS.md` - systematic completeness audit: original-request
   requirements → where satisfied; surveyed-native-JIT-language features → v1 has / deferred / out.
   Includes the honest performance caveat (baseline JIT, not an optimizing native-JIT language's
   optimizing pipeline, but beats AngelScript's bytecode interpreter).
 - `docs/ROADMAP.md` - every v2+ deferral with a re-entry trigger and
   dependency, tiered by likely build order; hard non-goals listed.
-- `docs/RESTRUCTURE_PLAN.md` - the (fired) plan that promoted prism's
+- `docs/planning/RESTRUCTURE_PLAN.md` - the (fired) plan that promoted prism's
   in-tree ember to this canonical standalone home, so the language
   carries no cheat references and is reusable.
 
 Every feature in the original request (C-style syntax, JIT to native
 x86-64, composable chunks via the dispatch table, safety, AngelScript-
 style bindings, hot reload, GC deferral) has a detail doc with edge
-cases spelled out. `GAP_ANALYSIS.md` is the audit confirming nothing
-the original request asked for is missing; `ROADMAP.md` is the tracked
+cases spelled out. `docs/planning/GAP_ANALYSIS.md` is the audit confirming nothing
+the original request asked for is missing; `docs/ROADMAP.md` is the tracked
 list of what's deliberately deferred and when each comes back. The v1.0
 concurrency + Tier 2 batch (context thread-safety, enums, sync queues,
-first-class function refs) is documented at `docs/v1.0_INTEGRATION_NOTES.md`;
+first-class function refs) is documented at `docs/planning/v1.0_INTEGRATION_NOTES.md`;
 the four `plan_*.md` files are the historical plans for that batch.
 
 Status: **v1.0** (full frontend + binding API + safe execution + live
@@ -186,7 +186,7 @@ ember_cli emit-em <input.ember> <output.em>
   the tick thread runs on its own `context_t` via `ember_call_void`, isolated
   from the main thread's `context_t` — a budget/overflow trap in a tick stops
   the tick thread, never the main thread (the `--tick` thread-safety bug,
-  fixed; see `docs/v1.0_INTEGRATION_NOTES.md` §1). The CLI also drives any
+  fixed; see `docs/planning/v1.0_INTEGRATION_NOTES.md` §1). The CLI also drives any
   routines a script registered via `register_routine(&fn, data)` (the
   dynamic-registration path, `examples/scripts/dynamic_registration.ember`).
 
@@ -222,14 +222,15 @@ tight loops by typically 5-50×, which comfortably satisfies "much faster"
 for hot game-logic — the v0.6 benchmark harness (`examples/bench_ember_vs_as.cpp`,
 ctest target `bench_ember_vs_as`) recorded Ember/AngelScript ratios of
 **0.15** for `fib(32)`, **0.16** for `tight_loop(1e8)`, **0.18** for
-`nested_calls(1e7)`, and **0.55** for mandelbrot (results in
-`v0.6_BENCHMARK_RESULTS.md`). Available provenance: Windows x86-64, MinGW g++
-15.2.0, Release `-O3 -DNDEBUG`; results were committed before the 2026-07-09
-audit (exact CPU and run date were not recorded). These are compile-once hot-path
+`nested_calls(1e7)`, and **0.55** for mandelbrot (reproduce with `ember bench`, the
+live microbenchmark CLI). Available provenance for the recorded run: Windows x86-64,
+MinGW g++ 15.2.0, Release `-O3 -DNDEBUG`; the committed snapshot those numbers came
+from had no recorded CPU/run-date metadata and was removed (the `ember bench` tool is
+the live source of truth). These are compile-once hot-path
 means with safety checks disabled, not cross-machine statistical claims. Matching an optimizing
 native-JIT language's speed is a v2+ goal, gated on a benchmark-proven
 need — the SSA-lite IR + linear-scan allocation design
-(`COMPILER_PIPELINE.md` Section 5) is explicitly deferred until stronger
+(`docs/spec/COMPILER_PIPELINE.md` Section 5) is explicitly deferred until stronger
 benchmarks show where Ember is slow.
-No speculative optimization (`DESIGN.md` Section 9). The codegen is
+No speculative optimization (`docs/planning/DESIGN.md` Section 9). The codegen is
 correctness-first today.

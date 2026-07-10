@@ -1,4 +1,4 @@
-// em_roundtrip_test - `.em` pre-compile round-trip proof (RESTRUCTURE_PLAN.md Section 5).
+// em_roundtrip_test - `.em` pre-compile round-trip proof (docs/planning/RESTRUCTURE_PLAN.md Section 5).
 //
 // Exercises the REAL parser→sema→codegen→.em→load path end to end (better than
 // the standalone tree's hand-built fib test, which had no parser). Compiles a
@@ -7,7 +7,7 @@
 // produces the SAME result as the JIT'd one for the same inputs.
 //
 // This is the additive, in-place port of the standalone `.em` feature into
-// prism's live ember (RESTRUCTURE_PLAN.md step 1). It links only the ember +
+// prism's live ember (docs/planning/RESTRUCTURE_PLAN.md step 1). It links only the ember +
 // ember_frontend libs - no prism natives, no prism_script_host - because the
 // test function (`double_it`) uses no natives/globals/structs, so an empty
 // native table + empty struct-layout table is a valid sema input. That keeps
@@ -56,7 +56,7 @@ static int64_t call_i64_i64(void* entry, int64_t a) {
 }
 
 // Build the EmModule from a set of JIT'd CompiledFns + the slot table, the
-// way a host serializer would (BUNDLING_AND_EM_MODULES.md Section 2.3). Each
+// way a host serializer would (docs/BUNDLING_AND_EM_MODULES.md Section 2.3). Each
 // function's `relocs` are filled from `CompiledFn::abs_fixups` (captured by
 // compile_func from the emitter's mov_reg_imm64_external records).
 static ember::EmModule build_em_module(

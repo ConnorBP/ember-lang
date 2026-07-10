@@ -1,5 +1,5 @@
 // ext_lifecycle.cpp - ember extension: dynamic routine registration
-// (plan_FUNCTION_REFS.md §6). See ext_lifecycle.hpp for the scope statement.
+// (docs/planning/plan_FUNCTION_REFS.md §6). See ext_lifecycle.hpp for the scope statement.
 //
 // A Tier-0-shaped extension mirroring ext_array/ext_sync (1-based ids, bounds
 // check, register_natives/reset, host accessor). One TU per extensions/README.md

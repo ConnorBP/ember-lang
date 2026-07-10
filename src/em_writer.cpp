@@ -1,4 +1,4 @@
-// ember `.em` serializer impl (BUNDLING_AND_EM_MODULES.md Section 2.3)
+// ember `.em` serializer impl (docs/BUNDLING_AND_EM_MODULES.md Section 2.3)
 //
 // Writes the on-disk binary defined in em_file.hpp / Section 2.2 to `path` via a
 // std::ofstream opened in binary mode (Windows target). All multi-byte

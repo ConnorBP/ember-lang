@@ -1,10 +1,10 @@
-// ember module linker (MODULES.md §5) - host-side glue for live modules.
+// ember module linker (docs/MODULES.md §5) - host-side glue for live modules.
 //
 // The runtime half (ModuleRegistry) and the kind-2 cross-module call sequence
 // are in module_registry.hpp / codegen. This header is the LINKER STAGE: it
 // builds the ModuleExportTable that sema resolves `mod::fn` against, and
 // registers modules (JIT or .em) into the per-process registry. Provenance-
-// agnostic (MODULES.md §2.6): a JIT module (parsed Program + DispatchTable)
+// agnostic (docs/MODULES.md §2.6): a JIT module (parsed Program + DispatchTable)
 // and a .em module (LoadedModule) both register the same way and both expose
 // the same ModuleExport shape — the registry and the call site neither know
 // nor care which kind a module is.

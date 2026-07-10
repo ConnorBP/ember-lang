@@ -1,4 +1,4 @@
-// ember parser - recursive descent, full v1 grammar (COMPILER_PIPELINE.md Section 2).
+// ember parser - recursive descent, full v1 grammar (docs/spec/COMPILER_PIPELINE.md Section 2).
 #pragma once
 #include "ast.hpp"
 #include "lexer.hpp"
@@ -26,7 +26,7 @@ struct ParseResult {
 
 // Parse a full program. Throws on first unrecoverable error (caught
 // internally, surfaced as ParseResult::ok=false). Best-effort
-// synchronization to the next ';' / '}' (COMPILER_PIPELINE.md Section 7).
+// synchronization to the next ';' / '}' (docs/spec/COMPILER_PIPELINE.md Section 7).
 ParseResult parse(std::vector<Token> toks);
 
 } // namespace ember

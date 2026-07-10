@@ -1,4 +1,4 @@
-// ember module registry impl (MODULES.md Section 2).
+// ember module registry impl (docs/MODULES.md Section 2).
 //
 // See module_registry.hpp for the design and the REGISTRY-BASE STABILITY
 // INVARIANT. The implementation is small: size-at-construction +

@@ -1,4 +1,4 @@
-// ember AST + Type. Node shapes per COMPILER_PIPELINE.md Section 3.
+// ember AST + Type. Node shapes per docs/spec/COMPILER_PIPELINE.md Section 3.
 #pragma once
 #include "lexer.hpp"
 #include <memory>
@@ -25,7 +25,7 @@ struct Type {
     uint32_t array_len = 0;        // 0 = not a fixed array; >0 = T[N]
     std::shared_ptr<Type> elem;     // element type for slice/array
 
-    // v1.0 Tier 2 first-class function refs (plan_FUNCTION_REFS.md §2): a
+    // v1.0 Tier 2 first-class function refs (docs/planning/plan_FUNCTION_REFS.md §2): a
     // function handle is Prim::I64 with is_fn_handle=true. Representation is
     // identical to a plain i64 (8 bytes, GP reg, Win64 i64 ABI); the tag is
     // metadata for the call-target guard (§5) + diagnostics. recorded_* carry
@@ -106,7 +106,7 @@ struct BinExpr  : Expr { enum class Op {
         Add,Sub,Mul,Div,Mod, And,Or,Xor,Shl,Shr,
         Eq,Neq,Lt,Le,Gt,Ge, LAnd,LOr } op;
     ExprPtr lhs, rhs;
-    // operator-overload dispatch (TYPE_SYSTEM.md Section 7): if sema resolves this
+    // operator-overload dispatch (docs/spec/TYPE_SYSTEM.md Section 7): if sema resolves this
     // BinExpr to a registered overload (vec3_add, etc.), codegen emits a native
     // call instead of inline arithmetic.
     bool is_overload = false;
@@ -120,7 +120,7 @@ struct BinExpr  : Expr { enum class Op {
 };
 struct UnaryExpr: Expr { enum class Op { Neg,Not,BitNot } op; ExprPtr operand; };
 struct CastExpr : Expr { ExprPtr operand; std::shared_ptr<Type> to; };
-// v1.0 Tier 2 first-class function refs (plan_FUNCTION_REFS.md §3.1): `&fn_name`
+// v1.0 Tier 2 first-class function refs (docs/planning/plan_FUNCTION_REFS.md §3.1): `&fn_name`
 // produces a function handle. Sema resolves the operand to a script fn slot,
 // bakes it as an i64 literal (slot). NOT a runtime computation — a compile-time
 // reification. `slot` is filled by sema; codegen emits `mov rax, imm64(slot)`.
@@ -135,7 +135,7 @@ struct CallExpr : Expr { std::string name; std::vector<ExprPtr> args;
                          // v0.5 cross-module: non-empty module_alias = a `mod::fn()` call.
                          // Sema resolves it against the linked-module export table; if the
                          // module/fn is not yet registered it's an unresolved external (deferred
-                         // trap, MODULES.md §5). codegen stamps cross_module_id/slot when
+                         // trap, docs/MODULES.md §5). codegen stamps cross_module_id/slot when
                          // resolved (kind-2 call site); unresolved stays -1 (trap stub).
                          std::string module_alias;       // empty = same-module call
                          int cross_module_id = -1;        // registry module_id (resolved)
@@ -143,7 +143,7 @@ struct CallExpr : Expr { std::string name; std::vector<ExprPtr> args;
                          bool cross_module_unresolved = false; // sema couldn't resolve (deferred trap)
                          // method-call sugar: obj.method(args) desugars to
                          // method(obj, args) - receiver becomes arg[0]. Null
-                         // for free-function calls. (BINDING_API.md Section 3)
+                         // for free-function calls. (docs/spec/BINDING_API.md Section 3)
                          ExprPtr receiver;
                          // compile-time assertion folding (sema.cpp's
                          // CallExpr check): set when this call is one of
@@ -194,7 +194,7 @@ struct StructLit : Expr { std::string type_name; std::vector<std::pair<std::stri
 struct ArrayLit : Expr { std::vector<ExprPtr> elements; };
 // E::A - enum-variant access. Exists only between parse and sema's check_expr:
 // sema rewrites this node IN PLACE to an IntLit carrying the variant's i32
-// value (see plan_ENUMS.md Section 5 - the switch case-value literal-check
+// value (see docs/planning/plan_ENUMS.md Section 5 - the switch case-value literal-check
 // at sema.cpp's SwitchStmt requires an IntLit by the time check_expr
 // returns, so the rewrite happens in sema, not as a codegen pre-pass).
 struct EnumAccessExpr : Expr { std::string enum_name; std::string variant; };
@@ -266,11 +266,11 @@ struct GlobalDecl {
     bool is_const = false;
 };
 
-// v0.5 live-module link declaration (MODULES.md §6). `link "foo.em" as foo;`
+// v0.5 live-module link declaration (docs/MODULES.md §6). `link "foo.em" as foo;`
 // loads+registers a .em bundle at init; `link "foo" as foo;` links to an
 // already-registered module. `as alias` is optional sugar (defaults to the
 // module name / the file stem). Distinct from textual `import "path";` which
-// inlines source before lexing (BUNDLING_AND_EM_MODULES.md §1.1).
+// inlines source before lexing (docs/BUNDLING_AND_EM_MODULES.md §1.1).
 struct LinkDecl {
     std::string target;      // module name OR .em file path
     std::string alias;       // the name scripts use (foo in foo::bar())
@@ -278,7 +278,7 @@ struct LinkDecl {
     Loc loc;
 };
 
-// Tier 1 script-side `enum` (plan_ENUMS.md). An enum is a set of named i32
+// Tier 1 script-side `enum` (docs/planning/plan_ENUMS.md). An enum is a set of named i32
 // compile-time constants; an enum value IS an i32 (no new Type shape).
 // `explicit_value` is nullptr iff the variant has no `= value` (auto-
 // increment from the previous variant). It is a constexpr-foldable integer
@@ -303,8 +303,8 @@ struct Program {
     std::vector<StructDecl> structs;
     std::vector<GlobalDecl> globals;
     std::vector<FuncDecl> funcs;
-    std::vector<LinkDecl> links;   // v0.5 live-module link declarations (MODULES.md §6)
-    std::vector<EnumDecl> enums;   // Tier 1 script-side enums (plan_ENUMS.md)
+    std::vector<LinkDecl> links;   // v0.5 live-module link declarations (docs/MODULES.md §6)
+    std::vector<EnumDecl> enums;   // Tier 1 script-side enums (docs/planning/plan_ENUMS.md)
     // type store: owns synthesized Types created by sema (slices, adapted
     // literal types) so the raw `ty` pointers stashed on AST nodes survive
     // until codegen finishes (sema's local Checker would otherwise free them).

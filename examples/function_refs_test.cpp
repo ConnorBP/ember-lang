@@ -1,5 +1,5 @@
 // function_refs_test - v1.0 Tier 2 first-class function references
-// (plan_FUNCTION_REFS.md). Proves:
+// (docs/planning/plan_FUNCTION_REFS.md). Proves:
 //   A. `&fn` bakes the slot as an i64 literal; the `fn` type tag distinguishes
 //      it from a plain i64 (i64<->fn assignment is a sema error).
 //   B. `handle(args)` dispatches to the right fn through the runtime i64,

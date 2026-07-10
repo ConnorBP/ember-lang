@@ -1,6 +1,6 @@
 // bench_ember_vs_as - v0.6 benchmark: ember (native JIT) vs AngelScript (bytecode interpreter).
 //
-// DESIGN.md §9's gate. Runs the SAME workload in both, times the hot path (compile
+// docs/planning/DESIGN.md §9's gate. Runs the SAME workload in both, times the hot path (compile
 // once, then N iterations), reports the ratio. The categorical difference: ember
 // compiles to native x86-64 (no dispatch-decode loop), AngelScript interprets
 // bytecode. The spec's claim: baseline native beats a bytecode interpreter by

@@ -1,4 +1,4 @@
-// ember execution context (SAFETY_AND_SANDBOX.md Section 2/Section 3/Section 4).
+// ember execution context (docs/spec/SAFETY_AND_SANDBOX.md Section 2/Section 3/Section 4).
 //
 // The non-local abort primitive + the two quantity budgets (coarse execution
 // budget, combined script/native call-stack depth). A host that requires
@@ -41,7 +41,7 @@
 namespace ember {
 
 // Default maximum simultaneously active script-issued calls (script or native,
-// including native-to-script re-entry; SAFETY_AND_SANDBOX.md Section 4).
+// including native-to-script re-entry; docs/spec/SAFETY_AND_SANDBOX.md Section 4).
 inline constexpr int32_t DEFAULT_MAX_CALL_DEPTH = 512;
 
 // A trap reason, set by the trap stub before it longjmps to the host-managed
