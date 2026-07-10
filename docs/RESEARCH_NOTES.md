@@ -2,8 +2,9 @@
 
 Sources examined before design:
 
-## binprotect (`hyper_workspace/binprotect`)
-- x64 PE bin2bin obfuscator, own `ext/binwrite` lib on top of Zydis (decode+encode).
+## Sibling x64 PE bin2bin obfuscator (surveyed prior art)
+- A sibling workspace project ships an x64 PE bin2bin obfuscator, with its own
+  `ext/binwrite` lib on top of Zydis (decode+encode).
 - `binwrite::assembler_instruction_t` wraps one `ZydisEncoderRequest` + calls
   `ZydisEncoderEncodeInstruction` per instruction. No concept of labels, no
   relocation fixups, no executable-memory allocator. It's built for patching

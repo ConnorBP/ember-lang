@@ -242,7 +242,7 @@ the source fn's signature on the type for arg checking. The indirect
 guard is the backstop; documented as an open item in `../ROADMAP.md` Tier 2).
 **i64 ↔ fn assignment is forbidden either direction** (closes forging at the
 type level). Codegen validates the runtime i64 against a host-built bitset
-allowlist before dispatch (REDSHELL guard #6, `SAFETY_AND_SANDBOX.md` §7a).
+allowlist before dispatch (the call-target-provenance guard, `SAFETY_AND_SANDBOX.md` §7a).
 
 - **Annotation** node: `struct Annotation { string name; vector<LiteralValue> args; };`  - 
   attached to `FuncDecl` only (TYPE_SYSTEM.md Section 10/Section 2 grammar - struct

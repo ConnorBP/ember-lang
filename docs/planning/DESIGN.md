@@ -7,8 +7,9 @@ ergonomics, an optimizing native-JIT language's speed.
 **This document is the index.** Each subsystem is fully specified in
 its own detail doc under `docs/`. Read this for the shape and
 cross-references; read the detail docs for the byte-level / rule-level
-answers. See `../RESEARCH_NOTES.md` for the prior-art survey (binprotect,
-a prior native-JIT scripting language, AngelScript, Mun) that grounds every decision below.
+answers. See `../RESEARCH_NOTES.md` for the prior-art survey (a sibling PE
+obfuscator, a prior native-JIT scripting language, AngelScript, Mun) that
+grounds every decision below.
 
 ## Architecture in one page
 
@@ -98,7 +99,7 @@ Non-goals for v1:
   round-trip) and cross-module textual `import "path";` inclusion both
   work. A standard addon set ships as native extensions in `extensions/`
   (vec/quat/mat/string/array/math). The canonical tree is standalone-
-  buildable and standalone-testable: a prism-decoupled `ember` CLI runs
+  buildable and standalone-testable: a host-decoupled `ember` CLI runs
   `.ember` files, and a language regression suite (`tests/lang/` +
   `ember_check`/`sema_check` exes) runs under `ctest`.
   Honest divergence from the spec above: codegen is currently a
@@ -142,8 +143,8 @@ Non-goals for v1:
   host trap-stub → longjmp, fixing red-team V7 `@obf_keyed` forced
   SIGILL). Performance: budget+depth are compile-flag gated — zero
   overhead when off, one sub+jg per loop iteration / one inc+cmp+jcc
-  per call when on. A red-team writeup (`../../../EMBER_REDSHELL_WRITEUP.md` at
-  the workspace root) documents the full attack-surface study + 8
+  per call when on. A red-team writeup at
+  the workspace root documents the full attack-surface study + 8
   prioritized mitigations.
   **NOT shipped** (the original v0.4 prose listed these; they slipped to
   later work): lifecycle annotation *runtime effect* (`@on_tick`/`@event`
@@ -162,7 +163,7 @@ Non-goals for v1:
   added the source half (grammar, sema, codegen, linker/loader, an
   `--emit-em` CLI pre-compile mode). `--tick` lifecycle mode (a tick
   thread + TUI unload keybind, shared between the terminal CLI and the
-  prism runtime) is a suggested follow-on once `@on_tick` has runtime
+  host runtime) is a suggested follow-on once `@on_tick` has runtime
   effect.
 - **v0.6** - benchmark harness vs AngelScript; tune regalloc/peephole
   only if the bench shows a need. This is the gate the SSA-lite IR +
@@ -200,7 +201,7 @@ Non-goals for v1:
   - **First-class function refs (Tier 2)** — `&fn` take-handle,
     `handle(args)` indirect call, `fn` type keyword; `emit_call_target_guard`
     validates the runtime i64 against a host-built bitset allowlist before
-    dispatch (REDSHELL guard #6), `BadCallTarget` trap on a bad handle.
+    dispatch (the call-target-provenance guard), `BadCallTarget` trap on a bad handle.
     Pinned by `examples/function_refs_test.cpp`. Two open items documented at
     `../ROADMAP.md` Tier 2 (bare-`fn` signature hole → `fn(...)->...` typed fn
     params v2+; cross-module handles → v2+). See `plan_FUNCTION_REFS.md`.
@@ -252,7 +253,7 @@ detail docs, summarized here)
   not a forgotten gap (`GAP_ANALYSIS.md` Section 2).
 - Script-side first-class function references shipped **v1.0** (`&fn` /
   `handle(args)` / the `fn` type keyword, `../ROADMAP.md` Tier 2 ✓), with the
-  REDSHELL guard #6 call-target-provenance invariant (`../spec/SAFETY_AND_SANDBOX.md`
+  the call-target-provenance guard invariant (`../spec/SAFETY_AND_SANDBOX.md`
   §7a) as the runtime backstop. Dynamic `register_routine`-style registration
   is host-defined (no ember core change) once a real mod wants it;
   annotation-based static discovery covers the game-loop case (`../LIFECYCLE.md`).

@@ -256,12 +256,12 @@ host-callable functions (mirrors the surveyed native-JIT language's `runtime_err
   simplification (one code path to get right, one thing to test)
   rather than N special-cased error-propagation mechanisms.
 
-### 7a. Call-target provenance (first-class function refs — REDSHELL guard #6, shipped v1.0)
+### 7a. Call-target provenance (first-class function refs — the call-target-provenance guard, shipped v1.0)
 
 First-class function references (`&fn` / `handle(args)` / the `fn` type
 keyword, `../ROADMAP.md` Tier 2 ✓ shipped) open a new runtime surface: a
 script can carry an i64 around and later use it as a call target. The
-i64-as-call-target surface (the V2 vector the REDSHELL writeup names)
+i64-as-call-target surface (the i64-as-call-target vector the safety writeup names)
 gets two guards, one at each layer:
 
 - **Compile-time first line** (sema, `src/sema.cpp`): i64 ↔ fn

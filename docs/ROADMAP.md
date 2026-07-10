@@ -20,7 +20,7 @@ deferral below; each now carries a ✓ shipped marker at its tier entry):
   access; sema rewrites `EnumAccessExpr` to an `IntLit`, no codegen change.
   See Tier 1 below.
 - **Tier 2 first-class function references** — `&fn` / `handle(args)` /
-  `fn` type keyword + the REDSHELL guard #6 call-target-provenance
+  `fn` type keyword + the call-target-provenance guard
   invariant. Two open items documented at the Tier 2 entry (the bare-`fn`
   signature hole, cross-module handles → v2+). See Tier 2 below.
 - **Sync queue primitives** (`extensions/sync/`) — atomics, swap buffer,
@@ -125,7 +125,7 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
   is the host helper that derives the bitset from `script_slots`.
   Pinned by `examples/function_refs_test.cpp` (ctest target
   `function_refs`): handle creation, multi-arg dispatch, recursion via
-  handle (`fib` via `&fib`), and the REDSHELL guard #6 (out-of-range and
+  handle (`fib` via `&fib`), and the call-target-provenance guard (out-of-range and
   in-range-unregistered handles both trap). **No GC needed** — handles
   are slot indices into the existing dispatch table, not heap objects,
   exactly as the original Tier 2 entry predicted. Spec/plan: `planning/plan_FUNCTION_REFS.md`.
@@ -363,7 +363,79 @@ here so the decision and its evidence have a tracked home.
   subsumed by this fix — the owned `string`-handle path is already correct, so
   no separate const-mode feature is needed). Verified: ctest 22/22, lang
   255/0/0 (incl. 5 new `sema_invalid_*` regression tests for the closed
-  categories).
+  categories). See `docs/spec/SPEC_AUDIT_2026-07-10.md` for F4 (the spec
+  side of this — MEMORY_AND_GC §3/COMPILER_PIPELINE §4 called call-arg
+  passing "perfectly fine"; the audit + this fix correct that claim).
+
+- **Codegen optimization (gated on benchmark evidence).** ember v1 is a
+  baseline JIT: a tree-walker that lowers the AST directly to x86-64 with a
+  stack-spilling value convention (every value goes through rax/memory, no
+  register allocation across expressions). The SSA-lite IR + linear-scan
+  regalloc (COMPILER_PIPELINE §5) is the documented target but is EXPLICITLY
+  DEFERRED — DESIGN.md §9: "no speculative optimization before the bench
+  proves it matters." A benchmark system (`bench/`, `spec/BENCHMARK_SYSTEM_
+  DESIGN.md`) now PROVES the need per path, so the optimization design is no
+  longer speculative — it is evidence-gated. The full design is
+  `docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md` (LLVM pass survey × JIT-scripting
+  relevance, per-path waste mapping with line numbers, three architecture
+  options, a staged recommendation, pass interface, migration plan). The
+  roadmap entries below are gated, not scheduled; each carries its benchmark
+  trigger.
+
+  **Benchmark evidence (the gate, from `bench/results_codegen_paths.md`):**
+  ember vs g++ -O2 (median ns ratio, the real "optimizing native" baseline):
+  int_div **1.00x** (YAGNI vindicated — straight-line integer arithmetic is
+  already adequate); call_overhead **5.23x** (safety off) / 6.12x (on);
+  loop_overhead **5.69x** / 6.11x; slice_bounds **5.60x** / 9.15x (the bounds
+  check is +54% safety-on overhead); string_decrypt **5.58x** / 6.27x;
+  struct_by_value **3.00x**. So the SSA-lite IR + linear-scan regalloc is
+  benchmark-PROVEN warranted on 5 of 6 paths, not speculative.
+
+  **Recommended architecture (staged, no flag-day rewrite):**
+  - **Stage 1** — a peephole + per-basic-block local register allocator
+    LAYERED OVER the current tree-walker (keep it, add a post-emit peephole
+    pass over the emitted byte buffer + a local regalloc that keeps values in
+    regs within a basic block, spilling at block boundaries). Ships behind a
+    flag (`enable_peephole`/`enable_local_regalloc`, default off → byte-
+    identical to today, the gate holds). Least invasive, gets much of the win.
+    Gate: the 5-9x call/loop/slice/string slowdowns are spill-bound (confirmed).
+  - **Stage 2** — a thin three-address IR replacing the tree-walker's `eval`
+    with `lower_expr` + emit, with the Stage 1 peephole table carried over as IR
+    passes. Gated on Stage 1's brittleness or cross-block evidence. Gate: Stage 1
+    insufficient on a cross-block-hot workload.
+  - **Stage 3** — full SSA-lite rename + linear-scan regalloc (COMPILER_PIPELINE
+    §5's target). Gated on Stage 2's insufficiency. Gate: Stage 2 insufficient
+    on a spill-heavy workload (CODEGEN_SPEC §5 acceptance criteria become the
+    test surface).
+
+  **Ordered optimization entries (research prediction, confirmed/reordered by
+  the benchmark; build first):**
+  1. **R1 Register allocation** (per-block local → linear-scan) — fixes the
+     BinExpr per-expression spill + the CallExpr arg stash; the most-executed
+     spills. Gate: call_overhead/loop/slice/string are spill-bound (5-9x,
+     confirmed). Stage 1 → 3.
+  2. **R-loop LICM** (loop-invariant code motion) — fixes loop-invariant exprs
+     re-evaluated per iteration (the string_decrypt re-XOR-per-use is exactly
+     this). Gate: loop/string-decrypt workloads invariant-dominated (6x,
+     confirmed for string_decrypt). Stage 1 → 2.
+  3. **P1 Peephole** (redundant-guard trimming + `setcc;movzx`) — per-site byte
+     savings on the div/overflow/bounds/call-target guards. Gate: slice_bounds
+     safety-on is +54% (confirmed). Stage 1.
+  4. **I1 Instruction selection** (smart immediate forms) — `IntLit`→10-byte
+     `mov rax,imm64` always; cheaper forms for small imms. Stage 1.
+  5. **N1 Inlining** (small leaf script fns) — fixes call dispatch overhead;
+     hot-reload interaction (inline only `const`/`@noinline`-marked fns to keep
+     reload correct). Stage 2.
+  6. **T1 Tail-call optimization** — `fib`-style recursion stack/budget-bound.
+     Stage 2.
+  7. **C1/D1/B1/CSE1/R2/W9** — constant prop/folding (the missing folds: Div/
+     Mod, float, comparisons), dead-code/dead-store elim, branch folding,
+     block-local CSE, range propagation (bounds-check elision for induction
+     vars), max-simultaneously-live temp sizing. Stage 1-2, lower predicted win.
+
+  See `docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md` §3 (per-path waste), §4
+  (architecture), §5 (full prediction table) for the complete design; see
+  `docs/spec/BENCHMARK_SYSTEM_DESIGN.md` + `bench/` for the harness + results.
 
 ## What will never be added (hard non-goals)
 

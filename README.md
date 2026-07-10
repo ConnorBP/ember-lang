@@ -84,9 +84,6 @@ Status: **v1.0** - the full frontend + binding API + safe execution + live
   optimizing pipeline, but beats AngelScript's bytecode interpreter).
 - `docs/ROADMAP.md` - every v2+ deferral with a re-entry trigger and
   dependency, tiered by likely build order; hard non-goals listed.
-- `docs/planning/RESTRUCTURE_PLAN.md` - the (fired) plan that promoted prism's
-  in-tree ember to this canonical standalone home, so the language
-  carries no cheat references and is reusable.
 
 Every feature in the original request (C-style syntax, JIT to native
 x86-64, composable chunks via the dispatch table, safety, AngelScript-

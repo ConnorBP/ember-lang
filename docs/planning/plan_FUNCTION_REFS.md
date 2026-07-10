@@ -9,9 +9,9 @@ or a *compile-time-known* host native fn ptr (`c->native_fn`). This plan adds
 a third kind: a call whose target is an i64 that the program produced at
 runtime, validated against a registered-fn allowlist before dispatch.
 
-**Why the guard is load-bearing.** `../../../EMBER_REDSHELL_WRITEUP.md` Section 3 item
-#6 ("call-target provenance invariant, forward guard") fires the instant this
-feature lands: V2 ("i64-as-call-target") is currently STOPPED at sema only
+**Why the guard is load-bearing.** The call-target-provenance invariant
+("call-target provenance, forward guard") fires the instant this
+feature lands: the i64-as-call-target vector is currently STOPPED at sema only
 because there is *no* syntax to call an i64 and *no* `call rax`-by-value path.
 Adding `handle(args)` opens exactly that path. If the JIT'd indirect call were
 a raw `call [dispatch_base + handle*8]` with the handle taken on faith, a
@@ -240,7 +240,7 @@ Add one field to `CallExpr`:
 // a call through a RUNTIME i64 handle, not a compile-time-known name. Sema
 // types indirect_target as a fn handle, records its signature for the
 // call-site arg check, and sets `is_indirect = true`. Codegen validates the
-// handle against the registered-fn allowlist (the REDSHELL guard #6) before
+// handle against the registered-fn allowlist (the call-target-provenance guard) before
 // dispatching (§5). Mutually exclusive with is_native/script_slot/module_alias
 // being set (sema asserts this).
 ExprPtr indirect_target;
@@ -429,9 +429,9 @@ so the runtime guard is mandatory regardless of type-tagging.
 
 **Sema rule that tightens the type path (defense-in-depth, does NOT replace
 the runtime guard):** an assignment / `let` init from a plain `i64` to a
-`fn`-typed variable is a *compile error* (closes V3-style forging at the type
-level, the same way `let s: u8[] = forged_ptr;` is already a sema error,
-`../../../EMBER_REDSHELL_WRITEUP.md` V3). Only `&fn` and a `fn`-typed source produce a
+`fn`-typed variable is a *compile error* (closes the type-forging vector at the type
+level, the same way `let s: u8[] = forged_ptr;` is already a sema error).
+Only `&fn` and a `fn`-typed source produce a
 `fn`-typed value. A host native may *return* a `fn`-typed i64
 (`register
 _routine` returns the handle it stored; §6) — that's the one
@@ -572,7 +572,7 @@ Rejected because:
   where the JIT'd code is about to make an untrusted indirect call — the
   native's return value would be trusted to decide whether to trap, adding a
   trust hop where the bitset has none.
-- It is what `../../../EMBER_REDSHELL_WRITEUP.md` V2's "defensive pairing" explicitly
+- It is exactly what the call-target-provenance invariant explicitly
   does *not* want: "dispatch must validate an i64 used as a call target
   against a registered-fn allowlist; never raw call rax of a script value."
   A bitset the JIT reads directly *is* the allowlist; a native is an
@@ -703,16 +703,15 @@ recursion. No new recursion hazard.
 
 ---
 
-## 7. REDSHELL guard #6 compliance — how the guard prevents raw-call-rax-of-script-value
+## 7. Call-target-provenance guard compliance — how the guard prevents raw-call-rax-of-script-value
 
-The guard's job, stated in `../../../EMBER_REDSHELL_WRITEUP.md` §2 (V2 defensive
-pairing) and §3 item #6: "when first-class function references are ever added,
+The guard's job, stated as the call-target-provenance invariant: "when first-class function references are ever added,
 dispatch must validate an i64 used as a call target against a registered-fn
 allowlist; never raw call rax of a script value."
 
 ### How the guard satisfies it, concretely
 
-The threat model (V2's "i64-as-call-target"): a script produces an i64, treats
+The threat model (the i64-as-call-target vector): a script produces an i64, treats
 it as a call target, and the JIT'd code `call rax` (or `call [dispatch + rax*8]`)
 with no validation. The i64 could be:
 
@@ -769,7 +768,7 @@ with no validation. The i64 could be:
 
 ### The one-line invariant for ../spec/SAFETY_AND_SANDBOX.md
 
-Add to `../spec/SAFETY_AND_SANDBOX.md` (the REDSHELL §3 item #6 forward guard,
+Add to `../spec/SAFETY_AND_SANDBOX.md` (the call-target-provenance forward guard,
 now realized):
 
 > **Call-target provenance (Tier 2).** A first-class function handle is an
@@ -815,7 +814,7 @@ code / trap reason). New file: `examples/v0_7_function_refs_test.cpp`
 | B4 | A float-returning fn called through a handle | exit proves a float-returning fn is callable through a handle (xmm0 result path). |
 | B5 | Recursion via handle: `fn fib(n: i64) -> i64 { if (n <= 1) return n; let f = &fib; return f(n-1) + f(n-2); }` | exit = `fib(N)` for small N. Proves the depth check + guard compose on recursive handle calls. |
 
-### C. The guard — invalid handles trap (the REDSHELL #6 test)
+### C. The guard — invalid handles trap (the call-target-provenance test)
 
 | # | Script | Asserts |
 |---|---|---|

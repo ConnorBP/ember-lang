@@ -36,7 +36,7 @@ can touch them concurrently without ember-side synchronization:
   host invocation must participate in that domain.
 
 - **JIT'd code bytes after `finalize`.** `alloc_executable` commits the page
-  (the REDSHELL writeup flagged RWX as a latent V5 catastrophe; v0.4 hardened
+  (the safety writeup flagged RWX as a latent V5 catastrophe; v0.4 hardened
   it to RW→memcpy→RX, per `DESIGN.md` v0.4 entry). After finalize the
   page is RX; multiple threads executing the same function body
   simultaneously is fine (it's pure code, no embedded mutable state in the
@@ -778,4 +778,4 @@ test. Those are later batches.
 | Spec: per-`context_t` parallelism allowed, in-context not | `../spec/SAFETY_AND_SANDBOX.md §8` |
 | Hot reload: outer-call guards + concurrent epoch reclamation | `../HOT_RELOAD.md §5` |
 | ROADMAP: `aint*`/`thread` deferred; multi-context covers most | `../ROADMAP.md` Tier 5 (`:119`–`125`) |
-| REDSHELL: trap-surface / budgets / checkpoint spec | `../../../EMBER_REDSHELL_WRITEUP.md` §0, V6-DoS, V7 (workspace root) |
+| Safety: trap-surface / budgets / checkpoint spec | `../spec/SAFETY_AND_SANDBOX.md` §2–§7 (checkpoint, budget, depth, bounds, FFI gating, traps) |

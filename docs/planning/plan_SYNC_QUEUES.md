@@ -255,7 +255,7 @@ swapbuf_free(h: swapbuf)
 - `swapbuf_write` is **script-side only** (writes front).
 - `swapbuf_read` is **host-side** (reads back) — exposed as a native for
   symmetry, but the host typically reaches in via the public accessor
-  `swapbuf_back_ptr(h, &out, &len)` (see §5), the same way `prism`'s
+  `swapbuf_back_ptr(h, &out, &len)` (see §5), the same way the host's
   shader draw calls reach into `ext_array::get_bytes`. The native form lets
   a *script* also consume if the dataflow is reversed (host produces, script
   consumes) — the buffer is symmetric; "front" is just "the side the last
@@ -616,7 +616,7 @@ ember/extensions/sync/
 // swap buffer, SPSC/MPSC/MPMC queues). See plan_SYNC_QUEUES.md.
 //
 // An ember *extension* (see ../../extensions/README.md): a reusable,
-// non-cheat-specific addon. Host-owned, internally-synchronized storage
+// non-host-specific addon. Host-owned, internally-synchronized storage
 // behind opaque i64 handles. Each primitive's store is a separate host
 // std::vector of slots; reset() clears them all.
 //
@@ -712,7 +712,7 @@ ember_add_extension(sync   extensions/sync/ext_sync.cpp)
 
 This produces `ember_ext_sync`, a static lib linking `ember_frontend`
 PUBLIC (the macro does this; sync needs `make_prim`/`bind_handle`/`Type`
-symbols from `ember_frontend`, same as the other six). A consumer (prism,
+symbols from `ember_frontend`, same as the other six). A consumer (the host,
 or a future second consumer) links it and calls
 `ember::ext_sync::register_natives(m)` + `ember::ext_sync::reset()` from
 its own host native-table builder + per-run reset, exactly as it does for
@@ -858,13 +858,13 @@ Tests:
 
 ---
 
-## 7. Red-team guard #8 compliance — backing-store isolation
+## 7. Backing-store-isolation guard compliance — backing-store isolation
 
-`../../../EMBER_REDSHELL_WRITEUP.md` (workspace root) Section 3, mitigation #8:
+The backing-store isolation invariant:
 
 > **Backing-store isolation invariant:** array/string host stores must
 > never be co-located with exec memory or the dispatch table (make today's
-> accident an invariant). [Closes V4 defense-in-depth; spec section:
+> accident an invariant). [Closes the V4 defense-in-depth finding; spec section:
 > SAFETY §5]
 
 The V4 finding it backs: every `array`/`string` native is per-index bounds-
@@ -891,14 +891,14 @@ exec memory or the dispatch table.**
 2. **The handles are 1-based small integers into a `std::vector`, not
    pointers** — mirroring `ext_array` exactly. A script holding an `atomic`
    handle holds, e.g., `3` (the third slot), not a pointer. There is no
-   native in this addon that returns a raw pointer as an `i64` (the REDSHELL
+   native in this addon that returns a raw pointer as an `i64` (the pointer-leak
    V5 finding's "no native hands out an exec-memory address" invariant is
    preserved — this addon doesn't hand out *any* address, exec or not, as
    an i64; handles are indices).
 3. **The one slice/pointer accessor** — `swapbuf_back_ptr` — returns a
    `int64_t*` to the *host heap* `std::vector`'s storage, to a *host C++
    caller*, not to the script. This mirrors `ext_array::get_bytes` (which
-   returns a `uint8_t*` to a host caller). The REDSHELL V3 invariant ("a
+   returns a `uint8_t*` to a host caller). The V3 pointer-provenance invariant ("a
    slice ptr cannot be forged; no native constructs a slice from a
    script-supplied i64 ptr") is preserved: `swapbuf_back_ptr` is a C++
    function the host calls directly (it's not a registered ember native;
@@ -928,7 +928,7 @@ exec memory or the dispatch table.**
    it's not on the dispatch table. The lock's existence doesn't change the
    backing-store isolation story — it's just another host-heap member.
 
-**Net:** the addon is REDSHELL guard #8 compliant by construction, because
+**Net:** the addon is backing-store-isolation-guard compliant by construction, because
 it's structurally identical to `ext_array`/`ext_string` (host `std::vector`
 of slots, 1-based handles, bounds-checked indexed natives, host-callable
 pointer accessors that never go through the script ABI) — and it adds no
@@ -965,7 +965,7 @@ safe for concurrent calls (U1 is the separate `plan_CONTEXT_THREADSAFETY.md`
 batch). Use under the U2 contract: the script side is single-threaded per
 context; host threads produce/consume via the `_host` C++ accessors and
 never call ember. Tests reflect this: the multi-thread stress tests never
-put two ember-calling threads on one context. REDSHELL guard #8 (backing-
+put two ember-calling threads on one context. The backing-store-isolation guard (backing-
 store isolation) is satisfied by construction — the stores are host heap,
 handles are indices, no native writes to a passed address.**
 
