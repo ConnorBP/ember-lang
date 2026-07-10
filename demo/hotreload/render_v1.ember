@@ -1,0 +1,27 @@
+// render_v1.ember - hot-reload demo renderer, version 1 (the baseline body).
+//
+// This is one of three .ember source files the hotreload harness swaps in
+// at runtime via reload_function + HotReloadDomain. The signature
+// `fn renderer() -> i64` is the reload invariant: it MUST stay byte-identical
+// across every version (reload_function rejects any arity/param/return change).
+// Only the body changes between versions.
+//
+// v1 prints the frame marker 11 (a host native `emit_frame(code)` appends the
+// code to a deterministic host output buffer). Three ticks of v1 produce the
+// expected sub-string "11 11 11".
+//
+// The `frame_count` global is declared here in the INITIAL module so the
+// globals block is sized for it from the start (the block is fixed-size for
+// the module's lifetime; reload only swaps the renderer's executable page,
+// never the globals block). v1 and v2 do not touch it; v3's reloaded body
+// reads/writes it. This is the reload-model constraint a demo must respect:
+// a reload can swap a function body and use any pre-existing global, but it
+// cannot INTRODUCE a new global (the globals base is baked as an absolute
+// imm64 into every already-JIT'd page; growing the block would move .data()
+// and invalidate those addresses).
+global frame_count : i64 = 0;
+
+fn renderer() -> i64 {
+    emit_frame(11);
+    return 1;
+}

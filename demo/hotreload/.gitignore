@@ -1,0 +1,3 @@
+# built demo artifacts — do not commit the .exe (build it with the pinned
+# toolchain: see demo/hotreload/NOTES.md "Status" section for the g++ command).
+*.exe

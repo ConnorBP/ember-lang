@@ -1,0 +1,22 @@
+// render_v3.ember - hot-reload demo renderer, version 3 (uses the counter).
+//
+// Same signature as v1/v2 (`fn renderer() -> i64` — the reload invariant).
+// The body adds a per-frame counter via the module's `frame_count` global
+// (declared in render_v1.ember, sized into the globals block at initial
+// compile), proving a reloaded function can carry mutable state across ticks
+// within its version. The counter starts at zero (the initial-compile
+// const-initializer seed), so the first v3 tick sees frame_count == 0, bumps
+// it to 1, emits marker 33, then emits the new count via `emit_count(c)`.
+//
+// This file is the RELOAD source (parsed as a complete program by
+// reload_function, which extracts the single `fn renderer` and ignores any
+// other declarations). It references `frame_count` but does NOT redeclare it
+// — the global already exists in the module being reloaded (the initial v1
+// program). Whole-module sema during reload resolves `frame_count` against the
+// existing prog.globals, so the reference is sound.
+fn renderer() -> i64 {
+    emit_frame(33);
+    frame_count = frame_count + 1;
+    emit_count(frame_count);
+    return 1;
+}

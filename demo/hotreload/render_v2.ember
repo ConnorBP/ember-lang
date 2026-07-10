@@ -1,0 +1,17 @@
+// render_v2.ember - hot-reload demo renderer, version 2 (the swapped-in body).
+//
+// Same signature as v1 (`fn renderer() -> i64` — the reload invariant). Only
+// the body differs: it emits frame marker 22 instead of 11, so the live-reload
+// is visible in the host output buffer as the marker changing mid-tick-loop.
+// This is the proof that the new page takes effect atomically: the next tick
+// after publication runs v2, not v1.
+//
+// This file is the RELOAD source (parsed as a complete program by
+// reload_function, which extracts the single `fn renderer` and ignores any
+// other declarations). It declares no globals — the `frame_count` global
+// belongs to the initial module (render_v1.ember) and is already sized into
+// the globals block. v2 does not use it.
+fn renderer() -> i64 {
+    emit_frame(22);
+    return 1;
+}
