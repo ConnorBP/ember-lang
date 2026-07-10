@@ -372,11 +372,11 @@ here so the decision and its evidence have a tracked home.
   stack-spilling value convention (every value goes through rax/memory, no
   register allocation across expressions). The SSA-lite IR + linear-scan
   regalloc (COMPILER_PIPELINE §5) is the documented target but is EXPLICITLY
-  DEFERRED — DESIGN.md §9: "no speculative optimization before the bench
-  proves it matters." A benchmark system (`bench/`, `spec/BENCHMARK_SYSTEM_
+  DEFERRED — `../planning/DESIGN.md` §9: "no speculative optimization before the bench
+  proves it matters." A benchmark system (`bench/`, `../spec/BENCHMARK_SYSTEM_
   DESIGN.md`) now PROVES the need per path, so the optimization design is no
   longer speculative — it is evidence-gated. The full design is
-  `docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md` (LLVM pass survey × JIT-scripting
+  `../spec/CODEGEN_OPTIMIZATION_DESIGN.md` (LLVM pass survey × JIT-scripting
   relevance, per-path waste mapping with line numbers, three architecture
   options, a staged recommendation, pass interface, migration plan). The
   roadmap entries below are gated, not scheduled; each carries its benchmark
@@ -433,9 +433,9 @@ here so the decision and its evidence have a tracked home.
      block-local CSE, range propagation (bounds-check elision for induction
      vars), max-simultaneously-live temp sizing. Stage 1-2, lower predicted win.
 
-  See `docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md` §3 (per-path waste), §4
+  See `../spec/CODEGEN_OPTIMIZATION_DESIGN.md` §3 (per-path waste), §4
   (architecture), §5 (full prediction table) for the complete design; see
-  `docs/spec/BENCHMARK_SYSTEM_DESIGN.md` + `bench/` for the harness + results.
+  `../spec/BENCHMARK_SYSTEM_DESIGN.md` + `bench/` for the harness + results.
 
 ## What will never be added (hard non-goals)
 

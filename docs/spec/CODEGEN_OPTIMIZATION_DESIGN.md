@@ -102,7 +102,7 @@ faster than AngelScript** (the bytecode interpreter) on every workload:
 | nested_calls (1e7) | 136.30 | 777.72 | 0.18 |
 | mandelbrot (200×200, iters=50) | 3.69 | 6.53 | 0.56 |
 
-This is the categorical native-vs-bytecode win (`GAP_ANALYSIS.md` §4: baseline native
+This is the categorical native-vs-bytecode win (`../planning/GAP_ANALYSIS.md` §4: baseline native
 beats a bytecode interpreter by 5–50×). It does **not** tell us where ember is slow
 *relative to an optimizing native-JIT language* — that is the gap t109 closes. The
 existing bench harness is the seed t109 extends; the design below assumes t109
@@ -732,7 +732,7 @@ first" ordering the research suggests; t109 reorders if the evidence says so).
 
 ### 4.9. Inlining × hot reload (the design constraint on N1)
 
-ember's hot reload (`HOT_RELOAD.md`) replaces a function's dispatch-table slot
+ember's hot reload (`../HOT_RELOAD.md`) replaces a function's dispatch-table slot
 atomically; every caller's `call [table+slot*8]` re-routes without recompilation.
 **Inlining breaks this**: an inlined call site has the callee's body baked into the
 caller's bytes, so a callee hot-reload does not update the inlined site until the

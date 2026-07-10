@@ -276,7 +276,7 @@ stable across runs — slice/string/loop/call are always 5-9x, struct ~3x, int_d
 ### 8.3 What the evidence says (the gate's input)
 
 - **Five of six codegen paths are 5-9x slower than g++ -O2.** This is the
-  per-path evidence the gate (`DESIGN.md` §9 / `COMPILER_PIPELINE.md` §5) was
+  per-path evidence the gate (`../planning/DESIGN.md` §9 / `COMPILER_PIPELINE.md` §5) was
   waiting for: the tree-walking stack-spilling codegen is NOT adequate on the
   call/loop/slice/string paths. The SSA-lite IR + linear-scan regalloc target
   design (`COMPILER_PIPELINE.md` §5) is now **benchmark-proven to matter** on
