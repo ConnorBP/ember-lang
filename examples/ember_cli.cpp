@@ -55,6 +55,7 @@
 #include "ext_string.hpp"
 #include "ext_array.hpp"
 #include "ext_math.hpp"
+#include "ext_lifecycle.hpp"   // v1.0: register_routine/unregister_routine (dynamic registration)
 
 #include <cstdio>
 #include <csetjmp>   // setjmp/longjmp (v0.4 safe-execution checkpoint)
@@ -215,6 +216,7 @@ int main(int argc, char** argv) {
     ext_string::register_natives(natives);
     ext_array::register_natives(natives);
     ext_math::register_natives(natives);
+    ember::ext_lifecycle::register_natives(natives);  // v1.0: dynamic registration (register_routine/unregister_routine)
 
     OpOverloadTable overloads;
     ext_vec::register_overloads(overloads);
@@ -465,13 +467,14 @@ int main(int argc, char** argv) {
         bool entry_says_stay = (entry_decl && entry_decl->ret && !entry_decl->ret->is_void())
                                ? (exit_code > 0) : true;
         auto ticks = ember::get_annotated_functions(pr.program, "@on_tick");
+        auto dyn_routines = ember::ext_lifecycle::host_routines();  // v1.0: dynamically-registered routines
         if (!entry_says_stay) {
             std::printf("ember: @entry returned <= 0, module unloaded (no tick)\n");
-        } else if (ticks.empty()) {
-            std::printf("ember: --tick mode but no @on_tick functions; nothing to tick\n");
+        } else if (ticks.empty() && dyn_routines.empty()) {
+            std::printf("ember: --tick mode but no @on_tick functions and no dynamically-registered routines; nothing to tick\n");
         } else {
-            std::printf("ember: --tick mode — %zu @on_tick fn(s), %dms interval. Press 'q' to unload + exit.\n",
-                        ticks.size(), tick_interval_ms);
+            std::printf("ember: --tick mode — %zu @on_tick fn(s) + %zu dynamic routine(s), %dms interval. Press 'q' to unload + exit.\n",
+                        ticks.size(), dyn_routines.size(), tick_interval_ms);
             std::atomic<bool> stop{false};
             std::atomic<uint64_t> tick_count{0};
             // The tick thread calls each @on_tick fn via the dispatch table.
@@ -499,6 +502,17 @@ int main(int argc, char** argv) {
                             ember::ember_call_void(f, &tick_ctx);  // r14 = tick_ctx; isolated from ectx
                         }
                     }
+                    // v1.0: also drive any DYNAMICALLY-REGISTERED routines (register_routine
+                    // in the script stored (slot, data) pairs; the host calls each via the
+                    // dispatch table with data as the arg — the §6.2 dynamic-registration
+                    // call path, same mechanism as @on_tick, discovered by the script at runtime).
+                    for (auto& r : ember::ext_lifecycle::host_routines()) {
+                        void* f = table.get(int(r.slot));
+                        if (f) {
+                            // The routine takes one i64 arg (data); use ember_call_i64 (rcx=data).
+                            ember::ember_call_i64(f, &tick_ctx, r.data);
+                        }
+                    }
                     tick_ctx.has_checkpoint = false;
                     tick_count.fetch_add(1, std::memory_order_relaxed);
                     std::this_thread::sleep_for(std::chrono::milliseconds(tick_interval_ms));
@@ -524,6 +538,7 @@ int main(int argc, char** argv) {
     // reset extension host stores (array/string own process-global storage)
     ext_vec::reset(); ext_quat::reset(); ext_mat::reset();
     ext_string::reset(); ext_array::reset();
+    ember::ext_lifecycle::reset();   // v1.0: clear the dynamic-registration routine table
     // ext_math is stateless (no reset()).
 
     return exit_code;

@@ -225,7 +225,8 @@ add_executable(ember_cli examples/ember_cli.cpp)
 target_link_libraries(ember_cli PRIVATE
     ember ember_frontend ember_import
     ember_ext_vec ember_ext_quat ember_ext_mat
-    ember_ext_string ember_ext_array ember_ext_math)
+    ember_ext_string ember_ext_array ember_ext_math
+    ember_ext_lifecycle)   # v1.0: register_routine/unregister_routine (dynamic registration)
 
 # ---- binding ABI correctness suite (BINDING_API.md Sec 4) ----
 # Pins the script->native Win64 call ABI (struct-by-value arg <=8B,
