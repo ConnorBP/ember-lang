@@ -294,7 +294,9 @@ int main(int argc, char** argv) {
     }
     std::vector<uint8_t> gb_store(pr.program.globals.size() * 8, 0);
     gb.base = int64_t(gb_store.data());
-    g_globals_for_codegen = &gb;
+    // v1.0 thread-safety: thread globals index/types through CodeGenCtx instead
+    // of the process-wide g_globals_for_codegen pointer (parallel-compile-safe).
+    g_globals_for_codegen = nullptr;   // not consulted — ctx.globals_index used
     // v1.0: seed const global initializers into the block (global g = 10; starts
     // at 10, not 0). Non-const inits (g = some_fn();) stay zero — a host or
     // @entry seeds those. The v1.0 integration found this gap; see
@@ -305,6 +307,8 @@ int main(int argc, char** argv) {
     DispatchTable table(pr.program.funcs.size());
     CodeGenCtx ctx;
     ctx.globals_base = gb.base;
+    ctx.globals_index = &gb.index;      // v1.0: parallel-compile-safe globals resolution
+    ctx.globals_types = &gb.types;
     ctx.dispatch_base = int64_t(table.base());
     ctx.natives = &natives;
     ctx.script_slots = &slots;
@@ -318,21 +322,34 @@ int main(int argc, char** argv) {
     // str_decrypt_fn stays null: key=0 above means string literals never
     // emit a decrypt call, so no __str_decrypt native is needed.
 
-    // ---- v0.4 safe-execution context (SAFETY_AND_SANDBOX.md §2-§4) ----
+    // ---- v0.4/v1.0 safe-execution context (SAFETY_AND_SANDBOX.md §2-§4) ----
     // The CLI runs untrusted .ember input, so enable BOTH budgets + route
     // all traps through the stub (longjmp to a checkpoint). Trusted-tool
     // hosts leave these off/null for zero JIT overhead (see context.hpp).
+    //
+    // v1.0 thread-safety (Option D + B1): compile with use_context_reg=true so
+    // the budget/depth/trap reads go through r14 (the per-call context register)
+    // instead of a baked pointer. This FIXES the --tick bug: the tick thread can
+    // use its OWN context_t (passed via ember_call_void -> r14) without corrupting
+    // the main thread's context. One compiled body serves both threads' contexts.
     context_t ectx;
     ectx.budget_remaining = 100000000;   // 100M coarse instructions per call (~ generous)
     ectx.max_call_depth = 512;
     ectx.has_checkpoint = false;
-    ctx.trap_stub = reinterpret_cast<void*>(&ember_cli_trap);
-    ctx.trap_ctx  = &ectx;
-    ctx.budget_ptr = &ectx.budget_remaining;
+    ctx.trap_stub = reinterpret_cast<void*>(&ember_cli_trap);  // host fn (constant) — still baked
+    // B1: budget/depth/trap_ctx are NOT baked — read through r14 per call. So we
+    // do NOT set ctx.budget_ptr/depth_ptr/trap_ctx; the JIT'd code loads them from
+    // [r14 + context_offsets::*] at each check.
+    ctx.use_context_reg = true;
     ctx.emit_budget_checks = true;
-    ctx.depth_ptr  = &ectx.call_depth;
     ctx.max_call_depth = ectx.max_call_depth;
     ctx.emit_depth_checks = true;
+    // v1.0 Tier 2: build + wire the fn allowlist so a CLI-loaded script that uses
+    // &fn / handle(args) works (the guard validates runtime handles; no-op when
+    // the script doesn't use function refs — fn_slot_count reflects the slots).
+    std::vector<uint8_t> fn_allowlist = build_fn_allowlist(slots, int(slots.size()));
+    ctx.fn_allowlist_base = int64_t(fn_allowlist.data());
+    ctx.fn_slot_count = int64_t(slots.size());
 
     // ---- compile + finalize each function ----
     std::vector<CompiledFn> fns;
@@ -428,8 +445,10 @@ int main(int argc, char** argv) {
                      ectx.last_error.c_str(), ember::trap_reason_str(ectx.last_trap));
         exit_code = 70;   // distinct from valid script return codes + parse/sema exit 2
     } else if (!returns_void) {
-        using F0 = int64_t(*)();   // 0-arg, returns i64 in rax
-        int64_t r = reinterpret_cast<F0>(entry)();
+        // v1.0 B1: call via ember_call_void(entry, &ectx) — sets r14 = the
+        // per-call context register before the call. The JIT'd budget/depth/trap
+        // reads go through r14, so ectx is the live context for this call.
+        int64_t r = ember::ember_call_void(entry, &ectx);
         exit_code = int(r & 0x7fffffff);   // clamp to a usable exit code
     }
     ectx.has_checkpoint = false;
@@ -460,31 +479,27 @@ int main(int argc, char** argv) {
             // stops the tick thread + sets a flag, not a process crash).
             std::atomic<bool> tick_trapped{false};
             std::thread tick_thread([&]() {
-                using F0 = int64_t(*)();
+                // v1.0 B1: the tick thread uses its OWN context_t (passed via
+                // ember_call_void -> r14), fully isolated from the main thread's
+                // ectx. This fixes the pre-B1 --tick bug where the tick thread
+                // reused ectx and a trap on one thread could longjmp to the other's
+                // checkpoint. Each tick gets a fresh checkpoint; a trap stops THIS
+                // tick (sets tick_trapped), not the process or the main thread.
+                context_t tick_ctx; tick_ctx.max_call_depth = 512; tick_ctx.budget_remaining = 100000000;
                 while (!stop.load(std::memory_order_relaxed)) {
                     if (tick_max > 0 && tick_count.load(std::memory_order_relaxed) >= (uint64_t)tick_max) { stop.store(true); break; }
+                    tick_ctx.call_depth = 0;  // reset per tick (budget NOT reset — host's responsibility)
+                    tick_ctx.has_checkpoint = true;
+                    if (__builtin_setjmp(tick_ctx.checkpoint)) {
+                        tick_trapped.store(true); stop.store(true); break;
+                    }
                     for (auto& af : ticks) {
                         void* f = table.get(af.slot);
                         if (f) {
-                            // per-tick checkpoint: a trap stops THIS tick, not the process.
-                            context_t tctx; tctx.has_checkpoint = true; tctx.max_call_depth = 512;
-                            tctx.budget_remaining = 100000000;
-                            // NB: the trap stub is process-wide (ember_cli_trap); it longjmps
-                            // to tctx.checkpoint. We pass &tctx as trap_ctx for this tick.
-                            // (ember_cli_trap uses __builtin_longjmp on the passed ctx.)
-                            extern void ember_cli_trap(ember::context_t*, int, const char*);
-                            // The JIT'd code baked ctx.trap_ctx = &ectx at compile time, so a
-                            // trap in a tick longjmps to ECTX's checkpoint (already cleared).
-                            // For tick-safety we instead catch via a wrapper: run the tick in a
-                            // try via the existing ectx checkpoint re-arm. Simpler: re-arm ectx.
-                            ectx.has_checkpoint = true;
-                            if (__builtin_setjmp(ectx.checkpoint)) {
-                                tick_trapped.store(true); stop.store(true); break;
-                            }
-                            reinterpret_cast<F0>(f)();
-                            ectx.has_checkpoint = false;
+                            ember::ember_call_void(f, &tick_ctx);  // r14 = tick_ctx; isolated from ectx
                         }
                     }
+                    tick_ctx.has_checkpoint = false;
                     tick_count.fetch_add(1, std::memory_order_relaxed);
                     std::this_thread::sleep_for(std::chrono::milliseconds(tick_interval_ms));
                 }
