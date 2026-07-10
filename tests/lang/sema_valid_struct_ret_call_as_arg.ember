@@ -1,0 +1,20 @@
+// sema-valid: a struct-returning call may be used directly as another call's
+// struct-by-value argument (when the argument's struct type matches the
+// parameter's). Codegen materializes the inner call's result into a
+// compiler-hidden temp frame slot (forwarding the temp's address as the
+// inner call's hidden word-0 return pointer), then copies that temp's bytes
+// into the outer call's arg stash. (Relaxation of the prior "struct-by-value
+// arg must be a bare local" restriction - the binding_abi_test pins the
+// runtime value, including a nested struct-returning-call-as-arg case.)
+struct Point { x: i64; y: i64; }
+
+fn make_point(x: i64, y: i64) -> Point {
+    let p: Point = Point { x: x, y: y };
+    return p;
+}
+fn sum_point(p: Point) -> i64 { return p.x + p.y; }
+
+fn main() -> i64 {
+    let r: i64 = sum_point(make_point(1, 2));
+    return r;
+}

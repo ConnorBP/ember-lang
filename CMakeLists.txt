@@ -346,6 +346,40 @@ if(WIN32)
 endif()
 add_test(NAME float_global_regression COMMAND float_global_regression)
 
+# array_lit_test - pins array-literal expressions (chunk c2): fixed-array
+# construction `let arr: i64[3] = [1,2,3];` and slice construction
+# `let s: i64[] = [1,2,3];`. Compiles tiny .ember probes through the full
+# pipeline and reads the i64 return directly via C (a non-circular direct-
+# value probe - NOT an in-language comparison). A reverted LetStmt-init /
+# eval() slice / sema type-bake fix turns this red. Pure language features
+# (no native calls), so links only the core libs (independent of the
+# extension refactor). Mirrors float_global_regression's link shape.
+add_executable(array_lit_test examples/array_lit_test.cpp)
+target_link_libraries(array_lit_test PRIVATE ember ember_frontend ember_import)
+if(WIN32)
+    target_link_libraries(array_lit_test PRIVATE kernel32)
+endif()
+add_test(NAME array_lit COMMAND array_lit_test)
+
+# aggregate_global_test - pins aggregate globals (chunk c3): struct globals
+# `global cfg : Config = Config{...};`, fixed-array globals `global arr : i64[3]
+# = [10,20,30];`, slice globals `global s : i64[] = [1,2,3];`. Compiles tiny
+# .ember probes through the full pipeline and reads the i64 return directly
+# via C (a non-circular direct-value probe - NOT an in-language comparison).
+# A reverted fix (typed globals-block layout removed, StructLit/ArrayLit
+# const-fold removed, FieldExpr/IndexExpr global-base path removed) -> a wrong
+# exit code -> this test records FAIL. Also exercises the c1 interactions
+# (struct global by-value arg + by-value return fall back to the global
+# base) and the H12 .em round-trip for struct/array/slice globals (the slice
+# global's relative-ptr makes its .em round-trip work without a loader change).
+add_executable(aggregate_global_test examples/aggregate_global_test.cpp)
+target_link_libraries(aggregate_global_test PRIVATE ember ember_frontend ember_import)
+if(WIN32)
+    target_link_libraries(aggregate_global_test PRIVATE kernel32)
+endif()
+add_test(NAME aggregate_global COMMAND aggregate_global_test)
+
 set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
     v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
+    array_lit aggregate_global
     PROPERTIES TIMEOUT 30)

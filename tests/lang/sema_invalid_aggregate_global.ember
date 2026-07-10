@@ -1,2 +1,0 @@
-global values: i64[2] = 0 as i64[2];
-fn bad() -> i64 { return 0; }

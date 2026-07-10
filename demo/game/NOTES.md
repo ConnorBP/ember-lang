@@ -131,17 +131,34 @@ in the first draft of the demo wrongly said `(w, x, y, z)` — the demo's
 identity, got `quat_w == 0`). Fixed to `quat_new(0, 0, 0, 1)`.
 
 **L4. Struct-return + struct-by-value-arg ABI restrictions (Win64 hidden
-pointer).** A fn cannot `return Entity { ... }` directly — must `let r : Entity
+pointer).** ~~A fn cannot `return Entity { ... }` directly — must `let r : Entity
 = Entity { ... }; return r;`. A struct-by-value arg must be a plain local — not a
-struct literal or a struct-returning fn call. The demo stores every struct
-return in a local (`integrate`, `bounce`, `load_entity`) and passes only locals
-as struct args. These are the same restrictions `demo/NOTES.md` (the prior demo)
-recorded (M10-adjacent); kept as-is.
+struct literal or a struct-returning fn call.~~ **RESOLVED:** both restrictions
+are relaxed — a fn may now `return Entity { ... };` directly and a struct-by-
+value arg may be a struct literal or a struct-returning fn call (codegen
+materializes these into a compiler-hidden temp frame slot). The demo's
+workarounds (stashing every struct return in a local, passing only locals as
+struct args) still work but are no longer required; pinned by the non-circular
+`binding_abi_test` probes [2c] (struct-literal return), [2d] (`v3_dot(v3_up(),
+v3_up())` — struct-ret-call as arg), and [2e] (nested struct-ret-call arg).
+These were the same restrictions `demo/NOTES.md` (the prior demo) recorded
+(M10-adjacent).
 
 **L5. No aggregate global initialization (audit M11).** Globals accept only
 scalar initializers. The SoA store handles (`store_pos_vel`, `store_active`) are
 `global : i64 = 0` (scalar), seeded by `init_store` in `@entry`. No struct/array
 literals at global scope. Consistent with the prior demo.
+
+   **RESOLVED (first-class struct / aggregate pass, 2026-07-10):** aggregate
+globals now ship — struct, fixed-array, and slice globals all type-check,
+initialize, load, and store, with the globals table carrying typed per-global
+offsets/sizes (slices 16 bytes ptr+len, structs/arrays their full layout). The
+`init_store`-in-`@entry` workaround still compiles and is still the right shape
+for this sim (the SoA store handles are host-created `array<T>` extension
+handles, not script aggregate literals), but a struct/array/slice *value* global
+is no longer rejected. Pinned by the non-circular `aggregate_global_test` ctest
+probes [1]-[8]. Documented in `docs/TYPE_SYSTEM.md` §12.2 and
+`docs/CODEGEN_SPEC.md` §16.
 
 **L6. `let` bindings are immutable; `let mut` opts into reassignment.** The
 `bounce` locals (`px`, `py`, `vx`, `vy`) and the `approx_eq` slack (`d`) must be

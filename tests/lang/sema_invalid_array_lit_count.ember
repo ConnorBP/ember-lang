@@ -1,0 +1,7 @@
+// invalid for sema: a fixed-array array literal must have exactly N elements
+// for a declared T[N] target. `[1, 2, 3]` for an i64[2] is a count mismatch
+// (3 vs 2). Parses fine (the bracket grammar is unambiguous); fails at sema.
+fn bad() -> i64 {
+    let arr: i64[2] = [1, 2, 3];
+    return arr[0];
+}

@@ -1,0 +1,10 @@
+// valid for sema: a fixed-array array literal `[1, 2, 3]` constructs an i64[3]
+// in one expression (chunk c2). Count must match the declared extent exactly;
+// element types must match the declared element type (int literals coerce to
+// the declared int width via the existing adapt_int_lit path). Runtime
+// execution is covered by examples/array_lit_test.cpp (a non-circular direct
+// exit-code probe); this file only needs to sema-pass.
+fn main() -> i64 {
+    let arr: i64[3] = [10, 20, 30];
+    return arr[0] + arr[1] + arr[2];
+}

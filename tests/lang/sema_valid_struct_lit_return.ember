@@ -1,0 +1,3 @@
+struct V3 { x: f32; y: f32; z: f32; }
+fn up() -> V3 { return V3 { x: 0.0f, y: 1.0f, z: 0.0f }; }
+fn main() -> i64 { return 0; }

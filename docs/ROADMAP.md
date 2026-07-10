@@ -313,12 +313,69 @@ sync primitives serve). Going forward the same trigger-driven rule applies:
 adding features driven by measured need, not speculative demand, is the
 whole point of the staged plan.
 
-## HIGH PRIORITY — first-class struct / aggregate (re-entry trigger: met)
+## SHIPPED — first-class struct / aggregate (was HIGH PRIORITY; shipped 2026-07-10)
 
-**Priority:** HIGH. The re-entry trigger has fired: the 2026-07-10 multi-file
-demo (`demo/`) and the game-sim/compiler/hot-reload/concurrency demos surfaced
-this as the single biggest ergonomic blocker to writing real ember programs.
-Every non-trivial module fights it.
+**Status: SHIPPED (2026-07-10).** The re-entry trigger had fired: the
+2026-07-10 multi-file demo (`demo/`) and the game-sim/compiler/hot-reload/
+concurrency demos surfaced this as the single biggest ergonomic blocker to
+writing real ember programs — every non-trivial module fought it. The pass
+closed all four concrete gaps in a single coordinated chunk (c1 struct-literal
+return + struct-by-value-arg temps; c2 array literals; c3 aggregate globals),
+then validated the result by marking each demo's workaround kinks RESOLVED,
+documenting the four features in `docs/TYPE_SYSTEM.md` §12 and
+`docs/CODEGEN_SPEC.md` §16, and re-running all four demos (game / compiler /
+hot-reload / concurrency) green.
+
+**Shipped (2026-07-10), four sub-features:**
+
+1. **Struct-literal return** — a fn may now `return V3 { ... };` directly.
+   Codegen materializes the struct literal into a compiler-hidden temp frame
+   slot, then copies it through the Win64 hidden return pointer. Regression:
+   `binding_abi_test` probe [2c] (`V3{1,2,3}.x+y+z==6.0`, host reads fields
+   directly — non-circular). Docs: `docs/CODEGEN_SPEC.md` §16.
+2. **Struct-by-value-arg temporaries** — a struct-by-value arg may now be a
+   struct literal, a struct-returning fn call, or a bare local. Codegen
+   materializes a general-expr struct arg into a distinct compiler-hidden
+   temp frame slot (one distinct temp per arg, never reused within a call) and
+   copies bytes into the arg-stash slot. `v3_dot(v3_up(), v3_up())` now works.
+   Regression: `binding_abi_test` probes [2d] (`v3_dot(v3_up(),v3_up())==1.0`)
+   and [2e] (nested `v3_shift(v3_up())==(1,1,0)`). Docs: `docs/CODEGEN_SPEC.md` §16.
+3. **Array literals** — `[a, b, c]` is a first-class expression constructing a
+   fixed array (`let arr: i64[3] = [10, 20, 30];`) or a slice (`let s: i64[] =
+   [1, 2, 3];` — allocates a backing store, yields ptr/len). Declared type
+   required (no inference); count and element type checked; empty `[]` rejected.
+   Regression: `array_lit_test` probes [1]-[8] (fixed-array + slice construction,
+   full-i64 storage pinned via the direct C read path). Docs:
+   `docs/TYPE_SYSTEM.md` §12.1, `docs/CODEGEN_SPEC.md` §16.
+4. **Aggregate globals** — `struct`/`array`/`slice` globals ship with typed
+   per-global offsets/sizes (slices 16 bytes ptr+len, structs/arrays their full
+   layout, 8-byte alignment), const-foldable struct/array/slice initializers
+   baked at load, and correct `.em` round-trip (slice relative-ptr relocation).
+   Regression: `aggregate_global_test` probes [1]-[8] (struct/array/slice global
+   read + by-value arg/return + `.em` round-trip). Docs: `docs/TYPE_SYSTEM.md`
+   §12.2, `docs/CODEGEN_SPEC.md` §16.
+
+**Verification (the synthesizer's final gate):** full `ninja` rebuild clean
+(c1+c2+c3 compile together); ctest 22/22 (was 20, +1 `array_lit`, +1
+`aggregate_global`; `binding_abi` carries c1's [2c]/[2d]/[2e] probes); lang suite
+241/0/0; all four demos green (game exit 1 / clean 20-tick run, compiler exit 0,
+hot-reload v1→v2→v3 PASS, concurrency shape A + shape B PASS); the four headline
+probes ([2c] `V3{1,2,3}`, [2d] `v3_dot(v3_up(),v3_up())`, c2 `[10,20,30]` sum,
+c3 `cfg.name_id==42`) each confirmed non-circular (each fails with its fix
+reverted).
+
+---
+
+### Historical record — what "first-class struct/aggregate" meant (the concrete gaps, now closed)
+
+The re-entry-trigger narrative and the concrete-gaps text below are preserved
+as the audit trail of what was fixed and why. Nothing here is still open; it is
+the shipped contract described as it was when it was the open roadmap item.
+
+**Priority (at time of deferral):** HIGH. The re-entry trigger had fired: the
+2026-07-10 multi-file demo (`demo/`) and the game-sim/compiler/hot-reload/
+concurrency demos surfaced this as the single biggest ergonomic blocker to
+writing real ember programs. Every non-trivial module fights it.
 
 **What "first-class struct/aggregate" means (the concrete gaps to close):**
 
@@ -350,10 +407,13 @@ Every non-trivial module fights it.
    struct ABI surface (M10-adjacent), not a parser tweak — but it's the change
    that turns ember from "verbose for any vector-math-style API" to ergonomic.
 
-**Why HIGH:** these four together are the difference between a language where
-`v3_dot(v3_up(), v3_up())` and `global cfg = Config{...}` work (every real
-program) and one where every struct must be hand-shuttled through named locals.
-The demos proved the workarounds are pervasive and error-prone.
+**Why HIGH (at time of deferral):** these four together are the difference
+between a language where `v3_dot(v3_up(), v3_up())` and `global cfg =
+Config{...}` work (every real program) and one where every struct must be
+hand-shuttled through named locals. The demos proved the workarounds are
+pervasive and error-prone.
+
+---
 
 ---
 

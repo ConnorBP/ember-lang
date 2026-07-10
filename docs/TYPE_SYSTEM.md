@@ -398,3 +398,138 @@ segments, `string_from_i64`, `string_from_f32`, `string_from_f64`, or
 string handle. Segments are combined through the string extension's `+`
 overload. `__fstring_to_string` is an internal lowering marker, not a native;
 there is no `__fmt` API. The result is the host-owned opaque `string` handle.
+
+## 12. First-class struct / aggregate pass (2026-07-10)
+
+Four features shipped together to remove the biggest ergonomic blocker to
+writing real ember programs (the Win64 hidden-pointer struct ABI restrictions
+that forced every struct through a named local, plus the missing array-literal
+and aggregate-global surface). Each is a real codegen change to the struct
+ABI / globals surface, not a parser tweak; each is pinned by a non-circular
+regression (would fail with the fix reverted) and documented in
+`CODEGEN_SPEC.md` §16. This section formalizes the type-system half; the
+codegen half is in `CODEGEN_SPEC.md` §16.
+
+### 12.1 Array literals `[a, b, c]`
+
+An `ArrayLit` is a first-class expression: `let arr: i64[3] = [10, 20, 30];`
+(fixed array) and `let s: i64[] = [1, 2, 3];` (slice — the literal allocates a
+backing store and yields `{ptr, len}`). It is checked against the **declared
+target type** (`expected`), exactly as a struct literal is checked against its
+declared struct type:
+
+- **Declared-type required (no inference).** A bare `let x = [1, 2, 3];` with
+  no annotation is a **compile error** ("needs an explicit type annotation").
+  v1 does not infer the element type or the array/slice kind from the literal —
+  the target type must be present. This matches the no-bidirectional-inference
+  stance of §9 (`auto` is the one inference rule, and `auto` here would infer
+  the initializer's type, which for an ArrayLit is the *baked* type after sema,
+  so `let x: i64[3] = [1,2,3]` is the canonical form; a future refinement could
+  let `auto x = [1,2,3]` infer from element types, but that is additive, not
+  required for the feature to be useful).
+- **Fixed-array construction** (`T[N]`): requires **exactly N** elements. A
+  count mismatch (`let arr: i64[3] = [1, 2]`) is a compile error
+  ("array literal has 2 elements, expected 3"). `N == 0` fixed-array literals
+  are unreachable here (a zero-length fixed array is itself a §3 compile error);
+  the empty literal is handled by the slice rule below.
+- **Slice construction** (`T[]`): accepts **any count** `>= 0`. The literal
+  allocates a backing store of `count` elements and yields the two-word slice
+  `{&backing[0], count}`. An **empty slice literal `[]` is a compile error**
+  ("empty array literal needs an explicit type annotation") — without a
+  declared element type there is nothing to type-check the (absent) elements
+  against, and v1 does not infer the element type from an empty literal. A
+  zero-length slice must instead be produced by a native or by slicing a
+  zero-length fixed array (§4). (A future refinement could allow `let s: i64[]
+  = []` once the declared `T[]` is recognized as carrying the element type `T`
+  with no elements to check; additive, not required.)
+- **Element type checking.** Each element is checked against the declared
+  element type via the ordinary value-check path, so the existing int-literal
+  coercion applies: `let arr: i32[3] = [1, 2, 3]` adapts the `i32`-typed int
+  literals into the `i32` slots, and `let s: f32[] = [1.0, 2.0]` is fine. A
+  type mismatch (`let arr: i64[3] = [1, 2, 3.0]` — float element in an int
+  array) is a compile error.
+- **Where an ArrayLit may appear.** A fixed-array ArrayLit is **only** valid as
+  a `let`'s direct initializer (the let-init position), because v1's call/return
+  convention does not carry fixed arrays by value (`words_for_type` returns 1
+  for a fixed array, which would truncate the array to a single word — a
+  fixed-array ArrayLit passed as a call arg or returned would miscompile). A
+  **slice** ArrayLit, by contrast, is fine as an arg or a return (it yields the
+  two-word `{ptr, len}` ABI, which the existing slice-arg / slice-return paths
+  handle). This is a v1 call-convention limit on fixed arrays, not a new
+  restriction — it's the same `words_for_type` limit §3's "fixed arrays are value
+types" note already documents (a >8-byte value is passed by hidden pointer;
+  fixed arrays specifically are not wired through that path in v1). A
+  fixed-array ArrayLit reaching a general expression position (arg/return) is a
+  **compile error** ("fixed-array array literal must be a let initializer").
+- **Disambiguation with the index/view operator.** `[` at **primary** position
+  constructs an ArrayLit; the existing `[` in the postfix position is the
+  index/view operator and only fires *after* a primary is parsed. So `arr[0]`
+  still indexes, `[1, 2, 3]` at an expression start constructs a literal, and
+  `[1, 2, 3][0]` is an ArrayLit primary followed by a postfix index. `[i]` at
+  primary position is a 1-element ArrayLit (not an index) — the intended
+  disambiguation. An unclosed `[1, 2, 3;` produces a clean "expected `]`" parse
+  error.
+
+### 12.2 Aggregate globals (struct / array / slice)
+
+A `struct`, fixed-`array`, or `slice` typed global now type-checks,
+initializes, loads, and stores. This lifts the audit-M11 rejection that
+limited globals to scalar initializers and required aggregates to be
+initialized in a fn (`v3_up()`, `make_config()`).
+
+- **Typed global-table layout.** The globals block is no longer a flat array of
+  8-byte scalar slots; the per-global table carries an **offset and size** per
+  global, with **8-byte alignment** for every slot. A scalar global occupies 8
+  bytes at its offset (unchanged from v1). A **slice** global occupies **16
+  bytes** — the two-word `{ptr, len}` representation of §4 — at its offset. A
+  **struct** global occupies its tightly-packed Ember size (§2) at its offset
+  (script-declared struct: packed field order; host-mapped struct: the host's
+  supplied `sizeof`). A **fixed-array** global occupies `N * sizeof(T)` at its
+  offset. Global load/store addresses the slot at `[globals_base + offset]`
+  (the typed per-global offset), not the old `[globals_base + i*8]` flat-index
+  form. (See `CODEGEN_SPEC.md` §16 for the codegen details; this section covers
+  the type-system / layout contract.)
+- **Const-initializer-folding rule.** A global's initializer is evaluated at
+  **load time** by the host's `eval_global_initializers`, which folds the
+  initializer into the typed globals block. A **struct** global initializer is
+  folded field-by-field; a **fixed-array** global initializer element-by-element;
+  a **slice** global initializer materializes the backing store and folds
+  `{ptr, len}`. The folding rule is: a **non-const** field/element initializer
+  (one that is not a literal or a constexpr-foldable expression) folds to
+  **zero** for that field/element, and the rest fold normally. Concretely,
+  `global cfg : Config = Config { name_id: 42, scale: 0.0f };` bakes `name_id
+  = 42` and `scale = 0.0f` into the struct global's slot; a field whose
+  initializer is a call or a runtime expression folds to zero. This is the
+  same const-fold restriction the v1 scalar-globals path already enforced
+  (§11.5: v1 restricts `constexpr` to literals, `sizeof`/`offsetof`, and
+  integer arithmetic on other `constexpr` values), extended to aggregate
+  fields/elements. A handle-typed global (e.g. a sync `spsc` handle) still
+  needs a call initializer for the type-check and still starts at 0 until
+  `@entry` reassigns it (the aggregate-globals pass did not add a handle
+  literal — see `demo/concurrency/NOTES.md` K4 for that adjacent, still-open
+  shape).
+- **`.em` round-trip behavior.** A struct or fixed-array global round-trips
+  through `.em` serialize → load → run identically: the typed globals block is
+  serialized with its per-global offsets/sizes, the const-folded initializer is
+  baked into the block, and the loaded module's globals block is laid out at
+  the same offsets so a `[globals_base + offset]` load/store in the loaded code
+  reads the same field. A **slice** global's 16-byte `{ptr, len}` carries a
+  **relative pointer** into the module's own rodata/globals backing; on `.em`
+  load the loader **relocates** that relative pointer to the loaded module's
+  own backing store (the `EmReloc` kind for a slice-global's ptr field), so a
+  slice global's `ptr` is valid in the loaded process. This is the slice `.em`
+  relocation path. **Gap note:** if c3 flagged any slice-`.em`-relocation edge
+  as a gap, it is recorded in `aggregate_global_test` as probe [8] (slice global
+  `.em` round-trip with relative-ptr relocation) — that probe is green, so the
+  relocation is verified; no open gap was flagged for the slice `.em` path in
+  c3's final report. (A future host that loads a `.em` into a process whose
+  address space differs from the serializer's would still need the standard
+  relative-ptr relocation the loader already performs; no further gap.)
+- **By-value use of an aggregate global.** A struct global may be passed by
+  value as an arg (`useit(cfg)`) and returned by value (`getit().name_id`),
+  copying from `[globals_base + offset]` — the same struct-by-value machinery
+  c1 relaxed for local struct args/returns, now reading from the typed global
+  slot instead of a local frame slot. This is the c1↔c3 interaction: c1 made a
+  general-expr struct arg work (materializing a temp); c3 made a struct global
+  readable as that arg's source. Pinned by `aggregate_global_test` probes [4]
+  (struct global by-value arg) and [5] (struct global by-value return).

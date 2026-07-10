@@ -165,6 +165,71 @@ static void usage(FILE* out) {
         "  --tick-interval MS  tick interval in milliseconds (default: 16)\n");
 }
 
+// Compute the TYPED globals-block layout (chunk c3): per-global (offset, size)
+// + per-slice-global backing offset + the total block byte size. Scalars land
+// 8 bytes at an 8-aligned offset; structs at StructLayout::size; fixed arrays
+// at elem_size*array_len; slices at 16 bytes ({ptr,len}) with their backing
+// array appended after all primary slots (8-aligned). A slice global's ptr is
+// stored as a RELATIVE offset within the block at bake time so the baked bytes
+// round-trip through .em without loader fixup (codegen adds globals_base at
+// runtime). Mirrors CG::value_bytes for the per-type byte width.
+static uint32_t host_value_bytes(const ember::Type* t, const ember::StructLayoutTable* structs) {
+    if (!t) return 8;
+    if (t->is_slice) return 16;
+    if (t->array_len > 0)
+        return uint32_t(t->array_len) * host_value_bytes(t->elem.get(), structs);
+    if (!t->struct_name.empty() && structs) {
+        auto it = structs->find(t->struct_name);
+        if (it != structs->end()) return uint32_t(it->second.size);
+    }
+    switch (t->prim) {
+    case ember::Prim::Bool: case ember::Prim::I8: case ember::Prim::U8: return 1;
+    case ember::Prim::I16: case ember::Prim::U16: return 2;
+    case ember::Prim::I32: case ember::Prim::U32: case ember::Prim::F32: return 4;
+    default: return 8;
+    }
+}
+
+struct TypedGlobalsLayout {
+    uint32_t total_size = 0;
+    std::unordered_map<std::string, uint32_t> offsets;
+    std::unordered_map<std::string, uint32_t> sizes;
+    std::unordered_map<std::string, uint32_t> backing_offsets; // slice globals only
+};
+
+static TypedGlobalsLayout compute_typed_globals_layout(const ember::Program& prog,
+                                                       const ember::StructLayoutTable& structs) {
+    TypedGlobalsLayout L;
+    uint32_t cur = 0;
+    auto align8 = [](uint32_t v) -> uint32_t { return (v + 7u) & ~7u; };
+    // Pass 1: primary slots (scalar/struct/fixed-array/slice {ptr,len}).
+    for (const auto& g : prog.globals) {
+        uint32_t sz = host_value_bytes(g.ty.get(), &structs);
+        cur = align8(cur);
+        L.offsets[g.name] = cur;
+        L.sizes[g.name] = sz;
+        cur += sz;
+    }
+    // Pass 2: backing regions for slice globals (appended after all primary
+    // slots). A slice global with an ArrayLit initializer needs a backing
+    // array of count*elem_size bytes; a slice global with no initializer
+    // stays a zero slice ({ptr=0,len=0}) and needs no backing.
+    for (const auto& g : prog.globals) {
+        if (!g.ty || !g.ty->is_slice) continue;
+        if (!g.init) continue;
+        auto* al = dynamic_cast<const ember::ArrayLit*>(g.init.get());
+        if (!al) continue;
+        uint32_t elem_sz = host_value_bytes(g.ty->elem.get(), &structs);
+        if (elem_sz == 0) elem_sz = 8;
+        uint32_t count = uint32_t(al->elements.size());
+        cur = align8(cur);
+        L.backing_offsets[g.name] = cur;
+        cur += count * elem_sz;
+    }
+    L.total_size = cur;
+    return L;
+}
+
 int main(int argc, char** argv) {
     using namespace ember;
 
@@ -349,20 +414,30 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // ---- globals block (sized from declared globals; empty if none) ----
-    // Codegen addresses global i at [base + i*8]; size = 8 * #globals.
+    // ---- globals block (TYPED layout, chunk c3; sized from declared globals) ----
+    // Each global lands at a per-global byte OFFSET (8-aligned): scalars 8 bytes,
+    // structs StructLayout::size, fixed arrays elem_size*array_len, slices 16
+    // bytes ({ptr,len}) with their backing array appended after all primary
+    // slots. The block is sized to the SUM of all aligned (slot + backing)
+    // sizes. `gb.index` is kept as the legacy flat slot index (offset == i*8
+    // for an all-scalar set, so scalar-only hosts keep working); `gb.offsets`/
+    // `gb.sizes` are the typed c3 layout codegen + the initializer folder use.
     GlobalsBlock gb;
+    TypedGlobalsLayout tgl = compute_typed_globals_layout(pr.program, struct_layouts);
     {
         uint32_t gi = 0;
         for (auto& g : pr.program.globals) {
             gb.index[g.name] = gi++;
             gb.types[g.name] = g.ty.get();
+            gb.offsets[g.name] = tgl.offsets[g.name];
+            gb.sizes[g.name] = tgl.sizes[g.name];
         }
     }
-    std::vector<uint8_t> gb_store(pr.program.globals.size() * 8, 0);
+    std::vector<uint8_t> gb_store(size_t(tgl.total_size), 0);
     gb.base = int64_t(gb_store.data());
-    // v1.0 thread-safety: thread globals index/types through CodeGenCtx instead
-    // of the process-wide g_globals_for_codegen pointer (parallel-compile-safe).
+    // v1.0 thread-safety: thread globals index/types/offsets through CodeGenCtx
+    // instead of the process-wide g_globals_for_codegen pointer (parallel-
+    // compile-safe).
     g_globals_for_codegen = nullptr;   // not consulted — ctx.globals_index used
     // v1.0: seed const global initializers into the block (global g = 10; starts
     // at 10, not 0). Non-const inits (g = some_fn();) stay zero — a host or
@@ -375,10 +450,21 @@ int main(int argc, char** argv) {
     // the first read saw a null handle (string_length 0). The compiler demo
     // surfaced this; the fix is the optional string_alloc_fn hook in
     // GlobalInitCtx.
+    // c3: seed AGGREGATE global initializers too (struct StructLit / array
+    // ArrayLit / slice ArrayLit) by const-folding fields/elements into the
+    // typed block at each global's offset (struct/fixed-array) or its backing
+    // region (slice, with the {ptr,len} slot seeded with a RELATIVE ptr so
+    // the baked bytes round-trip through .em without loader fixup).
     auto string_alloc_thunk = [](const char* bytes, int64_t len) -> int64_t {
         return ember::ext_string::alloc(std::string(bytes, size_t(len > 0 ? len : 0)));
     };
-    eval_global_initializers(pr.program, GlobalInitCtx{gb_store, gb.index, gb.types, string_alloc_thunk});
+    GlobalInitCtx gic{gb_store, gb.index, gb.types};
+    gic.string_alloc_fn = string_alloc_thunk;
+    gic.offsets = &gb.offsets;
+    gic.sizes = &gb.sizes;
+    gic.backing_offsets = &tgl.backing_offsets;
+    gic.structs = &struct_layouts;
+    eval_global_initializers(pr.program, gic);
 
     // ---- dispatch table + codegen ctx (mirrors em_roundtrip_test) ----
     DispatchTable table(pr.program.funcs.size());
@@ -386,6 +472,7 @@ int main(int argc, char** argv) {
     ctx.globals_base = gb.base;
     ctx.globals_index = &gb.index;      // v1.0: parallel-compile-safe globals resolution
     ctx.globals_types = &gb.types;
+    ctx.globals_offsets = &gb.offsets; // c3: typed byte offsets (aggregate globals)
     ctx.dispatch_base = int64_t(table.base());
     ctx.natives = &natives;
     ctx.script_slots = &slots;
@@ -482,8 +569,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "ember: --emit-em write failed: %s\n", werr.c_str());
             return 2;
         }
-        std::printf("ember: wrote %s (%zu fns, %zu globals, entry slot %u)\n",
-                    emit_em_path.c_str(), mod.functions.size(), mod.globals.size()/8, mod.entry_slot);
+        std::printf("ember: wrote %s (%zu fns, %zu globals block bytes, entry slot %u)\n",
+                    emit_em_path.c_str(), mod.functions.size(), mod.globals.size(), mod.entry_slot);
         return 0;  // pre-compile mode: do not run
     }
 

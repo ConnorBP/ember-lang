@@ -1,0 +1,9 @@
+// invalid for parser: an unclosed array-literal bracket. `[1, 2, 3;` reaches
+// the LBracket primary case, parses three elements, then the `;` is not the
+// expected `]` - the parser must report "expected ']'" and fail (NOT silently
+// accept the partial literal). Confirms the bracket handling produces a parse
+// error, the way `let x = (1;` already does for the grouping paren.
+fn main() -> i64 {
+    let arr: i64[3] = [1, 2, 3;
+    return arr[0];
+}

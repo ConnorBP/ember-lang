@@ -782,3 +782,154 @@ no globals, no rodata; the GlobalsBase reloc path, multi-function
 dispatch tables, and rodata RIP-relative on a loaded page are
 code-complete in `em_loader.cpp` but untested pending the v0.2 parser
 (correct by inspection; see `BUNDLING_AND_EM_MODULES.md` Section 2.5).
+
+## 16. First-class struct / aggregate lowering (2026-07-10)
+
+The 2026-07-10 first-class struct / aggregate pass (`ROADMAP.md` SHIPPED)
+added four codegen features that remove the Win64 hidden-pointer struct ABI
+restrictions and add the array-literal and aggregate-global surfaces. Each is a
+lowering into the instructions and frame/global machinery already specified
+above (no new instruction class); each is pinned by a non-circular regression
+(see the test pointers in `ROADMAP.md`'s SHIPPED entry). This section specifies
+the lowering contract; the type-system contract is in `TYPE_SYSTEM.md` §12.
+
+### 16.1 Struct-literal return hidden-temp lowering
+
+A fn `return V3{...};` (a `ReturnStmt` whose value is a `StructLit` of the
+return type) lowers differently from the two pre-existing struct-return shapes:
+
+- **Named-local return** (pre-existing): the return value is a `let`'d struct
+  local already living in the frame. The epilogue copies the local's bytes from
+  its frame address `[rbp - local_off]` to the incoming hidden return pointer
+  (passed in `rcx` per §1, stored in the frame at entry): `copy_struct_to_ptr(
+  hidden_ret_ptr, [rbp - local_off], struct_size)`.
+- **Forwarding-call return** (pre-existing): the fn tail-returns another
+  struct-returning call's result by forwarding the hidden return pointer — the
+  callee writes through the caller's hidden pointer directly, no copy. (§8's
+  hidden-pointer convention; the forwarding call passes `rcx` = the caller's
+  hidden ptr.)
+- **Struct-literal return** (new): the return value is a `StructLit` with no
+  existing frame slot. Codegen synthesizes a **compiler-hidden temp frame
+  slot** (`alloc_struct_temp`, named `__tmp$N` with a per-fn counter so temps
+  never collide with user identifiers or each other), materializes the literal
+  into it via `store_value_to_memory` per field, then `copy_struct_to_ptr`s
+  from the temp `[rbp - temp_off]` to the incoming hidden return pointer. The
+  temp is a plain caller-frame stack slot (no exec memory, no register-
+  convention change), so ABI correctness is unchanged. A `count_struct_temps_block`
+  prescan walks the fn body, sums all struct-temp bytes, and pre-reserves them in
+  `FRAME_SIZE` (§2/§6) so a temp never overflows the pre-sized frame — temps are
+  reserved as the **sum** of all temp bytes across the fn (over-reserved but
+  correct; a future optimization could compute max-simultaneously-live instead).
+
+Contrast: the named-local return copies from a *user-declared* frame slot; the
+struct-literal return copies from a *compiler-synthesized* temp; the
+forwarding-call return copies nothing (it forwards the hidden ptr). All three
+end with `rax = hidden_ret_ptr` (§1's struct-return convention).
+
+### 16.2 Struct-by-value-arg temp lowering
+
+A struct-by-value argument that is a **general expression** (a `StructLit` or a
+struct-returning `CallExpr`, not a bare `Ident` local) lowers to an
+alloc-temp + materialize + copy-bytes sequence, distinct from the named-local
+arg path:
+
+- **Named-local arg** (pre-existing): the arg is a `let`'d struct local. The
+  arg-stash helper copies the struct's bytes from the local's frame address
+  `[rbp - local_off]` into the call's arg-stash slot (the slot the callee will
+  read, per §8's hidden-pointer or by-value struct-arg convention).
+- **General-expr arg** (new): the arg is a `StructLit` or a struct-returning
+  `CallExpr`. Codegen synthesizes a **distinct compiler-hidden temp**
+  (`__tmp$N`, one per arg — never reused within a single call), materializes the
+  struct into it (a `StructLit` via per-field `store_value_to_memory`; a
+  struct-returning `CallExpr` via `lea rax, [rbp - temp];` + a recursive
+  `eval_struct_returning_call` that writes the call's struct result *into the
+  temp* through the temp's address as the hidden pointer — this nests safely
+  because the inner call's frame is below the outer frame and `rbp` is stable
+  across the inner call), then copies bytes from the temp `[rbp - temp_off]`
+  into the arg-stash slot. The same `stash_struct_arg` helper handles all three
+  arg shapes (Ident / StructLit / struct-returning CallExpr) at both the `eval()`
+  and `eval_struct_returning_call()` arg-stash sites.
+- **Per-arg distinct-temp requirement.** Each general-expr struct arg in a
+  single call gets its own temp (`__tmp$0`, `__tmp$1`, …) — a temp is **never
+  reused** within a call, because two args materializing into the same slot
+  would clobber each other before the copy-to-stash completes. The per-fn
+  counter guarantees distinctness; the `count_struct_temps_block` prescan sums
+  them into `FRAME_SIZE`.
+
+Contrast: the named-local arg copies from a user-declared frame address; the
+general-expr arg copies from a compiler-synthesized temp that was materialized
+first. Both end with the struct bytes in the arg-stash slot the callee reads.
+
+### 16.3 Array-literal lowering
+
+An `ArrayLit` lowers differently for the fixed-array and slice cases
+(`TYPE_SYSTEM.md` §12.1):
+
+- **Fixed-array literal** (`let arr: i64[3] = [10, 20, 30];`): codegen
+  allocates the local's full array extent (`N * sizeof(T)` bytes at the
+  local's frame offset, per §3), then emits one `store_value_to_memory` per
+  element at `[rbp - base_off + i*elem_size]` for `i = 0..N-1`. This is the
+  element-by-element store the v1 workaround (`arr[0] = 10; arr[1] = 20; …`)
+  emitted by hand, now synthesized by the compiler for the literal. A
+  fixed-array ArrayLit reaching a general expression position (arg/return) is a
+  sema error (`TYPE_SYSTEM.md` §12.1's where-an-ArrayLit-may-appear rule) — it
+  never reaches codegen there (a defensive guard traps if it does).
+- **Slice literal** (`let s: i64[] = [1, 2, 3];`): codegen allocates the 16-byte
+  slice slot `{ptr, len}` at the local's frame offset, **plus a separate backing
+  temp** (`__arrtmp$N`, distinct from the `__tmp$N` struct-temp family by name
+  prefix and counter so the two temp families never collide). It materializes
+  the elements into the backing temp via per-element `store_value_to_memory`,
+  then stores `ptr = lea [rbp - back_off]` (the address of the backing temp) and
+  `len = count` into the slice slot. The backing temp lives in the frame for the
+  whole fn (the slice's `ptr` points at it; it survives across calls), so a slice
+  literal passed as an arg or returned is valid for the callee's lifetime within
+  this fn — the same over-reserved-but-correct discipline as the struct temps.
+- **Slice ArrayLit as a general expression** (arg or return): the `eval()` path
+  materializes the backing into a temp and yields the slice ABI `{rax = ptr,
+  rdx = len}`, so the existing 2-word slice-arg path (§8: a slice is two
+  consecutive arg slots, ptr then len) and the slice-return path both work for a
+  slice literal passed as an arg or returned — no new ABI slot, just the
+  materialization. A `count_arr_temps_block` prescan (mirroring the struct-temp
+  prescan) pre-reserves the backing-temp bytes in `FRAME_SIZE`.
+
+### 16.4 Aggregate global codegen
+
+The globals block is no longer a flat `i64[]` of 8-byte scalar slots; it is a
+**typed block** with per-global offset and size (`TYPE_SYSTEM.md` §12.2):
+
+- **Typed global table.** Each global has an `offset` and `size` in the block,
+  with **8-byte alignment** for every slot. A scalar = 8 bytes; a **slice = 16
+  bytes** (the `{ptr, len}` pair, §4); a **struct** = its tightly-packed Ember
+  size (§2); a **fixed array** = `N * sizeof(T)` (§3). The block's total size is
+  the sum of all per-global sizes rounded to 8-byte alignment.
+- **Global load/store addressing.** A global identifier load/store addresses
+  the slot at `[globals_base + offset]` — the **typed per-global offset**, not
+  the old `[globals_base + i*8]` flat-index form. A scalar global is an 8-byte
+  load/store (unchanged). A **slice global** is a 16-byte load/store (ptr at
+  `[base+offset]`, len at `[base+offset+8]`). A **struct global** by-value copy
+  reads `struct_size` bytes from `[globals_base + offset]` — the same
+  `copy_struct_to_ptr` / by-value-copy machinery §16.1/§16.2 use for locals, now
+  reading from the typed global slot. This is the c1↔c3 interaction: c1 made a
+  general-expr struct arg work (materializing a temp); c3 made a struct global
+  readable as that arg's source (`useit(cfg)` reads `cfg`'s struct bytes from
+  `[globals_base + cfg_offset]`).
+- **Load-time initializer folding.** The host's `eval_global_initializers`
+  writes the const-folded struct/array/slice initializer into the typed block at
+  load (§12.2's const-initializer-folding rule: a non-const field/element
+  initializer folds to zero for that field/element). A struct global's fields
+  are written at `[globals_base + offset + field_off]`; a fixed-array global's
+  elements at `[globals_base + offset + i*elem_size]`; a slice global's `ptr`
+  (a relative pointer into the module's own backing) and `len` at the 16-byte
+  slot. This runs once at module load, before any fn call; the typed block is
+  then read by the per-global-offset load/store addressing above at runtime.
+- **`.em` round-trip.** The typed globals block is serialized with its per-global
+  offsets/sizes and the const-folded initializers baked in. On `.em` load, the
+  loader lays out the loaded module's globals block at the same offsets, so a
+  `[globals_base + offset]` load/store in the loaded code reads the same field.
+  A **slice global's** 16-byte `{ptr, len}` carries a **relative pointer** into
+  the module's own rodata/globals backing; the loader **relocates** that
+  relative pointer to the loaded module's own backing store (the `EmReloc` kind
+  for a slice-global's ptr field), so the slice's `ptr` is valid in the loaded
+  process. This is the slice-`.em`-relocation path; `aggregate_global_test`
+  probe [8] pins it (slice global `.em` round-trip with relative-ptr
+  relocation), green.

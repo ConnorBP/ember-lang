@@ -182,6 +182,16 @@ struct TernaryExpr: Expr { ExprPtr cond, then_e, else_e; };
 struct SizeofExpr: Expr { std::shared_ptr<Type> ty; uint64_t resolved = 0; };
 struct OffsetofExpr: Expr { std::shared_ptr<Type> ty; std::string field; uint64_t resolved = 0; };
 struct StructLit : Expr { std::string type_name; std::vector<std::pair<std::string,ExprPtr>> fields; };
+// Array literal `[ expr, expr, ... ]` as a first-class expression (chunk c2).
+// Parsed in the PRIMARY position (parse_primary's LBracket case); the postfix
+// `[` at parse_postfix stays the index/view operator, so `arr[0]` still indexes
+// and `[1,2,3]` at an expression start constructs a literal. The element type
+// is carried on `->ty` after sema; for a fixed-array literal the array Type is
+// on `->ty`, for a slice literal the slice Type is on `->ty` too. Sema requires
+// a declared target type at the let-init / arg site (v1 does not infer array
+// types from elements), so an ArrayLit never reaches codegen without `->ty`
+// already baked to the full array/slice Type.
+struct ArrayLit : Expr { std::vector<ExprPtr> elements; };
 // E::A - enum-variant access. Exists only between parse and sema's check_expr:
 // sema rewrites this node IN PLACE to an IntLit carrying the variant's i32
 // value (see plan_ENUMS.md Section 5 - the switch case-value literal-check

@@ -1,0 +1,8 @@
+// chunk c3: a struct-typed global with a StructLit initializer is sema-ok.
+// `global cfg : Config = Config { name_id: 42, scale: 2.0f };` - the struct
+// global is accepted in v1 (typed globals-block layout + load-time const fold
+// of the StructLit initializer). The field-access read `cfg.name_id` is
+// type-checked as i64. (Runtime value verified by examples/aggregate_global_test.)
+struct Config { name_id: i64; scale: f32; }
+global cfg : Config = Config { name_id: 42, scale: 2.0f };
+fn main() -> i64 { return cfg.name_id; }

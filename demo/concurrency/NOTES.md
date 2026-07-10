@@ -84,6 +84,8 @@ I first considered using an ember `atomic` for the shared consumed counter (host
 
 **Fix (shape B):** declare handle-typed globals with a CALL initializer that type-checks: `global spsc_h : spsc = spsc_new(4);`. `spsc_new` returns `spsc`, which `same`-checks against the `spsc` global. `eval_global_initializers` only folds CONST initializers (a call is not const-foldable), so the global starts at 0 (invalid handle); `@entry setup()` creates the real primitives and reassigns. This is the standard "host-created handle stored in a global" pattern. (For shape A I avoided this entirely by passing handles via `ember_call_i64` args, not globals.)
 
+   **Note (first-class struct / aggregate pass, 2026-07-10):** the *aggregate value-global* half of this story is now resolved — `struct`/`array`/`slice` value globals ship with const-foldable struct/array/slice initializers baked at load (`docs/TYPE_SYSTEM.md` §12.2). This kink, however, is the *handle-typed* half, which is NOT what that pass addressed: a sync handle is an opaque `i64` with a nominal `struct_name`, and there is no handle literal in ember, so a handle-typed global still needs a CALL initializer (`spsc_new(4)`) for the type-check and still starts at 0 until `@entry` reassigns it. The call-init-for-type-check workaround remains the correct shape for handle-typed globals; only the aggregate value-global rejection it was adjacent to has lifted.
+
 **Judge: fix-the-demo.** The const-fold restriction on global initializers is documented (`globals.hpp::eval_global_initializers`); the call-init-for-type-check workaround is the clean shape.
 
 ### K5: `let` without `mut` is immutable (Rust-like)

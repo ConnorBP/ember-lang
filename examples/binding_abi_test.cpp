@@ -85,6 +85,16 @@ static void n_make_vec3s(Vec3s* dest, float x, float y, float z) {
     dest->x = x; dest->y = y; dest->z = z;
 }
 
+// Host shape for the struct-literal-return / struct-ret-call-as-arg probes.
+// A 3x f32 packed aggregate = 12B (matches ember's packed declaration-order
+// layout for `struct V3 { x: f32; y: f32; z: f32; }`). Used both as the host
+// read-back struct for a script fn that RETURNS a V3 (the hidden-pointer
+// return path - the host allocates a V3, passes &it in rcx, the script writes
+// through it, the host reads x/y/z back: a NON-CIRCULAR direct-value probe) and
+// as the struct-by-value call-argument shape inside the script itself.
+struct V3 { float x; float y; float z; };
+static_assert(sizeof(V3) == 12, "V3 must be a packed 12-byte 3x f32 aggregate");
+
 // [3] >4 args -> args 5,6 spill to the outgoing stack past the 32-byte shadow
 // space. Win64: rcx,rdx,r8,r9 for args 1-4; [rsp+32], [rsp+40] for 5,6.
 static int64_t n_sum6(int64_t a, int64_t b, int64_t c, int64_t d,
@@ -209,6 +219,13 @@ static void* entry_of(CompiledProgram* p, const char* name) {
 // Win64 call trampolines (typed reinterpret of the JIT entry).
 static int64_t  call0_i64 (void* e)                                    { using F=int64_t(*)();    return reinterpret_cast<F>(e)(); }
 static float    call0_f32 (void* e)                                    { using F=float(*)();      return reinterpret_cast<F>(e)(); }
+// Call a no-arg script fn that returns a >8B struct via the hidden-pointer
+// path (Win64: caller passes the dest address in rcx, callee writes the
+// struct through it and returns the same pointer in rax). The host allocates
+// the dest, passes &it, and reads the fields back directly - a non-circular
+// direct-value read (in-language struct equality could circularly hide a
+// codegen bug; the host C struct read cannot).
+static V3       call0_struct_v3(void* e)                               { V3 r; using F=V3*(*)(V3*); reinterpret_cast<F>(e)(&r); return r; }
 
 #if defined(__GNUC__) && defined(__x86_64__)
 extern "C" uint64_t call_check_nonvolatiles(void* entry);
@@ -492,6 +509,99 @@ static void test_vec3_handle_ret() {
     std::printf("       got=%f\n", (double)r);
 }
 
+// [2c] struct-literal RETURN directly: `return V3 { ... };` from a script fn
+// that returns a struct by pointer (the >8B hidden-pointer return path). The
+// relaxation lets a struct-returning fn `return` a struct literal directly
+// (today rejected - sema required a named local first). Codegen materializes
+// the literal into a compiler-hidden temp frame slot, then copies the temp's
+// bytes through the hidden return pointer. NON-CIRCULAR: the host allocates a
+// V3, passes &it as the hidden word-0, calls the script fn, and reads x/y/z
+// back directly (the C struct read cannot circularly hide a codegen bug the
+// way an in-language struct equality could). Reverting the fix -> sema rejects
+// `return V3 { ... };` -> compile fails -> this records false.
+static void test_struct_lit_return_direct() {
+    using namespace ember;
+    NativeTable tab;  // pure script: v3_lit_up takes no args, returns V3 - no natives
+    const std::string src =
+        "struct V3 { x: f32; y: f32; z: f32; }\n"
+        "fn v3_lit_up() -> V3 { return V3 { x: 1.0f, y: 2.0f, z: 3.0f }; }\n"
+        "fn main() -> i64 { return 0; }\n";
+    CompiledProgram* p = compile_program(src, tab);
+    if (!p) { record(false, "[2c] struct-literal return direct (compile)"); return; }
+    V3 r = call0_struct_v3(entry_of(p, "v3_lit_up"));
+    free_program(p);
+    // 1+2+3 = 6.0. Verifies the struct-literal materialized into the temp and
+    // was copied byte-exact through the hidden return pointer (a wrong field
+    // order, a missed field, or a stale-temp copy would read back garbage).
+    record(r.x + r.y + r.z == 6.0f, "[2c] struct-literal return: V3{1,2,3}.x+y+z==6.0");
+    std::printf("       got=(%f,%f,%f) sum=%f\n", (double)r.x, (double)r.y, (double)r.z, (double)(r.x+r.y+r.z));
+}
+
+// [2d] struct-by-value arg as a general expression: `v3_dot(v3_up(), v3_up())`
+// where each arg is a struct-returning CALL (not a bare local). The relaxation
+// lets a struct-returning call be used directly as a struct-by-value argument
+// (today rejected - sema required a bare local). Codegen materializes each
+// struct-returning-call arg into its own compiler-hidden temp frame slot
+// (forwarding the temp's address as the inner call's hidden word-0, the
+// callee writes through it), then copies the temp's bytes into the outer
+// call's arg stash. NON-CIRCULAR: the host reads the f32 return of main
+// directly. Reverting the fix -> sema rejects `v3_dot(v3_up(), v3_up())` ->
+// compile fails -> this records false.
+static void test_struct_arg_general_expr() {
+    using namespace ember;
+    NativeTable tab;  // pure script: v3_up/v3_dot/main, no natives
+    const std::string src =
+        "struct V3 { x: f32; y: f32; z: f32; }\n"
+        "fn v3_up() -> V3 { return V3 { x: 0.0f, y: 1.0f, z: 0.0f }; }\n"
+        "fn v3_dot(a: V3, b: V3) -> f32 { return a.x*b.x + a.y*b.y + a.z*b.z; }\n"
+        "fn main() -> f32 { return v3_dot(v3_up(), v3_up()); }\n";
+    CompiledProgram* p = compile_program(src, tab);
+    if (!p) { record(false, "[2d] struct-ret-call as struct-by-value arg (compile)"); return; }
+    float r = call0_f32(entry_of(p, "main"));
+    free_program(p);
+    // v3_up()=(0,1,0); dot((0,1,0),(0,1,0)) = 0+1+0 = 1.0. Verifies BOTH
+    // struct-ret-call args were materialized into distinct temps (NOT aliased -
+    // a single reused slot would have the second v3_up() overwrite the first
+    // before the copy, but since both are (0,1,0) the value still happens to
+    // be 1.0; the distinctness is pinned by the nested probe below which would
+    // break under aliasing) and copied into the arg stash byte-exact.
+    record(r == 1.0f, "[2d] v3_dot(v3_up(),v3_up())==1.0 (struct-ret-call as arg)");
+    std::printf("       got=%f\n", (double)r);
+}
+
+// [2e] NESTED struct-ret-call as a struct-by-value arg to ANOTHER struct-
+// returning call: `v3_shift(v3_up())` where v3_shift returns V3 (so the call
+// goes through eval_struct_returning_call's arg-stash, whose struct-ret-call
+// arg v3_up() is recursively materialized into a temp). This pins the second
+// arg-stash site (eval_struct_returning_call's op.is_struct path) AND the
+// per-arg temp distinctness in a context that WOULD break under temp aliasing
+// (v3_up writes (0,1,0) into the temp; v3_shift reads it, shifts to (1,1,0);
+// if the temp were wrongly reused/aliased the shift would read stale data).
+// main returns the shifted V3; the host reads it back directly. NON-CIRCULAR.
+// Reverting the fix -> sema rejects `v3_shift(v3_up())` -> compile fails ->
+// this records false.
+static void test_nested_struct_ret_call_arg() {
+    using namespace ember;
+    NativeTable tab;
+    const std::string src =
+        "struct V3 { x: f32; y: f32; z: f32; }\n"
+        "fn v3_up() -> V3 { return V3 { x: 0.0f, y: 1.0f, z: 0.0f }; }\n"
+        "fn v3_shift(a: V3) -> V3 { return V3 { x: a.x + 1.0f, y: a.y, z: a.z }; }\n"
+        "fn main() -> V3 { return v3_shift(v3_up()); }\n";
+    CompiledProgram* p = compile_program(src, tab);
+    if (!p) { record(false, "[2e] nested struct-ret-call arg (compile)"); return; }
+    V3 r = call0_struct_v3(entry_of(p, "main"));
+    free_program(p);
+    // v3_up()=(0,1,0); v3_shift((0,1,0)) = (1,1,0). Verifies the inner
+    // v3_up() arg was materialized into a temp and v3_shift read it correctly
+    // (x+1 -> 1, y,z unchanged) AND the result was forwarded through main's
+    // own hidden return pointer. A temp-aliasing or wrong-slot bug would read
+    // back a wrong x (e.g. 0 if v3_shift read the temp before v3_up wrote it).
+    record(r.x == 1.0f && r.y == 1.0f && r.z == 0.0f,
+           "[2e] v3_shift(v3_up())==(1,1,0) (nested struct-ret-call arg)");
+    std::printf("       got=(%f,%f,%f)\n", (double)r.x, (double)r.y, (double)r.z);
+}
+
 // [3] >4 args: args 5,6 spill to the outgoing stack past the 32-byte shadow
 // space. sum6(a,b,c,d,e,f) = a+b+c+d+e+f. Args 1-4 in rcx/rdx/r8/r9, args
 // 5,6 at [rsp+32]/[rsp+40] (the codegen's `words 4+ -> outgoing stack` path).
@@ -630,6 +740,9 @@ int main() {
     test_rejected_aggregate_shapes(); // [1c/d]
     test_struct_by_value_ret();    // [2]
     test_vec3_handle_ret();       // [2b]
+    test_struct_lit_return_direct();  // [2c]
+    test_struct_arg_general_expr();  // [2d]
+    test_nested_struct_ret_call_arg();  // [2e]
     test_six_args();               // [3]
     test_f32_args();               // [4] + [4b]
     test_slice_arg();              // [5]

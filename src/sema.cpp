@@ -346,17 +346,32 @@ struct Checker {
         return got;
     }
 
-    // A struct-by-value call argument must be a bare local variable: codegen
-    // (CG::eval's CallExpr struct-arg stash) copies the argument's bytes
-    // directly from a known frame address, never evaluating a general
-    // expression into a multi-word aggregate (there's no such single-value
-    // form for a struct). Reject anything else here instead of letting
-    // codegen either crash or silently copy garbage.
+    // A struct-by-value call argument may be (a) a bare local variable, (b)
+    // a struct literal of the matching struct type, or (c) a call whose own
+    // return type is the matching struct (a struct-returning call used
+    // directly as an argument). Cases (b)/(c) have no single source frame
+    // address, so codegen (CG::eval's CallExpr struct-arg stash) materializes
+    // them into a compiler-hidden temp frame slot first, then copies that
+    // temp's bytes into the arg stash - reusing the existing hidden-pointer /
+    // arg-copy machinery. A genuinely-mismatched shape (wrong struct, scalar
+    // where a struct is expected) is still rejected - by types_compatible for
+    // the wrong struct / scalar case above, and here for any other aggregate
+    // expression (e.g. a field access) that isn't one of the three allowed
+    // forms. arg.ty is already populated by the check_value(arg, want) call
+    // that runs immediately before this.
     void check_struct_arg_shape(const Expr& arg, const Type* want) {
         if (!is_registered_struct(want)) return;
         if (dynamic_cast<const Ident*>(&arg)) return;
+        if (auto* sl = dynamic_cast<const StructLit*>(&arg)) {
+            if (sl->type_name == want->struct_name) return;
+        }
+        if (auto* call = dynamic_cast<const CallExpr*>(&arg)) {
+            if (call->ty && is_registered_struct(call->ty) && call->ty->struct_name == want->struct_name)
+                return;
+        }
         err("a struct-by-value argument (type '" + want->struct_name + "') must be a plain "
-            "local variable, not a general expression", arg.loc.line, arg.loc.col);
+            "local variable, a struct literal of '" + want->struct_name + "', or a call "
+            "returning '" + want->struct_name + "'", arg.loc.line, arg.loc.col);
     }
 
     void reject_large_native_aggregate(const Type* want, const Loc& loc) {
@@ -480,8 +495,13 @@ struct Checker {
                 err("duplicate global declaration '" + g.name + "'", g.loc.line, g.loc.col);
             if (contains_void(g.ty.get()))
                 err("global '" + g.name + "' cannot have void type", g.loc.line, g.loc.col);
-            if (g.ty->is_slice || g.ty->array_len || is_registered_struct(g.ty.get()))
-                err("aggregate global '" + g.name + "' is unsupported in v1", g.loc.line, g.loc.col);
+            // Aggregate globals (struct / fixed-array / slice) are accepted in
+            // v1 (chunk c3): a typed globals-block layout + load-time const
+            // folding of aggregate initializers backs them. A global with NO
+            // initializer stays zero (as for scalars). When an initializer IS
+            // present it is validated below (after signatures are registered)
+            // by the same check_value -> check_expr path fn bodies use, so
+            // the StructLit/ArrayLit field/element shape checks fire there.
         }
     }
 
@@ -554,6 +574,8 @@ struct Checker {
             lower_enum_access_expr(t->else_e);
         } else if (auto* sl = dynamic_cast<StructLit*>(slot.get())) {
             for (auto& kv : sl->fields) lower_enum_access_expr(kv.second);
+        } else if (auto* al = dynamic_cast<ArrayLit*>(slot.get())) {
+            for (auto& el : al->elements) lower_enum_access_expr(el);
         }
         // leaves (IntLit/FloatLit/BoolLit/StringLit/Ident/SizeofExpr): no children
     }
@@ -1083,15 +1105,25 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                 ret_ty = intern(type_void()); params = nullptr;
             }
         }
-        // A struct-returning call is only allowed as a `let x: T = f(...);`
-        // initializer or a `return f(...);` value (see check_expr's
-        // allow_struct_ret_call doc comment) - codegen needs a concrete
-        // destination address (the hidden return pointer) for those two
-        // shapes, not a value to materialize in a register.
-        if (is_registered_struct(ret_ty) && !allow_struct_ret_call) {
+        // A struct-returning call is allowed as a `let x: T = f(...);`
+        // initializer, a `return f(...);` value (see check_expr's
+        // allow_struct_ret_call doc comment), OR - when `expected` is a
+        // registered struct of the SAME type - as a struct-by-value call
+        // argument (e.g. `v3_dot(v3_up(), v3_up())`). The arg-slot case is
+        // gated here by the matching `expected` type so a struct-returning
+        // call used as a bare discarded statement (expected == nullptr) or as
+        // the base of a field access (expected == nullptr) is still rejected;
+        // a struct-returning call of a MISMATCHED struct used as an arg is
+        // rejected by types_compatible above (it never reaches here with a
+        // matching expected). Codegen materializes the arg case into a
+        // compiler-hidden temp frame slot (CG::eval's CallExpr struct-arg
+        // stash), reusing the existing hidden-pointer / arg-copy machinery.
+        if (is_registered_struct(ret_ty) && !allow_struct_ret_call &&
+            !(expected && is_registered_struct(expected) && ret_ty->same(*expected))) {
             err("a call returning struct '" + ret_ty->struct_name + "' is only allowed as a "
-                "`let x: " + ret_ty->struct_name + " = " + c->name + "(...);` initializer or a "
-                "`return " + c->name + "(...);` value", c->loc.line, c->loc.col);
+                "`let x: " + ret_ty->struct_name + " = " + c->name + "(...);` initializer, a "
+                "`return " + c->name + "(...);` value, or a struct-by-value argument of "
+                "type '" + ret_ty->struct_name + "'", c->loc.line, c->loc.col);
         }
         e.ty = ret_ty; return ret_ty;
     }
@@ -1408,6 +1440,83 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
         e.ty = intern(st);
         return e.ty;
     }
+    if (auto* al = dynamic_cast<ArrayLit*>(&e)) {
+        // Array literal `[ expr, expr, ... ]` (chunk c2). v1 does NOT infer array
+        // types from elements - an ArrayLit requires a declared target type
+        // (`expected`) at the let-init / arg site, which is the ONLY place this
+        // node is legal. Sema's check_value/check_expr callers always thread a
+        // declared `expected` for a typed let / a call argument / a return;
+        // a bare `let x = [1,2,3];` (no annotation) reaches here with
+        // expected==nullptr and is rejected. The declared type must be a fixed
+        // array T[N] or a slice T[]; anything else (a scalar, a struct, void)
+        // is a shape mismatch. Each element is checked against the declared
+        // element type via check_value so the existing int-literal coercion
+        // (adapt_int_lit) applies - `let arr: i32[3] = [1, 2, 3]` adopts i32.
+        if (!expected || !(expected->is_slice || expected->array_len > 0) || !expected->elem) {
+            if (!expected) {
+                err("array literal needs an explicit type annotation (v1 does not infer array types from elements)",
+                    al->loc.line, al->loc.col);
+            } else {
+                err("array literal requires a fixed-array or slice target type (got " +
+                    expected->to_string() + ")", al->loc.line, al->loc.col);
+            }
+            e.ty = intern(type_void());
+            return e.ty;
+        }
+        if (al->elements.empty()) {
+            // v1 rejects an empty array literal outright (no type-inference
+            // subsystem to recover the element type from a surrounding
+            // context, and a zero-length fixed array T[0] is not a valid v1
+            // shape). The declared type is present here, but the literal still
+            // carries no elements to validate against, so reject for v1.
+            err("empty array literal needs a declared type and at least one element (v1 does not infer array types)",
+                al->loc.line, al->loc.col);
+            e.ty = intern(type_void());
+            return e.ty;
+        }
+        // v1 scope restriction (chunk c2): a FIXED-array ArrayLit may only
+        // appear as the direct initializer of a `let`/`const`/`auto` binding -
+        // the LetStmt init path sets aggregate_cast_init to point at the
+        // init expr while it is being checked, so == &e identifies exactly
+        // that position. A fixed array is a multi-word aggregate that v1's
+        // call/return convention does NOT carry by value (words_for_type
+        // returns 1 for a fixed array, truncating it; no hidden-pointer path
+        // like a registered struct has), so a fixed-array ArrayLit used as a
+        // call argument or a return value would silently miscompile. A
+        // SLICE ArrayLit is fine in any position with a declared slice type
+        // (codegen materializes its backing into a temp and yields
+        // {rax=ptr, rdx=len}, which the existing 2-word slice arg / slice
+        // return paths already handle). An ArrayLit as the base of an index /
+        // a binary operand reaches here with expected==nullptr and is rejected
+        // by the annotation check above.
+        if (!expected->is_slice && aggregate_cast_init != &e) {
+            err("a fixed-array array literal may only appear as a `let`/`const` "
+                "initializer in v1 (fixed-array call args / returns are not "
+                "supported); use a slice `" + expected->elem->to_string() +
+                "[]` for arg-passing, or assign the literal to a local first",
+                al->loc.line, al->loc.col);
+        }
+        const Type* elem_ty = expected->elem.get();
+        if (!expected->is_slice) {
+            // fixed array T[N]: requires EXACTLY N elements.
+            if (al->elements.size() != expected->array_len) {
+                err("array literal for " + expected->to_string() + " needs " +
+                    std::to_string(expected->array_len) + " elements, got " +
+                    std::to_string(al->elements.size()),
+                    al->loc.line, al->loc.col);
+            }
+        }
+        for (auto& el : al->elements) {
+            const Type* got = check_value(el, elem_ty);
+            if (!types_compatible(elem_ty, got))
+                err("array element type mismatch (expected " + elem_ty->to_string() +
+                    ", got " + got->to_string() + ")", el->loc.line, el->loc.col);
+        }
+        // Bake the declared array/slice Type onto ->ty so codegen knows the
+        // shape (fixed-array extent vs. slice {ptr,len}) and the element type.
+        e.ty = expected;
+        return e.ty;
+    }
     err("codegen: expression node not yet supported by sema", e.loc.line, e.loc.col);
     e.ty = intern(type_void()); return e.ty;
 }
@@ -1478,20 +1587,29 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
             if (vt && vt->is_slice && is_local_array_view(*rs->value))
                 err("cannot return a slice/view derived from a local fixed array",
                     rs->loc.line, rs->loc.col);
-            // A struct-returning function's `return` value must be a bare
+            // A struct-returning function's `return` value may be (a) a bare
             // local (codegen copies its bytes through the hidden return
-            // pointer) or a call to a function with the SAME struct return
+            // pointer), (b) a call to a function with the SAME struct return
             // type (forwarding this function's own incoming hidden pointer -
-            // supports multi-hop chains, e.g. return relay(...);). Anything
-            // else has no destination address codegen can use.
+            // supports multi-hop chains, e.g. return relay(...);), or (c) a
+            // struct literal of the return type (codegen materializes it into
+            // a compiler-hidden temp frame slot, then copies that temp's
+            // bytes through the hidden return pointer). A struct literal of a
+            // MISMATCHED struct is rejected by types_compatible above and never
+            // reaches here; any other aggregate expression (e.g. a field
+            // access) has no destination address codegen can use and stays
+            // rejected.
             if (ret_ty && is_registered_struct(ret_ty)) {
                 bool is_ident = dynamic_cast<const Ident*>(rs->value.get()) != nullptr;
                 auto* call = dynamic_cast<const CallExpr*>(rs->value.get());
                 bool is_forwarding_call = call && vt->same(*ret_ty);
-                if (!is_ident && !is_forwarding_call) {
+                auto* sl = dynamic_cast<const StructLit*>(rs->value.get());
+                bool is_struct_lit = sl && sl->type_name == ret_ty->struct_name;
+                if (!is_ident && !is_forwarding_call && !is_struct_lit) {
                     err("a `return` of struct '" + ret_ty->struct_name + "' must be a plain "
-                        "local variable or a call to a function with the same struct return "
-                        "type", rs->loc.line, rs->loc.col);
+                        "local variable, a call to a function with the same struct return "
+                        "type, or a struct literal of '" + ret_ty->struct_name + "'",
+                        rs->loc.line, rs->loc.col);
                 }
             }
         } else if (ret_ty && !ret_ty->is_void()) {
@@ -1760,11 +1878,18 @@ SemaResult sema(Program& prog,
 
     // Global initializers obey the same nominal assignment barrier as locals.
     // Check them after signatures are registered so any initializer call has
-    // the normal native/script result type available.
+    // the normal native/script result type available. An aggregate (struct /
+    // fixed-array / slice) global's initializer is a StructLit/ArrayLit; the
+    // ArrayLit path uses the aggregate_cast_init == &e discriminator to allow
+    // a fixed-array ArrayLit ONLY as a direct init, so set it to the init expr
+    // for the duration of this check (mirrors LetStmt's own setting, c2/c3).
     for (auto& g : prog.globals) {
         if (!g.init) continue;
         const Type* want = c.globals[g.name].ty;
+        const Expr* saved_aggregate_cast_init = c.aggregate_cast_init;
+        c.aggregate_cast_init = g.init.get();
         const Type* got = c.check_value(g.init, want);
+        c.aggregate_cast_init = saved_aggregate_cast_init;
         if (!Checker::types_compatible(want, got))
             c.err("global initializer type mismatch (" + want->to_string() + " = " +
                   got->to_string() + ")", g.loc.line, g.loc.col);

@@ -84,16 +84,46 @@ mismatch (so a wrong result is harness-observable, not a silent 0). Run:
    every helper. This is also why the lexer cursor is scalar globals
    (`lx_src`/`lx_pos`/`lx_len`/`lx_err`) and not a struct global.
 
+   **RESOLVED (first-class struct / aggregate pass, 2026-07-10):** aggregate
+   globals now ship — `struct`/`array`/`slice` globals all type-check,
+   initialize, load, and store, with the globals table carrying typed per-global
+   offsets/sizes (slices 16 bytes ptr+len, structs/arrays their full layout). The
+   fn-local-pool workaround still compiles and is still the right shape for this
+   demo (the pools are passed by value as slices to every helper, which is the
+   structurally-supported shape; a slice global is now legal but threading a
+   global pool through reentrant parse/eval helpers would still be a design
+   question, not a language limitation), but a `struct`/`array`/`slice` global is
+   no longer rejected by sema. Pinned by the non-circular `aggregate_global_test`
+   ctest probes [1]-[8]. Documented in `docs/TYPE_SYSTEM.md` §12.2 and
+   `docs/CODEGEN_SPEC.md` §16.
+
 2. **Slice globals are aggregate globals** — the same M11 rejection. An
    `i64[]` global can't be initialized (or even declared). So the pool
    can't live in a global; it must be threaded as by-value slice args.
    (The first draft tried `global ps_kinds : i64[]` and was rewritten.)
 
+   **RESOLVED (first-class struct / aggregate pass, 2026-07-10):** slice
+   globals now ship as part of the aggregate-globals pass — a `slice<T>`
+   global carries 16 bytes (ptr+len) in the typed globals table, with a
+   const-foldable initializer baked at load and the slice's backing store
+   relocated correctly across `.em` round-trip (relative-ptr). The
+   by-value-slice-arg-threading workaround still compiles and is still the
+   shape this demo uses (the pools live in the driving fn), but a slice
+   global is no longer rejected. Pinned by `aggregate_global_test` probes
+   [3] (slice global element read) and [8] (slice global `.em` round-trip
+   with relative-ptr relocation). Documented in `docs/TYPE_SYSTEM.md` §12.2
+   and `docs/CODEGEN_SPEC.md` §16.
+
 3. **`struct`-return-via-local ABI** (the documented Win64 hidden-pointer
-   restriction). `lex_one`/`lex_word`/`blank_token`/`tok`/`tok_err` each
+   restriction). ~~`lex_one`/`lex_word`/`blank_token`/`tok`/`tok_err` each
    build the `Token` literal in a local and `return` the local — never
-   `return Token { ... };` directly. Same pattern `demo/math/vec.ember`
-   uses for `V2`/`V3`.
+   `return Token { ... };` directly.~~ **RESOLVED:** a fn may now `return
+   Token { ... };` directly (codegen materializes the struct literal into a
+   compiler-hidden temp frame slot, then copies it through the hidden return
+   pointer). The via-local workaround still works but is no longer required;
+   pinned by the non-circular `binding_abi_test` probe [2c] (struct-literal
+   return). Same pattern `demo/math/vec.ember` uses for `V2`/`V3` is also no
+   longer required.
 
 4. **Switch cases are statement form, not block form.** `case N: return x;`
    is supported; `case N: { return x; }` is rejected with "nonempty switch

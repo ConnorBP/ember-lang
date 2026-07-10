@@ -57,6 +57,44 @@ struct CG {
     int32_t next_local_off = 0;          // grows downward (negative offsets)
     std::unordered_map<std::string, int32_t> locals;  // name -> offset from rbp
     std::unordered_map<std::string, const Type*> local_types;
+    // Compiler-hidden temp frame slots for struct-by-value general-expression
+    // args (a struct literal or struct-returning call passed by value) and for
+    // a struct-literal `return` value. These have no single source frame
+    // address (they're not a bare local), so codegen materializes them into a
+    // fresh temp slot (via alloc_local with a synthesized name containing '$',
+    // which cannot collide with any user identifier - ember identifiers can't
+    // contain '$'), then copies the temp's bytes through the existing
+    // hidden-pointer / arg-copy machinery. temp_counter hands out distinct
+    // names so two temps in the same fn get distinct slots (alloc_local already
+    // mangles by name). compile_func's sum_bytes pass pre-counts the total
+    // bytes these temps need so the frame is sized to hold them.
+    int32_t temp_counter = 0;
+    int32_t alloc_struct_temp(const Type* t) {
+        std::string name = "__tmp$" + std::to_string(temp_counter++);
+        return alloc_local(name, t);
+    }
+    // Chunk c2: compiler-hidden temp frame slots for array-literal backing
+    // storage. A slice array literal `let s: i64[] = [1, 2, 3];` needs a
+    // separate backing region of `count * elem_size` bytes to hold the
+    // elements (the slice local itself is only the 16-byte {ptr,len} pair,
+    // whose ptr field points at this backing region). Reuses c1's
+    // alloc_local-with-a-synthesized-name temp discipline but with a DISTINCT
+    // name prefix (`__arrtmp$`) and a distinct counter so the two temp families
+    // never collide (c1's struct temps are `__tmp$N`; these are `__arrtmp$M`).
+    // arr_temp_types owns the synthesized fixed-array backing Types so the
+    // raw pointers stashed in local_types stay stable for the function's
+    // codegen lifetime (mirrors sema's type_store owning synthesized Types).
+    // compile_func's count_arr_temps_block pre-counts the total backing bytes
+    // so the frame is sized to hold them (mirrors count_struct_temps_block).
+    int32_t arr_temp_counter = 0;
+    std::vector<std::shared_ptr<Type>> arr_temp_types;
+    int32_t alloc_arr_temp(const Type* elem, uint32_t count) {
+        std::string name = "__arrtmp$" + std::to_string(arr_temp_counter++);
+        auto bt = std::make_shared<Type>(*elem);   // base element type, then wrap as fixed array
+        Type t; t.prim = elem->prim; t.array_len = count; t.elem = bt;
+        arr_temp_types.push_back(std::make_shared<Type>(std::move(t)));
+        return alloc_local(name, arr_temp_types.back().get());
+    }
     int32_t arg_temps_base = 0;          // offset of arg-temp area start
     int32_t frame_size = 0;
     bool makes_calls = false;
@@ -542,6 +580,156 @@ struct CG {
         if (auto* a = dynamic_cast<const AssignExpr*>(&ex)) { prescan_expr(*a->value); if (a->target) prescan_expr(*a->target); return; }
     }
 
+    // Pre-count the total frame bytes needed for compiler-hidden struct temp
+    // slots (see temp_counter / alloc_struct_temp). Two sources: (1) a
+    // `return <StructLit>;` in a struct-by-pointer-returning function (the
+    // ReturnStmt struct-by-pointer path materializes the literal into a temp
+    // before copying through the hidden pointer), and (2) a struct-by-value
+    // call argument that is itself a StructLit or a struct-returning CallExpr
+    // (the CallExpr arg-stash materializes it into a temp before copying into
+    // the arg slot). A bare-Ident struct arg needs no temp (it already has a
+    // frame address). Temps are short-lived (materialize -> copy -> done) but
+    // are reserved as full frame slots for simplicity, so the SUM of all temp
+    // bytes across the function is a safe (over-)reservation. ex.ty is set by
+    // sema before compile_func runs, so the struct size is resolvable here via
+    // value_bytes(ex.ty, ctx.structs).
+    void count_struct_temps_block(const Block& b, int32_t& total) {
+        for (auto& s : b.stmts) count_struct_temps_stmt(*s, total);
+    }
+    void count_struct_temps_stmt(const Stmt& s, int32_t& total) {
+        if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_struct_temps_expr(*ls->init, total); return; }
+        if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_struct_temps_expr(*es->expr, total); return; }
+        if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) {
+            if (rs->value && returns_struct_by_ptr()) {
+                // Only a StructLit return value needs a temp; the Ident and
+                // forwarding-call branches copy directly / forward the hidden
+                // pointer with no temp.
+                if (dynamic_cast<const StructLit*>(rs->value.get()) &&
+                    rs->value->ty && is_registered_struct_ty(rs->value->ty))
+                    total += value_bytes(rs->value->ty, ctx.structs);
+            }
+            if (rs->value) count_struct_temps_expr(*rs->value, total);
+            return;
+        }
+        if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) { count_struct_temps_expr(*ds->expr, total); return; }
+        if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
+            count_struct_temps_expr(*is->cond, total); count_struct_temps_block(is->then_b, total);
+            if (is->has_else) count_struct_temps_block(is->else_b, total); return;
+        }
+        if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_struct_temps_expr(*ws->cond, total); count_struct_temps_block(ws->body, total); return; }
+        if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_struct_temps_block(ds->body, total); count_struct_temps_expr(*ds->cond, total); return; }
+        if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
+            if (fs->init) count_struct_temps_stmt(*fs->init, total);
+            if (fs->cond) count_struct_temps_expr(*fs->cond, total);
+            if (fs->step) count_struct_temps_expr(*fs->step, total);
+            count_struct_temps_block(fs->body, total); return;
+        }
+        if (auto* bs = dynamic_cast<const BlockStmt*>(&s)) { count_struct_temps_block(bs->block, total); return; }
+        if (auto* sw = dynamic_cast<const SwitchStmt*>(&s)) {
+            count_struct_temps_expr(*sw->subject, total);
+            for (auto& c : sw->cases) count_struct_temps_block(c.body, total);
+            return;
+        }
+    }
+    bool is_registered_struct_ty(const Type* t) const {
+        return t && !t->struct_name.empty() && ctx.structs && ctx.structs->count(t->struct_name) != 0;
+    }
+    void count_struct_temps_expr(const Expr& ex, int32_t& total) {
+        if (auto* c = dynamic_cast<const CallExpr*>(&ex)) {
+            if (c->receiver) count_struct_temps_expr(*c->receiver, total);
+            for (auto& a : c->args) {
+                // A struct-by-value arg that is NOT a bare Ident needs a temp.
+                // ex.ty (the arg's sema-resolved type) is a registered struct
+                // iff this is a struct-by-value arg slot. StructLit and
+                // struct-returning CallExpr both resolve to the struct type and
+                // are not Idents -> temp.
+                if (a->ty && is_registered_struct_ty(a->ty) &&
+                    !dynamic_cast<const Ident*>(a.get()))
+                    total += value_bytes(a->ty, ctx.structs);
+                count_struct_temps_expr(*a, total);
+            }
+            return;
+        }
+        if (auto* b = dynamic_cast<const BinExpr*>(&ex)) { count_struct_temps_expr(*b->lhs, total); count_struct_temps_expr(*b->rhs, total); return; }
+        if (auto* u = dynamic_cast<const UnaryExpr*>(&ex)) { count_struct_temps_expr(*u->operand, total); return; }
+        if (auto* c = dynamic_cast<const CastExpr*>(&ex)) { count_struct_temps_expr(*c->operand, total); return; }
+        if (auto* t = dynamic_cast<const TernaryExpr*>(&ex)) { count_struct_temps_expr(*t->cond, total); count_struct_temps_expr(*t->then_e, total); count_struct_temps_expr(*t->else_e, total); return; }
+        if (auto* a = dynamic_cast<const AssignExpr*>(&ex)) { if (a->target) count_struct_temps_expr(*a->target, total); count_struct_temps_expr(*a->value, total); return; }
+        if (auto* ix = dynamic_cast<const IndexExpr*>(&ex)) { count_struct_temps_expr(*ix->base, total); count_struct_temps_expr(*ix->index, total); return; }
+        if (auto* fx = dynamic_cast<const FieldExpr*>(&ex)) { count_struct_temps_expr(*fx->base, total); return; }
+        if (auto* v = dynamic_cast<const ViewExpr*>(&ex)) { count_struct_temps_expr(*v->base, total); return; }
+        if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) count_struct_temps_expr(*kv.second, total); return; }
+    }
+
+    // Chunk c2: pre-count the total frame bytes needed for array-literal
+    // backing storage (see arr_temp_counter / alloc_arr_temp). A SLICE array
+    // literal `let s: i64[] = [1,2,3];` (and a slice literal used as a call
+    // arg or a return value) needs a separate backing region of
+    // count*elem_size bytes to hold the elements; the slice local/arg/return
+    // itself is only the 16-byte {ptr,len} pair whose ptr points at the
+    // backing. A FIXED-ARRAY array literal `let a: i64[3] = [1,2,3];` does NOT
+    // need a separate backing temp (its elements go directly into the fixed-
+    // array local's own frame slot, already counted by sum_bytes via
+    // local_width_bytes(ls->init->ty)). So this pass adds backing bytes ONLY
+    // for slice-typed ArrayLits. ex.ty is set by sema before compile_func runs,
+    // so the slice-ness and element size are resolvable here. Counting the SUM
+    // is a safe over-reservation (backings are short-lived but reserved as
+    // full frame slots, mirroring struct temps).
+    void count_arr_temps_block(const Block& b, int32_t& total) {
+        for (auto& s : b.stmts) count_arr_temps_stmt(*s, total);
+    }
+    void count_arr_temps_stmt(const Stmt& s, int32_t& total) {
+        if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_arr_temps_expr(*ls->init, total); return; }
+        if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_arr_temps_expr(*es->expr, total); return; }
+        if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) { if (rs->value) count_arr_temps_expr(*rs->value, total); return; }
+        if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) { count_arr_temps_expr(*ds->expr, total); return; }
+        if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
+            count_arr_temps_expr(*is->cond, total); count_arr_temps_block(is->then_b, total);
+            if (is->has_else) count_arr_temps_block(is->else_b, total); return;
+        }
+        if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_arr_temps_expr(*ws->cond, total); count_arr_temps_block(ws->body, total); return; }
+        if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_arr_temps_block(ds->body, total); count_arr_temps_expr(*ds->cond, total); return; }
+        if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
+            if (fs->init) count_arr_temps_stmt(*fs->init, total);
+            if (fs->cond) count_arr_temps_expr(*fs->cond, total);
+            if (fs->step) count_arr_temps_expr(*fs->step, total);
+            count_arr_temps_block(fs->body, total); return;
+        }
+        if (auto* bs = dynamic_cast<const BlockStmt*>(&s)) { count_arr_temps_block(bs->block, total); return; }
+        if (auto* sw = dynamic_cast<const SwitchStmt*>(&s)) {
+            count_arr_temps_expr(*sw->subject, total);
+            for (auto& c : sw->cases) count_arr_temps_block(c.body, total);
+            return;
+        }
+    }
+    void count_arr_temps_expr(const Expr& ex, int32_t& total) {
+        if (auto* al = dynamic_cast<const ArrayLit*>(&ex)) {
+            // A slice-typed ArrayLit needs a backing temp (count*elem_size bytes);
+            // a fixed-array ArrayLit does not (its elements go into its own
+            // local slot). Recurse into elements too (a nested slice ArrayLit
+            // inside an element expr would need its own backing).
+            if (al->ty && al->ty->is_slice && al->ty->elem) {
+                total += int32_t(al->elements.size()) * value_bytes(al->ty->elem.get(), ctx.structs);
+            }
+            for (auto& el : al->elements) count_arr_temps_expr(*el, total);
+            return;
+        }
+        if (auto* c = dynamic_cast<const CallExpr*>(&ex)) {
+            if (c->receiver) count_arr_temps_expr(*c->receiver, total);
+            for (auto& a : c->args) count_arr_temps_expr(*a, total);
+            return;
+        }
+        if (auto* b = dynamic_cast<const BinExpr*>(&ex)) { count_arr_temps_expr(*b->lhs, total); count_arr_temps_expr(*b->rhs, total); return; }
+        if (auto* u = dynamic_cast<const UnaryExpr*>(&ex)) { count_arr_temps_expr(*u->operand, total); return; }
+        if (auto* c = dynamic_cast<const CastExpr*>(&ex)) { count_arr_temps_expr(*c->operand, total); return; }
+        if (auto* t = dynamic_cast<const TernaryExpr*>(&ex)) { count_arr_temps_expr(*t->cond, total); count_arr_temps_expr(*t->then_e, total); count_arr_temps_expr(*t->else_e, total); return; }
+        if (auto* a = dynamic_cast<const AssignExpr*>(&ex)) { if (a->target) count_arr_temps_expr(*a->target, total); count_arr_temps_expr(*a->value, total); return; }
+        if (auto* ix = dynamic_cast<const IndexExpr*>(&ex)) { count_arr_temps_expr(*ix->base, total); count_arr_temps_expr(*ix->index, total); return; }
+        if (auto* fx = dynamic_cast<const FieldExpr*>(&ex)) { count_arr_temps_expr(*fx->base, total); return; }
+        if (auto* v = dynamic_cast<const ViewExpr*>(&ex)) { count_arr_temps_expr(*v->base, total); return; }
+        if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) count_arr_temps_expr(*kv.second, total); return; }
+    }
+
     // Item E ("hot local pinning") candidate selection: a purely syntactic,
     // static pre-pass over ONE loop's body (not the whole function - loops
     // are pinned independently, one at a time), counting textual references
@@ -902,12 +1090,9 @@ struct CG {
         for (auto& op : ops) {
             int32_t off = op.slot0 * 8;
             if (op.is_struct) {
-                auto* id = dynamic_cast<const Ident*>(op.e);
-                auto it = id ? locals.find(id->name) : locals.end();
                 auto sit = (op.ty && !op.ty->struct_name.empty() && ctx.structs) ? ctx.structs->find(op.ty->struct_name) : ctx.structs->end();
-                if (it != locals.end() && sit != ctx.structs->end()) {
-                    copy_bytes(Reg::rsp, off, Reg::rbp, it->second, sit->second.size);
-                }
+                if (sit != ctx.structs->end())
+                    stash_struct_arg(op.e, op.ty, off, sit->second);
             } else {
                 eval(*op.e);
                 if (op.words == 2) {
@@ -960,11 +1145,85 @@ struct CG {
     }
     // Copy a registered struct's bytes from a local (by name) to the address
     // in `dest_reg` (matching how struct-by-value call arguments are copied
-    // above - exact byte count, not a rounded-up word count).
+    // above - exact byte count, not a rounded-up word count). c3: if the name
+    // is a GLOBAL struct (not a local), copy from [globals_base + offset]
+    // instead of [rbp + local_off] - a struct global used by-value (`return cfg;`
+    // or `foo(cfg)`) has no frame slot, so the global block is the source.
     void copy_struct_to_ptr(const std::string& local_name, const StructLayout& layout, Reg dest_reg) {
         auto it = locals.find(local_name);
-        if (it == locals.end()) return;
-        copy_bytes(dest_reg, 0, Reg::rbp, it->second, layout.size);
+        if (it != locals.end()) {
+            copy_bytes(dest_reg, 0, Reg::rbp, it->second, layout.size);
+            return;
+        }
+        // c3: struct global by-value. Resolve the typed byte offset (globals_
+        // offsets if wired, else index*8) and copy layout.size bytes from
+        // [globals_base + offset] into dest_reg. mov r10, <globals_base reloc>;
+        // copy_bytes(dest_reg, 0, r10, offset, size).
+        const auto* gidx = ctx.globals_index ? ctx.globals_index : (g_globals_for_codegen ? &g_globals_for_codegen->index : nullptr);
+        const auto* goffsets = ctx.globals_offsets ? ctx.globals_offsets : (g_globals_for_codegen ? &g_globals_for_codegen->offsets : nullptr);
+        const auto* gtypes = ctx.globals_types ? ctx.globals_types : (g_globals_for_codegen ? &g_globals_for_codegen->types : nullptr);
+        if (gidx && gtypes) {
+            int32_t goff = 0; bool found = false;
+            if (goffsets) { auto oit = goffsets->find(local_name); if (oit != goffsets->end()) { goff = int32_t(oit->second); found = true; } }
+            if (!found) { auto gi = gidx->find(local_name); if (gi != gidx->end()) { goff = int32_t(gi->second) * 8; found = true; } }
+            if (found) {
+                e.mov_reg_imm64_external(Reg::r10, AbsFixup::GlobalsBase);
+                copy_bytes(dest_reg, 0, Reg::r10, goff, layout.size);
+            }
+        }
+    }
+
+    // Stash a struct-by-value call argument into the call's arg-stash region
+    // at [rsp+off]. Sema (check_struct_arg_shape) permits three shapes: a bare
+    // Ident (copy from its frame address), a StructLit of the matching struct
+    // (materialize into a fresh temp, then copy), or a struct-returning CallExpr
+    // of the matching struct (lea the temp's address into rax as the hidden
+    // word-0, eval_struct_returning_call writes through it into the temp, then
+    // copy). Each non-Ident arg gets its OWN fresh temp (alloc_struct_temp
+    // hands out distinct '$'-tagged names so two struct args in one call never
+    // alias), sized into the frame by count_struct_temps_block. The temp lives
+    // in the caller's frame (a plain stack slot) - W^X and register
+    // preservation are unaffected.
+    void stash_struct_arg(const Expr* arg_e, const Type* ty, int32_t off, const StructLayout& layout) {
+        if (auto* id = dynamic_cast<const Ident*>(arg_e)) {
+            auto it = locals.find(id->name);
+            if (it != locals.end()) {
+                copy_bytes(Reg::rsp, off, Reg::rbp, it->second, layout.size);
+                return;
+            }
+            // c3: struct GLOBAL by-value arg. Copy from [globals_base + offset]
+            // into the arg-stash region at [rsp+off] (mirrors copy_struct_to_ptr's
+            // global fallback - a struct global has no frame slot).
+            const auto* gidx = ctx.globals_index ? ctx.globals_index : (g_globals_for_codegen ? &g_globals_for_codegen->index : nullptr);
+            const auto* goffsets = ctx.globals_offsets ? ctx.globals_offsets : (g_globals_for_codegen ? &g_globals_for_codegen->offsets : nullptr);
+            const auto* gtypes = ctx.globals_types ? ctx.globals_types : (g_globals_for_codegen ? &g_globals_for_codegen->types : nullptr);
+            if (gidx && gtypes) {
+                int32_t goff = 0; bool found = false;
+                if (goffsets) { auto oit = goffsets->find(id->name); if (oit != goffsets->end()) { goff = int32_t(oit->second); found = true; } }
+                if (!found) { auto gi = gidx->find(id->name); if (gi != gidx->end()) { goff = int32_t(gi->second) * 8; found = true; } }
+                if (found) {
+                    e.mov_reg_imm64_external(Reg::r10, AbsFixup::GlobalsBase);
+                    copy_bytes(Reg::rsp, off, Reg::r10, goff, layout.size);
+                }
+            }
+            return;
+        }
+        if (auto* sl = dynamic_cast<const StructLit*>(arg_e)) {
+            int32_t temp_off = alloc_struct_temp(ty);
+            store_value_to_memory(*sl, ty, Reg::rbp, temp_off);
+            copy_bytes(Reg::rsp, off, Reg::rbp, temp_off, layout.size);
+            return;
+        }
+        if (auto* call = dynamic_cast<const CallExpr*>(arg_e)) {
+            int32_t temp_off = alloc_struct_temp(ty);
+            e.byte(0x48); e.byte(0x8D); e.byte(0x85); e.imm32(temp_off); // lea rax, [rbp+temp_off]
+            eval_struct_returning_call(*call);
+            copy_bytes(Reg::rsp, off, Reg::rbp, temp_off, layout.size);
+            return;
+        }
+        // Sema's check_struct_arg_shape rejects any other shape; this is
+        // unreachable for a sema-clean program. Trap rather than copy garbage.
+        emit_trap(int(TrapReason::IllegalInstruction), "internal: struct-by-value arg is not a local/literal/call");
     }
 
     // --- obfuscation helpers (CODEGEN_SPEC.md Section obf) ---
@@ -1250,21 +1509,53 @@ void CG::eval(const Expr& ex) {
         // global? (v1.0: prefer ctx.globals_index/types threaded through CodeGenCtx —
         // avoids the process-wide g_globals_for_codegen pointer which races under
         // parallel compile. Fall back to it for backward compat if ctx fields null.)
+        // c3: prefer ctx.globals_offsets (the TYPED byte offset) over the legacy
+        // flat index*8 — aggregate globals land at non-8-byte slots. Fall back to
+        // index*8 when offsets is null (scalar-only hosts keep working).
         const auto* gidx = ctx.globals_index ? ctx.globals_index : (g_globals_for_codegen ? &g_globals_for_codegen->index : nullptr);
+        const auto* goffsets = ctx.globals_offsets ? ctx.globals_offsets : (g_globals_for_codegen ? &g_globals_for_codegen->offsets : nullptr);
         const auto* gtypes = ctx.globals_types ? ctx.globals_types : (g_globals_for_codegen ? &g_globals_for_codegen->types : nullptr);
         const int64_t gbase = ctx.globals_base;
         if (gidx && gtypes) {
-            auto gi = gidx->find(id->name);
-            if (gi != gidx->end()) {
-                int32_t off = int32_t(gi->second) * 8;
+            // resolve the per-global byte offset: typed offset if available,
+            // else the legacy flat index*8.
+            int32_t off = 0;
+            bool found = false;
+            if (goffsets) {
+                auto oit = goffsets->find(id->name);
+                if (oit != goffsets->end()) { off = int32_t(oit->second); found = true; }
+            }
+            if (!found) {
+                auto gi = gidx->find(id->name);
+                if (gi != gidx->end()) { off = int32_t(gi->second) * 8; found = true; }
+            }
+            if (found) {
                 auto tit = gtypes->find(id->name);
                 const Type* t = (tit != gtypes->end()) ? tit->second : nullptr;
-                load_global_to_rax(*this, gbase, off);
-                if (t && t->prim == Prim::F64) {
-                    e.byte(0x66); e.byte(0x48); e.byte(0x0F); e.byte(0x6E); e.byte(0xC0); // movq xmm0,rax
-                } else if (t && t->is_float()) {
-                    e.byte(0x66); e.byte(0x0F); e.byte(0x6E); e.byte(0xC0); // movd xmm0,eax
-                } else normalize_rax(t);
+                if (t && t->is_slice) {
+                    // slice global read: load {ptr,len} (16 bytes) at [base+off],
+                    // then turn the RELATIVE ptr (a 0-based offset within the
+                    // block, baked at load so the bytes round-trip through .em
+                    // without loader fixup) into an ABSOLUTE address by adding
+                    // globals_base. Mirrors the slice-local ABI {rax=ptr,rdx=len}.
+                    // Sequence: rax=ptr; rdx=rax (save ptr); rax=len; rcx=rax
+                    // (save len); rax=rdx (ptr); rax += base; rdx=rcx (len).
+                    load_global_to_rax(*this, gbase, off);        // rax = relative ptr
+                    e.mov_reg_reg(Reg::rdx, Reg::rax);             // rdx = ptr (saved)
+                    load_global_to_rax(*this, gbase, off + 8);    // rax = len
+                    e.mov_reg_reg(Reg::rcx, Reg::rax);             // rcx = len (saved)
+                    e.mov_reg_reg(Reg::rax, Reg::rdx);             // rax = ptr
+                    e.mov_reg_imm64_external(Reg::r11, AbsFixup::GlobalsBase);
+                    e.add_reg_reg(Reg::rax, Reg::r11);             // rax = absolute ptr
+                    e.mov_reg_reg(Reg::rdx, Reg::rcx);             // rdx = len
+                } else {
+                    load_global_to_rax(*this, gbase, off);
+                    if (t && t->prim == Prim::F64) {
+                        e.byte(0x66); e.byte(0x48); e.byte(0x0F); e.byte(0x6E); e.byte(0xC0); // movq xmm0,rax
+                    } else if (t && t->is_float()) {
+                        e.byte(0x66); e.byte(0x0F); e.byte(0x6E); e.byte(0xC0); // movd xmm0,eax
+                    } else normalize_rax(t);
+                }
                 return;
             }
         }
@@ -1692,15 +1983,25 @@ void CG::eval(const Expr& ex) {
                 }
             } else {
                 // v1.0: prefer ctx.globals_index/types (parallel-compile-safe).
+                // c3: prefer ctx.globals_offsets (typed byte offset) over index*8.
                 const auto* gidx = ctx.globals_index ? ctx.globals_index : (g_globals_for_codegen ? &g_globals_for_codegen->index : nullptr);
+                const auto* goffsets = ctx.globals_offsets ? ctx.globals_offsets : (g_globals_for_codegen ? &g_globals_for_codegen->offsets : nullptr);
                 const auto* gtypes = ctx.globals_types ? ctx.globals_types : (g_globals_for_codegen ? &g_globals_for_codegen->types : nullptr);
                 if (gidx && gtypes) {
-                    auto gi = gidx->find(id->name);
-                    if (gi != gidx->end()) {
+                    int32_t off = 0; bool found = false;
+                    if (goffsets) {
+                        auto oit = goffsets->find(id->name);
+                        if (oit != goffsets->end()) { off = int32_t(oit->second); found = true; }
+                    }
+                    if (!found) {
+                        auto gi = gidx->find(id->name);
+                        if (gi != gidx->end()) { off = int32_t(gi->second) * 8; found = true; }
+                    }
+                    if (found) {
                         auto tit = gtypes->find(id->name);
                         const Type* gt = (tit != gtypes->end()) ? tit->second : nullptr;
-                        if (gt && gt->is_float()) store_xmm0_to_global(*this, ctx.globals_base, int32_t(gi->second)*8, gt);
-                        else { normalize_rax(gt); store_rax_to_global(*this, ctx.globals_base, int32_t(gi->second)*8); }
+                        if (gt && gt->is_float()) store_xmm0_to_global(*this, ctx.globals_base, off, gt);
+                        else { normalize_rax(gt); store_rax_to_global(*this, ctx.globals_base, off); }
                     }
                 }
             }
@@ -1893,18 +2194,18 @@ void CG::eval(const Expr& ex) {
         for (auto& op : ops) {
             int32_t off = op.slot0 * 8;
             if (op.is_struct) {
-                // struct-by-value: sema (check_struct_arg_shape) guarantees
-                // op.e is a bare local Ident - copy its EXACT byte extent
-                // (not a rounded-up word count - see copy_bytes) from the
-                // source local's frame address into the stash region,
-                // rather than eval()'ing a single register value (a
-                // multi-word struct has no such single-register form).
-                auto* id = dynamic_cast<const Ident*>(op.e);
-                auto it = id ? locals.find(id->name) : locals.end();
+                // struct-by-value: sema (check_struct_arg_shape) permits a bare
+                // local Ident, a struct literal of the param struct, or a call
+                // returning the param struct. stash_struct_arg materializes the
+                // literal/call forms into a fresh per-arg temp frame slot first
+                // (sized into the frame by count_struct_temps_block), then
+                // copies the EXACT byte extent (not a rounded-up word count -
+                // see copy_bytes) into the stash region, rather than eval()'ing
+                // a single register value (a multi-word struct has no such
+                // single-register form).
                 auto sit = (op.ty && !op.ty->struct_name.empty() && ctx.structs) ? ctx.structs->find(op.ty->struct_name) : ctx.structs->end();
-                if (it != locals.end() && sit != ctx.structs->end()) {
-                    copy_bytes(Reg::rsp, off, Reg::rbp, it->second, sit->second.size);
-                }
+                if (sit != ctx.structs->end())
+                    stash_struct_arg(op.e, op.ty, off, sit->second);
             } else {
                 eval(*op.e);
                 if (op.words == 2) {
@@ -2064,6 +2365,33 @@ void CG::eval(const Expr& ex) {
                 } else if (lt->array_len > 0) {
                     base_reg = Reg::rbp; base_off = it->second; base_ready = true;
                 }
+            } else {
+                // c3: array/slice GLOBAL base. Resolve the global's typed byte
+                // offset; for a fixed-array global set base_reg=r10 (holds
+                // globals_base) + base_off=global_offset; for a slice global
+                // eval the slice (yields {rax=absolute ptr, rdx=len}) and
+                // reuse the slice-local path.
+                const auto* gidx = ctx.globals_index ? ctx.globals_index : (g_globals_for_codegen ? &g_globals_for_codegen->index : nullptr);
+                const auto* goffsets = ctx.globals_offsets ? ctx.globals_offsets : (g_globals_for_codegen ? &g_globals_for_codegen->offsets : nullptr);
+                const auto* gtypes = ctx.globals_types ? ctx.globals_types : (g_globals_for_codegen ? &g_globals_for_codegen->types : nullptr);
+                if (gidx && gtypes) {
+                    int32_t goff = 0; bool found = false;
+                    if (goffsets) { auto oit = goffsets->find(bid->name); if (oit != goffsets->end()) { goff = int32_t(oit->second); found = true; } }
+                    if (!found) { auto gi = gidx->find(bid->name); if (gi != gidx->end()) { goff = int32_t(gi->second) * 8; found = true; } }
+                    if (found) {
+                        auto tit = gtypes->find(bid->name);
+                        const Type* gt = (tit != gtypes->end()) ? tit->second : nullptr;
+                        if (gt && gt->is_slice) {
+                            eval(*ix->base);       // rax=absolute ptr, rdx=len
+                            e.mov_reg_reg(Reg::r10, Reg::rax);
+                            e.mov_reg_reg(Reg::r9, Reg::rdx);
+                            base_reg = Reg::r10; base_off = 0; base_ready = true; is_slice_base = true;
+                        } else if (gt && gt->array_len > 0) {
+                            e.mov_reg_imm64_external(Reg::r10, AbsFixup::GlobalsBase);
+                            base_reg = Reg::r10; base_off = goff; base_ready = true;
+                        }
+                    }
+                }
             }
         }
         if (base_ready) {
@@ -2119,8 +2447,8 @@ void CG::eval(const Expr& ex) {
     }
     if (auto* fl = dynamic_cast<const FieldExpr*>(&ex)) {
         // struct field read (p.x). v1 scope: base must be a bare local Ident
-        // of a registered struct type (matches the IndexExpr/ViewExpr
-        // decision above - no nested-expression bases yet).
+        // or a global Ident of a registered struct type (c3: a struct global's
+        // field is at [globals_base + global_offset + field_offset]).
         if (auto* bid = dynamic_cast<const Ident*>(fl->base.get())) {
             auto it = locals.find(bid->name);
             if (it != locals.end() && ctx.structs) {
@@ -2142,12 +2470,79 @@ void CG::eval(const Expr& ex) {
                         }
                     }
                 }
+            } else if (ctx.structs) {
+                // c3: struct GLOBAL field read. Resolve the global's typed byte
+                // offset (globals_offsets if wired, else index*8), then read the
+                // field at [globals_base + global_off + field_off].
+                const auto* gidx = ctx.globals_index ? ctx.globals_index : (g_globals_for_codegen ? &g_globals_for_codegen->index : nullptr);
+                const auto* goffsets = ctx.globals_offsets ? ctx.globals_offsets : (g_globals_for_codegen ? &g_globals_for_codegen->offsets : nullptr);
+                const auto* gtypes = ctx.globals_types ? ctx.globals_types : (g_globals_for_codegen ? &g_globals_for_codegen->types : nullptr);
+                if (gidx && gtypes) {
+                    int32_t goff = 0; bool found = false;
+                    if (goffsets) { auto oit = goffsets->find(bid->name); if (oit != goffsets->end()) { goff = int32_t(oit->second); found = true; } }
+                    if (!found) { auto gi = gidx->find(bid->name); if (gi != gidx->end()) { goff = int32_t(gi->second) * 8; found = true; } }
+                    if (found) {
+                        auto tit = gtypes->find(bid->name);
+                        const Type* bt = (tit != gtypes->end()) ? tit->second : nullptr;
+                        auto sit = bt && !bt->struct_name.empty() ? ctx.structs->find(bt->struct_name) : ctx.structs->end();
+                        if (sit != ctx.structs->end()) {
+                            auto fit = sit->second.fields.find(fl->field);
+                            if (fit != sit->second.fields.end()) {
+                                int32_t addr_off = goff + fit->second.offset;
+                                const Type* ft = fit->second.ty;
+                                // load from [globals_base + addr_off]: mov r11,<reloc>;
+                                // then movss/movsd/load_elem from [r11+addr_off].
+                                e.mov_reg_imm64_external(Reg::r11, AbsFixup::GlobalsBase);
+                                if (ft->prim == Prim::F64 && !ft->is_slice) {
+                                    e.movsd_xmm_mem(Xmm::xmm0, Reg::r11, addr_off);
+                                } else if (ft->prim == Prim::F32 && !ft->is_slice) {
+                                    e.movss_xmm_mem(Xmm::xmm0, Reg::r11, addr_off);
+                                } else {
+                                    bool is_signed = ft->prim==Prim::I8||ft->prim==Prim::I16||
+                                                     ft->prim==Prim::I32||ft->prim==Prim::I64;
+                                    e.load_elem_to_rax(Reg::r11, addr_off, value_bytes(ft, ctx.structs), is_signed);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         return;
     }
     if (auto* s = dynamic_cast<const SizeofExpr*>(&ex)) { e.mov_reg_imm64(Reg::rax, int64_t(s->resolved)); return; }
     if (auto* o = dynamic_cast<const OffsetofExpr*>(&ex)) { e.mov_reg_imm64(Reg::rax, int64_t(o->resolved)); return; }
+    if (auto* al = dynamic_cast<const ArrayLit*>(&ex)) {
+        // Array-literal rvalue (chunk c2). sema only lets a SLICE ArrayLit
+        // reach eval() (a fixed-array ArrayLit is let-init-only and never
+        // eval'd - see sema's ArrayLit case + the LetStmt init branch in
+        // exec_stmt). Materialize the backing elements into a fresh temp
+        // (alloc_arr_temp - a distinct __arrtmp$ slot, pre-reserved by
+        // count_arr_temps_block), then yield the slice ABI {rax=ptr, rdx=len}
+        // so the existing 2-word slice-arg path (CallExpr's op.words==2 stash)
+        // and the slice-return path (ReturnStmt's is_slice_ret) both work for a
+        // slice array literal passed as an arg or returned. A fixed-array
+        // ArrayLit reaching here is an internal error (sema should have
+        // rejected it) - trap rather than silently emit a truncated rax.
+        const Type* at = al->ty;
+        if (!at || !at->is_slice || !at->elem) {
+            emit_trap(int(TrapReason::IllegalInstruction),
+                      "internal: fixed-array array literal reached eval() (sema should reject)");
+            return;
+        }
+        const Type* elem_ty = at->elem.get();
+        int32_t elem_sz = value_bytes(elem_ty, ctx.structs);
+        uint32_t count = uint32_t(al->elements.size());
+        int32_t back_off = alloc_arr_temp(elem_ty, count);
+        for (size_t i = 0; i < al->elements.size(); ++i) {
+            store_value_to_memory(*al->elements[i], elem_ty, Reg::rbp,
+                                  back_off + int32_t(i) * elem_sz);
+        }
+        // rax = lea [rbp+back_off]; rdx = count (slice ABI).
+        e.byte(0x48); e.byte(0x8D); e.byte(0x85); e.imm32(back_off); // lea rax, [rbp+back_off]
+        e.mov_reg_imm64(Reg::rdx, int64_t(count));
+        return;
+    }
     // StructLit is handled at its LetStmt init site; it is multi-word.
 }
 
@@ -2216,6 +2611,49 @@ void CG::exec_stmt(const Stmt& s) {
             }
             return;
         }
+        if (auto* alit = dynamic_cast<const ArrayLit*>(ls->init.get())) {
+            // Array-literal init (chunk c2). sema guarantees ls->init->ty is
+            // the declared array/slice Type (baked onto the ArrayLit) and
+            // count+element types already validated. Two shapes:
+            //  (a) fixed array T[N]: alloc the local's full N*elem_size frame
+            //      slot (alloc_local sizes it via local_width_bytes), then
+            //      store each element directly at base_off + i*elem_size via
+            //      store_value_to_memory (handles int/float/elem widths).
+            //  (b) slice T[]: the local is the 16-byte {ptr,len} pair. Alloc
+            //      a SEPARATE backing temp (alloc_arr_temp - a distinct
+            //      __arrtmp$ slot, pre-reserved by count_arr_temps_block) of
+            //      count*elem_size bytes, store each element there, then store
+            //      ptr = lea [rbp+back_off] and len = count into the slice slot.
+            //      The backing lives in the frame for the whole fn (over-
+            //      reserved but correct - the slice's ptr points at it).
+            const Type* at = ls->init->ty;
+            const Type* elem_ty = at && at->elem ? at->elem.get() : nullptr;
+            int32_t elem_sz = value_bytes(elem_ty, ctx.structs);
+            if (at && at->array_len > 0) {
+                // fixed array T[N]: elements go directly into the local's slot.
+                int32_t base_off = alloc_local(ls->name, at);
+                for (size_t i = 0; i < alit->elements.size(); ++i) {
+                    store_value_to_memory(*alit->elements[i], elem_ty, Reg::rbp,
+                                          base_off + int32_t(i) * elem_sz);
+                }
+            } else if (at && at->is_slice) {
+                // slice T[]: local is {ptr,len}; backing is a separate temp.
+                int32_t slot_off = alloc_local(ls->name, at);  // 16 bytes
+                uint32_t count = uint32_t(alit->elements.size());
+                int32_t back_off = alloc_arr_temp(elem_ty, count);  // count*elem_sz bytes
+                for (size_t i = 0; i < alit->elements.size(); ++i) {
+                    store_value_to_memory(*alit->elements[i], elem_ty, Reg::rbp,
+                                          back_off + int32_t(i) * elem_sz);
+                }
+                // ptr = lea [rbp+back_off]; len = count. Mirror the slice
+                // store idiom (ptr at off, len at off+8) used everywhere else.
+                e.byte(0x48); e.byte(0x8D); e.byte(0x85); e.imm32(back_off); // lea rax, [rbp+back_off]
+                e.store_reg_mem(Reg::rbp, slot_off, Reg::rax);
+                e.mov_reg_imm64(Reg::rax, int64_t(count));
+                e.store_reg_mem(Reg::rbp, slot_off + 8, Reg::rax);
+            }
+            return;
+        }
         if (auto* call = dynamic_cast<const CallExpr*>(ls->init.get())) {
             const Type* ct = call->ty;
             if (ct && !ct->struct_name.empty() && ctx.structs && ctx.structs->count(ct->struct_name)) {
@@ -2277,8 +2715,14 @@ void CG::exec_stmt(const Stmt& s) {
             // struct-by-value return: no register-based result to stash
             // across defers (the callee writes through the hidden pointer
             // directly, at whatever point in this sequence that happens) -
-            // sema guarantees rs->value is a bare Ident or a same-return-
-            // type forwarding call (see check_stmt's ReturnStmt handling).
+            // sema guarantees rs->value is a bare Ident, a same-return-type
+            // forwarding call, or a struct literal of the return type (see
+            // check_stmt's ReturnStmt handling). The struct-literal case has
+            // no source frame address, so materialize it into a compiler-hidden
+            // temp slot first (alloc_struct_temp - sized into the frame by
+            // count_struct_temps_block), then copy the temp's bytes through the
+            // hidden pointer - mirroring the Ident branch with the temp
+            // standing in for the named local.
             if (rs->value) {
                 if (auto* id = dynamic_cast<const Ident*>(rs->value.get())) {
                     auto sit = ctx.structs->find(f.ret->struct_name);
@@ -2289,6 +2733,14 @@ void CG::exec_stmt(const Stmt& s) {
                 } else if (auto* call = dynamic_cast<const CallExpr*>(rs->value.get())) {
                     e.load_reg_mem(Reg::rax, Reg::rbp, struct_ret_ptr_offset);
                     eval_struct_returning_call(*call);
+                } else if (auto* sl = dynamic_cast<const StructLit*>(rs->value.get())) {
+                    auto sit = ctx.structs->find(f.ret->struct_name);
+                    if (sit != ctx.structs->end()) {
+                        int32_t temp_off = alloc_struct_temp(f.ret.get());
+                        store_value_to_memory(*sl, f.ret.get(), Reg::rbp, temp_off);
+                        e.load_reg_mem(Reg::r11, Reg::rbp, struct_ret_ptr_offset);
+                        copy_bytes(Reg::r11, 0, Reg::rbp, temp_off, sit->second.size);
+                    }
                 }
             }
             if (has_defers) emit_cleanups_to(0);
@@ -2685,6 +3137,25 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
         }
     };
     sum_bytes(f.body);
+    // Reserve frame bytes for the compiler-hidden struct temp slots (see
+    // temp_counter / count_struct_temps_block). These are synthesized during
+    // exec for struct-by-value general-expression args and struct-literal
+    // return values; sum_bytes above only counts user LetStmt locals, so the
+    // temps would otherwise overflow the pre-sized frame. Counting the SUM is
+    // a safe over-reservation (temps are short-lived, but reserving them as
+    // full frame slots keeps alloc_local's offsets within the frame).
+    int32_t struct_temp_bytes = 0;
+    cg.count_struct_temps_block(f.body, struct_temp_bytes);
+    locals_area += struct_temp_bytes;
+    // Chunk c2: reserve frame bytes for array-literal backing temps (see
+    // arr_temp_counter / count_arr_temps_block). A slice array literal's
+    // backing region is synthesized during exec; sum_bytes above only counts
+    // user LetStmt locals (the slice's own 16-byte {ptr,len} slot IS counted
+    // there via local_width_bytes(ls->init->ty)=16, but the separate backing
+    // array is not). Counting the SUM is a safe over-reservation.
+    int32_t arr_temp_bytes = 0;
+    cg.count_arr_temps_block(f.body, arr_temp_bytes);
+    locals_area += arr_temp_bytes;
     // Collect textual sites once for frame layout. Runtime cleanup ownership
     // is established later by exec_block's lexical cleanup-scope stack.
     std::function<void(const Block&)> collect_defers = [&](const Block& b) {

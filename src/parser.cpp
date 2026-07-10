@@ -669,6 +669,27 @@ struct P {
             return e;
         }
         case Tk::LParen: { adv(); ExprPtr e=parse_expr(); expect(Tk::RParen,"')'"); return e; }
+        case Tk::LBracket: {
+            // Array literal `[ expr, expr, ... ]` (chunk c2): a `[` in the
+            // PRIMARY position constructs an array literal. The EXISTING `[`
+            // in parse_postfix stays the index/view operator - that one only
+            // fires AFTER a primary has been parsed, so `arr[0]` still
+            // indexes and `[1,2,3][0]` is an ArrayLit primary followed by a
+            // postfix index. This mirrors how `(` is grouping (primary) vs
+            // call (postfix). Empty `[]` is left for sema to reject (v1
+            // requires a declared target type, never infers from elements).
+            uint32_t l = t.line, c = t.col;
+            adv(); // '['
+            auto al = std::make_unique<ArrayLit>();
+            al->loc = {l, c};
+            if (!at(Tk::RBracket)) {
+                do {
+                    al->elements.push_back(parse_expr());
+                } while (accept(Tk::Comma));
+            }
+            expect(Tk::RBracket, "']'");
+            return al;
+        }
         case Tk::Kw_sizeof: { adv(); expect(Tk::LParen,"'('"); auto ty=parse_type(); expect(Tk::RParen,"')'"); auto e=std::make_unique<SizeofExpr>(); e->loc=loc(t); e->ty=std::move(ty); return e; }
         case Tk::Kw_offsetof: {
             adv(); expect(Tk::LParen,"'('"); auto ty=parse_type(); expect(Tk::Comma,"','");

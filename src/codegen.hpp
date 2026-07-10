@@ -15,11 +15,19 @@ namespace ember {
 
 struct CompiledFn;
 
-// Globals block: a flat 8-byte-per-global region the host reads/writes.
-// Codegen bakes `base` as an absolute imm64; global i is at [base + i*8].
+// Globals block: a TYPED layout (chunk c3) - one per-global (offset, size)
+// pair, addressed [base + offset]. Scalars are 8 bytes at an 8-aligned offset;
+// structs occupy StructLayout::size; fixed arrays occupy elem_size*array_len;
+// slices occupy 16 bytes ({ptr,len}) with the ptr stored as a RELATIVE offset
+// within the block (so the baked bytes round-trip through .em without loader
+// fixup - codegen's global-slice-load adds globals_base at runtime). `index`
+// is kept as the legacy flat slot index for backward compat with hosts that
+// only seed scalar globals (offset == index*8 for an all-scalar set).
 struct GlobalsBlock {
     int64_t base = 0;                       // set before compiling/calling
-    std::unordered_map<std::string, uint32_t> index;  // name -> slot index
+    std::unordered_map<std::string, uint32_t> index;   // name -> slot index (legacy)
+    std::unordered_map<std::string, uint32_t> offsets; // name -> byte offset (c3)
+    std::unordered_map<std::string, uint32_t> sizes;   // name -> byte size (c3)
     std::unordered_map<std::string, const Type*> types;
 };
 
@@ -102,6 +110,7 @@ struct CodeGenCtx {
     // (which races under parallel compilation). If null, falls back to the legacy
     // process-wide pointer (backward compat for hosts that haven't migrated).
     const std::unordered_map<std::string, uint32_t>* globals_index = nullptr;
+    const std::unordered_map<std::string, uint32_t>* globals_offsets = nullptr; // c3: typed byte offsets (null -> fall back to index*8)
     const std::unordered_map<std::string, const Type*>* globals_types = nullptr;
     // v1.0 Tier 2 (plan_FUNCTION_REFS.md §5.2): the registered-fn allowlist — a
     // host-allocated byte array of length ceil(fn_slot_count/8), one bit per

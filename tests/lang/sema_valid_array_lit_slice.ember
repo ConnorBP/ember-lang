@@ -1,0 +1,9 @@
+// valid for sema: a slice array literal `[1, 2, 3]` constructs an i64[] whose
+// backing storage is compiler-allocated (chunk c2). Any element count is
+// allowed for a slice (the length is carried at runtime). Runtime execution
+// is covered by examples/array_lit_test.cpp (a non-circular direct exit-code
+// probe); this file only needs to sema-pass.
+fn main() -> i64 {
+    let s: i64[] = [1, 2, 3];
+    return s[2];
+}

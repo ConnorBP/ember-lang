@@ -1,0 +1,7 @@
+// chunk c3: a fixed-array-typed global with an ArrayLit initializer is sema-ok.
+// `global arr : i64[3] = [10, 20, 30];` - the fixed-array global is accepted in
+// v1 (typed globals-block layout + load-time const fold of the elements). The
+// index read `arr[1]` is type-checked as i64. (Runtime value verified by
+// examples/aggregate_global_test.)
+global arr : i64[3] = [10, 20, 30];
+fn main() -> i64 { return arr[1]; }

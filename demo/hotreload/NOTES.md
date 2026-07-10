@@ -86,6 +86,16 @@ double-free it (the domain owns the retired page).
 
 ## Kinks surfaced (the real deliverable)
 
+> **Note (first-class struct / aggregate pass, 2026-07-10):** none of the
+> kinks below were resolvable by the c1/c2/c3 first-class struct / aggregate
+> pass. They are all reload-model or demo-harness constraints (output-buffer
+> pollution, the fixed-globals-block reload constraint, globals-index
+> threading, probe side-effects on shared state), not struct / aggregate /
+> array-literal language limitations. The hot-reload demo uses a single scalar
+> `global frame_count : i64 = 0;` (Kink 2) — a struct/array/slice global would
+> now be legal under c3, but the demo never needed one, so no RESOLVED marking
+> applies here. Recorded so the omission is seen as deliberate, not forgotten.
+
 ### Kink 1 — the immediate-callability probe polluted the deterministic output buffer
 
 The "new page callable immediately after publication" assertion called the
