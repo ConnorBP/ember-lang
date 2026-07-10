@@ -12,6 +12,7 @@ namespace ember {
 struct DispatchTable {
     std::vector<std::atomic<void*>> slots;
 
+    DispatchTable() = default;            // empty (v1.0: lets a host hold a table field that's sized later)
     explicit DispatchTable(size_t count) : slots(count) {
         for (auto& s : slots) s.store(nullptr, std::memory_order_relaxed);
     }

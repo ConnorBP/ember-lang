@@ -98,6 +98,16 @@ struct CodeGenCtx {
     // process-wide pointer (backward compat for hosts that haven't migrated).
     const std::unordered_map<std::string, uint32_t>* globals_index = nullptr;
     const std::unordered_map<std::string, const Type*>* globals_types = nullptr;
+    // v1.0 Tier 2 (plan_FUNCTION_REFS.md §5.2): the registered-fn allowlist — a
+    // host-allocated byte array of length ceil(fn_slot_count/8), one bit per
+    // script-fn slot (set by the host from script_slots at compile time). The
+    // provenance guard (emit_call_target_guard) validates a runtime i64 handle
+    // against this bitset before indexing the dispatch table (REDSHELL #6).
+    // fn_allowlist_base is baked as a raw imm64 (stable for the module's
+    // lifetime, same as the allowlist itself); fn_slot_count is the range bound.
+    // Both 0 = no allowlist -> the guard is skipped (function refs unused).
+    int64_t fn_allowlist_base = 0;
+    int64_t fn_slot_count = 0;
 };
 
 // Compile one function. Returns the JIT'd bytes + (after finalize) entry.
@@ -107,5 +117,16 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx);
 // A single process-wide pointer (v1 frontend; the host wires one block per
 // engine). Defined in codegen.cpp.
 extern GlobalsBlock* g_globals_for_codegen;
+
+// v1.0 Tier 2 (plan_FUNCTION_REFS.md §5.2): build the registered-fn allowlist —
+// a byte array of length ceil(slot_count/8), one bit per slot, set iff that
+// slot is a registered script function of this module (derived from
+// script_slots). Returned as a std::vector<uint8_t> the host owns; the host
+// pins its .data() base for the module's lifetime and sets CodeGenCtx::
+// fn_allowlist_base / fn_slot_count before compiling. The guard validates a
+// runtime i64 handle against this bitset before indexing the dispatch table.
+// Slot 0 is valid iff it's in script_slots (handles are 0-based slot indices).
+std::vector<uint8_t> build_fn_allowlist(
+    const std::unordered_map<std::string, int>& script_slots, int slot_count);
 
 } // namespace ember

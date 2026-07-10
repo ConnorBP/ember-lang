@@ -558,7 +558,74 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
         if (!t) { err("undefined name '" + id->name + "'", id->loc.line, id->loc.col); e.ty = intern(type_void()); return e.ty; }
         e.ty = t; return t;
     }
+    // v1.0 Tier 2 (plan_FUNCTION_REFS.md §4.2): `&fn_name` takes a function handle.
+    // The operand must be an Ident naming a script function of this module.
+    // The handle IS the slot index, baked as an i64 literal — a COMPILE-TIME
+    // reification, not a runtime value. We stash the slot on the AST node for
+    // codegen; the first-class-ness lives at the CALL site (handle(args)), not here.
+    if (auto* h = dynamic_cast<FnHandleExpr*>(&e)) {
+        auto* id = dynamic_cast<Ident*>(h->operand.get());
+        if (!id) {
+            err("'&' may only be applied to a function name, not an expression", h->loc.line, h->loc.col);
+            e.ty = intern(type_void()); return e.ty;
+        }
+        auto sit = script_slots->find(id->name);
+        if (sit == script_slots->end()) {
+            err("'" + id->name + "' is not a script function in this module "
+                "(cannot take a handle of a native or an unknown name)",
+                h->loc.line, h->loc.col);
+            e.ty = intern(type_void()); return e.ty;
+        }
+        h->slot = sit->second;
+        // Build a fn-handle type carrying the source fn's recorded signature,
+        // so a `let h = &fib; h(5);` call checks 5 against fib's (i64) param (§4.4).
+        Type t = type_i64();
+        t.is_fn_handle = true;
+        for (auto& f : prog->funcs) {
+            if (f.name == id->name) {
+                t.has_recorded_sig = true;
+                for (auto& p : f.params) t.recorded_params.push_back(p.ty);
+                t.recorded_ret = std::make_shared<Type>(*f.ret);
+                break;
+            }
+        }
+        e.ty = intern(t); return e.ty;
+    }
     if (auto* c = dynamic_cast<CallExpr*>(&e)) {
+        // v1.0 Tier 2 first-class call (plan_FUNCTION_REFS.md §4.3): handle(args).
+        // The target is a RUNTIME i64 fn handle, not a compile-time-known name.
+        // Type the target; it must be a fn handle. If it carries a recorded sig,
+        // check args against it; if bare `fn` (no recorded sig, e.g. a param),
+        // args are unchecked at the type level — the runtime guard (§5) still
+        // validates the handle is a registered slot before dispatch.
+        if (c->indirect_target) {
+            const Type* tt = check_expr(*c->indirect_target);
+            if (!tt || !tt->is_fn_handle) {
+                err("call target must be a function handle (fn), got '" +
+                    (tt ? tt->to_string() : std::string("?")) + "'",
+                    c->loc.line, c->loc.col);
+                e.ty = intern(type_void()); return e.ty;
+            }
+            c->is_indirect = true;
+            if (tt->has_recorded_sig) {
+                size_t nargs = c->args.size() + (c->receiver ? 1 : 0);
+                if (nargs != tt->recorded_params.size()) {
+                    err("function handle call has " + std::to_string(nargs) +
+                        " arg(s) but the function takes " +
+                        std::to_string(tt->recorded_params.size()),
+                        c->loc.line, c->loc.col);
+                    e.ty = intern(type_void()); return e.ty;
+                }
+                size_t i = 0;
+                if (c->receiver) { check_expr(*c->receiver, tt->recorded_params[0].get()); ++i; }
+                for (auto& a : c->args) { check_expr(*a, tt->recorded_params[i].get()); ++i; }
+                e.ty = intern(*tt->recorded_ret);
+            } else {
+                for (auto& a : c->args) check_expr(*a);
+                e.ty = intern(type_i64());   // default ret for a bare-`fn` call
+            }
+            return e.ty;
+        }
         // f-string interpolation sentinel (Item D - synthesized by the
         // parser's build_fstring_expr around every {expr} segment, never
         // user-callable). Resolve BEFORE the normal natives lookup below:
@@ -649,6 +716,42 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
         auto nit = natives->find(c->name);
         auto sit = script_slots->find(c->name);
         if (nit == natives->end() && sit == script_slots->end()) {
+            // v1.0 Tier 2 (plan_FUNCTION_REFS.md §4.3): `name(args)` where `name`
+            // is neither a native nor a script fn — but it might be a LOCAL
+            // VARIABLE of fn-handle type (the `let h = &fn; h(args);` case, which
+            // parses identically to a named call). Promote it to an indirect call:
+            // move an Ident referring to the var into indirect_target + recurse.
+            // This closes the parse-time ambiguity (the parser can't know if `h`
+            // is a fn name or a fn-typed var; sema resolves it here).
+            const Var* v = lookup_local_var(c->name);
+            if (v && v->ty && v->ty->is_fn_handle) {
+                auto hid = std::make_unique<Ident>();
+                hid->loc = c->loc; hid->name = c->name; hid->ty = v->ty;
+                c->indirect_target = std::move(hid);
+                c->is_indirect = true;
+                c->name.clear();
+                // re-run as an indirect call (the indirect path at the top of
+                // the CallExpr case). Re-check this same CallExpr by recursing.
+                const Type* tt = v->ty;
+                if (tt->has_recorded_sig) {
+                    size_t nargs = c->args.size() + (c->receiver ? 1 : 0);
+                    if (nargs != tt->recorded_params.size()) {
+                        err("function handle call has " + std::to_string(nargs) +
+                            " arg(s) but the function takes " +
+                            std::to_string(tt->recorded_params.size()),
+                            c->loc.line, c->loc.col);
+                        e.ty = intern(type_void()); return e.ty;
+                    }
+                    size_t i = 0;
+                    if (c->receiver) { check_expr(*c->receiver, tt->recorded_params[0].get()); ++i; }
+                    for (auto& a : c->args) { check_expr(*a, tt->recorded_params[i].get()); ++i; }
+                    e.ty = intern(*tt->recorded_ret);
+                } else {
+                    for (auto& a : c->args) check_expr(*a);
+                    e.ty = intern(type_i64());
+                }
+                return e.ty;
+            }
             err("unknown function '" + c->name + "'", c->loc.line, c->loc.col);
             e.ty = intern(type_void()); return e.ty;
         }
@@ -928,6 +1031,12 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
         if (lt && rt && !lt->same(*rt) && !(lt->is_int() && rt->is_int()))
             err("assignment type mismatch (" + lt->to_string() + " = " + rt->to_string() + ")",
                 a->loc.line, a->loc.col);
+        // v1.0 Tier 2 (§4.5): fn handle <-> plain i64 assignment is forbidden
+        // (closes V3 forging at the type level; the runtime guard is the backstop).
+        else if (lt && rt && lt->is_fn_handle != rt->is_fn_handle)
+            err("assignment type mismatch (" + lt->to_string() + " = " + rt->to_string() +
+                ") — a function handle is not interchangeable with a plain i64",
+                a->loc.line, a->loc.col);
         if (a->compound && lt && lt->is_float()) {
             switch (*a->compound) {
             case BinExpr::Op::Mod: case BinExpr::Op::Shl: case BinExpr::Op::Shr:
@@ -1106,7 +1215,16 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
         else { decl_ty = expected_ty; if (!decl_ty->same(*init_ty) && !(decl_ty->is_int()&&init_ty->is_int())
             && !(decl_ty->prim==Prim::I64 && init_ty->prim==Prim::I64))
             err("let type mismatch (" + decl_ty->to_string() + " = " + init_ty->to_string() + ")",
-                ls->loc.line, ls->loc.col); }
+                ls->loc.line, ls->loc.col);
+            // v1.0 Tier 2 (plan_FUNCTION_REFS.md §4.5): a fn handle and a plain
+            // i64 are NOT assignable either direction, even though both are_int()
+            // — closes V3-style forging (assigning a forged i64 to a fn-typed
+            // var) at the type level. The runtime guard (§5) is the last line.
+            else if (decl_ty->is_fn_handle != init_ty->is_fn_handle)
+                err("let type mismatch (" + decl_ty->to_string() + " = " + init_ty->to_string() +
+                    ") — a function handle is not interchangeable with a plain i64",
+                    ls->loc.line, ls->loc.col);
+        }
         declare(ls->name, decl_ty, ls->is_const);
         return;
     }

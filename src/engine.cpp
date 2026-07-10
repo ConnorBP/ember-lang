@@ -188,4 +188,35 @@ CompiledFn compile_native_passthrough_2arg(void* native_fn) {
     return CompiledFn{"native_call2", std::move(e.code), nullptr, nullptr};
 }
 
+// v1.0 thread-safety (Option B1): call a JIT'd entry with context_t* in r14.
+// r14 = the per-call context register (callee-saved, preserved across the call
+// tree). The module must be compiled with CodeGenCtx::use_context_reg = true
+// for this to be the right entry path (else use the plain call_i64_* helpers).
+int64_t ember_call_void(void* entry, context_t* ctx) {
+    // Set r14 = ctx, then call entry (no args, returns i64 in rax). r14 is
+    // callee-saved so the JIT'd fn + any script-to-script calls it makes keep it.
+    register int64_t result asm("rax");
+    asm volatile(
+        "movq %[ctx], %%r14\n"
+        "callq *%[entry]\n"
+        : [result] "=a"(result)
+        : [ctx] "r"(reinterpret_cast<uintptr_t>(ctx)), [entry] "r"(entry)
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "memory"
+    );
+    return result;
+}
+int64_t ember_call_i64(void* entry, context_t* ctx, int64_t a) {
+    // r14 = ctx; rcx = a (Win64 first int arg); call entry.
+    register int64_t result asm("rax");
+    asm volatile(
+        "movq %[ctx], %%r14\n"
+        "movq %[a], %%rcx\n"
+        "callq *%[entry]\n"
+        : [result] "=a"(result)
+        : [ctx] "r"(reinterpret_cast<uintptr_t>(ctx)), [a] "r"(a), [entry] "r"(entry)
+        : "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "memory"
+    );
+    return result;
+}
+
 } // namespace ember

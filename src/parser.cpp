@@ -57,6 +57,15 @@ struct P {
         case Tk::Kw_u8: prim(Prim::U8); break;  case Tk::Kw_u16: prim(Prim::U16); break;
         case Tk::Kw_u32: prim(Prim::U32); break; case Tk::Kw_u64: prim(Prim::U64); break;
         case Tk::Kw_f32: prim(Prim::F32); break; case Tk::Kw_f64: prim(Prim::F64); break;
+        case Tk::Kw_fn:
+            // v1.0 Tier 2 (plan_FUNCTION_REFS.md §2): a bare `fn` is the
+            // function-handle type (i64 with is_fn_handle=true). A parameterized
+            // `fn(i64)->i64` form is v2+; Tier 2's bare `fn` accepts any fn (the
+            // call-target guard validates the handle at the call site, §5).
+            // Unambiguous: parse_type is only called in type positions (param/
+            // ret/let annotations, as/sizeof operands), never where a `fn`
+            // declaration could start (that path consumes Kw_fn at parse_top).
+            t->prim = Prim::I64; t->is_fn_handle = true; adv(); break;
         case Tk::Ident:
             // named struct type (resolved in sema) - or a registered handle
             // type alias (vec3, vec2, mat4 - i64 handles with operator overloads)
@@ -373,6 +382,18 @@ struct P {
             u->operand = std::move(e);
             return u;
         }
+        // v1.0 Tier 2 (plan_FUNCTION_REFS.md §3.1): prefix `&` takes a function
+        // handle. `&fn_name` is a compile-time reification (sema bakes the slot
+        // as an i64 literal), not a runtime deref. Parse the operand as unary so
+        // `&&fib`-style nesting is structurally parseable then rejected by sema.
+        if (k==Tk::Amp) {
+            adv();
+            ExprPtr e = parse_unary();
+            auto h = std::make_unique<FnHandleExpr>();
+            h->loc = e->loc;
+            h->operand = std::move(e);
+            return h;
+        }
         // prefix ++/-- desugars to assign
         if (k==Tk::Inc || k==Tk::Dec) {
             adv();
@@ -444,7 +465,17 @@ struct P {
                     c->name = fld->field; c->loc = e->loc;
                     c->receiver = std::move(fld->base);
                 } else {
-                    throw ParseError("call target must be a function name or obj.method", peek().line, peek().col);
+                    // v1.0 Tier 2 first-class call (plan_FUNCTION_REFS.md §3.2):
+                    // <expr>(args) where <expr> is none of the three named forms
+                    // above — a call through a RUNTIME i64 handle. Sema types the
+                    // target as a fn handle; codegen validates it against the
+                    // registered-fn allowlist before dispatch (REDSHELL guard #6).
+                    // Lifts the old `throw "call target must be..."` that V2
+                    // (i64-as-call-target) turned into a sema error.
+                    c = std::make_unique<CallExpr>();
+                    c->loc = e->loc;
+                    c->name.clear();                  // empty name = not a named call
+                    c->indirect_target = std::move(e); // the runtime handle
                 }
                 adv(); // '('
                 if (!at(Tk::RParen)) {

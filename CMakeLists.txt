@@ -135,6 +135,34 @@ if(WIN32)
 endif()
 add_test(NAME v0_4_hardening COMMAND v0_4_hardening_test)
 
+# v1.0 context thread-safety (Option D + B1): pins the per-call context-register
+# (r14) indirection so one compiled body serves N per-thread context_t's, each
+# thread's trap longjmp'ing to ITS OWN checkpoint. Mirrors v0_4's harness but
+# compiles with use_context_reg=true and calls via ember_call_void (r14=ctx).
+add_executable(thread_safety_test examples/thread_safety_test.cpp)
+target_link_libraries(thread_safety_test PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_vec ember_ext_quat ember_ext_mat
+    ember_ext_string ember_ext_array ember_ext_math)
+if(WIN32)
+    target_link_libraries(thread_safety_test PRIVATE kernel32)
+endif()
+add_test(NAME thread_safety COMMAND thread_safety_test)
+
+# v1.0 Tier 2 first-class function references: `&fn` handles + `handle(args)`
+# indirect call, with the REDSHELL guard #6 (validate the runtime i64 against a
+# registered-fn allowlist bitset before indexing the dispatch table, else
+# BadCallTarget trap). Mirrors v0_4's harness + builds the fn allowlist.
+add_executable(function_refs_test examples/function_refs_test.cpp)
+target_link_libraries(function_refs_test PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_vec ember_ext_quat ember_ext_mat
+    ember_ext_string ember_ext_array ember_ext_math)
+if(WIN32)
+    target_link_libraries(function_refs_test PRIVATE kernel32)
+endif()
+add_test(NAME function_refs COMMAND function_refs_test)
+
 # v0.5 live-modules stress matrix: bidirectional script<->.em cross-module
 # linking through the real grammar (link directive + mod::fn calls). Covers
 # the user's ask: scripts and .em bundles both able to use either form,

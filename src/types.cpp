@@ -56,6 +56,23 @@ bool Type::same(const Type& o) const {
     if (array_len != o.array_len) return false;
     if (elem && o.elem) { if (!elem->same(*o.elem)) return false; }
     else if (elem || o.elem) return false;
+    // v1.0 Tier 2 fn handles: a fn handle is `same` to another fn handle iff
+    // both is_fn_handle AND (both carry matching recorded sigs, OR neither has
+    // a recorded sig — a bare `fn` param accepts a specific-fn arg, the one
+    // subtyping direction we allow; safe because the runtime guard still
+    // validates the handle, plan §4.4). A fn handle is NOT same to a plain i64
+    // (distinguishes `&fn` from `let x: i64 = 5`).
+    if (is_fn_handle != o.is_fn_handle) return false;
+    if (is_fn_handle) {
+        if (has_recorded_sig && o.has_recorded_sig) {
+            if (recorded_params.size() != o.recorded_params.size()) return false;
+            for (size_t i = 0; i < recorded_params.size(); ++i)
+                if (!recorded_params[i]->same(*o.recorded_params[i])) return false;
+            if (recorded_ret && o.recorded_ret) { if (!recorded_ret->same(*o.recorded_ret)) return false; }
+            else if (recorded_ret || o.recorded_ret) return false;
+        }
+        // one recorded + one bare (or both bare): same (the bare-`fn` accepts).
+    }
     return true;
 }
 std::string Type::to_string() const {
@@ -63,6 +80,7 @@ std::string Type::to_string() const {
     if (is_slice) return (elem?elem->to_string():std::string("?")) + "[]";
     if (array_len) return (elem?elem->to_string():std::string("?")) + "[" + std::to_string(array_len) + "]";
     if (!struct_name.empty()) return struct_name;
+    if (is_fn_handle) return "fn";   // v1.0 Tier 2: display alias for i64-with-fn-handle-tag
     switch (prim) {
     case Prim::Bool: return "bool";
     case Prim::I8: return "i8"; case Prim::I16: return "i16"; case Prim::I32: return "i32"; case Prim::I64: return "i64";

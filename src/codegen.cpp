@@ -239,7 +239,10 @@ struct CG {
             // align) before the call; the stub longjmps (never returns) so the
             // reserved space is never restored by us — longjmp handles rsp.
             e.byte(0x48); e.byte(0x83); e.byte(0xEC); e.byte(0x28); // sub rsp, 0x28
-            e.mov_reg_imm64(Reg::rcx, int64_t(ctx.trap_ctx));
+            // rcx = context_t* (the trap stub's first arg). B1: from r14 (the per-call
+            // context register) when use_context_reg; else the baked imm64 ptr.
+            if (ctx.use_context_reg) e.mov_reg_reg(Reg::rcx, Reg::r14);
+            else                     e.mov_reg_imm64(Reg::rcx, int64_t(ctx.trap_ctx));
             e.mov_reg_imm64(Reg::rdx, int64_t(reason_ord));
             e.mov_reg_imm64(Reg::r8,  int64_t(reinterpret_cast<uintptr_t>(detail)));
             e.mov_reg_imm64(Reg::rax, int64_t(ctx.trap_stub));
@@ -264,10 +267,18 @@ struct CG {
     // a true infinite loop drives it to zero in finite iterations). A bare
     // `while(true){}` floors at 1 so even an empty infinite loop is caught.
     void emit_budget_check(int64_t body_cost) {
-        if (!ctx.emit_budget_checks || !ctx.budget_ptr || body_cost <= 0) return;
-        e.mov_reg_imm64(Reg::rax, int64_t(ctx.budget_ptr));
-        // sub qword ptr [rax], imm32 : REX.W (48) + opcode 81 /5 + imm32
-        e.byte(0x48); e.byte(0x81); e.byte(0x28); e.imm32(int32_t(body_cost));
+        if (!ctx.emit_budget_checks || body_cost <= 0) return;
+        if (!ctx.use_context_reg && !ctx.budget_ptr) return;  // baked mode needs a ptr
+        if (ctx.use_context_reg) {
+            // B1: sub qword [r14 + off_budget], imm32. r14 = context_t*, budget_remaining is a field.
+            // sub r/m,imm32 = opcode 81 /5 (modrm.reg=5). rm=r14 (low3=6, REX.B).
+            // REX.WB (49: W=64, B=r14) + 81 + modrm(10,reg=101,rm=110)=0xAE + disp32 + imm32.
+            e.byte(0x49); e.byte(0x81); e.byte(0xAE); e.imm32(context_offsets::budget()); e.imm32(int32_t(body_cost));
+        } else {
+            e.mov_reg_imm64(Reg::rax, int64_t(ctx.budget_ptr));
+            // sub qword ptr [rax], imm32 : REX.W (48) + opcode 81 /5 + imm32
+            e.byte(0x48); e.byte(0x81); e.byte(0x28); e.imm32(int32_t(body_cost));
+        }
         Label cont = e.alloc_label();
         e.jcc(Cond::g, cont);              // budget_remaining > 0 -> continue
         emit_trap(int(TrapReason::BudgetExceeded), "budget exceeded at loop back-edge");
@@ -291,21 +302,79 @@ struct CG {
     //   <the call>
     //   ... emit_depth_leave() after the call returns: dec dword [rax]
     void emit_depth_check() {
-        if (!ctx.emit_depth_checks || !ctx.depth_ptr) return;
-        e.mov_reg_imm64(Reg::rax, int64_t(ctx.depth_ptr));
-        e.byte(0xFF); e.byte(0x00);                  // inc dword ptr [rax]
-        e.byte(0x81); e.byte(0x38); e.imm32(int32_t(ctx.max_call_depth)); // cmp dword [rax], imm32
+        if (!ctx.emit_depth_checks) return;
+        if (!ctx.use_context_reg && !ctx.depth_ptr) return;
+        if (ctx.use_context_reg) {
+            // B1: inc dword [r14+off_depth]; cmp dword [r14+off_depth], max.
+            // inc r/m = FF /0 (modrm.reg=0). rm=r14(low3=6, REX.B). modrm(10,000,110)=0x86.
+            e.byte(0x41); e.byte(0xFF); e.byte(0x86); e.imm32(context_offsets::depth());
+            // cmp r/m,imm32 = 81 /7 (modrm.reg=7). modrm(10,111,110)=0xBE.
+            e.byte(0x41); e.byte(0x81); e.byte(0xBE); e.imm32(context_offsets::depth()); e.imm32(int32_t(ctx.max_call_depth));
+        } else {
+            e.mov_reg_imm64(Reg::rax, int64_t(ctx.depth_ptr));
+            e.byte(0xFF); e.byte(0x00);                  // inc dword ptr [rax]
+            e.byte(0x81); e.byte(0x38); e.imm32(int32_t(ctx.max_call_depth)); // cmp dword [rax], imm32
+        }
         Label ok = e.alloc_label();
         e.jcc(Cond::l, ok);                          // depth < max -> ok
         emit_trap(int(TrapReason::StackOverflow), "stack overflow: call depth exceeded");
         e.bind(ok);
     }
     void emit_depth_leave() {
-        if (!ctx.emit_depth_checks || !ctx.depth_ptr) return;
-        // After the call returns, rax HOLDS THE RESULT — must not clobber it.
-        // Use r10 (caller-saved scratch, not a return/arg reg) for the ptr load.
-        e.mov_reg_imm64(Reg::r10, int64_t(ctx.depth_ptr));
-        e.byte(0x49); e.byte(0xFF); e.byte(0x0A);  // dec dword ptr [r10]  (REX.B=1, /1, rm=r10)
+        if (!ctx.emit_depth_checks) return;
+        if (!ctx.use_context_reg && !ctx.depth_ptr) return;
+        if (ctx.use_context_reg) {
+            // After the call, rax HOLDS THE RESULT — must not clobber it. r14 is
+            // the callee-saved context reg (preserved across the call), use it.
+            // dec r/m = FF /1 (modrm.reg=1). rm=r14(low3=6, REX.B). modrm(10,001,110)=0x8E.
+            e.byte(0x41); e.byte(0xFF); e.byte(0x8E); e.imm32(context_offsets::depth());
+        } else {
+            // Use r10 (caller-saved scratch, not a return/arg reg) for the ptr load.
+            e.mov_reg_imm64(Reg::r10, int64_t(ctx.depth_ptr));
+            e.byte(0x49); e.byte(0xFF); e.byte(0x0A);  // dec dword ptr [r10]
+        }
+    }
+
+    // v1.0 Tier 2 REDSHELL guard #6 (plan_FUNCTION_REFS.md §5.2): validate that
+    // the i64 in rax is a registered script-fn slot before it's used as a
+    // dispatch-table index. Two checks, both before any arg-stash clobber of
+    // rcx/rdx/r8/r9 (the guard runs BEFORE the stash; rcx + r11 are its scratch):
+    //   1. Range: cmp rax, slot_count; jae .trap  (unsigned — a negative handle
+    //      reinterprets as huge and fails range, same one-shot trick as bounds check).
+    //   2. Bit test: bt [allowlist + (handle>>3)], (handle&7); jnc .trap  — only
+    //      slots whose bit is set pass.
+    // .trap is bound BEFORE emit_trap so the fall-through (valid handle) reaches
+    // the dispatch, matching emit_cpuid_gate's pattern. rax SURVIVES (scratch is
+    // rcx + r11 only). No-op (zero emitted) when no allowlist is configured (the
+    // fn-slot-count-0 case — function refs unused, e.g. all existing modules).
+    void emit_call_target_guard() {
+        if (ctx.fn_slot_count <= 0 || ctx.fn_allowlist_base == 0) return;  // no allowlist = no indirect calls = no guard
+        Label trap = e.alloc_label();
+        // 1. Range: cmp rax, slot_count; jae .trap (unsigned). cmp r64,imm32: REX.W 81 /7.
+        e.byte(0x48); e.byte(0x81); e.byte(0xF8); e.imm32(int32_t(ctx.fn_slot_count));  // cmp rax, imm32
+        e.jcc(Cond::ae, trap);                 // unsigned >= -> out of range -> trap
+        // 2. Bit test. r11 = allowlist_base (raw imm64); rcx = handle>>3 (byte offset);
+        //    r11 += rcx; rcx = handle & 7 (bit index); bt [r11], rcx; jnc .trap.
+        e.mov_reg_imm64(Reg::r11, ctx.fn_allowlist_base);
+        e.mov_reg_reg(Reg::rcx, Reg::rax);     // rcx = handle (preserve rax)
+        // shr rcx, 3: REX.W C1 /5 rcx, 3
+        e.byte(0x48); e.byte(0xC1); e.byte(0xE9); e.byte(0x03);  // shr rcx, 3
+        // add r11, rcx: REX.W 01 /r (add r/m, r), mod=11 reg=rcx rm=r11 (REX.B)
+        e.byte(0x49); e.byte(0x01); e.byte(0xCB);  // add r11, rcx  (rm=r11 low3=3 +REX.B; reg=rcx low3=1) -> modrm 11_001_011=0xCB
+        e.mov_reg_reg(Reg::rcx, Reg::rax);     // rcx = handle again (bit index)
+        e.byte(0x48); e.byte(0x83); e.byte(0xE1); e.byte(0x07);  // and rcx, 7 (REX.W 83 /4 imm8)
+        // bt [r11], rcx: 0F AB /4 (bt r/m64, r64). reg=rcx(low3=1, the bit index in the
+        // reg field), rm=r11(low3=3, +REX.B). modrm = (00<<6)|(1<<3)|3 = 0x0B.
+        // REX = W(1) + B(r11 extended) = 0x49 (reg=rcx not extended -> R=0).
+        e.byte(0x49); e.byte(0x0F); e.byte(0xAB); e.byte(0x0B);  // bt [r11], rcx; CF = tested bit
+        e.jcc(Cond::ae, trap);                 // bit clear (CF=0) -> not a registered fn -> trap
+        // fall through: rax still = handle (guard used rcx + r11 only)
+        Label after = e.alloc_label();
+        e.jmp(after);                            // skip the trap block on the valid path
+        e.bind(trap);
+        emit_trap(int(TrapReason::BadCallTarget),
+                  "call-target provenance: handle is not a registered function");
+        e.bind(after);
     }
 
     // v0.5 cross-module call (MODULES.md §3). The kind-2 sequence: one registry
@@ -1219,6 +1288,15 @@ void CG::eval(const Expr& ex) {
         }
         return;
     }
+    // v1.0 Tier 2 (plan_FUNCTION_REFS.md §4.2): `&fn_name` is a compile-time
+    // reification — sema baked the slot as an i64 literal. Emit mov rax, imm64(slot).
+    // The first-class-ness is at the CALL site (handle(args)), not here: this is
+    // just a constant load. (The advisor flagged making sure this eval case exists
+    // for the `&fib(42)` direct-call-without-let form.)
+    if (auto* h = dynamic_cast<const FnHandleExpr*>(&ex)) {
+        e.mov_reg_imm64(Reg::rax, int64_t(h->slot));
+        return;
+    }
     if (auto* u = dynamic_cast<const UnaryExpr*>(&ex)) {
         eval(*u->operand);
         if (u->op == UnaryExpr::Op::Not) {
@@ -1507,10 +1585,29 @@ void CG::eval(const Expr& ex) {
         for (auto& a : c->args) add_operand(a.get());
         int n = next_slot; // total word count
         int32_t stash_size = n * 8;
+        // v1.0 Tier 2 indirect call (plan §5.1): reserve a scratch word for the
+        // runtime handle so it survives the arg stash + emit_depth_check (which
+        // clobbers rax in non-B1 mode — the handle reload comes AFTER it, per the
+        // advisor's correction). The handle word lives at [rsp+stash_size], past
+        // all arg slots [0..n*8-1]; shadow space shifts to stash_size+8, outgoing
+        // args to stash_size+8+32+...
+        int32_t handle_word = c->is_indirect ? 8 : 0;
         int32_t outgoing = std::max(0, n - 4) * 8;
-        int32_t total = round16(stash_size + 32 + outgoing);
+        int32_t total = round16(stash_size + handle_word + 32 + outgoing);
+        // ---- indirect call ONLY: eval the target, run the provenance guard ----
+        // BEFORE `sub rsp` (rcx/r11 are free here; the guard clobbers them but no
+        // args are in regs yet). rax = the validated handle on return.
+        if (c->is_indirect) {
+            eval(*c->indirect_target);   // rax = handle (a &fn literal, a fn-typed var, or a native return)
+            emit_call_target_guard();    // validates rax against the allowlist; traps if bad; rax survives
+        }
         // sub rsp, total
         e.byte(0x48); e.byte(0x81); e.byte(0xEC); e.imm32(total);
+        // ---- indirect call: stash the handle at [rsp+stash_size] BEFORE the arg
+        // eval loop (args don't touch that offset — it's past all arg slots) ----
+        if (c->is_indirect) {
+            e.byte(0x48); e.byte(0x89); e.byte(0x84); e.byte(0x24); e.imm32(stash_size);  // mov [rsp+stash_size], rax
+        }
         // eval + stash each operand to its word slot(s)
         for (auto& op : ops) {
             int32_t off = op.slot0 * 8;
@@ -1557,10 +1654,12 @@ void CG::eval(const Expr& ex) {
                 e.load_reg_mem(int_regs[w], Reg::rsp, off);
             }
         }
-        // words 4+ -> [rsp + stash_size + 32 + (w-4)*8] (caller's outgoing stack args)
+        // words 4+ -> [rsp + stash_size + handle_word + 32 + (w-4)*8] (caller's
+        // outgoing stack args). The handle_word shift (advisor §2) keeps shadow
+        // space + outgoing clear of the stashed handle word.
         for (int w = 4; w < n; ++w) {
             int32_t src = w * 8;
-            int32_t dst = stash_size + 32 + (w - 4) * 8;
+            int32_t dst = stash_size + handle_word + 32 + (w - 4) * 8;
             e.load_reg_mem(Reg::rax, Reg::rsp, src);
             e.store_reg_mem(Reg::rsp, dst, Reg::rax);
         }
@@ -1572,6 +1671,18 @@ void CG::eval(const Expr& ex) {
             // v0.5 cross-module call (mod::fn): kind-2 registry-hop sequence.
             emit_depth_check();
             emit_cross_module_call(*c);
+            emit_depth_leave();
+        } else if (c->is_indirect) {
+            // v1.0 Tier 2 first-class call (plan_FUNCTION_REFS.md §5.1): dispatch
+            // through the runtime handle. emit_depth_check may clobber rax
+            // (non-B1 mode), so RELOAD the handle from [rsp+stash_size] AFTER it
+            // (the advisor's ordering correction), then lea+load+call the slot.
+            emit_depth_check();                        // v0.4 stack-depth guard (SAFETY §4)
+            e.load_reg_mem(Reg::rax, Reg::rsp, stash_size);  // reload handle AFTER depth check
+            e.mov_reg_imm64_external(Reg::r11, AbsFixup::DispatchTableBase);
+            e.lea_reg_mem_sib(Reg::r11, Reg::r11, Reg::rax, 3);  // lea r11, [r11 + rax*8]
+            e.load_reg_mem(Reg::r11, Reg::r11, 0);               // mov r11, [r11] (load the entry)
+            e.call_reg(Reg::r11);                                  // call r11
             emit_depth_leave();
         } else {
             // call [dispatch_base + slot*8] - dispatch-table base is a
@@ -2067,6 +2178,17 @@ int64_t CG::stmt_cost(const Stmt& s) {
 } // namespace
 
 GlobalsBlock* g_globals_for_codegen = nullptr;
+
+// v1.0 Tier 2 (plan_FUNCTION_REFS.md §5.2): build the registered-fn allowlist.
+std::vector<uint8_t> build_fn_allowlist(
+    const std::unordered_map<std::string, int>& script_slots, int slot_count) {
+    std::vector<uint8_t> bits((size_t(slot_count) + 7) / 8, 0);
+    for (const auto& kv : script_slots) {
+        int s = kv.second;
+        if (s >= 0 && s < slot_count) bits[size_t(s) / 8] |= uint8_t(1u << (s % 8));
+    }
+    return bits;
+}
 
 CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
     CG cg(ctx, f);

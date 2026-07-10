@@ -25,6 +25,18 @@ struct Type {
     uint32_t array_len = 0;        // 0 = not a fixed array; >0 = T[N]
     std::shared_ptr<Type> elem;     // element type for slice/array
 
+    // v1.0 Tier 2 first-class function refs (plan_FUNCTION_REFS.md §2): a
+    // function handle is Prim::I64 with is_fn_handle=true. Representation is
+    // identical to a plain i64 (8 bytes, GP reg, Win64 i64 ABI); the tag is
+    // metadata for the call-target guard (§5) + diagnostics. recorded_* carry
+    // the source fn's signature when known (a `&fib`-typed local); a bare `fn`
+    // parameter has has_recorded_sig=false (accepts any fn, args unchecked at
+    // the type level — the runtime guard still validates the handle, §7).
+    bool is_fn_handle = false;
+    bool has_recorded_sig = false;
+    std::vector<std::shared_ptr<Type>> recorded_params;  // empty unless is_fn_handle
+    std::shared_ptr<Type> recorded_ret;                  // null unless is_fn_handle
+
     bool is_int() const;            // any i*/u*
     bool is_uint() const;          // any u*
     bool is_float() const;          // f32/f64
@@ -101,6 +113,11 @@ struct BinExpr  : Expr { enum class Op {
 };
 struct UnaryExpr: Expr { enum class Op { Neg,Not,BitNot } op; ExprPtr operand; };
 struct CastExpr : Expr { ExprPtr operand; std::shared_ptr<Type> to; };
+// v1.0 Tier 2 first-class function refs (plan_FUNCTION_REFS.md §3.1): `&fn_name`
+// produces a function handle. Sema resolves the operand to a script fn slot,
+// bakes it as an i64 literal (slot). NOT a runtime computation — a compile-time
+// reification. `slot` is filled by sema; codegen emits `mov rax, imm64(slot)`.
+struct FnHandleExpr : Expr { ExprPtr operand; int slot = -1; };
 struct CallExpr : Expr { std::string name; std::vector<ExprPtr> args;
                          // sema-resolved target (native fn ptr or script slot)
                          bool is_native = false; void* native_fn = nullptr;
@@ -124,7 +141,16 @@ struct CallExpr : Expr { std::string name; std::vector<ExprPtr> args;
                          // compile-time constants that compare EQUAL - codegen
                          // emits nothing at all for this call (a mismatch is a
                          // sema compile error instead, never reaches codegen).
-                         bool elided = false; };
+                         bool elided = false;
+                         // v1.0 Tier 2 first-class call: `indirect_target(args)` — a call
+                         // through a RUNTIME i64 handle, not a compile-time-known name. Sema
+                         // types indirect_target as a fn handle, sets is_indirect=true;
+                         // codegen validates the handle against the registered-fn allowlist
+                         // (REDSHELL guard #6, plan §5) before dispatching via
+                         // `call [dispatch_base + handle*8]`. Mutually exclusive with
+                         // is_native / script_slot / module_alias being set (sema asserts).
+                         ExprPtr indirect_target;
+                         bool is_indirect = false; };
 struct IndexExpr: Expr { ExprPtr base, index;
                          // compile-time bounds folding (sema.cpp's IndexExpr
                          // check): set when `index` folded to a compile-time

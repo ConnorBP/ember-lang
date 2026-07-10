@@ -290,6 +290,21 @@ public:
         imm32(disp);
     }
 
+    // v1.0 Tier 2 (plan_FUNCTION_REFS.md §5.3/§9.1): lea r64, [base + index*scale]
+    // — the indirect-call dispatch uses `lea r11,[r11+rax*8]` to compute the
+    // dispatch-table slot address from a runtime handle. Centralized here so the
+    // SIB/REX bytes are built in ONE place (the §9.1 highest-risk detail).
+    //   REX = W(64-bit addr) | R(dst extended in reg field) | X(index extended)
+    //         | B(base extended in SIB base field)
+    //   ModRM = mod=00 (no disp) | reg=dst | rm=4 (SIB escape)
+    //   SIB = (scale_log2<<6) | (index&7)<<3 | (base&7)   [scale_log2: 0->1,1->2,2->4,3->8]
+    void lea_reg_mem_sib(Reg dst, Reg base, Reg index, uint8_t scale_log2) {
+        byte(rex(true, is_extended(dst), is_extended(index), is_extended(base)));
+        byte(0x8D);                       // lea opcode
+        byte(modrm(0b00, dst, Reg(4)));   // rm=4 = SIB follows, mod=00 = no disp
+        byte(uint8_t((scale_log2 & 3) << 6) | ((uint8_t(index) & 7) << 3) | (uint8_t(base) & 7));
+    }
+
     // script->native call: mov rax, imm64; call rax
     void call_imm64(int64_t target) {
         mov_reg_imm64(Reg::rax, target);
