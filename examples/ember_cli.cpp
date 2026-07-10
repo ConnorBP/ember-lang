@@ -357,14 +357,19 @@ int main(int argc, char** argv) {
 
     // ---- struct layouts + string key + sema ----
     auto struct_layouts = build_struct_layouts(pr.program);
-    // key=0: string literals bake as raw rodata pointers (codegen's unencrypted
-    // branch). A nonzero key would enable encrypted-rodata codegen, which emits
-    // a call to __str_decrypt — a host-side obfuscation native the standard
-    // extension set doesn't register, so it would crash on any string literal.
-    // Encrypted rodata is a host opt-in (the host registers __str_decrypt and
-    // sets a nonzero key); a standalone language CLI has no such host, so it
-    // must leave encryption off.
-    pr.program.string_xor_key = 0;
+    // String encryption is ON by default (key=0xA5). String literals bake
+    // XOR-encrypted in rodata; codegen decrypts INLINE into a compiler-hidden
+    // temp frame slot at each use site (see codegen's StringLit eval case /
+    // alloc_str_temp), so the plaintext is TRANSIENT — it lives only on the
+    // stack for the expression's lifetime and is reclaimed when the frame is
+    // torn down. No heap, no host native call, no leak: the encrypted form
+    // alone lives in rodata, and raw strings never appear in the JIT'd
+    // executable memory. This is pure codegen — the host need only set a
+    // nonzero key before sema; there is no __str_decrypt native to register
+    // (the old heap-allocating native contract was removed when inline
+    // stack-XOR landed). A fixed key (not random) keeps test output
+    // deterministic.
+    pr.program.string_xor_key = 0xA5;
 
     // ---- v0.5 live-module link resolution (docs/MODULES.md §5) ----
     // Resolve each `link "..." as alias;` directive: a .em target is loaded +
@@ -488,8 +493,8 @@ int main(int argc, char** argv) {
     std::string reg_err;
     uint32_t self_id = registry.register_module("__main__", table.base(), &reg_err);
     (void)self_id;  // registered so others can link "__main__"; not referenced here
-    // str_decrypt_fn stays null: key=0 above means string literals never
-    // emit a decrypt call, so no __str_decrypt native is needed.
+    // String encryption needs no ctx field: it is pure codegen (inline
+    // stack-XOR into a temp frame slot, see the StringLit eval case).
 
     // ---- v0.4/v1.0 safe-execution context (docs/spec/SAFETY_AND_SANDBOX.md §2-§4) ----
     // The CLI runs untrusted .ember input, so enable BOTH budgets + route

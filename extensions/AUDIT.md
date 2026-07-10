@@ -94,7 +94,12 @@ Anything else stays in prism. No new addons are authored (YAGNI).
 | `string_from_bool` | string | **general-purpose** | → `ember_ext_string` |
 | `string_identity` | string | **general-purpose** | → `ember_ext_string` |
 | `print_string` | print/IO (host sink) | cheat-host-coupled | stays (prism) |
-| `__str_decrypt` | string-encryption host backing (language feature, set via `ctx.str_decrypt_fn`, NOT NativeSig) | language-feature host contract | stays (prism) - see RESTRUCTURE_PLAN Section 4 |
+
+String encryption is now pure codegen (no host native): an encrypted literal
+is decrypted inline into a compiler-hidden temp frame slot at each use site
+(see codegen's StringLit eval case / alloc_str_temp). The old
+`__str_decrypt` host-contract native was removed; there is nothing for a host
+to register.
 
 ## OpOverloadTable entries (RegisterScriptHostOverloads)
 
@@ -143,7 +148,7 @@ brought into `ember/`).
 - **Stayed in prism**: everything else (proc.*, render/view/shader,
   gui/panel, host-sink print/assert, host-process timer, cheat-named
   audio/font/bitmap/http/fs/input, numeric helpers not in the ROADMAP
-  list, test toys, the `__str_decrypt` language-feature host backing,
-  the cheat overlay host's own overload table).
+  list, test toys, the cheat overlay host's own overload table). String
+  encryption needs no host backing (pure codegen).
 - **No new addons authored** (YAGNI). Only existing, provably-non-cheat,
   ROADMAP-Tier-0 extensions moved.

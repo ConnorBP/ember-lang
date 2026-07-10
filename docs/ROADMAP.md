@@ -300,26 +300,38 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
 
 ## Investigation-backed candidate changes
 
-Changes recommended by a completed investigation, not yet slated for a
-specific milestone — listed here so the decision and its evidence have a
-tracked home.
+Changes recommended by a completed investigation. The first item below is
+now DONE; the rest remain not-yet-slated-for-a-specific-milestone, listed
+here so the decision and its evidence have a tracked home.
 
-- **Runtime string encryption — replace the `__str_decrypt` heap-ptr
-  contract with an inline-stack-XOR lowering.** The current string-
-  encryption feature is a half-feature: it defeats *static* literal
-  extraction from the JIT'd executable pages (the `__str_decrypt` call
-  site + its argument are what appears in code memory, not the plaintext
-  literal), but on the *runtime-memory* axis it does the opposite of
-  transience — the decrypted plaintext is resident on the host heap in
-  N copies (one per decryption site) with no cleanup, so a live-memory
-  probe recovers every string trivially. Recommendation: replace the
-  `__str_decrypt`-decrypt-heap-ptr native contract with an inline-
-  stack-XOR lowering for `const`/transient literals, where the plaintext
-  lives only on the stack frame for the expression's lifetime (no heap
-  residency, no residual copy after the statement); retire the
-  `__str_decrypt` native contract entirely. See
-  `../demo/STRING_ENCRYPTION_ANALYSIS.md` for the full analysis + the
-  probe that demonstrates the heap-residency leak.
+- **Runtime string encryption — DONE (2026-07-10).** Replaced the
+  `__str_decrypt` heap-ptr native contract with an inline-stack-XOR
+  lowering: an encrypted string literal is now decrypted inline into a
+  compiler-hidden temp frame slot at each use site (see codegen's StringLit
+  eval case / `alloc_str_temp` / `count_str_temps_block`). The plaintext is
+  TRANSIENT — it lives only on the caller's stack frame for the
+  expression's lifetime and is reclaimed at frame teardown; no heap, no
+  host native call, no leak. The `__str_decrypt` host contract was removed
+  entirely (`str_decrypt_fn`/`str_decrypt_name` dropped from `CodeGenCtx`);
+  encryption is now pure codegen, so a host turns it on just by setting
+  `Program::string_xor_key != 0` before sema (the CLI default is now `0xA5`,
+  ON by default for the first time — the old "no in-tree host registers the
+  native" barrier is gone). The `string`-handle path reuses the same inline
+  XOR + `string_from_slice` (the handle owns the only persistent copy).
+  **Design note: the const/non-const literal classification the original
+  analysis recommended was NOT implemented — every encrypted literal takes
+  the same inline-XOR path.** This is safe because the `string`-handle path
+  copies out of the stack temp immediately (the handle owns the only
+  persistent copy), and a raw `slice<u8>` literal that escapes the frame
+  (returned, stored to a global, captured across loop iterations) has the
+  same pre-existing dangling-slice-of-stack-local limitation that
+  `local_array_view` already has — not a regression introduced here.
+  Verified: ctest 22/22, lang 245/0/0 with encryption on (incl. a 260-byte
+  literal test that forces the runtime-loop XOR path), plus a probe
+  (`tmp_edit/enc2/`) confirming 0 native calls, distinct stack temps per
+  use, and frame-reclaimed plaintext after return. See
+  `../demo/STRING_ENCRYPTION_ANALYSIS.md` for the original analysis + the
+  probe that demonstrated the old heap-residency leak.
 
 ## What will never be added (hard non-goals)
 

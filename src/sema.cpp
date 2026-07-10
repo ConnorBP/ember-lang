@@ -676,7 +676,9 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
         // String encryption (default): XOR the bytes with a
         // per-compile key before storing. The raw string never appears in
         // the JIT'd exec memory - only the encrypted bytes are in rodata,
-        // and codegen emits a __str_decrypt call at each use site.
+        // and codegen decrypts inline into a temp frame slot at each use
+        // site (the plaintext is transient - stack-scoped, reclaimed at frame
+        // teardown; no host native, no heap, no leak).
         e.ty = lit->ty = intern(make_slice(std::make_shared<Type>(make_prim(Prim::U8))));
         uint8_t key = prog->string_xor_key;
         auto enc = std::make_shared<std::string>(lit->s);

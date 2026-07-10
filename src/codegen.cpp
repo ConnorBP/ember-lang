@@ -96,6 +96,28 @@ struct CG {
         return alloc_local(name, arr_temp_types.back().get());
     }
     int32_t arg_temps_base = 0;          // offset of arg-temp area start
+    // Chunk c3: compiler-hidden temp frame slots for string-literal inline
+    // decryption. When string encryption is on (string_xor_key != 0), a
+    // StringLit's plaintext is decrypted INLINE into a stack frame slot at
+    // each use site (no __str_decrypt heap native - see the StringLit eval
+    // case). The slot is `ceil(baked_len, 8)` bytes (8-aligned to match
+    // next_local_off's 8-byte slot discipline) and is reclaimed when the
+    // function returns (it's rbp-relative, part of the frame). Reuses c1/c2's
+    // alloc_local-with-a-synthesized-name temp discipline with a DISTINCT
+    // prefix (`__strtmp$`) and counter so the three temp families never
+    // collide. compile_func's count_str_temps_block pre-counts the total
+    // backing bytes so the frame is sized to hold them (mirrors the struct/
+    // arr temp pre-counts). The Type passed to alloc_local is a fixed array of
+    // u8[baked_len] so local_width_bytes reserves the right number of bytes.
+    int32_t str_temp_counter = 0;
+    std::vector<std::shared_ptr<Type>> str_temp_types;
+    int32_t alloc_str_temp(int64_t baked_len) {
+        std::string name = "__strtmp$" + std::to_string(str_temp_counter++);
+        auto bt = std::make_shared<Type>(make_prim(Prim::U8));
+        Type t; t.prim = Prim::U8; t.array_len = uint32_t(baked_len); t.elem = bt;
+        str_temp_types.push_back(std::make_shared<Type>(std::move(t)));
+        return alloc_local(name, str_temp_types.back().get());
+    }
     int32_t frame_size = 0;
     bool makes_calls = false;
     int max_args = 0;
@@ -248,9 +270,8 @@ struct CG {
     // was repurposed as a VEX-prefix escape for AVX), so there is no
     // hardware instruction this JIT can emit that raises that code.
     //
-    // The alternative - a host-provided native (mirroring __str_decrypt's
-    // "codegen calls a host function by absolute address" pattern) that
-    // calls Win32 RaiseException(EXCEPTION_ARRAY_BOUNDS_EXCEEDED, ...) - was
+    // The alternative - a host-provided native (codegen calls a host
+    // function by absolute address) that calls Win32 RaiseException(EXCEPTION_ARRAY_BOUNDS_EXCEEDED, ...) - was
     // tried first and empirically confirmed UNRELIABLE from this JIT:
     // RaiseException's dispatch goes through the real Windows SEH machinery
     // (RtlDispatchException / stack unwinding), which expects every frame on
@@ -728,6 +749,67 @@ struct CG {
         if (auto* fx = dynamic_cast<const FieldExpr*>(&ex)) { count_arr_temps_expr(*fx->base, total); return; }
         if (auto* v = dynamic_cast<const ViewExpr*>(&ex)) { count_arr_temps_expr(*v->base, total); return; }
         if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) count_arr_temps_expr(*kv.second, total); return; }
+    }
+
+    // Chunk c3: pre-count the total frame bytes needed for string-literal inline
+    // decryption temps (see str_temp_counter / alloc_str_temp). Every encrypted
+    // StringLit (encrypted && baked_key != 0) needs a backing region of
+    // baked_len bytes (8-aligned via alloc_local's local_width_bytes slot
+    // discipline) to hold its inline-decrypted plaintext for the expression's
+    // lifetime. The slot is rbp-relative and reclaimed at frame teardown, so the
+    // plaintext is transient - it lives only on the stack for the expression.
+    // Mirrors count_struct_temps_block / count_arr_temps_block. Counting the SUM
+    // is a safe over-reservation (temps are short-lived but reserved as full
+    // frame slots). baked_len is int64_t but in-tree literals are <256 bytes;
+    // cast to int32_t for the total as everywhere else.
+    void count_str_temps_block(const Block& b, int32_t& total) {
+        for (auto& s : b.stmts) count_str_temps_stmt(*s, total);
+    }
+    void count_str_temps_stmt(const Stmt& s, int32_t& total) {
+        if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_str_temps_expr(*ls->init, total); return; }
+        if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_str_temps_expr(*es->expr, total); return; }
+        if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) { if (rs->value) count_str_temps_expr(*rs->value, total); return; }
+        if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) { count_str_temps_expr(*ds->expr, total); return; }
+        if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
+            count_str_temps_expr(*is->cond, total); count_str_temps_block(is->then_b, total);
+            if (is->has_else) count_str_temps_block(is->else_b, total); return;
+        }
+        if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_str_temps_expr(*ws->cond, total); count_str_temps_block(ws->body, total); return; }
+        if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_str_temps_block(ds->body, total); count_str_temps_expr(*ds->cond, total); return; }
+        if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
+            if (fs->init) count_str_temps_stmt(*fs->init, total);
+            if (fs->cond) count_str_temps_expr(*fs->cond, total);
+            if (fs->step) count_str_temps_expr(*fs->step, total);
+            count_str_temps_block(fs->body, total); return;
+        }
+        if (auto* bs = dynamic_cast<const BlockStmt*>(&s)) { count_str_temps_block(bs->block, total); return; }
+        if (auto* sw = dynamic_cast<const SwitchStmt*>(&s)) {
+            count_str_temps_expr(*sw->subject, total);
+            for (auto& c : sw->cases) count_str_temps_block(c.body, total);
+            return;
+        }
+    }
+    void count_str_temps_expr(const Expr& ex, int32_t& total) {
+        if (auto* lit = dynamic_cast<const StringLit*>(&ex)) {
+            if (lit->encrypted && lit->baked_key != 0 && lit->baked_len > 0)
+                total += int32_t(lit->baked_len);
+            return;   // a StringLit has no sub-expressions
+        }
+        if (auto* c = dynamic_cast<const CallExpr*>(&ex)) {
+            if (c->receiver) count_str_temps_expr(*c->receiver, total);
+            for (auto& a : c->args) count_str_temps_expr(*a, total);
+            return;
+        }
+        if (auto* b = dynamic_cast<const BinExpr*>(&ex)) { count_str_temps_expr(*b->lhs, total); count_str_temps_expr(*b->rhs, total); return; }
+        if (auto* u = dynamic_cast<const UnaryExpr*>(&ex)) { count_str_temps_expr(*u->operand, total); return; }
+        if (auto* c = dynamic_cast<const CastExpr*>(&ex)) { count_str_temps_expr(*c->operand, total); return; }
+        if (auto* t = dynamic_cast<const TernaryExpr*>(&ex)) { count_str_temps_expr(*t->cond, total); count_str_temps_expr(*t->then_e, total); count_str_temps_expr(*t->else_e, total); return; }
+        if (auto* a = dynamic_cast<const AssignExpr*>(&ex)) { if (a->target) count_str_temps_expr(*a->target, total); count_str_temps_expr(*a->value, total); return; }
+        if (auto* ix = dynamic_cast<const IndexExpr*>(&ex)) { count_str_temps_expr(*ix->base, total); count_str_temps_expr(*ix->index, total); return; }
+        if (auto* fx = dynamic_cast<const FieldExpr*>(&ex)) { count_str_temps_expr(*fx->base, total); return; }
+        if (auto* v = dynamic_cast<const ViewExpr*>(&ex)) { count_str_temps_expr(*v->base, total); return; }
+        if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) count_str_temps_expr(*kv.second, total); return; }
+        if (auto* al = dynamic_cast<const ArrayLit*>(&ex)) { for (auto& el : al->elements) count_str_temps_expr(*el, total); return; }
     }
 
     // Item E ("hot local pinning") candidate selection: a purely syntactic,
@@ -2286,30 +2368,108 @@ void CG::eval(const Expr& ex) {
         const uint32_t string_off = append_rodata(lit->baked_ptr, size_t(lit->baked_len));
         // slice ABI: rax=ptr, rdx=len.
         // String encryption (default): if the string is XOR-encrypted in
-        // rodata, emit a __str_decrypt(enc_ptr, len, key) call instead of
-        // a raw pointer. The host native allocates a decrypted buffer on
-        // the heap (not in JIT exec memory) and returns its address; rax=
-        // decrypted ptr, rdx=len (stays the same). Raw strings never appear
-        // in the executable memory.
+        // rodata, decrypt INLINE into a compiler-hidden temp frame slot
+        // (see alloc_str_temp / count_str_temps_block) and yield the slot's
+        // address as the slice ptr. The plaintext is TRANSIENT - it lives only
+        // in this stack frame for the expression's lifetime and is reclaimed
+        // when the frame is torn down (rbp-relative, part of the frame). No
+        // heap, no host native call, no leak: the encrypted form alone lives
+        // in rodata, and raw strings never appear in the JIT'd executable
+        // memory. The same path serves the implicit-to-`string` conversion
+        // below (string_from_slice copies out of the frame slot into the host
+        // string store, after which the slot's plaintext is dead). Registers:
+        // r11 = enc source (volatile), r10 = dest (volatile), al = scratch
+        // byte (volatile), then rax = dest ptr, rdx = len. No callee-saved
+        // register is touched.
         if (lit->encrypted && lit->baked_key != 0) {
-            // call __str_decrypt(enc_ptr, len, key) -> rax = decrypted_ptr
-            // Win64: rcx=enc_ptr, rdx=len, r8=key; shadow space reserved.
-            int32_t call_sz = 32; // shadow space for 3-arg call
-            e.sub_reg_imm32(Reg::rsp, call_sz);
-            // mov rcx, enc_ptr
-            e.mov_reg_imm64_external(Reg::rcx, AbsFixup::FunctionRodataBase, string_off);
-            // mov rdx, len
-            e.mov_reg_imm64(Reg::rdx, lit->baked_len);
-            // mov r8, key
-            e.mov_reg_imm64(Reg::r8, int64_t(lit->baked_key));
-            // call __str_decrypt (host-provided native)
-            emit_counted_named_native(ctx.str_decrypt_fn, ctx.str_decrypt_name,
-                                      "string decrypt native");
-            // add rsp, shadow
-            e.add_reg_imm32(Reg::rsp, call_sz);
-            // rax = decrypted ptr (from native), rdx = len (preserved by callee? no -
-            // Win64 callee clobbers rdx. Re-set rdx = len after the call.)
-            e.mov_reg_imm64(Reg::rdx, lit->baked_len);
+            // Allocate the temp frame slot at this use site. eval is called once
+            // per AST node at compile time; the emitted XOR runs per runtime use
+            // (e.g. per loop iteration). A literal used textually twice is two
+            // separate StringLit nodes, so each gets its own slot (mirrors how
+            // struct temps are allocated one-per-materialization-site). The
+            // slot's bytes were pre-counted by count_str_temps_block into the
+            // frame sizing pass, so alloc_local's next_local_off bump stays
+            // within the already-sized frame.
+            const int32_t slot_off = alloc_str_temp(lit->baked_len);
+            const int64_t len = lit->baked_len;
+            const uint8_t key = lit->baked_key;
+            // r11 = enc source (rodata base + string_off)
+            e.mov_reg_imm64_external(Reg::r11, AbsFixup::FunctionRodataBase, string_off);
+            // r10 = rbp; sub r10, slot_off  -> r10 = frame slot address
+            // (lea_reg_mem_sib only supports mod=00 [no disp], so mov+sub.)
+            e.mov_reg_reg(Reg::r10, Reg::rbp);
+            e.sub_reg_imm32(Reg::r10, -slot_off);  // slot_off is negative; -slot_off is positive
+            // Inline byte XOR: for each byte i, mov al,[r11+i]; xor al,key; mov [r10+i],al.
+            // Unrolled for len <= 256 (covers every in-tree literal; tightest code for
+            // the common short-literal case); a runtime loop for longer literals.
+            // Displacement encoding: i < 128 fits a signed disp8 (mod=01); i >= 128
+            // needs a disp32 (mod=10) because disp8 is signed -128..127 (a raw 0x80
+            // disp8 byte would read [r11 - 128], the wrong address). The modrm rm
+            // field is r11's low 3 bits (011) for the load and r10's (010) for the
+            // store; mod goes 01->10 when switching disp8->disp32.
+            auto emit_byte_xor = [&](int64_t i) {
+                bool disp32 = i >= 128;
+                if (!disp32) {
+                    // mov al, [r11 + disp8]  ->  0x41, 0x8A, 0x43, disp8
+                    e.byte(0x41); e.byte(0x8A); e.byte(0x43); e.byte(uint8_t(i));
+                } else {
+                    // mov al, [r11 + disp32] ->  0x41, 0x8A, 0x83, disp32 (4 bytes LE)
+                    e.byte(0x41); e.byte(0x8A); e.byte(0x83); e.imm32(int32_t(i));
+                }
+                // xor al, imm8          ->  0x34, key
+                e.byte(0x34); e.byte(key);
+                if (!disp32) {
+                    // mov [r10 + disp8], al ->  0x41, 0x88, 0x42, disp8
+                    e.byte(0x41); e.byte(0x88); e.byte(0x42); e.byte(uint8_t(i));
+                } else {
+                    // mov [r10 + disp32], al->  0x41, 0x88, 0x82, disp32
+                    e.byte(0x41); e.byte(0x88); e.byte(0x82); e.imm32(int32_t(i));
+                }
+            };
+            if (len <= 256) {
+                for (int64_t i = 0; i < len; ++i) emit_byte_xor(i);
+            } else {
+                // Runtime loop: rcx=len (counter), r11=src (post-inc), r10=dst (post-inc), al scratch.
+                // After the loop r10 has been incremented `len` times (points PAST the
+                // slot), so the post-loop rax must RE-DERIVE the slot base from rbp
+                // (NOT use r10). The unrolled path doesn't have this issue (it uses
+                // [r10+i] displacements and never mutates r10).
+                e.mov_reg_imm64(Reg::rcx, len);
+                Label loop = e.alloc_label();
+                e.bind(loop);
+                // mov al, [r11]        ->  REX.B 0x41, 0x8A, modrm(11,000,011)=0x03
+                e.byte(0x41); e.byte(0x8A); e.byte(0x03);
+                // xor al, key          ->  0x34, key
+                e.byte(0x34); e.byte(key);
+                // mov [r10], al        ->  REX.B 0x41, 0x88, modrm(11,000,010)=0x02
+                e.byte(0x41); e.byte(0x88); e.byte(0x02);
+                // inc r11              ->  REX.WB 0x49, 0xFF, modrm(11,000,011)=0xC3
+                e.byte(0x49); e.byte(0xFF); e.byte(0xC3);
+                // inc r10              ->  REX.WB 0x49, 0xFF, modrm(11,000,010)=0xC2
+                e.byte(0x49); e.byte(0xFF); e.byte(0xC2);
+                // dec rcx              ->  REX.W 0x48, 0xFF, modrm(11,001,001)=0xC9
+                e.byte(0x48); e.byte(0xFF); e.byte(0xC9);
+                // cmp rcx, 0           ->  REX.W 0x48, 0x83, 0xF9, 0x00
+                e.byte(0x48); e.byte(0x83); e.byte(0xF9); e.byte(0x00);
+                // ember while-loop pattern: conditional FORWARD exit (je done) plus
+                // an UNCONDITIONAL back-edge (jmp loop). jcc as a direct back-branch
+                // is never used elsewhere in the codebase (all back-edges are jmp).
+                Label done = e.alloc_label();
+                e.jcc(Cond::e, done);   // rcx == 0 -> exit (forward branch)
+                e.jmp(loop);            // rcx != 0 -> iterate (unconditional back)
+                e.bind(done);
+            }
+            // rax = dest ptr (the frame slot BASE). For the unrolled path r10 was
+            // never mutated, so rax = r10 is the base. For the runtime-loop path
+            // r10 was incremented `len` times (points past the slot), so re-derive
+            // the base from rbp instead of using the now-advanced r10.
+            if (lit->encrypted && lit->baked_key != 0 && lit->baked_len > 256) {
+                e.mov_reg_reg(Reg::rax, Reg::rbp);
+                e.sub_reg_imm32(Reg::rax, -slot_off);  // rax = rbp - slot_off = slot base
+            } else {
+                e.mov_reg_reg(Reg::rax, Reg::r10);
+            }
+            e.mov_reg_imm64(Reg::rdx, len);
         } else {
             // unencrypted: raw pointer (backward compat / key=0)
             e.mov_reg_imm64_external(Reg::rax, AbsFixup::FunctionRodataBase, string_off);
@@ -3156,6 +3316,15 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
     int32_t arr_temp_bytes = 0;
     cg.count_arr_temps_block(f.body, arr_temp_bytes);
     locals_area += arr_temp_bytes;
+    // Chunk c3: reserve frame bytes for string-literal inline-decryption
+    // temps (see str_temp_counter / count_str_temps_block). An encrypted
+    // string literal's plaintext is decrypted inline into a stack temp at
+    // each use site; sum_bytes above does not count these compiler-hidden
+    // temps. Counting the SUM is a safe over-reservation (each temp is
+    // short-lived but reserved as a full frame slot, mirroring struct/arr).
+    int32_t str_temp_bytes = 0;
+    cg.count_str_temps_block(f.body, str_temp_bytes);
+    locals_area += str_temp_bytes;
     // Collect textual sites once for frame layout. Runtime cleanup ownership
     // is established later by exec_block's lexical cleanup-scope stack.
     std::function<void(const Block&)> collect_defers = [&](const Block& b) {

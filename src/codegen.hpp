@@ -59,8 +59,12 @@ struct CodeGenCtx {
     const std::unordered_map<std::string, int>* script_slots = nullptr;
     ObfOptions obf;   // host-set defaults; @obf annotations layer on top
     const StructLayoutTable* structs = nullptr;  // struct value types (task 1.6)
-    void* str_decrypt_fn = nullptr;  // __str_decrypt native (string encryption)
-    std::string str_decrypt_name = "__str_decrypt"; // exact portable binding key
+    // String encryption is now pure codegen: an encrypted string literal is
+    // decrypted inline into a compiler-hidden temp frame slot (see codegen's
+    // StringLit eval case / alloc_str_temp). No host native is involved, so
+    // there is no str_decrypt_fn / str_decrypt_name field here anymore. A host
+    // turns encryption on simply by setting Program::string_xor_key != 0
+    // before calling sema; the JIT'd code decrypts on the stack at each use.
 
     // --- v0.4 safety: non-local trap + budgets (docs/spec/SAFETY_AND_SANDBOX.md §2-§4) ---
     // All compile-flag GATED for zero overhead when disabled. A host running

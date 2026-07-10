@@ -1,0 +1,34 @@
+// runtime_string_encryption_long.ember — regression for the RUNTIME-LOOP
+// XOR path of the inline-stack-XOR string-encryption lowering (2026-07-10).
+//
+// The main string-encryption test (runtime_string_encryption.ember) exercises
+// the UNROLLED inline-XOR path, which codegen uses for literals <= 256 bytes.
+// Every in-tree literal is <= 147 bytes, so the unrolled path is what the
+// whole lang suite (243 tests) stresses. This test adds a SINGLE literal of
+// 260 bytes — past the 256-byte threshold — to force codegen's runtime-loop
+// XOR path (mov rcx,len; loop: mov al,[r11]; xor; mov [r10],al; inc; dec; jnz).
+// If the loop's byte encodings, register use, or back-branch are wrong, the
+// char-at checks at the start, middle, and end of the literal fail.
+//
+// The literal is 260 'A' characters (ASCII 65). char-at at any index returns
+// 65. We check index 0 (loop prologue), 129 (mid-loop, many iterations in),
+// and 259 (the last iteration — verifies the loop ran the full count and the
+// final byte wrote correctly, not one short).
+
+fn main() -> i64 {
+    let s: string = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";  // 260 'A's
+    let n: i64 = string_length(s);
+    if (n != 260) { return 1; }
+    // 'A' = 65 at every position
+    if (string_char_at(s, 0)   != 65) { return 2; }  // first byte (loop prologue)
+    if (string_char_at(s, 129) != 65) { return 3; }  // middle (deep in the loop)
+    if (string_char_at(s, 259) != 65) { return 4; }  // last byte (final iteration)
+    // a second long literal (different content) to make sure two >256 temps
+    // in one function each get their own frame slot and don't alias.
+    let t: string = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";  // 260 'B's
+    if (string_length(t) != 260) { return 5; }
+    if (string_char_at(t, 0)   != 66) { return 6; }  // 'B' = 66
+    if (string_char_at(t, 259) != 66) { return 7; }
+    if (string_char_at(s, 130) != 65) { return 8; }  // s still intact (no slot aliasing with t)
+    return 42;
+}

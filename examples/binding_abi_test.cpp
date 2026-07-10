@@ -160,7 +160,7 @@ static CompiledProgram* compile_program(const std::string& src,
 
     // struct layouts from script-declared structs
     auto struct_layouts = build_struct_layouts(pr.program);
-    pr.program.string_xor_key = 0; // raw rodata pointers (no __str_decrypt host)
+    pr.program.string_xor_key = 0; // raw rodata (encryption off for this ABI test)
 
     // sema against the BindingBuilder-built table
     auto sr = sema(pr.program, tab.natives, prog->slots, 0, &tab.overloads, &struct_layouts);

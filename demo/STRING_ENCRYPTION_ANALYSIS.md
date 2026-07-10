@@ -29,6 +29,17 @@ Desired property:
 
 ## TL;DR — the answer
 
+> **STATUS: FIXED (2026-07-10).** The recommendation below was
+> implemented: the `__str_decrypt` heap-ptr native contract was removed and
+> replaced with an inline-stack-XOR lowering into a compiler-hidden temp
+> frame slot. The plaintext is now transient — it lives only on the stack for
+> the expression's lifetime and is reclaimed at frame teardown; no heap, no
+> host native call, no leak. Encryption is ON by default in the CLI
+> (`string_xor_key=0xA5`) for the first time. See `docs/ROADMAP.md`'s
+> "Runtime string encryption — DONE" entry and the regression test
+> `tests/lang/runtime_string_encryption.ember`. The prose below describes
+> the PRE-FIX state (kept as the investigation record).
+
 **The raw value is NOT transient today.** Ember's automatic string encryption
 does *encrypt literals into rodata* and *does* re-decrypt on every use, but it
 decrypts **into a heap buffer** (not onto the stack), and that buffer **leaks**.

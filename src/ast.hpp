@@ -83,9 +83,12 @@ struct StringLit: Expr { std::string s;            // slice<u8> to host rodata
     // owns the bytes so the pointer stays valid as long as the JIT'd code is
     // callable, same lifetime contract as globals/dispatch table).
     // If string encryption is enabled (default), the stored bytes are
-    // XOR-encrypted with baked_key; codegen emits a __str_decrypt call
-    // instead of a raw pointer so raw strings never appear in the JIT'd
-    // executable memory (encrypted-rodata string obfuscation).
+    // XOR-encrypted with baked_key; codegen decrypts inline into a
+    // compiler-hidden temp frame slot (see codegen's alloc_str_temp) at
+    // each use site, so raw strings never appear in the JIT'd executable
+    // memory AND the plaintext is transient - it lives only in the caller's
+    // stack frame for the expression's lifetime, reclaimed when the frame
+    // is torn down. The encrypted form alone lives in rodata.
     const uint8_t* baked_ptr = nullptr;
     int64_t baked_len = 0;
     uint8_t baked_key = 0;  // XOR key (0 = no encryption)
@@ -313,7 +316,8 @@ struct Program {
     // baked_ptr points into these) so they outlive sema, same as type_store.
     std::vector<std::shared_ptr<std::string>> rodata_store;
     // per-compile XOR key for string encryption. Nonzero =
-    // strings are XOR-encrypted in rodata; codegen emits __str_decrypt
+    // strings are XOR-encrypted in rodata; codegen decrypts inline into a
+    // compiler-hidden temp frame slot at each use site (no host native)
     // calls. The host sets this before sema; 0 disables encryption.
     uint8_t string_xor_key = 0;
 };

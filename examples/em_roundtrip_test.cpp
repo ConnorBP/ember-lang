@@ -152,7 +152,9 @@ int main() {
     ctx.natives = &natives;
     ctx.script_slots = &slots;
     ctx.structs = &struct_layouts;
-    // str_decrypt_fn stays null: no encrypted string literals in this source.
+    // String encryption needs no ctx field: it is pure codegen (inline
+    // stack-XOR into a temp frame slot). key=0 below means this source's
+    // literals bake unencrypted (backward-compat raw-rodata branch).
 
     // ---- compile + finalize each function ----
     std::vector<CompiledFn> fns;

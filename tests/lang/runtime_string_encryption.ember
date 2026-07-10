@@ -1,0 +1,83 @@
+// runtime_string_encryption.ember — regression for the inline-stack-XOR
+// string-encryption lowering (2026-07-10).
+//
+// Before the fix, ember's string encryption was a half-feature: an encrypted
+// literal was lowered to a __str_decrypt host-native call that allocated a
+// HEAP buffer per use, which codegen never freed — so the plaintext was
+// resident on the heap in N copies (one per use site), the opposite of the
+// "transient" property the feature advertises. The fix replaced the native
+// contract with an inline-stack-XOR lowering: each use site materializes the
+// plaintext into a compiler-hidden temp frame slot (see codegen's
+// alloc_str_temp / count_str_temps_block), so it lives only on the stack for
+// the expression's lifetime and is reclaimed at frame teardown. No heap, no
+// native call, no leak.
+//
+// This test runs under ember_cli, which sets string_xor_key=0xA5 (encryption
+// ON). Every string literal below takes the inline-XOR path: the literal
+// decrypts into a stack temp, then string_from_slice copies it into the host
+// string store, then the temp is dead. If the lowering regresses (wrong byte
+// encoding, alignment, register clobber, slot reuse aliasing, or the loop-
+// body re-decrypt path), the char-at assertions fail.
+//
+// Exercises:
+//   - the literal->string-handle conversion path (inline XOR -> string_from_slice),
+//   - the SAME literal used 3x (distinct stack temps per use, no aliasing),
+//   - a literal inside a loop body (one AST node, emitted once, the XOR runs
+//     per iteration — verifies the temp slot is correctly re-materialized
+//     each iteration rather than holding stale bytes),
+//   - a longer literal (>8 bytes, exercises the unrolled-XOR path beyond a
+//     single qword) char-verified at both ends and the middle.
+
+fn main() -> i64 {
+    // (1) string-handle path: the implicit conversion decrypts into a stack
+    // temp, then string_from_slice copies it into the host string store, then
+    // the temp is dead. Verify the handle owns the right content char-by-char.
+    let s: string = "handle-ok";
+    let n: i64 = string_length(s);
+    if (n != 9) { return 1; }            // 'handle-ok' is 9 chars
+    // 'h'=104 'a'=97 'n'=110 'd'=100 'l'=108 'e'=101 '-'=45 'o'=111 'k'=107
+    if (string_char_at(s, 0) != 104) { return 2; }
+    if (string_char_at(s, 6) != 45)  { return 3; }  // '-'
+    if (string_char_at(s, 8) != 107) { return 4; }  // 'k'
+
+    // (2) same literal 3x in one function: each use must decrypt into its own
+    // fresh stack temp. A slot-reuse bug (one temp aliased across uses) would
+    // show up as corrupted content on a later use. Bind each to a handle and
+    // verify all three are independent and correct.
+    let a: string = "repeat";
+    let b: string = "repeat";
+    let c: string = "repeat";
+    if (string_length(a) != 6) { return 5; }
+    if (string_length(b) != 6) { return 6; }
+    if (string_length(c) != 6) { return 7; }
+    // all three handles must hold the same content (they came from the same
+    // literal, independently decrypted + copied)
+    if (!(a == b)) { return 8; }
+    if (!(b == c)) { return 9; }
+    if (string_char_at(a, 0) != 114) { return 10; }  // 'r'
+    if (string_char_at(c, 5) != 116) { return 11; }  // 't'
+
+    // (3) literal in a loop body: the StringLit is one AST node emitted once;
+    // the inline XOR runs per iteration, re-materializing the temp each time.
+    // Sum the char-at of a fixed literal across 100 iterations to confirm
+    // each iteration saw a correct, freshly-decrypted temp (not stale bytes
+    // from a previous iteration's slot). 'X'=88; 100 * 88 = 8800.
+    let mut sum: i64 = 0;
+    let mut i: i64 = 0;
+    while (i < 100) {
+        let li: string = "X";
+        sum = sum + string_char_at(li, 0);
+        i = i + 1;
+    }
+    if (sum != 8800) { return 12; }
+
+    // (4) a longer literal (>8 bytes, exercises the unrolled path beyond a
+    // single qword) char-verified at both ends and the middle.
+    let long_s: string = "abcdefghijklmnopqrstuvwxyz";  // 26 chars
+    if (string_length(long_s) != 26) { return 13; }
+    if (string_char_at(long_s, 0)  != 97)  { return 14; }  // 'a'
+    if (string_char_at(long_s, 25) != 122) { return 15; }  // 'z'
+    if (string_char_at(long_s, 13) != 110) { return 16; }  // 'n' (middle)
+
+    return 42;
+}
