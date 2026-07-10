@@ -711,6 +711,7 @@ struct P {
     std::unique_ptr<LetStmt> parse_let_stmt(const Token& t) {
         auto s = std::make_unique<LetStmt>();
         s->is_auto = (t.kind==Tk::Kw_auto);
+        s->used_auto_kw = (t.kind==Tk::Kw_auto);
         bool explicit_const = (t.kind==Tk::Kw_const);
         adv();
         bool is_mut = accept(Tk::Kw_mut);

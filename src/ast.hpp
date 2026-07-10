@@ -206,7 +206,7 @@ using StmtPtr = std::unique_ptr<Stmt>;
 struct Block { std::vector<StmtPtr> stmts; };
 
 struct ExprStmt : Stmt { ExprPtr expr; };
-struct LetStmt  : Stmt { std::string name; std::shared_ptr<Type> ty; ExprPtr init; bool is_auto; bool is_const; };
+struct LetStmt  : Stmt { std::string name; std::shared_ptr<Type> ty; ExprPtr init; bool is_auto; bool is_const; bool used_auto_kw = false; };
 struct IfStmt   : Stmt { ExprPtr cond; Block then_b; bool has_else=false; Block else_b; };
 struct WhileStmt: Stmt { ExprPtr cond; Block body; };
 struct ForStmt  : Stmt { std::unique_ptr<LetStmt> init; ExprPtr cond; ExprPtr step; Block body; };

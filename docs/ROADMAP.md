@@ -287,6 +287,17 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
   compile-time-conditional needs without C-preprocessor footguns.
   A `#include`-equivalent is just module `import`.
 
+## Slated for removal (deprecated)
+
+- **`auto x = expr;`** — deprecated (2026-07-10). A redundant spelling of
+  `let x = expr;` type inference (both share the same `is_auto` inference
+  path in the parser). `let x = expr;` is the canonical inference form;
+  `let x: T = expr;` is the explicit form. `auto` adds a second way to spell
+  the same thing with no semantic difference, so it's deprecated for
+  removal: using it emits a non-fatal sema warning (the program still
+  compiles and runs). Migrate any `auto x = e;` to `let x = e;`. Removed
+  from the in-tree tests; remove from the language after a grace period.
+
 ## What will never be added (hard non-goals)
 
 - **`goto`** - structured control only; complicates liveness, scope,

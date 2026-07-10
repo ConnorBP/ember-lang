@@ -224,6 +224,7 @@ struct Checker {
     const std::unordered_map<std::string, int>* script_slots;
     uint32_t perms;
     std::vector<SemaError> errs;
+    std::vector<SemaError> warns;
     Program* prog = nullptr;
     const OpOverloadTable* overloads = nullptr;
     const StructLayoutTable* structs = nullptr;
@@ -267,6 +268,10 @@ struct Checker {
 
     void err(const std::string& m, uint32_t l, uint32_t c) {
         errs.push_back({m, l, c});
+    }
+    // Non-fatal deprecation notice (the CLI prints these to stderr but still runs).
+    void warn(const std::string& m, uint32_t l, uint32_t c) {
+        warns.push_back({m, l, c});
     }
 
     // Returns the scope-stack record itself (type, constness, provenance), or
@@ -1523,6 +1528,13 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
 
 void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
     if (auto* ls = dynamic_cast<LetStmt*>(&s)) {
+        // `auto` is deprecated: it's a redundant spelling of `let x = expr;`
+        // inference (both share the is_auto path; `let x = expr;` is the
+        // canonical form). Keep working — emit a non-fatal warning, don't error.
+        if (ls->used_auto_kw) {
+            warn("'auto' is deprecated; use 'let x = expr;' for inference or 'let x: T = expr;' for an explicit type",
+                 ls->loc.line, ls->loc.col);
+        }
         // V6-DoS mitigation: reject any local whose frame width exceeds the
         // per-frame byte budget BEFORE codegen emits a `sub rsp, <huge>`.
         // The confirmed exploit was `let a: u8[65536];` -> SIGSEGV (no cap).
@@ -1902,6 +1914,7 @@ SemaResult sema(Program& prog,
 
     SemaResult r;
     r.errors = std::move(c.errs);
+    r.warnings = std::move(c.warns);
     r.ok = r.errors.empty();
     return r;
 }

@@ -95,6 +95,7 @@ bool try_eval_const_bool(const Expr& e, bool& out);
 struct SemaResult {
     bool ok = true;
     std::vector<SemaError> errors;
+    std::vector<SemaError> warnings;  // non-fatal: deprecations, etc. (the CLI prints these)
     // resolved per-function: native calls and script-call slots are stamped
     // onto the AST CallExpr nodes (is_native/native_fn/script_slot) by sema.
 };

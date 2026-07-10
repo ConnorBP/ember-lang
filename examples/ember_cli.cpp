@@ -413,6 +413,11 @@ int main(int argc, char** argv) {
         for (auto& e : sr.errors) std::fprintf(stderr, "  line %u: %s\n", e.line, e.msg.c_str());
         return 2;
     }
+    // Non-fatal deprecation warnings (e.g. `auto` -> use `let x = expr;`).
+    if (!sr.warnings.empty()) {
+        std::fprintf(stderr, "ember: sema warnings (%zu):\n", sr.warnings.size());
+        for (auto& w : sr.warnings) std::fprintf(stderr, "  line %u: %s\n", w.line, w.msg.c_str());
+    }
 
     // ---- globals block (TYPED layout, chunk c3; sized from declared globals) ----
     // Each global lands at a per-global byte OFFSET (8-aligned): scalars 8 bytes,

@@ -134,17 +134,16 @@ grammar restrictions - grammar accepts `1 + 1.0` syntactically, sema
 rejects it, which is the right layering since "same type required" is
 a semantic property, not a parseable one).
 
-- **`let` vs `auto`**: `let x: i32 = expr;` (explicit type, checked
-  against `expr`'s type - implicit-conversion rules from
-  TYPE_SYSTEM.md Section 6 apply, e.g. `let x: i64 = some_i32_expr;` is fine
-  via implicit widening, `let x: i32 = some_i64_expr;` is a compile
-  error requiring `as`). `auto x = expr;` infers per TYPE_SYSTEM.md
-  Section 9. `let x = expr;` (no type, no `auto` keyword) is **not valid
-  syntax** - deliberately requiring the explicit `auto` keyword rather
-  than making type omission implicitly mean inference, so "did the
-  author mean to infer or forget a type" is never ambiguous to a
-  reader (small ergonomic/readability choice, zero implementation
-  cost either way, chosen for clarity).
+- **`let` inference vs explicit**: `let x = expr;` (no type) **infers** the type
+  from the initializer (Rust-style optional annotation). `let x: T = expr;`
+  (explicit type) is checked against `expr`'s type - implicit-conversion
+  rules from TYPE_SYSTEM.md Section 6 apply, e.g. `let x: i64 = some_i32_expr;`
+  is fine via implicit widening, `let x: i32 = some_i64_expr;` is a compile
+  error requiring `as`). `auto x = expr;` is a **deprecated** redundant
+  spelling of `let x = expr;` (both share the same inference path; `auto`
+  is kept working but emits a deprecation warning and is slated for
+  removal). Use `let x = expr;` for inference, `let x: T = expr;` for
+  explicit.
 - **Dangling-else**: standard resolution (`else` binds to the nearest
   unmatched `if`) - no special grammar rule needed beyond the
   recursive-descent parser's natural greedy behavior.
