@@ -79,6 +79,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <algorithm>   // Family A: ember bench (std::sort for percentile stats)
+#include <cmath>      // Family A: ember bench (std::sqrt for stddev)
 
 // Extension headers resolve via each ember_ext_* lib's PUBLIC include dir
 // (extensions/<name>), which flows transitively to this target because we
@@ -147,9 +149,14 @@ static void usage(FILE* out) {
         "                          [--tick [--tick-count N] [--tick-interval MS]]\n"
         "  ember emit-em <input.ember> <output.em>\n"
         "  ember run --load-em <input.em> [--fn NAME]\n"
+        "  ember bench <input.ember> [--fn NAME] [--iters N] [--warmup N]\n"
         "\n"
         "  run                 compile and call the entry function\n"
         "  emit-em             compile without running and write <output.em>\n"
+        "  bench               microbenchmark the entry fn: warmup + N timed iters;\n"
+        "                      print min/median/mean/p99/stddev + return value +\n"
+        "                      machine/compiler metadata (closes the audit's\n"
+        "                      benchmark-methodology gap)\n"
         "  --fn NAME           entry function (default: main)\n"
         "  --dump              print each compiled fn: name, slot, byte size, reloc count\n"
         "  --emit-em PATH      run-mode precompile output; compile and write without running\n"
@@ -171,6 +178,9 @@ int main(int argc, char** argv) {
     bool tick_mode = false;     // v0.6: --tick runs @on_tick fns on a thread until a keybind
     int tick_interval_ms = 16;  // v0.6: --tick-interval (default ~60fps)
     int tick_max = 0;           // v0.6: --tick-count N auto-stop after N ticks (0 = until keybind; for tests/non-interactive)
+    bool bench_mode = false;    // Family A: `ember bench` — microbenchmark the entry fn
+    int bench_iters = 20;       // --iters N (measured iterations)
+    int bench_warmup = 5;       // --warmup N (untimed warmup iterations)
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--fn") {
@@ -193,6 +203,12 @@ int main(int argc, char** argv) {
         } else if (a == "--tick-count") {
             if (++i >= argc) { std::fprintf(stderr, "ember: --tick-count needs N\n"); return 2; }
             tick_max = std::atoi(argv[i]);
+        } else if (a == "--iters") {
+            if (++i >= argc) { std::fprintf(stderr, "ember: --iters needs N\n"); return 2; }
+            bench_iters = std::atoi(argv[i]); if (bench_iters < 1) bench_iters = 20;
+        } else if (a == "--warmup") {
+            if (++i >= argc) { std::fprintf(stderr, "ember: --warmup needs N\n"); return 2; }
+            bench_warmup = std::atoi(argv[i]); if (bench_warmup < 0) bench_warmup = 0;
         } else if (a == "-h" || a == "--help") {
             usage(stdout); return 0;
         } else if (a.size() > 0 && a[0] == '-') {
@@ -207,7 +223,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "ember: unexpected argument '%s'\n", a.c_str()); return 2;
         }
     }
-    if (action != "run" && action != "emit-em") { usage(stderr); return 2; }
+    if (action != "run" && action != "emit-em" && action != "bench") { usage(stderr); return 2; }
+    if (action == "bench") { bench_mode = true; tick_mode = false; }
     if (file.empty() && load_em_path.empty()) { std::fprintf(stderr, "ember: missing <input.ember>\n"); usage(stderr); return 2; }
     if (action == "emit-em" && emit_em_path.empty()) {
         std::fprintf(stderr, "ember: emit-em needs <output.em>\n"); usage(stderr); return 2;
@@ -497,8 +514,74 @@ int main(int argc, char** argv) {
     // budget exhaustion, stack overflow, @obf_keyed mismatch) longjmps back
     // here instead of crashing the process (REDSHELL V6-DoS / V7).
     int exit_code = 0;
+    int64_t entry_ret = 0;   // SIGNED @entry return (lifecycle signal); exit_code is the clamped process code
     bool returns_void = entry_decl && entry_decl->ret && entry_decl->ret->is_void();
     ectx.has_checkpoint = true;
+
+    // ---- Family A: `ember bench` — microbenchmark the entry fn ----
+    // Warmup (untimed) then N timed iterations, each under its OWN fresh
+    // checkpoint so a trap in one iter stops the bench cleanly (not the process).
+    // Reports min/median/mean/p99/stddev over the timed iters + the return value
+    // + machine/compiler metadata. Closes the 07-09 §6.1/§6.3 benchmark-methodology
+    // gap (was: one mean, no variance/CI, no machine metadata, report written as
+    // a test side-effect). bench writes to stdout ON REQUEST only, never as a side-effect.
+    if (bench_mode) {
+        // warmup
+        for (int w = 0; w < bench_warmup; ++w) {
+            if (__builtin_setjmp(ectx.checkpoint)) { std::fprintf(stderr, "ember: bench warmup trap: %s\n", ectx.last_error.c_str()); exit_code = 70; goto bench_done; }
+            if (!returns_void) entry_ret = ember::ember_call_void(entry, &ectx);
+            else              ember::ember_call_void(entry, &ectx);
+        }
+        // measured iterations
+        std::vector<double> ns; ns.reserve(size_t(bench_iters));
+        bool bench_trapped = false;
+        for (int it = 0; it < bench_iters; ++it) {
+            if (__builtin_setjmp(ectx.checkpoint)) { std::fprintf(stderr, "ember: bench iter %d trap: %s\n", it, ectx.last_error.c_str()); bench_trapped = true; break; }
+            auto t0 = std::chrono::steady_clock::now();
+            if (!returns_void) entry_ret = ember::ember_call_void(entry, &ectx);
+            else              (void)ember::ember_call_void(entry, &ectx);
+            auto t1 = std::chrono::steady_clock::now();
+            ns.push_back(double(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+        }
+        if (bench_trapped) { exit_code = 70; goto bench_done; }
+        // statistics
+        std::sort(ns.begin(), ns.end());
+        double mn = ns.front(), mx = ns.back();
+        double mean = 0; for (double v : ns) mean += v; mean /= double(ns.size());
+        double sd = 0; for (double v : ns) sd += (v - mean) * (v - mean); sd = ns.size() > 1 ? std::sqrt(sd / double(ns.size() - 1)) : 0.0;
+        double median = ns[ns.size() / 2];
+        double p99 = ns[size_t(double(ns.size() - 1) * 0.99)];
+        // report (machine + compiler metadata — the audit's missing provenance)
+#if defined(__GNUC__)
+        const char* cc = "gcc"; const char* ccver = __VERSION__;
+#elif defined(_MSC_VER)
+        const char* cc = "msvc"; const char* ccver = "?";
+#else
+        const char* cc = "unknown"; const char* ccver = "?";
+#endif
+        std::printf("# ember bench %s [--fn %s] --iters %d --warmup %d\n", file.c_str(), fn_name.c_str(), bench_iters, bench_warmup);
+        std::printf("#   compiler: %s %s\n", cc, ccver);
+        std::printf("#   platform: %s (ptr=%zu-bit)\n",
+#if defined(__x86_64__) || defined(_M_X64)
+                    "x86-64", sizeof(void*)*8
+#else
+                    "unknown", sizeof(void*)*8
+#endif
+        );
+        std::printf("#   date:     %s %s\n", __DATE__, __TIME__);
+        std::printf("#   iters=%d  warmup=%d  entry_returns=%s\n", bench_iters, bench_warmup, returns_void ? "void" : "i64");
+        std::printf("result        %lld\n", (long long)entry_ret);
+        std::printf("min_ns        %.1f\n", mn);
+        std::printf("median_ns     %.1f\n", median);
+        std::printf("mean_ns       %.1f\n", mean);
+        std::printf("p99_ns        %.1f\n", p99);
+        std::printf("max_ns        %.1f\n", mx);
+        std::printf("stddev_ns     %.1f\n", sd);
+        std::printf("cv_pct        %.2f\n", mean > 0 ? (sd / mean) * 100.0 : 0.0);
+        exit_code = 0;
+        goto bench_done;
+    }
+
     if (__builtin_setjmp(ectx.checkpoint)) {
         // A trap fired during the call: recoverable error, not a crash.
         std::fprintf(stderr, "ember: RUNTIME TRAP: %s (%s)\n",
@@ -508,10 +591,22 @@ int main(int argc, char** argv) {
         // v1.0 B1: call via ember_call_void(entry, &ectx) — sets r14 = the
         // per-call context register before the call. The JIT'd budget/depth/trap
         // reads go through r14, so ectx is the live context for this call.
-        int64_t r = ember::ember_call_void(entry, &ectx);
-        exit_code = int(r & 0x7fffffff);   // clamp to a usable exit code
+        entry_ret = ember::ember_call_void(entry, &ectx);
+        // Clamp to a usable PROCESS exit code (POSIX exit codes are 0-255). The
+        // clamp intentionally drops the sign for the *process* code, but the
+        // SIGNED value (entry_ret) is what the lifecycle decision below uses —
+        // @entry returning <= 0 means unload (LIFECYCLE.md §1), and a negative
+        // return must NOT be misread as stay-loaded by the clamp turning it
+        // into a large positive. (The demo/game sim surfaced this: a probe
+        // failure returned -2, the clamp made it 254 > 0, and --tick started
+        // ticking a module that had asked to unload.)
+        exit_code = int(uint64_t(entry_ret) & 0x7fffffff);
     }
     ectx.has_checkpoint = false;
+    goto run_tick;   // skip the bench_done label (bench already returned)
+bench_done:
+    ectx.has_checkpoint = false;
+run_tick:
 
     // ---- v0.6 --tick mode: run @on_tick fns on a thread until a keybind ----
     // (user suggestion: a tick lifecycle that works on the terminal runtime,
@@ -520,10 +615,14 @@ int main(int argc, char** argv) {
     // minimal TUI + waits for 'q' to stop, unload, and exit. If @entry returned
     // <= 0 the module asked to unload — don't tick.
     if (tick_mode && exit_code != 70) {
-        // @entry return <= 0 = unload (LIFECYCLE.md §1). exit_code holds it only
-        // when @entry is `main`; if --fn pointed elsewhere this is approximate.
+        // @entry return <= 0 = unload (LIFECYCLE.md §1). Use the SIGNED return
+        // (entry_ret), NOT the clamped process exit_code — the clamp turns a
+        // negative unload signal into a large positive (e.g. -2 -> 254), which
+        // would incorrectly satisfy `> 0` and start ticking a module that asked
+        // to unload. If @entry is void or --fn pointed elsewhere, treat as
+        // stay-loaded (the historical default); this is approximate there.
         bool entry_says_stay = (entry_decl && entry_decl->ret && !entry_decl->ret->is_void())
-                               ? (exit_code > 0) : true;
+                               ? (entry_ret > 0) : true;
         auto ticks = ember::get_annotated_functions(pr.program, "@on_tick");
         auto dyn_routines = ember::ext_lifecycle::host_routines();  // v1.0: dynamically-registered routines
         if (!entry_says_stay) {
@@ -588,6 +687,16 @@ int main(int argc, char** argv) {
             std::printf("\nember: stopped after %llu ticks%s\n",
                         (unsigned long long)tick_count.load(),
                         tick_trapped.load() ? " (a tick trapped — runtime error, see above)" : "");
+            // v1.0+: a tick-trap is a runtime error in the per-frame path. Propagate
+            // it to the PROCESS exit code (70, the same trap code used for a trap in
+            // the main @entry call) so a test harness running `--tick --tick-count N`
+            // can distinguish a clean run (exit = @entry's stay-loaded return, e.g. 1)
+            // from a tick-time assertion failure (exit 70). Without this, a trapped
+            // tick printed a message but exited with @entry's positive return, so the
+            // demo/game sim's deterministic assertion had no programmatic failure
+            // channel — only the human-readable print. Now the assertion is harness-
+            // observable. (This does not change the human-readable output above.)
+            if (tick_trapped.load()) exit_code = 70;
         }
     }
 

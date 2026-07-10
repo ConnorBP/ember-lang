@@ -312,3 +312,93 @@ tick loop with per-thread state, and the host↔script coordination pattern the
 sync primitives serve). Going forward the same trigger-driven rule applies:
 adding features driven by measured need, not speculative demand, is the
 whole point of the staged plan.
+
+## HIGH PRIORITY — first-class struct / aggregate (re-entry trigger: met)
+
+**Priority:** HIGH. The re-entry trigger has fired: the 2026-07-10 multi-file
+demo (`demo/`) and the game-sim/compiler/hot-reload/concurrency demos surfaced
+this as the single biggest ergonomic blocker to writing real ember programs.
+Every non-trivial module fights it.
+
+**What "first-class struct/aggregate" means (the concrete gaps to close):**
+
+1. **Aggregate global initializers** (audit M11, currently rejected in sema):
+   `global cfg : Config = Config { name_id: 42, scale: 2.0f, ... };` and
+   `global arr : i64[4] = [1, 2, 3, 4];`. Today globals accept only scalar
+   initializers; aggregates must be initialized in a fn. Requires the
+   global table to allocate typed offsets/sizes (slices need ptr+len;
+   structs/arrays need their full layout) and complete init/load/store —
+   the codegen work M11 flagged, not just a parser/sema relaxation.
+
+2. **Array literals** (`[1, 2, 3]`) as expressions, for fixed arrays AND
+   slice construction. Today arrays must be initialized element-by-element.
+
+3. **Struct-literal return** — let a fn `return V3 { x:..., y:..., z:... };`
+   directly. Today sema rejects this: "a return of struct must be a plain
+   local variable or a call to a function with the same struct return type"
+   (a Win64 hidden-pointer-ABI restriction). Workaround today: store the
+   literal in a local first (`let r: V3 = V3{...}; return r;`).
+
+4. **Struct-by-value argument temporaries** — let a struct literal or a
+   struct-returning fn call be passed directly as a struct-by-value argument.
+   Today sema requires "a plain local variable." Workaround: introduce a local.
+
+   Items 3 & 4 are the Win64 hidden-pointer struct-return/arg ABI: the named
+   slot IS the hidden pointer, so the compiler today requires a named local.
+   The fix is to let codegen allocate a hidden temp for struct-literal returns
+   and struct-by-value arg temporaries. This is a real codegen change to the
+   struct ABI surface (M10-adjacent), not a parser tweak — but it's the change
+   that turns ember from "verbose for any vector-math-style API" to ergonomic.
+
+**Why HIGH:** these four together are the difference between a language where
+`v3_dot(v3_up(), v3_up())` and `global cfg = Config{...}` work (every real
+program) and one where every struct must be hand-shuttled through named locals.
+The demos proved the workarounds are pervasive and error-prone.
+
+---
+
+## CLI tooling (Family A built; B & C deferred)
+
+### Family A — compute-engine CLI (no new natives; shipped/next)
+
+- **`ember bench`** — SHIPPED (2026-07-10, commit pending). Microbenchmark
+  the entry fn: warmup + N timed iterations, each under its own fresh
+  checkpoint. Reports min/median/mean/p99/max/stddev/CV% + the return value +
+  machine/compiler/date provenance. **Closes the 07-09 §6.1/§6.3
+  benchmark-methodology gap** (was: one mean, no variance/CI, no machine
+  metadata, report written as a test side-effect; bench writes to stdout on
+  request only, never as a side-effect). Zero new natives.
+- **`ember test`** — NEXT. A native test runner over a directory of `.ember`
+  files classified by expected exit code (the convention
+  `tests/run_lang_tests.sh` already uses). Replaces the bash harness with a
+  fast, parallel, TAP-ish runner. Zero new natives. Blocked on a small
+  refactor: extracting the compile-to-entry flow from `main` into a reusable
+  helper so `test` can call it per-file without duplicating ~200 lines.
+
+### Family B — ember as a scripting language with real I/O (DEFERRED)
+
+Add a small `io` extension registered in the CLI: `print`, `println`,
+`read_line`, `read_file`, `write_file` (+ argv access). `print`/`println`
+ungated; `read_file`/`write_file` `PERM_FFI`-gated (file I/O is a real
+security surface — `PERM_FFI` exists for exactly this). This turns ember into
+a usable scripting language and unlocks arbitrary CLI tools (data processing,
+code-gen, templating, build helpers). **Deferred because it's a language
+feature + a security decision, not just a tool** — and the demos should
+demonstrate concrete I/O starvation before we commit to the extension surface.
+Re-entry trigger: a demo or real use that is genuinely blocked on output
+beyond the exit code.
+
+### Family C — ember as a unique compute module/pipeline tool (DEFERRED)
+
+- **`ember pipe`** — a dataflow pipeline runner: load several `.em` modules,
+  wire their functions into a directed graph (`A.process -> B.reduce`), run a
+  stream of i64 values through it, report the transformed result. Exercises
+  the bundler + module linking + the array/sync extensions. "ember as a
+  dataflow compute kernel" — distinct from a general script runner.
+- **`ember live`** — a live-coding/reload runner: `--tick` + hot-reload
+  watching a `.ember` file, recompiling on change, showing the tick output
+  evolve. Turns the hot-reload demo into a tool.
+
+  Deferred: both lean on surfaces whose demos (t91 hot-reload, t92
+  concurrency) are still validating the ergonomics. Build after those demos
+  prove the underlying APIs are pleasant enough to expose as a tool.
