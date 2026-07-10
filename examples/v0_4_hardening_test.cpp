@@ -128,7 +128,7 @@ int main() {
           "V6-DoS: u8[65536] local rejected at sema (was SIGSEGV)");
 
     // --- V6-DoS negative control: a small in-budget array must ACCEPT ---
-    check(sema_ok("fn main() -> i64 { let a: u8[100]; return a[0]; }\n"),
+    check(sema_ok("fn main() -> i64 { let a: u8[100]; return a[0] as i64; }\n"),
           "V6-DoS negative control: u8[100] in-budget sema OK");
 
     // --- V6-overflow: struct field whose byte_size overflows int32 ---

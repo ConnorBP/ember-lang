@@ -1,13 +1,7 @@
 # ember - compiler pipeline spec
 
-Detail doc for DESIGN.md Section 3. Lexer token set, grammar, AST, sema
-
-> **Implementation status: v0.1** - this is the v1.0 design spec. The
-> current repo implements the JIT codegen proof (encoder, label/patch,
-> exec-mem, `.em` format). See `README.md` for what's shipped; see
-> `CODEGEN_SPEC.md` Section 12 + Section 15 for the acceptance suite. This doc's
-> content is the target design, not a claim of current implementation.
-passes, IR shape, lowering rules, error reporting.
+Detail doc for DESIGN.md Section 3. Lexer tokens, grammar, AST, shipped sema
+and tree-walking lowering, plus explicitly deferred IR/regalloc design.
 
 ## 1. Lexer token set
 
@@ -89,13 +83,13 @@ prim_type    := 'bool'|'i8'|'i16'|'i32'|'i64'
 block        := '{' stmt* '}'
 stmt         := 'let' IDENT (':' type)? '=' expr ';'      // local decl
                | 'const' IDENT ':' type '=' expr ';'       // immutable local
-               | 'defer' expr ';'                          // scope-exit cleanup (Section 6, CODEGEN_SPEC.md Section 14)
+               | 'defer' expr ';'                          // function-exit LIFO cleanup (Section 6, CODEGEN_SPEC.md Section 13)
                | 'auto' IDENT '=' expr ';'                 // TYPE_SYSTEM.md Section 9
                | 'if' '(' expr ')' block ('else' (block|stmt))?
                | 'while' '(' expr ')' block
                | 'do' block 'while' '(' expr ')' ';'
                | 'for' '(' for_init? ';' expr? ';' for_step? ')' block
-               | 'switch' '(' expr ')' '{' case_clause* '}'    // CODEGEN_SPEC.md Section 13
+               | 'switch' '(' expr ')' '{' case_clause* '}'    // CODEGEN_SPEC.md Section 12
                | 'break' ';' | 'continue' ';'
                | 'return' expr? ';'
                | expr ';'                                   // expr-statement (calls, assignments)
@@ -493,21 +487,12 @@ struct IrFunction {
   rejection actually happens (stated once here for clarity: lowering
   never sees an escaping case because sema already turned it into a
   compile error before lowering runs).
-- **`defer` statement**: pushed onto a per-block "deferred-actions"
-  stack during lowering (one stack per enclosing block, pushed when
-  the `defer` stmt is lowered, popped at block exit). Every scope-exit
-  path that lowers *into* the block (normal fallthrough off the end,
-  explicit `return`, `break`/`continue` out of an enclosing loop, a
-  trap-unwind) must emit the deferred actions in reverse order. **v1
-  limitation, documented** (`GAP_ANALYSIS.md` Section 5): the trap-unwind
-  path (non-local jump, `SAFETY_AND_SANDBOX.md` Section 2) does **not** run
-  `defer` bodies - traps abort the whole `ember_call`, jumping past
-  them; only the structured-exit paths (`return`/`break`/`continue`/
-  fallthrough) run defers. This matches the "traps abort, don't
-  gracefully unwind locals" stance and avoids needing defer-cleanup
-  awareness in the non-local-unwind machinery. If a script needs
-  cleanup on trap too, it must do it via a host-side
-  `runtime_error`/`runtime_exception` handler, not `defer`.
+- **`defer` statement (implemented v1)**: codegen records deferred
+  expressions per function and emits them in reverse order at ordinary
+  function exit. It does not synthesize lexical cleanup edges for nested-block
+  fallthrough, `break`, or `continue`, and trap unwind bypasses defers. Sema
+  therefore restricts references to parameters/globals whose storage survives
+  until function exit. Per-block cleanup-edge architecture remains deferred.
 - **`switch` statement**: scrutinee is a compile-time-known integer
   type (signed or unsigned, any width) - non-integer scrutinee is a
   compile error. Case labels must be `constexpr` integer literals
@@ -521,18 +506,15 @@ struct IrFunction {
   `GAP_ANALYSIS.md` Section 5) - checked at sema, so lowering never emits a
   fallthrough path. `default` missing + no case matched = fall
   through to `switch_exit_bb` (no-op, equivalent to an empty
-  switch). See `CODEGEN_SPEC.md` Section 13 for the jump-table encoding.
-- **`f"...{expr}..."` interpolation**: sema-lowered to a sequence of
-  string-literal `IrValue`s (the static parts, rodata per
-  `MEMORY_AND_GC.md` Section 6) plus the hole expressions, all passed to a
-  host-provided `__fmt` native addon (`GAP_ANALYSIS.md` Section 3) returning
-  an `array<u8>` handle. Concretely `f"v={x}"` desugars to
-  `__fmt(__sl("v="), x)` where `__sl` constructs a `slice<u8>` from a
-  literal and `__fmt` is a `PERM_FFI`-free standard-addon native.
-  If the `__fmt` addon isn't registered, sema errors with "string
-  interpolation requires the `__fmt` addon" - the feature is syntactic
-  sugar over a host native, not a language builtin, so it's absent
-  when the host doesn't ship the format addon.
+  switch). See `CODEGEN_SPEC.md` Section 12 for the jump-table encoding.
+- **`f"...{expr}..."` interpolation**: the parser wraps each segment in
+  the internal `__fstring_to_string` sentinel. Sema replaces each sentinel
+  with a real string-extension conversion: literal `u8[]` segments use
+  `string_from_slice`; integer, `f32`, `f64`, and bool holes use the matching
+  `string_from_i64`/`string_from_f32`/`string_from_f64`/`string_from_bool`;
+  existing string handles use `string_identity`. Concatenation is lowered via
+  the registered string `+` overload. `__fstring_to_string` is not a native
+  API and no `__fmt` native exists.
 - **`const`/`constexpr` locals**: `const x: T = expr;` lowers like
   an ordinary local whose `StoreFrameSlot` happens once and whose
   subsequent assignment is rejected at sema (compile error, not a
@@ -582,7 +564,7 @@ struct Diagnostic {
   the same compile - same best-effort-continuation philosophy as the
   lexer (Section 1), not a guarantee of zero cascade errors.
 
-## 8. Regalloc / codegen interface (module boundary between passes)
+## 8. Deferred regalloc/codegen interface (not implemented)
 
 ```cpp
 // lowering produces this; regalloc consumes it and produces physical assignments;
@@ -597,7 +579,7 @@ struct RegAllocResult {
 RegAllocResult run_linear_scan(const IrFunction&);
 vector<uint8_t> emit_x64(const IrFunction&, const RegAllocResult&); // CODEGEN_SPEC.md Section 3-Section 11
 ```
-This three-stage split (lower -> regalloc -> emit) is what makes each
+If implemented, this three-stage split (lower -> regalloc -> emit) would make each
 of CODEGEN_SPEC.md's acceptance-criteria cases (Section 12) independently
 testable: a spill-heavy test case only needs to check `RegAllocResult`
 correctness, an encoding-correctness test only needs to check

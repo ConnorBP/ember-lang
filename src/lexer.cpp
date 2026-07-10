@@ -190,17 +190,26 @@ LexResult tokenize(std::string_view src, const char*) {
         if (std::isdigit((unsigned char)c)) {
             uint32_t sl = line, sc = col; size_t s = i;
             bool isfloat = false;
-            bool ishex = false;
             // hex prefix 0x / 0X
             if (c == '0' && i + 1 < src.size() && (src[i+1] == 'x' || src[i+1] == 'X')) {
-                adv(2); ishex = true;
+                adv(2);
+                size_t digits = i;
                 while (i < src.size() && std::isxdigit((unsigned char)src[i])) adv(1);
+                if (i == digits) {
+                    r.ok = false; r.error = "hex literal requires at least one digit"; r.err_line = sl; r.err_col = sc; return r;
+                }
+                if (i < src.size() && (std::isalnum((unsigned char)src[i]) || src[i] == '_')) {
+                    r.ok = false; r.error = "unsupported or malformed hex literal suffix"; r.err_line = sl; r.err_col = sc; return r;
+                }
                 std::string num(src.substr(s, i - s));
                 Token t{Tk::IntLit, num, sl, sc};
                 try {
-                    t.ivalue = int64_t(std::stoull(num, nullptr, 16));  // unsigned parse for full 64-bit range
-                } catch (const std::out_of_range&) {
-                    r.ok = false; r.error = "integer literal out of range: 0x" + num; r.err_line = sl; r.err_col = sc; return r;
+                    size_t used = 0;
+                    unsigned long long value = std::stoull(num.substr(2), &used, 16);
+                    if (used != num.size() - 2) throw std::invalid_argument("trailing hex input");
+                    t.ivalue = int64_t(value);
+                } catch (const std::exception&) {
+                    r.ok = false; r.error = "integer literal out of range or malformed: " + num; r.err_line = sl; r.err_col = sc; return r;
                 }
                 r.toks.push_back(std::move(t));
                 continue;
@@ -225,10 +234,12 @@ LexResult tokenize(std::string_view src, const char*) {
                 }
             }
             std::string num(src.substr(s, i - s));
-            // strip type suffixes (u/i + width)
-            std::string suffix;
-            while (i < src.size() && (src[i] == 'u' || src[i] == 'i' || std::isdigit((unsigned char)src[i]))) {
-                suffix.push_back(src[i]); adv(1);
+            // Integer-width suffixes are not represented in the AST/type
+            // system yet. Reject them consistently for decimal and hex rather
+            // than silently consuming and discarding their meaning.
+            if (!isfloat && i < src.size() && (src[i] == 'u' || src[i] == 'i')) {
+                r.ok = false; r.error = "integer literal width suffixes are unsupported; use an explicit `as` cast";
+                r.err_line = sl; r.err_col = sc; return r;
             }
             bool f32_suf = false;
             // 'f' suffix forces f32
@@ -240,8 +251,8 @@ LexResult tokenize(std::string_view src, const char*) {
                 std::string clean = num;
                 try {
                     t.fvalue = std::stod(clean);
-                } catch (const std::out_of_range&) {
-                    r.ok = false; r.error = "floating-point literal out of range: " + num; r.err_line = sl; r.err_col = sc; return r;
+                } catch (const std::exception&) {
+                    r.ok = false; r.error = "floating-point literal out of range or malformed: " + num; r.err_line = sl; r.err_col = sc; return r;
                 }
             } else {
                 try {
@@ -254,8 +265,8 @@ LexResult tokenize(std::string_view src, const char*) {
                     // uncaught, past that - which used to crash the whole
                     // process (std::terminate) on this exact kind of literal.
                     t.ivalue = int64_t(std::stoull(num, nullptr, 10));
-                } catch (const std::out_of_range&) {
-                    r.ok = false; r.error = "integer literal out of range: " + num; r.err_line = sl; r.err_col = sc; return r;
+                } catch (const std::exception&) {
+                    r.ok = false; r.error = "integer literal out of range or malformed: " + num; r.err_line = sl; r.err_col = sc; return r;
                 }
             }
             r.toks.push_back(std::move(t));

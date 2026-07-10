@@ -1,0 +1,16 @@
+fn main() -> i64 {
+    let neg: i64 = -9223372036854775807 - 1;
+    let d: f64 = neg as f64;
+    if ((d as i64) != neg) { return 1; }
+
+    let hi: i64 = 2147483647;
+    let f: f64 = hi as f64;
+    if ((f as i64) != hi) { return 2; }
+
+    let mut a: i64[2];
+    a[0] = 11;
+    a[1] = 31;
+    let b: i64[2] = a as i64[2];
+    if (b[0] != 11 || b[1] != 31) { return 3; }
+    return 42;
+}

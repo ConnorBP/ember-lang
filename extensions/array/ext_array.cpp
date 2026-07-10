@@ -9,6 +9,9 @@
 #include "ast.hpp"
 #include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
 #include <cstring>
+#include <limits>
+#include <new>
+#include <stdexcept>
 #include <vector>
 
 using namespace ember;  // bind_handle, BindingBuilder, type_* singletons
@@ -18,10 +21,31 @@ namespace ember::ext_array {
 // --- array<T> host store (opaque i64 handle; host owns the byte vector + elem_size) ---
 struct ArraySlot { std::vector<uint8_t> bytes; int64_t elem_size = 1; };
 static std::vector<ArraySlot> g_arrays;
-static int64_t arr_new(int64_t elem_size, int64_t count) {
-    if (elem_size < 1) elem_size = 1;
-    g_arrays.push_back(ArraySlot{std::vector<uint8_t>(size_t(elem_size * count), 0), elem_size});
-    return int64_t(g_arrays.size());  // handle = index (1-based)
+// A single extension container is limited to 1 GiB.  This is checked before
+// every allocation/growth so script sizes cannot wrap size_t or exhaust the
+// host through one array.
+static constexpr size_t MAX_CONTAINER_BYTES = size_t(1) << 30;
+static bool checked_bytes(int64_t elem_size, int64_t count, size_t* out) {
+    if (elem_size < 1 || count < 0) return false;
+    const uint64_t es = uint64_t(elem_size), n = uint64_t(count);
+    if (n != 0 && es > uint64_t(MAX_CONTAINER_BYTES) / n) return false;
+    *out = size_t(es * n);
+    return *out <= MAX_CONTAINER_BYTES;
+}
+static int64_t arr_new(int64_t elem_size, int64_t count) noexcept {
+    size_t bytes = 0;
+    if (!checked_bytes(elem_size, count, &bytes)) return 0;
+    try {
+        ArraySlot slot;
+        slot.elem_size = elem_size;
+        slot.bytes.assign(bytes, 0);
+        g_arrays.push_back(std::move(slot));
+        return int64_t(g_arrays.size());  // handle = index (1-based)
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::length_error&) {
+        return 0;
+    }
 }
 static ArraySlot* arr_slot(int64_t h) {
     if (h < 1 || h > int64_t(g_arrays.size())) return nullptr;
@@ -30,14 +54,24 @@ static ArraySlot* arr_slot(int64_t h) {
 extern "C" {
     static int64_t n_array_new(int64_t esz, int64_t n) { return arr_new(esz, n); }
     static int64_t n_array_length(int64_t h) { auto* s = arr_slot(h); return s ? int64_t(s->bytes.size() / s->elem_size) : 0; }
-    static void n_array_resize(int64_t h, int64_t n) { auto* s = arr_slot(h); if (s) s->bytes.resize(size_t(n * s->elem_size), 0); }
+    static void n_array_resize(int64_t h, int64_t n) {
+        auto* s = arr_slot(h); size_t bytes = 0;
+        if (!s || !checked_bytes(s->elem_size, n, &bytes)) return;
+        try { s->bytes.resize(bytes, 0); }
+        catch (const std::bad_alloc&) {} catch (const std::length_error&) {}
+    }
     static void n_array_set_u8(int64_t h, int64_t i, int64_t v) { auto* s = arr_slot(h); if (s && i>=0 && i<int64_t(s->bytes.size())) s->bytes[size_t(i)] = uint8_t(v); }
     static int64_t n_array_get_u8(int64_t h, int64_t i) { auto* s = arr_slot(h); return (s && i>=0 && i<int64_t(s->bytes.size())) ? int64_t(s->bytes[size_t(i)]) : 0; }
     static void n_array_set_f32(int64_t h, int64_t i, float v) { auto* s = arr_slot(h); if (s && i>=0 && size_t(i)*4+4<=s->bytes.size()) std::memcpy(&s->bytes[size_t(i)*4], &v, 4); }
     static float n_array_get_f32(int64_t h, int64_t i) { auto* s = arr_slot(h); float v=0; if (s && i>=0 && size_t(i)*4+4<=s->bytes.size()) std::memcpy(&v, &s->bytes[size_t(i)*4], 4); return v; }
     static void n_array_set_i64(int64_t h, int64_t i, int64_t v) { auto* s = arr_slot(h); if (s && i>=0 && size_t(i)*8+8<=s->bytes.size()) std::memcpy(&s->bytes[size_t(i)*8], &v, 8); }
     static int64_t n_array_get_i64(int64_t h, int64_t i) { auto* s = arr_slot(h); int64_t v=0; if (s && i>=0 && size_t(i)*8+8<=s->bytes.size()) std::memcpy(&v, &s->bytes[size_t(i)*8], 8); return v; }
-    static void n_array_push_u8(int64_t h, int64_t v) { auto* s = arr_slot(h); if (s && s->elem_size==1) s->bytes.push_back(uint8_t(v)); }
+    static void n_array_push_u8(int64_t h, int64_t v) {
+        auto* s = arr_slot(h);
+        if (!s || s->elem_size != 1 || s->bytes.size() >= MAX_CONTAINER_BYTES) return;
+        try { s->bytes.push_back(uint8_t(v)); }
+        catch (const std::bad_alloc&) {} catch (const std::length_error&) {}
+    }
 }
 
 // Exposed so a host native that receives an array<u8> handle (process

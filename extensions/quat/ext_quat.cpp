@@ -26,19 +26,20 @@ extern "C" {
     static void n_quat_set_y(int64_t h, float v) { auto* s=q_slot(h); if(s) s->y=v; }
     static void n_quat_set_z(int64_t h, float v) { auto* s=q_slot(h); if(s) s->z=v; }
     static void n_quat_set_w(int64_t h, float v) { auto* s=q_slot(h); if(s) s->w=v; }
-    static int64_t n_quat_add(int64_t a, int64_t b) { auto* x=q_slot(a); auto* y=q_slot(b); return q_new(x->x+y->x, x->y+y->y, x->z+y->z, x->w+y->w); }
-    static int64_t n_quat_sub(int64_t a, int64_t b) { auto* x=q_slot(a); auto* y=q_slot(b); return q_new(x->x-y->x, x->y-y->y, x->z-y->z, x->w-y->w); }
+    static int64_t n_quat_add(int64_t a, int64_t b) { auto* x=q_slot(a); auto* y=q_slot(b); return (x&&y)?q_new(x->x+y->x, x->y+y->y, x->z+y->z, x->w+y->w):0; }
+    static int64_t n_quat_sub(int64_t a, int64_t b) { auto* x=q_slot(a); auto* y=q_slot(b); return (x&&y)?q_new(x->x-y->x, x->y-y->y, x->z-y->z, x->w-y->w):0; }
     // Hamilton product (real quaternion multiplication, not component-wise -
     // this is what `*` means mathematically for a quat).
     static int64_t n_quat_mul(int64_t a, int64_t b) {
         auto* p=q_slot(a); auto* q=q_slot(b);
+        if (!p || !q) return 0;
         float x = p->w*q->x + p->x*q->w + p->y*q->z - p->z*q->y;
         float y = p->w*q->y - p->x*q->z + p->y*q->w + p->z*q->x;
         float z = p->w*q->z + p->x*q->y - p->y*q->x + p->z*q->w;
         float w = p->w*q->w - p->x*q->x - p->y*q->y - p->z*q->z;
         return q_new(x, y, z, w);
     }
-    static int64_t n_quat_eq(int64_t a, int64_t b) { auto* x=q_slot(a); auto* y=q_slot(b); return (x->x==y->x && x->y==y->y && x->z==y->z && x->w==y->w) ? 1 : 0; }
+    static int64_t n_quat_eq(int64_t a, int64_t b) { auto* x=q_slot(a); auto* y=q_slot(b); return (x&&y&&x->x==y->x && x->y==y->y && x->z==y->z && x->w==y->w) ? 1 : 0; }
 }
 
 // Registered surface is byte-identical to the old I/H/add lambda form
@@ -46,14 +47,14 @@ extern "C" {
 void register_natives(std::unordered_map<std::string, NativeSig>& m) {
     BindingBuilder b;
     b.add("quat_new", bind_handle("quat"), {type_f32(),type_f32(),type_f32(),type_f32()}, (void*)&n_quat_new);
-    b.add("quat_x",   type_f32(), {type_i64()}, (void*)&n_quat_x);
-    b.add("quat_y",   type_f32(), {type_i64()}, (void*)&n_quat_y);
-    b.add("quat_z",   type_f32(), {type_i64()}, (void*)&n_quat_z);
-    b.add("quat_w",   type_f32(), {type_i64()}, (void*)&n_quat_w);
-    b.add("quat_set_x",type_void(),{type_i64(),type_f32()}, (void*)&n_quat_set_x);
-    b.add("quat_set_y",type_void(),{type_i64(),type_f32()}, (void*)&n_quat_set_y);
-    b.add("quat_set_z",type_void(),{type_i64(),type_f32()}, (void*)&n_quat_set_z);
-    b.add("quat_set_w",type_void(),{type_i64(),type_f32()}, (void*)&n_quat_set_w);
+    b.add("quat_x",   type_f32(), {bind_handle("quat")}, (void*)&n_quat_x);
+    b.add("quat_y",   type_f32(), {bind_handle("quat")}, (void*)&n_quat_y);
+    b.add("quat_z",   type_f32(), {bind_handle("quat")}, (void*)&n_quat_z);
+    b.add("quat_w",   type_f32(), {bind_handle("quat")}, (void*)&n_quat_w);
+    b.add("quat_set_x",type_void(),{bind_handle("quat"),type_f32()}, (void*)&n_quat_set_x);
+    b.add("quat_set_y",type_void(),{bind_handle("quat"),type_f32()}, (void*)&n_quat_set_y);
+    b.add("quat_set_z",type_void(),{bind_handle("quat"),type_f32()}, (void*)&n_quat_set_z);
+    b.add("quat_set_w",type_void(),{bind_handle("quat"),type_f32()}, (void*)&n_quat_set_w);
     NativeTable t = b.build();
     for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }

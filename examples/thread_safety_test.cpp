@@ -206,28 +206,22 @@ int main() {
                 a_result = run_with_ctx(m.main_entry, &ea, &a_trapped);
                 a_done.store(true, std::memory_order_release);
             });
-            // Thread B: tiny budget, expects a budget trap.
+            // Thread B invokes the exact same machine-code entry as A, but its
+            // own small context budget traps before the finite loop completes.
+            // This distinguishes shared-body/per-context isolation from merely
+            // compiling independent modules on independent threads.
             std::thread tb([&]{
-                // a tight infinite loop so the back-edge budget check fires fast
-                // (reuse the same entry; the trap depends on the per-thread budget).
-                // We need an infinite-loop entry for B to trap -- compile a second
-                // module for B so A completes and B traps on its own loop.
-                B1Module mb;
-                bool okb = compile_b1(
-                    "fn main() -> i64 { while (true) { let mut x: i64 = 1+1+1; } return 0; }\n", mb);
-                if (!okb) { b_reason = TrapReason::None; b_done.store(true); return; }
-                context_t eb; eb.budget_remaining = 500; eb.max_call_depth=8;
+                context_t eb; eb.budget_remaining = 20; eb.max_call_depth=8;
                 bool tp=false;
-                run_with_ctx(mb.main_entry, &eb, &tp);
+                run_with_ctx(m.main_entry, &eb, &tp);
                 b_trapped = tp; b_reason = eb.last_trap;
-                for(auto&fn:mb.fns) if(fn.exec) free_executable(fn.exec);
                 b_done.store(true, std::memory_order_release);
             });
             ta.join(); tb.join();
             check(!a_trapped && a_result == 4950,
                   "B1: thread A (big budget) completed + returned 4950, no trap");
             check(b_trapped && b_reason == TrapReason::BudgetExceeded,
-                  "B1: thread B (tiny budget) trapped BudgetExceeded on ITS OWN context");
+                  "B1: same compiled body trapped thread B's tiny independent context");
             check(a_done.load() && b_done.load(),
                   "B1: both threads finished (no cross-thread longjmp corrupted either)");
         }

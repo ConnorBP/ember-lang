@@ -1,0 +1,2 @@
+const answer: i64 = 42;
+fn bad() -> i64 { answer = 1; return answer; }

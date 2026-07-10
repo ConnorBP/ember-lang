@@ -53,32 +53,33 @@ struct CG {
 
     CG(const CodeGenCtx& c, const FuncDecl& fn) : ctx(c), f(fn) {}
 
-    // byte width of a local's frame slot. Slices are {ptr,len} = 16 bytes
-    // (slice ABI: see eval()'s StringLit/Ident cases). Fixed-size arrays T[N]
-    // are N tightly-packed elem_bytes(T) slots (see elem_bytes below) so a
-    // fixed array can be viewed as a real contiguous slice via `arr[..]`.
-    // A registered struct type (looked up in `structs`) gets its full layout
-    // size. Everything else (scalars, i64 handles) is a flat 8-byte slot.
-    static int32_t local_width_bytes(const Type* t, const StructLayoutTable* structs) {
-        if (t && t->is_slice) return 16;
-        if (t && t->array_len > 0) return int32_t(t->array_len) * elem_bytes(t->elem.get());
-        if (t && !t->struct_name.empty() && structs) {
+    // Exact byte width of an Ember-layout value. Struct fields are tightly
+    // packed and fixed arrays recurse through their element type, so neither
+    // may fall back to the scalar default merely because it is nested.
+    static int32_t value_bytes(const Type* t, const StructLayoutTable* structs) {
+        if (!t) return 8;
+        if (t->is_slice) return 16;
+        if (t->array_len > 0)
+            return int32_t(t->array_len) * value_bytes(t->elem.get(), structs);
+        if (!t->struct_name.empty() && structs) {
             auto it = structs->find(t->struct_name);
             if (it != structs->end()) return it->second.size;
         }
-        return 8;
-    }
-
-    // byte width of one array/slice element for JIT frame storage - distinct
-    // from Type::byte_size() (which isn't used for frame layout here).
-    static int32_t elem_bytes(const Type* t) {
-        if (!t) return 8;
         switch (t->prim) {
         case Prim::Bool: case Prim::I8: case Prim::U8: return 1;
         case Prim::I16: case Prim::U16: return 2;
         case Prim::I32: case Prim::U32: case Prim::F32: return 4;
-        default: return 8; // I64/U64/F64 and handle types (i64 under the hood)
+        default: return 8; // I64/U64/F64 and opaque handle types
         }
+    }
+
+    // Local scalar slots remain word-sized; aggregates use their exact,
+    // recursively computed Ember extent.
+    static int32_t local_width_bytes(const Type* t, const StructLayoutTable* structs) {
+        if (t && (t->is_slice || t->array_len > 0 ||
+                  (!t->struct_name.empty() && structs && structs->count(t->struct_name))))
+            return value_bytes(t, structs);
+        return 8;
     }
 
     // number of 8-byte "words" a call-site operand (or param) occupies in
@@ -232,13 +233,12 @@ struct CG {
     // freely clobber rax/rcx/rdx/r8 here.
     void emit_trap(int reason_ord, const char* detail) {
         if (ctx.trap_stub) {
-            // Win64: the stub is a normal C function — needs 16-byte-aligned
-            // rsp at the call + 32-byte shadow space. At a trap site rsp is at
-            // the frame base (16-aligned by the prologue), so a raw `call`
-            // would misalign to 8 and fault. Reserve 0x28 (40 = 32 shadow + 8
-            // align) before the call; the stub longjmps (never returns) so the
-            // reserved space is never restored by us — longjmp handles rsp.
-            e.byte(0x48); e.byte(0x83); e.byte(0xEC); e.byte(0x28); // sub rsp, 0x28
+            // Emitter invariant: rsp must be 16-byte aligned immediately
+            // before every Win64 call.  Reserve exactly the mandatory 32-byte
+            // shadow space plus only the padding required by the tracked
+            // parity (normally 0; 8 while a temporary value is pushed).
+            const int32_t call_frame = e.win64_call_frame_size(32);
+            e.sub_reg_imm32(Reg::rsp, call_frame);
             // rcx = context_t* (the trap stub's first arg). B1: from r14 (the per-call
             // context register) when use_context_reg; else the baked imm64 ptr.
             if (ctx.use_context_reg) e.mov_reg_reg(Reg::rcx, Reg::r14);
@@ -246,9 +246,11 @@ struct CG {
             e.mov_reg_imm64(Reg::rdx, int64_t(reason_ord));
             e.mov_reg_imm64(Reg::r8,  int64_t(reinterpret_cast<uintptr_t>(detail)));
             e.mov_reg_imm64(Reg::rax, int64_t(ctx.trap_stub));
+            e.require_win64_call_alignment();
             e.call_reg(Reg::rax);
-            // stub does not return (longjmps); if it ever did, fall through.
-            e.byte(0x48); e.byte(0x83); e.byte(0xC4); e.byte(0x28); // add rsp, 0x28
+            // Stub normally longjmps; keep a balanced fallback if a faulty
+            // host stub returns.
+            e.add_reg_imm32(Reg::rsp, call_frame);
         } else {
             e.byte(0x0F); e.byte(0x0B); // ud2 (raises #UD, pre-v0.4 trap)
         }
@@ -424,6 +426,7 @@ struct CG {
             if (is->has_else) prescan_block(is->else_b); return;
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { prescan_expr(*ws->cond); prescan_block(ws->body); return; }
+        if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { prescan_block(ds->body); prescan_expr(*ds->cond); return; }
         if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
             if (fs->init) prescan_stmt(*fs->init);
             if (fs->cond) prescan_expr(*fs->cond);
@@ -470,6 +473,7 @@ struct CG {
             if (is->has_else) count_pin_refs_block(is->else_b, counts); return;
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_pin_refs_expr(*ws->cond, counts); count_pin_refs_block(ws->body, counts); return; }
+        if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_pin_refs_block(ds->body, counts); count_pin_refs_expr(*ds->cond, counts); return; }
         if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
             if (fs->init) count_pin_refs_stmt(*fs->init, counts);
             if (fs->cond) count_pin_refs_expr(*fs->cond, counts);
@@ -546,18 +550,119 @@ struct CG {
         return best;
     }
 
-    // --- expression evaluation: int/bool result in rax, f32 in xmm0 ---
+    static int int_bits(const Type* t) {
+        if (!t) return 64;
+        switch (t->prim) {
+        case Prim::I8: case Prim::U8: return 8;
+        case Prim::I16: case Prim::U16: return 16;
+        case Prim::I32: case Prim::U32: return 32;
+        default: return 64;
+        }
+    }
+    void normalize_rax(const Type* t) {
+        if (!t || !t->is_int() || t->is_fn_handle || !t->struct_name.empty()) return;
+        int bits = int_bits(t);
+        if (bits == 64) return;
+        if (bits == 32) {
+            if (t->is_uint()) { e.byte(0x89); e.byte(0xC0); } // mov eax,eax
+            else { e.byte(0x48); e.byte(0x63); e.byte(0xC0); } // movsxd rax,eax
+            return;
+        }
+        e.byte(0x48); e.byte(0xC1); e.byte(t->is_uint() ? 0xE0 : 0xE0); e.byte(uint8_t(64-bits));
+        e.byte(0x48); e.byte(0xC1); e.byte(t->is_uint() ? 0xE8 : 0xF8); e.byte(uint8_t(64-bits));
+    }
+    void emit_integer_divmod(bool want_mod, bool is_unsigned) {
+        Label nonzero = e.alloc_label();
+        e.cmp_reg_imm32(Reg::rcx, 0); e.jcc(Cond::ne, nonzero);
+        emit_trap(int(TrapReason::DivByZero), "integer division by zero"); e.bind(nonzero);
+        if (!is_unsigned) {
+            Label safe = e.alloc_label(), overflow = e.alloc_label();
+            e.cmp_reg_imm32(Reg::rcx, -1); e.jcc(Cond::ne, safe);
+            e.mov_reg_imm64(Reg::r10, INT64_MIN); e.cmp_reg_reg(Reg::rax, Reg::r10); e.jcc(Cond::e, overflow);
+            e.jmp(safe); e.bind(overflow);
+            emit_trap(int(TrapReason::DivByZero), "signed division overflow"); e.bind(safe);
+            e.byte(0x48); e.byte(0x99);              // cqo
+            e.byte(0x48); e.byte(0xF7); e.byte(0xF9); // idiv rcx
+        } else {
+            e.byte(0x48); e.byte(0x31); e.byte(0xD2); // xor rdx,rdx
+            e.byte(0x48); e.byte(0xF7); e.byte(0xF1); // div rcx
+        }
+        if (want_mod) e.mov_reg_reg(Reg::rax, Reg::rdx);
+    }
+
+    // --- expression evaluation: int/bool result in rax, float in xmm0 ---
     void eval(const Expr& ex);
+
+    bool local_value_offset(const Expr& ex, int32_t& off, const Type*& ty) const {
+        if (auto* id = dynamic_cast<const Ident*>(&ex)) {
+            auto it = locals.find(id->name);
+            if (it == locals.end()) return false;
+            off = it->second;
+            auto tt = local_types.find(id->name);
+            ty = tt == local_types.end() ? ex.ty : tt->second;
+            return true;
+        }
+        if (auto* fl = dynamic_cast<const FieldExpr*>(&ex)) {
+            const Type* base_ty = nullptr;
+            if (!local_value_offset(*fl->base, off, base_ty) || !ctx.structs ||
+                !base_ty || base_ty->struct_name.empty()) return false;
+            auto sit = ctx.structs->find(base_ty->struct_name);
+            if (sit == ctx.structs->end()) return false;
+            auto fit = sit->second.fields.find(fl->field);
+            if (fit == sit->second.fields.end()) return false;
+            off += fit->second.offset;
+            ty = fit->second.ty;
+            return true;
+        }
+        return false;
+    }
+
+    // Materialize a value directly into Ember-layout memory. Aggregates never
+    // acquire a fake scalar-register representation: nested literals recurse,
+    // and existing aggregate locals are copied by their exact packed extent.
+    void store_value_to_memory(const Expr& value, const Type* t, Reg dst, int32_t off) {
+        if (t && !t->struct_name.empty() && ctx.structs && ctx.structs->count(t->struct_name)) {
+            const StructLayout& layout = ctx.structs->at(t->struct_name);
+            if (auto* lit = dynamic_cast<const StructLit*>(&value)) {
+                for (const auto& kv : lit->fields) {
+                    auto fit = layout.fields.find(kv.first);
+                    if (fit != layout.fields.end())
+                        store_value_to_memory(*kv.second, fit->second.ty, dst,
+                                              off + fit->second.offset);
+                }
+                return;
+            }
+            int32_t src_off = 0; const Type* src_ty = nullptr;
+            if (local_value_offset(value, src_off, src_ty))
+                copy_bytes(dst, off, Reg::rbp, src_off, layout.size);
+            return;
+        }
+        if (t && t->array_len > 0) {
+            int32_t src_off = 0; const Type* src_ty = nullptr;
+            if (local_value_offset(value, src_off, src_ty))
+                copy_bytes(dst, off, Reg::rbp, src_off, value_bytes(t, ctx.structs));
+            return;
+        }
+        eval(value);
+        if (t && t->is_slice) {
+            e.store_reg_mem(dst, off, Reg::rax);
+            e.store_reg_mem(dst, off + 8, Reg::rdx);
+        } else if (t && t->prim == Prim::F64) e.movsd_mem_xmm(dst, off, Xmm::xmm0);
+        else if (t && t->prim == Prim::F32) e.movss_mem_xmm(dst, off, Xmm::xmm0);
+        else e.store_rax_elem(dst, off, value_bytes(t, ctx.structs));
+    }
 
     // load a value (int or float) from a stack slot [rbp + off]
     void load_slot(int32_t off, const Type* t) {
-        if (t->is_float()) e.movss_xmm_mem(Xmm::xmm0, Reg::rbp, off);
-        else e.load_reg_mem(Reg::rax, Reg::rbp, off);
+        if (t->prim == Prim::F64) e.movsd_xmm_mem(Xmm::xmm0, Reg::rbp, off);
+        else if (t->is_float()) e.movss_xmm_mem(Xmm::xmm0, Reg::rbp, off);
+        else { e.load_reg_mem(Reg::rax, Reg::rbp, off); normalize_rax(t); }
     }
     // store rax (int) or xmm0 (float) to a stack slot [rbp + off]
     void store_slot(int32_t off, const Type* t) {
-        if (t->is_float()) e.movss_mem_xmm(Reg::rbp, off, Xmm::xmm0);
-        else { // mov [rbp+off], rax  -> REX.W 89 /r mod=10 reg=rax rm=rbp
+        if (t->prim == Prim::F64) e.movsd_mem_xmm(Reg::rbp, off, Xmm::xmm0);
+        else if (t->is_float()) e.movss_mem_xmm(Reg::rbp, off, Xmm::xmm0);
+        else { normalize_rax(t); // mov [rbp+off], rax  -> REX.W 89 /r mod=10 reg=rax rm=rbp
             e.byte(0x48); e.byte(0x89);
             e.byte(0x85 | 0); // mod=10, reg=0(rax), rm=5(rbp) -> 10 000 101 = 0x85
             // actually modrm(0b10, rax=0, rbp=5) = (2<<6)|(0<<3)|5 = 0x85. correct.
@@ -665,7 +770,7 @@ struct CG {
         int32_t stash_size = n * 8;
         int32_t outgoing = std::max(0, n - 4) * 8;
         int32_t total = round16(stash_size + 32 + outgoing);
-        e.byte(0x48); e.byte(0x81); e.byte(0xEC); e.imm32(total); // sub rsp,total
+        e.sub_reg_imm32(Reg::rsp, total);
         e.store_reg_mem(Reg::rsp, 0, Reg::rax); // word 0: the hidden dest pointer (already in rax)
         for (auto& op : ops) {
             int32_t off = op.slot0 * 8;
@@ -682,22 +787,21 @@ struct CG {
                     e.store_reg_mem(Reg::rsp, off, Reg::rax);
                     e.store_reg_mem(Reg::rsp, off + 8, Reg::rdx);
                 } else if (op.ty && op.ty->is_float()) {
-                    e.byte(0xF3); e.byte(0x0F); e.byte(0x11);
-                    e.byte(0x84); e.byte(0x24); e.imm32(off);
+                    if(op.ty->prim==Prim::F64)e.movsd_mem_xmm(Reg::rsp,off,Xmm::xmm0);else e.movss_mem_xmm(Reg::rsp,off,Xmm::xmm0);
                 } else {
                     e.byte(0x48); e.byte(0x89); e.byte(0x84); e.byte(0x24); e.imm32(off);
                 }
             }
         }
-        std::vector<bool> word_is_float(size_t(n), false);
-        for (auto& op : ops) {
-            if (op.words == 1 && !op.is_struct && op.ty && op.ty->is_float()) word_is_float[size_t(op.slot0)] = true;
+        std::vector<bool> word_is_float(size_t(n), false), word_is_f64(size_t(n), false);
+        for (auto& op : ops) if (op.words==1 && !op.is_struct && op.ty && op.ty->is_float()) {
+            word_is_float[size_t(op.slot0)]=true; word_is_f64[size_t(op.slot0)]=op.ty->prim==Prim::F64;
         }
         static const Reg int_regs[4] = {Reg::rcx, Reg::rdx, Reg::r8, Reg::r9};
         static const Xmm flt_regs[4] = {Xmm::xmm0, Xmm::xmm1, Xmm::xmm2, Xmm::xmm3};
         for (int w = 0; w < n && w < 4; ++w) {
             int32_t off = w * 8;
-            if (word_is_float[size_t(w)]) e.movss_xmm_mem(flt_regs[w], Reg::rsp, off);
+            if (word_is_float[size_t(w)]) { if(word_is_f64[size_t(w)])e.movsd_xmm_mem(flt_regs[w],Reg::rsp,off);else e.movss_xmm_mem(flt_regs[w],Reg::rsp,off); }
             else e.load_reg_mem(int_regs[w], Reg::rsp, off);
         }
         for (int w = 4; w < n; ++w) {
@@ -724,7 +828,7 @@ struct CG {
             e.call_mem(Reg::r11, int32_t(c.script_slot) * 8);
             emit_depth_leave();
         }
-        e.byte(0x48); e.byte(0x81); e.byte(0xC4); e.imm32(total); // add rsp,total
+        e.add_reg_imm32(Reg::rsp, total);
         // no result in rax/xmm0 to propagate - the callee wrote the struct
         // directly through the hidden pointer.
     }
@@ -749,19 +853,17 @@ struct CG {
         e.mov_reg_imm64(Reg::rax, 1);           // cpuid leaf 1
         // cpuid: 0F A2
         e.byte(0x0F); e.byte(0xA2);
-        // cmp eax, imm32: F9 81 F8 <key32>  (no REX - 32-bit cmp)
-        // Actually: cmp rax, imm32 sign-extends; use cmp eax, imm32 (no REX, 81 /7 id)
+        // Restore rbx before branching so both successors have the same stack
+        // parity. pop does not alter CPUID's EAX result or flags (the compare
+        // follows it), and a keyed-gate trap must not leave emitter tracking
+        // dependent on the unrelated success edge.
+        e.pop(Reg::rbx);
+        // cmp eax, imm32: use the 32-bit CPUID signature (no REX, 81 /7 id).
         e.byte(0x81); e.byte(0xF8); e.imm32(int32_t(obf.cpuid_key));
-        Label trap = e.alloc_label(), ok = e.alloc_label();
-        e.jcc(Cond::ne, trap);                  // mismatch -> trap
-        e.pop(Reg::rbx);                        // restore rbx, continue
-        e.jmp(ok);
-        e.bind(trap);
+        Label ok = e.alloc_label();
+        e.jcc(Cond::e, ok);
         // v0.4: route through the trap stub (longjmp to checkpoint) instead of
-        // ud2 -> recoverable, not process death (REDSHELL V7). On the trap path
-        // rbx is still pushed, but the stub longjmps (never returns, rsp
-        // restored by longjmp) so the unbalanced push is harmless; with a null
-        // stub the ud2 kills the process regardless.
+        // ud2 -> recoverable, not process death (REDSHELL V7).
         emit_trap(int(TrapReason::IllegalInstruction), "@obf_keyed: CPUID gate mismatch");
         e.bind(ok);
     }
@@ -929,9 +1031,9 @@ void store_rax_to_rbp(CG& cg, int32_t off) {
     cg.e.byte(0x48); cg.e.byte(0x89); cg.e.byte(0x85); cg.e.imm32(off);
 }
 // store xmm0 -> [rbp + disp32]
-void store_xmm0_to_rbp(CG& cg, int32_t off) {
-    // F3 0F 11 /r mod=10 reg=xmm0(0) rm=rbp(5) -> F3 0F 11 85 <disp32>
-    cg.e.byte(0xF3); cg.e.byte(0x0F); cg.e.byte(0x11); cg.e.byte(0x85); cg.e.imm32(off);
+void store_xmm0_to_rbp(CG& cg, int32_t off, const Type* t = nullptr) {
+    if (t && t->prim == Prim::F64) cg.e.movsd_mem_xmm(Reg::rbp, off, Xmm::xmm0);
+    else cg.e.movss_mem_xmm(Reg::rbp, off, Xmm::xmm0);
 }
 // load [rbp + disp32] -> rax
 void load_rbp_to_rax(CG& cg, int32_t off) {
@@ -964,9 +1066,10 @@ void store_rax_to_global(CG& cg, int64_t /*base*/, int32_t off) {
 // AFTER the mandatory F3 prefix. Wrong order (41 F3 0F 11) drops REX -> stores to
 // rbx instead of r11 (the bug that broke float-global writes in the heap case).
 // Correct: F3 41 0F 11 + modrm(10, xmm0=0, r11=3)=0x83 + disp32.
-void store_xmm0_to_global(CG& cg, int64_t /*base*/, int32_t off) {
+void store_xmm0_to_global(CG& cg, int64_t /*base*/, int32_t off, const Type* t = nullptr) {
     cg.e.mov_reg_imm64_external(Reg::r11, AbsFixup::GlobalsBase);
-    cg.e.byte(0xF3); cg.e.byte(0x41); cg.e.byte(0x0F); cg.e.byte(0x11); cg.e.byte(0x83); cg.e.imm32(off);
+    if (t && t->prim == Prim::F64) cg.e.movsd_mem_xmm(Reg::r11, off, Xmm::xmm0);
+    else cg.e.movss_mem_xmm(Reg::r11, off, Xmm::xmm0);
 }
 
 void CG::eval(const Expr& ex) {
@@ -975,14 +1078,15 @@ void CG::eval(const Expr& ex) {
         return;
     }
     if (auto* lit = dynamic_cast<const FloatLit*>(&ex)) {
-        // load the f32 bit pattern into eax, then movd xmm0, eax
-        // movd xmm0, eax = 66 0F 6E C0
-        float fv = (float)lit->v;
-        uint32_t bits;
-        std::memcpy(&bits, &fv, 4);
-        e.mov_reg_imm64(Reg::rax, int64_t(int32_t(bits)));  // mov rax, imm (sign-extended)
-        // movd xmm0, eax: 66 0F 6E C0
-        e.byte(0x66); e.byte(0x0F); e.byte(0x6E); e.byte(0xC0);
+        if (ex.ty && ex.ty->prim == Prim::F64) {
+            uint64_t bits; std::memcpy(&bits, &lit->v, 8);
+            e.mov_reg_imm64(Reg::rax, int64_t(bits));
+            e.byte(0x66); e.byte(0x48); e.byte(0x0F); e.byte(0x6E); e.byte(0xC0); // movq xmm0,rax
+        } else {
+            float fv = float(lit->v); uint32_t bits; std::memcpy(&bits, &fv, 4);
+            e.mov_reg_imm64(Reg::rax, int64_t(int32_t(bits)));
+            e.byte(0x66); e.byte(0x0F); e.byte(0x6E); e.byte(0xC0); // movd xmm0,eax
+        }
         return;
     }
     if (auto* lit = dynamic_cast<const BoolLit*>(&ex)) {
@@ -1012,8 +1116,9 @@ void CG::eval(const Expr& ex) {
                 // register convention CallExpr/LetStmt/AssignExpr all share.
                 e.load_reg_mem(Reg::rax, Reg::rbp, it->second);
                 e.load_reg_mem(Reg::rdx, Reg::rbp, it->second + 8);
-            } else if (t->is_float()) { e.movss_xmm_mem(Xmm::xmm0, Reg::rbp, it->second); }
-            else load_rbp_to_rax(*this, it->second);
+            } else if (t->prim == Prim::F64) { e.movsd_xmm_mem(Xmm::xmm0, Reg::rbp, it->second); }
+            else if (t->is_float()) { e.movss_xmm_mem(Xmm::xmm0, Reg::rbp, it->second); }
+            else { load_rbp_to_rax(*this, it->second); normalize_rax(t); }
             return;
         }
         // global? (v1.0: prefer ctx.globals_index/types threaded through CodeGenCtx —
@@ -1029,10 +1134,11 @@ void CG::eval(const Expr& ex) {
                 auto tit = gtypes->find(id->name);
                 const Type* t = (tit != gtypes->end()) ? tit->second : nullptr;
                 load_global_to_rax(*this, gbase, off);
-                if (t && t->is_float()) {
-                    // movd xmm0, eax: 66 0F 6E C0
-                    e.byte(0x66); e.byte(0x0F); e.byte(0x6E); e.byte(0xC0);
-                }
+                if (t && t->prim == Prim::F64) {
+                    e.byte(0x66); e.byte(0x48); e.byte(0x0F); e.byte(0x6E); e.byte(0xC0); // movq xmm0,rax
+                } else if (t && t->is_float()) {
+                    e.byte(0x66); e.byte(0x0F); e.byte(0x6E); e.byte(0xC0); // movd xmm0,eax
+                } else normalize_rax(t);
                 return;
             }
         }
@@ -1042,8 +1148,8 @@ void CG::eval(const Expr& ex) {
         // operator-overload dispatch: sema stamped this BinExpr as a native call
         // (e.g. vec3 + vec3 -> vec3_add). Emit a call with lhs as arg[0], rhs as arg[1].
         if (b->is_overload && b->overload_fn) {
-            // sub rsp, 48 (2 args*8 + 32 shadow)
-            e.byte(0x48); e.byte(0x81); e.byte(0xEC); e.imm32(48);
+            // Two argument slots plus Win64 shadow space.
+            e.sub_reg_imm32(Reg::rsp, 48);
             // eval lhs -> rax; mov [rsp+0], rax
             eval(*b->lhs);
             e.byte(0x48); e.byte(0x89); e.byte(0x84); e.byte(0x24); e.imm32(0);
@@ -1056,8 +1162,7 @@ void CG::eval(const Expr& ex) {
             // call overload_fn
             e.mov_reg_imm64(Reg::rax, int64_t(b->overload_fn));
             e.call_reg(Reg::rax);
-            // add rsp, 48
-            e.byte(0x48); e.byte(0x81); e.byte(0xC4); e.imm32(48);
+            e.add_reg_imm32(Reg::rsp, 48);
             return;
         }
         const Type* lt = b->lhs->ty;
@@ -1098,31 +1203,8 @@ void CG::eval(const Expr& ex) {
                 if (folded) { e.mov_reg_imm64(Reg::rax, result); return; }
             }
         }
-        if (auto* lf = dynamic_cast<const FloatLit*>(b->lhs.get())) {
-            if (auto* rf = dynamic_cast<const FloatLit*>(b->rhs.get())) {
-                bool folded = true;
-                double result = 0;
-                switch (b->op) {
-                case BinExpr::Op::Add: result = lf->v + rf->v; break;
-                case BinExpr::Op::Sub: result = lf->v - rf->v; break;
-                case BinExpr::Op::Mul: result = lf->v * rf->v; break;
-                // float div-by-zero is well-defined (IEEE754 inf/nan, no
-                // trap) - safe to fold, unlike the integer case above.
-                case BinExpr::Op::Div: result = lf->v / rf->v; break;
-                default: folded = false; break;
-                }
-                if (folded) {
-                    // mirrors the FloatLit codegen above exactly (always
-                    // narrows to f32) so folded and unfolded results agree
-                    // even for a nominally-f64 expression.
-                    float fv = float(result);
-                    uint32_t bits; std::memcpy(&bits, &fv, 4);
-                    e.mov_reg_imm64(Reg::rax, int64_t(int32_t(bits)));
-                    e.byte(0x66); e.byte(0x0F); e.byte(0x6E); e.byte(0xC0); // movd xmm0, eax
-                    return;
-                }
-            }
-        }
+        // Float expressions deliberately use the normal typed SSE path below;
+        // avoiding a second constant implementation keeps f32/f64 width exact.
         bool is_logical = (b->op==BinExpr::Op::LAnd||b->op==BinExpr::Op::LOr);
         bool is_cmp = (b->op>=BinExpr::Op::Eq && b->op<=BinExpr::Op::Ge);
         bool is_float = lt && lt->is_float();
@@ -1147,26 +1229,21 @@ void CG::eval(const Expr& ex) {
         }
 
         if (is_float) {
-            // float path (clean): eval lhs -> xmm0, stash to stack; eval rhs -> xmm0; lhs in xmm1
-            eval(*b->lhs);
-            // sub rsp, 8; movss [rsp], xmm0
-            e.byte(0x48); e.byte(0x83); e.byte(0xEC); e.byte(0x08);
-            e.byte(0xF3); e.byte(0x0F); e.byte(0x11); e.byte(0x04); e.byte(0x24);
+            bool f64 = lt->prim == Prim::F64;
+            eval(*b->lhs); e.sub_reg_imm32(Reg::rsp, 8);
+            if (f64) e.movsd_mem_xmm(Reg::rsp, 0, Xmm::xmm0); else e.movss_mem_xmm(Reg::rsp, 0, Xmm::xmm0);
             eval(*b->rhs);
-            // xmm0 = rhs; load lhs into xmm1: movss xmm1, [rsp]; add rsp, 8
-            e.byte(0xF3); e.byte(0x0F); e.byte(0x10); e.byte(0x0C); e.byte(0x24);
-            e.byte(0x48); e.byte(0x83); e.byte(0xC4); e.byte(0x08);
+            if (f64) e.movsd_xmm_mem(Xmm::xmm1, Reg::rsp, 0); else e.movss_xmm_mem(Xmm::xmm1, Reg::rsp, 0);
+            e.add_reg_imm32(Reg::rsp, 8);
             switch (b->op) {
-            case BinExpr::Op::Add: e.addss_xmm(Xmm::xmm0, Xmm::xmm1); break;
-            case BinExpr::Op::Mul: e.mulss_xmm(Xmm::xmm0, Xmm::xmm1); break;
-            case BinExpr::Op::Sub: e.subss_xmm(Xmm::xmm1, Xmm::xmm0);
-                e.movss_xmm_xmm(Xmm::xmm0, Xmm::xmm1); break;
-            case BinExpr::Op::Div: e.divss_xmm(Xmm::xmm1, Xmm::xmm0);
-                e.movss_xmm_xmm(Xmm::xmm0, Xmm::xmm1); break;
+            case BinExpr::Op::Add: if(f64)e.addsd_xmm(Xmm::xmm0,Xmm::xmm1);else e.addss_xmm(Xmm::xmm0,Xmm::xmm1); break;
+            case BinExpr::Op::Mul: if(f64)e.mulsd_xmm(Xmm::xmm0,Xmm::xmm1);else e.mulss_xmm(Xmm::xmm0,Xmm::xmm1); break;
+            case BinExpr::Op::Sub: if(f64){e.subsd_xmm(Xmm::xmm1,Xmm::xmm0);e.movsd_xmm_xmm(Xmm::xmm0,Xmm::xmm1);}else{e.subss_xmm(Xmm::xmm1,Xmm::xmm0);e.movss_xmm_xmm(Xmm::xmm0,Xmm::xmm1);} break;
+            case BinExpr::Op::Div: if(f64){e.divsd_xmm(Xmm::xmm1,Xmm::xmm0);e.movsd_xmm_xmm(Xmm::xmm0,Xmm::xmm1);}else{e.divss_xmm(Xmm::xmm1,Xmm::xmm0);e.movss_xmm_xmm(Xmm::xmm0,Xmm::xmm1);} break;
             case BinExpr::Op::Eq: case BinExpr::Op::Neq:
             case BinExpr::Op::Lt: case BinExpr::Op::Le:
             case BinExpr::Op::Gt: case BinExpr::Op::Ge: {
-                e.ucomiss_xmm(Xmm::xmm1, Xmm::xmm0);
+                if (f64) e.ucomisd_xmm(Xmm::xmm1, Xmm::xmm0); else e.ucomiss_xmm(Xmm::xmm1, Xmm::xmm0);
                 uint8_t cc = 0;
                 switch (b->op) {
                 case BinExpr::Op::Eq: cc = 0x4; break;
@@ -1212,19 +1289,10 @@ void CG::eval(const Expr& ex) {
                 }
                 break;
             case BinExpr::Op::Mul: e.imul_reg_reg(Reg::rax, Reg::rcx); break;
-            case BinExpr::Op::Div:
-                // rax / rcx: cqo; idiv rcx
-                e.byte(0x48); e.byte(0x99); // cqo
-                // idiv rcx: REX.W F7 /7 (mod=11, reg=7, rm=rcx=1) -> 48 F7 F9
-                e.byte(0x48); e.byte(0xF7); e.byte(0xF9);
-                break;
-            case BinExpr::Op::Mod:
-                e.byte(0x48); e.byte(0x99); // cqo
-                e.byte(0x48); e.byte(0xF7); e.byte(0xF9); // idiv rcx -> rdx=remainder
-                e.mov_reg_reg(Reg::rax, Reg::rdx);
-                break;
+            case BinExpr::Op::Div: emit_integer_divmod(false, lt && lt->is_uint()); break;
+            case BinExpr::Op::Mod: emit_integer_divmod(true, lt && lt->is_uint()); break;
             case BinExpr::Op::Shl: e.byte(0x48); e.byte(0xD3); e.byte(0xE0); break; // shl rax,cl
-            case BinExpr::Op::Shr: e.byte(0x48); e.byte(0xD3); e.byte(0xF8); break; // sar rax,cl
+            case BinExpr::Op::Shr: e.byte(0x48); e.byte(0xD3); e.byte((lt&&lt->is_uint())?0xE8:0xF8); break;
             case BinExpr::Op::Eq: case BinExpr::Op::Neq:
             case BinExpr::Op::Lt: case BinExpr::Op::Le:
             case BinExpr::Op::Gt: case BinExpr::Op::Ge: {
@@ -1233,10 +1301,10 @@ void CG::eval(const Expr& ex) {
                 switch (b->op) {
                 case BinExpr::Op::Eq: cc = 0x4; break;  // sete
                 case BinExpr::Op::Neq: cc = 0x5; break; // setne
-                case BinExpr::Op::Lt: cc = 0xC; break;  // setl
-                case BinExpr::Op::Le: cc = 0xE; break;  // setle
-                case BinExpr::Op::Gt: cc = 0xF; break;  // setg
-                case BinExpr::Op::Ge: cc = 0xD; break;  // setge
+                case BinExpr::Op::Lt: cc = (lt&&lt->is_uint()) ? 0x2 : 0xC; break;
+                case BinExpr::Op::Le: cc = (lt&&lt->is_uint()) ? 0x6 : 0xE; break;
+                case BinExpr::Op::Gt: cc = (lt&&lt->is_uint()) ? 0x7 : 0xF; break;
+                case BinExpr::Op::Ge: cc = (lt&&lt->is_uint()) ? 0x3 : 0xD; break;
                 default: break;
                 }
                 // setcc al: 0F 9x /0 (mod=11, reg=0, rm=al=0) -> 0F 9x C0
@@ -1247,17 +1315,18 @@ void CG::eval(const Expr& ex) {
             }
             default: break;
             }
+            if (!is_cmp) normalize_rax(lt);
             return;
         }
         // float path (clean):
         eval(*b->lhs);
-        // sub rsp, 8; movss [rsp], xmm0
-        e.byte(0x48); e.byte(0x83); e.byte(0xEC); e.byte(0x08);
-        e.byte(0xF3); e.byte(0x0F); e.byte(0x11); e.byte(0x04); e.byte(0x24);
+        // Preserve the temporary through any trapping RHS evaluation while
+        // keeping the emitter's stack parity exact.
+        e.sub_reg_imm32(Reg::rsp, 8);
+        e.movss_mem_xmm(Reg::rsp, 0, Xmm::xmm0);
         eval(*b->rhs);
-        // xmm0 = rhs; load lhs into xmm1: movss xmm1, [rsp]; add rsp, 8
-        e.byte(0xF3); e.byte(0x0F); e.byte(0x10); e.byte(0x0C); e.byte(0x24);
-        e.byte(0x48); e.byte(0x83); e.byte(0xC4); e.byte(0x08);
+        e.movss_xmm_mem(Xmm::xmm1, Reg::rsp, 0);
+        e.add_reg_imm32(Reg::rsp, 8);
         switch (b->op) {
         case BinExpr::Op::Add: e.addss_xmm(Xmm::xmm0, Xmm::xmm1); break; // xmm0 = rhs+lhs
         case BinExpr::Op::Mul: e.mulss_xmm(Xmm::xmm0, Xmm::xmm1); break;
@@ -1306,11 +1375,15 @@ void CG::eval(const Expr& ex) {
             e.byte(0x48); e.byte(0x0F); e.byte(0xB6); e.byte(0xC0); // movzx rax,al
         } else if (u->op == UnaryExpr::Op::Neg) {
             if (u->operand->ty && u->operand->ty->is_float()) {
-                // negate f32 in xmm0: flip sign bit via xorps with 0x80000000
-                // mov eax, 0x80000000 ; movd xmm1, eax ; xorps xmm0, xmm1
-                e.byte(0xB8); e.imm32(int32_t(0x80000000));
-                e.byte(0x66); e.byte(0x0F); e.byte(0x6E); e.byte(0xC8);  // movd xmm1, eax
-                e.byte(0x0F); e.byte(0x57); e.byte(0xC1);                // xorps xmm0, xmm1
+                if (u->operand->ty->prim == Prim::F64) {
+                    e.mov_reg_imm64(Reg::rax, INT64_MIN);
+                    e.byte(0x66); e.byte(0x48); e.byte(0x0F); e.byte(0x6E); e.byte(0xC8); // movq xmm1,rax
+                    e.byte(0x66); e.byte(0x0F); e.byte(0x57); e.byte(0xC1); // xorpd
+                } else {
+                    e.byte(0xB8); e.imm32(int32_t(0x80000000));
+                    e.byte(0x66); e.byte(0x0F); e.byte(0x6E); e.byte(0xC8);
+                    e.byte(0x0F); e.byte(0x57); e.byte(0xC1);
+                }
             } else {
                 // neg rax: REX.W F7 /3 -> 48 F7 D8
                 e.byte(0x48); e.byte(0xF7); e.byte(0xD8);
@@ -1323,17 +1396,41 @@ void CG::eval(const Expr& ex) {
     }
     if (auto* c = dynamic_cast<const CastExpr*>(&ex)) {
         eval(*c->operand);
-        // int<->int: no-op (same width in rax). f32<->f32: no-op.
-        // int->float: cvtsi2ss. float->int: cvttss2si.
         const Type* from = c->operand->ty;
         const Type* to = c->to.get();
-        if (from->is_int() && to->is_float()) {
-            // cvtsi2ss xmm0, rax: F3 REX.W 0F 2A C0
-            e.byte(0xF3); e.byte(0x48); e.byte(0x0F); e.byte(0x2A); e.byte(0xC0);
-        } else if (from->is_float() && to->is_int()) {
-            // cvttss2si rax, xmm0: F3 REX.W 0F 2C C0
-            e.byte(0xF3); e.byte(0x48); e.byte(0x0F); e.byte(0x2C); e.byte(0xC0);
+        const bool plain_from_int = from && from->is_int() && !from->is_fn_handle && from->struct_name.empty();
+        const bool plain_to_int = to && to->is_int() && !to->is_fn_handle && to->struct_name.empty();
+        const bool by_value_aggregate = from && (from->array_len > 0 ||
+            (!from->struct_name.empty() && ctx.structs && ctx.structs->count(from->struct_name) != 0));
+
+        if (from && to && from->same(*to) && !by_value_aggregate) {
+            return; // same-type scalar, slice, or nominal handle
         }
+        if (plain_from_int && plain_to_int) {
+            normalize_rax(to); return;
+        }
+        if (from && to && from->is_float() && to->is_float()) {
+            if (from->prim == Prim::F32 && to->prim == Prim::F64)
+                { e.byte(0xF3); e.byte(0x0F); e.byte(0x5A); e.byte(0xC0); } // cvtss2sd
+            else if (from->prim == Prim::F64 && to->prim == Prim::F32)
+                { e.byte(0xF2); e.byte(0x0F); e.byte(0x5A); e.byte(0xC0); } // cvtsd2ss
+            return;
+        }
+        if (plain_from_int && !from->is_uint() && to && to->is_float()) {
+            normalize_rax(from);
+            e.byte(to->prim == Prim::F64 ? 0xF2 : 0xF3); e.byte(0x48); e.byte(0x0F); e.byte(0x2A); e.byte(0xC0);
+            return;
+        }
+        if (from && from->is_float() && plain_to_int && !to->is_uint()) {
+            e.byte(from->prim == Prim::F64 ? 0xF2 : 0xF3); e.byte(0x48); e.byte(0x0F); e.byte(0x2C); e.byte(0xC0);
+            normalize_rax(to); return;
+        }
+
+        // Sema's explicit cast matrix makes this unreachable.  Keep a hard
+        // generated-code failure rather than ever treating unknown casts as
+        // representation-preserving bitcasts.
+        assert(false && "invalid cast reached codegen");
+        emit_trap(int(TrapReason::IllegalInstruction), "internal: invalid cast reached codegen");
         return;
     }
     if (auto* t = dynamic_cast<const TernaryExpr*>(&ex)) {
@@ -1353,23 +1450,18 @@ void CG::eval(const Expr& ex) {
         if (a->compound) {
             const Type* tt = a->target->ty;
             if (tt && tt->is_float()) {
-                // float compound-assign: target op= value, via SSE (mirrors the
-                // BinExpr float path). xmm0=target(lhs) stashed to [rsp],
-                // then xmm0=value(rhs), xmm1=restored lhs.
-                eval(*a->target);                                             // xmm0 = lhs
-                e.byte(0x48); e.byte(0x83); e.byte(0xEC); e.byte(0x08);        // sub rsp,8
-                e.byte(0xF3); e.byte(0x0F); e.byte(0x11); e.byte(0x04); e.byte(0x24); // movss [rsp], xmm0
-                eval(*a->value);                                              // xmm0 = rhs
-                e.byte(0xF3); e.byte(0x0F); e.byte(0x10); e.byte(0x0C); e.byte(0x24); // movss xmm1, [rsp]
-                e.byte(0x48); e.byte(0x83); e.byte(0xC4); e.byte(0x08);        // add rsp,8
+                bool f64 = tt->prim == Prim::F64;
+                eval(*a->target); e.sub_reg_imm32(Reg::rsp, 8);
+                if(f64)e.movsd_mem_xmm(Reg::rsp,0,Xmm::xmm0);else e.movss_mem_xmm(Reg::rsp,0,Xmm::xmm0);
+                eval(*a->value);
+                if(f64)e.movsd_xmm_mem(Xmm::xmm1,Reg::rsp,0);else e.movss_xmm_mem(Xmm::xmm1,Reg::rsp,0);
+                e.add_reg_imm32(Reg::rsp,8);
                 switch (*a->compound) {
-                case BinExpr::Op::Add: e.addss_xmm(Xmm::xmm0, Xmm::xmm1); break;
-                case BinExpr::Op::Mul: e.mulss_xmm(Xmm::xmm0, Xmm::xmm1); break;
-                case BinExpr::Op::Sub: e.subss_xmm(Xmm::xmm1, Xmm::xmm0);
-                    e.movss_xmm_xmm(Xmm::xmm0, Xmm::xmm1); break;
-                case BinExpr::Op::Div: e.divss_xmm(Xmm::xmm1, Xmm::xmm0);
-                    e.movss_xmm_xmm(Xmm::xmm0, Xmm::xmm1); break;
-                default: break; // Mod/Shl/Shr/And/Or/Xor: sema rejects these for float targets
+                case BinExpr::Op::Add: if(f64)e.addsd_xmm(Xmm::xmm0,Xmm::xmm1);else e.addss_xmm(Xmm::xmm0,Xmm::xmm1); break;
+                case BinExpr::Op::Mul: if(f64)e.mulsd_xmm(Xmm::xmm0,Xmm::xmm1);else e.mulss_xmm(Xmm::xmm0,Xmm::xmm1); break;
+                case BinExpr::Op::Sub: if(f64){e.subsd_xmm(Xmm::xmm1,Xmm::xmm0);e.movsd_xmm_xmm(Xmm::xmm0,Xmm::xmm1);}else{e.subss_xmm(Xmm::xmm1,Xmm::xmm0);e.movss_xmm_xmm(Xmm::xmm0,Xmm::xmm1);} break;
+                case BinExpr::Op::Div: if(f64){e.divsd_xmm(Xmm::xmm1,Xmm::xmm0);e.movsd_xmm_xmm(Xmm::xmm0,Xmm::xmm1);}else{e.divss_xmm(Xmm::xmm1,Xmm::xmm0);e.movss_xmm_xmm(Xmm::xmm0,Xmm::xmm1);} break;
+                default: break;
                 }
             } else {
                 // load target, op with value, store back (integer path)
@@ -1398,22 +1490,26 @@ void CG::eval(const Expr& ex) {
                     }
                     break;
                 case BinExpr::Op::Mul: e.imul_reg_reg(Reg::rax, Reg::rcx); break;
-                case BinExpr::Op::Div:
-                    e.byte(0x48); e.byte(0x99);              // cqo
-                    e.byte(0x48); e.byte(0xF7); e.byte(0xF9); // idiv rcx -> rax=quotient
-                    break;
-                case BinExpr::Op::Mod:
-                    e.byte(0x48); e.byte(0x99);              // cqo
-                    e.byte(0x48); e.byte(0xF7); e.byte(0xF9); // idiv rcx -> rdx=remainder
-                    e.mov_reg_reg(Reg::rax, Reg::rdx);
-                    break;
-                case BinExpr::Op::Shl: e.byte(0x48); e.byte(0xD3); e.byte(0xE0); break; // shl rax,cl
-                case BinExpr::Op::Shr: e.byte(0x48); e.byte(0xD3); e.byte(0xF8); break; // sar rax,cl
+                case BinExpr::Op::Div: emit_integer_divmod(false, tt && tt->is_uint()); break;
+                case BinExpr::Op::Mod: emit_integer_divmod(true, tt && tt->is_uint()); break;
+                case BinExpr::Op::Shl: e.byte(0x48); e.byte(0xD3); e.byte(0xE0); break;
+                case BinExpr::Op::Shr: e.byte(0x48); e.byte(0xD3); e.byte((tt&&tt->is_uint())?0xE8:0xF8); break;
                 default: break;
                 }
+                normalize_rax(tt);
             }
         } else {
             eval(*a->value);
+        }
+        // Postfix forms return the pre-update value.  The parser's minimal
+        // flag is only produced for ++/--, whose target is evaluated once.
+        if (a->postfix) {
+            if (a->target->ty && a->target->ty->is_float()) {
+                bool f64=a->target->ty->prim==Prim::F64;
+                if(f64)e.movsd_xmm_xmm(Xmm::xmm2,Xmm::xmm0);else e.movss_xmm_xmm(Xmm::xmm2,Xmm::xmm0);
+            } else {
+                e.push(Reg::rax); // updated value survives address/store lowering
+            }
         }
         // store rax (or xmm0, or rax/rdx for a slice) to target
         if (auto* id = dynamic_cast<Ident*>(a->target.get())) {
@@ -1423,7 +1519,7 @@ void CG::eval(const Expr& ex) {
                 if (t->is_slice) {
                     e.store_reg_mem(Reg::rbp, it->second, Reg::rax);
                     e.store_reg_mem(Reg::rbp, it->second + 8, Reg::rdx);
-                } else if (t->is_float()) store_xmm0_to_rbp(*this, it->second);
+                } else if (t->is_float()) store_xmm0_to_rbp(*this, it->second, t);
                 else {
                     // Item E ("hot local pinning") write-through: keep the
                     // pinned register in sync too, IN ADDITION to the
@@ -1436,6 +1532,7 @@ void CG::eval(const Expr& ex) {
                     // set for eligible scalars (find_pin_candidate's
                     // filter), so this can't fire for the is_slice/is_float
                     // branches above.
+                    normalize_rax(t);
                     if (active_pin && active_pin->name == id->name)
                         e.mov_reg_reg(active_pin->reg, Reg::rax);
                     store_rax_to_rbp(*this, it->second);
@@ -1449,8 +1546,8 @@ void CG::eval(const Expr& ex) {
                     if (gi != gidx->end()) {
                         auto tit = gtypes->find(id->name);
                         const Type* gt = (tit != gtypes->end()) ? tit->second : nullptr;
-                        if (gt && gt->is_float()) store_xmm0_to_global(*this, ctx.globals_base, int32_t(gi->second)*8);
-                        else store_rax_to_global(*this, ctx.globals_base, int32_t(gi->second)*8);
+                        if (gt && gt->is_float()) store_xmm0_to_global(*this, ctx.globals_base, int32_t(gi->second)*8, gt);
+                        else { normalize_rax(gt); store_rax_to_global(*this, ctx.globals_base, int32_t(gi->second)*8); }
                     }
                 }
             }
@@ -1460,11 +1557,17 @@ void CG::eval(const Expr& ex) {
             // IndexExpr *load* path in eval() (element addressing).
             const Type* bt = ixt->base->ty;
             const Type* elem = bt && bt->elem ? bt->elem.get() : nullptr;
-            int32_t width = elem_bytes(elem);
+            int32_t width = value_bytes(elem, ctx.structs);
             bool is_f32 = elem && elem->prim == Prim::F32 && !elem->is_slice;
-            if (is_f32) { e.byte(0x48); e.byte(0x83); e.byte(0xEC); e.byte(0x08); // sub rsp,8
-                e.byte(0xF3); e.byte(0x0F); e.byte(0x11); e.byte(0x04); e.byte(0x24); } // movss [rsp],xmm0
-            else e.push(Reg::rax);
+            bool is_f64 = elem && elem->prim == Prim::F64 && !elem->is_slice;
+            if (is_f32 || is_f64) {
+                // This temporary remains live across the bounds trap, so use
+                // the tracked rsp helper: emit_trap must see the taken edge's
+                // real parity and provide the required eight-byte call padding.
+                e.sub_reg_imm32(Reg::rsp, 8);
+                if (is_f64) e.movsd_mem_xmm(Reg::rsp, 0, Xmm::xmm0);
+                else e.movss_mem_xmm(Reg::rsp, 0, Xmm::xmm0);
+            } else e.push(Reg::rax);
             if (auto* bid = dynamic_cast<const Ident*>(ixt->base.get())) {
                 auto bit = locals.find(bid->name);
                 if (bit != locals.end()) {
@@ -1507,10 +1610,12 @@ void CG::eval(const Expr& ex) {
                         }
                         e.mov_reg_reg(Reg::r11, base_reg);
                         e.add_reg_reg(Reg::r11, Reg::rax);     // r11 = element address
-                        if (is_f32) {
-                            e.byte(0xF3); e.byte(0x0F); e.byte(0x10); e.byte(0x0C); e.byte(0x24); // movss xmm1,[rsp]
-                            e.byte(0x48); e.byte(0x83); e.byte(0xC4); e.byte(0x08); // add rsp,8
-                            e.movss_mem_xmm(Reg::r11, base_off, Xmm::xmm1);
+                        if (is_f32 || is_f64) {
+                            if (is_f64) e.movsd_xmm_mem(Xmm::xmm1, Reg::rsp, 0);
+                            else e.movss_xmm_mem(Xmm::xmm1, Reg::rsp, 0);
+                            e.add_reg_imm32(Reg::rsp, 8);
+                            if (is_f64) e.movsd_mem_xmm(Reg::r11, base_off, Xmm::xmm1);
+                            else e.movss_mem_xmm(Reg::r11, base_off, Xmm::xmm1);
                         } else {
                             e.pop(Reg::rax);
                             e.store_rax_elem(Reg::r11, base_off, width);
@@ -1520,7 +1625,7 @@ void CG::eval(const Expr& ex) {
                 }
             }
             // base wasn't a recognized local: drop the stashed value cleanly
-            if (is_f32) { e.byte(0x48); e.byte(0x83); e.byte(0xC4); e.byte(0x08); }
+            if (is_f32 || is_f64) e.add_reg_imm32(Reg::rsp, 8);
             else e.pop(Reg::rax);
         } else if (auto* flt = dynamic_cast<FieldExpr*>(a->target.get())) {
             // p.x = value: value already eval'd into rax/xmm0 above. The
@@ -1536,11 +1641,35 @@ void CG::eval(const Expr& ex) {
                         if (fit != sit->second.fields.end()) {
                             int32_t addr_off = bit->second + fit->second.offset;
                             const Type* ft = fit->second.ty;
-                            if (ft->prim == Prim::F32 && !ft->is_slice) e.movss_mem_xmm(Reg::rbp, addr_off, Xmm::xmm0);
-                            else e.store_rax_elem(Reg::rbp, addr_off, elem_bytes(ft));
+                            if (ft->prim == Prim::F64 && !ft->is_slice) e.movsd_mem_xmm(Reg::rbp, addr_off, Xmm::xmm0);
+                            else if (ft->prim == Prim::F32 && !ft->is_slice) e.movss_mem_xmm(Reg::rbp, addr_off, Xmm::xmm0);
+                            else if (ft->is_slice) {
+                                e.store_reg_mem(Reg::rbp, addr_off, Reg::rax);
+                                e.store_reg_mem(Reg::rbp, addr_off + 8, Reg::rdx);
+                            } else if (ft->struct_name.empty() || !ctx.structs || !ctx.structs->count(ft->struct_name)) {
+                                e.store_rax_elem(Reg::rbp, addr_off, value_bytes(ft, ctx.structs));
+                            }
                         }
                     }
                 }
+            }
+        }
+        if (a->postfix) {
+            // The updated value is now committed; derive the old result from
+            // the new value without evaluating target/value again.
+            const Type* t=a->target->ty;
+            if (t && t->is_float()) {
+                bool f64=t->prim==Prim::F64;
+                if(f64)e.movsd_xmm_xmm(Xmm::xmm0,Xmm::xmm2);else e.movss_xmm_xmm(Xmm::xmm0,Xmm::xmm2);
+                double one=1.0; uint64_t db; float onef=1.0f; uint32_t fb;
+                if(f64){std::memcpy(&db,&one,8);e.mov_reg_imm64(Reg::rax,int64_t(db));e.byte(0x66);e.byte(0x48);e.byte(0x0F);e.byte(0x6E);e.byte(0xC8);}
+                else{std::memcpy(&fb,&onef,4);e.mov_reg_imm64(Reg::rax,int64_t(fb));e.byte(0x66);e.byte(0x0F);e.byte(0x6E);e.byte(0xC8);}
+                if(*a->compound==BinExpr::Op::Add){if(f64)e.subsd_xmm(Xmm::xmm0,Xmm::xmm1);else e.subss_xmm(Xmm::xmm0,Xmm::xmm1);}
+                else {if(f64)e.addsd_xmm(Xmm::xmm0,Xmm::xmm1);else e.addss_xmm(Xmm::xmm0,Xmm::xmm1);}
+            } else {
+                e.pop(Reg::rax);
+                if(*a->compound==BinExpr::Op::Add)e.sub_reg_imm32(Reg::rax,1);else e.add_reg_imm32(Reg::rax,1);
+                normalize_rax(t);
             }
         }
         return;
@@ -1601,8 +1730,7 @@ void CG::eval(const Expr& ex) {
             eval(*c->indirect_target);   // rax = handle (a &fn literal, a fn-typed var, or a native return)
             emit_call_target_guard();    // validates rax against the allowlist; traps if bad; rax survives
         }
-        // sub rsp, total
-        e.byte(0x48); e.byte(0x81); e.byte(0xEC); e.imm32(total);
+        e.sub_reg_imm32(Reg::rsp, total);
         // ---- indirect call: stash the handle at [rsp+stash_size] BEFORE the arg
         // eval loop (args don't touch that offset — it's past all arg slots) ----
         if (c->is_indirect) {
@@ -1631,17 +1759,16 @@ void CG::eval(const Expr& ex) {
                     e.store_reg_mem(Reg::rsp, off, Reg::rax);
                     e.store_reg_mem(Reg::rsp, off + 8, Reg::rdx);
                 } else if (op.ty && op.ty->is_float()) {
-                    e.byte(0xF3); e.byte(0x0F); e.byte(0x11);
-                    e.byte(0x84); e.byte(0x24); e.imm32(off);
+                    if(op.ty->prim==Prim::F64)e.movsd_mem_xmm(Reg::rsp,off,Xmm::xmm0);else e.movss_mem_xmm(Reg::rsp,off,Xmm::xmm0);
                 } else {
                     e.byte(0x48); e.byte(0x89); e.byte(0x84); e.byte(0x24); e.imm32(off);
                 }
             }
         }
-        // per-word float flag (a slice's/struct's words are always integer)
-        std::vector<bool> word_is_float(size_t(n), false);
-        for (auto& op : ops) {
-            if (op.words == 1 && !op.is_struct && op.ty && op.ty->is_float()) word_is_float[size_t(op.slot0)] = true;
+        // per-word float width (a slice's/struct's words are always integer)
+        std::vector<bool> word_is_float(size_t(n), false), word_is_f64(size_t(n), false);
+        for (auto& op : ops) if (op.words==1 && !op.is_struct && op.ty && op.ty->is_float()) {
+            word_is_float[size_t(op.slot0)]=true; word_is_f64[size_t(op.slot0)]=op.ty->prim==Prim::F64;
         }
         // place words 0..3 into regs
         static const Reg int_regs[4] = {Reg::rcx, Reg::rdx, Reg::r8, Reg::r9};
@@ -1649,7 +1776,7 @@ void CG::eval(const Expr& ex) {
         for (int w = 0; w < n && w < 4; ++w) {
             int32_t off = w * 8;
             if (word_is_float[size_t(w)]) {
-                e.movss_xmm_mem(flt_regs[w], Reg::rsp, off);
+                if(word_is_f64[size_t(w)])e.movsd_xmm_mem(flt_regs[w],Reg::rsp,off);else e.movss_xmm_mem(flt_regs[w], Reg::rsp, off);
             } else {
                 e.load_reg_mem(int_regs[w], Reg::rsp, off);
             }
@@ -1695,9 +1822,9 @@ void CG::eval(const Expr& ex) {
             e.call_mem(Reg::r11, int32_t(c->script_slot) * 8);
             emit_depth_leave();
         }
-        // add rsp, total
-        e.byte(0x48); e.byte(0x81); e.byte(0xC4); e.imm32(total);
-        // result in rax (int) or xmm0 (float) - already there per convention
+        e.add_reg_imm32(Reg::rsp, total);
+        // Normalize narrow integer returns at every call boundary.
+        if (ex.ty && ex.ty->is_int()) normalize_rax(ex.ty);
         return;
     }
     if (auto* lit = dynamic_cast<const StringLit*>(&ex)) {
@@ -1712,7 +1839,7 @@ void CG::eval(const Expr& ex) {
             // call __str_decrypt(enc_ptr, len, key) -> rax = decrypted_ptr
             // Win64: rcx=enc_ptr, rdx=len, r8=key; shadow space reserved.
             int32_t call_sz = 32; // shadow space for 3-arg call
-            e.byte(0x48); e.byte(0x81); e.byte(0xEC); e.imm32(call_sz);
+            e.sub_reg_imm32(Reg::rsp, call_sz);
             // mov rcx, enc_ptr
             e.mov_reg_imm64(Reg::rcx, int64_t(lit->baked_ptr));
             // mov rdx, len
@@ -1723,7 +1850,7 @@ void CG::eval(const Expr& ex) {
             e.mov_reg_imm64(Reg::rax, int64_t(ctx.str_decrypt_fn));
             e.call_reg(Reg::rax);
             // add rsp, shadow
-            e.byte(0x48); e.byte(0x81); e.byte(0xC4); e.imm32(call_sz);
+            e.add_reg_imm32(Reg::rsp, call_sz);
             // rax = decrypted ptr (from native), rdx = len (preserved by callee? no -
             // Win64 callee clobbers rdx. Re-set rdx = len after the call.)
             e.mov_reg_imm64(Reg::rdx, lit->baked_len);
@@ -1749,10 +1876,10 @@ void CG::eval(const Expr& ex) {
             // this runs after, not a rare corner case).
             e.mov_reg_reg(Reg::rcx, Reg::rax);
             int32_t call_sz = 32; // shadow space for a 2-arg call
-            e.byte(0x48); e.byte(0x81); e.byte(0xEC); e.imm32(call_sz);
+            e.sub_reg_imm32(Reg::rsp, call_sz);
             e.mov_reg_imm64(Reg::rax, int64_t(lit->to_string_native_fn));
             e.call_reg(Reg::rax);
-            e.byte(0x48); e.byte(0x81); e.byte(0xC4); e.imm32(call_sz);
+            e.add_reg_imm32(Reg::rsp, call_sz);
             // rax = string handle (i64) - already the correct convention
         }
         return;
@@ -1764,7 +1891,7 @@ void CG::eval(const Expr& ex) {
         // FieldExpr/nested-index bases are a follow-on extension).
         const Type* bt = ix->base->ty;
         const Type* elem = bt && bt->elem ? bt->elem.get() : nullptr;
-        int32_t width = elem_bytes(elem);
+        int32_t width = value_bytes(elem, ctx.structs);
         Reg base_reg = Reg::rbp;
         int32_t base_off = 0;
         bool base_ready = false;
@@ -1810,9 +1937,11 @@ void CG::eval(const Expr& ex) {
             e.mov_reg_reg(Reg::r11, base_reg);
             e.add_reg_reg(Reg::r11, Reg::rax);        // r11 = element address
             bool is_f32 = elem && elem->prim == Prim::F32 && !elem->is_slice;
+            bool is_f64 = elem && elem->prim == Prim::F64 && !elem->is_slice;
             bool is_signed = elem && (elem->prim==Prim::I8||elem->prim==Prim::I16||
                                        elem->prim==Prim::I32||elem->prim==Prim::I64);
-            if (is_f32) e.movss_xmm_mem(Xmm::xmm0, Reg::r11, base_off);
+            if (is_f64) e.movsd_xmm_mem(Xmm::xmm0, Reg::r11, base_off);
+            else if (is_f32) e.movss_xmm_mem(Xmm::xmm0, Reg::r11, base_off);
             else e.load_elem_to_rax(Reg::r11, base_off, width, is_signed);
         }
         return;
@@ -1846,12 +1975,14 @@ void CG::eval(const Expr& ex) {
                     if (fit != sit->second.fields.end()) {
                         int32_t addr_off = it->second + fit->second.offset;
                         const Type* ft = fit->second.ty;
-                        if (ft->prim == Prim::F32 && !ft->is_slice) {
+                        if (ft->prim == Prim::F64 && !ft->is_slice) {
+                            e.movsd_xmm_mem(Xmm::xmm0, Reg::rbp, addr_off);
+                        } else if (ft->prim == Prim::F32 && !ft->is_slice) {
                             e.movss_xmm_mem(Xmm::xmm0, Reg::rbp, addr_off);
                         } else {
                             bool is_signed = ft->prim==Prim::I8||ft->prim==Prim::I16||
                                              ft->prim==Prim::I32||ft->prim==Prim::I64;
-                            e.load_elem_to_rax(Reg::rbp, addr_off, elem_bytes(ft), is_signed);
+                            e.load_elem_to_rax(Reg::rbp, addr_off, value_bytes(ft, ctx.structs), is_signed);
                         }
                     }
                 }
@@ -1859,9 +1990,9 @@ void CG::eval(const Expr& ex) {
         }
         return;
     }
-    // StructLit: only handled at its LetStmt init site (exec_stmt) - a
-    // struct literal is a multi-word aggregate, it doesn't fit eval()'s
-    // single-register-result convention. SizeofExpr: not yet supported.
+    if (auto* s = dynamic_cast<const SizeofExpr*>(&ex)) { e.mov_reg_imm64(Reg::rax, int64_t(s->resolved)); return; }
+    if (auto* o = dynamic_cast<const OffsetofExpr*>(&ex)) { e.mov_reg_imm64(Reg::rax, int64_t(o->resolved)); return; }
+    // StructLit is handled at its LetStmt init site; it is multi-word.
 }
 
 void CG::exec_block(const Block& b) {
@@ -1906,11 +2037,8 @@ void CG::exec_stmt(const Stmt& s) {
                 for (auto& kv : slit->fields) {
                     auto fit = layout->fields.find(kv.first);
                     if (fit == layout->fields.end()) continue;
-                    eval(*kv.second);
-                    int32_t addr_off = base_off + fit->second.offset;
-                    const Type* ft = fit->second.ty;
-                    if (ft->prim == Prim::F32 && !ft->is_slice) e.movss_mem_xmm(Reg::rbp, addr_off, Xmm::xmm0);
-                    else e.store_rax_elem(Reg::rbp, addr_off, elem_bytes(ft));
+                    store_value_to_memory(*kv.second, fit->second.ty, Reg::rbp,
+                                          base_off + fit->second.offset);
                 }
             }
             return;
@@ -1928,15 +2056,34 @@ void CG::exec_stmt(const Stmt& s) {
                 return;
             }
         }
+        if (auto* cast = dynamic_cast<const CastExpr*>(ls->init.get())) {
+            const Type* ct = cast->ty;
+            const bool aggregate = ct && (ct->array_len > 0 ||
+                (!ct->struct_name.empty() && ctx.structs && ctx.structs->count(ct->struct_name) != 0));
+            if (aggregate && cast->operand->ty && cast->operand->ty->same(*ct)) {
+                // A permitted same-type aggregate cast is a real whole-value
+                // no-op, not eval()'s one-register scalar convention.  Sema
+                // restricts the source to a local below; copy every byte.
+                int32_t dst = alloc_local(ls->name, ct);
+                auto* id = dynamic_cast<const Ident*>(cast->operand.get());
+                auto src = id ? locals.find(id->name) : locals.end();
+                if (src != locals.end())
+                    copy_bytes(Reg::rbp, dst, Reg::rbp, src->second, local_width_bytes(ct, ctx.structs));
+                else {
+                    assert(false && "aggregate cast source is not a local");
+                    emit_trap(int(TrapReason::IllegalInstruction), "internal: aggregate cast source is not a local");
+                }
+                return;
+            }
+        }
         int32_t off = alloc_local(ls->name, ls->init->ty);
         eval(*ls->init);
         const Type* t = ls->init->ty;
         if (t->is_slice) {
-            // slice ABI: rax=ptr -> [off], rdx=len -> [off+8]
             e.store_reg_mem(Reg::rbp, off, Reg::rax);
             e.store_reg_mem(Reg::rbp, off + 8, Reg::rdx);
-        } else if (t->is_float()) store_xmm0_to_rbp(*this, off);
-        else store_rax_to_rbp(*this, off);
+        } else if (t->is_float()) store_xmm0_to_rbp(*this, off, t);
+        else { normalize_rax(t); store_rax_to_rbp(*this, off); }
         return;
     }
     if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { eval(*es->expr); return; }
@@ -1978,6 +2125,7 @@ void CG::exec_stmt(const Stmt& s) {
             return;
         }
         bool is_float_ret = f.ret && f.ret->is_float();
+        bool is_f64_ret = f.ret && f.ret->prim == Prim::F64;
         bool is_slice_ret = f.ret && f.ret->is_slice;
         if (rs->value) {
             eval(*rs->value);
@@ -1986,10 +2134,10 @@ void CG::exec_stmt(const Stmt& s) {
                 // stash the return value(s) across defer evaluation - a
                 // defer's own expression may clobber rax/xmm0/rdx.
                 if (is_float_ret) {
-                    e.byte(0x48); e.byte(0x83); e.byte(0xEC); e.byte(0x08);        // sub rsp,8
-                    e.byte(0xF3); e.byte(0x0F); e.byte(0x11); e.byte(0x04); e.byte(0x24); // movss [rsp],xmm0
+                    e.sub_reg_imm32(Reg::rsp, 8);
+                    if(is_f64_ret)e.movsd_mem_xmm(Reg::rsp,0,Xmm::xmm0);else e.movss_mem_xmm(Reg::rsp,0,Xmm::xmm0);
                 } else if (is_slice_ret) {
-                    e.byte(0x48); e.byte(0x83); e.byte(0xEC); e.byte(0x10);        // sub rsp,16
+                    e.sub_reg_imm32(Reg::rsp, 16);
                     e.store_reg_mem(Reg::rsp, 0, Reg::rax);
                     e.store_reg_mem(Reg::rsp, 8, Reg::rdx);
                 } else {
@@ -2001,12 +2149,12 @@ void CG::exec_stmt(const Stmt& s) {
             emit_defers();
             if (rs->value) {
                 if (is_float_ret) {
-                    e.byte(0xF3); e.byte(0x0F); e.byte(0x10); e.byte(0x04); e.byte(0x24); // movss xmm0,[rsp]
-                    e.byte(0x48); e.byte(0x83); e.byte(0xC4); e.byte(0x08);        // add rsp,8
+                    if(is_f64_ret)e.movsd_xmm_mem(Xmm::xmm0,Reg::rsp,0);else e.movss_xmm_mem(Xmm::xmm0,Reg::rsp,0);
+                    e.add_reg_imm32(Reg::rsp,8);
                 } else if (is_slice_ret) {
                     e.load_reg_mem(Reg::rax, Reg::rsp, 0);
                     e.load_reg_mem(Reg::rdx, Reg::rsp, 8);
-                    e.byte(0x48); e.byte(0x83); e.byte(0xC4); e.byte(0x10);        // add rsp,16
+                    e.add_reg_imm32(Reg::rsp, 16);
                 } else {
                     e.pop(Reg::rax);
                 }
@@ -2059,6 +2207,21 @@ void CG::exec_stmt(const Stmt& s) {
         if (set_pin_here) active_pin.reset();
         emit_budget_check(block_cost(ws->body));   // v0.4 budget (SAFETY §3): back-edge only
         e.jmp(top);
+        e.bind(end);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) {
+        // Bottom-tested loop: body first; continue goes to the condition;
+        // budget is charged only on the taken back edge.
+        Label body = e.alloc_label(), cond = e.alloc_label(), end = e.alloc_label();
+        e.bind(body);
+        loops.push_back({cond, end});
+        exec_block(ds->body);
+        loops.pop_back();
+        e.bind(cond);
+        eval(*ds->cond); e.cmp_reg_imm32(Reg::rax, 0); e.jcc(Cond::e, end);
+        emit_budget_check(block_cost(ds->body));
+        e.jmp(body);
         e.bind(end);
         return;
     }
@@ -2118,7 +2281,11 @@ void CG::exec_stmt(const Stmt& s) {
         // early - correctness-first, matching this tree-walker's style
         // (no jump-table optimization).
         eval(*sw->subject);
-        e.mov_reg_reg(Reg::r13, Reg::rax); // stash subject - survives the case-value evals below
+        // Win64 r10 is volatile, unlike the old r13 scratch.  Sema permits
+        // only IntLit/BoolLit case values; their eval paths are immediate
+        // loads into rax and cannot clobber r10, so the subject remains live
+        // across the complete compare chain without a nonvolatile save.
+        e.mov_reg_reg(Reg::r10, Reg::rax);
         std::vector<Label> case_labels;
         for (size_t i = 0; i < sw->cases.size(); ++i) case_labels.push_back(e.alloc_label());
         Label end_label = e.alloc_label();
@@ -2126,7 +2293,7 @@ void CG::exec_stmt(const Stmt& s) {
         for (size_t i = 0; i < sw->cases.size(); ++i) {
             if (sw->cases[i].is_default) { default_idx = int(i); continue; }
             eval(*sw->cases[i].value);
-            e.cmp_reg_reg(Reg::r13, Reg::rax);
+            e.cmp_reg_reg(Reg::r10, Reg::rax);
             e.jcc(Cond::e, case_labels[i]);
         }
         e.jmp(default_idx >= 0 ? case_labels[size_t(default_idx)] : end_label);
@@ -2211,7 +2378,7 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
     // We alloc locals during exec. But frame size must be known up front.
     // Simplification: give a generous fixed frame based on a quick count of let-stmts.
     // Count locals: walk and count LetStmt occurrences.
-    // sum actual byte widths (slices=16, fixed arrays=N*elem_bytes, else 8)
+    // sum actual byte widths (slices=16, fixed arrays/structs recursive, else 8)
     // rather than a flat per-local count*8 - needed now that locals can be
     // wider than 8 bytes (slice ABI / fixed arrays).
     int32_t locals_area = 8; // rbx_save_offset's reservation above (Item E) - must track next_local_off's starting bump
@@ -2223,6 +2390,7 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
                 locals_area += CG::local_width_bytes(ls->init ? ls->init->ty : ls->ty.get(), ctx.structs);
             if (auto* is = dynamic_cast<const IfStmt*>(s.get())) { sum_bytes(is->then_b); if(is->has_else) sum_bytes(is->else_b); }
             if (auto* ws = dynamic_cast<const WhileStmt*>(s.get())) sum_bytes(ws->body);
+            if (auto* ds = dynamic_cast<const DoWhileStmt*>(s.get())) sum_bytes(ds->body);
             if (auto* bs = dynamic_cast<const BlockStmt*>(s.get())) sum_bytes(bs->block);
             if (auto* fs = dynamic_cast<const ForStmt*>(s.get())) {
                 if (fs->init) locals_area += CG::local_width_bytes(fs->init->init ? fs->init->init->ty : fs->init->ty.get(), ctx.structs);
@@ -2241,6 +2409,7 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
             if (auto* ds = dynamic_cast<const DeferStmt*>(s.get())) cg.defer_sites.push_back(ds);
             if (auto* is = dynamic_cast<const IfStmt*>(s.get())) { collect_defers(is->then_b); if (is->has_else) collect_defers(is->else_b); }
             if (auto* ws = dynamic_cast<const WhileStmt*>(s.get())) collect_defers(ws->body);
+            if (auto* ds = dynamic_cast<const DoWhileStmt*>(s.get())) collect_defers(ds->body);
             if (auto* bs = dynamic_cast<const BlockStmt*>(s.get())) collect_defers(bs->block);
             if (auto* fs = dynamic_cast<const ForStmt*>(s.get())) collect_defers(fs->body);
             if (auto* sw = dynamic_cast<const SwitchStmt*>(s.get())) for (auto& c : sw->cases) collect_defers(c.body);
@@ -2257,7 +2426,7 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
     int32_t total = locals_area + arg_temps_area + 16; // +16 slack
     cg.frame_size = round16(total);
     // sub rsp, frame_size
-    cg.e.byte(0x48); cg.e.byte(0x81); cg.e.byte(0xEC); cg.e.imm32(cg.frame_size);
+    cg.e.sub_reg_imm32(Reg::rsp, cg.frame_size);
     // Save rbx into its reserved frame slot now that the (still 16-byte
     // aligned) frame is live (Item E) - paired with emit_epilogue()'s
     // load_reg_mem restore. Unconditional regardless of whether this
@@ -2294,15 +2463,15 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
     // functions past the old limit), which is now fixed for every caller.
     int32_t total_words = cg.returns_struct_by_ptr() ? 1 : 0;
     for (auto& p : f.params) total_words += CG::words_for_type(p.ty.get(), ctx.structs);
-    auto spill_word = [&](int32_t w, int32_t dst_off, bool is_float_word) {
+    auto spill_word = [&](int32_t w, int32_t dst_off, const Type* float_ty) {
         if (w < 4) {
-            if (is_float_word) cg.e.movss_mem_xmm(Reg::rbp, dst_off, flt_arg_regs[w]);
+            if (float_ty) { if(float_ty->prim==Prim::F64)cg.e.movsd_mem_xmm(Reg::rbp,dst_off,flt_arg_regs[w]);else cg.e.movss_mem_xmm(Reg::rbp,dst_off,flt_arg_regs[w]); }
             else cg.e.store_reg_mem(Reg::rbp, dst_off, int_arg_regs[w]);
         } else {
             int32_t src_off = 48 + total_words * 8 + (w - 4) * 8;
-            if (is_float_word) {
-                cg.e.movss_xmm_mem(Xmm::xmm4, Reg::rbp, src_off); // xmm4: scratch, unused elsewhere here
-                cg.e.movss_mem_xmm(Reg::rbp, dst_off, Xmm::xmm4);
+            if (float_ty) {
+                if(float_ty->prim==Prim::F64){cg.e.movsd_xmm_mem(Xmm::xmm4,Reg::rbp,src_off);cg.e.movsd_mem_xmm(Reg::rbp,dst_off,Xmm::xmm4);}
+                else { cg.e.movss_xmm_mem(Xmm::xmm4, Reg::rbp, src_off); cg.e.movss_mem_xmm(Reg::rbp, dst_off, Xmm::xmm4); }
             } else {
                 cg.e.load_reg_mem(Reg::rax, Reg::rbp, src_off);
                 cg.e.store_reg_mem(Reg::rbp, dst_off, Reg::rax);
@@ -2319,7 +2488,7 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
         // struct_ret_ptr_offset, not by name.
         cg.next_local_off += 8;
         cg.struct_ret_ptr_offset = -cg.next_local_off;
-        spill_word(0, cg.struct_ret_ptr_offset, false);
+        spill_word(0, cg.struct_ret_ptr_offset, nullptr);
         param_word = 1;
     }
     for (size_t i = 0; i < f.params.size(); ++i) {
@@ -2344,7 +2513,7 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
                 int32_t word_bytes = std::min<int32_t>(8, struct_bytes - byte_pos);
                 int32_t w_global = param_word + w;
                 if (word_bytes >= 8) {
-                    spill_word(w_global, off + byte_pos, false);
+                    spill_word(w_global, off + byte_pos, nullptr);
                 } else {
                     if (w_global < 4) cg.e.mov_reg_reg(Reg::rax, int_arg_regs[w_global]);
                     else {
@@ -2356,12 +2525,12 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
                 byte_pos += word_bytes;
             }
         } else if (pt->is_slice) {
-            spill_word(param_word, off, false);
-            spill_word(param_word + 1, off + 8, false);
+            spill_word(param_word, off, nullptr);
+            spill_word(param_word + 1, off + 8, nullptr);
         } else if (pt->is_float()) {
-            spill_word(param_word, off, true);
+            spill_word(param_word, off, pt);
         } else {
-            spill_word(param_word, off, false);
+            spill_word(param_word, off, nullptr);
         }
         param_word += wcount;
     }

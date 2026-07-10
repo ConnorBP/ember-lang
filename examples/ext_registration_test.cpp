@@ -1,7 +1,7 @@
 // ext_registration_test - ember extensions registration smoke test.
 //
 // Validates the Section 6 restructure's core promise: the relocated non-cheat
-// extensions (vec2/vec3/vec4/quat/mat4/string/array<T>/math) register their
+// extensions (vec/quat/mat/string/array/math/sync/lifecycle) register their
 // NativeSig entries + OpOverloadTable entries via the extension entry points
 // (ember::ext_*::register_natives / register_overloads), so a host that links
 // the extension libs and calls those entry points gets the full addon surface
@@ -29,6 +29,8 @@
 #include "ext_string.hpp"
 #include "ext_array.hpp"
 #include "ext_math.hpp"
+#include "ext_sync.hpp"
+#include "ext_lifecycle.hpp"
 #include "ast.hpp"
 #include "sema.hpp"
 #include <cstdio>
@@ -47,7 +49,7 @@ static void check(bool cond, const char* msg) {
 int main() {
     std::printf("=== ember extensions registration smoke test ===\n");
 
-    // --- natives: register all six extensions into one map, as a host would ---
+    // --- natives: register all eight extensions into one map, as a host would ---
     std::unordered_map<std::string, NativeSig> m;
     ext_vec::register_natives(m);
     ext_quat::register_natives(m);
@@ -55,6 +57,8 @@ int main() {
     ext_string::register_natives(m);
     ext_array::register_natives(m);
     ext_math::register_natives(m);
+    ext_sync::register_natives(m);
+    ext_lifecycle::register_natives(m);
 
     auto has = [&](const char* n) -> bool { return m.find(n) != m.end(); };
     auto arity = [&](const char* n) -> size_t { auto it = m.find(n); return it == m.end() ? size_t(-1) : it->second.params.size(); };
@@ -119,13 +123,55 @@ int main() {
     check(!ext_array::get_bytes(0, &data, &len), "array: get_bytes(invalid) == false");
     check(!ext_array::get_bytes(99999, &data, &len), "array: get_bytes(out-of-range) == false");
 
+    // C5: allocation-taking extension boundaries reject negative/overflowing
+    // sizes and do not let allocation exceptions escape into the host.
+    auto array_new = reinterpret_cast<int64_t(*)(int64_t,int64_t)>(m.at("array_new").fn_ptr);
+    auto array_resize = reinterpret_cast<void(*)(int64_t,int64_t)>(m.at("array_resize").fn_ptr);
+    auto array_length = reinterpret_cast<int64_t(*)(int64_t)>(m.at("array_length").fn_ptr);
+    check(array_new(1, -1) == 0, "array: negative count rejected");
+    check(array_new(0, 1) == 0, "array: zero element size rejected");
+    check(array_new(INT64_MAX, INT64_MAX) == 0, "array: overflowing/over-cap size rejected");
+    int64_t ah = array_new(1, 4);
+    array_resize(ah, -1);
+    check(ah != 0 && array_length(ah) == 4, "array: rejected resize leaves container unchanged");
+    array_resize(ah, INT64_MAX);
+    check(array_length(ah) == 4, "array: over-cap resize leaves container unchanged");
+
+    auto string_from_slice = reinterpret_cast<int64_t(*)(uint8_t*,int64_t)>(m.at("string_from_slice").fn_ptr);
+    uint8_t byte = 'x';
+    check(string_from_slice(&byte, -1) == 0, "string: negative length rejected");
+    check(string_from_slice(&byte, INT64_MAX) == 0, "string: over-cap length rejected");
+
+    auto swapbuf_new = reinterpret_cast<int64_t(*)(int64_t)>(m.at("swapbuf_new").fn_ptr);
+    auto spsc_new = reinterpret_cast<int64_t(*)(int64_t)>(m.at("spsc_new").fn_ptr);
+    auto mpsc_new = reinterpret_cast<int64_t(*)(int64_t,int64_t)>(m.at("mpsc_new").fn_ptr);
+    auto mpmc_new = reinterpret_cast<int64_t(*)(int64_t)>(m.at("mpmc_new").fn_ptr);
+    check(swapbuf_new(-1) == 0 && swapbuf_new(INT64_MAX) == 0, "sync: invalid swapbuf capacities rejected");
+    check(spsc_new(-1) == 0 && spsc_new(INT64_MAX) == 0, "sync: invalid/round-up-overflow SPSC capacities rejected");
+    check(mpsc_new(4, -1) == 0 && mpsc_new(INT64_MAX, 1) == 0 && mpsc_new(4, INT64_MAX) == 0,
+          "sync: invalid MPSC capacity/producer count rejected");
+    check(mpmc_new(-1) == 0 && mpmc_new(INT64_MAX) == 0, "sync: invalid MPMC capacities rejected");
+    check(has("register_routine") && arity("register_routine") == 2 &&
+          has("unregister_routine") && arity("unregister_routine") == 1,
+          "lifecycle: register/unregister routine natives registered");
+
+    // Defense in depth for stale/forged native-boundary handles: invoke the
+    // operator functions directly and require their documented zero result.
+    auto vec_add = reinterpret_cast<int64_t(*)(int64_t,int64_t)>(t.find("vec3", int(BinExpr::Op::Add))->fn_ptr);
+    auto vec_eq = reinterpret_cast<int64_t(*)(int64_t,int64_t)>(t.find("vec3", int(BinExpr::Op::Eq))->fn_ptr);
+    auto quat_mul = reinterpret_cast<int64_t(*)(int64_t,int64_t)>(t.find("quat", int(BinExpr::Op::Mul))->fn_ptr);
+    auto mat_mul = reinterpret_cast<int64_t(*)(int64_t,int64_t)>(t.find("mat4", int(BinExpr::Op::Mul))->fn_ptr);
+    check(vec_add(999, 999) == 0 && vec_eq(999, 999) == 0, "vec: invalid operator handles return zero/false");
+    check(quat_mul(999, 999) == 0, "quat: invalid operator handles return zero");
+    check(mat_mul(999, 999) == 0, "mat: invalid operator handles return zero");
+
     // --- string slot accessor: invalid handle returns nullptr ---
     check(ext_string::slot(0) == nullptr, "string: slot(invalid) == nullptr");
     check(ext_string::slot(99999) == nullptr, "string: slot(out-of-range) == nullptr");
 
     // --- reset() is callable and idempotent (stateless math has no reset) ---
-    ext_vec::reset(); ext_quat::reset(); ext_mat::reset(); ext_string::reset(); ext_array::reset();
-    ext_vec::reset(); ext_quat::reset(); ext_mat::reset(); ext_string::reset(); ext_array::reset();
+    ext_vec::reset(); ext_quat::reset(); ext_mat::reset(); ext_string::reset(); ext_array::reset(); ext_sync::reset(); ext_lifecycle::reset();
+    ext_vec::reset(); ext_quat::reset(); ext_mat::reset(); ext_string::reset(); ext_array::reset(); ext_sync::reset(); ext_lifecycle::reset();
     check(true, "extensions: reset() callable + idempotent");
 
     // --- purity: no host/process/render coupling - extensions only touch ember types ---

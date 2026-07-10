@@ -1,15 +1,18 @@
 // ember execution context (SAFETY_AND_SANDBOX.md Section 2/Section 3/Section 4).
 //
 // The non-local abort primitive + the two quantity budgets (instruction
-// budget, call depth). ember_call establishes a checkpoint (setjmp) before
-// entering JIT'd code; any trap (bounds check, budget exhaustion, stack
-// overflow, @obf_keyed gate mismatch, bad call target) calls the host-provided
-// trap stub, which longjmps back to the checkpoint. ember_call then returns
-// with last_error set instead of the script crashing the process.
+// budget, call depth). A host that requires recoverable traps establishes a
+// checkpoint (setjmp) before entering JIT'd code; any trap (bounds check,
+// budget exhaustion, stack overflow, @obf_keyed gate mismatch, bad call target)
+// calls the host-provided trap stub, which longjmps back to that checkpoint.
+// The raw B1 helpers ember_call_void/ember_call_i64 only install r14 and call;
+// they do NOT reset this context or establish a recoverable checkpoint. Manual
+// setjmp/has_checkpoint management (as in ember_cli), or a host safe-call
+// wrapper providing it, is required.
 //
-// v0.4 ships the single-call checkpoint (one jmp_buf). The spec's nested
-// ember_call checkpoint STACK (a native calling back into ember_call) is
-// v1.0 — the CLI and prism's single-call-per-entry model is covered now.
+// context_t currently stores one host-managed checkpoint (one jmp_buf).
+// A nested checkpoint stack remains deferred; hosts use single-call-per-entry
+// discipline and manage has_checkpoint around each raw B1 thunk invocation.
 //
 // THREAD-SAFETY (v1.0, Option D + B1): a context_t is NOT shared across
 // threads. Each concurrent caller thread allocates its own context_t (private
@@ -17,7 +20,7 @@
 // module registry (all read-only after compile). The JIT'd budget/depth/trap
 // reads go through a context pointer passed per-call (CodeGenCtx::use_context_reg),
 // so one compiled body serves N per-thread contexts — no per-context recompile.
-// The host's ember_call sets the context register before entry; script-to-script
+// The host's raw B1 thunk sets the context register before entry; script-to-script
 // calls forward it (callee-saved). SAFETY §8 + HOT_RELOAD §5 document this
 // multi-context model.
 //
@@ -36,8 +39,8 @@ namespace ember {
 // Default max script-to-script call depth (SAFETY_AND_SANDBOX.md Section 4).
 inline constexpr int32_t DEFAULT_MAX_CALL_DEPTH = 512;
 
-// A trap reason, set by the trap stub before the longjmp so ember_call can
-// report what happened (the spec's exception-as-data model, minimum form).
+// A trap reason, set by the trap stub before it longjmps to the host-managed
+// checkpoint (the exception-as-data model, minimum form).
 enum class TrapReason : uint8_t {
     None = 0,
     BoundsCheck,       // runtime slice/array index out of range
@@ -60,7 +63,7 @@ struct context_t {
 
     // ---- checkpoint + host-side state (NOT read by JIT'd [ctx_reg+off]) ----
     jmp_buf checkpoint{};
-    bool has_checkpoint = false;     // set true by ember_call after setjmp
+    bool has_checkpoint = false;     // host sets true after setjmp, before raw B1 call
     std::string last_error;          // human-readable detail for last_trap
 
     void reset_for_call() {

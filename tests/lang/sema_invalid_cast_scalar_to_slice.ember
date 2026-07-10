@@ -1,0 +1,6 @@
+// C3 regression: a scalar word must never be reinterpreted as a slice.
+fn main() -> i64 {
+    let x: i64 = 1;
+    let s: u8[] = x as u8[];
+    return 0;
+}

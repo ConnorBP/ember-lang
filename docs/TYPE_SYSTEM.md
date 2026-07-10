@@ -1,12 +1,7 @@
 # ember - type system spec
 
-Detail doc for DESIGN.md Section 2. Formalizes types, layout, conversions.
-
-> **Implementation status: v0.1** - this is the v1.0 design spec. The
-> current repo implements the JIT codegen proof (encoder, label/patch,
-> exec-mem, `.em` format). See `README.md` for what's shipped; see
-> `CODEGEN_SPEC.md` Section 12 + Section 15 for the acceptance suite. This doc's
-> content is the target design, not a claim of current implementation.
+Detail doc for DESIGN.md Section 2. Formalizes the shipped v1 types, Ember
+layout, conversions, and ABI limits; future extensions are labeled inline.
 
 ## 1. Primitive types
 
@@ -37,19 +32,14 @@ Two layout modes, chosen per struct at declaration:
   supplied by the host (`sizeof` of the real struct), not computed by
   ember.
 - **Script-declared struct** (a `struct Foo { ... }` written directly
-  in ember source, no host backing): layout computed by ember using
-  the same rules as a standard C compiler on the target platform
-  (MSVC x64 struct layout, since Windows is the v1 target):
-  1. Fields laid out in declaration order.
-  2. Each field's offset rounded up to its own alignment (from Section 1's
-     table, or a nested struct's alignment = max of its members').
-  3. Struct's own alignment = max alignment of any member (minimum 1).
-  4. Struct's total size rounded up to a multiple of its alignment
-     (trailing padding, matches C rules, needed for correct array-of-
-     struct stride).
-  - No `#pragma pack`/custom alignment attributes in v1 - one layout
-    rule, no exceptions (YAGNI; add if a host integration genuinely
-    needs a packed layout later).
+  in Ember source, no host backing): fields are **tightly packed in
+  declaration order**, with no alignment gaps or trailing padding. Nested
+  structs and fixed arrays contribute their recursively resolved Ember size.
+  This is Ember layout, not MSVC/C host layout. Native by-value aggregate
+  arguments are supported only through 8 bytes; sema rejects larger native
+  aggregate arguments. Large aggregate returns use the tested hidden-return
+  path. Hosts needing arbitrary C layouts must use explicit bindings/handles;
+  a host-layout builder remains deferred.
 - **Nested structs**: allowed, computed recursively with the rule
   above. **Self-referential structs** (a struct containing a field of
   its own type, or a cycle through multiple structs) are a **compile
@@ -75,9 +65,7 @@ Two layout modes, chosen per struct at declaration:
 literally be a literal in v1; named compile-time constants are a
 post-v1 nicety, not needed yet).
 - Layout: `N` contiguous elements of `T`, each at `i * sizeof(T)`
-  (`sizeof(T)` already includes T's own trailing padding if T is a
-  struct - this gives correct C-compatible array stride automatically
-  from Section 2's struct sizing rule).
+  (`sizeof(T)` is the tightly packed Ember size for a script struct).
 - `N == 0` is a compile error (a zero-length fixed array has no
   sensible use - if a variable-length empty case is needed, that's
   what slices are for).
@@ -389,38 +377,25 @@ COMPILER_PIPELINE.md Section 2)
 - `switch (e) { case L: ...; break; ... }` - `e` integer-typed, `L`
   constexpr integer literals, unique within the switch, in-range for
   `e`'s type. **No fallthrough**: each case must end in
-  `break`/`return`/`continue`/`trap` (sema rejects falling off a case
+  `break` or `return` (sema rejects falling off a case
   body - eliminates the entire C-fallthrough footgun class at the
   grammar level, GAP_ANALYSIS.md Section 5). `default` optional. Lowering
-  and jump-table vs cascade decision in CODEGEN_SPEC.md Section 13.
-- `defer expr;` - `expr` (typically a call, e.g.
-  `defer release_resource(handle);`) runs at scope exit. Semantics:
-  LIFO order if multiple `defer`s in one scope; runs on every scope-
-  exit path (return/break/continue/fallthrough) **except the trap-
-  unwind path** (Section 11 of COMPILER_PIPELINE.md, GAP_ANALYSIS.md Section 5  - 
-  traps abort, don't gracefully unwind locals). `defer`'s `expr` is
-  typechecked at the `defer` statement's location (so it sees the
-  in-scope variables at that point), not at scope exit - meaning if a
-  variable the deferred expression references is later reassigned, the
-  deferred call sees the *final* value at exit, not the value at
-  `defer` time (matches C++ `defer`/Go `defer` semantics - defer
-  captures the *expression*, evaluated lazily, not a snapshot of
-  variable values).
+  and jump-table vs cascade decision in CODEGEN_SPEC.md Section 12.
+- `defer expr;` - the shipped v1 implementation is **function-exit LIFO**.
+  Deferred expressions run in reverse registration order on ordinary function
+  return/fallthrough. They do not run at nested lexical block exits,
+  `break`/`continue`, or trap unwind; a defer in a loop is registered at most
+  once by the current lowering. To keep frame references valid, sema permits
+  deferred expressions to reference only parameters and globals. Lexical
+  cleanup edges remain deferred rather than being implied by this syntax.
 
 ### 11.7 String interpolation `f"...{expr}..."`
 
-An `f"..."` literal is syntactic sugar lowered at sema to a call to
-the host `__fmt` addon (`GAP_ANALYSIS.md` Section 3) - not a language
-builtin. `f"v={x} and y={y}"` desugars to roughly
-`__fmt(__sl("v="), x, __sl(" and y="), y)`, returning an `array<u8>`
-handle. Hole expressions (`{expr}`) are typechecked normally against
-whatever `__fmt`'s signature accepts (the standard `__fmt` addon
-accepts `slice<u8>` for the literal parts and any of `i64`/`u64`/
-`f64`/`bool`/`slice<u8>` for holes - finer integer widths require an
-explicit `as` cast to `i64`/`u64` first). If `__fmt` isn't
-registered, sema errors: "string interpolation requires the `__fmt`
-addon" - the feature simply doesn't exist in a host that doesn't ship
-the format addon, no silent fallback. The result is an `array<u8>`
-handle (host-owned memory, MEMORY_AND_GC.md Section 1 category 2), not a
-slice - interpolation produces fresh owned bytes, the addon manages
-their lifetime.
+The parser wraps every literal/hole segment in the internal
+`__fstring_to_string` sentinel. During sema that sentinel is replaced by a
+real registered string conversion: `string_from_slice` for literal `u8[]`
+segments, `string_from_i64`, `string_from_f32`, `string_from_f64`, or
+`string_from_bool` for scalar holes, and `string_identity` for an existing
+string handle. Segments are combined through the string extension's `+`
+overload. `__fstring_to_string` is an internal lowering marker, not a native;
+there is no `__fmt` API. The result is the host-owned opaque `string` handle.

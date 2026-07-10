@@ -31,9 +31,9 @@ can touch them concurrently without ember-side synchronization:
   pointer is explicitly unsafe, `HOT_RELOAD.md §7`). Script→script calls go
   through `call [dispatch_base + slot*8]` (`src/codegen.cpp:647`, `:656`),
   re-reading the slot on every call. → **multi-thread reads of the dispatch
-  table are safe today.** The only caveat is hot-reload's retired-page
-  reclamation, which `HOT_RELOAD.md §5` keys off a per-`context_t` epoch — see
-  §1.3 below.
+  table are safe today.** The only caveat is retired-page reclamation:
+  `HOT_RELOAD.md §5` ships caller-managed single-thread retirement and defers
+  any concurrent epoch/quiescence protocol; see §1.3 below.
 
 - **JIT'd code bytes after `finalize`.** `alloc_executable` commits the page
   (the REDSHELL writeup flagged RWX as a latent V5 catastrophe; v0.4 hardened
@@ -192,12 +192,11 @@ confessed bug.
 > multi-context parallelism covers most real cases without in-context
 > threading."*
 
-`HOT_RELOAD.md §5` (epoch reclamation) confirms the intended shape:
-*"context_t (not module_t — depth counters and checkpoints already live
-per-context, SAFETY §2/§4, so epoch tracking fits the same place)."* The spec
-**already models the context as the per-call/per-thread unit of mutable
-execution state.** The options below are largely a question of how faithfully
-to make the implementation match that already-stated model.
+`HOT_RELOAD.md §5` now explicitly defers concurrent epoch/quiescence
+reclamation. If a future implementation chooses epochs, per-thread contexts
+are a plausible observation point, but no epoch field or registry is part of
+the shipped model. The context remains the per-call/per-thread unit for the
+mutable execution state that actually exists.
 
 **Bottom line of §1:** the dispatch table, the JIT'd code, and the registry
 are already shareable. The five things in §1.2 (checkpoint, budget, depth,
@@ -440,9 +439,8 @@ question is handled explicitly (§3 below).
 this: *"a host runs multiple `context_t`s on multiple threads against the
 same `module_t` (allowed — the dispatch table and JIT'd code are read-only
 after compilation except during a hot-reload slot swap, HOT_RELOAD.md §5)."*
-`HOT_RELOAD.md §5` keys epoch reclamation off the per-`context_t` epoch and
-notes *"depth counters and checkpoints already live per-context."* D is the
-implementation catching up to the spec.
+`HOT_RELOAD.md §5` ships caller-owned retirement and defers any concurrent
+quiescence design. D is therefore about context safety, not page reclamation.
 
 **What changes.**
 - **Host API.** A host wanting N concurrent caller threads allocates N
@@ -675,13 +673,10 @@ to the `aint*` batch — U2).
   Nested (a native calling back into `ember_call` from within a call) ships
   later, building on the now-safe single-`jmp_buf`.
 
-- **Hot-reload's epoch-reclamation `current_epoch`** (`HOT_RELOAD §5`) — the
-  spec already puts the per-context epoch on `context_t`, so D's per-thread
-  contexts are the natural home for it, but wiring up the retired-page sweep
-  is its own (later) task and is **not required** for the first pass unless
-  the first pass also ships real hot-reload (it doesn't — reload is a v0.4
-  "NOT shipped" item per `DESIGN.md`). The first pass only needs to not
-  *break* the spec's intended home for it.
+- **Concurrent hot-reload reclamation** (`HOT_RELOAD §5`) — remains a later
+  host epoch/quiescence task. This plan does not add speculative epoch fields
+  to `context_t`; single-threaded caller-owned retirement remains the shipped
+  path.
 
 - **Cross-thread forced unwind / preemptible wall-clock timeout**
   (`SAFETY §3` explicit deferral: "cross-thread forced unwind of running JIT
@@ -779,6 +774,6 @@ test. Those are later batches.
 | CLI calls JIT'd entry via raw fn-ptr (no `ember_call`) | `examples/ember_cli.cpp:432` (raw `reinterpret_cast<F0>(entry)()`); `src/engine.hpp`/`engine.cpp` have no `ember_call` |
 | Trap stub `__builtin_longjmp`s the passed ctx | `examples/ember_cli.cpp:97`–`110` |
 | Spec: per-`context_t` parallelism allowed, in-context not | `docs/SAFETY_AND_SANDBOX.md §8` |
-| Spec: epoch + depth/checkpoint live per-context | `docs/HOT_RELOAD.md §5` |
+| Hot reload: caller-managed retirement; concurrent epochs deferred | `docs/HOT_RELOAD.md §5` |
 | ROADMAP: `aint*`/`thread` deferred; multi-context covers most | `docs/ROADMAP.md` Tier 5 (`:119`–`125`) |
 | REDSHELL: trap-surface / budgets / checkpoint spec | `EMBER_REDSHELL_WRITEUP.md` §0, V6-DoS, V7 (workspace root) |

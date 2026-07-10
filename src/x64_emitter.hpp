@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <optional>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace ember {
@@ -57,6 +58,23 @@ class X64Emitter {
 public:
     std::vector<uint8_t> code;
 
+    // Win64 stack invariant used by every emitted call: rsp is 16-byte
+    // aligned immediately before `call`, and the caller owns at least 32
+    // bytes of shadow space.  A function enters with rsp % 16 == 8; the
+    // emitter tracks every push/pop and rsp add/sub it emits from there.
+    // `win64_call_frame_size` adds only the padding required by the current
+    // parity. `require_win64_call_alignment` lets standardized call sites
+    // enforce the invariant explicitly.
+    uint8_t rsp_mod16() const { return rsp_mod16_; }
+    int32_t win64_call_frame_size(int32_t minimum_bytes) const {
+        if (minimum_bytes < 32) minimum_bytes = 32;
+        const int32_t residue = int32_t(rsp_mod16_);
+        return ((minimum_bytes - residue + 15) & ~15) + residue;
+    }
+    void require_win64_call_alignment() const {
+        if (rsp_mod16_ != 0)
+            throw std::logic_error("ember: x64 emitter call site is not 16-byte aligned");
+    }
     // --- label/patch system (CODEGEN_SPEC.md Section 4) ---
     // Two-pass: branches emit a rel32 placeholder + record a fixup;
     // resolve_fixups() backpatches once all labels are bound.
@@ -87,6 +105,9 @@ public:
         byte(rex(true, is_extended(src), false, is_extended(dst)));
         byte(0x89);
         byte(modrm(0b11, src, dst));
+        // Ember frames establish rbp only after `push rbp`, so rbp is always
+        // 16-byte aligned.  This is the sole non-arithmetic rsp assignment.
+        if (dst == Reg::rsp && src == Reg::rbp) rsp_mod16_ = 0;
     }
 
     // mov r64, imm64 -> REX.W B8+rd io
@@ -137,6 +158,7 @@ public:
         byte(0x81);
         byte(modrm(0b11, Reg(5), r));
         imm32(imm);
+        if (r == Reg::rsp) rsp_mod16_ = uint8_t((rsp_mod16_ + 16 - (imm & 15)) & 15);
     }
 
     // add r64, imm32 -> REX.W 81 /0 id
@@ -145,6 +167,7 @@ public:
         byte(0x81);
         byte(modrm(0b11, Reg(0), r));
         imm32(imm);
+        if (r == Reg::rsp) rsp_mod16_ = uint8_t((rsp_mod16_ + (imm & 15)) & 15);
     }
 
     // shr r64, imm8 -> REX.W C1 /5 ib (logical shift right)
@@ -254,8 +277,16 @@ public:
     }
 
     // push r64 / pop r64
-    void push(Reg r) { if (is_extended(r)) byte(0x41); byte(uint8_t(0x50 + (uint8_t(r) & 7))); }
-    void pop (Reg r) { if (is_extended(r)) byte(0x41); byte(uint8_t(0x58 + (uint8_t(r) & 7))); }
+    void push(Reg r) {
+        if (is_extended(r)) byte(0x41);
+        byte(uint8_t(0x50 + (uint8_t(r) & 7)));
+        rsp_mod16_ = uint8_t((rsp_mod16_ + 8) & 15);
+    }
+    void pop(Reg r) {
+        if (is_extended(r)) byte(0x41);
+        byte(uint8_t(0x58 + (uint8_t(r) & 7)));
+        rsp_mod16_ = uint8_t((rsp_mod16_ + 8) & 15);
+    }
 
     // --- v0.2 control flow (label/patch, CODEGEN_SPEC.md Section 4) ---
 
@@ -351,13 +382,28 @@ public:
         }
         imm32(disp);
     }
+    // scalar double forms use F2 in place of the f32 F3 prefix.
+    void movsd_xmm_xmm(Xmm dst, Xmm src) { sse_op_prefix(0xF2, 0x10, dst, src); }
+    void movsd_xmm_mem(Xmm dst, Reg base, int32_t disp) { sse_mem(0xF2, 0x10, dst, base, disp); }
+    void movsd_mem_xmm(Reg base, int32_t disp, Xmm src) { sse_mem(0xF2, 0x11, src, base, disp); }
+
     // addss/subss/mulss/divss xmm, xmm  (F3 0F 58/5C/59/5E /r, reg=dst, rm=src)
     void addss_xmm(Xmm dst, Xmm src) { sse_op(0x58, dst, src); }
     void subss_xmm(Xmm dst, Xmm src) { sse_op(0x5C, dst, src); }
     void mulss_xmm(Xmm dst, Xmm src) { sse_op(0x59, dst, src); }
     void divss_xmm(Xmm dst, Xmm src) { sse_op(0x5E, dst, src); }
+    void addsd_xmm(Xmm dst, Xmm src) { sse_op_prefix(0xF2, 0x58, dst, src); }
+    void subsd_xmm(Xmm dst, Xmm src) { sse_op_prefix(0xF2, 0x5C, dst, src); }
+    void mulsd_xmm(Xmm dst, Xmm src) { sse_op_prefix(0xF2, 0x59, dst, src); }
+    void divsd_xmm(Xmm dst, Xmm src) { sse_op_prefix(0xF2, 0x5E, dst, src); }
     // ucomiss xmm, xmm  (0F 2E /r, reg=src-for-cmp, rm=dst) - sets ZF/PF/CF
     void ucomiss_xmm(Xmm a, Xmm b) {
+        byte(rex(false, is_extended(Reg(uint8_t(a))), false, is_extended(Reg(uint8_t(b)))));
+        byte(0x0F); byte(0x2E);
+        byte(modrm(0b11, Reg(uint8_t(a)), Reg(uint8_t(b))));
+    }
+    void ucomisd_xmm(Xmm a, Xmm b) {
+        byte(0x66);
         byte(rex(false, is_extended(Reg(uint8_t(a))), false, is_extended(Reg(uint8_t(b)))));
         byte(0x0F); byte(0x2E);
         byte(modrm(0b11, Reg(uint8_t(a)), Reg(uint8_t(b))));
@@ -371,11 +417,22 @@ public:
     }
 
 private:
-    void sse_op(uint8_t op, Xmm dst, Xmm src) {
-        byte(0xF3);
+    void sse_op_prefix(uint8_t prefix, uint8_t op, Xmm dst, Xmm src) {
+        byte(prefix);
         byte(rex(false, is_extended(Reg(uint8_t(dst))), false, is_extended(Reg(uint8_t(src)))));
         byte(0x0F); byte(op);
         byte(modrm(0b11, Reg(uint8_t(dst)), Reg(uint8_t(src))));
+    }
+    void sse_mem(uint8_t prefix, uint8_t op, Xmm x, Reg base, int32_t disp) {
+        byte(prefix);
+        byte(rex(false, is_extended(Reg(uint8_t(x))), false, is_extended(base)));
+        byte(0x0F); byte(op);
+        if ((uint8_t(base) & 7) == 4) { byte(modrm(0b10, Reg(uint8_t(x)), Reg(4))); byte(0x24); }
+        else byte(modrm(0b10, Reg(uint8_t(x)), base));
+        imm32(disp);
+    }
+    void sse_op(uint8_t op, Xmm dst, Xmm src) {
+        sse_op_prefix(0xF3, op, dst, src);
     }
 public:
 
@@ -385,6 +442,7 @@ public:
     void resolve_fixups();
 
 private:
+    uint8_t rsp_mod16_ = 8; // Win64 function-entry parity (return address is on stack)
     uint32_t next_label = 0;
     std::unordered_map<uint32_t, uint32_t> bound;
     struct Fixup { uint32_t code_offset; uint32_t label_id; bool is_rel8; };

@@ -1,0 +1,75 @@
+// Positive execution coverage for audit D6/D7: control flow, compile-time
+// layout constants, function-exit LIFO defer, f64, integer boundaries, and
+// f-string lowering through the standalone string extension.
+struct Inner { a: i16; b: u8; }
+struct Outer { tag: u8; inner: Inner; words: i32[2]; }
+struct DoublePair { left: f64; right: f64; }
+enum Constants { Folded = 6 * 7 }
+
+global defer_trace: i64 = 0;
+fn mark(v: i64) -> i64 { defer_trace = defer_trace * 10 + v; return 0; }
+
+fn main() -> i64 {
+    let mut i: i64 = 0;
+    let mut sum: i64 = 0;
+    do {
+        i++;
+        if (i == 2) { continue; }
+        sum += i;
+    } while (i < 3);
+    if (sum != 4) { return 1; }
+    do {
+        sum += 10;
+        break;
+        sum += 100;
+    } while (true);
+    if (sum != 14) { return 1; }
+
+    let mut n: i64 = 5;
+    let post_inc = n++;
+    let pre_inc = ++n;
+    let post_dec = n--;
+    let pre_dec = --n;
+    if (n != 5 || post_inc != 5 || pre_inc != 7 || post_dec != 7 || pre_dec != 5) { return 2; }
+
+    const primitive_size: u64 = sizeof(i64);
+    const inner_offset: u64 = offsetof(Outer, inner);
+    const words_offset: u64 = offsetof(Outer, words);
+    // `const` plus an explicit enum value exercise v1's restricted constexpr
+    // evaluator (integer literals/arithmetic and sizeof/offsetof constants).
+    const folded: i64 = Constants::Folded;
+    if (primitive_size != 8 || sizeof(Outer) != 12 || inner_offset != 1 || words_offset != 4 || folded != 42) { return 3; }
+
+    // Ember v1 defer is function-exit scoped and runs reached sites in LIFO
+    // order. The helper returns the trace so main can assert after its exit.
+    if (defer_probe() != 0 || defer_trace != 21) { return 4; }
+
+    let precise: f64 = 16777217.0;
+    if (!(precise > 16777216.0)) { return 5; }
+    let mut values: f64[2];
+    values[0] = 16777217.0;
+    values[1] = values[0] + 1.0;
+    if (!(values[0] > 16777216.0) || values[1] != 16777218.0) { return 5; }
+    let mut pair: DoublePair = DoublePair { left: 16777217.0, right: 2.0 };
+    if (!(pair.left > 16777216.0) || pair.right != 2.0) { return 5; }
+    pair.right = pair.left + 1.0;
+    if (pair.right != 16777218.0) { return 5; }
+
+    let umax: u64 = (0 as u64) - (1 as u64);
+    if (!(umax > 0 as u64) || (umax >> (63 as u64)) != 1 as u64) { return 6; }
+    let wrap: u8 = (255 as u8) + (1 as u8);
+    let signed_min: i8 = 128 as i8;
+    if (wrap != 0 as u8 || signed_min != -128 as i8) { return 7; }
+
+    let who: i64 = 42;
+    let text: string = f"value={who}, ok={true}";
+    if (string_length(text) != 17) { return 8; }
+    return 93;
+}
+
+fn defer_probe() -> i64 {
+    defer_trace = 0;
+    defer mark(1);
+    defer mark(2);
+    return 0;
+}

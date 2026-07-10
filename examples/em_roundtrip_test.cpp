@@ -35,6 +35,7 @@
 #include "../src/em_file.hpp"
 #include "../src/em_writer.hpp"
 #include "../src/em_loader.hpp"
+#include "../src/module_linker.hpp"
 #include "../src/jit_memory.hpp"
 
 #include <cstdio>
@@ -216,6 +217,32 @@ int main() {
     std::printf("loaded: %zu funcs, dispatch=%zu slots, entry_slot=%u\n",
                 lm.pages.size(), lm.dispatch.size(), lm.entry_slot);
 
+    // v1 carries names/slots but no signatures. Pin the intentional H14
+    // behavior: exports are marked unknown_sig and sema treats calls as
+    // ABI-trusted (standalone args are checked, but arity/return cannot be).
+    // Do not execute the deliberately wrong-arity probe.
+    auto trusted_exports = build_em_exports(lm, 7);
+    bool unknown_sig_ok = trusted_exports.size() == 2;
+    for (const auto& exp : trusted_exports) unknown_sig_ok &= exp.unknown_sig;
+    ModuleExportTable mt;
+    add_exports(mt, "trusted", trusted_exports);
+    auto ulr = tokenize("link \"trusted\"; fn main() -> i64 { return trusted::double_it(); }", "<unknown-sig>");
+    bool trusted_sema_ok = ulr.ok;
+    if (trusted_sema_ok) {
+        auto upr = parse(std::move(ulr.toks));
+        trusted_sema_ok = upr.ok;
+        if (trusted_sema_ok) {
+            std::unordered_map<std::string, int> uslots{{"main", 0}};
+            upr.program.funcs[0].slot = 0;
+            auto ulayouts = build_struct_layouts(upr.program);
+            trusted_sema_ok = sema(upr.program, natives, uslots, 0, nullptr,
+                                   &ulayouts, &mt).ok;
+        }
+    }
+    bool h14_contract_ok = unknown_sig_ok && trusted_sema_ok;
+    std::printf("[4] v1 unknown_sig ABI-trusted contract: %s\n", passfail(h14_contract_ok));
+    if (!h14_contract_ok) failures++;
+
     // ---- call the loaded functions (same args as the JIT ground truth) ----
     void* loaded_double = lm.entry_by_name("double_it");
     void* loaded_fib    = lm.entry_by_name("fib");
@@ -237,7 +264,7 @@ int main() {
                        (ld_fib_10 == jit_fib_10) && (ld_fib_15 == jit_fib_15) &&
                        (ld_double_7 == 14) && (ld_double_21 == 42) &&
                        (ld_fib_10 == 55) && (ld_fib_15 == 610);
-    std::printf("[4] round-trip matches JIT: %s\n", passfail(roundtrip_ok));
+    std::printf("[5] round-trip matches JIT: %s\n", passfail(roundtrip_ok));
     if (!roundtrip_ok) failures++;
 
     // ---- cleanup ----

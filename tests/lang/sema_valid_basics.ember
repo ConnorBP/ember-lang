@@ -13,10 +13,10 @@ fn classify(n: i64) -> i64 {
     }
 }
 
-fn entry() -> i64 {
-    let x: u64 = ru64(0, 4096);
-    let f: f32 = rf32(0, 16);
-    let c: f32 = clamp(f, 0.0f, 1.0f);
+fn main() -> i64 {
+    let x: u64 = 4096;
+    let f: f32 = 0.75f;
+    let c: f32 = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
     let b: bool = (x > 0) && (c > 0.5f);
-    return b ? 1 : 0;
+    return b ? classify(4) : 0;
 }

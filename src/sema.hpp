@@ -26,7 +26,7 @@ struct ModuleExport {
     std::vector<Type> params;
     uint32_t module_id = 0;
     int slot = -1;
-    bool unknown_sig = false;  // v0.5: true for .em exports (name table has no sigs); sema skips arg/return checks
+    bool unknown_sig = false;  // v1 .em ABI-trusted export: format has no sigs; sema skips arg/return checks
 };
 // module_alias -> list of exported fns. Host populates from the registry.
 using ModuleExportTable = std::unordered_map<std::string, std::vector<ModuleExport>>;
@@ -66,11 +66,9 @@ struct OpOverloadTable {
     }
 };
 
-// Struct value types (task 1.6): field offsets within a POD frame slot.
-// v1 scope: fields must be primitive types (no nested struct/array/slice
-// fields), tightly packed in declaration order (no alignment padding - these
-// are JIT-internal frame layouts only, never passed across the native-call
-// ABI boundary, so there's no external struct layout to match).
+// Ember struct value types: fields are tightly packed in declaration order
+// with no alignment or trailing padding. Nested structs/fixed arrays use their
+// recursively computed Ember sizes. These are not host-C aggregate layouts.
 struct StructFieldLayout { const Type* ty; int32_t offset; };
 struct StructLayout {
     int32_t size = 0;

@@ -27,45 +27,66 @@ static constexpr int64_t MAX_ARRAY_LEN = INT32_MAX / 8; // any elem <= 8 bytes
 static int64_t frame_byte_width(const Type& t, const StructLayoutTable* structs) {
     if (t.is_slice) return 16;
     if (t.array_len > 0) {
-        if (int64_t(t.array_len) > MAX_ARRAY_LEN) return INT64_MAX; // overflow -> reject
-        const Type* e = t.elem.get();
-        int64_t eb = e ? int64_t(e->byte_size()) : 1;
-        if (eb < 1) eb = 8;
+        if (int64_t(t.array_len) > MAX_ARRAY_LEN || !t.elem) return INT64_MAX;
+        int64_t eb = frame_byte_width(*t.elem, structs);
+        if (eb <= 0 || eb > INT64_MAX / int64_t(t.array_len)) return INT64_MAX;
         return int64_t(t.array_len) * eb;
     }
-    if (!t.struct_name.empty() && structs) {
-        auto it = structs->find(t.struct_name);
-        if (it != structs->end()) return int64_t(it->second.size);
+    if (!t.struct_name.empty()) {
+        if (structs) {
+            auto it = structs->find(t.struct_name);
+            if (it != structs->end()) return int64_t(it->second.size);
+        }
+        return -1;
     }
-    return 8;
+    size_t n = t.byte_size();
+    return n ? int64_t(n) : 0;
 }
 
 StructLayoutTable build_struct_layouts(const Program& prog) {
     StructLayoutTable out;
-    for (auto& sd : prog.structs) {
+    std::unordered_map<std::string, const StructDecl*> decls;
+    std::unordered_set<std::string> active;
+    for (auto& sd : prog.structs) decls[sd.name] = &sd;
+
+    std::function<int64_t(const Type&)> size_of;
+    std::function<bool(const std::string&)> build = [&](const std::string& name) {
+        if (out.count(name)) return true;
+        auto di = decls.find(name);
+        if (di == decls.end() || !active.insert(name).second) return false;
         StructLayout layout;
         int64_t off = 0;
-        for (auto& fd : sd.fields) {
-            int64_t sz = int64_t(fd.ty->byte_size());
-            if (sz < 1) sz = 8; // defensive fallback (v1 fields are primitives, always sized)
-            // V6-overflow: a field whose byte_size overflows int32 (e.g.
-            // i64[1073741824] = 8.6GB) must NOT silently become a 0-byte frame
-            // slot (the confirmed latent arbitrary-write path). Force the field
-            // to a size that exceeds the per-frame budget so any `let` of this
-            // struct is rejected by the LetStmt budget check. The struct is
-            // also unreachable for legitimate use at this size anyway.
-            if (sz > INT32_MAX) {
-                sz = MAX_FRAME_BYTES + 1; // guarantees rejection at any `let`
+        for (auto& fd : di->second->fields) {
+            int64_t sz = size_of(*fd.ty);
+            if (sz < 0 || sz > INT32_MAX || off > INT32_MAX - sz) {
+                active.erase(name);
+                return false;
             }
             layout.fields[fd.name] = StructFieldLayout{fd.ty.get(), int32_t(off)};
             layout.field_names.push_back(fd.name);
             off += sz;
         }
-        // cap the struct's total size at int32 (a struct bigger than the frame
-        // budget is rejected by the per-local check at the LetStmt).
-        layout.size = off > INT32_MAX ? INT32_MAX : int32_t(off);
-        out[sd.name] = std::move(layout);
-    }
+        active.erase(name);
+        layout.size = int32_t(off);
+        out[name] = std::move(layout);
+        return true;
+    };
+    size_of = [&](const Type& t) -> int64_t {
+        if (t.is_slice) return 16;
+        if (t.array_len) {
+            if (!t.elem || t.array_len > uint32_t(MAX_ARRAY_LEN)) return -1;
+            int64_t es = size_of(*t.elem);
+            if (es < 0 || es > INT32_MAX / int64_t(t.array_len)) return -1;
+            return es * int64_t(t.array_len);
+        }
+        if (!t.struct_name.empty()) {
+            if (!build(t.struct_name)) return -1;
+            return out.at(t.struct_name).size;
+        }
+        int64_t size = int64_t(t.byte_size());
+        return size > 0 ? size : -1;
+    };
+    for (auto& sd : prog.structs) build(sd.name);
     return out;
 }
 
@@ -209,11 +230,14 @@ struct Checker {
     const ModuleExportTable* module_exports = nullptr;  // v0.5 cross-module exports (mod::fn resolution)
 
     // scope stack for locals/params
-    struct Var { std::string name; const Type* ty; bool is_const; };
+    struct Var { std::string name; const Type* ty; bool is_const; bool local_array_view; };
     std::vector<std::vector<Var>> scopes;
 
-    // global table: name -> type (pointer into a stable type store)
-    std::unordered_map<std::string, const Type*> globals;
+    struct GlobalVar { const Type* ty; bool is_const; };
+    std::unordered_map<std::string, GlobalVar> globals;
+    int loop_depth = 0;
+    int switch_depth = 0;
+    const Expr* aggregate_cast_init = nullptr;
 
     // Tier 1 enums (plan_ENUMS.md Section 4): (enum_name -> (variant -> i32 value)),
     // built by the enum-resolution pass (pass 1.5, before any function body is
@@ -245,19 +269,23 @@ struct Checker {
         errs.push_back({m, l, c});
     }
 
-    // Returns the scope-stack record itself (type + const-ness), or nullptr
-    // if `n` isn't a local/param (does NOT search globals - globals have no
-    // const tracking today; GlobalDecl carries no is_const field).
-    const Var* lookup_local_var(const std::string& n) {
+    // Returns the scope-stack record itself (type, constness, provenance), or
+    // nullptr if `n` isn't a local/param.
+    Var* lookup_local_var(const std::string& n) {
         for (int i = int(scopes.size())-1; i >= 0; --i)
             for (auto& v : scopes[i]) if (v.name == n) return &v;
+        return nullptr;
+    }
+    const Var* lookup_local_var(const std::string& n) const {
+        for (int i = int(scopes.size())-1; i >= 0; --i)
+            for (const auto& v : scopes[i]) if (v.name == n) return &v;
         return nullptr;
     }
 
     const Type* lookup_var(const std::string& n) {
         if (const Var* v = lookup_local_var(n)) return v->ty;
         auto it = globals.find(n);
-        if (it != globals.end()) return it->second;
+        if (it != globals.end()) return it->second.ty;
         return nullptr;
     }
 
@@ -279,6 +307,55 @@ struct Checker {
         return structs && t && !t->struct_name.empty() && structs->count(t->struct_name) != 0;
     }
 
+    // Opaque named handles and function handles use an integer machine word,
+    // but are nominal types.  Only actual, untagged integer types participate
+    // in v1's integer compatibility rule.
+    static bool is_plain_integer(const Type* t) {
+        return t && t->is_int() && !t->is_fn_handle && t->struct_name.empty();
+    }
+    bool is_by_value_aggregate(const Type* t) const {
+        return t && (t->array_len > 0 || is_registered_struct(t));
+    }
+    static int int_width(const Type* t) {
+        if (!t) return 0;
+        switch (t->prim) {
+        case Prim::I8: case Prim::U8: return 8;
+        case Prim::I16: case Prim::U16: return 16;
+        case Prim::I32: case Prim::U32: return 32;
+        case Prim::I64: case Prim::U64: return 64;
+        default: return 0;
+        }
+    }
+    static bool can_implicitly_convert(const Type* want, const Type* got) {
+        if (!want || !got) return false;
+        if (want->same(*got)) return true;
+        return is_plain_integer(want) && is_plain_integer(got) &&
+               want->is_uint() == got->is_uint() && int_width(got) < int_width(want);
+    }
+    static bool types_compatible(const Type* want, const Type* got) {
+        return want && got && want->same(*got);
+    }
+
+    // The single implicit-conversion gate for value-flow contexts.  Legal
+    // same-signedness widening is represented by the ordinary typed CastExpr
+    // so codegen sees the conversion explicitly; narrowing/signedness changes
+    // remain available only through source-level `as`.
+    const Type* check_value(ExprPtr& slot, const Type* want, bool allow_struct_ret_call = false) {
+        const Type* got = check_expr(*slot, want, allow_struct_ret_call);
+        // Integer literals retain contextual adaptation (including a fitting
+        // literal's signedness); non-literal values obey widening-only.
+        if (dynamic_cast<IntLit*>(slot.get()) && want && want->same(*got)) return got;
+        if (!can_implicitly_convert(want, got)) return got;
+        if (!want->same(*got)) {
+            auto cast = std::make_unique<CastExpr>();
+            cast->loc = slot->loc; cast->operand = std::move(slot);
+            cast->to = std::make_shared<Type>(*want); cast->ty = intern(*want);
+            slot = std::move(cast);
+            return slot->ty;
+        }
+        return got;
+    }
+
     // A struct-by-value call argument must be a bare local variable: codegen
     // (CG::eval's CallExpr struct-arg stash) copies the argument's bytes
     // directly from a known frame address, never evaluating a general
@@ -290,6 +367,15 @@ struct Checker {
         if (dynamic_cast<const Ident*>(&arg)) return;
         err("a struct-by-value argument (type '" + want->struct_name + "') must be a plain "
             "local variable, not a general expression", arg.loc.line, arg.loc.col);
+    }
+
+    void reject_large_native_aggregate(const Type* want, const Loc& loc) {
+        if (!is_registered_struct(want)) return;
+        auto it = structs->find(want->struct_name);
+        if (it != structs->end() && it->second.size > 8)
+            err("native by-value argument '" + want->struct_name + "' is " +
+                std::to_string(it->second.size) + " bytes; Ember v1 supports native "
+                "aggregate arguments only through 8 bytes", loc.line, loc.col);
     }
 
     // --- Tier 1 enums (plan_ENUMS.md) ---
@@ -361,6 +447,52 @@ struct Checker {
             check_type_not_enum(f.ret.get(), f.loc);
         }
         for (auto& g : prog->globals) check_type_not_enum(g.ty.get(), g.loc);
+    }
+
+    static bool contains_void(const Type* t) {
+        if (!t) return true;
+        if (t->is_slice || t->array_len) return !t->elem || contains_void(t->elem.get());
+        return t->is_void();
+    }
+
+    void validate_declarations() {
+        std::unordered_set<std::string> struct_names;
+        for (auto& sd : prog->structs) {
+            if (!struct_names.insert(sd.name).second)
+                err("duplicate struct declaration '" + sd.name + "'", sd.loc.line, sd.loc.col);
+            std::unordered_set<std::string> fields;
+            for (auto& fd : sd.fields) {
+                if (!fields.insert(fd.name).second)
+                    err("duplicate field '" + fd.name + "' in struct '" + sd.name + "'", sd.loc.line, sd.loc.col);
+                if (contains_void(fd.ty.get()))
+                    err("struct field '" + sd.name + "." + fd.name + "' cannot have void type", sd.loc.line, sd.loc.col);
+            }
+        }
+        for (auto& sd : prog->structs) {
+            if (!structs || !structs->count(sd.name))
+                err("struct '" + sd.name + "' has a recursive, unknown, or invalid by-value layout", sd.loc.line, sd.loc.col);
+        }
+        std::unordered_set<std::string> fn_names;
+        for (auto& f : prog->funcs) {
+            if (!fn_names.insert(f.name).second)
+                err("duplicate function declaration '" + f.name + "'", f.loc.line, f.loc.col);
+            std::unordered_set<std::string> params;
+            for (auto& p : f.params) {
+                if (!params.insert(p.name).second)
+                    err("duplicate parameter '" + p.name + "'", p.loc.line, p.loc.col);
+                if (contains_void(p.ty.get()))
+                    err("parameter '" + p.name + "' cannot have void type", p.loc.line, p.loc.col);
+            }
+        }
+        std::unordered_set<std::string> global_names;
+        for (auto& g : prog->globals) {
+            if (!global_names.insert(g.name).second)
+                err("duplicate global declaration '" + g.name + "'", g.loc.line, g.loc.col);
+            if (contains_void(g.ty.get()))
+                err("global '" + g.name + "' cannot have void type", g.loc.line, g.loc.col);
+            if (g.ty->is_slice || g.ty->array_len || is_registered_struct(g.ty.get()))
+                err("aggregate global '" + g.name + "' is unsupported in v1", g.loc.line, g.loc.col);
+        }
     }
 
     // Pass 1.7 (Section 5, the central design move): rewrite every
@@ -440,8 +572,33 @@ struct Checker {
 
     void push_scope() { scopes.emplace_back(); }
     void pop_scope()  { scopes.pop_back(); }
-    void declare(const std::string& n, const Type* t, bool is_const) {
-        if (!scopes.empty()) scopes.back().push_back({n, t, is_const});
+    void declare(const std::string& n, const Type* t, bool is_const,
+                 bool local_array_view = false, Loc loc = {0, 0}) {
+        if (scopes.empty()) return;
+        for (const auto& v : scopes.back()) {
+            if (v.name == n) {
+                err("redeclaration of '" + n + "' in the same scope", loc.line, loc.col);
+                return;
+            }
+        }
+        scopes.back().push_back({n, t, is_const, local_array_view});
+    }
+
+    bool is_local_array_view(const Expr& e) const {
+        if (dynamic_cast<const ViewExpr*>(&e)) return true;
+        if (auto* id = dynamic_cast<const Ident*>(&e)) {
+            for (int i = int(scopes.size()) - 1; i >= 0; --i)
+                for (const auto& v : scopes[size_t(i)])
+                    if (v.name == id->name) return v.local_array_view;
+        }
+        if (auto* t = dynamic_cast<const TernaryExpr*>(&e))
+            return is_local_array_view(*t->then_e) || is_local_array_view(*t->else_e);
+        return false;
+    }
+
+    static bool is_lvalue(const Expr& e) {
+        return dynamic_cast<const Ident*>(&e) || dynamic_cast<const IndexExpr*>(&e) ||
+               dynamic_cast<const FieldExpr*>(&e);
     }
 
     // --- expression type-check. returns resolved type (or nullptr on error).
@@ -617,8 +774,21 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                     e.ty = intern(type_void()); return e.ty;
                 }
                 size_t i = 0;
-                if (c->receiver) { check_expr(*c->receiver, tt->recorded_params[0].get()); ++i; }
-                for (auto& a : c->args) { check_expr(*a, tt->recorded_params[i].get()); ++i; }
+                if (c->receiver) {
+                    const Type* want = tt->recorded_params[0].get();
+                    const Type* got = check_value(c->receiver, want);
+                    if (!types_compatible(want, got))
+                        err("function handle receiver type mismatch (expected " + want->to_string() +
+                            ", got " + got->to_string() + ")", c->receiver->loc.line, c->receiver->loc.col);
+                    ++i;
+                }
+                for (auto& a : c->args) {
+                    const Type* want = tt->recorded_params[i++].get();
+                    const Type* got = check_value(a, want);
+                    if (!types_compatible(want, got))
+                        err("function handle argument type mismatch (expected " + want->to_string() +
+                            ", got " + got->to_string() + ")", a->loc.line, a->loc.col);
+                }
                 e.ty = intern(*tt->recorded_ret);
             } else {
                 for (auto& a : c->args) check_expr(*a);
@@ -695,8 +865,8 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                             }
                             // check each arg's type against the export's param types
                             for (size_t i = 0; i < c->args.size() && i < exp.params.size(); ++i) {
-                                const Type* got = check_expr(*c->args[i], &exp.params[i]);
-                                if (!got->same(exp.params[i]) && !(got->is_int() && exp.params[i].is_int()))
+                                const Type* got = check_value(c->args[i], &exp.params[i]);
+                                if (!types_compatible(&exp.params[i], got))
                                     err("cross-module arg " + std::to_string(i) + " type mismatch (expected " +
                                         exp.params[i].to_string() + ", got " + got->to_string() + ")",
                                         c->loc.line, c->loc.col);
@@ -743,8 +913,21 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                         e.ty = intern(type_void()); return e.ty;
                     }
                     size_t i = 0;
-                    if (c->receiver) { check_expr(*c->receiver, tt->recorded_params[0].get()); ++i; }
-                    for (auto& a : c->args) { check_expr(*a, tt->recorded_params[i].get()); ++i; }
+                    if (c->receiver) {
+                        const Type* want = tt->recorded_params[0].get();
+                        const Type* got = check_value(c->receiver, want);
+                        if (!types_compatible(want, got))
+                            err("function handle receiver type mismatch (expected " + want->to_string() +
+                                ", got " + got->to_string() + ")", c->receiver->loc.line, c->receiver->loc.col);
+                        ++i;
+                    }
+                    for (auto& a : c->args) {
+                        const Type* want = tt->recorded_params[i++].get();
+                        const Type* got = check_value(a, want);
+                        if (!types_compatible(want, got))
+                            err("function handle argument type mismatch (expected " + want->to_string() +
+                                ", got " + got->to_string() + ")", a->loc.line, a->loc.col);
+                    }
                     e.ty = intern(*tt->recorded_ret);
                 } else {
                     for (auto& a : c->args) check_expr(*a);
@@ -776,22 +959,24 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                 size_t off = 0;
                 if (c->receiver) {
                     const Type* want = &(*params)[0];
-                    const Type* got = check_expr(*c->receiver, want);
-                    if (!got->same(*want) && !(got->is_int() && want->is_int()) && !(got->prim==Prim::I64 && want->prim==Prim::I64))
+                    const Type* got = check_value(c->receiver, want);
+                    if (!types_compatible(want, got))
                         err("receiver of '" + c->name + "': expected " +
                             want->to_string() + ", got " + got->to_string(),
                             c->receiver->loc.line, c->receiver->loc.col);
                     check_struct_arg_shape(*c->receiver, want);
+                    reject_large_native_aggregate(want, c->receiver->loc);
                     off = 1;
                 }
                 for (size_t i = 0; i < c->args.size(); ++i) {
                     const Type* want = &(*params)[off + i];
-                    const Type* got = check_expr(*c->args[i], want);
-                    if (!got->same(*want) && !(got->is_int() && want->is_int()) && !(got->prim==Prim::I64 && want->prim==Prim::I64))
+                    const Type* got = check_value(c->args[i], want);
+                    if (!types_compatible(want, got))
                         err("arg " + std::to_string(i+1) + " of '" + c->name + "': expected " +
                             want->to_string() + ", got " + got->to_string(),
                             c->args[i]->loc.line, c->args[i]->loc.col);
                     check_struct_arg_shape(*c->args[i], want);
+                    reject_large_native_aggregate(want, c->args[i]->loc);
                 }
                 // Compile-time assertion folding (efficiency ask, part 2):
                 // when BOTH arguments to an assert_eq_* call are compile-time
@@ -892,8 +1077,8 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                     }
                     for (size_t i = 0; i < c->args.size(); ++i) {
                         const Type* want = ssi->second.params[i];
-                        const Type* got = check_expr(*c->args[i], want);
-                        if (!got->same(*want) && !(got->is_int() && want->is_int()) && !(got->prim==Prim::I64 && want->prim==Prim::I64))
+                        const Type* got = check_value(c->args[i], want);
+                        if (!types_compatible(want, got))
                             err("arg " + std::to_string(i+1) + " of '" + c->name +
                                 "': expected " + want->to_string() + ", got " + got->to_string(),
                                 c->args[i]->loc.line, c->args[i]->loc.col);
@@ -962,7 +1147,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
             }
         }
         if (is_cmp) {
-            if (!lt->same(*rt) && !(lt->is_int() && rt->is_int()))
+            if (!types_compatible(lt, rt))
                 err("comparison requires same-type operands (got " + lt->to_string() + " and " + rt->to_string() + ")",
                     b->loc.line, b->loc.col);
             e.ty = &type_bool(); return e.ty;
@@ -1001,8 +1186,28 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
         return e.ty;
     }
     if (auto* c = dynamic_cast<CastExpr*>(&e)) {
-        check_expr(*c->operand);
-        e.ty = intern(*c->to); return e.ty;
+        const Type* from = check_expr(*c->operand);
+        const Type* to = intern(*c->to);
+        // Explicit v1 cast matrix.  No representation reinterpretation is
+        // permitted: slices, aggregates, opaque handles, bool, and function
+        // handles can only take a same-type no-op cast.
+        const bool same = from && from->same(*to);
+        const bool int_to_int = is_plain_integer(from) && is_plain_integer(to);
+        const bool float_to_float = from && to && from->is_float() && to->is_float();
+        // The x64 backend currently implements signed integer/float conversion.
+        // Unsigned conversion (especially u64 above INT64_MAX) needs a distinct
+        // lowering, so it is deliberately outside the v1 cast matrix.
+        const bool int_float = (is_plain_integer(from) && !from->is_uint() && to && to->is_float()) ||
+                               (from && from->is_float() && is_plain_integer(to) && !to->is_uint());
+        if (!same && !int_to_int && !float_to_float && !int_float) {
+            err("invalid cast from '" + (from ? from->to_string() : std::string("?")) +
+                "' to '" + to->to_string() + "'", c->loc.line, c->loc.col);
+        } else if (same && is_by_value_aggregate(from) &&
+                   (aggregate_cast_init != &e || !dynamic_cast<const Ident*>(c->operand.get()))) {
+            err("same-type aggregate casts are only supported as direct local initializers from a local variable",
+                c->loc.line, c->loc.col);
+        }
+        e.ty = to; return e.ty;
     }
     if (auto* t = dynamic_cast<TernaryExpr*>(&e)) {
         const Type* ct = check_expr(*t->cond);
@@ -1016,27 +1221,41 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
     }
     if (auto* a = dynamic_cast<AssignExpr*>(&e)) {
         const Type* lt = check_expr(*a->target);
-        // const-correctness: reassigning a const-declared local is an error.
-        // Only a bare-identifier target is checked - arr[0]=... or p.f=...
-        // through a const binding is intentionally out of scope (is_const
-        // models "this binding can't be reassigned", not deep immutability).
+        if (!is_lvalue(*a->target))
+            err("assignment target is not an lvalue", a->loc.line, a->loc.col);
+        // Constness is shallow binding constness for both locals and globals.
         if (auto* tid = dynamic_cast<Ident*>(a->target.get())) {
             if (const Var* v = lookup_local_var(tid->name)) {
                 if (v->is_const)
                     err("cannot assign to const variable '" + tid->name + "'",
                         a->loc.line, a->loc.col);
+            } else {
+                auto gi = globals.find(tid->name);
+                if (gi != globals.end() && gi->second.is_const)
+                    err("cannot assign to const global '" + tid->name + "'",
+                        a->loc.line, a->loc.col);
             }
         }
-        const Type* rt = check_expr(*a->value, lt);
-        if (lt && rt && !lt->same(*rt) && !(lt->is_int() && rt->is_int()))
+        const Type* rt = a->compound ? check_expr(*a->value, lt) : check_value(a->value, lt);
+        if (lt && rt && !types_compatible(lt, rt))
             err("assignment type mismatch (" + lt->to_string() + " = " + rt->to_string() + ")",
                 a->loc.line, a->loc.col);
-        // v1.0 Tier 2 (§4.5): fn handle <-> plain i64 assignment is forbidden
-        // (closes V3 forging at the type level; the runtime guard is the backstop).
-        else if (lt && rt && lt->is_fn_handle != rt->is_fn_handle)
-            err("assignment type mismatch (" + lt->to_string() + " = " + rt->to_string() +
-                ") — a function handle is not interchangeable with a plain i64",
-                a->loc.line, a->loc.col);
+        if (auto* tid = dynamic_cast<Ident*>(a->target.get())) {
+            const bool local_view = rt && rt->is_slice && is_local_array_view(*a->value);
+            if (Var* v = lookup_local_var(tid->name)) {
+                // Until full provenance escape analysis exists, slice aliases
+                // carry the conservative local-array-view bit through every
+                // simple assignment. This closes `s = a[..]; return s;` as
+                // well as longer local alias chains.
+                if (!a->compound && v->ty && v->ty->is_slice)
+                    v->local_array_view = v->local_array_view || local_view;
+            } else {
+                auto gi = globals.find(tid->name);
+                if (gi != globals.end() && local_view)
+                    err("cannot store a slice/view derived from a local fixed array in a global",
+                        a->loc.line, a->loc.col);
+            }
+        }
         if (a->compound && lt && lt->is_float()) {
             switch (*a->compound) {
             case BinExpr::Op::Mod: case BinExpr::Op::Shl: case BinExpr::Op::Shr:
@@ -1050,6 +1269,24 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
         e.ty = lt; return e.ty;
     }
     if (auto* s = dynamic_cast<SizeofExpr*>(&e)) {
+        int64_t size = frame_byte_width(*s->ty, structs);
+        if (!s->ty->struct_name.empty() && (!structs || !structs->count(s->ty->struct_name)))
+            err("unknown type '" + s->ty->struct_name + "' in sizeof", s->loc.line, s->loc.col);
+        else if (size < 0 || size == INT64_MAX)
+            err("invalid type in sizeof", s->loc.line, s->loc.col);
+        else s->resolved = uint64_t(size);
+        e.ty = intern(make_prim(Prim::U64)); return e.ty;
+    }
+    if (auto* o = dynamic_cast<OffsetofExpr*>(&e)) {
+        if (!o->ty->is_struct() || !structs || !structs->count(o->ty->struct_name)) {
+            err("unknown struct type '" + o->ty->to_string() + "' in offsetof", o->loc.line, o->loc.col);
+        } else {
+            auto& layout = structs->at(o->ty->struct_name);
+            auto fit = layout.fields.find(o->field);
+            if (fit == layout.fields.end())
+                err("struct '" + o->ty->struct_name + "' has no field '" + o->field + "'", o->loc.line, o->loc.col);
+            else o->resolved = uint64_t(fit->second.offset);
+        }
         e.ty = intern(make_prim(Prim::U64)); return e.ty;
     }
     if (auto* ix = dynamic_cast<IndexExpr*>(&e)) {
@@ -1149,9 +1386,14 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                 continue;
             }
             const Type* want = fit->second.ty;
-            const Type* got = check_expr(*kv.second, want);
-            if (!got->same(*want) && !(got->is_int() && want->is_int()))
+            const Type* got = check_value(kv.second, want);
+            if (!types_compatible(want, got))
                 err("field '" + kv.first + "' type mismatch (expected " + want->to_string() + ", got " + got->to_string() + ")",
+                    kv.second->loc.line, kv.second->loc.col);
+            if (is_registered_struct(want) &&
+                !dynamic_cast<const Ident*>(kv.second.get()) &&
+                !dynamic_cast<const StructLit*>(kv.second.get()))
+                err("nested struct field '" + kv.first + "' must be initialized from a local or struct literal",
                     kv.second->loc.line, kv.second->loc.col);
         }
         // v1: every field must be explicitly initialized (keeps codegen
@@ -1181,6 +1423,8 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
         // The confirmed exploit was `let a: u8[65536];` -> SIGSEGV (no cap).
         // Also catches V6-overflow (array_len so large byte_size wraps).
         if (ls->ty) {
+            if (contains_void(ls->ty.get()))
+                err("local '" + ls->name + "' cannot have void type", ls->loc.line, ls->loc.col);
             int64_t w = frame_byte_width(*ls->ty, structs);
             if (w > MAX_FRAME_BYTES) {
                 err("local '" + ls->name + "' frame size (" + std::to_string(w) +
@@ -1197,7 +1441,7 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
             // no initializer (parser only allows this for explicitly-typed
             // let/const, never auto): declare at the stated type, default
             // zero-filled by codegen.
-            declare(ls->name, intern(*ls->ty), ls->is_const);
+            declare(ls->name, intern(*ls->ty), ls->is_const, false, ls->loc);
             return;
         }
         // Pass the declared type as `expected` (when there is one) so the
@@ -1209,32 +1453,34 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
         // couldn't work even in principle - the literal never saw what type
         // was wanted.
         const Type* expected_ty = ls->is_auto ? nullptr : intern(*ls->ty);
-        const Type* init_ty = check_expr(*ls->init, expected_ty, true);
+        const Expr* saved_aggregate_cast_init = aggregate_cast_init;
+        aggregate_cast_init = ls->init.get();
+        const Type* init_ty = expected_ty ? check_value(ls->init, expected_ty, true)
+                                          : check_expr(*ls->init, nullptr, true);
+        aggregate_cast_init = saved_aggregate_cast_init;
         const Type* decl_ty;
         if (ls->is_auto) decl_ty = init_ty;
-        else { decl_ty = expected_ty; if (!decl_ty->same(*init_ty) && !(decl_ty->is_int()&&init_ty->is_int())
-            && !(decl_ty->prim==Prim::I64 && init_ty->prim==Prim::I64))
-            err("let type mismatch (" + decl_ty->to_string() + " = " + init_ty->to_string() + ")",
-                ls->loc.line, ls->loc.col);
-            // v1.0 Tier 2 (plan_FUNCTION_REFS.md §4.5): a fn handle and a plain
-            // i64 are NOT assignable either direction, even though both are_int()
-            // — closes V3-style forging (assigning a forged i64 to a fn-typed
-            // var) at the type level. The runtime guard (§5) is the last line.
-            else if (decl_ty->is_fn_handle != init_ty->is_fn_handle)
-                err("let type mismatch (" + decl_ty->to_string() + " = " + init_ty->to_string() +
-                    ") — a function handle is not interchangeable with a plain i64",
+        else {
+            decl_ty = expected_ty;
+            if (!types_compatible(decl_ty, init_ty))
+                err("let type mismatch (" + decl_ty->to_string() + " = " + init_ty->to_string() + ")",
                     ls->loc.line, ls->loc.col);
         }
-        declare(ls->name, decl_ty, ls->is_const);
+        if (contains_void(decl_ty))
+            err("local '" + ls->name + "' cannot have void type", ls->loc.line, ls->loc.col);
+        declare(ls->name, decl_ty, ls->is_const, is_local_array_view(*ls->init), ls->loc);
         return;
     }
     if (auto* es = dynamic_cast<ExprStmt*>(&s)) { check_expr(*es->expr); return; }
     if (auto* rs = dynamic_cast<ReturnStmt*>(&s)) {
         returns = true;
         if (rs->value) {
-            const Type* vt = check_expr(*rs->value, ret_ty, true);
-            if (ret_ty && !vt->same(*ret_ty) && !(ret_ty->is_int()&&vt->is_int()))
+            const Type* vt = check_value(rs->value, ret_ty, true);
+            if (ret_ty && !types_compatible(ret_ty, vt))
                 err("return type mismatch (got " + vt->to_string() + ", fn returns " + ret_ty->to_string() + ")",
+                    rs->loc.line, rs->loc.col);
+            if (vt && vt->is_slice && is_local_array_view(*rs->value))
+                err("cannot return a slice/view derived from a local fixed array",
                     rs->loc.line, rs->loc.col);
             // A struct-returning function's `return` value must be a bare
             // local (codegen copies its bytes through the hidden return
@@ -1275,11 +1521,19 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
     if (auto* ws = dynamic_cast<WhileStmt*>(&s)) {
         const Type* ct = check_expr(*ws->cond);
         if (!ct->is_bool()) err("while condition must be bool", ws->loc.line, ws->loc.col);
-        push_scope(); bool r=false; check_block(ws->body, ret_ty, r); pop_scope();
+        ++loop_depth; push_scope(); bool r=false; check_block(ws->body, ret_ty, r); pop_scope(); --loop_depth;
         return; // while doesn't guarantee return (condition may be false first)
     }
-    if (dynamic_cast<BreakStmt*>(&s)) return;
-    if (dynamic_cast<ContinueStmt*>(&s)) return;
+    if (dynamic_cast<BreakStmt*>(&s)) {
+        if (loop_depth == 0 && switch_depth == 0)
+            err("break is only valid inside a loop or switch", s.loc.line, s.loc.col);
+        return;
+    }
+    if (dynamic_cast<ContinueStmt*>(&s)) {
+        if (loop_depth == 0)
+            err("continue is only valid inside a loop", s.loc.line, s.loc.col);
+        return;
+    }
     if (auto* bs = dynamic_cast<BlockStmt*>(&s)) {
         push_scope(); check_block(bs->block, ret_ty, returns); pop_scope(); return;
     }
@@ -1308,16 +1562,20 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
         return;
     }
     if (auto* fs = dynamic_cast<ForStmt*>(&s)) {
+        ++loop_depth;
         push_scope();
         if (fs->init) check_stmt(*fs->init, ret_ty, returns);
         if (fs->cond) { const Type* ct = check_expr(*fs->cond); if(!ct->is_bool()) err("for cond must be bool", fs->loc.line, fs->loc.col); }
         if (fs->step) check_expr(*fs->step);
         bool r=false; check_block(fs->body, ret_ty, r);
         pop_scope();
+        --loop_depth;
         return;
     }
     if (auto* ds = dynamic_cast<DoWhileStmt*>(&s)) {
+        ++loop_depth;
         push_scope(); bool r=false; check_block(ds->body, ret_ty, r); pop_scope();
+        --loop_depth;
         if (ds->cond) { const Type* ct = check_expr(*ds->cond); if(!ct->is_bool()) err("do-while cond must be bool", ds->loc.line, ds->loc.col); }
         return;
     }
@@ -1327,6 +1585,7 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
             err("switch subject must be an integer or bool (got " + subj_ty->to_string() + ")",
                 sw->loc.line, sw->loc.col);
         bool seen_default = false;
+        ++switch_depth;
         for (auto& c : sw->cases) {
             if (c.is_default) {
                 if (seen_default) err("switch has more than one 'default' case", sw->loc.line, sw->loc.col);
@@ -1345,10 +1604,16 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
             bool r = false;
             check_block(c.body, ret_ty, r);
             pop_scope();
+            if (!c.body.stmts.empty()) {
+                Stmt* last = c.body.stmts.back().get();
+                if (!dynamic_cast<BreakStmt*>(last) && !dynamic_cast<ReturnStmt*>(last))
+                    err("nonempty switch case must end with break or return; implicit fallthrough is not allowed",
+                        last->loc.line, last->loc.col);
+            }
         }
-        // v1: conservative - a switch never proves the function returns on
-        // every path (case fallthrough + optional default make that analysis
-        // non-trivial, and no script currently relies on it).
+        --switch_depth;
+        // Conservative: switch does not prove a return unless a future CFG
+        // analysis establishes exhaustive all-return cases.
         returns = false;
         return;
     }
@@ -1373,7 +1638,7 @@ void Checker::check_func(FuncDecl& f) {
     // return convention. The only restrictions live at call sites, not here:
     // check_struct_arg_shape (a by-value argument must be a bare local) and
     // the CallExpr/ReturnStmt position checks for struct-returning calls.
-    for (auto& p : f.params) declare(p.name, intern(*p.ty), false);
+    for (auto& p : f.params) declare(p.name, intern(*p.ty), false, false, p.loc);
     const Type* ret_ty = intern(*f.ret);
     bool returns = false;
     check_block(f.body, ret_ty, returns);
@@ -1464,7 +1729,7 @@ SemaResult sema(Program& prog,
 
     // register globals (stable type pointers via intern)
     for (auto& g : prog.globals) {
-        c.globals[g.name] = c.intern(*g.ty);
+        if (!c.globals.count(g.name)) c.globals[g.name] = {c.intern(*g.ty), g.is_const};
     }
     // Tier 1 enums (plan_ENUMS.md Section 4): pass 1.5 resolve variant values
     // + build the (enum,variant)->i32 table and the enum_names set; pass 1.6
@@ -1475,6 +1740,7 @@ SemaResult sema(Program& prog,
     // an EnumAccessExpr at all (Section 5: codegen stays untouched).
     c.resolve_enums();
     c.check_declared_types_not_enum();
+    c.validate_declarations();
     for (auto& g : prog.globals) {
         if (g.init) c.lower_enum_access_expr(g.init);
     }
@@ -1510,6 +1776,18 @@ SemaResult sema(Program& prog,
             }
         }
         c.script_sigs[f.name] = ss;
+    }
+
+    // Global initializers obey the same nominal assignment barrier as locals.
+    // Check them after signatures are registered so any initializer call has
+    // the normal native/script result type available.
+    for (auto& g : prog.globals) {
+        if (!g.init) continue;
+        const Type* want = c.globals[g.name].ty;
+        const Type* got = c.check_value(g.init, want);
+        if (!Checker::types_compatible(want, got))
+            c.err("global initializer type mismatch (" + want->to_string() + " = " +
+                  got->to_string() + ")", g.loc.line, g.loc.col);
     }
 
     // check each function

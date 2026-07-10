@@ -133,5 +133,5 @@ native+hot-reload binding. AngelScript's decl-string parsing and Mun's LLVM
 backend are both explicitly skipped as overkill for the performance and
 compile-latency goals here. The v0.1 implementation (encoder, label/patch,
 exec-mem, IR data model, `.em` serializer/loader) is the first concrete
-realization of this conclusion; see `CODEGEN_SPEC.md` Section 12 + Section 15 for the
+realization of this conclusion; see `CODEGEN_SPEC.md` Section 14 + Section 15 for the
 acceptance suite that proves it.

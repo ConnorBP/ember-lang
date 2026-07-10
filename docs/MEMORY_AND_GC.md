@@ -1,13 +1,7 @@
 # ember - memory & ownership spec
 
-Detail doc for DESIGN.md Section 7. Frame layout ownership, arena allocator,
-
-> **Implementation status: v0.1** - this is the v1.0 design spec. The
-> current repo implements the JIT codegen proof (encoder, label/patch,
-> exec-mem, `.em` format). See `README.md` for what's shipped; see
-> `CODEGEN_SPEC.md` Section 12 + Section 15 for the acceptance suite. This doc's
-> content is the target design, not a claim of current implementation.
-host-object references, string/array representation, v2 GC deferral.
+Detail doc for DESIGN.md Section 7. Frame ownership, host-object references,
+string/array representation, and explicitly deferred arena/GC designs.
 
 ## 1. Ownership taxonomy (every byte a script touches falls into
 exactly one of these)
@@ -21,10 +15,9 @@ exactly one of these)
    handed a `slice`/struct pointer into via a native call return or a
    host-mapped struct field (TYPE_SYSTEM.md Section 4). Lifetime is entirely
    the host's responsibility; ember never frees it, never tracks it.
-3. **Module-global storage** - script `global` variables
-   (`set_global`/`get_global`, DESIGN.md Section 8), one fixed block per
-   `module_t`, allocated once at compile time, lives exactly as long
-   as the `module_t`, survives reload (HOT_RELOAD.md Section 6).
+3. **Module-global storage** - supported scalar/handle `global` variables,
+   one fixed block per compiled/loaded module. It is independent of individual
+   function pages and is unchanged by the shipped single-function reload.
 4. **Arena storage** (v1: unused unless a future feature needs
    script-owned dynamic allocation - see Section 5; documented now so the
    plan has an answer ready, not because v0.x milestones need it).
@@ -68,7 +61,7 @@ into the current frame. This is safe **only** because:
   Section 4): if a `return` expression's static type is `slice<T>` and its
   value was constructed via a local `arr[..]` view within *this same
   function body* (tracked via a simple "provenance" tag carried on
-  the IR value during lowering - not full escape analysis, just "was
+  the typed AST during sema - not full borrow checking, just "was
   this slice value's ptr derived from a local array view with no
   intervening native call," which is decidable locally per-function),
   it's a **compile error** ("cannot return a slice viewing a local
@@ -92,11 +85,9 @@ into the current frame. This is safe **only** because:
 
 ## 4. Module-global storage
 
-- Allocated as one contiguous block per `module_t`, sized at compile
-  time (sum of all `global` declarations' sizes, laid out with the
-  same offset/alignment rules as TYPE_SYSTEM.md Section 2's struct layout  - 
-  reusing one layout algorithm everywhere rather than inventing a
-  second one).
+- v1 global storage supports scalar/handle globals only: one eight-byte slot
+  per declaration. Sema rejects slice, fixed-array, and by-value struct globals;
+  a typed aggregate global layout remains deferred.
 - Access from JIT'd code: each global's frame offset within this block
   is a compile-time constant, so a global read/write compiles to
   `mov reg, [globals_base_imm64 + offset]` - `globals_base` is an
@@ -105,14 +96,9 @@ into the current frame. This is safe **only** because:
   block's address is stable for the `module_t`'s lifetime, never
   moves, so baking it in is safe and avoids an extra indirection a
   RIP-relative or table-lookup scheme would cost).
-- **Reload and globals**: HOT_RELOAD.md Section 6 already states globals
-  survive reload untouched - concretely, this works because the
-  globals block is owned by the `module_t`, not by any individual
-  function's compiled code; recompiling a function just changes what
-  offset-into-globals-block instructions it emits (if the global
-  layout itself is unchanged, which it is - reload never changes
-  global *declarations*, only function *bodies*, so offsets are
-  stable across reload by construction, no migration needed).
+- **Reload and globals**: the shipped single-function reload changes only one
+  dispatch slot/page and cannot change declarations, so global slots remain
+  untouched. Whole-module declaration/layout migration is deferred.
 - **Global initializer**: evaluated once at `ember_compile` time (for
   compile-time-constant initializers - the only kind allowed in v1,
   matching `auto`'s restriction to no-solver-needed cases, TYPE_SYSTEM.md
@@ -135,9 +121,9 @@ struct Arena {
 void* arena_alloc(Arena*, size_t size, size_t align); // bump offset up, aligned; OOM -> runtime_error (SAFETY_AND_SANDBOX.md Section 7), not silent null
 void  arena_reset(Arena*, size_t mark = 0);            // rewind offset, invalidates everything allocated after `mark`
 ```
-- One arena per `context_t` (matches checkpoint/epoch/depth-counter
-  scoping already established, HOT_RELOAD.md Section 5, SAFETY_AND_SANDBOX.md
-  Section 2/Section 4 - `context_t` is already the natural per-execution-session
+- One arena per `context_t` (matching checkpoint/depth-counter scoping in
+  SAFETY_AND_SANDBOX.md Section 2/Section 4; no epoch field ships) is the
+  proposed natural per-execution-session
   scope for all of these).
 - **Reset point**: an explicit `arena_reset` called by the host between
   logical units of work (e.g. once per game frame, or once per
@@ -169,7 +155,7 @@ source (`"hello"`) is emitted as a `RipFixup`-referenced rodata blob
 (CODEGEN_SPEC.md Section 4) embedded in the *literal's containing function's*
 compiled code - i.e. string literals are function-local rodata, valid
 for exactly as long as that function's code page is alive (which, per
-HOT_RELOAD.md Section 5's epoch reclamation, is at least as long as any
+HOT_RELOAD.md Section 5's caller-owned retirement (and deferred concurrent reclamation), is at least as long as any
 in-flight call into that function version - so a literal's lifetime
 is never shorter than any code that could reference it). A slice
 value derived from a literal follows the same "cannot escape via

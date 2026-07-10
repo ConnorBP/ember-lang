@@ -40,10 +40,10 @@ wiring to the B1 model (the `--tick` thread-safety bug, fixed), and a demo
 script (`examples/scripts/dynamic_registration.ember`). See
 `docs/v1.0_INTEGRATION_NOTES.md` §5.
 
-`ctest` is now 17 targets (the batch took it from 14 to 16 by adding
-`thread_safety` and `function_refs` — `ext_sync` was wired in the preceding
-WIP commit; `ext_lifecycle` added the 17th). 17/17 green. The four `plan_*.md`
-files in `docs/` are the historical plans for this batch, left as-is.
+The current tree configures 20 CTest tests when the AngelScript SDK is present
+and 19 when it is absent (only the benchmark is conditional). The four
+`plan_*.md` files in `docs/` are historical design records; shipped contracts
+in the main docs take precedence where those plans describe earlier states.
 
 ## Tier 0 - standard addon set (ships with v1.0, host C++ side)
 
@@ -51,17 +51,20 @@ These are not language features - they're `NativeFn` addons using the
 stable v1 binding API, delivered as part of a v1.0 release so mods are
 actually writable (`GAP_ANALYSIS.md` Section 3):
 
-- **`array<T>`** - host-allocated growable buffer behind an i64 handle.
-  `push`/`pop`/`get`/`set`/`len`/`remove`/`clear`. Internal bounds
-  checks in every indexing native.
-- **`map<K,V>`** - hash map behind an i64 handle.
-  `get`/`set`/`contains`/`remove`/`len`/iter-via-`slice` of keys.
-- **`string` (mutable)** - `array<u8>` specialization + format/concat/
-  find/substr natives. `f"..."` interpolation lowers to `__fmt`.
-- **`math`** - sin/cos/sqrt/floor/ceil/abs/min/max/pow (f32 + f64).
-- **`vec2/vec3/vec4`, `quat`, `mat4`** - registered as host-mapped
-  structs with operator overloads (`TypeBuilder.bin_add` etc.), the
-  one place v1's operator-overload API earns its keep for game work.
+- **`array`** ✓ limited v1 API — opaque i64 buffer handle with new/length/
+  resize, typed u8/f32/i64 get/set, and `array_push_u8`. Generic push,
+  pop/remove/clear are deferred.
+- **`map<K,V>`** — deferred; no map extension exists.
+- **`string`** ✓ limited v1 API — opaque nominal handle with construction,
+  from-slice/scalar conversion, length/character access, identity, concat and
+  equality. find/substr/general format natives are deferred. F-strings lower
+  through `__fstring_to_string` to `string_from_*`/identity; no `__fmt` exists.
+- **`math`** ✓ limited v1 API — f32 `sqrt`/`sin`/`cos`/`tan`; broader f32/f64
+  math is deferred.
+- **`vec2/vec3/vec4`, `quat`, `mat4`** ✓ opaque nominal handles with
+  constructors/accessors and registered overloads. `sync` ✓ provides atomics,
+  swap buffers, and SPSC/MPSC/MPMC queues; `lifecycle` ✓ provides dynamic
+  routine registration.
 
 **Trigger to build:** v1.0 milestone. No JIT/type-system changes
 needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.

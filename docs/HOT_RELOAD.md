@@ -1,13 +1,9 @@
 # ember - hot reload spec
 
-Detail doc for DESIGN.md Section 6. Dispatch table layout, reload protocol,
-
-> **Implementation status: v0.1** - this is the v1.0 design spec. The
-> current repo implements the JIT codegen proof (encoder, label/patch,
-> exec-mem, `.em` format). See `README.md` for what's shipped; see
-> `CODEGEN_SPEC.md` Section 12 + Section 15 for the acceptance suite. This doc's
-> content is the target design, not a claim of current implementation.
-reclamation, concurrency.
+Detail doc for DESIGN.md Section 6. v1 ships atomic single-function
+replacement with signature validation and caller-managed, single-threaded
+page retirement. Concurrent reclamation and broader reload workflows are
+labeled deferred below.
 
 ## 1. Dispatch table layout
 
@@ -30,29 +26,17 @@ struct DispatchTable {
   (CODEGEN_SPEC.md Section 7: callers bake in `slot*8` as part of their
   compiled code, so slot renumbering would require recompiling every
   caller, which defeats the purpose).
-- **`std::atomic<void*>` not plain `void*`**: a slot write during
-  reload (Section 3) must be observed atomically by any thread concurrently
-  executing a `call [slot]` - relaxed-order atomic store is
-  sufficient on x86-64 (aligned 8-byte stores are already atomic at
-  the hardware level; the `std::atomic` wrapper is here for the C++
-  memory model's sake and to stop the optimizer from doing anything
-  unexpected, not because x86-64 needs extra instructions for it  - 
-  `mov [slot], reg` compiles the same either way on this target).
+- **`std::atomic<void*>` not plain `void*`**: slot publication uses a
+  `std::memory_order_release` store and readers use
+  `std::memory_order_acquire` loads. This is the actual `DispatchTable`
+  contract and publishes finalized code before a caller observes its address.
 
-## 2. New function added after initial compile
+## 2. Added/removed functions (deferred)
 
-- Adding a brand-new function to a module (not present at initial
-  compile) via reload gets the **next available slot index**
-  (`count++`), growing the table if `count == capacity` (realloc to a
-  new, larger `slots` array - see Section 5 for why growing is safe even
-  with concurrent readers). Existing functions' slots are untouched.
-- A function *removed* from source on reload: its slot is repointed
-  to the shared `ember_trap_removed_function` stub (same non-returning
-  trap pattern as SAFETY_AND_SANDBOX.md Section 2/Section 7) rather than freed/
-  reused - slot indices are never recycled in v1 (simpler than
-  tracking a free-list, and script modules realistically have at most
-  a few hundred functions, so slot-table growth is not a real memory
-  concern).
+v1 `reload_function` replaces exactly one function already present in the
+module. Adding functions, growing a live dispatch table, and repointing removed
+functions to a trap stub are not implemented. Those operations belong to a
+future whole-module reload transaction.
 
 ## 3. Reload protocol (single function)
 
@@ -74,14 +58,12 @@ new_source)`:
    be the same size; in-flight calls (Section 4) may still be executing the
    old bytes at the moment of the swap, so the old page must remain
    valid and unmodified until provably unreferenced.
-3. Atomically store the new address into `slots[fn.slot_index]`
-   (`std::memory_order_release` store; call sites load with implicit
-   acquire-enough ordering since x86-64 loads are already
-   acquire-ordered by the hardware - again the atomic wrapper is
-   about correctness-on-paper for the C++ memory model rather than
-   needing a fence instruction on this target).
-4. Old code page is handed to the epoch reclamation scheme (Section 5)  - 
-   not freed synchronously.
+3. Atomically store the new address into `slots[fn.slot_index]` with a
+   `std::memory_order_release` store. `DispatchTable::get` uses an explicit
+   `std::memory_order_acquire` load.
+4. Old code page is returned to the caller for retirement. The shipped path
+   is single-threaded/caller-owned: free only when no call can be in flight.
+   Concurrent epoch/quiescence reclamation is deferred (Section 5).
 5. Host is notified via an optional reload callback (mirrors a typical
    native-JIT scripting language's `reload()` returning success/failure, DESIGN.md Section 8's
    `ember_reload_function` signature) - no separate "reload event"
@@ -116,91 +98,32 @@ new_source)`:
   probably on the stack" (a host-level policy, not an ember mechanism)
   - documented as a known, deliberate limitation, not an oversight.
 
-## 5. Old code page reclamation (epoch scheme)
+## 5. Old code page reclamation (deferred for concurrent hosts)
 
-```cpp
-struct RetiredCodePage {
-    void*    ptr;
-    size_t   size;
-    uint64_t retired_epoch;
-};
-```
-- `context_t` (not `module_t` - depth counters and checkpoints already
-  live per-context, SAFETY_AND_SANDBOX.md Section 2/Section 4, so epoch tracking
-  fits the same place) increments a per-context `current_epoch`
-  counter each time `ember_call` is entered at the *outermost* level
-  (not on nested calls - one bump per top-level host->script
-  invocation is enough granularity; this is deliberately coarse, we
-  are not trying to reclaim memory within microseconds of a reload,
-  just "eventually, safely, without a tracing GC").
-- On reload (Section 3 step 4), the retired old page is stamped with the
-  module's **maximum currently-observed epoch across all live
-  contexts at the moment of the swap** (module keeps a registry of
-  its live `context_t*`s for exactly this read - cheap, reload is a
-  rare/manual operation, not a hot path, so an O(live_contexts) scan
-  here is fine).
-- A background/periodic sweep (called by the host, or invoked
-  automatically on the next reload - either is acceptable, v1 just
-  needs *a* trigger, not necessarily automatic-on-a-timer) frees any
-  `RetiredCodePage` whose `retired_epoch` is less than the current
-  minimum epoch across all live contexts (standard epoch-based
-  reclamation - a page retired at epoch E is safe to free once every
-  context has advanced past E, since that means no context could
-  still be inside a call that started before the swap).
-- **Why not refcount the code page instead**: refcounting would need
-  an increment on every `call [slot]` and decrement on every return  - 
-  a cost on the hot path for something that only matters during the
-  rare reload event. Epoch counting only costs one increment per
-  *top-level* `ember_call`, which is already the coarse granularity
-  the rest of the safety model (checkpoints, Section 2's non-local unwind
-  scope) operates at. Consistent with "pay for reload-safety on the
-  reload path, not on every call."
-- **v1 simplification**: if a host never calls the sweep, retired
-  pages simply accumulate (a documented, bounded-by-reload-frequency
-  leak, acceptable since reload is a development-time/manual-ops
-  action, not something happening thousands of times per second in
-  production) - a real production deployment is expected to call the
-  sweep periodically (e.g. once per game-server tick, cheap
-  epoch-min computation) or on each reload; this is a host-integration
-  detail documented here, not a hidden gotcha.
+`reload_function` returns the old entry page without freeing it. In the shipped
+single-threaded model, the caller owns retirement and frees that page only
+after it knows no invocation can still execute it. There is no context epoch,
+live-context registry, quiescence API, or background sweep in v1.
 
-## 6. Whole-module reload
+A concurrent host requires an explicit epoch/quiescence protocol before it can
+reclaim old pages; implementing that protocol remains deferred. Such a host
+must retain retired pages (safe but leaking) or establish its own stop-the-world
+quiescent point. This section is a boundary statement, not a speculative epoch
+architecture presented as shipped behavior.
 
-- `reload(module_t*, source, len, filename)` (DESIGN.md Section 8, mirrors
-  a typical native-JIT scripting language's `reload`) recompiles every function in the new source in one
-  batch, matching each by name against the module's existing slot
-  table:
-  - Name exists in both old and new source: slot repointed as in Section 3
-    (per-function, but batched - all-or-nothing at the *parse/sema*
-    stage: if *any* function in the new source fails to compile, the
-    whole `reload()` call fails and **no slots are touched at all**,
-    same "never leave a partially-broken module" guarantee as Section 3 step
-    1, just scoped to the whole batch instead of one function).
-  - Name exists only in old: repointed to the removed-function trap
-    stub (Section 2).
-  - Name exists only in new: assigned a fresh slot (Section 2).
-- Globals (`set_global`/`get_global`, DESIGN.md Section 8) are **preserved
-  across reload** - a reload only touches function slots and their
-  associated code pages, never the module's global-variable storage
-  (a separate, stable block, MEMORY_AND_GC.md Section 4) - this matches the
-  "hot reload changes behavior, not state" expectation from Mun-style
-  hot-reloading workflows (RESEARCH_NOTES.md).
+## 6. Whole-module reload (deferred)
+
+No whole-module reload API ships in v1. Consequently, transactional batch
+replacement, added-function slot assignment, removed-function trap stubs, and
+global-layout migration are deferred. The shipped single-function path does
+not alter global declarations or storage.
 
 ## 7. Host-to-script calls through the dispatch table
 
-- Host code invoking a script function by name (`ember_call`) looks
-  up the slot once (by name -> index, a hash map maintained
-  alongside the table, rebuilt/updated whenever a function is
-  added/removed) and issues an indirect call through it - same
-  mechanism as script-to-script calls (CODEGEN_SPEC.md Section 7), just
-  initiated from native code instead of JIT'd code. This means
-  host->script calls are automatically reload-safe with **zero extra
-  work**: there's no separate "host caches a raw function pointer"
-  API that could go stale - `ember_call` always re-resolves through
-  the table by name on every invocation (a hash lookup per call, cheap
-  relative to actually running a script function, and avoids an
-  entire class of "host held a stale pointer across a reload" bugs by
-  construction).
+- Shipped hosts resolve a stable slot index/name and invoke the current address
+  from the dispatch table. The raw B1 thunks accept an entry pointer rather
+  than a function name, so the host must fetch the slot again after reload and
+  must not cache an old raw entry pointer.
 - Annotation-discovered event handlers (`@on_tick`, `@event(...)`,
   DESIGN.md Section 2/Section 8) are looked up by name the same way - the host
   caches the *name* (or a resolved slot index if it wants to skip the

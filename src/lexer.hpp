@@ -48,6 +48,8 @@ struct Token {
     double   fvalue = 0;
     bool     bvalue = false;
     bool     f32_suffix = false;  // float literal had `f`/`F` suffix -> f32
+    // Integer width suffixes are intentionally unsupported in v1; the lexer
+    // rejects them rather than consuming syntax without semantic metadata.
 };
 
 struct LexResult {

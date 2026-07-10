@@ -43,6 +43,13 @@
 // ModuleRegistryBase (reserved; used only if cross-module import lands). The
 // `kind` space is versioned with the format (BUNDLING_AND_EM_MODULES.md Section 2.7);
 // a new kind requires a version bump.
+//
+// TRUST/PORTABILITY NOTE: v1 code can embed process-local native-function,
+// trap-stub, function-reference allowlist, and string-storage pointers which
+// are not represented by these relocation kinds. A v1 `.em` is therefore
+// ABI/process-trusted native code, not a portable or untrusted-code container.
+// TODO(v2): symbolic signatures/import binding and authentication/signatures
+// require a versioned format; do not reinterpret or silently extend v1.
 
 #pragma once
 
@@ -64,6 +71,18 @@ constexpr uint32_t EM_NO_ENTRY = 0xFFFFFFFFu; // entry_slot when no @entry fn
 // Header size in bytes (7 u32 fields + 3 u32 reserved). Kept as a constant so
 // the writer and loader agree on the fixed prefix length.
 constexpr uint32_t EM_HEADER_SIZE = 40u;
+
+// Conservative v1 parser limits. These are part of the load contract: every
+// disk-controlled count/size is checked before reserve/resize/allocation.
+constexpr uint64_t MAX_FILE_SIZE       = 256ull * 1024ull * 1024ull;
+constexpr uint32_t MAX_FUNCTIONS       = 16u * 1024u;
+constexpr uint32_t MAX_GLOBALS         = 64u * 1024u * 1024u; // bytes in globals block
+constexpr uint32_t MAX_CODE_PER_FN     = 16u * 1024u * 1024u;
+constexpr uint32_t MAX_RODATA_PER_FN   = 16u * 1024u * 1024u;
+constexpr uint32_t MAX_RELOCS_PER_FN   = 256u * 1024u;
+constexpr uint32_t MAX_SLOTS           = 64u * 1024u;
+constexpr uint32_t MAX_NAMES           = 64u * 1024u;
+constexpr uint32_t MAX_NAME_SIZE       = 4u * 1024u;
 
 // ---- on-disk reloc (POD, mirrors x64_emitter.hpp::AbsFixup) ----
 //
@@ -102,8 +121,10 @@ struct EmFunctionRecord {
 };
 
 // A whole `.em` module in memory. `functions` is in no required order; the
-// loader indexes by `slot_index`. `globals` is the raw initial-value bytes
-// copied verbatim into the allocated globals block. `entry_slot` is
+// loader indexes by `slot_index`. `globals` is the raw initialized byte block
+// copied verbatim into the allocated globals block; producers must pass the
+// post-initializer bytes rather than manufacturing a fresh zero-filled block.
+// `entry_slot` is
 // `EM_NO_ENTRY` if the module has no @entry function. `name_table` is the
 // name->slot directory (for `ember_call` by name, HOT_RELOAD.md Section 7).
 struct EmModule {

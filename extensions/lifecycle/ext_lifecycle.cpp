@@ -5,17 +5,16 @@
 // check, register_natives/reset, host accessor). One TU per extensions/README.md
 // purity. The routine table is a std::vector<RoutineSlot>; register appends +
 // returns the 1-based id; unregister tombstones (marks active=false, O(1)); reset
-// clears. Not synchronized — register_routine/unregister are single-script-thread
-// ops under the U2 contract (the script side is single-threaded per context); the
-// HOST reads host_routines() on its own thread, which is safe because the host
-// either (a) reads after the script's @entry completes (the common case — the
-// script registers in @entry, the host ticks after), or (b) the host treats the
-// read as approximate (a snapshot). A std::atomic flag or mutex would be added
-// only if a real concurrent-register-while-ticking use case appears (YAGNI).
+// clears. A mutex protects registration, unregistration, reset, snapshots,
+// and counts so vector growth/tombstoning cannot race host readers. The host
+// receives an owned snapshot; no lock is held while invoking a routine.
 #include "ext_lifecycle.hpp"
 #include "ast.hpp"
 #include "binding_builder.hpp"
 #include <vector>
+#include <mutex>
+#include <new>
+#include <stdexcept>
 
 using namespace ember;  // bind_handle, BindingBuilder, type_* singletons, make_prim
 
@@ -28,21 +27,27 @@ struct RoutineSlot {
 };
 static std::vector<RoutineSlot> g_routines;
 static std::vector<int64_t>     g_free;   // free-list of freed ids (tombstones)
+static std::mutex               g_mutex;
 
 extern "C" {
     // register_routine(fn handle, i64 data) -> i64 routine_id (1-based).
     // The handle is the slot index (from &fn in the script). We store it + data.
     static int64_t n_register_routine(int64_t handle, int64_t data) {
-        if (!g_free.empty()) {
-            int64_t id = g_free.back(); g_free.pop_back();
-            g_routines[size_t(id - 1)] = {true, handle, data};
-            return id;
-        }
-        g_routines.push_back({true, handle, data});
-        return int64_t(g_routines.size());   // 1-based id
+        try {
+            std::lock_guard<std::mutex> guard(g_mutex);
+            if (!g_free.empty()) {
+                int64_t id = g_free.back(); g_free.pop_back();
+                g_routines[size_t(id - 1)] = {true, handle, data};
+                return id;
+            }
+            g_routines.push_back({true, handle, data});
+            return int64_t(g_routines.size());   // 1-based id
+        } catch (const std::bad_alloc&) { return 0; }
+          catch (const std::length_error&) { return 0; }
     }
     // unregister_routine(i64 id) -> i64 (1 = removed, 0 = no such id).
     static int64_t n_unregister_routine(int64_t id) {
+        std::lock_guard<std::mutex> guard(g_mutex);
         if (id < 1 || id > int64_t(g_routines.size())) return 0;
         auto& s = g_routines[size_t(id - 1)];
         if (!s.active) return 0;
@@ -65,11 +70,13 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
 }
 
 void reset() {
+    std::lock_guard<std::mutex> guard(g_mutex);
     g_routines.clear();
     g_free.clear();
 }
 
 std::vector<Routine> host_routines() {
+    std::lock_guard<std::mutex> guard(g_mutex);
     std::vector<Routine> out;
     for (size_t i = 0; i < g_routines.size(); ++i) {
         const auto& s = g_routines[i];
@@ -79,6 +86,7 @@ std::vector<Routine> host_routines() {
 }
 
 int64_t host_count() {
+    std::lock_guard<std::mutex> guard(g_mutex);
     int64_t c = 0;
     for (const auto& s : g_routines) if (s.active) ++c;
     return c;

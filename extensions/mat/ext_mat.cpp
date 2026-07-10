@@ -38,8 +38,10 @@ extern "C" {
     // standard row-major 4x4 matrix product (not component-wise)
     static int64_t n_mat4_mul(int64_t a, int64_t b) {
         auto* x=m4_slot(a); auto* y=m4_slot(b);
+        if (!x || !y) return 0;
         int64_t h = m4_new_zero();
         auto* out = m4_slot(h);
+        if (!out) return 0;
         for (int r=0;r<4;++r) for (int c=0;c<4;++c) {
             float sum=0;
             for (int k=0;k<4;++k) sum += x->m[size_t(r*4+k)] * y->m[size_t(k*4+c)];
@@ -49,6 +51,7 @@ extern "C" {
     }
     static int64_t n_mat4_eq(int64_t a, int64_t b) {
         auto* x=m4_slot(a); auto* y=m4_slot(b);
+        if (!x || !y) return 0;
         for (int i=0;i<16;++i) if (x->m[size_t(i)] != y->m[size_t(i)]) return 0;
         return 1;
     }
@@ -61,8 +64,8 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
     BindingBuilder b;
     b.add("mat4_new",      bind_handle("mat4"), {},                   (void*)&n_mat4_new);
     b.add("mat4_identity", bind_handle("mat4"), {},                   (void*)&n_mat4_identity);
-    b.add("mat4_get", type_f32(), {type_i64(),type_i64(),type_i64()}, (void*)&n_mat4_get);
-    b.add("mat4_set", type_void(), {type_i64(),type_i64(),type_i64(),type_f32()}, (void*)&n_mat4_set);
+    b.add("mat4_get", type_f32(), {bind_handle("mat4"),type_i64(),type_i64()}, (void*)&n_mat4_get);
+    b.add("mat4_set", type_void(), {bind_handle("mat4"),type_i64(),type_i64(),type_f32()}, (void*)&n_mat4_set);
     NativeTable t = b.build();
     for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }

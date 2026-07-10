@@ -15,6 +15,7 @@ fn sum_arr(buf: i64[]) -> i64 {
     return total;
 }
 
-fn make_view(arr: i64[8]) -> i64[] {
-    return arr[..];
+fn first(arr: i64[8]) -> i64 {
+    let view: i64[] = arr[..];
+    return view[0];
 }

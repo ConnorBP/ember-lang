@@ -26,6 +26,16 @@
 // cross-module call site with no registry to bind to would execute a wild
 // jump on the first call, which is worse than a loud load-time reject.
 //
+// TRUST/PORTABILITY NOTE: v1 `.em` is ABI/process-trusted native code. It can
+// embed process-local native-function, trap-stub, function-reference allowlist,
+// and string-storage pointers for which v1 has no relocation/binding record.
+// Consequently it is not a portable cross-process artifact and is not an
+// untrusted-code container. `.em` imports likewise have no serialized canonical
+// signatures in v1 and must be treated as ABI-trusted rather than link-verified.
+// TODO(v2): symbolic bindings, canonical import/export signatures, and optional
+// signature/authentication support require a versioned format; do not silently
+// change or reinterpret v1.
+//
 // prism port note (RESTRUCTURE_PLAN.md Section 5): the standalone loader used an
 // RAII `ExecArena` per function (owning a VirtualAlloc page); prism's
 // `jit_memory` is simpler - `alloc_executable`/`free_executable` return/own
@@ -72,7 +82,12 @@ struct LoadedModule {
     std::vector<std::pair<std::string, uint32_t>>   name_table;  // name -> slot (for ember_call by name)
     uint32_t                                       entry_slot = EM_NO_ENTRY;
 
+    LoadedModule() = default;
     ~LoadedModule();
+    LoadedModule(const LoadedModule&) = delete;
+    LoadedModule& operator=(const LoadedModule&) = delete;
+    LoadedModule(LoadedModule&& other) noexcept;
+    LoadedModule& operator=(LoadedModule&& other) noexcept;
 
     // Look up a function's entry by name (returns nullptr if not found).
     // O(n) linear scan of name_table; n is small (one entry per exported
@@ -87,8 +102,9 @@ struct LoadedModule {
 // Load a `.em` file from `path`. Returns true and fills `out` on success;
 // returns false and sets *err on any failure (bad magic, bad version, I/O,
 // truncated read, unknown reloc kind, a kind-2 reloc with no `registry`). On
-// failure `out` is left in a partially-filled state - caller should discard
-// it (its destructor frees any pages already allocated).
+// failure `out` is unchanged: parsing/validation and executable pages are
+// staged privately, and no dispatch entry/page is published until every
+// function and relocation has validated, patched, and sealed successfully.
 //
 // `registry` is optional (additive, default nullptr): when non-null, kind-2
 // (ModuleRegistryBase) relocs are patched with `registry->base()` (MODULES.md
@@ -98,11 +114,9 @@ struct LoadedModule {
 // GlobalsBase) are always patched with the loaded module's own dispatch table
 // / globals - they do not need a registry.
 //
-// The loader never throws on a malformed file; all failures surface as
-// `false` + a short `*err` message. The only allocation failure path is
-// `alloc_executable` returning nullptr (VirtualAlloc OOM), which surfaces as
-// a normal `false` return with an "alloc failed" message (matching the JIT
-// path's null-check policy rather than the standalone's throw).
+// No-throw boundary: malformed files, I/O failures, allocation failures, and
+// standard-library exceptions all surface as `false` plus a categorized
+// `*err` message. Disk-controlled counts/sizes are bounded before allocation.
 bool load_em_file(const char* path, LoadedModule& out, std::string* err,
                   ModuleRegistry* registry = nullptr);
 

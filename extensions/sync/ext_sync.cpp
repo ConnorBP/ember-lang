@@ -6,13 +6,11 @@
 // guard #8 compliance notes). One TU per the extensions/README.md purity
 // rule (self-contained, depends only on ember public headers + stdlib).
 //
-// Host store per primitive: std::vector<Slot>, 1-based handles, slot(h)
-// bounds check. Lifetime: free() pushes the slot index onto a free-list
-// (tombstone, O(1)); new() pops from the free-list or appends; reset()
-// clears everything. Leaks if a script forgets free() -- documented, not
-// prevented, mirroring ext_array. new/free are single-script-thread ops
-// (the store they mutate is not synchronized for concurrent new/free
-// because the script side is single-threaded per context under U2).
+// Host store per primitive: vector<shared_ptr<Slot>>, 1-based handles. One
+// store-management mutex serializes lookup/publication, alloc/free, and reset
+// across contexts. A lookup returns a shared ownership lease, so vector growth,
+// free, or reset cannot invalidate an acquired slot; primitive operations on
+// that stable slot remain lockless (except MPMC's own queue mutex).
 //
 // Memory-ordering policy (per plan S2.3/S3.3/S4.3):
 //   - Atomics: load=acquire, store=release, RMW=acq_rel. (seq_cst would also
@@ -36,20 +34,18 @@
 #include "binding_builder.hpp"  // BindingBuilder: add() registration
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
+#include <stdexcept>
 #include <vector>
 
 using namespace ember;  // bind_handle, BindingBuilder, type_* singletons, make_prim
 
-// The slots hold std::atomic / std::mutex members, which are non-copyable
-// AND non-movable. A std::vector<Slot> would need to move slots on grow,
-// which is ill-formed. Holding the slots by std::unique_ptr keeps the
-// 1-based index-into-vector shape (the vector holds movable pointers; the
-// non-movable slot lives at a stable heap address) -- the standard idiom
-// for "vector of atomics." Handles still index the vector; slot(h) bounds-
-// checks the 1-based index AND null-checks the pointer (a freed slot is
-// reset to nullptr, reused on new from the free-list).
+// Slots contain non-movable atomics/mutexes and therefore live behind
+// shared_ptr. Besides keeping stable addresses across vector growth, shared
+// ownership closes the lookup-vs-free/reset lifetime race.
 
 namespace ember::ext_sync {
 
@@ -58,6 +54,12 @@ namespace ember::ext_sync {
 // must agree never to push INT64_MIN. Host accessors return bool+value so
 // host C++ consumers never see this.
 static constexpr int64_t EMPTY_SENTINEL = INT64_MIN;
+// Hard allocation ceiling for each sync container, including both swap-buffer
+// sides and all per-producer rings in an MPSC container.
+static constexpr uint64_t MAX_CONTAINER_BYTES = uint64_t(1) << 30;
+static constexpr int64_t MAX_I64_SLOTS = int64_t(MAX_CONTAINER_BYTES / sizeof(int64_t));
+static constexpr size_t MAX_STORE_SLOTS = size_t(1) << 20;
+static std::recursive_mutex g_store_mutex;
 
 // ============================================================================
 // 1. ATOMICS (int-only; aint8/16/32/64). Plan S2.
@@ -71,12 +73,13 @@ struct AtomicSlot {
     std::atomic<int64_t> v{0};
     int width = 64;            // 8/16/32/64 -- store/fetch_add mask to this
 };
-static std::vector<std::unique_ptr<AtomicSlot>> g_atomics;
+static std::vector<std::shared_ptr<AtomicSlot>> g_atomics;
 static std::vector<int64_t>                   g_atomics_free;
 
-static AtomicSlot* atom_slot(int64_t h) {
-    if (h < 1 || h > int64_t(g_atomics.size())) return nullptr;
-    return g_atomics[size_t(h - 1)].get();   // freed slot -> nullptr (unique_ptr reset)
+static std::shared_ptr<AtomicSlot> atom_slot(int64_t h) {
+    std::lock_guard<std::recursive_mutex> guard(g_store_mutex);
+    if (h < 1 || h > int64_t(g_atomics.size())) return {};
+    return g_atomics[size_t(h - 1)];
 }
 
 // Mask a value to the atomic's width so an aint8 genuinely holds 8 bits
@@ -97,18 +100,20 @@ static int64_t atom_mask(int64_t v, int width) {
 }
 
 static int64_t atom_alloc(int width, int64_t init) {
+    std::lock_guard<std::recursive_mutex> guard(g_store_mutex);
     if (width != 8 && width != 16 && width != 32 && width != 64) width = 64;
     init = atom_mask(init, width);
     if (!g_atomics_free.empty()) {
         int64_t idx = g_atomics_free.back();
         g_atomics_free.pop_back();
         auto& slot = g_atomics[size_t(idx - 1)];
-        slot = std::make_unique<AtomicSlot>();
+        slot = std::make_shared<AtomicSlot>();
         slot->width = width;
         slot->v.store(init, std::memory_order_relaxed);  // slot is exclusively ours
         return idx;
     }
-    g_atomics.push_back(std::make_unique<AtomicSlot>());
+    if (g_atomics.size() >= MAX_STORE_SLOTS) return 0;
+    g_atomics.push_back(std::make_shared<AtomicSlot>());
     auto& s = g_atomics.back();
     s->width = width;
     s->v.store(init, std::memory_order_relaxed);
@@ -117,21 +122,23 @@ static int64_t atom_alloc(int width, int64_t init) {
 
 extern "C" {
     static int64_t n_atomic_new(int64_t width, int64_t init) {
-        return atom_alloc(int(width), init);
+        try { return atom_alloc(int(width), init); }
+        catch (const std::bad_alloc&) { return 0; }
+        catch (const std::length_error&) { return 0; }
     }
     static int64_t n_atomic_load(int64_t h) {
-        auto* s = atom_slot(h);
+        auto s = atom_slot(h);
         return s ? s->v.load(std::memory_order_acquire) : 0;
     }
     static void n_atomic_store(int64_t h, int64_t v) {
-        auto* s = atom_slot(h);
+        auto s = atom_slot(h);
         if (s) s->v.store(atom_mask(v, s->width), std::memory_order_release);
     }
     // fetch_add: for width<64 wrap modulo 2^width via a CAS loop (the
     // standard fetch_add would overflow the int64_t, not the width). For
     // width==64 a plain fetch_add is fine. Returns the OLD value. Plan S2.3.
     static int64_t n_atomic_fetch_add(int64_t h, int64_t delta) {
-        auto* s = atom_slot(h); if (!s) return 0;
+        auto s = atom_slot(h); if (!s) return 0;
         if (s->width == 64) {
             return s->v.fetch_add(delta, std::memory_order_acq_rel);
         }
@@ -147,7 +154,7 @@ extern "C" {
         }
     }
     static int64_t n_atomic_fetch_sub(int64_t h, int64_t delta) {
-        auto* s = atom_slot(h); if (!s) return 0;
+        auto s = atom_slot(h); if (!s) return 0;
         if (s->width == 64) {
             return s->v.fetch_sub(delta, std::memory_order_acq_rel);
         }
@@ -164,7 +171,7 @@ extern "C" {
     // ABI without a bool-marshalling special case (mirrors array_get_u8
     // returning i64 even for a u8). Plan S2.2.
     static int64_t n_atomic_cas(int64_t h, int64_t expected, int64_t desired) {
-        auto* s = atom_slot(h); if (!s) return 0;
+        auto s = atom_slot(h); if (!s) return 0;
         desired = atom_mask(desired, s->width);
         // compare_exchange_strong modifies `expected` on failure to the
         // current value -- that's a host-local var, not a script-visible
@@ -175,29 +182,33 @@ extern "C" {
         return ok ? 1 : 0;
     }
     static int64_t n_atomic_swap(int64_t h, int64_t v) {
-        auto* s = atom_slot(h); if (!s) return 0;
+        auto s = atom_slot(h); if (!s) return 0;
         return s->v.exchange(atom_mask(v, s->width), std::memory_order_acq_rel);
     }
     static void n_atomic_free(int64_t h) {
-        if (atom_slot(h)) {
-            g_atomics[size_t(h - 1)].reset();   // free the slot, keep the vector index
-            g_atomics_free.push_back(h);
-        }
+        try {
+            std::lock_guard<std::recursive_mutex> guard(g_store_mutex);
+            if (atom_slot(h)) {
+                g_atomics_free.reserve(g_atomics_free.size() + 1);
+                g_atomics[size_t(h - 1)].reset();
+                g_atomics_free.push_back(h);
+            }
+        } catch (const std::exception&) { /* leave the live slot unchanged */ }
     }
 }
 
 bool atomic_load_host(int64_t handle, int64_t* out_val) {
-    auto* s = atom_slot(handle); if (!s) return false;
+    auto s = atom_slot(handle); if (!s) return false;
     *out_val = s->v.load(std::memory_order_acquire);
     return true;
 }
 bool atomic_store_host(int64_t handle, int64_t val) {
-    auto* s = atom_slot(handle); if (!s) return false;
+    auto s = atom_slot(handle); if (!s) return false;
     s->v.store(atom_mask(val, s->width), std::memory_order_release);
     return true;
 }
 bool atomic_cas_host(int64_t handle, int64_t expected, int64_t desired, bool* out_swapped) {
-    auto* s = atom_slot(handle); if (!s) return false;
+    auto s = atom_slot(handle); if (!s) return false;
     desired = atom_mask(desired, s->width);
     *out_swapped = s->v.compare_exchange_strong(expected, desired,
                     std::memory_order_acq_rel, std::memory_order_acquire);
@@ -220,45 +231,47 @@ struct SwapBufSlot {
     std::atomic<int>     front{0};   // 0 or 1 -- which side the script writes
     int64_t              cap = 0;
 };
-static std::vector<std::unique_ptr<SwapBufSlot>> g_swapbufs;
+static std::vector<std::shared_ptr<SwapBufSlot>> g_swapbufs;
 static std::vector<int64_t>                    g_swapbufs_free;
 
-static SwapBufSlot* swapbuf_slot(int64_t h) {
-    if (h < 1 || h > int64_t(g_swapbufs.size())) return nullptr;
-    return g_swapbufs[size_t(h - 1)].get();
+static std::shared_ptr<SwapBufSlot> swapbuf_slot(int64_t h) {
+    std::lock_guard<std::recursive_mutex> guard(g_store_mutex);
+    if (h < 1 || h > int64_t(g_swapbufs.size())) return {};
+    return g_swapbufs[size_t(h - 1)];
 }
 
 static int64_t swapbuf_alloc(int64_t cap) {
-    if (cap < 0) cap = 0;
+    std::lock_guard<std::recursive_mutex> guard(g_store_mutex);
+    if (cap < 0 || uint64_t(cap) > MAX_CONTAINER_BYTES / (2 * sizeof(int64_t))) return 0;
+    auto fresh = std::make_shared<SwapBufSlot>();
+    fresh->cap = cap;
+    fresh->side[0].assign(size_t(cap), 0);
+    fresh->side[1].assign(size_t(cap), 0);
+    fresh->front.store(0, std::memory_order_relaxed);
     if (!g_swapbufs_free.empty()) {
         int64_t idx = g_swapbufs_free.back();
         g_swapbufs_free.pop_back();
-        auto& slot = g_swapbufs[size_t(idx - 1)];
-        slot = std::make_unique<SwapBufSlot>();
-        slot->cap = cap;
-        slot->side[0].assign(size_t(cap), 0);
-        slot->side[1].assign(size_t(cap), 0);
-        slot->front.store(0, std::memory_order_relaxed);
+        g_swapbufs[size_t(idx - 1)] = std::move(fresh);
         return idx;
     }
-    g_swapbufs.push_back(std::make_unique<SwapBufSlot>());
-    auto& s = g_swapbufs.back();
-    s->cap = cap;
-    s->side[0].assign(size_t(cap), 0);
-    s->side[1].assign(size_t(cap), 0);
-    s->front.store(0, std::memory_order_relaxed);
+    if (g_swapbufs.size() >= MAX_STORE_SLOTS) return 0;
+    g_swapbufs.push_back(std::move(fresh));
     return int64_t(g_swapbufs.size());
 }
 
 extern "C" {
-    static int64_t n_swapbuf_new(int64_t cap) { return swapbuf_alloc(cap); }
+    static int64_t n_swapbuf_new(int64_t cap) {
+        try { return swapbuf_alloc(cap); }
+        catch (const std::bad_alloc&) { return 0; }
+        catch (const std::length_error&) { return 0; }
+    }
     static int64_t n_swapbuf_capacity(int64_t h) {
-        auto* s = swapbuf_slot(h); return s ? s->cap : 0;
+        auto s = swapbuf_slot(h); return s ? s->cap : 0;
     }
     // Write to the FRONT (script-owned) side. Plain store -- safe because only
     // the script thread touches the front side; only the front INDEX is atomic.
     static void n_swapbuf_write(int64_t h, int64_t idx, int64_t val) {
-        auto* s = swapbuf_slot(h); if (!s) return;
+        auto s = swapbuf_slot(h); if (!s) return;
         if (idx < 0 || idx >= s->cap) return;   // bounds: out-of-range is a no-op (mirrors ext_array)
         int f = s->front.load(std::memory_order_acquire);
         s->side[f][size_t(idx)] = val;
@@ -266,7 +279,7 @@ extern "C" {
     // Read the BACK (host-owned) side. Symmetric accessor for the
     // script-consumes case; the host typically reaches in via swapbuf_back_ptr.
     static int64_t n_swapbuf_read(int64_t h, int64_t idx) {
-        auto* s = swapbuf_slot(h); if (!s) return 0;
+        auto s = swapbuf_slot(h); if (!s) return 0;
         if (idx < 0 || idx >= s->cap) return 0;  // bounds: out-of-range -> 0 (mirrors ext_array)
         int b = 1 - s->front.load(std::memory_order_acquire);
         return s->side[b][size_t(idx)];
@@ -274,34 +287,40 @@ extern "C" {
     // The one atomic op: flip front<->back. fetch_xor(1, acq_rel): release on
     // the publisher's cell writes, acquire on the reader's cell reads.
     static void n_swapbuf_swap(int64_t h) {
-        auto* s = swapbuf_slot(h); if (!s) return;
+        auto s = swapbuf_slot(h); if (!s) return;
         s->front.fetch_xor(1, std::memory_order_acq_rel);
     }
     static void n_swapbuf_free(int64_t h) {
-        if (swapbuf_slot(h)) { g_swapbufs[size_t(h - 1)].reset(); g_swapbufs_free.push_back(h); }
+        try {
+            std::lock_guard<std::recursive_mutex> guard(g_store_mutex);
+            if (swapbuf_slot(h)) {
+                g_swapbufs_free.reserve(g_swapbufs_free.size() + 1);
+                g_swapbufs[size_t(h - 1)].reset(); g_swapbufs_free.push_back(h);
+            }
+        } catch (const std::exception&) { /* leave the live slot unchanged */ }
     }
 }
 
 bool swapbuf_back_ptr(int64_t handle, int64_t** out_data, int64_t* out_len) {
-    auto* s = swapbuf_slot(handle); if (!s) return false;
+    auto s = swapbuf_slot(handle); if (!s) return false;
     int b = 1 - s->front.load(std::memory_order_acquire);
     *out_data = s->side[b].data();
     *out_len  = s->cap;
     return true;
 }
 int64_t swapbuf_front_index_host(int64_t handle) {
-    auto* s = swapbuf_slot(handle); if (!s) return -1;
+    auto s = swapbuf_slot(handle); if (!s) return -1;
     return int64_t(s->front.load(std::memory_order_acquire));
 }
 bool swapbuf_front_write_host(int64_t handle, int64_t idx, int64_t val) {
-    auto* s = swapbuf_slot(handle); if (!s) return false;
+    auto s = swapbuf_slot(handle); if (!s) return false;
     if (idx < 0 || idx >= s->cap) return false;
     int f = s->front.load(std::memory_order_acquire);
     s->side[f][size_t(idx)] = val;
     return true;
 }
 bool swapbuf_swap_host(int64_t handle) {
-    auto* s = swapbuf_slot(handle); if (!s) return false;
+    auto s = swapbuf_slot(handle); if (!s) return false;
     s->front.fetch_xor(1, std::memory_order_acq_rel);
     return true;
 }
@@ -323,39 +342,46 @@ struct SpscSlot {
     std::atomic<int64_t> tail{0};    // consumer reads here (only consumer touches)
     int64_t cap = 0;                 // power of two
 };
-static std::vector<std::unique_ptr<SpscSlot>> g_spsc;
+static std::vector<std::shared_ptr<SpscSlot>> g_spsc;
 static std::vector<int64_t>                  g_spsc_free;
 
-static SpscSlot* spsc_slot(int64_t h) {
-    if (h < 1 || h > int64_t(g_spsc.size())) return nullptr;
-    return g_spsc[size_t(h - 1)].get();
+static std::shared_ptr<SpscSlot> spsc_slot(int64_t h) {
+    std::lock_guard<std::recursive_mutex> guard(g_store_mutex);
+    if (h < 1 || h > int64_t(g_spsc.size())) return {};
+    return g_spsc[size_t(h - 1)];
 }
 
-// Round capacity up to a power of two (>=1) so %cap is & (cap-1).
-static int64_t round_up_pow2(int64_t v) {
-    if (v < 1) v = 1;
+// Round capacity up to a power of two without signed overflow.  Zero retains
+// the historical minimum-capacity behavior; negative and >1 GiB requests fail.
+static bool round_up_pow2(int64_t requested, int64_t* out) {
+    if (requested < 0) return false;
+    uint64_t v = requested == 0 ? 1 : uint64_t(requested);
+    if (v > uint64_t(MAX_I64_SLOTS)) return false;
     --v;
     v |= v >> 1; v |= v >> 2; v |= v >> 4;
     v |= v >> 8; v |= v >> 16; v |= v >> 32;
-    return v + 1;
+    ++v;
+    if (v > uint64_t(MAX_I64_SLOTS)) return false;
+    *out = int64_t(v);
+    return true;
 }
 
-static int64_t spsc_alloc(int64_t cap) {
-    cap = round_up_pow2(cap);
+static int64_t spsc_alloc(int64_t requested_cap) {
+    std::lock_guard<std::recursive_mutex> guard(g_store_mutex);
+    int64_t cap = 0;
+    if (!round_up_pow2(requested_cap, &cap)) return 0;
+    auto fresh = std::make_shared<SpscSlot>();
+    fresh->cap = cap;
+    fresh->buf.assign(size_t(cap), 0);
+    fresh->head.store(0, std::memory_order_relaxed);
+    fresh->tail.store(0, std::memory_order_relaxed);
     if (!g_spsc_free.empty()) {
         int64_t idx = g_spsc_free.back(); g_spsc_free.pop_back();
-        auto& slot = g_spsc[size_t(idx - 1)];
-        slot = std::make_unique<SpscSlot>();
-        slot->cap = cap;
-        slot->buf.assign(size_t(cap), 0);
-        slot->head.store(0, std::memory_order_relaxed);
-        slot->tail.store(0, std::memory_order_relaxed);
+        g_spsc[size_t(idx - 1)] = std::move(fresh);
         return idx;
     }
-    g_spsc.push_back(std::make_unique<SpscSlot>());
-    auto& s = g_spsc.back();
-    s->cap = cap;
-    s->buf.assign(size_t(cap), 0);
+    if (g_spsc.size() >= MAX_STORE_SLOTS) return 0;
+    g_spsc.push_back(std::move(fresh));
     return int64_t(g_spsc.size());
 }
 
@@ -381,32 +407,42 @@ static bool spsc_try_pop_impl(SpscSlot* s, int64_t* out) {
 }
 
 extern "C" {
-    static int64_t n_spsc_new(int64_t cap) { return spsc_alloc(cap); }
+    static int64_t n_spsc_new(int64_t cap) {
+        try { return spsc_alloc(cap); }
+        catch (const std::bad_alloc&) { return 0; }
+        catch (const std::length_error&) { return 0; }
+    }
     static int64_t n_spsc_push(int64_t h, int64_t v) {
-        return spsc_push_impl(spsc_slot(h), v) ? 1 : 0;
+        return spsc_push_impl(spsc_slot(h).get(), v) ? 1 : 0;
     }
     static int64_t n_spsc_try_pop(int64_t h) {
         int64_t v = 0;
-        return spsc_try_pop_impl(spsc_slot(h), &v) ? v : EMPTY_SENTINEL;
+        return spsc_try_pop_impl(spsc_slot(h).get(), &v) ? v : EMPTY_SENTINEL;
     }
     static int64_t n_spsc_size(int64_t h) {
-        auto* s = spsc_slot(h); if (!s) return 0;
+        auto s = spsc_slot(h); if (!s) return 0;
         int64_t hd = s->head.load(std::memory_order_acquire);
         int64_t tl = s->tail.load(std::memory_order_acquire);
         return hd - tl;                          // approximate (cross-thread)
     }
     static void n_spsc_free(int64_t h) {
-        if (spsc_slot(h)) { g_spsc[size_t(h - 1)].reset(); g_spsc_free.push_back(h); }
+        try {
+            std::lock_guard<std::recursive_mutex> guard(g_store_mutex);
+            if (spsc_slot(h)) {
+                g_spsc_free.reserve(g_spsc_free.size() + 1);
+                g_spsc[size_t(h - 1)].reset(); g_spsc_free.push_back(h);
+            }
+        } catch (const std::exception&) { /* leave the live slot unchanged */ }
     }
 }
 bool spsc_push_host(int64_t handle, int64_t val, bool* out_pushed) {
-    auto* s = spsc_slot(handle); if (!s) return false;
-    *out_pushed = spsc_push_impl(s, val);
+    auto s = spsc_slot(handle); if (!s) return false;
+    *out_pushed = spsc_push_impl(s.get(), val);
     return true;
 }
 bool spsc_try_pop_host(int64_t handle, int64_t* out_val, bool* out_popped) {
-    auto* s = spsc_slot(handle); if (!s) return false;
-    *out_popped = spsc_try_pop_impl(s, out_val);
+    auto s = spsc_slot(handle); if (!s) return false;
+    *out_popped = spsc_try_pop_impl(s.get(), out_val);
     return true;
 }
 
@@ -431,38 +467,66 @@ struct MpscSlot {
     std::vector<int64_t> producers;  // SPSC handles, one per producer slot
     std::atomic<int64_t> cursor{0};   // round-robin index (single consumer)
 };
-static std::vector<std::unique_ptr<MpscSlot>> g_mpsc;
+static std::vector<std::shared_ptr<MpscSlot>> g_mpsc;
 static std::vector<int64_t>                  g_mpsc_free;
 
-static MpscSlot* mpsc_slot(int64_t h) {
-    if (h < 1 || h > int64_t(g_mpsc.size())) return nullptr;
-    return g_mpsc[size_t(h - 1)].get();
+static std::shared_ptr<MpscSlot> mpsc_slot(int64_t h) {
+    std::lock_guard<std::recursive_mutex> guard(g_store_mutex);
+    if (h < 1 || h > int64_t(g_mpsc.size())) return {};
+    return g_mpsc[size_t(h - 1)];
 }
 
-static int64_t mpsc_alloc(int64_t cap, int64_t producer_count) {
-    if (producer_count < 1) producer_count = 1;
-    if (!g_mpsc_free.empty()) {
-        int64_t idx = g_mpsc_free.back(); g_mpsc_free.pop_back();
-        auto& slot = g_mpsc[size_t(idx - 1)];
-        slot = std::make_unique<MpscSlot>();
-        for (int64_t i = 0; i < producer_count; ++i) slot->producers.push_back(spsc_alloc(cap));
-        slot->cursor.store(0, std::memory_order_relaxed);
-        return idx;
+static int64_t mpsc_alloc(int64_t requested_cap, int64_t producer_count) {
+    std::lock_guard<std::recursive_mutex> guard(g_store_mutex);
+    if (producer_count < 0) return 0;
+    if (producer_count == 0) producer_count = 1;
+    int64_t cap = 0;
+    if (!round_up_pow2(requested_cap, &cap)) return 0;
+    const uint64_t per_producer = uint64_t(cap) * sizeof(int64_t) + sizeof(int64_t);
+    if (uint64_t(producer_count) > MAX_CONTAINER_BYTES / per_producer) return 0;
+
+    auto fresh = std::make_shared<MpscSlot>();
+    fresh->producers.reserve(size_t(producer_count));
+    // Reserve rollback bookkeeping before creating any child rings.  Once
+    // this succeeds, the catch path below cannot allocate while restoring
+    // every child handle to the free list.
+    g_spsc_free.reserve(g_spsc_free.size() + size_t(producer_count));
+    try {
+        for (int64_t i = 0; i < producer_count; ++i) {
+            int64_t ph = spsc_alloc(cap);
+            if (ph == 0) throw std::bad_alloc();
+            fresh->producers.push_back(ph);
+        }
+        fresh->cursor.store(0, std::memory_order_relaxed);
+        if (!g_mpsc_free.empty()) {
+            int64_t idx = g_mpsc_free.back(); g_mpsc_free.pop_back();
+            g_mpsc[size_t(idx - 1)] = std::move(fresh);
+            return idx;
+        }
+        if (g_mpsc.size() >= MAX_STORE_SLOTS) throw std::length_error("sync store capacity");
+        g_mpsc.push_back(std::move(fresh));
+        return int64_t(g_mpsc.size());
+    } catch (...) {
+        for (auto ph : fresh->producers) {
+            if (spsc_slot(ph)) {
+                g_spsc[size_t(ph - 1)].reset();
+                g_spsc_free.push_back(ph);
+            }
+        }
+        throw;
     }
-    g_mpsc.push_back(std::make_unique<MpscSlot>());
-    auto& s = g_mpsc.back();
-    for (int64_t i = 0; i < producer_count; ++i) s->producers.push_back(spsc_alloc(cap));
-    return int64_t(g_mpsc.size());
 }
 
 extern "C" {
     static int64_t n_mpsc_new(int64_t cap, int64_t producer_count) {
-        return mpsc_alloc(cap, producer_count);
+        try { return mpsc_alloc(cap, producer_count); }
+        catch (const std::bad_alloc&) { return 0; }
+        catch (const std::length_error&) { return 0; }
     }
     // Returns the i64 producer sub-handle (a SPSC handle). The script passes
     // this to mpsc_push. Mirrors how a host would hand out per-producer rings.
     static int64_t n_mpsc_producer_handle(int64_t h, int64_t idx) {
-        auto* s = mpsc_slot(h); if (!s) return 0;
+        auto s = mpsc_slot(h); if (!s) return 0;
         if (idx < 0 || idx >= int64_t(s->producers.size())) return 0;
         return s->producers[size_t(idx)];
     }
@@ -471,20 +535,20 @@ extern "C" {
     // that wants to push must first get its producer handle. (This is the
     // two-handle shape; document it.)
     static int64_t n_mpsc_push(int64_t producer_h, int64_t v) {
-        return spsc_push_impl(spsc_slot(producer_h), v) ? 1 : 0;
+        return spsc_push_impl(spsc_slot(producer_h).get(), v) ? 1 : 0;
     }
     // Round-robin all producer rings, pop the first non-empty. Single consumer
     // -- only the consumer touches `cursor`, so it's relaxed on the consumer's
     // own load; the per-ring acquire/release does the cross-thread ordering.
     static int64_t n_mpsc_try_pop(int64_t h) {
-        auto* s = mpsc_slot(h); if (!s) return EMPTY_SENTINEL;
+        auto s = mpsc_slot(h); if (!s) return EMPTY_SENTINEL;
         int64_t n = int64_t(s->producers.size());
         int64_t start = s->cursor.load(std::memory_order_relaxed);
         for (int64_t i = 0; i < n; ++i) {
             int64_t idx = (start + i) % n;
-            auto* ring = spsc_slot(s->producers[size_t(idx)]);
+            auto ring = spsc_slot(s->producers[size_t(idx)]);
             int64_t v = 0;
-            if (spsc_try_pop_impl(ring, &v)) {
+            if (spsc_try_pop_impl(ring.get(), &v)) {
                 s->cursor.store((idx + 1) % n, std::memory_order_relaxed);
                 return v;
             }
@@ -492,10 +556,10 @@ extern "C" {
         return EMPTY_SENTINEL;
     }
     static int64_t n_mpsc_size(int64_t h) {
-        auto* s = mpsc_slot(h); if (!s) return 0;
+        auto s = mpsc_slot(h); if (!s) return 0;
         int64_t total = 0;
         for (auto ph : s->producers) {
-            auto* ring = spsc_slot(ph);
+            auto ring = spsc_slot(ph);
             if (ring) {
                 int64_t hd = ring->head.load(std::memory_order_acquire);
                 int64_t tl = ring->tail.load(std::memory_order_acquire);
@@ -505,29 +569,33 @@ extern "C" {
         return total;
     }
     static void n_mpsc_free(int64_t h) {
-        auto* s = mpsc_slot(h); if (!s) return;
-        // Free each producer ring too (they're owned by the container).
-        for (auto ph : s->producers) {
-            if (spsc_slot(ph)) { g_spsc[size_t(ph - 1)].reset(); g_spsc_free.push_back(ph); }
-        }
-        g_mpsc[size_t(h - 1)].reset();
-        g_mpsc_free.push_back(h);
+        try {
+            std::lock_guard<std::recursive_mutex> guard(g_store_mutex);
+            auto s = mpsc_slot(h); if (!s) return;
+            g_spsc_free.reserve(g_spsc_free.size() + s->producers.size());
+            g_mpsc_free.reserve(g_mpsc_free.size() + 1);
+            for (auto ph : s->producers) {
+                if (spsc_slot(ph)) { g_spsc[size_t(ph - 1)].reset(); g_spsc_free.push_back(ph); }
+            }
+            g_mpsc[size_t(h - 1)].reset();
+            g_mpsc_free.push_back(h);
+        } catch (const std::exception&) { /* leave all live slots unchanged */ }
     }
 }
 bool mpsc_push_host(int64_t handle, int64_t val, bool* out_pushed) {
     // The host accessor takes the PRODUCER sub-handle (same as the native).
-    auto* s = spsc_slot(handle); if (!s) return false;
-    *out_pushed = spsc_push_impl(s, val);
+    auto s = spsc_slot(handle); if (!s) return false;
+    *out_pushed = spsc_push_impl(s.get(), val);
     return true;
 }
 bool mpsc_try_pop_host(int64_t handle, int64_t* out_val, bool* out_popped) {
-    auto* s = mpsc_slot(handle); if (!s) return false;
+    auto s = mpsc_slot(handle); if (!s) return false;
     int64_t n = int64_t(s->producers.size());
     int64_t start = s->cursor.load(std::memory_order_relaxed);
     for (int64_t i = 0; i < n; ++i) {
         int64_t idx = (start + i) % n;
-        auto* ring = spsc_slot(s->producers[size_t(idx)]);
-        if (spsc_try_pop_impl(ring, out_val)) {
+        auto ring = spsc_slot(s->producers[size_t(idx)]);
+        if (spsc_try_pop_impl(ring.get(), out_val)) {
             s->cursor.store((idx + 1) % n, std::memory_order_relaxed);
             *out_popped = true;
             return true;
@@ -555,29 +623,30 @@ struct MpmcSlot {
     int64_t              cap = 0;
     std::mutex           lock;       // host-internal; NEVER held across an ember call
 };
-static std::vector<std::unique_ptr<MpmcSlot>> g_mpmc;
+static std::vector<std::shared_ptr<MpmcSlot>> g_mpmc;
 static std::vector<int64_t>                  g_mpmc_free;
 
-static MpmcSlot* mpmc_slot(int64_t h) {
-    if (h < 1 || h > int64_t(g_mpmc.size())) return nullptr;
-    return g_mpmc[size_t(h - 1)].get();
+static std::shared_ptr<MpmcSlot> mpmc_slot(int64_t h) {
+    std::lock_guard<std::recursive_mutex> guard(g_store_mutex);
+    if (h < 1 || h > int64_t(g_mpmc.size())) return {};
+    return g_mpmc[size_t(h - 1)];
 }
 
-static int64_t mpmc_alloc(int64_t cap) {
-    if (cap < 1) cap = 1;
+static int64_t mpmc_alloc(int64_t requested_cap) {
+    std::lock_guard<std::recursive_mutex> guard(g_store_mutex);
+    if (requested_cap < 0 || requested_cap > MAX_I64_SLOTS) return 0;
+    int64_t cap = requested_cap == 0 ? 1 : requested_cap;
+    auto fresh = std::make_shared<MpmcSlot>();
+    fresh->cap = cap;
+    fresh->buf.assign(size_t(cap), 0);
+    fresh->head = 0; fresh->tail = 0;
     if (!g_mpmc_free.empty()) {
         int64_t idx = g_mpmc_free.back(); g_mpmc_free.pop_back();
-        auto& slot = g_mpmc[size_t(idx - 1)];
-        slot = std::make_unique<MpmcSlot>();
-        slot->cap = cap;
-        slot->buf.assign(size_t(cap), 0);
-        slot->head = 0; slot->tail = 0;
+        g_mpmc[size_t(idx - 1)] = std::move(fresh);
         return idx;
     }
-    g_mpmc.push_back(std::make_unique<MpmcSlot>());
-    auto& s = g_mpmc.back();
-    s->cap = cap;
-    s->buf.assign(size_t(cap), 0);
+    if (g_mpmc.size() >= MAX_STORE_SLOTS) return 0;
+    g_mpmc.push_back(std::move(fresh));
     return int64_t(g_mpmc.size());
 }
 
@@ -599,31 +668,41 @@ static bool mpmc_try_pop_impl(MpmcSlot* s, int64_t* out) {
 }
 
 extern "C" {
-    static int64_t n_mpmc_new(int64_t cap) { return mpmc_alloc(cap); }
+    static int64_t n_mpmc_new(int64_t cap) {
+        try { return mpmc_alloc(cap); }
+        catch (const std::bad_alloc&) { return 0; }
+        catch (const std::length_error&) { return 0; }
+    }
     static int64_t n_mpmc_push(int64_t h, int64_t v) {
-        return mpmc_push_impl(mpmc_slot(h), v) ? 1 : 0;
+        return mpmc_push_impl(mpmc_slot(h).get(), v) ? 1 : 0;
     }
     static int64_t n_mpmc_try_pop(int64_t h) {
         int64_t v = 0;
-        return mpmc_try_pop_impl(mpmc_slot(h), &v) ? v : EMPTY_SENTINEL;
+        return mpmc_try_pop_impl(mpmc_slot(h).get(), &v) ? v : EMPTY_SENTINEL;
     }
     static int64_t n_mpmc_size(int64_t h) {
-        auto* s = mpmc_slot(h); if (!s) return 0;
+        auto s = mpmc_slot(h); if (!s) return 0;
         std::lock_guard<std::mutex> g(s->lock);    // exact under-lock
         return s->head - s->tail;
     }
     static void n_mpmc_free(int64_t h) {
-        if (mpmc_slot(h)) { g_mpmc[size_t(h - 1)].reset(); g_mpmc_free.push_back(h); }
+        try {
+            std::lock_guard<std::recursive_mutex> guard(g_store_mutex);
+            if (mpmc_slot(h)) {
+                g_mpmc_free.reserve(g_mpmc_free.size() + 1);
+                g_mpmc[size_t(h - 1)].reset(); g_mpmc_free.push_back(h);
+            }
+        } catch (const std::exception&) { /* leave the live slot unchanged */ }
     }
 }
 bool mpmc_push_host(int64_t handle, int64_t val, bool* out_pushed) {
-    auto* s = mpmc_slot(handle); if (!s) return false;
-    *out_pushed = mpmc_push_impl(s, val);
+    auto s = mpmc_slot(handle); if (!s) return false;
+    *out_pushed = mpmc_push_impl(s.get(), val);
     return true;
 }
 bool mpmc_try_pop_host(int64_t handle, int64_t* out_val, bool* out_popped) {
-    auto* s = mpmc_slot(handle); if (!s) return false;
-    *out_popped = mpmc_try_pop_impl(s, out_val);
+    auto s = mpmc_slot(handle); if (!s) return false;
+    *out_popped = mpmc_try_pop_impl(s.get(), out_val);
     return true;
 }
 
@@ -673,8 +752,8 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
 
     // --- MPSC queue (design (a): per-producer SPSC rings + container handle) ---
     b.add("mpsc_new",             M, {type_i64(), type_i64()},              (void*)&n_mpsc_new);
-    b.add("mpsc_producer_handle", type_i64(), {M, type_i64()},             (void*)&n_mpsc_producer_handle);
-    b.add("mpsc_push",            type_i64(), {type_i64(), type_i64()},    (void*)&n_mpsc_push);
+    b.add("mpsc_producer_handle", P, {M, type_i64()},                      (void*)&n_mpsc_producer_handle);
+    b.add("mpsc_push",            type_i64(), {P, type_i64()},             (void*)&n_mpsc_push);
     b.add("mpsc_try_pop",         type_i64(), {M},                         (void*)&n_mpsc_try_pop);
     b.add("mpsc_size",            type_i64(), {M},                          (void*)&n_mpsc_size);
     b.add("mpsc_free",            type_void(), {M},                         (void*)&n_mpsc_free);
@@ -693,6 +772,7 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
 // Clear all five stores + all five free-lists. Mirrors ext_array::reset /
 // ext_string::reset; a host wanting per-run or per-unload isolation calls this.
 void reset() {
+    std::lock_guard<std::recursive_mutex> guard(g_store_mutex);
     g_atomics.clear();      g_atomics_free.clear();
     g_swapbufs.clear();     g_swapbufs_free.clear();
     g_spsc.clear();         g_spsc_free.clear();

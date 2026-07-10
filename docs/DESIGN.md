@@ -22,13 +22,12 @@ lexer ─► parser (recursive descent) ─► AST
 sema: struct layout pass ─► fn-signature/slot pass ─► per-fn body check
   │
   ▼
-lower: AST ─► SSA-lite IR (basic blocks, no phis, slot-backed merge vars)
+codegen: tree-walk typed AST ─► stack-spilling x86-64 emitter
   │
   ▼
-regalloc: linear scan on IR ─► physical-assignment + frame layout
-  │
-  ▼
-emit_x64: IR + regalloc ─► machine bytes into exec-memory arena
+machine bytes ─► W^X executable pages
+
+(deferred: SSA-lite IR ─► linear-scan allocation)
   │
   ▼
 dispatch table slot[slot_index] = entry address   (HOT_RELOAD.md)
@@ -49,11 +48,11 @@ cases. JIT only, no bytecode interpreter fallback.
 |---|---|
 | `RESEARCH_NOTES.md` | What was pulled from each surveyed codebase and why. Read first  -  every later doc references it. |
 | `TYPE_SYSTEM.md` | Primitives, struct layout (host-mapped vs script-declared), fixed arrays, slices, the no-raw-pointer rule, implicit/explicit conversion matrix, operator result types, the unsigned-index rule that makes bounds-checking a runtime-only (not signedness) concern, `void` return-path enforcement, `auto`'s narrow scope, annotation argument grammar. |
-| `COMPILER_PIPELINE.md` | Lexer token set, full BNF grammar, AST node shapes, the four sema passes in order, SSA-lite IR definition (why no phis), lowering rules per AST node, error/diagnostic model, the lower→regalloc→emit three-stage split that makes each piece independently testable. |
-| `CODEGEN_SPEC.md` | The "prove we can compile to real x86-64" doc. Win64 calling convention, frame layout, exact byte encodings for the full ISA subset (integer + SSE scalar), label/patch two-pass system, linear-scan regalloc with spill rules, prologue/epilogue, script-to-script indirect calls, script-to-native calls, bounds-check emission, div/overflow traps, >4-arg spilling. Ends with 5 concrete acceptance criteria for v0.1. |
-| `BINDING_API.md` | `TypeId`, `NativeParam`, `NativeFn` descriptor structs (descriptor-style, declaration-string parsing rejected), `TypeBuilder` fluent API (each method, what was trimmed from the surveyed native-JIT language's surface and why), `StructBuilder`, the script-type→Win64-slot mapping table, slice-as-two-C++-params convention, the host-side template-wrapper pattern. |
+| `COMPILER_PIPELINE.md` | Lexer token set, grammar, AST/sema, shipped tree-walking lowering, error model, and clearly deferred SSA-lite/regalloc design. |
+| `CODEGEN_SPEC.md` | Win64 calling convention, frame/code emission, exact encoder subset, fixups, calls, bounds/div traps, and the deferred linear-scan design clearly labeled. |
+| `BINDING_API.md` | Shipped `BindingBuilder`/`NativeSig`, script-type→Win64 mapping and slice convention; fluent builders/descriptors are labeled deferred. |
 | `SAFETY_AND_SANDBOX.md` | Threat/trust model stated explicitly. Instruction budget mechanism (where counters live, what trap-on-exhaustion does), stack depth guard, bounds checking policy, `PERM_FFI` compile-time gating, the single non-local-unwind primitive that all traps funnel through, what is explicitly *not* checked (documented gaps, not oversights). |
-| `HOT_RELOAD.md` | Dispatch table layout, slot-index stability invariant, single-function reload protocol (atomic slot swap, old page retired not overwritten), in-flight call behavior, recursive-function-mid-recursion reload semantics, whole-module reload, globals preserved across reload, epoch-based reclamation of retired code pages. |
+| `HOT_RELOAD.md` | Shipped atomic single-function replacement and caller-owned single-thread retirement; epochs, whole-module reload, and removed-function traps are deferred. |
 | `MEMORY_AND_GC.md` | Ownership taxonomy (frame-local / host-owned / module-global / arena), the `arr[..]`-slice escape check that's the one place ember can introduce a dangling slice, module-global storage layout, string representation (rodata in the function's own code page), arena allocator design (reserved, not built in v1), explicit v2-GC deferral rationale. |
 | `LIFECYCLE.md` | The native-JIT-language-equivalent of `main()` + `register_routine(cast(fn))` expressed ember's way: `@entry`/`@on_tick`/`@event(...)` annotation-based discovery + host name/slot lookup. (Script-side first-class function references — `&fn` / `handle(args)` / the `fn` type — shipped in v1.0; see `ROADMAP.md` Tier 2 and `SAFETY_AND_SANDBOX.md` §7a.) |
 | `GAP_ANALYSIS.md` | Systematic completeness audit: every original-request requirement → where satisfied; every feature of the surveyed native-JIT language → v1 has / deferred-with-plan / out-of-scope. Includes the honest performance caveat (ember v1 is baseline JIT, won't match an optimizing native-JIT language's speed, but beats AngelScript's bytecode interpreter). |
@@ -85,7 +84,7 @@ Non-goals for v1:
   codegen, exec-memory allocator, the IR data model (`ir.hpp`), and
   the `.em` binary bundling/serialization format
   (`em_file`/`em_writer`/`em_loader`). Passes the original 5
-  acceptance criteria in `CODEGEN_SPEC.md` Section 12 (int path, float path,
+  acceptance criteria in `CODEGEN_SPEC.md` Section 14 (int path, float path,
   forward-label fixup, spill path, recursive-via-dispatch-table) plus
   the expanded criteria in Section 15 (full Section 3 ISA byte-exact encoder
   coverage, `.em` serialize→load→run round-trip). This is the "prove
@@ -150,8 +149,8 @@ Non-goals for v1:
   are parsed but do nothing — only `@obf`/`@obf_keyed` have codegen
   effect) and single-function hot reload (the slot-stability *machinery*
   exists + whole-module load works, but no atomic-slot-swap + page-retire
-  + epoch-reclaim path). Both have complete specs (`LIFECYCLE.md`,
-  `HOT_RELOAD.md`); both are open.
+  + concurrent reclamation path). Both have design docs (`LIFECYCLE.md`,
+  `HOT_RELOAD.md`); concurrent epoch/quiescence reclamation remains open.
 - **v0.5** ✓ shipped - live modules (the Tier 6 ROADMAP item, pulled
   forward): bidirectional script↔`.em` cross-module linking through the
   real grammar. `link "foo.em" as foo;` + `foo::bar(args)`; a
@@ -172,8 +171,9 @@ Non-goals for v1:
   analysis `docs/v0.3_DEFERRED_BINDING_ANALYSIS.md`), docs, example
   game-engine integration (event hooks via annotations).
 
-  **Concurrency + Tier 2 batch shipped v1.0 (commit e5d1814 + follow-ons,
-  17/17 ctest green):** four features, each verified in source/tests —
+  **Concurrency + Tier 2 batch shipped v1.0 (commit e5d1814 + follow-ons):**
+  four features, each verified in source/tests; the current tree has 20 CTest
+  tests with AngelScript and 19 without —
   - **Context thread-safety (Option D + B1)** — `context_t` restructured
     to a POD prefix; `CodeGenCtx::use_context_reg` makes the budget/depth/
     trap emits read `context_t` fields through `r14` (the per-call context
@@ -209,8 +209,8 @@ Non-goals for v1:
   **Follow-on commits** then built the dynamic-registration extension the
   Tier 2 fn-refs feature enables — `extensions/lifecycle/`
   (`register_routine`/`unregister_routine` + the `host_routines()` accessor;
-  `LIFECYCLE.md` §2; pinned by `examples/ext_lifecycle_test.cpp`, the 17th
-  ctest target) — and wired the CLI `--tick` to the B1 per-call context model
+  `LIFECYCLE.md` §2; pinned by `examples/ext_lifecycle_test.cpp`) — and wired
+  the CLI `--tick` to the B1 per-call context model
   (the `--tick` thread-safety bug, fixed; the CLI is now a B1 host). Demo
   script: `examples/scripts/dynamic_registration.ember`. See
   `docs/v1.0_INTEGRATION_NOTES.md` §5.

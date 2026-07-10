@@ -8,7 +8,11 @@
 # ship here; prism wires the host-side natives (__str_decrypt etc.).
 
 cmake_minimum_required(VERSION 3.16)
-project(ember VERSION 0.5.0 LANGUAGES CXX)
+project(ember VERSION 1.0.0 LANGUAGES CXX)
+
+if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "MSVC x64 not yet supported; use MinGW")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -54,8 +58,8 @@ target_include_directories(ember_import PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # entries + host C++ backing, NOT a grammar/type-system change (those are
 # ROADMAP Tier 1+ language features). These are the docs/ROADMAP.md Tier 0
 # standard addon set relocated out of prism's prism_script_host.cpp by the Section 6
-# audit (see ember/extensions/AUDIT.md): vec2/vec3/vec4, quat, mat4, string,
-# array<T>, math. Each is a self-contained TU depending only on ember's
+# audit (see ember/extensions/AUDIT.md): vec, quat, mat, string, array, math,
+# sync, and lifecycle. Each is a self-contained TU depending only on ember's
 # public headers (sema.hpp/ast.hpp) + the stdlib; no prism dependency. A
 # consumer (prism, or a future second consumer) links whichever extensions
 # it wants and calls the extension's register_natives/register_overloads/
@@ -89,6 +93,10 @@ add_executable(import_roundtrip_test examples/import_roundtrip_test.cpp)
 target_link_libraries(import_roundtrip_test PRIVATE ember ember_frontend)
 add_test(NAME import_roundtrip COMMAND import_roundtrip_test)
 
+add_executable(em_loader_hardening_test examples/em_loader_hardening_test.cpp)
+target_link_libraries(em_loader_hardening_test PRIVATE ember)
+add_test(NAME em_loader_hardening COMMAND em_loader_hardening_test)
+
 # ext_runtime_test: runtime coverage for the relocated extensions (RESTRUCTURE_PLAN.md Section 6).
 # em_roundtrip/import_roundtrip call NO relocated native; this one calls the math
 # extension's sqrt through the full pipeline, proving the extension relocation
@@ -107,6 +115,7 @@ add_test(NAME ext_runtime COMMAND ext_runtime_test)
 add_executable(ext_sync_test examples/ext_sync_test.cpp)
 target_link_libraries(ext_sync_test PRIVATE ember ember_frontend ember_ext_sync)
 add_test(NAME ext_sync COMMAND ext_sync_test)
+set_tests_properties(ext_sync PROPERTIES TIMEOUT 60)
 
 # ext_lifecycle_test: dynamic routine registration (plan_FUNCTION_REFS.md §6).
 # register_routine(&fn, data) -> id + unregister_routine(id); the host drives
@@ -116,7 +125,7 @@ target_link_libraries(ext_lifecycle_test PRIVATE ember ember_frontend ember_ext_
 add_test(NAME ext_lifecycle COMMAND ext_lifecycle_test)
 
 # Extension registration smoke test (RESTRUCTURE_PLAN.md Section 6): validates the
-# relocated non-cheat extensions (vec/quat/mat/string/array/math) register
+# relocated non-cheat extensions (vec/quat/mat/string/array/math/sync/lifecycle) register
 # their NativeSig + OpOverloadTable entries via the extension entry points.
 # Links ONLY the extension libs + ember_frontend (no prism/prism_script_host)
 # - proving the extensions are pure ember and self-contained. The end-to-end
@@ -125,13 +134,13 @@ add_test(NAME ext_lifecycle COMMAND ext_lifecycle_test)
 add_executable(ext_registration_test examples/ext_registration_test.cpp)
 target_link_libraries(ext_registration_test PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat ember_ext_string ember_ext_array ember_ext_math
-    ember_frontend)
+    ember_ext_sync ember_ext_lifecycle ember_frontend)
 add_test(NAME ext_registration COMMAND ext_registration_test)
 
 # v0.4 hardening regression: pins the red-team V5 (W^X JIT memory) and
 # V6 (per-frame byte budget + int32 struct-sizing overflow) mitigations.
 # Self-contained (inlined payloads + a VirtualQuery W^X probe). Links the
-# six extension libs (mirrors sema_check's registered surface) + ember
+# core vec/quat/mat/string/array/math extension libs + ember
 # (for alloc_executable/VirtualQuery).
 add_executable(v0_4_hardening_test examples/v0_4_hardening_test.cpp)
 target_link_libraries(v0_4_hardening_test PRIVATE
@@ -156,6 +165,13 @@ if(WIN32)
     target_link_libraries(thread_safety_test PRIVATE kernel32)
 endif()
 add_test(NAME thread_safety COMMAND thread_safety_test)
+set_tests_properties(thread_safety PROPERTIES TIMEOUT 30)
+
+# Win64 ABI regressions: switch volatile scratch, raw B1 thunk r14
+# preservation, and an aligned-SSE trap stub called from both stack parities.
+add_executable(win64_abi_test examples/win64_abi_test.cpp)
+target_link_libraries(win64_abi_test PRIVATE ember ember_frontend)
+add_test(NAME win64_abi COMMAND win64_abi_test)
 
 # v1.0 Tier 2 first-class function references: `&fn` handles + `handle(args)`
 # indirect call, with the REDSHELL guard #6 (validate the runtime i64 against a
@@ -175,7 +191,7 @@ add_test(NAME function_refs COMMAND function_refs_test)
 # linking through the real grammar (link directive + mod::fn calls). Covers
 # the user's ask: scripts and .em bundles both able to use either form,
 # compiled modules referencing others at runtime. Stresses the .em binary
-# type in every direction. Links all six extensions + the module/em libs.
+# type in every direction. Links the six core language addons + module/em libs.
 add_executable(v0_5_live_modules_test examples/v0_5_live_modules_test.cpp)
 target_link_libraries(v0_5_live_modules_test PRIVATE
     ember ember_frontend ember_import
@@ -196,10 +212,10 @@ add_test(NAME v0_5_live_modules COMMAND v0_5_live_modules_test)
 add_executable(ember_check examples/ember_check.cpp)
 target_link_libraries(ember_check PRIVATE ember ember_frontend ember_import)
 
-# sema_check links all six extension libs so scripts that call array/string
+# sema_check links the six core extension libs so scripts that call array/string
 # (or any standard-addon) natives sema-check against the registered set -
 # EXACTLY the ext_registration_test registration shape (register_natives for
-# all six, register_overloads for vec/quat/mat/string), not prism's process/
+# those six, register_overloads for vec/quat/mat/string), not prism's process/
 # render natives.
 add_executable(sema_check examples/sema_check.cpp)
 target_link_libraries(sema_check PRIVATE
@@ -213,10 +229,11 @@ find_program(BASH_EXE bash REQUIRED)
 add_test(NAME lang_suite
     COMMAND "${BASH_EXE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_lang_tests.sh"
             "${CMAKE_CURRENT_BINARY_DIR}")
+set_tests_properties(lang_suite PROPERTIES TIMEOUT 120)
 
 # ---- standalone ember CLI: prism-decoupled runner ----
 # A minimal host that exercises the full parse->sema->codegen->finalize->call
-# pipeline (the em_roundtrip_test shape) with the full six-extension addon
+# pipeline (the em_roundtrip_test shape) with the full eight-extension addon
 # surface registered (the ext_registration_test shape). Reads a .ember file,
 # resolves `import "path";` inlining, compiles, calls the entry fn (default
 # main), and exits with the i64 return code (or 0 for void). No prism linkage:
@@ -226,7 +243,14 @@ target_link_libraries(ember_cli PRIVATE
     ember ember_frontend ember_import
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
-    ember_ext_lifecycle)   # v1.0: register_routine/unregister_routine (dynamic registration)
+    ember_ext_sync ember_ext_lifecycle)
+
+# End-to-end H12 regression: invoke the real CLI emit-em path, then load the
+# artifact and inspect its nonzero initialized-global bytes.
+add_executable(em_cli_emit_test examples/em_cli_emit_test.cpp)
+target_link_libraries(em_cli_emit_test PRIVATE ember)
+add_test(NAME em_cli_emit COMMAND em_cli_emit_test $<TARGET_FILE:ember_cli>)
+set_tests_properties(em_cli_emit PROPERTIES TIMEOUT 30)
 
 # ---- binding ABI correctness suite (BINDING_API.md Sec 4) ----
 # Pins the script->native Win64 call ABI (struct-by-value arg <=8B,
@@ -234,7 +258,7 @@ target_link_libraries(ember_cli PRIVATE
 # slot-parallel, slice as ptr+len two words, mixed int+float slot-parallel)
 # so a future tree-walker->SSA-IR refactor cannot silently break it. The
 # codegen is already correct; this is the regression net. Registers FRESH
-# host fns via BindingBuilder (src/binding_builder.hpp) + links all six
+# host fns via BindingBuilder (src/binding_builder.hpp) + links the six core
 # ember_ext_* (the vec extension's vec3_new handle-return is exercised as a
 # struct-return-path comparison in test [2b], and the math extension's sqrt
 # as a second f32 pin in test [4b]). Independent of the parallel extension
@@ -262,7 +286,7 @@ endif()
 # 41 source files into a static lib, then links the bench harness that runs the same
 # workload in both and reports the ratio. The categorical difference under test:
 # ember compiles to native x86-64 (no dispatch-decode loop), AngelScript interprets
-# bytecode. DESIGN.md §9's gate for the SSA-lite IR + linear-scan regalloc refactor.
+# bytecode. SSA-lite IR + linear-scan allocation remain a benchmark-gated future refactor.
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/sdk/angelscript/source/as_atomic.cpp)
     file(GLOB AS_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/sdk/angelscript/source/*.cpp)
@@ -287,45 +311,41 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/sdk/angelscript/source/as_atomi
     add_test(NAME bench_ember_vs_as COMMAND bench_ember_vs_as)
     set_tests_properties(bench_ember_vs_as PROPERTIES TIMEOUT 300)
 
-    # v0.6 lifecycle + tick-mode tests (annotation discovery + tick loop).
-    add_executable(v0_6_lifecycle_test examples/v0_6_lifecycle_test.cpp)
-    target_link_libraries(v0_6_lifecycle_test PRIVATE
-        ember ember_frontend ember_import
-        ember_ext_vec ember_ext_math)
-    if(WIN32)
-        target_link_libraries(v0_6_lifecycle_test PRIVATE kernel32)
-    endif()
-    add_test(NAME v0_6_lifecycle COMMAND v0_6_lifecycle_test)
-
-    # v0.6 single-function hot reload tests (HOT_RELOAD.md §3).
-    add_executable(v0_6_hot_reload_test examples/v0_6_hot_reload_test.cpp)
-    target_link_libraries(v0_6_hot_reload_test PRIVATE
-        ember ember_frontend ember_import
-        ember_ext_vec ember_ext_math)
-    if(WIN32)
-        target_link_libraries(v0_6_hot_reload_test PRIVATE kernel32)
-    endif()
-    add_test(NAME v0_6_hot_reload COMMAND v0_6_hot_reload_test)
-
-    # v1.0 example game-engine integration (the embeddability proof). A minimal
-    # host that compiles+runs game_logic.ember with @entry/@on_tick/@event, drives
-    # host-owned entity state through BindingBuilder natives, and hot-reloads a
-    # gameplay fn mid-loop. The first real 'ember as embedding target' end-to-end
-    # proof; also the test that decides whether the fluent TypeBuilder is needed.
-    add_executable(game_host examples/game_host.cpp)
-    target_link_libraries(game_host PRIVATE ember ember_frontend ember_import)
-    if(WIN32)
-        target_link_libraries(game_host PRIVATE kernel32)
-    endif()
-    add_test(NAME game_host_integration COMMAND game_host
-        "${CMAKE_CURRENT_SOURCE_DIR}/examples/scripts/game_logic.ember")
-
-    # float-global regression: pins the v1.0-integration-found float-global-write
-    # bug fix (store_xmm0_to_global, movss with correct REX-after-F3 prefix order).
-    add_executable(float_global_regression examples/float_global_regression.cpp)
-    target_link_libraries(float_global_regression PRIVATE ember ember_frontend ember_import)
-    if(WIN32)
-        target_link_libraries(float_global_regression PRIVATE kernel32)
-    endif()
-    add_test(NAME float_global_regression COMMAND float_global_regression)
 endif()
+
+# These correctness/integration tests do not use AngelScript. Keep only the
+# actual comparison benchmark conditional on SDK availability.
+add_executable(v0_6_lifecycle_test examples/v0_6_lifecycle_test.cpp)
+target_link_libraries(v0_6_lifecycle_test PRIVATE
+    ember ember_frontend ember_import ember_ext_vec ember_ext_math)
+if(WIN32)
+    target_link_libraries(v0_6_lifecycle_test PRIVATE kernel32)
+endif()
+add_test(NAME v0_6_lifecycle COMMAND v0_6_lifecycle_test)
+
+add_executable(v0_6_hot_reload_test examples/v0_6_hot_reload_test.cpp)
+target_link_libraries(v0_6_hot_reload_test PRIVATE
+    ember ember_frontend ember_import ember_ext_vec ember_ext_math)
+if(WIN32)
+    target_link_libraries(v0_6_hot_reload_test PRIVATE kernel32)
+endif()
+add_test(NAME v0_6_hot_reload COMMAND v0_6_hot_reload_test)
+
+add_executable(game_host examples/game_host.cpp)
+target_link_libraries(game_host PRIVATE ember ember_frontend ember_import)
+if(WIN32)
+    target_link_libraries(game_host PRIVATE kernel32)
+endif()
+add_test(NAME game_host_integration COMMAND game_host
+    "${CMAKE_CURRENT_SOURCE_DIR}/examples/scripts/game_logic.ember")
+
+add_executable(float_global_regression examples/float_global_regression.cpp)
+target_link_libraries(float_global_regression PRIVATE ember ember_frontend ember_import)
+if(WIN32)
+    target_link_libraries(float_global_regression PRIVATE kernel32)
+endif()
+add_test(NAME float_global_regression COMMAND float_global_regression)
+
+set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
+    v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
+    PROPERTIES TIMEOUT 30)

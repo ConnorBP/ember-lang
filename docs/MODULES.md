@@ -254,54 +254,40 @@ Section 1.1). The flow:
      for cross-module name lookup - same data, no duplicate).
    - Look up `fn_name` in the target's directory. Absent → unmet
      import, trap stub stays.
-   - **Verify the signature matches** the expected signature from
-     step 1. Mismatch → hard link error (not a trap - a signature
-     mismatch is a type bug; calling it would misinterpret args/
-     return per the Win64 ABI, `CODEGEN_SPEC.md` Section 1). The module does
-     not run a mis-typed call; it reports and leaves the stub.
+   - **Signature handling:** JIT-module exports carry signatures and sema
+     verifies them. v1 `.em` exports do not serialize signatures, so
+     `build_em_exports` marks them `unknown_sig`; those imports are
+     ABI-trusted and skip arity/type/return verification. The host/caller must
+     know the exact ABI. Canonical signatures require a versioned format
+     update (H14).
    - On success → **bake `(target_module_id, target_slot_index)`
      into the call site**, rewriting the `module_id` and `slot_index`
      displacements in the Section 3 sequence from trap-stub placeholders to
      the resolved values. The `registry_base` reloc
      (`AbsFixup::ModuleRegistryBase`) is untouched - it was already
      correct; only the two displacements change.
-3. **Unresolved at call time → trap.** If a call site was not
-   resolved, it retains its trap-stub operands. When executed, the
-   registry lookup returns a table whose relevant slot points at
-   `ember_trap_uncompiled` (the same stub `CODEGEN_SPEC.md` Section 7 uses
-   for "call to a function whose compilation failed"), or the
-   `module_id` itself resolves to a trap entry if the target was
-   never registered. Either way the host sees a runtime error
-   (`SAFETY_AND_SANDBOX.md` Section 7) rather than a wild jump. This is
-   deliberately the same trap pattern as `HOT_RELOAD.md` Section 2's
-   removed-function handling - "slots never hold a null/garbage
-   pointer" is the unifying rule, and it extends to "registry entries
-   never hold a null/garbage pointer."
-4. **Re-linking on target load.** If the target registers *after*
-   the importer was linked (the deferred-trap case), the host may
-   call a `relink_imports(module_t*)` entry to re-walk the unresolved
-   list against the now-larger registry. This is the cross-module
-   analog of `HOT_RELOAD.md` Section 2's "new function added after initial
-   compile gets the next available slot" - late arrivals are
-   accommodated, not rejected. Mechanically the same walk re-run.
+3. **Unresolved at call time.** The current source linker marks unresolved
+   calls for the existing runtime trap lowering; hosts should treat unresolved
+   links as load/compile failures rather than rely on a removed-function or
+   uncompiled-function slot stub (those stubs are not shipped APIs).
+4. **Late re-linking is deferred.** No `relink_imports(module_t*)` API ships.
+   A host resolves/registers dependencies before compiling the importer or
+   recompiles after the dependency becomes available.
 
 ---
 
-## 6. Grammar sketch (NOT IN v1 GRAMMAR - Tier 6 future work)
+## 6. Shipped link grammar
 
-For reference only. This grammar does not exist in
-`COMPILER_PIPELINE.md` Section 2 today and is not added by this doc. It is
-what the implementation would look like *if* the Section 1 trigger fires.
+The v0.5 live-module trigger fired and the parser accepts:
 
 ```
-import_stmt   := 'import' STRING_LIT ('as' IDENT)? ';'
+link_stmt     := 'link' STRING_LIT 'as' IDENT ';'
 call_external := IDENT '::' IDENT '(' arg_list? ')'     // modname::fn
 ```
 
-- `import "modname" as alias;` - declares intent to call into a module
-  registered under `modname` (the registry name, Section 2). The `as alias`
-  is optional sugar so a script can refer to a long module name by a
-  short local alias; without it, `modname` itself is the alias.
+- `link "file.em" as alias;` loads/registers a file relative to the source
+  file. `link "registered-name" as alias;` is the host-driven form for a
+  module already in the registry. The alias is required by the grammar.
 - `modname::fn(args)` - a call into `fn` of the imported module. The
   `::` is the cross-module selector; an unqualified `fn(args)` is the
   existing intra-module call (`CODEGEN_SPEC.md` Section 7). The `::` makes
@@ -309,18 +295,11 @@ call_external := IDENT '::' IDENT '(' arg_list? ')'     // modname::fn
   code and makes the IR op choice (`CallScript` vs
   `CallScriptExternal`, Section 3) a trivial parse-time decision rather than
   a name-resolution guess.
-- **No `pub`/`export` in this sketch.** Visibility is a separate Tier
-  6 feature (`ROADMAP.md` "namespaces"); this sketch assumes every
+- **No `pub`/`export`.** Visibility remains deferred; every
   function in a registered module is callable cross-module, matching
   C `#include`'s "everything included is visible" stance
   (`BUNDLING_AND_EM_MODULES.md` Section 1.3) and the existing flat module
-  scope (`COMPILER_PIPELINE.md` Section 4). A real implementation may want
-  `pub` before this ships; that's a Section 8 companion-dependency call, not
-  a hard blocker on the call mechanism itself.
-
-**This section is explicitly not part of any v1 milestone.** It is
-recorded so a future implementer does not re-derive the syntax and so
-the `::` choice is not relitigated.
+  scope (`COMPILER_PIPELINE.md` Section 4).
 
 ---
 
@@ -329,28 +308,20 @@ the `::` choice is not relitigated.
 The two features share a keyword family and a user mental model ("pull
 in code from elsewhere") and almost nothing else.
 
-| | `include` (ships now) | `import` (Tier 6, this doc) |
+| | textual `import` | live `link` |
 |---|---|---|
 | Stage | parse time, before sema | load time, after each unit compiles |
 | Output | one module | N modules |
 | New runtime state | none  -  merged `Program` flows through existing pipeline (`BUNDLING_AND_EM_MODULES.md` Section 1.2) | module registry (`Section 2`), cross-module call IR (`Section 3`), linker stage (`Section 5`) |
 | New IR op | none  -  ordinary `CallScript` through the shared table | `CallScriptExternal` carrying `(module_id, slot_index)` |
 | New encoder reloc | none | `AbsFixup::ModuleRegistryBase` (`Section 3`) |
-| Signature verification | none  -  same module, sema already checked it | yes  -  linker compares expected vs target signature (`Section 5`) |
-| Re-entry trigger | "a script is too big for one file"  -  *has fired*; bundling covers it | "a mod loads another mod's pre-compiled `.em` at runtime"  -  *has not fired* (`ROADMAP.md` Tier 6) |
+| Signature verification | none — same module, sema checked it | JIT exports: yes; v1 `.em`: no metadata, ABI-trusted `unknown_sig` (`Section 5`) |
+| Status | shipped source merge | shipped v0.5; v1 `.em` signatures remain ABI-trusted |
 
-`include` is a parse-time concern with zero new runtime machinery and
-zero new IR shape; it reuses the entire existing pipeline unchanged
-(`BUNDLING_AND_EM_MODULES.md` Section 1.2: "sema and everything downstream:
-unchanged"). `import` is a runtime linker plus a registry plus a
-cross-module call IR shape plus a signature verification pass plus a
-new reloc kind. It is a fundamentally larger subsystem, and the
-`ROADMAP.md` re-entry trigger for it has not fired - there is no
-demonstrated need for true runtime mod-to-mod linking yet. Shipping it
-now would be YAGNI in the exact sense `ROADMAP.md` exists to police:
-building a subsystem whose trigger hasn't occurred. The bundling doc
-already made this call (`BUNDLING_AND_EM_MODULES.md` Section 1.1 decision,
-Section 1.5 deferral); this doc carries the deferred design.
+Textual `import` is a parse-time merge with no new runtime machinery. Live
+`link` is the shipped registry/kind-2-relocation path. The remaining gap is
+metadata: v1 `.em` exports do not carry canonical signatures, so link-time type
+verification applies only to JIT exports.
 
 ---
 
@@ -360,14 +331,9 @@ Section 1.5 deferral); this doc carries the deferred design.
 
 - **The `.em` loader (`BUNDLING_AND_EM_MODULES.md` Part 2).** The Section 1
   trigger is literally "one mod loads another mod's pre-compiled
-  `.em` at runtime." Without `ember_load_em` returning a `module_t`
-  that registers into the Section 2 registry, there is no second module to
-  call into. The loader and this doc are co-dependent - the loader
-  produces the modules, this doc defines how they call each other.
-  The loader's `module_t` shape already matches what the registry
-  needs (Section 2.6 of the bundling doc: "the runtime cannot tell a loaded
-  module from a JIT'd one"), so the dependency is on the loader's
-  *existence*, not on a shape change to it.
+  `.em` at runtime." `load_em_file`/`link_em_file` produce and register the
+  `LoadedModule`; callers must retain it while the registry points at its
+  dispatch storage.
 
 **Companion, not a hard dep:**
 
@@ -392,8 +358,9 @@ Section 1.5 deferral); this doc carries the deferred design.
   "for embedding in game engines"). Out of scope forever, not just
   for v1 of this feature.
 - **No dynamic unloading / module-registry-entry removal.**
-  `HOT_RELOAD.md` Section 5's epoch scheme reclaims *code pages* on reload
-  (page retirement, bounded by reload frequency) but does not remove
+  `HOT_RELOAD.md` Section 5's caller-managed retirement covers *code pages*
+  only after the host establishes quiescence; no epoch scheme ships. It does
+  not remove
   a `module_t` from the registry once registered. A `module_id` baked
   into a call site (`Section 3`) must remain valid for the caller's lifetime
   - unregistering a module would orphan every cross-module call site
@@ -402,24 +369,16 @@ Section 1.5 deferral); this doc carries the deferred design.
   precisely to avoid this; entry *removal* is the symmetric operation
   and is not provided. If a host needs to "drop" a module, the
   supported path is to leave its registry entry in place and repoint
-  its slots to the `ember_trap_removed_function` stub
-  (`HOT_RELOAD.md` Section 2) - the entry stays, the calls trap, no stale id
-  escapes. This is `HOT_RELOAD.md` Section 2's "slot indices are never
+  retain the entry and arrange its own unavailable-target policy; the proposed
+  removed-function trap stub is deferred with whole-module reload
+  (`HOT_RELOAD.md` Section 2). This is the "slot indices are never
   recycled in v1" stance lifted one level up: module ids are never
   recycled either.
-- **No version negotiation beyond signature-match.** The Section 5 linker
-  verifies the callee's signature matches what the caller expects. It
-  does *not* compare module versions, semver strings, ABI revision
-  numbers, or feature flags. Two modules link if and only if every
-  cross-module call site's expected signature matches the target
-  function's actual signature - which is exactly the information that
-  determines whether the call is safe under the Win64 ABI
-  (`CODEGEN_SPEC.md` Section 1). Anything beyond that (version banners,
-  compatibility manifests) is a build/packaging concern, not a
-  runtime-linking concern, and adding it would be a second subsystem
-  layered on top of this one with its own trigger - speculative
-  today, YAGNI by `ROADMAP.md`'s standard. Signature match is the
-  floor; the floor is the whole mechanism.
+- **No version negotiation.** JIT exports can be signature-checked. v1 `.em`
+  exports are `unknown_sig` and therefore ABI-trusted; the linker cannot
+  verify them. The format has no semver/build identity or canonical signature
+  records. A future version must add those records before claiming portable,
+  verified `.em` linking.
 
 ---
 

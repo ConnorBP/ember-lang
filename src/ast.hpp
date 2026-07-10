@@ -167,9 +167,10 @@ struct IndexExpr: Expr { ExprPtr base, index;
                          int64_t index_const_value = 0; };
 struct FieldExpr: Expr { ExprPtr base; std::string field; };
 struct ViewExpr : Expr { ExprPtr base; };           // arr[..]
-struct AssignExpr: Expr { ExprPtr target; std::optional<BinExpr::Op> compound; ExprPtr value; };
+struct AssignExpr: Expr { ExprPtr target; std::optional<BinExpr::Op> compound; ExprPtr value; bool postfix = false; };
 struct TernaryExpr: Expr { ExprPtr cond, then_e, else_e; };
-struct SizeofExpr: Expr { std::shared_ptr<Type> ty; };
+struct SizeofExpr: Expr { std::shared_ptr<Type> ty; uint64_t resolved = 0; };
+struct OffsetofExpr: Expr { std::shared_ptr<Type> ty; std::string field; uint64_t resolved = 0; };
 struct StructLit : Expr { std::string type_name; std::vector<std::pair<std::string,ExprPtr>> fields; };
 // E::A - enum-variant access. Exists only between parse and sema's check_expr:
 // sema rewrites this node IN PLACE to an IntLit carrying the variant's i32
@@ -196,8 +197,8 @@ struct ContinueStmt:Stmt {};
 struct DeferStmt : Stmt { ExprPtr expr; };
 struct BlockStmt: Stmt { Block block; };
 // one `case EXPR: stmts...` or `default: stmts...` clause. `value` is null
-// iff is_default. No implicit break between clauses (C-style fallthrough) -
-// codegen emits case bodies back to back; `break` exits the switch.
+// iff is_default. Sema requires each nonempty body to end in `break` or
+// `return`, so implicit fallthrough never reaches codegen.
 struct SwitchCase { ExprPtr value; bool is_default = false; Block body; };
 struct SwitchStmt: Stmt { ExprPtr subject; std::vector<SwitchCase> cases; };
 
@@ -242,6 +243,7 @@ struct GlobalDecl {
     std::shared_ptr<Type> ty;
     ExprPtr init;
     Loc loc;
+    bool is_const = false;
 };
 
 // v0.5 live-module link declaration (MODULES.md §6). `link "foo.em" as foo;`

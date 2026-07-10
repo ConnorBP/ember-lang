@@ -1,0 +1,47 @@
+struct Inner { a: i16; b: u8; }
+struct Outer { tag: u8; inner: Inner; words: i32[2]; }
+
+fn widen(x: i64) -> i64 { return x; }
+
+fn main() -> i64 {
+    let mut i: i64 = 0;
+    let mut sum: i64 = 0;
+    do {
+        i += 1;
+        if (i == 2) { continue; }
+        sum += i;
+    } while (i < 3);
+    if (sum != 4) { return 1; }
+
+    if (sizeof(i64) != 8) { return 2; }
+    if (sizeof(Inner) != 3) { return 3; }
+    if (sizeof(Outer) != 12) { return 4; }
+    if (sizeof(Outer[2]) != 24) { return 5; }
+    if (offsetof(Outer, inner) != 1) { return 6; }
+    if (offsetof(Outer, words) != 4) { return 7; }
+
+    let d: f64 = 16777217.0;
+    if (!(d > 16777216.0)) { return 8; }
+
+    let umax: u64 = 0 as u64 - 1 as u64;
+    if (!(umax > 0 as u64)) { return 9; }
+    if ((umax >> 63 as u64) != 1 as u64) { return 10; }
+    if (umax / 3 as u64 == 0 as u64) { return 11; }
+    let wrap: u8 = (255 as u8) + (1 as u8);
+    if (wrap != 0 as u8) { return 12; }
+    let neg: i8 = 255 as i8;
+    if (neg != -1 as i8) { return 13; }
+
+    let small: i8 = 7;
+    if (widen(small) != 7) { return 14; }
+    let narrow: i8 = (300 as i64) as i8;
+    if (narrow != 44 as i8) { return 15; }
+
+    let mut x: i64 = 1;
+    let y: i64 = x++;
+    let z: i64 = ++x;
+    if (x != 3 || y != 1 || z != 3) { return 16; }
+    let order: i64 = x++ + ++x;
+    if (order != 8 || x != 5) { return 17; }
+    return 77;
+}

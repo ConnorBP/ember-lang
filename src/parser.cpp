@@ -192,6 +192,7 @@ struct P {
     std::unique_ptr<GlobalDecl> parse_global() {
         auto g = std::make_unique<GlobalDecl>();
         expect(Tk::Kw_global, "'global'");
+        g->is_const = false;
         g->name = expect(Tk::Ident, "global name").text;
         expect(Tk::Colon, "':'");
         g->ty = parse_type();
@@ -503,10 +504,10 @@ struct P {
                 auto fl = std::make_unique<FieldExpr>(); fl->loc = e->loc; fl->base = std::move(e); fl->field = f;
                 e = std::move(fl);
             } else if (k==Tk::Inc || k==Tk::Dec) {
-                // postfix ++/-- : desugar to (t = t op 1) returning old - v1 simplify to assign (returns new)
+                // postfix ++/-- shares assignment lowering but preserves the old value.
                 adv();
                 auto a = std::make_unique<AssignExpr>();
-                a->loc = e->loc; a->target = std::move(e);
+                a->loc = e->loc; a->target = std::move(e); a->postfix = true;
                 a->compound = (k==Tk::Inc)?BinExpr::Op::Add:BinExpr::Op::Sub;
                 auto one = std::make_unique<IntLit>(); one->loc = a->loc; one->v = 1;
                 a->value = std::move(one);
@@ -669,6 +670,11 @@ struct P {
         }
         case Tk::LParen: { adv(); ExprPtr e=parse_expr(); expect(Tk::RParen,"')'"); return e; }
         case Tk::Kw_sizeof: { adv(); expect(Tk::LParen,"'('"); auto ty=parse_type(); expect(Tk::RParen,"')'"); auto e=std::make_unique<SizeofExpr>(); e->loc=loc(t); e->ty=std::move(ty); return e; }
+        case Tk::Kw_offsetof: {
+            adv(); expect(Tk::LParen,"'('"); auto ty=parse_type(); expect(Tk::Comma,"','");
+            std::string field = expect(Tk::Ident, "field name").text; expect(Tk::RParen,"')'");
+            auto e=std::make_unique<OffsetofExpr>(); e->loc=loc(t); e->ty=std::move(ty); e->field=std::move(field); return e;
+        }
         default:
             throw ParseError(std::string("unexpected token '")+tok_spelling(t.kind)+"'", t.line, t.col);
         }
@@ -755,8 +761,8 @@ struct P {
         }
         case Tk::Kw_switch: {
             // switch (expr) { case LIT: stmts...  default: stmts... }
-            // No implicit break between cases (C-style fallthrough); a case
-            // body runs until the next case/default label or the closing '}'.
+            // Sema requires each nonempty case to terminate with break/return;
+            // parsing still preserves each body independently for diagnostics.
             adv();
             auto s = std::make_unique<SwitchStmt>();
             s->loc = loc(t);
@@ -834,8 +840,8 @@ struct P {
                     expect(Tk::Assign, "'='");
                     g->init = parse_expr();
                     g->loc = loc(peek());
+                    g->is_const = is_const;
                     expect(Tk::Semicolon, "';'");
-                    (void)is_const; // const-ness recorded at sema; storage identical (TYPE_SYSTEM Section 11.5)
                     prog.globals.push_back(std::move(*g));
                 } else if (at(Tk::Kw_link)) {
                     if (!anns.empty()) throw ParseError("annotations on link not supported", peek().line, peek().col);

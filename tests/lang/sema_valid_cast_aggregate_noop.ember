@@ -1,0 +1,6 @@
+// Same-type aggregate casts preserve the complete value, not only word zero.
+fn main() -> i64 {
+    let a: i64[2];
+    let b: i64[2] = a as i64[2];
+    return 0;
+}

@@ -35,9 +35,9 @@ Status: **v1.0** - the full frontend + binding API + safe execution + live
   for the CLI + check exes + sample scripts, and `docs/v1.0_INTEGRATION_NOTES.md`
   for the batch + follow-on notes.
 
-  Next milestone: **v1.0+** - the SSA-lite IR + linear-scan regalloc refactor
-  remains gated on the v0.6 benchmark harness vs AngelScript proving it
-  matters (no speculative optimization). The fluent `TypeBuilder`/
+  Next milestone: **v1.0+** - SSA-lite IR + linear-scan allocation remain
+  deferred and benchmark-gated. The shipped backend is the tree-walking,
+  stack-spilling emitter (no speculative optimization). The fluent `TypeBuilder`/
   `StructBuilder`/`engine_t` surface stays trigger-gated on a host wanting
   script-visible C++ struct types (the v0.6 integration didn't fire it).
 
@@ -50,7 +50,7 @@ Status: **v1.0** - the full frontend + binding API + safe execution + live
 - `docs/TYPE_SYSTEM.md` - primitives, struct layout, slices, the
   no-raw-pointer rule, conversion matrix, operator types.
 - `docs/COMPILER_PIPELINE.md` - lexer tokens, BNF grammar, AST, sema
-  passes, SSA-lite IR, lowering rules, error model.
+  passes, shipped tree-walking lowering, deferred SSA-lite design, error model.
 - `docs/CODEGEN_SPEC.md` - the x86-64 backend: calling convention,
   exact instruction encodings, regalloc, label/patch system, call
   emission, trap stubs, v0.1 acceptance criteria.
@@ -58,8 +58,9 @@ Status: **v1.0** - the full frontend + binding API + safe execution + live
   the `EMBL` container contract (`em_file.hpp`), relocations
   (DispatchTableBase / GlobalsBase), the writer/loader pair, and the
   module round-trip that acceptance test #7 exercises.
-- `docs/BINDING_API.md` - `NativeFn`/`TypeBuilder`/`StructBuilder`,
-  script-type→Win64-slot mapping, slice convention.
+- `docs/BINDING_API.md` - shipped `BindingBuilder`/`NativeSig` API,
+  script-type→Win64-slot mapping, slice convention, and clearly deferred
+  fluent builder sketches.
 - `docs/SAFETY_AND_SANDBOX.md` - threat model, budgets, stack-depth
   guard, bounds checks, `PERM_FFI`, the single non-local-unwind
   primitive, the v1.0 call-target-provenance guard (#6) + context
@@ -69,7 +70,8 @@ Status: **v1.0** - the full frontend + binding API + safe execution + live
   Tier 1 `enum` / Tier 2 function refs / Tier 5 sync queues + context
   thread-safety all marked ✓ shipped v1.0 with their open items.
 - `docs/HOT_RELOAD.md` - dispatch table, slot stability, reload
-  protocol, in-flight calls, epoch reclamation.
+  protocol, in-flight calls, caller-owned retirement, and the deferred
+  concurrent epoch/quiescence requirement.
 - `docs/MEMORY_AND_GC.md` - ownership taxonomy, slice-escape check,
   globals, strings, arena (reserved), v2-GC deferral rationale.
 - `docs/LIFECYCLE.md` - `@entry`/`@on_tick`/`@event(...)` annotation-based
@@ -106,8 +108,9 @@ sample scripts.
 ## Building
 
 C++17, no external deps beyond `Windows.h` (VirtualAlloc). Builds clean
-on MinGW g++ 15.2.0 + Ninja (the config this tree is tested on); MSVC
-VS 2022 also supported. The build produces three static libs, eight
+on MinGW g++ 15.2.0 + Ninja (the supported and tested compiler path). **MSVC
+x64 is unsupported; use MinGW g++** (CMake fails loudly because no working
+MSVC B1 thunk exists). The build produces three static libs, eight
 extension libs (vec/quat/mat/string/array/math/sync/lifecycle), four
 round-trip/registration test exes, the standalone
 `ember` CLI, and two language-check exes:
@@ -116,15 +119,14 @@ round-trip/registration test exes, the standalone
 cd ember
 mkdir build && cd build
 # MinGW g++ + Ninja:
-cmake -G Ninja -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++..exe ..
+cmake -G Ninja -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe ..
 cmake --build .          # or: ninja
-ctest                    # 17 targets (see the list below)
+ctest                    # currently 20 tests with AngelScript, 19 without
 ```
 
-`ctest` is 17 targets and all must pass (the v1.0 concurrency + Tier 2
-batch took it from 14 to 16 by adding `thread_safety` and `function_refs`;
-`ext_sync` was wired in the preceding WIP commit; `ext_lifecycle` added the
-17th when dynamic registration shipped in a follow-on commit):
+The configured CTest suite is the release gate; all discovered targets must
+pass. With the AngelScript SDK present this tree currently configures 20 tests
+(including the benchmark); without it, only the benchmark target is omitted.
 - `em_roundtrip` - JIT→serialize→`load_em_file`→run round-trip on a real
   parsed function (double_it + recursive fib), asserting the loaded
   module matches the JIT'd one.
@@ -147,9 +149,10 @@ batch took it from 14 to 16 by adding `thread_safety` and `function_refs`;
   `context_t`, `r14` indirection, no cross-thread longjmp corruption).
 - `function_refs` - the v1.0 first-class function refs (handle creation,
   multi-arg dispatch, recursion via handle, the REDSHELL #6 guard).
-- `v0_5_live_modules`, `binding_abi`, `lang_suite`, `bench_ember_vs_as`,
-  `v0_6_lifecycle`, `v0_6_hot_reload`, `game_host_integration`,
-  `float_global_regression` - the rest of the v0.3–v1.0 suite.
+- `em_loader_hardening`, `em_cli_emit`, `win64_abi`, `v0_5_live_modules`, `binding_abi`,
+  `lang_suite`, optional `bench_ember_vs_as`, `v0_6_lifecycle`,
+  `v0_6_hot_reload`, `game_host_integration`, `float_global_regression` -
+  loader/ABI hardening and the rest of the v0.3–v1.0 suite.
 - `lang_suite` - the language regression suite (`tests/run_lang_tests.sh`)
   classifies `tests/lang/{valid,invalid,sema_valid,sema_invalid,import_*}.ember`
   (70 `.ember` files; the v1.0 batch added the four enum tests) against
@@ -162,7 +165,9 @@ ember + ember_frontend + the eight extension libs (no prism natives, no VFS,
 no backends):
 
 ```
-ember_cli run <file.ember> [--fn <name>] [--dump]
+ember_cli run <input.ember> [--fn NAME] [--dump] [--emit-em OUTPUT.em]
+                              [--tick [--tick-count N] [--tick-interval MS]]
+ember_cli emit-em <input.ember> <output.em>
 ```
 
 - `run` compiles and executes `<file.ember>`'s entry function (default
@@ -172,6 +177,9 @@ ember_cli run <file.ember> [--fn <name>] [--dump]
 - `--fn <name>` overrides the entry (default `main`).
 - `--dump` prints each compiled function's slot, byte size, and reloc
   count.
+- `emit-em <input.ember> <output.em>` precompiles without running and always
+  requires an explicit output. `run ... --emit-em <output.em>` is retained as
+  the option form of the same operation; initialized global bytes are emitted.
 - `--tick` (v0.6, B1-wired v1.0) runs the module's `@on_tick` fns on a tick
   thread at `--tick-interval <ms>` (default 16, ~60fps) until a keybind is
   pressed; `--tick-count <N>` auto-stops after N ticks (for tests/
@@ -183,13 +191,21 @@ ember_cli run <file.ember> [--fn <name>] [--dump]
   routines a script registered via `register_routine(&fn, data)` (the
   dynamic-registration path, `examples/scripts/dynamic_registration.ember`).
 
+There is no CLI `--load-em` action in v1. Loading is through the host
+`load_em_file`/`link_em_file` API and the source `link "module.em" as alias;`
+directive. A v1 `.em` contains native code and embedded process-local pointers;
+it is ABI/process trusted, not a portable or untrusted interchange format.
+Cross-process portability requires a versioned symbolic-relocation redesign
+(H12), and v1 exports carry no signatures, so `.em` imports are ABI-trusted
+unknown signatures (H14).
+
 `import "path";` in a script is resolved as textual inclusion before
 lexing (cycle-detected, `seen`-set deduped) - multi-file scripts work.
 Sample scripts live in `examples/scripts/` (`fib`, `control`, `struct`,
 `string`), each with a `// expect: <value>` the CLI's exit code validates.
 
-The `ember_check` (parse-only) and `sema_check` (parse+sema, full
-six-extension surface registered) exes are the language-regression
+The `ember_check` (parse-only) and `sema_check` (parse+sema, core
+vec/quat/mat/string/array/math surface registered) exes are the language-regression
 tooling the `lang_suite` CTest target drives; they also double as a
 quick "does this script parse/sema-check?" one-shot:
 
@@ -205,12 +221,16 @@ no opt passes, no inlining, no loop opts). AngelScript is a bytecode
 interpreter; even baseline native code beats a bytecode interpreter on
 tight loops by typically 5-50×, which comfortably satisfies "much faster"
 for hot game-logic — the v0.6 benchmark harness (`examples/bench_ember_vs_as.cpp`,
-ctest target `bench_ember_vs_as`) measured it: ember ~0.15× AngelScript's
-time on `fib(32)` / `tight_loop(1e8)` / `nested_calls(1e7)`, 0.55× on
-mandelbrot (results in `v0.6_BENCHMARK_RESULTS.md`). Matching an optimizing
+ctest target `bench_ember_vs_as`) recorded Ember/AngelScript ratios of
+**0.15** for `fib(32)`, **0.16** for `tight_loop(1e8)`, **0.18** for
+`nested_calls(1e7)`, and **0.55** for mandelbrot (results in
+`v0.6_BENCHMARK_RESULTS.md`). Available provenance: Windows x86-64, MinGW g++
+15.2.0, Release `-O3 -DNDEBUG`; results were committed before the 2026-07-09
+audit (exact CPU and run date were not recorded). These are compile-once hot-path
+means with safety checks disabled, not cross-machine statistical claims. Matching an optimizing
 native-JIT language's speed is a v2+ goal, gated on a benchmark-proven
-need — the SSA-lite IR + linear-scan regalloc refactor
-(`COMPILER_PIPELINE.md` Section 5) is the target the tree-walker lowers
-toward conceptually, deferred until the bench shows where ember is slow.
+need — the SSA-lite IR + linear-scan allocation design
+(`COMPILER_PIPELINE.md` Section 5) is explicitly deferred until stronger
+benchmarks show where Ember is slow.
 No speculative optimization (`DESIGN.md` Section 9). The codegen is
 correctness-first today.

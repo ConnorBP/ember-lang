@@ -229,9 +229,13 @@ struct RipFixup {
   reload / what if functions are compiled in different exec-memory
   chunks" problem class. One rule, no exceptions, easy to reason about.
 
-## 5. Register allocation: linear scan on SSA-lite IR
+## 5. Deferred register allocation design: linear scan on SSA-lite IR
 
-"SSA-lite" (see COMPILER_PIPELINE.md Section 5 for full IR definition): each
+> **Not implemented in v1.0.** The shipped backend walks the AST directly and
+> stack-spills expression intermediates. Everything in this section is a future,
+> benchmark-gated design, not a description of current codegen.
+
+"SSA-lite" (see COMPILER_PIPELINE.md Section 5 for the deferred IR definition): each
 IR value is assigned exactly once, values are typed, control flow is
 basic blocks with explicit terminators, but there are **no phi
 nodes** - instead, values that are live across a block boundary from
@@ -431,13 +435,10 @@ Edge cases:
   perspective a `Slice<T>` script param is exactly `(T* ptr, int64_t
   len)`, two normal C ABI args; the native-side binding signature
   documents this explicitly (BINDING_API.md Section 6).
-- Struct-by-value args >8 bytes: codegen materializes the struct into
-  a stack slot (or reuses its existing frame slot if it's already a
-  local) and passes **a pointer to it** in the arg slot, per Win64
-  struct-by-value-via-hidden-pointer rule - this matches what MSVC
-  does for the native side automatically, no special-casing needed
-  beyond "always pass address, never try to fit >8 byte structs in
-  registers."
+- Native struct-by-value arguments are supported only when the tightly packed
+  Ember aggregate is at most 8 bytes. Sema rejects larger native aggregate
+  arguments before codegen; a correct Win64 indirect-by-value implementation
+  for those shapes is deferred.
 - Return value: `rax`/`xmm0` per convention; struct return >8 bytes
   uses the hidden-pointer-return convention (Section 1) - caller allocates
   the destination slot (a local, or the caller's own struct-return
@@ -492,9 +493,8 @@ jmp  .after
 - The trap stub calls into the host runtime error path
   (SAFETY_AND_SANDBOX.md Section 7) which by policy **does not return**  - 
   it unwinds the current `context_t`'s execution back to the
-  `ember_call` entry point via a `longjmp`-equivalent (a saved
-  `jmp_buf`-style register/rsp snapshot taken at `ember_call` entry,
-  see MEMORY_AND_GC.md Section 3 and SAFETY_AND_SANDBOX.md Section 2) - so the
+  host-managed checkpoint via `__builtin_longjmp` (the raw B1 thunks do
+  not create that checkpoint; see SAFETY_AND_SANDBOX.md Section 2) - so the
   `jae .oob_trap` path never needs a "return and propagate an error
   code up through every caller" plumbing story. This is deliberate:
   checked-error propagation through every stack frame would cost a
@@ -572,7 +572,7 @@ count, per Section 1's slot-parallel rule):
   what makes frame-slot addressing (`[rbp - k]`) valid everywhere
   without tracking a moving `rsp` offset per instruction.
 
-## 13. `switch` lowering
+## 12. `switch` lowering
 
 Two strategies, chosen per-switch at lowering time based on case-label
 density (`COMPILER_PIPELINE.md` Section 6 / `TYPE_SYSTEM.md` Section 11.6):
@@ -615,42 +615,18 @@ path; each case body ends with an explicit terminator jumping to
 `switch_exit_bb` (or returning/trapping). This is what lets us skip
 the entire Duff-device-style fallthrough machinery C requires.
 
-## 14. `defer` emission
+## 13. `defer` emission
 
-`defer expr;` in a block pushes `expr`'s lowered form onto a
-**per-block deferred-actions list** during lowering
-(`COMPILER_PIPELINE.md` Section 6). Every scope-exit path emits the
-list's actions in reverse order (LIFO, matching Go/C++-`defer`):
-- **Normal fallthrough off the block's end**: emit defers, then
-  continue to the parent block.
-- **`return` inside the block**: emit the block's defers *before* the
-  return's value-move + epilogue (so a deferred `release(handle)` runs
-  before the function returns - the handle is still valid at defer
-  time, not after the frame is torn down). Nested-block defers emit
-  outer-to-inner as the return unwinds through each enclosing block.
-- **`break`/`continue` out of an enclosing loop from inside this
-  block**: emit this block's defers, then jump to the loop's break/
-  continue target (same as fallthrough, just to a different label).
-- **Trap-unwind path (bounds/div/budget/depth/`runtime_error`)**:
-  **defers do NOT run** (`GAP_ANALYSIS.md` Section 5, `COMPILER_PIPELINE.md`
-  Section 6) - the non-local jump (`SAFETY_AND_SANDBOX.md` Section 2) bypasses
-  them. This is a documented v1 limitation: traps abort the whole
-  `ember_call`, not a graceful per-frame unwind. A script needing
-  cleanup-on-trap must use a host-side error handler, not `defer`.
+The implemented v1 shape is deliberately narrower than lexical RAII:
+codegen gathers deferred expressions at function level and emits them LIFO at
+ordinary function exit. Nested block fallthrough and loop `break`/`continue`
+do not trigger cleanup, and trap unwind bypasses defers. A defer in a loop is
+therefore emitted at most once by the current static lowering. Sema restricts
+references to parameters and globals so values remain addressable at function
+exit. Per-block lists and lexical cleanup-edge architecture are deferred; they
+must not be assumed by hosts or scripts.
 
-Implementation: the per-block defer list is a lowering-time-only
-structure (not a runtime data structure on the frame - no hidden
-counter, no allocation); lowering simply emits the defer bodies' IR
-instructions inline at each exit point. Cost: code-size duplication
-(defer body IR appears N times for N exit paths), but defer bodies are
-expected to be tiny (one call, usually), and the alternative (a
-shared defer-cleanup trampoline + per-block exit counter) adds
-runtime indirection for a rare feature - YAGNI, accept the duplication
-in v1, revisit only if a real script's defer bodies are large enough
-that the duplication shows up in code size (unlikely; defers are
-short by idiom).
-
-## 12. What "prove it compiles" means for v0.1 (acceptance criteria)
+## 14. What "prove it compiles" means for v0.1 (acceptance criteria)
 
 Concrete, testable claims the v0.1 milestone (DESIGN.md Section 9) must
 satisfy before moving on, restated here in codegen terms:
@@ -689,10 +665,10 @@ The shipped runner also executes the expanded criteria in Section 15
 
 ## 15. v0.1 acceptance suite (expanded)
 
-The original v0.1 gate is Section 12 (five criteria). Two further tests
+The original v0.1 gate is Section 14 (five criteria). Two further tests
 shipped with the `.em` bundling format and the full-encoder coverage
 proof, between v0.1 and v0.2. They are recorded here rather than
-folded into Section 12 so Section 12 stays an accurate historical claim about the
+folded into Section 14 so Section 14 stays an accurate historical claim about the
 original gate.
 
 ### 15.6 Full Section 3 ISA byte-exact encoder coverage
@@ -709,7 +685,7 @@ comisd, cvtsi2sd r64→x, cvttsd2si x→r64, pxor). The expected byte
 vector is built independently of the encoder and compared for
 equality; on mismatch the runner dumps both sequences and the first
 differing byte. This proves the whole encoder is correct, not just
-the subset the five Section 12 tests touch.
+the subset the five Section 14 tests touch.
 
 ### 15.7 `.em` serialize → load → run round-trip
 

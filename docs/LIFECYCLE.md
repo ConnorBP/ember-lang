@@ -1,12 +1,6 @@
 # ember - lifecycle & routines
 
 The native-JIT-language-equivalent of `main()` + `register_routine(cast(fn), data)`
-
-> **Implementation status: v0.1** - this is the v1.0 design spec. The
-> current repo implements the JIT codegen proof (encoder, label/patch,
-> exec-mem, `.em` format). See `README.md` for what's shipped; see
-> `CODEGEN_SPEC.md` Section 12 + Section 15 for the acceptance suite. This doc's
-> content is the target design, not a claim of current implementation.
 (`RESEARCH_NOTES.md`), expressed ember's way: **annotation-based
 discovery + host name/slot lookup**. Script-side first-class function
 references (`&fn` / `handle(args)` / the `fn` type) shipped in v1.0
@@ -105,8 +99,8 @@ invalidated.
 
 ## 4. Reload interaction (`HOT_RELOAD.md`)
 
-Reloading a module preserves globals (`HOT_RELOAD.md` Section 6) and slot
-indices - so a `@on_tick` routine reloaded mid-session keeps its slot,
+Single-function reload preserves globals and the replaced function's slot
+index (`HOT_RELOAD.md` Sections 1/3), so an `@on_tick` routine reloaded mid-session keeps its slot,
 the host's cached slot index stays valid, and the next per-frame call
 picks up the new body. `@entry`/`main` is **not** re-run on reload
 (it already ran at load; re-running setup code on every hot-reload

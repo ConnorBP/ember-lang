@@ -1,13 +1,7 @@
 # ember - safety & sandbox spec
 
 Detail doc for DESIGN.md Section 5. Every "what happens when X goes wrong"
-
-> **Implementation status: v0.1** - this is the v1.0 design spec. The
-> current repo implements the JIT codegen proof (encoder, label/patch,
-> exec-mem, `.em` format). See `README.md` for what's shipped; see
-> `CODEGEN_SPEC.md` Section 12 + Section 15 for the acceptance suite. This doc's
-> content is the target design, not a claim of current implementation.
-case, and exactly where in the compiled code the check lives.
+case, the shipped safety boundary, and explicitly deferred mechanisms.
 
 ## 1. Threat/trust model (explicit, so nothing is assumed)
 
@@ -32,25 +26,19 @@ case, and exactly where in the compiled code the check lives.
 
 ## 2. Execution entry point & non-local abort mechanism
 
-Every `ember_call(context, fn_name, args, argc)` establishes a
-**resume point** before entering script code: saves the current
-`rsp`/`rbp`/callee-saved-register state (a small `struct
-ExecutionCheckpoint` - effectively a `setjmp`-equivalent, implemented
-directly rather than pulling in libc `setjmp/longjmp` semantics we
-don't need the C-runtime-signal-mask parts of) into the `context_t`.
-Any trap (Section 4-Section 7 below) performs the equivalent of `longjmp` back to
-this checkpoint: restores `rsp`/`rbp`/callee-saved regs, and
-`ember_call` returns `false` with an error recorded on the context
-(retrievable like AngelScript's/the surveyed native-JIT language's exception-as-data model,
-RESEARCH_NOTES.md - no C++ exception ever crosses the JIT/native
-boundary).
-- **Nested `ember_call`** (a native function called from script calls
-  back into `ember_call` for a different function): each call
-  pushes its own checkpoint onto a small stack of checkpoints on the
-  `context_t`; a trap unwinds to the *innermost* checkpoint only,
-  it a  a  which correctly resumes at the right nested `ember_call`
-  invocation, not the outermost one - plain checkpoint stack (`std::vector`
-  in the context struct), pop on normal return, pop-and-jump on trap.
+The shipped `ember_call_void` and `ember_call_i64` functions are **raw B1
+thunks**: they install the caller's `context_t*` in `r14`, invoke the supplied
+entry pointer, and preserve the incoming nonvolatile `r14`. They do not reset
+the context and do not establish a recoverable resume point.
+
+A host requiring recoverable traps must set `has_checkpoint`, establish the
+`__builtin_setjmp` checkpoint, invoke the raw thunk, and clear the checkpoint,
+as `examples/ember_cli.cpp` and the safety tests do. A host may wrap that
+pattern in its own safe-call API. A trap stub records the reason and performs
+`__builtin_longjmp` to that host-managed checkpoint. `context_t` stores one
+checkpoint; a nested checkpoint stack and a core safe-call wrapper remain
+deferred. Calling trap-capable code through a raw thunk without a checkpoint
+is not recoverable.
 - **Trap during a native call made from script** (host code called by
   script itself faults or throws a real C++ exception): this is
   outside ember's control by definition (Section 1, native code is trusted)
@@ -65,32 +53,22 @@ boundary).
 
 ## 3. Instruction budget
 
-- **Mechanism**: `context_t` holds a single `int64_t budget_remaining`
-  counter. Every JIT'd function's prologue decrements it by a
-  **per-function static cost estimate** (a simple count of emitted IR
-  instructions for straight-line code - not a cycle-accurate model,
-  just a coarse "how much work happened" proxy, matches the surveyed native-JIT language's
-  `set_budget(instructions)` being instruction-count not
-  cycle-count, RESEARCH_NOTES.md) and checks `<= 0`. **Every loop
-  back-edge** (the jump from a `while`/`for` body back to its
-  condition check) also decrements by the loop body's static
-  instruction count and checks - this is what actually catches
-  runaway loops, since a single function-entry check wouldn't catch
-  an infinite `while(true){}` that never returns.
+- **Mechanism (implemented v1 model)**: `context_t` holds a single
+  `int64_t budget_remaining` counter. A unit charge/check is emitted on
+  taken loop back-edges (`while`, `for`, and `do-while`). Function entry,
+  straight-line statements, and native calls are not budget-charged. The
+  model is a loop-iteration budget, not a total instruction counter.
   ```
   sub  [budget_ptr], body_cost_imm
   jg   .continue            ; budget_remaining > 0, keep going
   call [ember_trap_budget_slot]   ; does not return (checkpoint unwind, Section 2)
   .continue:
   ```
-  `budget_ptr` is loaded once (into a callee-saved register or a
-  fixed stack slot) at function entry rather than re-fetched from
-  `context_t` on every check, to keep the check itself to a single
-  `sub`+`jg`.
+  In B1 mode the counter is addressed through the per-call `r14` context.
 - **Exhaustion behavior**: traps via the shared budget-trap stub,
-  same non-local unwind as bounds/div-by-zero (Section 2). `ember_call`
-  returns `false`, error info records "budget exceeded" (retrievable
-  via `last_error`/`exception_*`, DESIGN.md Section 8-style API).
+  same non-local unwind as bounds/div-by-zero (Section 2). The host's
+  checkpoint wrapper resumes and observes "budget exceeded" through
+  `last_error`/`last_trap`.
   Script does **not** get a chance to catch this - no in-language
   exception handling exists (DESIGN.md Section 2), matches "abort, don't try
   to let a runaway script gracefully handle its own runaway-ness."
@@ -119,16 +97,13 @@ boundary).
 
 ## 4. Stack depth guard
 
-- **Mechanism**: `context_t` holds `int32_t call_depth` and a
-  configured `max_call_depth` (default e.g. 512 - generous for game
-  script call trees, well below actual native-stack-overflow territory
-  given ember frames are small). Every script-to-script *and*
-  script-to-native call increments `call_depth` before the call and
-  decrements after (native calls count too - a native function that
-  calls back into script via `ember_call`, Section 2, shares the same depth
-  counter across the boundary, since the actual native OS stack is
-  the real resource being protected regardless of which side is
-  "currently executing").
+- **Mechanism (implemented v1 model)**: `context_t` holds `int32_t
+  call_depth` and a configured `max_call_depth`. Script-to-script calls
+  increment before the call and decrement after. Native calls are not
+  charged to this counter. Together with budget charges at loop back-edges
+  (not every instruction or function entry), the shipped safety model is
+  precisely **loop budget + script-call depth**. Straight-line/native-heavy
+  work remains a trusted-host concern; broader accounting is deferred.
   ```
   inc  [call_depth_ptr]
   cmp  [call_depth_ptr], max_call_depth_imm
@@ -230,8 +205,8 @@ host-callable functions (mirrors the surveyed native-JIT language's `runtime_err
   not for the underlying unwind mechanism, which is identical either
   way.
 - **All traps funnel through one unwind primitive.** There is exactly
-  one "abort this `ember_call`" mechanism in the whole engine
-  (Section 2's checkpoint stack); bounds/budget/depth/div-zero/overflow/
+  one "abort this guarded entry" mechanism in the whole engine
+  (Section 2's host-managed checkpoint); bounds/budget/depth/div-zero/overflow/
   runtime_error/runtime_exception are all just different *reasons*
   recorded before invoking the same unwind - this is a deliberate
   simplification (one code path to get right, one thing to test)
@@ -260,7 +235,7 @@ gets two guards, one at each layer:
 > the JIT'd code validates the handle against a host-built bitset allowlist
 > (one bit per registered script-fn slot, set by sema at compile time) before
 > indexing the dispatch table. A handle that is out of range or whose bit is
-> clear traps via `emit_trap(BadCallTarget)` (longjmp to the `ember_call`
+> clear traps via `emit_trap(BadCallTarget)` (longjmp to the host-managed
 > checkpoint). The JIT'd code never executes `call rax` / `call [table + h*8]`
 > with an unvalidated script-supplied i64. This is the runtime backstop for
 > the V2 ("i64-as-call-target") surface that first-class function references
@@ -348,9 +323,10 @@ threads, each with its own `context_t`. Two pieces (plan:
   inherits the same ctx). The trap stub's first arg (`rcx`) is loaded
   from `r14` rather than a baked imm64 pointer. The load-bearing
   consequence: **one compiled body serves N per-thread `context_t`s** —
-  no per-context recompile. The host sets `r14 = ctx` at entry via the
-  `ember_call_void` / `ember_call_i64` inline-asm helpers
-  (`src/engine.{hpp,cpp}`); legacy non-B1 hosts keep the baked-pointer
+  no per-context recompile. The host sets `r14 = ctx` at entry via the raw
+  `ember_call_void` / `ember_call_i64` MinGW B1 thunks
+  (`src/engine.{hpp,cpp}`); those thunks do not establish checkpoints.
+  Legacy non-B1 hosts keep the baked-pointer
   behavior (`use_context_reg = false` is the default).
 
 The globals-lookup emit-time fix that came with it: codegen now prefers

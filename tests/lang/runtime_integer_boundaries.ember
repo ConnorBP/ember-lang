@@ -1,0 +1,22 @@
+// Table-driven-equivalent boundary matrix for every signed/unsigned integer width.
+// Each width checks upper wrapping, lower/sign normalization, comparison, and shift.
+fn main() -> i64 {
+    let u8_max: u8 = 255 as u8;
+    let u16_max: u16 = 65535 as u16;
+    let u32_max: u32 = 4294967295 as u32;
+    let u64_max: u64 = (0 as u64) - (1 as u64);
+    if (u8_max + (1 as u8) != 0 as u8 || !(u8_max > 0 as u8) || (u8_max >> (7 as u8)) != 1 as u8) { return 1; }
+    if (u16_max + (1 as u16) != 0 as u16 || !(u16_max > 0 as u16) || (u16_max >> (15 as u16)) != 1 as u16) { return 2; }
+    if (u32_max + (1 as u32) != 0 as u32 || !(u32_max > 0 as u32) || (u32_max >> (31 as u32)) != 1 as u32) { return 3; }
+    if (u64_max + (1 as u64) != 0 as u64 || !(u64_max > 0 as u64) || (u64_max >> (63 as u64)) != 1 as u64) { return 4; }
+
+    let i8_min: i8 = 128 as i8;
+    let i16_min: i16 = 32768 as i16;
+    let i32_min: i32 = 2147483648 as i32;
+    let i64_min: i64 = (-9223372036854775807) - 1;
+    if (!(i8_min < 0 as i8) || (i8_min >> (7 as i8)) != -1 as i8 || (127 as i8) + (1 as i8) != i8_min) { return 5; }
+    if (!(i16_min < 0 as i16) || (i16_min >> (15 as i16)) != -1 as i16 || (32767 as i16) + (1 as i16) != i16_min) { return 6; }
+    if (!(i32_min < 0 as i32) || (i32_min >> (31 as i32)) != -1 as i32 || (2147483647 as i32) + (1 as i32) != i32_min) { return 7; }
+    if (!(i64_min < 0) || (i64_min >> 63) != -1 || 9223372036854775807 + 1 != i64_min) { return 8; }
+    return 79;
+}

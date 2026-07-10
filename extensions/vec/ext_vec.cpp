@@ -26,10 +26,10 @@ extern "C" {
     static void n_vec3_set_x(int64_t h, float v) { auto* s=v3_slot(h); if(s) s->x=v; }
     static void n_vec3_set_y(int64_t h, float v) { auto* s=v3_slot(h); if(s) s->y=v; }
     static void n_vec3_set_z(int64_t h, float v) { auto* s=v3_slot(h); if(s) s->z=v; }
-    static int64_t n_vec3_add(int64_t a, int64_t b) { auto* x=v3_slot(a); auto* y=v3_slot(b); return v3_new(x->x+y->x, x->y+y->y, x->z+y->z); }
-    static int64_t n_vec3_sub(int64_t a, int64_t b) { auto* x=v3_slot(a); auto* y=v3_slot(b); return v3_new(x->x-y->x, x->y-y->y, x->z-y->z); }
-    static int64_t n_vec3_mul(int64_t a, int64_t b) { auto* x=v3_slot(a); auto* y=v3_slot(b); return v3_new(x->x*y->x, x->y*y->y, x->z*y->z); }
-    static int64_t n_vec3_eq(int64_t a, int64_t b) { auto* x=v3_slot(a); auto* y=v3_slot(b); return (x->x==y->x && x->y==y->y && x->z==y->z) ? 1 : 0; }
+    static int64_t n_vec3_add(int64_t a, int64_t b) { auto* x=v3_slot(a); auto* y=v3_slot(b); return (x&&y)?v3_new(x->x+y->x, x->y+y->y, x->z+y->z):0; }
+    static int64_t n_vec3_sub(int64_t a, int64_t b) { auto* x=v3_slot(a); auto* y=v3_slot(b); return (x&&y)?v3_new(x->x-y->x, x->y-y->y, x->z-y->z):0; }
+    static int64_t n_vec3_mul(int64_t a, int64_t b) { auto* x=v3_slot(a); auto* y=v3_slot(b); return (x&&y)?v3_new(x->x*y->x, x->y*y->y, x->z*y->z):0; }
+    static int64_t n_vec3_eq(int64_t a, int64_t b) { auto* x=v3_slot(a); auto* y=v3_slot(b); return (x&&y&&x->x==y->x && x->y==y->y && x->z==y->z) ? 1 : 0; }
 }
 
 // --- vec2 host store (opaque i64 handle; host owns {float x,y}) ---
@@ -43,10 +43,10 @@ extern "C" {
     static float n_vec2_y(int64_t h) { auto* v=v2_slot(h); return v?v->y:0; }
     static void n_vec2_set_x(int64_t h, float v) { auto* s=v2_slot(h); if(s) s->x=v; }
     static void n_vec2_set_y(int64_t h, float v) { auto* s=v2_slot(h); if(s) s->y=v; }
-    static int64_t n_vec2_add(int64_t a, int64_t b) { auto* x=v2_slot(a); auto* y=v2_slot(b); return v2_new(x->x+y->x, x->y+y->y); }
-    static int64_t n_vec2_sub(int64_t a, int64_t b) { auto* x=v2_slot(a); auto* y=v2_slot(b); return v2_new(x->x-y->x, x->y-y->y); }
-    static int64_t n_vec2_mul(int64_t a, int64_t b) { auto* x=v2_slot(a); auto* y=v2_slot(b); return v2_new(x->x*y->x, x->y*y->y); }
-    static int64_t n_vec2_eq(int64_t a, int64_t b) { auto* x=v2_slot(a); auto* y=v2_slot(b); return (x->x==y->x && x->y==y->y) ? 1 : 0; }
+    static int64_t n_vec2_add(int64_t a, int64_t b) { auto* x=v2_slot(a); auto* y=v2_slot(b); return (x&&y)?v2_new(x->x+y->x, x->y+y->y):0; }
+    static int64_t n_vec2_sub(int64_t a, int64_t b) { auto* x=v2_slot(a); auto* y=v2_slot(b); return (x&&y)?v2_new(x->x-y->x, x->y-y->y):0; }
+    static int64_t n_vec2_mul(int64_t a, int64_t b) { auto* x=v2_slot(a); auto* y=v2_slot(b); return (x&&y)?v2_new(x->x*y->x, x->y*y->y):0; }
+    static int64_t n_vec2_eq(int64_t a, int64_t b) { auto* x=v2_slot(a); auto* y=v2_slot(b); return (x&&y&&x->x==y->x && x->y==y->y) ? 1 : 0; }
 }
 
 // --- vec4 host store (opaque i64 handle; host owns {float x,y,z,w}) ---
@@ -64,10 +64,10 @@ extern "C" {
     static void n_vec4_set_y(int64_t h, float v) { auto* s=v4_slot(h); if(s) s->y=v; }
     static void n_vec4_set_z(int64_t h, float v) { auto* s=v4_slot(h); if(s) s->z=v; }
     static void n_vec4_set_w(int64_t h, float v) { auto* s=v4_slot(h); if(s) s->w=v; }
-    static int64_t n_vec4_add(int64_t a, int64_t b) { auto* x=v4_slot(a); auto* y=v4_slot(b); return v4_new(x->x+y->x, x->y+y->y, x->z+y->z, x->w+y->w); }
-    static int64_t n_vec4_sub(int64_t a, int64_t b) { auto* x=v4_slot(a); auto* y=v4_slot(b); return v4_new(x->x-y->x, x->y-y->y, x->z-y->z, x->w-y->w); }
-    static int64_t n_vec4_mul(int64_t a, int64_t b) { auto* x=v4_slot(a); auto* y=v4_slot(b); return v4_new(x->x*y->x, x->y*y->y, x->z*y->z, x->w*y->w); }
-    static int64_t n_vec4_eq(int64_t a, int64_t b) { auto* x=v4_slot(a); auto* y=v4_slot(b); return (x->x==y->x && x->y==y->y && x->z==y->z && x->w==y->w) ? 1 : 0; }
+    static int64_t n_vec4_add(int64_t a, int64_t b) { auto* x=v4_slot(a); auto* y=v4_slot(b); return (x&&y)?v4_new(x->x+y->x, x->y+y->y, x->z+y->z, x->w+y->w):0; }
+    static int64_t n_vec4_sub(int64_t a, int64_t b) { auto* x=v4_slot(a); auto* y=v4_slot(b); return (x&&y)?v4_new(x->x-y->x, x->y-y->y, x->z-y->z, x->w-y->w):0; }
+    static int64_t n_vec4_mul(int64_t a, int64_t b) { auto* x=v4_slot(a); auto* y=v4_slot(b); return (x&&y)?v4_new(x->x*y->x, x->y*y->y, x->z*y->z, x->w*y->w):0; }
+    static int64_t n_vec4_eq(int64_t a, int64_t b) { auto* x=v4_slot(a); auto* y=v4_slot(b); return (x&&y&&x->x==y->x && x->y==y->y && x->z==y->z && x->w==y->w) ? 1 : 0; }
 }
 
 // Registered surface is byte-identical to the old I/H/add lambda form:
@@ -76,26 +76,26 @@ extern "C" {
 void register_natives(std::unordered_map<std::string, NativeSig>& m) {
     BindingBuilder b;
     b.add("vec3_new", bind_handle("vec3"), {type_f32(),type_f32(),type_f32()}, (void*)&n_vec3_new);
-    b.add("vec3_x",   type_f32(), {type_i64()}, (void*)&n_vec3_x);
-    b.add("vec3_y",   type_f32(), {type_i64()}, (void*)&n_vec3_y);
-    b.add("vec3_z",   type_f32(), {type_i64()}, (void*)&n_vec3_z);
-    b.add("vec3_set_x",type_void(),{type_i64(),type_f32()}, (void*)&n_vec3_set_x);
-    b.add("vec3_set_y",type_void(),{type_i64(),type_f32()}, (void*)&n_vec3_set_y);
-    b.add("vec3_set_z",type_void(),{type_i64(),type_f32()}, (void*)&n_vec3_set_z);
+    b.add("vec3_x",   type_f32(), {bind_handle("vec3")}, (void*)&n_vec3_x);
+    b.add("vec3_y",   type_f32(), {bind_handle("vec3")}, (void*)&n_vec3_y);
+    b.add("vec3_z",   type_f32(), {bind_handle("vec3")}, (void*)&n_vec3_z);
+    b.add("vec3_set_x",type_void(),{bind_handle("vec3"),type_f32()}, (void*)&n_vec3_set_x);
+    b.add("vec3_set_y",type_void(),{bind_handle("vec3"),type_f32()}, (void*)&n_vec3_set_y);
+    b.add("vec3_set_z",type_void(),{bind_handle("vec3"),type_f32()}, (void*)&n_vec3_set_z);
     b.add("vec2_new", bind_handle("vec2"), {type_f32(),type_f32()}, (void*)&n_vec2_new);
-    b.add("vec2_x",   type_f32(), {type_i64()}, (void*)&n_vec2_x);
-    b.add("vec2_y",   type_f32(), {type_i64()}, (void*)&n_vec2_y);
-    b.add("vec2_set_x",type_void(),{type_i64(),type_f32()}, (void*)&n_vec2_set_x);
-    b.add("vec2_set_y",type_void(),{type_i64(),type_f32()}, (void*)&n_vec2_set_y);
+    b.add("vec2_x",   type_f32(), {bind_handle("vec2")}, (void*)&n_vec2_x);
+    b.add("vec2_y",   type_f32(), {bind_handle("vec2")}, (void*)&n_vec2_y);
+    b.add("vec2_set_x",type_void(),{bind_handle("vec2"),type_f32()}, (void*)&n_vec2_set_x);
+    b.add("vec2_set_y",type_void(),{bind_handle("vec2"),type_f32()}, (void*)&n_vec2_set_y);
     b.add("vec4_new", bind_handle("vec4"), {type_f32(),type_f32(),type_f32(),type_f32()}, (void*)&n_vec4_new);
-    b.add("vec4_x",   type_f32(), {type_i64()}, (void*)&n_vec4_x);
-    b.add("vec4_y",   type_f32(), {type_i64()}, (void*)&n_vec4_y);
-    b.add("vec4_z",   type_f32(), {type_i64()}, (void*)&n_vec4_z);
-    b.add("vec4_w",   type_f32(), {type_i64()}, (void*)&n_vec4_w);
-    b.add("vec4_set_x",type_void(),{type_i64(),type_f32()}, (void*)&n_vec4_set_x);
-    b.add("vec4_set_y",type_void(),{type_i64(),type_f32()}, (void*)&n_vec4_set_y);
-    b.add("vec4_set_z",type_void(),{type_i64(),type_f32()}, (void*)&n_vec4_set_z);
-    b.add("vec4_set_w",type_void(),{type_i64(),type_f32()}, (void*)&n_vec4_set_w);
+    b.add("vec4_x",   type_f32(), {bind_handle("vec4")}, (void*)&n_vec4_x);
+    b.add("vec4_y",   type_f32(), {bind_handle("vec4")}, (void*)&n_vec4_y);
+    b.add("vec4_z",   type_f32(), {bind_handle("vec4")}, (void*)&n_vec4_z);
+    b.add("vec4_w",   type_f32(), {bind_handle("vec4")}, (void*)&n_vec4_w);
+    b.add("vec4_set_x",type_void(),{bind_handle("vec4"),type_f32()}, (void*)&n_vec4_set_x);
+    b.add("vec4_set_y",type_void(),{bind_handle("vec4"),type_f32()}, (void*)&n_vec4_set_y);
+    b.add("vec4_set_z",type_void(),{bind_handle("vec4"),type_f32()}, (void*)&n_vec4_set_z);
+    b.add("vec4_set_w",type_void(),{bind_handle("vec4"),type_f32()}, (void*)&n_vec4_set_w);
     NativeTable t = b.build();
     for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }

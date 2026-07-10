@@ -9,7 +9,7 @@
 # and it resolves the three exes out of <build_dir>:
 #   PARSE = <build_dir>/ember_check.exe    (parse-only: lex + resolve_imports + parse)
 #   SEMA  = <build_dir>/sema_check.exe     (parse + sema against the six standard extensions)
-#   CLI   = <build_dir>/ember_cli.exe      (run end-to-end - built by a parallel worker; soft-fail if absent)
+#   CLI   = <build_dir>/ember_cli.exe      (required for positive execution/trap coverage)
 #
 # Classification (verbatim from prism's runner):
 #   valid_*.ember + sema_valid_*.ember + sema_invalid_*.ember  -> must PARSE ok
@@ -52,34 +52,20 @@ if [ ! -x "$SEMA" ];  then printf "FATAL: sema_check not found at %s\n" "$SEMA";
 
 # parse-only regression (syntactic errors only - sema_invalid_* parse fine,
 # failing at sema instead).
-for f in tests/lang/valid_*.ember tests/lang/sema_valid_*.ember tests/lang/sema_invalid_*.ember; do
+for f in tests/lang/valid_*.ember tests/lang/runtime_*.ember tests/lang/sema_valid_*.ember tests/lang/sema_invalid_*.ember; do
     run "$PARSE" "$f" ok
 done
 for f in tests/lang/invalid_*.ember; do
     run "$PARSE" "$f" err
 done
 
-# sema regression (only the sema_* named files + import_test + valid_structs_slices;
-# other valid_* cases use nodes sema doesn't fully cover yet).
-#
-# sema_valid_basics.ember is the ONE case in the ported corpus authored against
-# prism's process/render native surface (ru64/rf32/clamp on lines 17-19), NOT
-# ember's six standard extensions (vec/quat/mat/string/array/math) that
-# sema_check registers. ember's sema correctly flags those three as 'unknown
-# function' - that is NOT a frontend gap, it's a native-surface mismatch
-# between the test's authoring environment (prism) and ember's standalone
-# sema_check. We do NOT edit the verbatim port and do NOT smuggle prism
-# natives into sema_check (the task said register the six extensions exactly).
-# Instead this one case's SEMA check is a documented SKIP - its PARSE check
-# (run above, passes) is the hard requirement. Reported, not papered over.
-SEMA_SKIP_PRISM_NATIVES="tests/lang/sema_valid_basics.ember"
-for f in tests/lang/sema_valid_*.ember tests/lang/import_test.ember tests/lang/valid_structs_slices.ember; do
-    if [ "$f" = "$SEMA_SKIP_PRISM_NATIVES" ]; then
-        printf "SKIP  %s (sema - authored vs prism natives ru64/rf32/clamp, not the six ember extensions)\n" "$f"
-        skip=$((skip+1))
-    else
-        run "$SEMA" "$f" ok
-    fi
+# Sema regression. sema_valid_basics is intentionally standalone (no Prism
+# ru64/rf32/clamp dependency), so the entire sema_valid set is a hard gate.
+for f in tests/lang/sema_valid_*.ember tests/lang/runtime_audit_semantics.ember \
+         tests/lang/runtime_cast_regressions.ember tests/lang/runtime_division_forms.ember tests/lang/runtime_integer_boundaries.ember \
+         tests/lang/runtime_language_features.ember tests/lang/import_test.ember \
+         tests/lang/valid_structs_slices.ember; do
+    run "$SEMA" "$f" ok
 done
 for f in tests/lang/sema_invalid_*.ember; do
     run "$SEMA" "$f" err
@@ -87,9 +73,8 @@ done
 
 # --- import resolver corner cases: parse + run end-to-end via CLI ---
 # These parse via ember_check AND run end-to-end via ember_cli (each has a
-# main() that returns the chained result). The CLI is built by a parallel
-# worker; if it's not present yet the run-via-CLI block soft-fails (SKIP) so
-# the suite doesn't hard-depend on it. The PARSE check is the hard requirement.
+# main() that returns the chained result). Positive execution is a release
+# requirement, not a soft parse-only fallback.
 #
 # ember_cli's return convention (see examples/ember_cli.cpp): if the entry
 # returns i64, that value IS the process exit code (the validation signal).
@@ -98,9 +83,7 @@ done
 # value, not rc==0. import_diamond's main returns 2003, but process exit codes
 # truncate to 8 bits -> 2003 & 0xFF = 211, so we expect 211 (the OS truncation
 # is real and the CLI's comment documents the i64-as-exit-code convention).
-if [ ! -x "$CLI" ]; then
-    printf "NOTE: ember_cli.exe not built yet (%s) - import run-via-CLI blocks will SKIP\n" "$CLI"
-fi
+if [ ! -x "$CLI" ]; then printf "FATAL: ember_cli not found at %s\n" "$CLI"; exit 2; fi
 
 # expected exit codes per import_* script (from each script's header comment;
 # import_diamond's 2003 truncates to 211 as an 8-bit exit code).
@@ -108,18 +91,31 @@ exp_nested=111; exp_diamond=211; exp_double=100; exp_dotdot=101; exp_self=42
 
 run_import_cli() {
     local f="$1" exp="$2"
-    if [ -x "$CLI" ]; then
-        local out rc
-        out=$("$CLI" run "$f" 2>&1); rc=$?
-        if [ $rc -eq "$exp" ]; then
-            printf "PASS  %s (run main, rc=%d == expected %d)\n" "$f" "$rc" "$exp"; pass=$((pass+1))
-        else
-            printf "FAIL  %s (run main, rc=%d != expected %d)\n%s\n" "$f" "$rc" "$exp" "$out"; fail=$((fail+1))
-        fi
+    local out rc
+    out=$("$CLI" run "$f" 2>&1); rc=$?
+    if [ $rc -eq "$exp" ]; then
+        printf "PASS  %s (run main, rc=%d == expected %d)\n" "$f" "$rc" "$exp"; pass=$((pass+1))
     else
-        printf "SKIP  %s (run main - ember_cli not built)\n" "$f"; skip=$((skip+1))
+        printf "FAIL  %s (run main, rc=%d != expected %d)\n%s\n" "$f" "$rc" "$exp" "$out"; fail=$((fail+1))
     fi
 }
+
+# Executable language regressions use main's exit code as their assertion.
+for spec in "runtime_audit_semantics.ember:77" "runtime_cast_regressions.ember:42" \
+            "runtime_division_forms.ember:78" "runtime_integer_boundaries.ember:79" "runtime_language_features.ember:93" \
+            "sema_valid_basics.ember:6"; do
+    f=${spec%%:*}; exp=${spec##*:}; out=$("$CLI" run "tests/lang/$f" 2>&1); rc=$?
+    if [ $rc -eq "$exp" ]; then printf "PASS  %s (explicit expected rc=%d)\n" "$f" "$rc"; pass=$((pass+1))
+    else printf "FAIL  %s (rc=%d, expected %d)\n%s\n" "$f" "$rc" "$exp" "$out"; fail=$((fail+1)); fi
+done
+for f in tests/lang/runtime_trap_*.ember; do
+    out=$("$CLI" run "$f" 2>&1); rc=$?
+    if [ $rc -eq 70 ] && printf "%s" "$out" | grep -q "RUNTIME TRAP"; then
+        printf "PASS  %s (recoverable trap)\n" "$f"; pass=$((pass+1))
+    else
+        printf "FAIL  %s (expected recoverable rc=70, got %d)\n%s\n" "$f" "$rc" "$out"; fail=$((fail+1))
+    fi
+done
 
 for f in tests/lang/import_nested.ember tests/lang/import_diamond.ember \
          tests/lang/import_double.ember tests/lang/import_dotdot.ember \

@@ -1,0 +1,7 @@
+// Cast matrix regression: unsigned integer/float conversion is not implemented
+// by the v1 x64 backend (signed cvtsi2sd would corrupt u64 > INT64_MAX).
+fn main() -> i64 {
+    let x: u64 = 0 as u64 - 1 as u64;
+    let y: f64 = x as f64;
+    return 0;
+}

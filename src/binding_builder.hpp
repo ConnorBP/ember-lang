@@ -8,18 +8,21 @@
 // the v1.0 ergonomic target, deferred until a real host wants script-visible
 // C++ struct types (these extensions use opaque i64 handles + StructLayoutTable).
 //
-// Usage:
+// Usage (the actual API):
 //   BindingBuilder b;
-//   b.add("sqrt",        type_f32(), {type_f32()},                  &my_sqrt);
-//   b.add("vec3_new",    struct_t("vec3"), {type_f32(),type_f32(),type_f32()}, &vec3_new);
-//   b.add_struct_ret("vec3_x", "vec3", {type_i64()},                &vec3_x); // alt form
-//   b.add_overload("vec3", BinExpr::Op::Add, struct_t("vec3"),      &vec3_add);
+//   b.add("sqrt",     bind_prim(Prim::F32), {bind_prim(Prim::F32)}, &my_sqrt);
+//   b.add("vec3_new", bind_handle("vec3"),
+//         {bind_prim(Prim::F32), bind_prim(Prim::F32), bind_prim(Prim::F32)},
+//         &vec3_new);
+//   b.add_overload("vec3", int(BinExpr::Op::Add),
+//                  bind_handle("vec3"), &vec3_add);
 //   NativeTable t = b.build();
-//   SemaResult sr = sema(prog, t.natives, slots, 0, &t.overloads, &layouts);
+//   SemaResult sr = sema(prog, t.natives, slots, permissions,
+//                        &t.overloads, &layouts);
 //
 // permission defaults to 0 (no FFI). Set PERM_FFI on natives that should be
-// gated behind the FFI permission flag (full codegen-level gating is v0.4
-// safety; v0.3 just defines the constant so NativeSig::permission is usable).
+// gated behind the FFI permission flag. Sema enforces the permission at each
+// native call site before codegen; there is no runtime permission branch.
 #pragma once
 #include "ast.hpp"        // Type, Prim, BinExpr::Op, make_prim, make_struct
 #include "sema.hpp"        // NativeSig, OpOverload, OpOverloadTable
@@ -29,11 +32,10 @@
 
 namespace ember {
 
-// Permission flag bits for NativeSig::permission. v0.3: defined but not
-// enforced in codegen (the "check permission before marshalling" is the v0.4
-// safety milestone). Hosts may set them; sema stores them on the NativeSig.
-// The FFI bit marks natives that perform raw host calls/pointer access and
-// should be unavailable to scripts without the FFI module permission.
+// Permission flag bits for NativeSig::permission. Sema enforces these at
+// native call sites before codegen. The FFI bit marks natives that perform raw
+// host calls/pointer access and must be unavailable unless the compiling module
+// was granted the FFI permission.
 inline constexpr uint32_t PERM_FFI = 1u << 0;
 
 // Convenience: a primitive Type (Type{Prim::F32} etc.).

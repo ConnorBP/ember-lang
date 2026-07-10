@@ -128,6 +128,21 @@ int main() {
         auto rr = reload_function("fn nope() -> i64 { return 1; }\n", m->prog, *m->table, ctx, m->natives, &m->ov, &m->layouts);
         check(!rr.ok, "(5) reload of absent fn fails (not in module)");
     }
+    // (6) ABI signature changes are rejected before Program/slot mutation.
+    {
+        auto m = compile("fn val(x: i64) -> i64 { return x + 1; }\nfn main() -> i64 { return val(6); }\n");
+        auto ctx = make_ctx(*m);
+        auto arity = reload_function("fn val() -> i64 { return 9; }\n", m->prog, *m->table, ctx, m->natives, &m->ov, &m->layouts);
+        check(!arity.ok && call_void(*m, "main") == 7, "(6a) changed arity rejected; old body remains live");
+        auto param = reload_function("fn val(x: f32) -> i64 { return 9; }\n", m->prog, *m->table, ctx, m->natives, &m->ov, &m->layouts);
+        check(!param.ok && call_void(*m, "main") == 7, "(6b) changed parameter type rejected; old body remains live");
+        auto ret = reload_function("fn val(x: i64) -> f32 { return 9.0f; }\n", m->prog, *m->table, ctx, m->natives, &m->ov, &m->layouts);
+        check(!ret.ok && call_void(*m, "main") == 7, "(6c) changed return type rejected; old body remains live");
+        auto same = reload_function("fn val(x: i64) -> i64 { return x + 3; }\n", m->prog, *m->table, ctx, m->natives, &m->ov, &m->layouts);
+        check(same.ok && call_void(*m, "main") == 9, "(6d) unchanged canonical signature reload succeeds");
+        if (same.old_entry) free_executable(same.old_entry);
+        if (same.ok) m->fns.push_back({same.new_fn.name, std::move(same.new_fn.bytes), same.new_fn.exec, same.new_fn.entry, {}});
+    }
 
     std::printf("\nv0.6 hot reload test: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail;

@@ -1,0 +1,2 @@
+struct Bad { x: void; }
+fn bad() -> i64 { return 0; }

@@ -69,15 +69,15 @@ struct CodeGenCtx {
     // stub can record the reason + longjmp. Required when trap_stub is set.
     void* trap_ctx = nullptr;
 
-    // Instruction budget (§3): if non-null, each fn entry loads this pointer
-    // into a reserved slot and each loop back-edge does sub [ptr],body_cost +
+    // Loop budget (§3): the context pointer is available to generated code;
+    // each loop back-edge does sub [ptr],body_cost +
     // jg continue / else trap. emit_budget must be true for the checks to
     // be emitted. budget_remaining starts INT64_MAX (context.hpp) so a host
     // that enables checks but sets no budget gets no false traps.
     int64_t* budget_ptr = nullptr;
     bool emit_budget_checks = false;
 
-    // Stack-depth guard (§4): if non-null, each script-to-script call does
+    // Script-call depth guard (§4): if non-null, each script-to-script call does
     // inc [ptr] + cmp max + trap-before-call / dec after. emit_depth gates
     // emission. The depth counter + max live in context_t; codegen needs the
     // counter address + the max to compare against.

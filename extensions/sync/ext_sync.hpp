@@ -51,7 +51,7 @@
 // poll loop, which the instruction budget bounds, see SAFETY_AND_SANDBOX S3).
 //
 // REDSHELL guard #8 (backing-store isolation): all five stores are
-// std::vector<Slot> on the host heap (std::atomic / std::vector<int64_t>
+// host-heap vectors of shared stable slots (std::atomic / std::vector<int64_t>
 // / std::mutex), NEVER co-located with exec JIT memory or the dispatch
 // table. Handles are 1-based indices, never pointers. No native hands out
 // an address as an i64. Bounds checks on every indexed native. Mirrors

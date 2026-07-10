@@ -1,0 +1,5 @@
+// C4 regression: named opaque handles are nominal, not forgeable integers.
+fn main() -> i64 {
+    let bad: vec3 = 999;
+    return 0;
+}

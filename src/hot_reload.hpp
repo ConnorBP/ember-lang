@@ -13,9 +13,10 @@
 //      in-flight calls may still be in the old bytes; the old page must stay
 //      valid until provably unreferenced).
 //   3. atomically store the new address into slots[slot] (release store).
-//   4. retire the old page. The CLI is single-threaded (no concurrent caller),
-//      so the old page is freed synchronously after the swap. The spec's epoch
-//      reclamation (§5) is for the multi-threaded host case — YAGNI for the CLI.
+//   4. retire the old page. The caller owns retirement and may free it only
+//      when no call is in flight. Concurrent reclamation requires host-managed
+//      epochs/quiescence and remains explicitly deferred; the CLI's
+//      single-threaded caller-owned retirement is the only shipped model.
 //
 // Slot stability (HOT_RELOAD.md §1/§4): the slot index never changes on reload,
 // so callers that baked `slot*8` keep working — the swap only changes the slot's
@@ -78,6 +79,41 @@ inline ReloadResult reload_function(const std::string& new_fn_source,
     if (it == prog.funcs.end()) { r.error = "reload: function '" + new_fn.name + "' not in module"; return r; }
     int slot = it->slot;
     if (slot < 0) { r.error = "reload: slot not assigned for '" + new_fn.name + "'"; return r; }
+
+    // Compare the complete canonical calling shape before mutating Program,
+    // compiling, allocating, or publishing. Parameter names/default values and
+    // body-only annotations do not affect the v1 call ABI; arity, ordered
+    // parameter types, return type, and aggregate word shape do.
+    auto words = [&](const Type& t) -> int {
+        if (t.is_slice) return 2;
+        if (!t.struct_name.empty() && structs) {
+            auto si = structs->find(t.struct_name);
+            if (si != structs->end()) return (si->second.size + 7) / 8;
+        }
+        return 1;
+    };
+    auto mismatch = [&](const std::string& what) {
+        r.error = "reload: incompatible signature for '" + new_fn.name + "': " + what;
+    };
+    if (new_fn.params.size() != it->params.size()) {
+        mismatch("arity changed from " + std::to_string(it->params.size()) + " to " +
+                 std::to_string(new_fn.params.size()));
+        return r;
+    }
+    for (size_t i = 0; i < it->params.size(); ++i) {
+        const Type& old_ty = *it->params[i].ty;
+        const Type& new_ty = *new_fn.params[i].ty;
+        if (!old_ty.same(new_ty) || words(old_ty) != words(new_ty)) {
+            mismatch("parameter " + std::to_string(i + 1) + " changed from " +
+                     old_ty.to_string() + " to " + new_ty.to_string());
+            return r;
+        }
+    }
+    if (!it->ret->same(*new_fn.ret) || words(*it->ret) != words(*new_fn.ret)) {
+        mismatch("return type changed from " + it->ret->to_string() + " to " +
+                 new_fn.ret->to_string());
+        return r;
+    }
     new_fn.slot = slot;
 
     // Sema the new fn in the context of the WHOLE module: swap the new fn into

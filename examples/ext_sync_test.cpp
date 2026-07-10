@@ -29,6 +29,7 @@
 #include "../extensions/sync/ext_sync.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -46,6 +47,17 @@ static int g_fail = 0;
 static void check(bool cond, const char* msg) {
     std::printf("[%s] %s\n", cond ? "PASS" : "FAIL", msg);
     if (!cond) g_fail = 1;
+}
+
+using StressClock = std::chrono::steady_clock;
+static constexpr auto STRESS_TIMEOUT = std::chrono::seconds(15);
+static bool timed_out(const StressClock::time_point& deadline) {
+    return StressClock::now() >= deadline;
+}
+static void worker_error(std::atomic<int>& error, int code) {
+    int expected = 0;
+    error.compare_exchange_strong(expected, code, std::memory_order_release,
+                                  std::memory_order_relaxed);
 }
 
 // ---- JIT harness: compile `main` from src with the sync natives registered,
@@ -376,8 +388,15 @@ int main() {
         auto A_new   = native_ptr<int64_t(*)(int64_t,int64_t)>(NATIVES,"atomic_new");
         int64_t h = A_new(64, 0);
         std::atomic<bool> host_done{false};
+        std::atomic<int> worker_err{0};
+        const auto deadline = StressClock::now() + STRESS_TIMEOUT;
         std::thread host([&]{
-            for (int i = 0; i < 1000; ++i) ember::ext_sync::atomic_store_host(h, 0xDEAD);
+            for (int i = 0; i < 1000; ++i) {
+                if (!ember::ext_sync::atomic_store_host(h, 0xDEAD)) {
+                    worker_error(worker_err, 1); // false means invalid handle, not retry
+                    return;
+                }
+            }
             host_done.store(true, std::memory_order_release);
         });
         bool trapped=false;
@@ -405,62 +424,93 @@ int main() {
         // the atomic's acquire/release across threads, which is path-independent.
         auto A_load  = native_ptr<int64_t(*)(int64_t)>(NATIVES,"atomic_load");
         int64_t seen = 0;
-        while (seen != 0xDEAD) seen = A_load(h);
-        host.join();
-        check(seen == 0xDEAD, "T10 atomic cross-thread signal (host store, main poll via load native)");
-        (void)host_done; (void)src; (void)trapped;
-    }
-
-    // Test 11: SPSC host-produces, script-consumes (via the load native's
-    // fn_ptr -- main thread plays the script). Canonical U2 test.
-    {
-        auto Q_new = native_ptr<int64_t(*)(int64_t)>(NATIVES,"spsc_new");
-        auto Q_pop = native_ptr<int64_t(*)(int64_t)>(NATIVES,"spsc_try_pop");
-        int64_t h = Q_new(1024);
-        constexpr int64_t N = 10000;
-        std::thread host([&]{
-            for (int64_t i = 1; i <= N; ++i) {
-                bool pushed = false;
-                while (!ember::ext_sync::spsc_push_host(h, i, &pushed)) { /* spin until pushed */ }
-            }
-        });
-        int64_t expected = 1, got = 0, count = 0;
-        while (expected <= N) {
-            got = Q_pop(h);
-            if (got != INT64_MIN) {
-                if (got != expected) { std::printf("FAIL T11: expected %lld got %lld\n",(long long)expected,(long long)got); break; }
-                ++expected; ++count;
-            }
+        while (seen != 0xDEAD && worker_err.load(std::memory_order_acquire) == 0 &&
+               !timed_out(deadline)) {
+            seen = A_load(h);
+            std::this_thread::yield();
         }
+        if (seen != 0xDEAD && worker_err.load() == 0) worker_error(worker_err, 2);
         host.join();
-        check(count == N && expected == N+1, "T11 SPSC host-produces, main-consumes (FIFO, no lost/dup)");
+        check(seen == 0xDEAD && host_done.load(std::memory_order_acquire) && worker_err.load() == 0,
+              "T10 atomic cross-thread signal completes within deadline");
+        (void)src; (void)trapped;
     }
 
-    // Test 12: SPSC script-produces (main), host-consumes (via _host accessor).
+    // Tests 11/12: repeat both SPSC directions. Every host accessor's false
+    // return is an invalid-handle failure; queue-full/empty is communicated
+    // only through the out boolean. Shared deadlines make regressions fail
+    // instead of leaving CTest blocked forever.
     {
         auto Q_new  = native_ptr<int64_t(*)(int64_t)>(NATIVES,"spsc_new");
+        auto Q_pop  = native_ptr<int64_t(*)(int64_t)>(NATIVES,"spsc_try_pop");
         auto Q_push = native_ptr<int64_t(*)(int64_t,int64_t)>(NATIVES,"spsc_push");
-        int64_t h = Q_new(1024);
-        constexpr int64_t N = 10000;
-        std::thread host([&]{
-            int64_t expected = 1, got = 0, count = 0;
-            bool popped = false;
-            while (expected <= N) {
-                int64_t v = 0; popped = false;
-                ember::ext_sync::spsc_try_pop_host(h, &v, &popped);
-                if (popped) {
-                    if (v != expected) { std::printf("FAIL T12: expected %lld got %lld\n",(long long)expected,(long long)v); return; }
-                    ++expected; ++count;
+        constexpr int ROUNDS = 8;
+        constexpr int64_t N = 20000;
+        bool all_ok = true;
+
+        for (int round = 0; round < ROUNDS && all_ok; ++round) {
+            int64_t h = Q_new(257); // deliberately non-power-of-two pressure
+            std::atomic<int> err{0};
+            const auto deadline = StressClock::now() + STRESS_TIMEOUT;
+            std::thread producer([&]{
+                for (int64_t i = 1; i <= N; ++i) {
+                    bool pushed = false;
+                    while (!pushed) {
+                        if (!ember::ext_sync::spsc_push_host(h, i, &pushed)) {
+                            worker_error(err, 1); // invalid handle: never retry
+                            return;
+                        }
+                        if (!pushed) {
+                            if (timed_out(deadline)) { worker_error(err, 2); return; }
+                            std::this_thread::yield();
+                        }
+                    }
+                }
+            });
+            int64_t expected = 1;
+            while (expected <= N && err.load(std::memory_order_acquire) == 0 &&
+                   !timed_out(deadline)) {
+                const int64_t got = Q_pop(h);
+                if (got == INT64_MIN) { std::this_thread::yield(); continue; }
+                if (got != expected) { worker_error(err, 3); break; }
+                ++expected;
+            }
+            if (expected <= N && err.load() == 0) worker_error(err, 4);
+            producer.join();
+            all_ok &= err.load(std::memory_order_acquire) == 0 && expected == N + 1;
+        }
+        check(all_ok, "T11 SPSC host producer retries out_pushed across 8 FIFO/no-loss rounds");
+
+        for (int round = 0; round < ROUNDS && all_ok; ++round) {
+            int64_t h = Q_new(257);
+            std::atomic<int> err{0};
+            const auto deadline = StressClock::now() + STRESS_TIMEOUT;
+            std::thread consumer([&]{
+                int64_t expected = 1;
+                while (expected <= N) {
+                    int64_t value = 0; bool popped = false;
+                    if (!ember::ext_sync::spsc_try_pop_host(h, &value, &popped)) {
+                        worker_error(err, 5); return; // invalid handle
+                    }
+                    if (popped) {
+                        if (value != expected) { worker_error(err, 6); return; }
+                        ++expected;
+                    } else {
+                        if (timed_out(deadline)) { worker_error(err, 7); return; }
+                        std::this_thread::yield();
+                    }
+                }
+            });
+            for (int64_t i = 1; i <= N && err.load(std::memory_order_acquire) == 0; ++i) {
+                while (Q_push(h, i) == 0) {
+                    if (timed_out(deadline)) { worker_error(err, 8); break; }
+                    std::this_thread::yield();
                 }
             }
-            // stash count where main can read it
-            if (count != N) std::printf("FAIL T12: host count %lld != %lld\n",(long long)count,(long long)N);
-        });
-        for (int64_t i = 1; i <= N; ++i) {
-            while (Q_push(h, i) == 0) { /* full -> spin until room */ }
+            consumer.join();
+            all_ok &= err.load(std::memory_order_acquire) == 0;
         }
-        host.join();
-        check(true, "T12 SPSC main-produces, host-consumes (symmetric)");
+        check(all_ok, "T12 SPSC main producer/host consumer propagates worker errors across 8 rounds");
     }
 
     // Test 13: swap buffer -- main produces frames, host consumes via swapbuf_read.
@@ -518,32 +568,37 @@ int main() {
         auto M_ph  = native_ptr<int64_t(*)(int64_t,int64_t)>(NATIVES,"mpsc_producer_handle");
         int64_t ph0 = M_ph(h, 0), ph1 = M_ph(h, 1);
         constexpr int64_t N = 10000;
-        std::thread host0([&]{
+        std::atomic<int> err{0};
+        const auto deadline = StressClock::now() + STRESS_TIMEOUT;
+        auto produce = [&](int64_t ph, int64_t base) {
             for (int64_t i = 1; i <= N; ++i) {
                 bool pushed = false;
-                while (!ember::ext_sync::spsc_push_host(ph0, i, &pushed) || !pushed) {}
+                while (!pushed) {
+                    if (!ember::ext_sync::spsc_push_host(ph, base + i, &pushed)) {
+                        worker_error(err, 1); return;
+                    }
+                    if (!pushed) {
+                        if (timed_out(deadline)) { worker_error(err, 2); return; }
+                        std::this_thread::yield();
+                    }
+                }
             }
-        });
-        std::thread host1([&]{
-            for (int64_t i = 1; i <= N; ++i) {
-                bool pushed = false;
-                while (!ember::ext_sync::spsc_push_host(ph1, i + 100000, &pushed) || !pushed) {}
-            }
-        });
-        // main consumes -- count values from each producer, verify each appears N times.
-        std::atomic<int64_t> cnt0{0}, cnt1{0};
-        int64_t total_target = 2 * N;
-        int64_t got = 0;
-        while (cnt0.load() + cnt1.load() < total_target) {
-            got = M_pop(h);
-            if (got != INT64_MIN) {
-                if (got >= 1 && got <= N) cnt0.fetch_add(1, std::memory_order_relaxed);
-                else if (got >= 100001 && got <= 100000 + N) cnt1.fetch_add(1, std::memory_order_relaxed);
-                else { std::printf("FAIL T14: unexpected value %lld\n",(long long)got); break; }
-            }
+        };
+        std::thread host0(produce, ph0, 0);
+        std::thread host1(produce, ph1, 100000);
+        int64_t cnt0 = 0, cnt1 = 0;
+        while (cnt0 + cnt1 < 2 * N && err.load(std::memory_order_acquire) == 0 &&
+               !timed_out(deadline)) {
+            const int64_t got = M_pop(h);
+            if (got == INT64_MIN) { std::this_thread::yield(); continue; }
+            if (got >= 1 && got <= N) ++cnt0;
+            else if (got >= 100001 && got <= 100000 + N) ++cnt1;
+            else worker_error(err, 3);
         }
+        if (cnt0 + cnt1 < 2 * N && err.load() == 0) worker_error(err, 4);
         host0.join(); host1.join();
-        check(cnt0.load() == N && cnt1.load() == N, "T14 MPSC two host producers, main consumes (no lost/dup)");
+        check(err.load() == 0 && cnt0 == N && cnt1 == N,
+              "T14 MPSC workers complete within deadline with no lost values");
     }
 
     // Test 15: MPMC two host producers + two host consumers, main in the middle
@@ -552,25 +607,66 @@ int main() {
     {
         auto C_new  = native_ptr<int64_t(*)(int64_t)>(NATIVES,"mpmc_new");
         int64_t h = C_new(2048);
-        constexpr int64_t N = 50000;  // per host producer
+        constexpr int64_t N = 30000;  // per host producer
+        constexpr int64_t MAIN_N = 1000;
+        const int64_t target = 2 * N + MAIN_N;
         std::atomic<int64_t> sum_pushed{0}, sum_popped{0}, cnt_pushed{0}, cnt_popped{0};
-        std::thread prod0([&]{ for(int64_t i=1;i<=N;++i){ bool p=false; while((!ember::ext_sync::mpmc_push_host(h,i,&p))||!p){} sum_pushed.fetch_add(i,std::memory_order_relaxed); cnt_pushed.fetch_add(1,std::memory_order_relaxed);} });
-        std::thread prod1([&]{ for(int64_t i=1;i<=N;++i){ bool p=false; while((!ember::ext_sync::mpmc_push_host(h,i+N,&p))||!p){} sum_pushed.fetch_add(i+N,std::memory_order_relaxed); cnt_pushed.fetch_add(1,std::memory_order_relaxed);} });
-        std::thread cons0([&]{ int64_t v=0; bool ok=false; for(;;){ ok=false; ember::ext_sync::mpmc_try_pop_host(h,&v,&ok); if(ok){ sum_popped.fetch_add(v,std::memory_order_relaxed); cnt_popped.fetch_add(1,std::memory_order_relaxed);} else if(cnt_popped.load()>=2*N) break; } });
-        std::thread cons1([&]{ int64_t v=0; bool ok=false; for(;;){ ok=false; ember::ext_sync::mpmc_try_pop_host(h,&v,&ok); if(ok){ sum_popped.fetch_add(v,std::memory_order_relaxed); cnt_popped.fetch_add(1,std::memory_order_relaxed);} else if(cnt_popped.load()>=2*N) break; } });
-        // main pushes a few too (proves the native + accessor share the ring)
+        std::atomic<int> err{0}, producers_done{0};
+        const auto deadline = StressClock::now() + STRESS_TIMEOUT;
+        auto produce = [&](int64_t base) {
+            for (int64_t i = 1; i <= N; ++i) {
+                bool pushed = false;
+                while (!pushed) {
+                    if (!ember::ext_sync::mpmc_push_host(h, base + i, &pushed)) {
+                        worker_error(err, 1); return;
+                    }
+                    if (!pushed) {
+                        if (timed_out(deadline)) { worker_error(err, 2); return; }
+                        std::this_thread::yield();
+                    }
+                }
+                sum_pushed.fetch_add(base + i, std::memory_order_relaxed);
+                cnt_pushed.fetch_add(1, std::memory_order_release);
+            }
+            producers_done.fetch_add(1, std::memory_order_release);
+        };
+        auto consume = [&] {
+            while (err.load(std::memory_order_acquire) == 0) {
+                int64_t value = 0; bool popped = false;
+                if (!ember::ext_sync::mpmc_try_pop_host(h, &value, &popped)) {
+                    worker_error(err, 3); return;
+                }
+                if (popped) {
+                    sum_popped.fetch_add(value, std::memory_order_relaxed);
+                    cnt_popped.fetch_add(1, std::memory_order_release);
+                } else {
+                    if (producers_done.load(std::memory_order_acquire) == 2 &&
+                        cnt_pushed.load(std::memory_order_acquire) == target &&
+                        cnt_popped.load(std::memory_order_acquire) == target) return;
+                    if (timed_out(deadline)) { worker_error(err, 4); return; }
+                    std::this_thread::yield();
+                }
+            }
+        };
+        std::thread prod0(produce, 0);
+        std::thread prod1(produce, N);
+        std::thread cons0(consume), cons1(consume);
         auto C_push = native_ptr<int64_t(*)(int64_t,int64_t)>(NATIVES,"mpmc_push");
-        for (int64_t i = 0; i < 1000; ++i) { while(C_push(h, 0x40000000LL+i)==0){} sum_pushed.fetch_add(0x40000000LL+i, std::memory_order_relaxed); cnt_pushed.fetch_add(1, std::memory_order_relaxed); }
-        prod0.join(); prod1.join();
-        // host consumers may have exited early; finish draining until count matches.
-        while (cnt_popped.load() < cnt_pushed.load()) {
-            int64_t v=0; bool ok=false; ember::ext_sync::mpmc_try_pop_host(h,&v,&ok);
-            if(ok){ sum_popped.fetch_add(v,std::memory_order_relaxed); cnt_popped.fetch_add(1,std::memory_order_relaxed); }
+        for (int64_t i = 0; i < MAIN_N && err.load(std::memory_order_acquire) == 0; ++i) {
+            while (C_push(h, 0x40000000LL+i) == 0) {
+                if (timed_out(deadline)) { worker_error(err, 5); break; }
+                std::this_thread::yield();
+            }
+            if (err.load() == 0) {
+                sum_pushed.fetch_add(0x40000000LL+i, std::memory_order_relaxed);
+                cnt_pushed.fetch_add(1, std::memory_order_release);
+            }
         }
-        cons0.join(); cons1.join();
-        int64_t sp = sum_pushed.load(), spp = sum_popped.load();
-        check(cnt_pushed.load() == cnt_popped.load(), "T15 MPMC pushed count == popped count (no lost/dup)");
-        check(sp == spp, "T15 MPMC sum pushed == sum popped (correctness under MPMC contention)");
+        prod0.join(); prod1.join(); cons0.join(); cons1.join();
+        const bool counts_ok = cnt_pushed.load() == target && cnt_popped.load() == target;
+        check(err.load() == 0 && counts_ok, "T15 MPMC workers complete by deadline; pushed count == popped count");
+        check(err.load() == 0 && sum_pushed.load() == sum_popped.load(),
+              "T15 MPMC sum pushed == sum popped under contention");
     }
 
     // Test 16: leak-bound check -- create+free 100k atomics, assert store size

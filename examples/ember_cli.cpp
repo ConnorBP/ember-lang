@@ -2,18 +2,22 @@
 //
 // A minimal, prism-decoupled CLI that exercises the full
 // parse -> sema -> codegen -> finalize -> call pipeline against the
-// REAL ember frontend + the full six-extension addon surface. This is
+// REAL ember frontend + the full eight-extension addon surface. This is
 // the host shape proven by examples/em_roundtrip_test.cpp (the
 // parse/sema/codegen/finalize/call sequence) plus examples/ext_registration_test.cpp
-// (the six-extension natives + overloads registration), combined into one
+// (the eight-extension natives + overloads registration), combined into one
 // runnable program. No prism linkage: no prism_script_host, no VFS, no
 // memory backend, no proc/shader api, no pak/assets. Just: read file,
 // resolve imports, compile, run, exit code.
 //
 // Usage:
-//   ember run <file.ember> [--fn <name>] [--dump]
+//   ember run <file.ember> [--fn <name>] [--dump] [--emit-em <output.em>]
+//                           [--tick [--tick-count N] [--tick-interval MS]]
+//   ember emit-em <input.ember> <output.em>
 //
-//   run        compiles <file.ember> and calls the entry function.
+//   run        compiles <file.ember> and calls the entry function unless
+//              --emit-em selects precompile-only output.
+//   emit-em    precompiles input to the explicit positional output path.
 //   --fn NAME  entry function to call (default: main).
 //   --dump     after compile, print each fn's name, slot, byte size, and
 //              reloc (AbsFixup) count, mirroring em_roundtrip's reloc capture.
@@ -22,9 +26,9 @@
 // exit code (the validation signal); if it returns void, exit 0. The runner
 // never echoes the return value - scripts that want output call a native.
 // There is no print_i64 in the standard extension set (vec/quat/mat/string/
-// array/math), so YAGNI: keep it to exit-code-as-signal.
+// array/math/sync/lifecycle), so YAGNI: keep it to exit-code-as-signal.
 //
-// Build: linked against ember + ember_frontend + all six ember_ext_* libs.
+// Build: linked against ember + ember_frontend + all eight ember_ext_* libs.
 //        The native host backing (ext_*::register_natives populates
 //        NativeSig::fn_ptr, which sema stamps onto CallExpr::native_fn and
 //        codegen bakes as a direct `mov rax, imm64(fn); call rax`) requires
@@ -55,7 +59,8 @@
 #include "ext_string.hpp"
 #include "ext_array.hpp"
 #include "ext_math.hpp"
-#include "ext_lifecycle.hpp"   // v1.0: register_routine/unregister_routine (dynamic registration)
+#include "ext_sync.hpp"
+#include "ext_lifecycle.hpp"
 
 #include <cstdio>
 #include <csetjmp>   // setjmp/longjmp (v0.4 safe-execution checkpoint)
@@ -76,7 +81,7 @@
 
 // Extension headers resolve via each ember_ext_* lib's PUBLIC include dir
 // (extensions/<name>), which flows transitively to this target because we
-// link all six extension libs below.
+// link all eight extension libs below.
 
 namespace fs = std::filesystem;
 
@@ -114,10 +119,19 @@ extern "C" void ember_cli_trap(ember::context_t* ctx, int reason, const char* de
 static void usage(FILE* out) {
     std::fprintf(out,
         "ember - standalone ember language runner\n"
-        "usage: ember run <file.ember> [--fn <name>] [--dump]\n"
-        "  run         compile and call the entry function\n"
-        "  --fn NAME   entry function (default: main)\n"
-        "  --dump      print each compiled fn: name, slot, byte size, reloc count\n");
+        "usage:\n"
+        "  ember run <input.ember> [--fn NAME] [--dump] [--emit-em OUTPUT.em]\n"
+        "                          [--tick [--tick-count N] [--tick-interval MS]]\n"
+        "  ember emit-em <input.ember> <output.em>\n"
+        "\n"
+        "  run                 compile and call the entry function\n"
+        "  emit-em             compile without running and write <output.em>\n"
+        "  --fn NAME           entry function (default: main)\n"
+        "  --dump              print each compiled fn: name, slot, byte size, reloc count\n"
+        "  --emit-em PATH      run-mode precompile output; compile and write without running\n"
+        "  --tick              run @on_tick and dynamic routines on a tick thread\n"
+        "  --tick-count N      stop automatically after N ticks (default: keypress)\n"
+        "  --tick-interval MS  tick interval in milliseconds (default: 16)\n");
 }
 
 int main(int argc, char** argv) {
@@ -158,13 +172,18 @@ int main(int argc, char** argv) {
         } else if (action.empty()) {
             action = a;                 // first positional = action ("run")
         } else if (file.empty()) {
-            file = a;                    // second positional = file path
+            file = a;                    // second positional = input path
+        } else if (action == "emit-em" && emit_em_path.empty()) {
+            emit_em_path = a;            // third positional = required output path
         } else {
             std::fprintf(stderr, "ember: unexpected argument '%s'\n", a.c_str()); return 2;
         }
     }
     if (action != "run" && action != "emit-em") { usage(stderr); return 2; }
-    if (file.empty()) { std::fprintf(stderr, "ember: missing <file.ember>\n"); usage(stderr); return 2; }
+    if (file.empty()) { std::fprintf(stderr, "ember: missing <input.ember>\n"); usage(stderr); return 2; }
+    if (action == "emit-em" && emit_em_path.empty()) {
+        std::fprintf(stderr, "ember: emit-em needs <output.em>\n"); usage(stderr); return 2;
+    }
     if (!fs::exists(file)) { std::fprintf(stderr, "ember: no such file: %s\n", file.c_str()); return 2; }
 
     // ---- read + resolve imports (textual `import "path";` inlining) ----
@@ -208,7 +227,7 @@ int main(int argc, char** argv) {
     int si = 0;
     for (auto& fn : pr.program.funcs) { slots[fn.name] = si++; fn.slot = slots[fn.name]; }
 
-    // ---- register ALL six extensions: natives + overloads ----
+    // ---- register ALL eight extensions: natives + overloads ----
     std::unordered_map<std::string, NativeSig> natives;
     ext_vec::register_natives(natives);
     ext_quat::register_natives(natives);
@@ -216,14 +235,15 @@ int main(int argc, char** argv) {
     ext_string::register_natives(natives);
     ext_array::register_natives(natives);
     ext_math::register_natives(natives);
-    ember::ext_lifecycle::register_natives(natives);  // v1.0: dynamic registration (register_routine/unregister_routine)
+    ember::ext_sync::register_natives(natives);
+    ember::ext_lifecycle::register_natives(natives);
 
     OpOverloadTable overloads;
     ext_vec::register_overloads(overloads);
     ext_quat::register_overloads(overloads);
     ext_mat::register_overloads(overloads);
     ext_string::register_overloads(overloads);
-    // array + math have no operator overloads (method-call natives only).
+    // array, math, sync, and lifecycle expose natives but no operators.
 
     // ---- struct layouts + string key + sema ----
     auto struct_layouts = build_struct_layouts(pr.program);
@@ -374,7 +394,9 @@ int main(int argc, char** argv) {
     if (!emit_em_path.empty()) {
         EmModule mod;
         mod.functions.reserve(fns.size());
-        std::vector<uint8_t> globals_bytes(pr.program.globals.size() * 8, 0);
+        // Serialize the already-evaluated initial-value block. Constructing a
+        // fresh zero-filled block here would silently discard const globals.
+        const std::vector<uint8_t>& globals_bytes = gb_store;
         for (const auto& cf : fns) {
             EmFunctionRecord rec;
             rec.name = cf.name;
@@ -538,7 +560,8 @@ int main(int argc, char** argv) {
     // reset extension host stores (array/string own process-global storage)
     ext_vec::reset(); ext_quat::reset(); ext_mat::reset();
     ext_string::reset(); ext_array::reset();
-    ember::ext_lifecycle::reset();   // v1.0: clear the dynamic-registration routine table
+    ember::ext_sync::reset();
+    ember::ext_lifecycle::reset();
     // ext_math is stateless (no reset()).
 
     return exit_code;

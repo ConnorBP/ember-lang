@@ -155,20 +155,13 @@ int main() {
     setvbuf(stdout, NULL, _IONBF, 0);
     std::printf("=== v1.0 Tier 2 first-class function references ===\n");
 
-    // ---- A. handle creation: &fn bakes the slot ----
+    // ---- A. handle creation is nominal: it cannot escape as a plain i64 ----
     {
         FRModule m;
-        // main is slot 0, id is slot 1 (declared after main? no — funcs are
-        // slotted in declaration order; main first -> slot 0, id -> slot 1).
-        // `return &id;` returns id's slot index as an i64.
         bool ok = compile_fr(
             "fn id(x: i64) -> i64 { return x; }\n"
             "fn main() -> i64 { let h = &id; return h; }\n", m);
-        check(ok, "A1: compile `let h = &id; return h;`");
-        if (ok) { bool t=false; int64_t r=run_main(m,&t);
-            // id is slot 1 (declared first -> slot 0; wait: id declared first -> slot 0)
-            check(!t && r == m.slots["id"], "A1: &id bakes id's slot index as the i64 handle");
-        }
+        check(!ok, "A1: returning a fn handle as i64 is rejected");
         for(auto&fn:m.fns)if(fn.exec)free_executable(fn.exec);
     }
 

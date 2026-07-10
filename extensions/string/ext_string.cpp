@@ -9,6 +9,8 @@
 #include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
 #include <cstdio>
 #include <cstring>
+#include <new>
+#include <stdexcept>
 #include <vector>
 
 using namespace ember;  // bind_handle, BindingBuilder, type_* singletons
@@ -17,12 +19,30 @@ namespace ember::ext_string {
 
 // --- string host store (opaque i64 handle; host owns a mutable std::string).
 static std::vector<std::string> g_strings;
-static int64_t str_new(std::string s) { g_strings.push_back(std::move(s)); return int64_t(g_strings.size()); }
+// Match the other host containers: one string may own at most 1 GiB.
+static constexpr size_t MAX_STRING_BYTES = size_t(1) << 30;
+static int64_t str_new(std::string s) noexcept {
+    if (s.size() > MAX_STRING_BYTES) return 0;
+    try {
+        g_strings.push_back(std::move(s));
+        return int64_t(g_strings.size());
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::length_error&) {
+        return 0;
+    }
+}
 static std::string* str_slot(int64_t h) { if (h<1 || h>int64_t(g_strings.size())) return nullptr; return &g_strings[size_t(h-1)]; }
 extern "C" {
     static int64_t n_string_new() { return str_new(std::string()); }
     static int64_t n_string_from_slice(uint8_t* p, int64_t len) {
-        return str_new(std::string(reinterpret_cast<const char*>(p), size_t(len > 0 ? len : 0)));
+        if (len < 0 || uint64_t(len) > uint64_t(MAX_STRING_BYTES) || (!p && len != 0)) return 0;
+        try {
+            if (len == 0) return str_new(std::string());
+            return str_new(std::string(reinterpret_cast<const char*>(p), size_t(len)));
+        }
+        catch (const std::bad_alloc&) { return 0; }
+        catch (const std::length_error&) { return 0; }
     }
     static int64_t n_string_length(int64_t h) { auto* s = str_slot(h); return s ? int64_t(s->size()) : 0; }
     static int64_t n_string_char_at(int64_t h, int64_t i) {
@@ -30,23 +50,49 @@ extern "C" {
         if (!s || i < 0 || size_t(i) >= s->size()) return 0;
         return int64_t(uint8_t((*s)[size_t(i)]));
     }
-    static int64_t n_string_from_i64(int64_t v) { return str_new(std::to_string(v)); }
-    static int64_t n_string_from_f32(float v) { char buf[64]; std::snprintf(buf, sizeof buf, "%g", v); return str_new(std::string(buf)); }
+    static int64_t n_string_from_i64(int64_t v) {
+        try { return str_new(std::to_string(v)); }
+        catch (const std::bad_alloc&) { return 0; }
+        catch (const std::length_error&) { return 0; }
+    }
+    static int64_t n_string_from_f32(float v) {
+        char buf[64]; std::snprintf(buf, sizeof buf, "%g", v);
+        try { return str_new(std::string(buf)); }
+        catch (const std::bad_alloc&) { return 0; }
+        catch (const std::length_error&) { return 0; }
+    }
     // f-string interpolation converters (Item D). ember's codegen has no
     // real f64 runtime support at all today (no movsd/double-precision
     // emission anywhere) - registering this is safe/forward-compatible, but
     // f64 interpolation isn't exercised by the test suite until that
     // separate gap is closed.
-    static int64_t n_string_from_f64(double v) { char buf[64]; std::snprintf(buf, sizeof buf, "%g", v); return str_new(std::string(buf)); }
-    static int64_t n_string_from_bool(int64_t v) { return str_new(v != 0 ? std::string("true") : std::string("false")); }
+    static int64_t n_string_from_f64(double v) {
+        char buf[64]; std::snprintf(buf, sizeof buf, "%g", v);
+        try { return str_new(std::string(buf)); }
+        catch (const std::bad_alloc&) { return 0; }
+        catch (const std::length_error&) { return 0; }
+    }
+    static int64_t n_string_from_bool(int64_t v) {
+        try { return str_new(v != 0 ? std::string("true") : std::string("false")); }
+        catch (const std::bad_alloc&) { return 0; }
+        catch (const std::length_error&) { return 0; }
+    }
     // interpolating an already-`string`-typed segment needs no conversion -
     // just pass the handle through, so every __fstring_to_string sentinel
     // always resolves to SOME native call (uniform, no codegen special case).
     static int64_t n_string_identity(int64_t h) { return h; }
     static int64_t n_string_concat(int64_t a, int64_t b) {
         auto* x = str_slot(a); auto* y = str_slot(b);
-        std::string r; if (x) r += *x; if (y) r += *y;
-        return str_new(std::move(r));
+        if (!x || !y) return 0;
+        const size_t xn = x->size(), yn = y->size();
+        if (xn > MAX_STRING_BYTES || yn > MAX_STRING_BYTES - xn) return 0;
+        try {
+            std::string r; r.reserve(xn + yn);
+            r += *x;
+            r += *y;
+            return str_new(std::move(r));
+        } catch (const std::bad_alloc&) { return 0; }
+        catch (const std::length_error&) { return 0; }
     }
     static int64_t n_string_eq(int64_t a, int64_t b) {
         auto* x = str_slot(a); auto* y = str_slot(b);

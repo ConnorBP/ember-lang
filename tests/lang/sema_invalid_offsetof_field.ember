@@ -1,0 +1,2 @@
+struct P { x: i64; }
+fn main() -> u64 { return offsetof(P, missing); }

@@ -1,0 +1,2 @@
+struct Node { child: Node; }
+fn bad() -> i64 { return 0; }

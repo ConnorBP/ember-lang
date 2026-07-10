@@ -1,21 +1,15 @@
 # ember - native binding API spec
 
-Detail doc for DESIGN.md Section 4. Full descriptor structs, TypeBuilder,
-
-> **Implementation status: v0.1** - this is the v1.0 design spec. The
-> current repo implements the JIT codegen proof (encoder, label/patch,
-> exec-mem, `.em` format). See `README.md` for what's shipped; see
-> `CODEGEN_SPEC.md` Section 12 + Section 15 for the acceptance suite. This doc's
-> content is the target design, not a claim of current implementation.
-calling-convention mapping, error reporting across the boundary.
+Detail doc for DESIGN.md Section 4. The shipped `BindingBuilder`/`NativeSig`
+API comes first; later fluent descriptor sketches are labeled deferred inline.
+Calling-convention mapping and boundary error responsibilities are normative.
 
 ---
 
-> **Honest annotation (v0.3) — what actually ships vs. what this spec
-> describes.** The host-facing `TypeBuilder` / `StructBuilder` /
+> **Shipped vs deferred.** The host-facing `TypeBuilder` / `StructBuilder` /
 > `EnumBuilder` / `engine_t` / `NativeFn` / `NativeParam` / `TypeId`
-> surface in Sections 1–7 below is the **v1.0 ergonomic TARGET**, not
-> the current implementation. v0.3 ships the **working binding API**:
+> surface in Sections 1–7 below is a **deferred ergonomic target**, not
+> the current implementation. v1.0 ships the **working binding API**:
 > `src/binding_builder.hpp`'s `BindingBuilder` + the existing
 > `NativeSig`/`OpOverload` map that `sema()` already consumes, used by
 > the eight standard extensions in `extensions/` (vec/quat/mat/string/array/
@@ -26,13 +20,9 @@ calling-convention mapping, error reporting across the boundary.
 > proven** in the v0.3 `binding_abi_test` suite (script→native
 > struct-by-value arg/return, >4-arg spill, `f32` in xmm slot-parallel,
 > slice as `ptr+len` two words — all pinned by tests, all matching the
-> table as written). `PERM_FFI` is **defined** in v0.3 (the constant in
-> `binding_builder.hpp`); full permission **gating in codegen** is
-> deferred to the v0.4 safety milestone — v0.3 stores the bit on the
-> `NativeSig` and does not yet check-and-refuse before marshalling.
-> This mirrors the same honest-divergence pattern as
-> `COMPILER_PIPELINE.md` Section 5's v0.2 note: the spec is the target,
-> the shipped code is annotated against it.
+> table within the supported limits). `PERM_FFI` is defined in
+> `binding_builder.hpp` and **enforced by sema** at every native call site;
+> denied calls never reach marshalling or codegen.
 
 ## v0.3 working binding API
 
@@ -44,10 +34,12 @@ What you actually include and call today (`src/binding_builder.hpp`):
 using namespace ember;
 
 BindingBuilder b;
-b.add("sqrt",     type_f32(), {type_f32()},                    &my_sqrt);
-b.add("vec3_new", struct_t("vec3"), {type_f32(),type_f32(),type_f32()}, &vec3_new);
-b.add_struct_ret("vec3_x", "vec3", {type_i64()},                 &vec3_x); // alt form
-b.add_overload("vec3", BinExpr::Op::Add, struct_t("vec3"),      &vec3_add);
+b.add("sqrt", bind_prim(Prim::F32), {bind_prim(Prim::F32)}, &my_sqrt);
+b.add("vec3_new", bind_handle("vec3"),
+      {bind_prim(Prim::F32), bind_prim(Prim::F32), bind_prim(Prim::F32)},
+      &vec3_new);
+b.add_overload("vec3", int(BinExpr::Op::Add),
+               bind_handle("vec3"), &vec3_add);
 NativeTable t = b.build();
 SemaResult sr = sema(prog, t.natives, slots, 0, &t.overloads, &layouts);
 ```
@@ -61,22 +53,19 @@ SemaResult sr = sema(prog, t.natives, slots, 0, &t.overloads, &layouts);
   registers an operator overload for a struct-tagged opaque-handle type.
 - **`bind_prim(Prim)` / `bind_handle("struct")`** — convenience `Type`
   builders for a primitive and an opaque `i64` struct-name-tagged handle.
-- **`PERM_FFI`** — permission bit constant (v0.3). Pass it as the
-  `permission` arg to `add()` for natives that should be gated behind
-  the FFI flag. v0.3 stores it on the `NativeSig`; codegen-level
-  **gating is v0.4** (v0.3 does not yet refuse to marshal a `PERM_FFI`
-  native called from a non-FFI-permission context — it only records
-  the bit). See `SAFETY_AND_SANDBOX.md` Section 6 for the gate's intended
-  semantics.
+- **`PERM_FFI`** — permission bit constant. Pass it as the `permission`
+  arg to `add()` for FFI-gated natives. Sema rejects a gated native call
+  unless the module permission mask contains `PERM_FFI`; no call marshalling
+  or runtime permission branch is emitted. See `SAFETY_AND_SANDBOX.md` §6.
 - **`NativeTable b.build()`** — moves out the filled `natives` map +
   `overloads` table; call once after all `add()`s.
 
 The fluent `TypeBuilder`/`StructBuilder`/`engine_t` surface below
-(Sections 1–7) is the target that this builder is the interim floor of.
+(Sections 1–7) is deferred design. It does not exist in the v1.0 API.
 
 ---
 
-## 1. `TypeId` (all values, v1)
+## 1. Deferred `TypeId` design (not implemented)
 
 ```cpp
 enum class TypeId : uint16_t {
@@ -108,7 +97,7 @@ either; pointers/null don't exist as a script-visible concept
 (TYPE_SYSTEM.md Section 5). Extend this enum additively later if a real need
 appears (YAGNI).
 
-## 2. `NativeParam` / `NativeFn`
+## 2. Deferred `NativeParam` / `NativeFn` descriptor design
 
 ```cpp
 struct NativeParam {
@@ -149,12 +138,10 @@ void register_native(engine_t* engine, const NativeFn& fn);
   for each `NativeParam`, if `type == t_slice`, **two** C++ parameters
   (`ElemType*, int64_t`) consecutively; otherwise **one** C++
   parameter of the C++ type corresponding to the `TypeId` (Section 4 mapping
-  table); struct-by-value params follow whatever the *host's own C++
-  compiler* does for that struct under Win64 (>8 bytes: host's
-  compiler already passes by hidden pointer identically to
-  CODEGEN_SPEC.md Section 8's rule, since both sides target the same ABI  - 
-  this is exactly why zero marshalling is possible). Return follows
-  the same correspondence.
+  table). The shipped path accepts native by-value aggregate parameters only
+  through 8 bytes; larger aggregate arguments are rejected by sema. Large
+  aggregate returns use the tested hidden-return path. The broader descriptor
+  design must not be read as expanding those v1 ABI limits.
 - **Arity/type mismatch between `NativeFn` descriptor and the actual
   `fn_ptr` signature is not detectable by ember** (C++ function
   pointers are type-erased to `void*` at the registration API) - this
@@ -176,7 +163,7 @@ void register_native(engine_t* engine, const NativeFn& fn);
   pair's lifetime is entirely the native function's contract to the
   caller (TYPE_SYSTEM.md Section 4) - ember does not track or validate it.
 
-## 3. `TypeBuilder`
+## 3. Deferred `TypeBuilder` design
 
 ```cpp
 class TypeBuilder {
@@ -281,7 +268,7 @@ before the code.
 | `f64` | `double` | xmm reg/stack |
 | `slice<T>` | `T*, int64_t` (two consecutive slots) | GP+GP (or GP+stack / stack+stack once slot index exceeds 4, per CODEGEN_SPEC.md Section 1's slot-parallel rule) |
 | `struct` <=8 bytes, POD | the struct type, passed by value | packed into one GP reg (bitcast, matches MSVC's small-POD-by-value-in-register rule) |
-| `struct` >8 bytes | the struct type, passed by value | hidden pointer to a copy, in the arg's GP slot (CODEGEN_SPEC.md Section 8) |
+| `struct` >8 bytes argument | deferred/unsupported | v1 sema rejects native by-value aggregate arguments over 8 bytes |
 | `struct` return >8 bytes | the struct type, returned by value | hidden pointer as first arg (`rcx`), also returned in `rax` |
 
 This table is authoritative for both directions (script calling
@@ -289,7 +276,7 @@ native, native calling into script via a dispatch-table slot looked
 up by name for event callbacks) - one mapping, used everywhere,
 exactly matching CODEGEN_SPEC.md Section 1/Section 8.
 
-## 5. `StructBuilder` / `EnumBuilder`
+## 5. Deferred `StructBuilder` / `EnumBuilder` design
 
 `StructBuilder` (host declares a struct's shape without a full
 `TypeBuilder` - i.e. no methods/operators, just fields, for simple
@@ -326,17 +313,13 @@ YAGNI until a concrete binding asks for it.
   would trap per SAFETY_AND_SANDBOX.md Section 5, but simply passing it to a
   native function that, say, just checks `len == 0` and returns early
   is fine and common).
-- **Struct-by-value >8 bytes as a native param, with `PERM_FFI`
-  unset**: permission gating (SAFETY_AND_SANDBOX.md Section 6) applies
-  identically regardless of argument shape - the struct-passing
-  mechanism doesn't interact with the permission check at all, it's
-  checked purely on the function name/module-permission pair before
-  any argument-marshalling codegen happens.
+- **Struct-by-value >8 bytes as a native param**: rejected in v1 regardless
+  of permissions. `PERM_FFI` gating is orthogonal and is checked before
+  codegen for otherwise supported calls.
 - **Native function with zero params**: `params = nullptr,
   param_count = 0` - valid, ordinary case, no special encoding.
 
-## 7. Recommended host-side template wrapper (documented pattern, not
-part of the runtime API surface)
+## 7. Deferred host-side template wrapper (not runtime API)
 
 To avoid the "descriptor can drift from the real function pointer"
 risk noted in Section 2, hosts are expected to use a small variadic template

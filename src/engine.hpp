@@ -77,11 +77,12 @@ int64_t call_i64_i64_i64(void* entry, int64_t a, int64_t b);
 // Call a finalized i64() function pointer.
 int64_t call_i64_i64(void* entry);
 
-// v1.0 thread-safety (Option B1, plan_CONTEXT_THREADSAFETY.md): call a JIT'd
-// entry with a context_t* passed in r14 (the per-call context register). Use
-// when the module was compiled with CodeGenCtx::use_context_reg = true (the
-// budget/depth/trap reads go through r14). r14 = ctx at entry, callee-saved so
-// preserved across script-to-script calls (the callee inherits the same ctx).
+// Raw v1.0 B1 context thunks (plan_CONTEXT_THREADSAFETY.md): call a JIT'd
+// entry with context_t* installed in r14. Use only for modules compiled with
+// CodeGenCtx::use_context_reg=true. The thunk preserves its caller's incoming
+// r14 and script-to-script calls inherit ctx through that callee-saved register.
+// These helpers do NOT reset context_t and do NOT establish a setjmp checkpoint;
+// a host requiring recoverable traps must do that around the thunk call.
 int64_t ember_call_void(void* entry, context_t* ctx);
 int64_t ember_call_i64(void* entry, context_t* ctx, int64_t a);
 

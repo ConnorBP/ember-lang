@@ -102,13 +102,10 @@ top-level-only is the C-family default and is enough.)
   over real conflicts).
 
 **Sema and everything downstream: unchanged.** The merged `Program`
-flows through the existing four sema passes (`COMPILER_PIPELINE.md`
-Section 4), lowering, regalloc, emit - as if it had been one file. One
-dispatch table, one globals block, one module. **Hot reload works on
-the merged module exactly as today** (`HOT_RELOAD.md`): `reload` takes
-source (the union of all included files' source, or the root file
-plus re-resolved includes - see Section 1.4) and recompiles per-function by
-name against the existing slot table.
+flows through the existing sema passes and tree-walking x64 emitter as if it
+had been one file: one dispatch table, one globals block, one module. The
+shipped single-function reload can replace an existing function from that
+merged program; whole-module include re-resolution is deferred.
 
 **`SourceLoc.file`**: the `SourceLoc` struct (`COMPILER_PIPELINE.md`
 Section 7) already carries `const char* file`. The resolver must ensure each
@@ -132,12 +129,11 @@ across the whole merge."
 
 ### 1.4 Interaction with hot reload
 
-`ember_reload_function(module, fn_name, new_source)` and
-`reload(module, source, ...)` (`HOT_RELOAD.md` Section 3/Section 6) take source and
-recompile per function by name. With `include`, the "source" of a
-function is the merged `Program`, but reload is per-function, so:
+The shipped `reload_function` helper takes one complete replacement function
+and recompiles it by name. With textual inclusion, the function belongs to the
+merged `Program`, but reload remains per-function:
 
-- **Single-function reload** (`ember_reload_function`): unchanged.
+- **Single-function reload** (`reload_function`): unchanged.
   The host hands the new body of *one* function; includes don't
   participate (a function's body doesn't contain includes - includes
   are top-level only, Section 1.2). The host is responsible for re-resolving
@@ -146,13 +142,8 @@ function is the merged `Program`, but reload is per-function, so:
   module's slot table from the initial compile, so the reload just
   resolves the call against the existing slots. **No include
   machinery runs on reload.**
-- **Whole-module reload** (`reload`): the host passes the *root*
-  file's source; the driver re-runs the include resolver against it
-  to rebuild the merged `Program`, then recompiles every function by
-  name against the existing slot table. If an included file changed
-  on disk, the re-resolve picks up the new content (the `seen` set is
-  per-compile, not persisted). This is the natural behavior and needs
-  no special casing.
+- **Whole-module reload:** deferred. A future implementation would need to
+  re-resolve the root and apply a transactional batch; v1 does not claim this.
 
 ### 1.5 `import` (live) - design sketch only, not implemented
 
@@ -205,7 +196,7 @@ time.
   not the backend. The host still links the whole codegen. The only
   real win is "no parser/sema on load."
 - *Con:* regalloc and emit are still in flux (v0.1 is a proof; the
-  linear-scan and encoder will change). An IR-format `.em` baked today
+  future SSA-lite/linear-scan design and encoder may change). An IR-format `.em` baked today
   breaks the moment the IR shape changes - a serialized IR is a
   de-facto ABI you must version and migrate.
 
@@ -397,9 +388,11 @@ requires, and it is additive (a new encoder method + a new fixup
 vector; the existing `mov_r_imm64` with a real address still works
 for genuinely-constant pointers if any exist).
 
-### 2.5 Loader (`ember_load_em`)
+### 2.5 Loader (`load_em_file`)
 
-New `src/em_loader.hpp/.cpp`. `module_t* ember_load_em(const char* path)`:
+`src/em_loader.hpp/.cpp` exposes `bool load_em_file(const char* path,
+LoadedModule& out, std::string* error, ModuleRegistry* registry)`. It stages
+and validates the complete file before publication:
 
 1. Read + validate header (magic, version).
 2. Allocate the `DispatchTable` (slots array, `function_count`
@@ -421,9 +414,8 @@ New `src/em_loader.hpp/.cpp`. `module_t* ember_load_em(const char* path)`:
    - Stamp `dispatch_table.slots[slot_index] = page_base` (the
      function's entry, which is the page base since code is first).
 5. Build the name→slot directory from the trailing name table.
-6. Return a `module_t` wrapping the dispatch table, globals block,
-   and a list of the code pages (for epoch reclamation on reload,
-     `HOT_RELOAD.md` Section 5).
+6. On success move the staged dispatch/globals/name table/page ownership into
+   `LoadedModule`; on failure leave the caller's object unchanged.
 
 **No regalloc, no emit, no parser, no sema.** Load is header-read +
 `memcpy` + two pointer writes per function. This is the design's
@@ -431,25 +423,27 @@ core payoff.
 
 ### 2.6 Host API + CLI
 
-- `ember_compile(...)` → `module_t*`  - unchanged (JIT from source).
-- `ember_load_em(const char* path)` → `module_t*` - new, loads a
-  pre-compiled `.em`. Returns the same `module_t*` shape; the runtime
-  (`ember_call`, globals access, hot reload) cannot tell a loaded
-  module from a JIT'd one.
-- **Hot reload on a `.em`-loaded module:** `ember_reload_function`
-  and `reload` recompile from *source*. A `.em` does not carry
-  source (v1). So reload of a `.em`-loaded module requires the host
-  to still have the original source - document this. (A future
-  `flags` bit could mark "embeds source" and the loader could stash
-  it for reload; YAGNI for v1 - a host that ships a `.em` for
-  distribution and wants hot reload keeps the source separately,
-  exactly as a host shipping a `.dll` keeps the build.)
-- **CLI** (`main.cpp`, post-v0.1):
-  - `ember --emit-em input.ember [-o out.em]` - run the full pipeline,
-    serialize instead of executing.
-  - `ember --load-em out.em` - load and invoke `@entry` (or a named
-    `--run=fn`). The `--load-em` path exercises the loader and proves
-    a loaded module runs identically to a JIT'd one.
+- Source compilation is assembled from the public lexer/parser/sema/codegen
+  APIs (there is no shipped `ember_compile` facade).
+- `load_em_file(path, LoadedModule&, error, registry)` is the implemented
+  host loader; `link_em_file` additionally registers the loaded dispatch table.
+  v1 `.em` is ABI/process trusted: it contains native code and may contain
+  embedded process-local pointers. It is not promised portable across a new
+  process/build. Symbolic native/trap/string/allowlist relocations plus build
+  identity require a versioned format redesign (H12).
+- **Reloading code originally loaded from `.em`:** `.em` carries no source.
+  The host may compile a source replacement and use the existing
+  single-function machinery only if it also retains the corresponding Program,
+  signatures, codegen context, and safe retirement policy. There is no direct
+  `.em` reload facade or whole-module reload API in v1.
+- **CLI** (`examples/ember_cli.cpp`):
+  - `ember_cli emit-em input.ember output.em`, or
+    `ember_cli run input.ember --emit-em output.em`, runs the full pipeline,
+    serializes initialized globals, and does not execute.
+  - No `--load-em` action ships. Loading is via the host APIs above or a
+    source `link "file.em" as alias;` directive. The latter exposes v1 exports
+    as ABI-trusted unknown signatures because v1 serializes no signatures
+    (H14); exact arity/types/return ABI are the host/caller's responsibility.
 
 ### 2.7 Versioning and forward-compat
 
@@ -518,17 +512,16 @@ whenever Tier 6's trigger fires.
 
 ## Part 5 - Open questions to resolve at implementation time
 
-1. **`@entry` discovery in `.em`.** The `entry_slot` header field
-   assumes a single `@entry`-annotated function. If a module has
-   none, `entry_slot = 0xFFFFFFFF` and `--load-em` requires an
-   explicit `--run=fn`. Confirm against `LIFECYCLE.md`'s annotation
-   model when wiring the CLI.
-2. **Epoch reclamation of loaded pages.** `HOT_RELOAD.md` Section 5's epoch
-   scheme retires pages on reload. A `.em`-loaded module that never
-   reloads never retires pages - fine (no leak without reload). If a
-   loaded module *is* reloaded from source, the recompiled pages
-   retire the loaded ones normally. Verify the `module_t` carries the
-   page list for both JIT'd and loaded modules.
+1. **`@entry` discovery in `.em`.** The writer stores the annotated entry
+   slot, falling back to `main`, or `0xFFFFFFFF` if neither exists. The v1 CLI
+   emits this metadata but has no direct load/run action; hosts decide how to
+   invoke a loaded slot.
+2. **Concurrent reclamation of loaded pages (deferred).** `HOT_RELOAD.md`
+   Section 5 ships caller-owned retirement only. A `.em`-loaded module that
+   never reloads never retires pages. A concurrent host that reloads must keep
+   old pages until it establishes host-level quiescence; no epoch scheme ships
+   in v1. Verify the `module_t` carries the page list for both JIT'd and loaded
+   modules.
 3. **`mov_r_imm64_external` vs raw `mov_r_imm64` in v0.1 tests.** The
    five `Section 12` acceptance tests bake real addresses via raw
    `mov_r_imm64`. Switching to the external form means the JIT driver

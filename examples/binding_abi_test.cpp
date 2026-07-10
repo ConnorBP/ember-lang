@@ -62,6 +62,19 @@
 struct Pair8 { int32_t x; int32_t y; };
 static int64_t n_add_pair8(Pair8 p) { return int64_t(p.x) + int64_t(p.y); }
 
+// Ember-declared structs use the packed declaration-order layout in sema.hpp,
+// not the host compiler's default padding. This matching host shape proves a
+// nested aggregate whose natural C layout would differ still occupies one
+// supported 8-byte Win64 aggregate slot.
+#pragma pack(push, 1)
+struct PackedInner { uint8_t a; uint16_t b; };
+struct PackedOuter { uint8_t tag; int32_t value; PackedInner inner; };
+#pragma pack(pop)
+static_assert(sizeof(PackedInner) == 3 && sizeof(PackedOuter) == 8);
+static int64_t n_read_packed(PackedOuter p) {
+    return int64_t(p.inner.a) + int64_t(p.inner.b) + int64_t(p.tag) + int64_t(p.value);
+}
+
 // [2] struct-by-value RETURN, >8B, via the hidden-pointer path. Win64: a
 // >8-byte aggregate is returned through a hidden first pointer arg (rcx),
 // and the real args shift to rdx/r8/r9. Script struct Vec3s { x: f32; y: f32;
@@ -117,7 +130,8 @@ struct CompiledProgram {
 // Compile `src` against `natives`/`overlays`. On any stage failure, prints
 // the error and returns nullptr. `entry_name` is sanity-checked to exist.
 static CompiledProgram* compile_program(const std::string& src,
-                                        const ember::NativeTable& tab) {
+                                        const ember::NativeTable& tab,
+                                        void* trap_stub = nullptr) {
     using namespace ember;
     auto* prog = new CompiledProgram{ {}, DispatchTable(0), {}, {}, {} };
 
@@ -163,6 +177,7 @@ static CompiledProgram* compile_program(const std::string& src,
     ctx.natives = &tab.natives;
     ctx.script_slots = &prog->slots;
     ctx.structs = &struct_layouts;
+    ctx.trap_stub = trap_stub;
 
     // compile + finalize each function
     prog->fns.reserve(pr.program.funcs.size());
@@ -195,6 +210,90 @@ static void* entry_of(CompiledProgram* p, const char* name) {
 static int64_t  call0_i64 (void* e)                                    { using F=int64_t(*)();    return reinterpret_cast<F>(e)(); }
 static float    call0_f32 (void* e)                                    { using F=float(*)();      return reinterpret_cast<F>(e)(); }
 
+#if defined(__GNUC__) && defined(__x86_64__)
+extern "C" uint64_t call_check_nonvolatiles(void* entry);
+extern "C" void binding_aligned_trap(ember::context_t*, int, const char*);
+extern "C" int64_t binding_call_i64_aligned(void*, int64_t);
+asm(
+    ".section .rdata,\"dr\"\n"
+    ".p2align 4\n"
+    "abi_xmm_seed: .quad 0x0123456789abcdef, 0xfedcba9876543210\n"
+    ".text\n"
+    ".p2align 4\n"
+    ".globl binding_aligned_trap\n"
+    "binding_aligned_trap:\n"
+    "  movaps %xmm0, 8(%rsp)\n"
+    "  movq %rdx, %rax\n"
+    "  retq\n"
+    ".p2align 4\n"
+    ".globl binding_call_i64_aligned\n"
+    "binding_call_i64_aligned:\n"
+    "  pushq %r12\n"
+    "  subq $32, %rsp\n"
+    "  movq %rcx, %r11\n"
+    "  movq %rdx, %rcx\n"
+    "  callq *%r11\n"
+    "  addq $32, %rsp\n"
+    "  popq %r12\n"
+    "  retq\n"
+    ".p2align 4\n"
+    ".globl call_check_nonvolatiles\n"
+    "call_check_nonvolatiles:\n"
+    "  pushq %rbx\n  pushq %rsi\n  pushq %rdi\n  pushq %r12\n"
+    "  pushq %r13\n  pushq %r14\n  pushq %r15\n"
+    "  subq $200, %rsp\n"
+    "  movdqu %xmm6, 32(%rsp)\n  movdqu %xmm7, 48(%rsp)\n"
+    "  movdqu %xmm8, 64(%rsp)\n  movdqu %xmm9, 80(%rsp)\n"
+    "  movdqu %xmm10, 96(%rsp)\n  movdqu %xmm11, 112(%rsp)\n"
+    "  movdqu %xmm12, 128(%rsp)\n  movdqu %xmm13, 144(%rsp)\n"
+    "  movdqu %xmm14, 160(%rsp)\n  movdqu %xmm15, 176(%rsp)\n"
+    "  movabsq $0x1122334455667788, %rbx\n"
+    "  movabsq $0x1122334455667788, %rsi\n"
+    "  movabsq $0x1122334455667788, %rdi\n"
+    "  movabsq $0x1122334455667788, %r12\n"
+    "  movabsq $0x1122334455667788, %r13\n"
+    "  movabsq $0x1122334455667788, %r14\n"
+    "  movabsq $0x1122334455667788, %r15\n"
+    "  movdqu abi_xmm_seed(%rip), %xmm6\n  movdqa %xmm6, %xmm7\n"
+    "  movdqa %xmm6, %xmm8\n  movdqa %xmm6, %xmm9\n"
+    "  movdqa %xmm6, %xmm10\n  movdqa %xmm6, %xmm11\n"
+    "  movdqa %xmm6, %xmm12\n  movdqa %xmm6, %xmm13\n"
+    "  movdqa %xmm6, %xmm14\n  movdqa %xmm6, %xmm15\n"
+    "  callq *%rcx\n"
+    "  xorq %r10, %r10\n"
+    "  movabsq $0x1122334455667788, %rax\n"
+    "  cmpq %rax, %rbx\n  je 1f\n  orq $1, %r10\n1:\n"
+    "  cmpq %rax, %rsi\n  je 2f\n  orq $2, %r10\n2:\n"
+    "  cmpq %rax, %rdi\n  je 3f\n  orq $4, %r10\n3:\n"
+    "  cmpq %rax, %r12\n  je 4f\n  orq $8, %r10\n4:\n"
+    "  cmpq %rax, %r13\n  je 5f\n  orq $16, %r10\n5:\n"
+    "  cmpq %rax, %r14\n  je 6f\n  orq $32, %r10\n6:\n"
+    "  cmpq %rax, %r15\n  je 7f\n  orq $64, %r10\n7:\n"
+    "  movdqu abi_xmm_seed(%rip), %xmm5\n"
+    "  pcmpeqb %xmm5, %xmm6\n  pmovmskb %xmm6, %eax\n  cmp $65535, %eax\n  je 8f\n  orq $128, %r10\n8:\n"
+    "  pcmpeqb %xmm5, %xmm7\n  pmovmskb %xmm7, %eax\n  cmp $65535, %eax\n  je 9f\n  orq $128, %r10\n9:\n"
+    "  pcmpeqb %xmm5, %xmm8\n  pmovmskb %xmm8, %eax\n  cmp $65535, %eax\n  je 10f\n  orq $128, %r10\n10:\n"
+    "  pcmpeqb %xmm5, %xmm9\n  pmovmskb %xmm9, %eax\n  cmp $65535, %eax\n  je 11f\n  orq $128, %r10\n11:\n"
+    "  pcmpeqb %xmm5, %xmm10\n  pmovmskb %xmm10, %eax\n  cmp $65535, %eax\n  je 12f\n  orq $128, %r10\n12:\n"
+    "  pcmpeqb %xmm5, %xmm11\n  pmovmskb %xmm11, %eax\n  cmp $65535, %eax\n  je 13f\n  orq $128, %r10\n13:\n"
+    "  pcmpeqb %xmm5, %xmm12\n  pmovmskb %xmm12, %eax\n  cmp $65535, %eax\n  je 14f\n  orq $128, %r10\n14:\n"
+    "  pcmpeqb %xmm5, %xmm13\n  pmovmskb %xmm13, %eax\n  cmp $65535, %eax\n  je 15f\n  orq $128, %r10\n15:\n"
+    "  pcmpeqb %xmm5, %xmm14\n  pmovmskb %xmm14, %eax\n  cmp $65535, %eax\n  je 16f\n  orq $128, %r10\n16:\n"
+    "  pcmpeqb %xmm5, %xmm15\n  pmovmskb %xmm15, %eax\n  cmp $65535, %eax\n  je 17f\n  orq $128, %r10\n17:\n"
+    "  movq %r10, %rax\n"
+    "  movdqu 32(%rsp), %xmm6\n  movdqu 48(%rsp), %xmm7\n"
+    "  movdqu 64(%rsp), %xmm8\n  movdqu 80(%rsp), %xmm9\n"
+    "  movdqu 96(%rsp), %xmm10\n  movdqu 112(%rsp), %xmm11\n"
+    "  movdqu 128(%rsp), %xmm12\n  movdqu 144(%rsp), %xmm13\n"
+    "  movdqu 160(%rsp), %xmm14\n  movdqu 176(%rsp), %xmm15\n"
+    "  addq $200, %rsp\n"
+    "  popq %r15\n  popq %r14\n  popq %r13\n  popq %r12\n"
+    "  popq %rdi\n  popq %rsi\n  popq %rbx\n  retq\n"
+);
+#else
+#error "binding_abi_test requires the supported MinGW x64 ABI path"
+#endif
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -219,6 +318,37 @@ static void record(bool ok, const char* tag) {
 // (ceil(size/8) words, copied via copy_bytes); absent -> opaque handle
 // (1 word). So a struct-by-value native param is bound with bind_handle
 // (the i64 tag), NOT make_struct (prim=Void, never matches a script type).
+static void test_aligned_trap() {
+    using namespace ember;
+    NativeTable tab;
+    CompiledProgram* p = compile_program(
+        "fn entry(i: i64) -> i64 { let a: i64[1]; return a[i]; }\n", tab,
+        reinterpret_cast<void*>(&binding_aligned_trap));
+    if (!p) { record(false, "[0a] aligned trap path (compile)"); return; }
+    // OOB invokes the alignment-sensitive movaps stub. Returning is sufficient:
+    // a misaligned generated call faults before this test can report success.
+    (void)binding_call_i64_aligned(entry_of(p, "entry"), 2);
+    free_program(p);
+    record(true, "[0a] generated trap call provides aligned Win64 shadow frame");
+}
+
+static void test_nonvolatile_preservation() {
+    using namespace ember;
+    BindingBuilder b;
+    b.add("mixed_if", make_prim(Prim::I64),
+          { make_prim(Prim::I64), make_prim(Prim::F32), make_prim(Prim::I64) },
+          (void*)&n_mixed_if);
+    NativeTable tab = b.build();
+    CompiledProgram* p = compile_program(
+        "fn entry() -> i64 { let mut x: i64 = 0; switch (2) { case 1: x = 1; break; default: x = mixed_if(30, 4.0f, 8); break; } return x; }\n",
+        tab);
+    if (!p) { record(false, "[0] nonvolatile register preservation (compile)"); return; }
+    uint64_t changed = call_check_nonvolatiles(entry_of(p, "entry"));
+    free_program(p);
+    record(changed == 0, "[0] generated code preserves rbx/rsi/rdi/r12-r15 and XMM6-XMM15");
+    if (changed) std::printf("       changed-mask=0x%llx\n", (unsigned long long)changed);
+}
+
 static void test_struct_by_value_arg() {
     using namespace ember;
     BindingBuilder b;
@@ -251,6 +381,56 @@ static void test_struct_by_value_arg() {
 // the vec extension's vec3_new handle-return path (a DIFFERENT, i64-handle
 // convention) as a regression baseline so both struct-return shapes stay
 // covered.
+static void test_nested_packed_arg() {
+    using namespace ember;
+    BindingBuilder b;
+    b.add("read_packed", make_prim(Prim::I64), { bind_handle("PackedOuter") },
+          (void*)&n_read_packed);
+    NativeTable tab = b.build();
+    const std::string src =
+        "struct PackedInner { a: u8; b: u16; }\n"
+        "struct PackedOuter { tag: u8; value: i32; inner: PackedInner; }\n"
+        "fn entry() -> i64 { let p: PackedOuter = PackedOuter { tag: 3, value: 36, inner: PackedInner { a: 1, b: 2 } }; return read_packed(p); }\n";
+    CompiledProgram* p = compile_program(src, tab);
+    if (!p) { record(false, "[1b] nested packed aggregate (compile)"); return; }
+    int64_t r = call0_i64(entry_of(p, "entry"));
+    free_program(p);
+    record(r == 42, "[1b] trailing nested field at offset 5 uses its exact 3-byte packed extent");
+}
+
+static void expect_sema_reject(const std::string& src, const ember::NativeTable& tab,
+                               const char* tag) {
+    using namespace ember;
+    auto lr = tokenize(src, "<binding-abi-negative>");
+    bool rejected = !lr.ok;
+    if (lr.ok) {
+        auto pr = parse(std::move(lr.toks));
+        rejected = !pr.ok;
+        if (pr.ok) {
+            std::unordered_map<std::string, int> slots;
+            int slot = 0;
+            for (auto& fn : pr.program.funcs) { fn.slot = slot; slots[fn.name] = slot++; }
+            auto layouts = build_struct_layouts(pr.program);
+            rejected = !sema(pr.program, tab.natives, slots, 0, &tab.overloads, &layouts).ok;
+        }
+    }
+    record(rejected, tag);
+}
+
+static void test_rejected_aggregate_shapes() {
+    using namespace ember;
+    BindingBuilder b;
+    b.add("take_big", make_prim(Prim::I64), { bind_handle("Big") }, (void*)&n_add_pair8);
+    NativeTable tab = b.build();
+    expect_sema_reject(
+        "struct Big { a: i64; b: i64; } fn main() -> i64 { let v: Big = Big { a: 1, b: 2 }; return take_big(v); }\n",
+        tab, "[1c] native by-value aggregate argument >8 bytes rejected");
+    NativeTable empty;
+    expect_sema_reject(
+        "struct Node { value: i64; next: Node; } fn main() -> i64 { return 0; }\n",
+        empty, "[1d] recursive aggregate layout rejected explicitly");
+}
+
 static void test_struct_by_value_ret() {
     using namespace ember;
     BindingBuilder b;
@@ -296,10 +476,10 @@ static void test_vec3_handle_ret() {
 
     const std::string src =
         "fn entry() -> f32 {\n"
-        "    let v: i64 = vec3_new(1.0f, 2.0f, 3.0f);\n"
+        "    let v: vec3 = vec3_new(1.0f, 2.0f, 3.0f);\n"
         "    return vec3_x(v) + vec3_y(v) + vec3_z(v);\n"
         "}\n";
-    // Note: script sees vec3 as an opaque i64 (the handle). vec3_x/y/z take
+    // Script sees vec3 as a nominal opaque handle. vec3_x/y/z take
     // that i64 and return the stored f32. struct_layouts empty (no script
     // struct) -> handle passed as 1 word (rcx), returned as 1 word (rax).
 
@@ -439,10 +619,15 @@ static void test_mixed_slot_parallel() {
 }
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("=== ember binding ABI correctness suite ===\n");
     std::printf("(pins script->native Win64 call ABI per BINDING_API.md Sec 4)\n\n");
 
+    test_nonvolatile_preservation(); // [0]
+    test_aligned_trap();           // [0a]
     test_struct_by_value_arg();    // [1]
+    test_nested_packed_arg();      // [1b]
+    test_rejected_aggregate_shapes(); // [1c/d]
     test_struct_by_value_ret();    // [2]
     test_vec3_handle_ret();       // [2b]
     test_six_args();               // [3]

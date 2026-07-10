@@ -45,13 +45,12 @@ inline std::vector<ModuleExport> build_jit_exports(const Program& prog, uint32_t
     return out;
 }
 
-// Build the ModuleExportTable entry for a .em-loaded module: one export per
-// name_table entry. The signature (ret/params) is NOT in the .em name table
-// (the format stores name+slot only), so exports from a .em carry an UNKNOWN
-// signature — sema skips arg/return type-checking for them (the .em was
-// already type-checked when it was compiled). This is the honest trade: a .em
-// exports its callable surface but not its type signatures (a future format
-// revision could add them; v0.5 leaves it to the caller to use the right args).
+// Build the ModuleExportTable entry for a v1 .em-loaded module: one export per
+// name_table entry. v1 stores name+slot only, so these are explicitly
+// ABI-TRUSTED UNKNOWN signatures: sema cannot verify arity, argument types, or
+// return type, and the host/caller must supply the exact original ABI.
+// TODO(format v2): version the format and serialize canonical export/import
+// signatures before enabling link-time verification. Do not reinterpret v1.
 inline std::vector<ModuleExport> build_em_exports(const LoadedModule& mod, uint32_t module_id) {
     std::vector<ModuleExport> out;
     out.reserve(mod.name_table.size());
@@ -60,9 +59,9 @@ inline std::vector<ModuleExport> build_em_exports(const LoadedModule& mod, uint3
         exp.fn_name = name;
         exp.module_id = module_id;
         exp.slot = int(slot);
-        exp.unknown_sig = true;  // .em name table stores name+slot only, no type signatures
-        // ret/params left default (Type{Void}); sema's .em-export path skips
-        // arity/return checking (the .em was type-checked at compile time).
+        exp.unknown_sig = true;  // v1 ABI-trusted unknown signature
+        // ret/params left default; sema deliberately skips all signature
+        // checking because the v1 file contains no data with which to verify.
         out.push_back(std::move(exp));
     }
     return out;
