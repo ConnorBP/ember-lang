@@ -3,3 +3,5 @@
 /tmp_edit
 /build_ts
 /buildt
+# demo build artifacts (harnesses relinked from buildt libs)
+demo/**/*.exe

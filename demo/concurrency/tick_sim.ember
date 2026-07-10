@@ -1,0 +1,101 @@
+// demo/concurrency/tick_sim.ember — single-thread tick-sim pipeline (shape B).
+//
+// A bounded, deterministic pipeline driven by @on_tick (the host ticks it a
+// fixed number of times; no real threads). One stage produces into an SPSC
+// queue, a second stage drains it, atomics count produced/consumed, and a
+// swap buffer double-buffers a per-tick "frame" the host can read back.
+//
+// The sync primitives here are the SAME surface shape (A) races through, but
+// exercised single-threaded for API ergonomics + tick integration: the SPSC
+// retry-on-full/empty loop, atomic counters, and swapbuf write/swap/read frame
+// publishing.
+//
+// Determinism contract: after TICKS ticks, produced == TICKS*PER_TICK,
+// consumed == produced (the consumer drains each tick), and the swap buffer's
+// back frame carries the last published frame's generation number + item
+// count. The host harness reads the atomics + swapbuf back via the _host
+// accessors and asserts the deterministic invariants.
+//
+// HANDLE-TYPED GLOBALS: the sync handles are typed with their tag (spsc /
+// atomic / swapbuf) so the natives accept them. A global's initializer must
+// type-match; a call to e.g. spsc_new() returns `spsc` and type-checks against
+// a `spsc` global. eval_global_initializers only folds CONST initializers
+// (a call is not const-foldable), so the global starts at 0 (invalid handle);
+// @entry creates the real primitives and reassigns. This is the standard
+// "host-created handle stored in a global" pattern (mirrors how a host would
+// seed shared state before ticking).
+
+// --- process-global sync handles (created once in @entry, reused per tick) ---
+// spsc_new returns `spsc`; the call initializer type-checks the global as spsc.
+global spsc_h : spsc = spsc_new(4);
+global counter_produced : atomic = atomic_new(64, 0);
+global counter_consumed : atomic = atomic_new(64, 0);
+global frame_h : swapbuf = swapbuf_new(2);
+global tick_gen : atomic = atomic_new(64, 0);
+
+@entry
+fn setup() -> i64 {
+    // capacity 4 (rounded up to 4 by spsc_new). PER_TICK (3) <= cap so a single
+    // tick's burst fits without blocking; the consumer drains the same tick.
+    spsc_h = spsc_new(4);
+    counter_produced = atomic_new(64, 0);
+    counter_consumed = atomic_new(64, 0);
+    // 2-cell frame: [generation, items_this_tick]
+    frame_h = swapbuf_new(2);
+    tick_gen = atomic_new(64, 0);
+    return 1;  // >0 = stay loaded (LIFECYCLE.md §1)
+}
+
+// Producer stage: push PER_TICK items into the SPSC, retrying on full (bounded
+// retries; cap 4 >= PER_TICK 3 so it never blocks in practice, but the retry
+// loop exercises the non-blocking push contract). Each item is a deterministic
+// value gen*1000+ordinal. Publishes a frame [gen, items] + swaps.
+@on_tick
+fn producer() -> i64 {
+    let g : i64 = atomic_fetch_add(tick_gen, 1);
+    let mut pushed_this_tick : i64 = 0;
+    let mut i : i64 = 0;
+    // PER_TICK = 3
+    while (i < 3) {
+        let v : i64 = g * 1000 + i;
+        // retry on full (non-blocking push returns 0 on full); bounded guard
+        let mut ok : i64 = spsc_push(spsc_h, v);
+        let mut guard : i64 = 0;
+        while (ok == 0 && guard < 100) {
+            ok = spsc_push(spsc_h, v);
+            guard = guard + 1;
+        }
+        if (ok == 1) {
+            atomic_fetch_add(counter_produced, 1);
+            pushed_this_tick = pushed_this_tick + 1;
+        }
+        i = i + 1;
+    }
+    // publish a frame: [generation, items this tick], then swap (publish).
+    swapbuf_write(frame_h, 0, g);
+    swapbuf_write(frame_h, 1, pushed_this_tick);
+    swapbuf_swap(frame_h);
+    return 0;
+}
+
+// Consumer stage: drain the SPSC until empty, counting consumed items.
+// Discipline: single-threaded here, so spsc_size is EXACT (not the
+// "approximate cross-thread" the impl documents under contention). Use it as
+// the loop guard, pop only when non-empty, so try_pop never returns the
+// INT64_MIN empty sentinel inside the loop. Every pop is a real value
+// (g*1000+i, g>=0, i in [0,3)); count unconditionally. This avoids needing to
+// name the INT64_MIN sentinel in ember (which has no literal for it); the
+// size-guarded drain is the correct single-threaded shape.
+@on_tick
+fn consumer() -> i64 {
+    let mut drained : i64 = 0;
+    while (spsc_size(spsc_h) > 0) {
+        let v : i64 = spsc_try_pop(spsc_h);  // guaranteed non-empty -> real value
+        atomic_fetch_add(counter_consumed, 1);
+        drained = drained + 1;
+        // v is a deterministic value g*1000+i; the harness asserts no-loss via
+        // the consumed atomic == produced atomic.
+        let _keep : i64 = v;
+    }
+    return drained;
+}

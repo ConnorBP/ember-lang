@@ -1,0 +1,238 @@
+// demo/concurrency/race.ember — shape (A) ember fns for the host-driven
+// multi-thread concurrency demo.
+//
+// Each fn is called by a HOST thread via ember_call_i64(entry, &thread_ctx, h).
+// Each thread owns its own context_t (the single-context contract: a context_t
+// is NOT entered concurrently by multiple threads). The handles (h args) are
+// process-global sync-extension slots (the extension's g_store), so threads
+// genuinely race through the SAME shared SPSC/MPSC/MPMC rings + atomics.
+//
+// WORK DISCIPLINE (bounded batch per call + host re-call loop):
+// ember has no script-visible yield, so a busy-wait-retry loop inside a fn
+// would spin in JIT'd code and burn the context budget (or stall a partner on
+// a contended core). Instead each fn does a BOUNDED batch of work per call
+// (BATCH items, BOUNDED_RETRIES per item) and RETURNS to the host, which
+// yields (std::this_thread::yield) and re-calls. Progress persists in
+// per-role globals (shared backing store, single writer per global -> no
+// race). This mirrors how a real host drives staged script work per frame,
+// keeps each ember call bounded (no budget exhaustion on a legit busy-wait),
+// and gives the host the deadline + yield.
+//
+// SENTINEL: try_pop returns INT64_MIN on empty. All pushed values are positive
+// (1..N or base+1..base+N), so `v < 0` reliably detects empty (signed cmp:
+// ember's `<` on i64 is setl). We never push INT64_MIN (the contract).
+
+// ---- per-role progress globals (shared backing store; single writer each) ----
+global spsc_prod_next : i64 = 1;     // next value the SPSC producer pushes
+global spsc_cons_count : i64 = 0;    // how many the SPSC consumer has popped
+global mpsc_a_next : i64 = 1;        // MPSC producer A next (base 0)
+global mpsc_b_next : i64 = 1;        // MPSC producer B next (base 100000)
+global mpsc_cons_count : i64 = 0;    // MPSC consumer popped count
+global mpmc_pa_next : i64 = 1;      // MPMC producer A next (base 0)
+global mpmc_pb_next : i64 = 1;      // MPMC producer B next (base 1000000)
+
+// tunables baked as constants (the host passes the handle; counts are per-fn)
+const BATCH : i64 = 64;
+const RETRIES : i64 = 64;
+
+// ===========================================================================
+// SPSC: one producer pushes 1..SPSC_N; one consumer pops, verifying FIFO
+// (each popped value == expected) and no-loss (count reaches SPSC_N).
+// The host calls these on two threads until both signal done.
+// ===========================================================================
+
+// Producer step: push up to BATCH items toward SPSC_N. Returns count pushed
+// this call, or -1 when all SPSC_N pushed.
+fn spsc_producer_step(h: spsc) -> i64 {
+    let mut pushed : i64 = 0;
+    while (pushed < BATCH) {
+        let nxt : i64 = spsc_prod_next;
+        if (nxt > 100000) { return -1; }   // SPSC_N = 100000 -> done
+        let mut tries : i64 = 0;
+        let mut ok : i64 = 0;
+        while (tries < RETRIES && ok == 0) {
+            ok = spsc_push(h, nxt);
+            tries = tries + 1;
+        }
+        if (ok == 1) {
+            spsc_prod_next = nxt + 1;
+            pushed = pushed + 1;
+        } else {
+            return pushed;   // queue stayed full -> yield back to host
+        }
+    }
+    return pushed;
+}
+
+// Consumer step: pop up to BATCH items, verifying FIFO (v == spsc_cons_count+1).
+// Returns count popped this call, -1 when SPSC_N received, -2 on FIFO violation.
+fn spsc_consumer_step(h: spsc) -> i64 {
+    let mut popped : i64 = 0;
+    while (popped < BATCH) {
+        if (spsc_cons_count >= 100000) { return -1; }  // SPSC_N -> done
+        let v : i64 = spsc_try_pop(h);
+        if (v < 0) { return popped; }    // INT64_MIN sentinel -> empty -> yield
+        // FIFO: the value must be exactly count+1 (producer pushes 1,2,3,...)
+        if (v != spsc_cons_count + 1) { return -2; }   // FIFO violation
+        spsc_cons_count = spsc_cons_count + 1;
+        popped = popped + 1;
+    }
+    return popped;
+}
+
+// ===========================================================================
+// MPSC: two producers (each on its own producer sub-handle) push base+N values;
+// one consumer round-robins. The host passes the PRODUCER sub-handle to each
+// producer thread (from mpsc_producer_handle on the host). No-loss = each
+// producer's count reaches MPSC_N; FIFO per producer = values arrive in order
+// within each producer's stream (the consumer distinguishes by value range).
+// ===========================================================================
+
+// Producer A step: push 1..MPSC_N (base 0). ph = producer sub-handle (an spsc
+// handle -- mpsc_push takes the producer sub-handle which is a per-producer SPSC ring).
+fn mpsc_producer_a_step(ph: spsc) -> i64 {
+    let mut pushed : i64 = 0;
+    while (pushed < BATCH) {
+        let nxt : i64 = mpsc_a_next;
+        if (nxt > 50000) { return -1; }   // MPSC_N = 50000 -> done
+        let mut tries : i64 = 0;
+        let mut ok : i64 = 0;
+        while (tries < RETRIES && ok == 0) {
+            ok = mpsc_push(ph, nxt);       // mpsc_push takes the producer sub-handle
+            tries = tries + 1;
+        }
+        if (ok == 1) {
+            mpsc_a_next = nxt + 1;
+            pushed = pushed + 1;
+        } else {
+            return pushed;
+        }
+    }
+    return pushed;
+}
+
+// Producer B step: push (100000+1)..(100000+MPSC_N) (base 100000).
+fn mpsc_producer_b_step(ph: spsc) -> i64 {
+    let mut pushed : i64 = 0;
+    while (pushed < BATCH) {
+        let nxt : i64 = mpsc_b_next;
+        if (nxt > 50000) { return -1; }    // MPSC_N -> done (nxt is the 1..N offset)
+        let mut tries : i64 = 0;
+        let mut ok : i64 = 0;
+        while (tries < RETRIES && ok == 0) {
+            ok = mpsc_push(ph, 100000 + nxt);   // base 100000 + offset
+            tries = tries + 1;
+        }
+        if (ok == 1) {
+            mpsc_b_next = nxt + 1;
+            pushed = pushed + 1;
+        } else {
+            return pushed;
+        }
+    }
+    return pushed;
+}
+
+// Consumer step: pop up to BATCH from the mpsc CONTAINER (h = container handle).
+// Returns count popped, -1 when 2*MPSC_N received, -2 on out-of-range value.
+fn mpsc_consumer_step(h: mpsc) -> i64 {
+    let mut popped : i64 = 0;
+    while (popped < BATCH) {
+        if (mpsc_cons_count >= 100000) { return -1; }  // 2*MPSC_N = 100000 -> done
+        let v : i64 = mpsc_try_pop(h);
+        if (v < 0) { return popped; }    // empty -> yield
+        // value ranges: producer A pushes 1..50000; producer B pushes 100001..150000.
+        if (v < 1) { return -2; }
+        if (v > 150000) { return -2; }
+        if (v >= 1 && v <= 50000) { } else if (v >= 100001 && v <= 150000) { } else { return -2; }
+        mpsc_cons_count = mpsc_cons_count + 1;
+        popped = popped + 1;
+    }
+    return popped;
+}
+
+// ===========================================================================
+// MPMC: two producers + two consumers, all on the same container handle.
+// No-loss = sum pushed == sum popped (verified on the host via atomics the
+// producers/consumers bump). Each consumer pops up to its quota.
+// ===========================================================================
+
+// Producer A step: push 1..MPMC_N (base 0).
+fn mpmc_producer_a_step(h: mpmc) -> i64 {
+    let mut pushed : i64 = 0;
+    while (pushed < BATCH) {
+        let nxt : i64 = mpmc_pa_next;
+        if (nxt > 20000) { return -1; }   // MPMC_N = 20000 -> done
+        let mut tries : i64 = 0;
+        let mut ok : i64 = 0;
+        while (tries < RETRIES && ok == 0) {
+            ok = mpmc_push(h, nxt);
+            tries = tries + 1;
+        }
+        if (ok == 1) {
+            mpmc_pa_next = nxt + 1;
+            pushed = pushed + 1;
+        } else {
+            return pushed;
+        }
+    }
+    return pushed;
+}
+
+// Producer B step: push (1000000+1)..(1000000+MPMC_N) (base 1000000).
+fn mpmc_producer_b_step(h: mpmc) -> i64 {
+    let mut pushed : i64 = 0;
+    while (pushed < BATCH) {
+        let nxt : i64 = mpmc_pb_next;
+        if (nxt > 20000) { return -1; }
+        let mut tries : i64 = 0;
+        let mut ok : i64 = 0;
+        while (tries < RETRIES && ok == 0) {
+            ok = mpmc_push(h, 1000000 + nxt);
+            tries = tries + 1;
+        }
+        if (ok == 1) {
+            mpmc_pb_next = nxt + 1;
+            pushed = pushed + 1;
+        } else {
+            return pushed;
+        }
+    }
+    return pushed;
+}
+
+// Consumer step: pop up to BATCH items from the MPMC ring. Returns the count
+// popped THIS call (a LOCAL, no shared mutable global -> no race between the
+// two consumer threads). The HOST accumulates per-consumer totals and decides
+// when to stop (producers done && mpmc_size == 0). Returns 0 when the ring was
+// empty for the whole batch. This keeps the MPMC consumer stateless: the two
+// consumer threads share ONLY the mpmc ring (internally synchronized) and no
+// mutable global, so there is no globals-backing-store data race.
+fn mpmc_consumer_step(h: mpmc) -> i64 {
+    let mut popped : i64 = 0;
+    while (popped < BATCH) {
+        let v : i64 = mpmc_try_pop(h);
+        if (v < 0) { return popped; }    // empty -> yield back to host
+        popped = popped + 1;
+    }
+    return popped;
+}
+
+// ===========================================================================
+// ATOMIC: a shared counter bumped by N threads. Each thread's fn does
+// fetch_add ATOMIC_N times. The host asserts the final value == N*ATOMIC_N.
+// This is the M1 race-safety fix test: concurrent fetch_add on one atomic.
+// ===========================================================================
+
+// Bump the shared atomic ATOMIC_N times. h = atomic handle. Returns -1 (done)
+// so the host worker_loop calls this fn EXACTLY ONCE per thread (it is not a
+// batched step fn; it does the full 50000 fetch_adds in one bounded call).
+// ATOMIC_N = 50000 is small enough that one call stays well under the budget.
+fn atomic_bumper(h: atomic) -> i64 {
+    let mut i : i64 = 0;
+    while (i < 50000) {     // ATOMIC_N = 50000
+        atomic_fetch_add(h, 1);
+        i = i + 1;
+    }
+    return -1;   // done signal -> worker_loop stops after this one call
+}
