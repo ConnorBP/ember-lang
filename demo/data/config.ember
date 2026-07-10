@@ -1,0 +1,39 @@
+// data/config.ember — struct config, struct-by-value across modules (locals per ABI)
+import "../math/vec.ember";
+
+struct Config {
+    name_id: i64;
+    scale: f32;
+    origin: V3;
+    flags: u8;
+}
+
+global default_id : i64 = 42;
+
+fn make_config(id: i64, scale: f32, origin: V3, flags: u8) -> Config {
+    let c: Config = Config { name_id: id, scale: scale, origin: origin, flags: flags };
+    return c;
+}
+
+fn config_origin(c: Config) -> V3 {
+    let o: V3 = c.origin;
+    return o;
+}
+
+fn config_scaled_origin(c: Config) -> V3 {
+    let o: V3 = c.origin;
+    let r: V3 = v3_scale(o, c.scale);
+    return r;
+}
+
+fn flag_label(flags: u8) -> i64 {
+    switch (flags) {
+        case 0: return 0;
+        case 1: return 1;
+        case 2: return 2;
+        case 3: return 3;
+        case 4: return 4;
+        default: return 99;
+    }
+    return 99; // sema doesn't recognize switch default:return as exhaustive (M7-adjacent kink)
+}

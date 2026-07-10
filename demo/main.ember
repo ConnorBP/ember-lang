@@ -1,0 +1,6 @@
+// main.ember — entry point: imports the pipeline and runs it
+import "pipeline/process.ember";
+
+fn main() -> i64 {
+    return run_pipeline();
+}

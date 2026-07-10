@@ -1,0 +1,2 @@
+import "pipeline/process_em.ember";
+fn main() -> i64 { return run_pipeline_em(); }

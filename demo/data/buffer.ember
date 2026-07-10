@@ -1,0 +1,18 @@
+// data/buffer.ember — fn-reference + division + string extension across modules
+import "../math/vec.ember";
+
+fn apply_twice(f: fn, x: i64) -> i64 {
+    let once: i64 = f(x);
+    let twice: i64 = f(once);
+    return twice;
+}
+
+fn inc(x: i64) -> i64 { return x + 1; }
+
+fn safe_div(a: i64, b: i64) -> i64 {
+    return a / b; // division trap recovery (H2) — caller wraps in checkpoint
+}
+
+fn greet(who: string) -> string {
+    return f"hello, {who}!"; // f-string lowering (D5)
+}

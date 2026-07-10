@@ -1,0 +1,57 @@
+// pipeline/process.ember — central module: imports math + data, runs the pipeline
+import "../math/vec.ember";
+import "../math/stats.ember";
+import "../data/config.ember";
+import "../data/buffer.ember";
+
+fn run_pipeline() -> i64 {
+    // 1. make a config via cross-module fn (struct-by-value return → local)
+    let up: V3 = v3_up();
+    let c: Config = make_config(7, 3.0f, up, 255);
+
+    // 2. scale the origin (calls v3_scale in math/vec through data/config)
+    let scaled: V3 = config_scaled_origin(c);
+
+    // 3. dot product with up vector (f32 math) — both args are locals
+    let d: f32 = v3_dot(scaled, up);
+
+    // 4. integer work via math/stats (local-array slice, recursion, defer)
+    let s: i64 = make_arr_and_sum(); // 10+20+30 = 60
+
+    // 5. factorial (depth guard) — 5! = 120
+    let f: i64 = fact(5);
+
+    // 6. defer per-iteration (M5) — defer_counter advances by `count`
+    let acc: i64 = accumulate_with_defer(3);
+
+    // 7. fn-reference handle: apply inc twice to 10 -> 12
+    let inc_h: fn = &inc;
+    let doubled: i64 = apply_twice(inc_h, 10);
+
+    // 8. flag label via switch (u8) — flags=255 -> default -> 99
+    let label: i64 = flag_label(c.flags);
+
+    // 9. f64 precision (H7): average of two f32s — (0+3)/2 = 1.5
+    let avg: f64 = average(scaled.x, scaled.y);
+
+    // 10. string (D5 f-string) — len("hello, world!") = 13
+    let msg: string = greet("world");
+    let msg_len: i64 = string_length(msg);
+
+    // pack a deterministic result asserting every feature
+    // scaled = up * 3 = (0,3,0); d = dot((0,3,0),(0,1,0)) = 3
+    if (d != 3.0f) { return 101; }
+    if (s != 60) { return 102; }
+    if (f != 120) { return 103; }
+    if (acc != 3) { return 104; }
+    if (doubled != 12) { return 105; }
+    if (label != 99) { return 106; }
+    if (avg != 1.5) { return 107; }
+    if (msg_len != 13) { return 108; }
+    return 777;
+}
+
+// distinct export exercising H14 signature storage in .em
+fn run_pipeline_safe() -> i64 {
+    return run_pipeline();
+}

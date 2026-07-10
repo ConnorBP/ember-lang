@@ -1,0 +1,45 @@
+// math/vec.ember — vector math lib, written to the language's struct ABI:
+// struct returns must be a local; struct-by-value args must be a local.
+// (Two real language kinks surfaced by this demo: a fn can't return a struct
+//  literal directly, and a struct-by-value arg can't be a general expression.
+//  Both are Win64-hidden-pointer-ABI restrictions. Worked around here with
+//  locals; relaxing them is a candidate language change — see demo/NOTES.md.)
+struct V2 {
+    x: f32;
+    y: f32;
+}
+
+struct V3 {
+    x: f32;
+    y: f32;
+    z: f32;
+}
+
+global pi : f32 = 3.14159265f;
+
+fn v2_add(a: V2, b: V2) -> V2 {
+    let r: V2 = V2 { x: a.x + b.x, y: a.y + b.y };
+    return r;
+}
+
+fn v3_add(a: V3, b: V3) -> V3 {
+    let r: V3 = V3 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z };
+    return r;
+}
+
+fn v3_dot(a: V3, b: V3) -> f32 {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+fn v3_scale(a: V3, s: f32) -> V3 {
+    let r: V3 = V3 { x: a.x * s, y: a.y * s, z: a.z * s };
+    return r;
+}
+
+fn v3_zero() -> V3 { let r: V3 = V3 { x: 0.0f, y: 0.0f, z: 0.0f }; return r; }
+fn v3_up() -> V3    { let r: V3 = V3 { x: 0.0f, y: 1.0f, z: 0.0f }; return r; }
+
+fn v3_length_sq(a: V3) -> f64 {
+    let d: f64 = (a.x as f64) * (a.x as f64) + (a.y as f64) * (a.y as f64) + (a.z as f64) * (a.z as f64);
+    return d;
+}

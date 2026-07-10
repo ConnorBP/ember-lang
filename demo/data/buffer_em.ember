@@ -1,0 +1,4 @@
+import "../math/vec.ember";
+
+fn safe_div(a: i64, b: i64) -> i64 { return a / b; }
+fn greet(who: string) -> string { return f"hello, {who}!"; }

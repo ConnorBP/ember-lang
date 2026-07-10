@@ -1,0 +1,28 @@
+import "../math/vec.ember";
+import "../math/stats.ember";
+import "../data/config.ember";
+import "../data/buffer_em.ember";
+
+fn run_pipeline_em() -> i64 {
+    let up: V3 = v3_up();
+    let c: Config = make_config(7, 3.0f, up, 255);
+    let scaled: V3 = config_scaled_origin(c);
+    let d: f32 = v3_dot(scaled, up);
+    let s: i64 = make_arr_and_sum();        // 60
+    let f: i64 = fact(5);                  // 120
+    let acc: i64 = accumulate_with_defer(3); // 3
+    let label: i64 = flag_label(c.flags);  // 99
+    let avg: f64 = average(scaled.x, scaled.y); // 1.5
+    let msg: string = greet("world");
+    let msg_len: i64 = string_length(msg); // 13
+    let q: i64 = safe_div(100, 4);         // 25
+    if (d != 3.0f) { return 101; }
+    if (s != 60) { return 102; }
+    if (f != 120) { return 103; }
+    if (acc != 3) { return 104; }
+    if (label != 99) { return 106; }
+    if (avg != 1.5) { return 107; }
+    if (msg_len != 13) { return 108; }
+    if (q != 25) { return 109; }
+    return 888;
+}
