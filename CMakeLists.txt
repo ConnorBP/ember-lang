@@ -73,6 +73,7 @@ ember_add_extension(string   extensions/string/ext_string.cpp)
 ember_add_extension(array    extensions/array/ext_array.cpp)
 ember_add_extension(math     extensions/math/ext_math.cpp)
 ember_add_extension(sync     extensions/sync/ext_sync.cpp)
+ember_add_extension(lifecycle extensions/lifecycle/ext_lifecycle.cpp)
 
 # ---- tests: .em pre-compile round-trip + live import cross-module round-trip ----
 # These link only ember + ember_frontend (no prism/prism_script_host) so they
@@ -106,6 +107,13 @@ add_test(NAME ext_runtime COMMAND ext_runtime_test)
 add_executable(ext_sync_test examples/ext_sync_test.cpp)
 target_link_libraries(ext_sync_test PRIVATE ember ember_frontend ember_ext_sync)
 add_test(NAME ext_sync COMMAND ext_sync_test)
+
+# ext_lifecycle_test: dynamic routine registration (plan_FUNCTION_REFS.md §6).
+# register_routine(&fn, data) -> id + unregister_routine(id); the host drives
+# the stored routines via host_routines(). Links ember_ext_lifecycle directly.
+add_executable(ext_lifecycle_test examples/ext_lifecycle_test.cpp)
+target_link_libraries(ext_lifecycle_test PRIVATE ember ember_frontend ember_ext_lifecycle)
+add_test(NAME ext_lifecycle COMMAND ext_lifecycle_test)
 
 # Extension registration smoke test (RESTRUCTURE_PLAN.md Section 6): validates the
 # relocated non-cheat extensions (vec/quat/mat/string/array/math) register
