@@ -80,7 +80,7 @@ hyper_workspace/
 │   │   ├── em_writer.{hpp,cpp}     # PORTED from standalone (Section 5)
 │   │   └── em_loader.{hpp,cpp}    # PORTED from standalone (Section 5)
 │   ├── extensions/                # non-cheat-specific language extensions, reusable
-│   │   ├── README.md              # what lives here, how to add one (Section 6)
+│   │   ├── ../../README.md              # what lives here, how to add one (Section 6)
 │   │   └── (relocated non-cheat addons from prism, if any exist - Section 6 audit)
 │   ├── examples/                  # language-only examples (from standalone + prism)
 │   └── tests/                     # language tests (lexer/parser/sema/codegen/.em)
