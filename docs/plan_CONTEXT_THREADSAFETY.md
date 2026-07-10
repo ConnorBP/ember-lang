@@ -67,23 +67,26 @@ themselves*:
    last saved, on thread A's stack. This is the most dangerous of the four:
    a misrouted longjmp corrupts a foreign thread's stack pointer.
 
-2. **`int64_t budget_remaining`** (`context.hpp:54`). Decremented at every
-   loop back-edge by JIT'd code: `src/codegen.cpp:266`–`282` (`emit_budget_check`).
-   The JIT'd body does `mov rax, <budget_ptr>; sub qword [rax], body_cost; jg
-   .continue; else trap`. Two threads decrementing the same `int64_t` is a
-   classic read-modify-write race — lost decrements (a runaway loop on one
-   thread may not be caught because the other thread's sub overwrites it) and
-   torn reads on the `jg` branch.
+2. **`int64_t budget_remaining`** (`context.hpp:64`). Decremented by JIT'd
+   code at each budget charge site (function entry and loop back-edges;
+   reach-aware per-statement charging is in flight): `src/codegen.cpp:319`–`340`
+   (`emit_budget_check`). The JIT'd body does `mov rax, <budget_ptr>; sub qword
+   [rax], body_cost; jg .continue; else trap` (B1 mode decrements through
+   `[r14 + off_budget]` instead of a baked pointer). Two threads decrementing
+   the same `int64_t` is a classic read-modify-write race — lost decrements (a
+   runaway loop on one thread may not be caught because the other thread's sub
+   overwrites it) and torn reads on the `jg` branch.
 
-3. **`int32_t call_depth`** (`context.hpp:57`). Incremented before every
-   script-to-script call and decremented after: `src/codegen.cpp:293`–`310`
-   (`emit_depth_check` / `emit_depth_leave`). Same RMW race as the budget —
-   lost incs/deczs mean the depth guard can both false-trap (one thread's
-   incs counted against the other's max) and fail to trap (real overflow
-   hidden by a lost inc).
+3. **`int32_t call_depth`** (`context.hpp:68`). Incremented before every
+   script-to-script call and decremented after: `src/codegen.cpp:364`–`407`
+   (`emit_depth_check` `:364`–`392` / `emit_depth_leave` `:394`–`407`).
+   Same RMW race as the budget — lost incs/deczs mean the depth guard can both
+   false-trap (one thread's incs counted against the other's max) and fail to
+   trap (real overflow hidden by a lost inc).
 
-4. **`TrapReason last_trap` + `std::string last_error`** (`context.hpp:61`–`63`).
-   Written by the trap stub before the longjmp (`ember_cli.cpp:66`–`67`). Two
+4. **`TrapReason last_trap` + `std::string last_error`** (`context.hpp:70`,
+   `:75`). Written by the trap stub before the longjmp (`ember_cli.cpp:106`–
+   `107`). Two
    concurrent traps racing these fields produce garbage error reporting
    (interleaved bytes in `last_error`, a `last_trap` from the wrong thread).
    Lower severity than 1–3 (it's diagnostics, not control flow), but still a
@@ -756,22 +759,22 @@ test. Those are later batches.
 
 | Claim | Evidence |
 |---|---|
-| `context_t` fields are non-atomic | `src/context.hpp:44`–`72` |
-| Single `jmp_buf` checkpoint (not the spec's stack) | `src/context.hpp:8`–`11`, `:47`–`48` |
-| `budget_remaining` decremented at loop back-edges | `src/codegen.cpp:266`–`282` |
-| `call_depth` inc/dec at script-to-script calls | `src/codegen.cpp:293`–`310`; call sites `:645`,`:653`,`:1563`,`:1572` |
-| `trap_ctx` baked as imm64 | `src/codegen.cpp:242` |
-| `budget_ptr` baked as imm64 | `src/codegen.cpp:268` |
-| `depth_ptr` baked as imm64 | `src/codegen.cpp:295`, `:307` |
-| `CodeGenCtx` carries the three pointers | `src/codegen.hpp:36`–`73` (`trap_stub`/`trap_ctx`/`budget_ptr`/`depth_ptr`) |
-| `g_globals_for_codegen` process-wide pointer (defn) | `src/codegen.cpp:2059`; decl `src/codegen.hpp:95` |
-| Globals emit-time decision reads process-wide ptr | `src/codegen.cpp:951`–`957` (load), `:1360`–`1365` (store) |
-| Globals run-time address via `AbsFixup::GlobalsBase` | `src/codegen.cpp:878`–`900` (helpers), `:2289` (reloc fill) |
-| Dispatch table is `std::atomic<void*>` release/acquire | `src/dispatch_table.hpp:6`–`13` |
+| `context_t` fields are non-atomic | `src/context.hpp:60`–`86` |
+| Single `jmp_buf` checkpoint (not the spec's stack) | `src/context.hpp:14`–`16` |
+| `budget_remaining` decremented at budget charge sites (entry + back-edges) | `src/codegen.cpp:319`–`340` (`emit_budget_check`) |
+| `call_depth` inc/dec at script-to-script calls | `src/codegen.cpp:364`–`407`; call sites `:415`,`:944`,`:952`,`:1951`,`:1961`,`:1974` |
+| `trap_ctx` baked as imm64 | `src/codegen.cpp:293` |
+| `budget_ptr` baked as imm64 | `src/codegen.cpp:332` |
+| `depth_ptr` baked as imm64 | `src/codegen.cpp:385`, `:404` |
+| `CodeGenCtx` carries the three pointers | `src/codegen.hpp:43`–`116` (`trap_stub` `:70`/`trap_ctx` `:73`/`budget_ptr` `:81`/`depth_ptr` `:89`) |
+| `g_globals_for_codegen` process-wide pointer (defn) | `src/codegen.cpp:2631`; decl `src/codegen.hpp:124` |
+| Globals emit-time decision reads process-wide ptr | `src/codegen.cpp:1253`–`1254` (load), `:1695`–`1696` (store) |
+| Globals run-time address via `AbsFixup::GlobalsBase` | `src/codegen.cpp:1169`–`1196` (helpers), `:2875`–`2885` (reloc fill) |
+| Dispatch table is `std::atomic<void*>` release/acquire | `src/dispatch_table.hpp:14` |
 | Slot indices stable; cache index not pointer | `docs/HOT_RELOAD.md §1`, `§4`, `§7` |
-| `--tick` spawns a thread reusing one `ectx` (the live bug) | `examples/ember_cli.cpp:440`–`510`, esp. `:476`–`:481` |
-| CLI calls JIT'd entry via raw fn-ptr (no `ember_call`) | `examples/ember_cli.cpp:432` (raw `reinterpret_cast<F0>(entry)()`); `src/engine.hpp`/`engine.cpp` have no `ember_call` |
-| Trap stub `__builtin_longjmp`s the passed ctx | `examples/ember_cli.cpp:97`–`110` |
+| `--tick` spawns a thread reusing one `ectx` (the live bug; **remediated in v1.0**) | `examples/ember_cli.cpp:542`–`589`, esp. `:549`–`:571` — the tick thread now uses its OWN `tick_ctx` (`context_t tick_ctx;` at `:549`) via `ember_call_void`/`ember_call_i64`, isolated from the main thread's `ectx`; the pre-B1 shared-`ectx` bug this plan flagged is fixed |
+| CLI calls JIT'd entry (v1.0 via `ember_call_void`, not raw fn-ptr) | `examples/ember_cli.cpp:511` (`ember::ember_call_void(entry, &ectx)`); the pre-B1 raw `reinterpret_cast<F0>(entry)()` is gone — `src/engine.hpp:97`–`98` declares `ember_call_void`/`ember_call_i64` |
+| Trap stub `__builtin_longjmp`s the passed ctx | `examples/ember_cli.cpp:99`–`113` |
 | Spec: per-`context_t` parallelism allowed, in-context not | `docs/SAFETY_AND_SANDBOX.md §8` |
 | Hot reload: outer-call guards + concurrent epoch reclamation | `docs/HOT_RELOAD.md §5` |
 | ROADMAP: `aint*`/`thread` deferred; multi-context covers most | `docs/ROADMAP.md` Tier 5 (`:119`–`125`) |

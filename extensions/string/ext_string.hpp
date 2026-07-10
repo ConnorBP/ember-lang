@@ -31,4 +31,13 @@ void reset();
 // the host because it routes through the host print sink).
 const std::string* slot(int64_t handle);
 
+// Allocate a new string handle owning `s`, returning a 1-based opaque handle
+// (0 on allocation failure). Exposed so host-side natives that produce a
+// path/id value the script then passes back to another host native (e.g.
+// prism's write_temp_file_native -> delete_file_native) can mint an ember
+// `string` handle the consumer resolves via slot() - the same round-trip
+// print_string already relies on for reading. The handle is owned by this
+// extension's host store and freed on reset().
+int64_t alloc(std::string s);
+
 } // namespace ember::ext_string

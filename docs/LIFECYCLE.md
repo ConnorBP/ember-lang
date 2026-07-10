@@ -22,20 +22,22 @@ fn main() -> i64 {
 ```
 
 - `main` is **not** a magic name - the host opts in by querying
-  `ember_get_annotated_functions(module, "@entry", out)` and calling
-  the (single) result. This keeps the entry-point convention explicit
-  and avoids a reserved-name trap. If zero functions are annotated
-  `@entry`, the host simply doesn't auto-call anything (a module that
-  only registers handlers via other annotations doesn't need a
-  `main`).
+  `get_annotated_functions(prog, "@entry")` (declared in `src/lifecycle.hpp`;
+  the `@` is optional — `"entry"` works too) and calling the (single) result.
+  This keeps the entry-point convention explicit and avoids a reserved-name
+  trap. If zero functions are annotated `@entry`, the host simply doesn't
+  auto-call anything (a module that only registers handlers via other
+  annotations doesn't need a `main`).
 - Return value semantics match a typical native-JIT scripting language's lifecycle
   (`RESEARCH_NOTES.md`): `> 0` ⇒ module stays loaded; `<= 0` ⇒ module
-  unloaded (host calls `ember_module_destroy`, frees dispatch table +
-  globals + exec pages). The host decides what "unload" means for its
-  integration; ember just provides the return value.
+  unloaded (host-owned teardown: free the dispatch table + globals block +
+  executable pages). The host decides what "unload" means for its
+  integration; ember just provides the return value. There is no
+  `ember_module_destroy` facade — unload is host-owned teardown.
 - `main` runs **once**, at host discretion (typically right after
-  `ember_compile`), via an ordinary `ember_call`. No special "init
-  phase" in the JIT - `@entry` is pure metadata, the call is a normal
+  `ember_compile`), via an ordinary `ember_call_void(entry, ctx)` (or
+  `ember_call_i64(entry, ctx, arg)` when an argument is passed). No special
+  "init phase" in the JIT - `@entry` is pure metadata, the call is a normal
   dispatch-table call.
 
 ## 2. Routines (per-frame / per-event callbacks)
@@ -53,11 +55,12 @@ fn update_physics(state: slice<f32>) { ... }
 fn on_player_hit(info: HitInfo) { ... }
 ```
 
-- Host queries `ember_get_annotated_functions(module, "@on_tick", out)`
+- Host queries `get_annotated_functions(prog, "@on_tick")`
   once after compile, resolves each to a slot index
   (`HOT_RELOAD.md` Section 7 - caching the slot index is safe, indices never
-  change), and calls it per frame via `ember_call(context, name, args,
-  argc)`.
+  change), and calls it per frame via `ember_call_void(fn, ctx)` or
+  `ember_call_i64(fn, ctx, arg)` (declared in `src/engine.hpp`), passing the
+  routine's arguments through the dispatch table.
 - **Argument passing**: the host passes whatever the routine's
   signature declares - `update_physics` takes a `slice<f32>`, so the
   host passes `(ptr, len)` per `BINDING_API.md` Section 4. The host *knows*
@@ -88,7 +91,9 @@ fn on_player_hit(info: HitInfo) { ... }
 
 A module unloads when:
 - `@entry`'s `main` returns `<= 0` (Section 1), **or**
-- the host explicitly calls `ember_module_destroy(module)`.
+- the host explicitly triggers unload (host-owned teardown:
+  free dispatch table + globals block + executable pages; there is no
+  `ember_module_destroy` facade).
 
 On unload: retired code pages are freed (no in-flight calls should
 exist - the host's responsibility to not unload while a call is live,
@@ -107,7 +112,8 @@ picks up the new body. `@entry`/`main` is **not** re-run on reload
 would re-initialize state the user is iteratively tweaking, defeating
 the point of hot reload) - if the script author wants reload-time
 re-init, they annotate a separate `@on_reload` function, which the
-host opts to call after a successful `ember_reload_*`.
+host opts to call after a successful `reload_function` (see `HOT_RELOAD.md`
+for the `HotReloadDomain`-based migration recipe).
 
 ## 5. What this deliberately does NOT cover (cross-ref)
 
@@ -115,7 +121,7 @@ host opts to call after a successful `ember_reload_*`.
   looking-code primitive; per-frame routines + state in globals is
   the v1 state-machine pattern (adequate for most game tick logic).
 - Exceptions caught in-script (`ROADMAP.md` Tier 5) - a routine that
-  faults aborts the whole `ember_call` via the non-local unwind
+  faults aborts the whole `ember_call_void`/`ember_call_i64` invocation via the non-local unwind
   (`SAFETY_AND_SANDBOX.md` Section 2/Section 7); the host logs and the routine is
   simply not rescheduled if the host decides (the host controls the
   per-frame call loop, so "stop calling a faulting routine" is a

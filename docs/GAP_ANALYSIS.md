@@ -99,8 +99,11 @@ The `.em` bundling format shipped in v0.1 (`em_file`/`em_writer`/`em_loader`,
 `CODEGEN_SPEC.md` Section 15 test 7). v0.5 then shipped live cross-module
 `link "foo.em" as foo;` plus `foo::bar()` through `ModuleRegistry`; textual
 `import` remains source inclusion. v1 `.em` native code is ABI/process trusted
-and exports carry unknown signatures, so portability and signature metadata
-remain H12/H14 format redesigns rather than claimed module guarantees.
+and exports carry `unknown_sig` (no canonical signatures, no build/ABI identity —
+the v1 compatibility contract). v2 `.em` ships canonical `Type` signatures plus
+build/ABI identity, and sema/loader verify arity, ordered parameter types, and
+return type at link before page publication; portability and signatures are now
+shipped v2 guarantees (`MODULES.md` Section 5), not H12/H14 redesigns.
 
 ## 4. Honest performance caveat ("MUCH faster than AngelScript")
 

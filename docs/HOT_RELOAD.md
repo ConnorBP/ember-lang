@@ -4,6 +4,60 @@ ember ships atomic single-function replacement plus a host-visible epoch
 reclamation domain. Added/removed functions and whole-module transactions
 remain deferred.
 
+## 0. Migration from the pre-v1.0 single-threaded reload API (breaking bump)
+
+The reload source API changed in v1.0. The old helper took seven arguments
+and **returned a caller-owned `old_entry` pointer** that the host was expected
+to free after no caller could still be executing the old page. That model is
+gone: the new `reload_function` (Section 3) takes a `HotReloadDomain&` as its
+fourth argument and `ReloadResult` no longer carries `old_entry`. The domain,
+not the caller, owns the replaced executable page from the moment
+`publish` succeeds, and frees it only after a guarded quiescent point.
+
+A hidden temporary domain inside the helper would be unsafe: it would
+conflate the domain's lifetime with the call and could not survive a caller
+that holds a guard across the reload. The domain must be a long-lived object
+the host stores beside the table.
+
+A host using the old signature no longer compiles. The migration recipe:
+
+1. **Hold a persistent `HotReloadDomain` beside the `DispatchTable`** for the
+   table's entire lifetime. Do not create a fresh domain per reload; a domain
+   destroyed immediately after `publish` cannot track retirement or guarantee
+   quiescence.
+2. **Guard before every outer slot load/call.** Every host-to-script
+   invocation through the reloadable table must construct a `domain.guard()`
+   *before* loading the slot and keep it across the call return:
+   ```cpp
+   auto guard = domain.guard();
+   void* entry = table.get(slot);
+   return reinterpret_cast<Fn>(entry)(args...);
+   ```
+   One outer guard covers all nested script-to-script and recursive calls.
+3. **Stop freeing/reading `old_entry` — it no longer exists.** `ReloadResult`
+   reports `publication_epoch`, `retirement_epoch`, and `old_page_retired`,
+   but carries no owning pointer to the replaced page. The domain owns it.
+4. **Disown the old `CompiledFn`.** Remove/clear the replaced `CompiledFn` from
+   your own bookkeeping (set `exec = nullptr`, `entry = nullptr` or erase it
+   from the vector) so your destructor does not double-free it. The domain
+   frees the executable page after reclamation; your destructor frees only the
+   pages that are still *current*.
+5. **Periodically call `domain.reclaim()` or `domain.quiesce()`** to actually
+   free retired pages. `reclaim()` is nonblocking and frees currently-eligible
+   pages; `quiesce()` blocks until pages retired through the entry-observed
+   epoch are eligible, then frees them. An uncomplicated single-threaded host
+   can call `quiesce()` after each reload.
+6. **At shutdown: drain all guards, then `domain.quiesce()`, then free current
+   pages / table / domain.** The domain must outlive all of its guards. Its
+   destructor performs a final `quiesce()`, but explicit draining first makes
+   the shutdown ordering unambiguous. After quiesce, free the pages still
+   published in the table (the domain does not own current pages), then let
+   the domain and table destruct.
+
+No deprecated single-threaded compatibility abstraction ships: a temporary
+hidden domain is unsafe per the audit, and the domain-based API is the
+supported path for both single-threaded and concurrent hosts.
+
 ## 1. Dispatch table layout and slot stability
 
 ```cpp
@@ -19,6 +73,12 @@ struct DispatchTable {
 - `DispatchTable::set` is a `std::memory_order_release` store and `get` is a
   `std::memory_order_acquire` load. Finalized RX code and its bytes therefore
   happen-before a caller that acquires the published entry.
+- `DispatchTable::set` rejects a null function with `std::invalid_argument`. A
+  null entry would be dereferenced by the generated `call [base + slot*8]` and
+  fault with `0xC0000005` outside Ember's trap model; rejecting it at
+  publication time makes a null entry a recoverable host error (catchable via
+  try/catch) rather than a process fault. `HotReloadDomain::publish` already
+  rejects null before reaching `set`; this guards direct host writes.
 - A host may cache a function name or stable slot index. An unguarded cached raw
   entry pointer is unsupported because reclamation can invalidate it.
 
@@ -47,7 +107,16 @@ ReloadResult reload_function(source, program, table, domain, codegen_ctx,
 4. `HotReloadDomain::publish` records the replaced page for retirement, release-
    stores the new entry into the slot, and advances the domain's monotonic epoch
    exactly once. Recording retirement is prepared before publication, so an
-   allocation failure cannot publish an untracked replacement.
+   allocation failure cannot publish an untracked replacement. **Executable-page
+   ownership is uniquely bound to one `(domain, table, slot)`:** before retiring
+   the replaced page, `publish` scans the other slots of the same table, and if
+   any still holds the old page it is **not** retired (the page stays current via
+   that other slot and is retired only when its last publishing slot is
+   replaced). This prevents a duplicate current-page alias from being reclaimed
+   while still published. A host that publishes the same allocation to more than
+   one slot through direct `DispatchTable::set` writes must observe the same
+   contract: the domain's reclamation is sound only while each executable page is
+   current in at most one slot of the table it was published through.
 5. `ReloadResult` reports `publication_epoch`, `retirement_epoch`, and
    `old_page_retired`, and carries the current `new_fn`. It intentionally does
    **not** return an owning old-page pointer: the old executable allocation has

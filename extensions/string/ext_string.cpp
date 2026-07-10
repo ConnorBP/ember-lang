@@ -104,6 +104,10 @@ const std::string* slot(int64_t handle) {
     return str_slot(handle);
 }
 
+int64_t alloc(std::string s) {
+    return str_new(std::move(s));
+}
+
 // Registered surface is byte-identical to the old I/H/add lambda form
 // (ext_registration_test asserts string_new -> struct "string" 0 params;
 //  string_from_slice -> struct "string" 1 param; string_length -> i64;

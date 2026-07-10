@@ -313,13 +313,15 @@ in code from elsewhere") and almost nothing else.
 | New runtime state | none  -  merged `Program` flows through existing pipeline (`BUNDLING_AND_EM_MODULES.md` Section 1.2) | module registry (`Section 2`), cross-module call IR (`Section 3`), linker stage (`Section 5`) |
 | New IR op | none  -  ordinary `CallScript` through the shared table | `CallScriptExternal` carrying `(module_id, slot_index)` |
 | New encoder reloc | none | `AbsFixup::ModuleRegistryBase` (`Section 3`) |
-| Signature verification | none — same module, sema checked it | JIT exports: yes; v1 `.em`: no metadata, ABI-trusted `unknown_sig` (`Section 5`) |
-| Status | shipped source merge | shipped v0.5; v1 `.em` signatures remain ABI-trusted |
+| Signature verification | none — same module, sema checked it | JIT exports + v2 `.em`: canonical `Type` signatures, sema/loader verify (arity, ordered params, return); v1 `.em`: no metadata, ABI-trusted `unknown_sig` (`Section 5`) |
+| Status | shipped source merge | shipped v0.5 (JIT sigs) + v2 `.em` (canonical sigs + build/ABI identity); v1 `.em` remains ABI-trusted `unknown_sig` |
 
 Textual `import` is a parse-time merge with no new runtime machinery. Live
-`link` is the shipped registry/kind-2-relocation path. The remaining gap is
-metadata: v1 `.em` exports do not carry canonical signatures, so link-time type
-verification applies only to JIT exports.
+`link` is the shipped registry/kind-2-relocation path. v2 `.em` exports carry
+canonical `Type` signatures plus build/ABI identity and are verified at link
+(see `Section 5`); the metadata gap is now closed for v2. Only v1 `.em` exports
+remain `unknown_sig` (ABI-trusted, no canonical signatures) — the v1
+compatibility contract, not a live gap.
 
 ---
 
@@ -371,11 +373,13 @@ verification applies only to JIT exports.
   (`HOT_RELOAD.md` Section 2). This is the "slot indices are never
   recycled in v1" stance lifted one level up: module ids are never
   recycled either.
-- **No version negotiation.** JIT exports can be signature-checked. v1 `.em`
-  exports are `unknown_sig` and therefore ABI-trusted; the linker cannot
-  verify them. The format has no semver/build identity or canonical signature
-  records. A future version must add those records before claiming portable,
-  verified `.em` linking.
+- **Version negotiation.** v2 `.em` carries build/ABI identity (`EM_BUILD_ID`
+  / `EM_TARGET_ABI_HASH`, `em_file.hpp`) and canonical `Type` signature records;
+  the loader rejects identity mismatch before page publication and sema verifies
+  the signatures. v1 `.em` exports are `unknown_sig` and ABI-trusted (no metadata,
+  no identity check) — the v1 compatibility contract, retained for backward
+  compat. Portable, verified `.em` linking is therefore a shipped v2 guarantee,
+  not a future redesign.
 
 ---
 

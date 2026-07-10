@@ -26,6 +26,19 @@ fn main() -> i64 {
     let unfolded: i64 = negative << count;
     if (!(negative < 0) || (0xFFFFFFFFFFFFFFFD << 62) != 4611686018427387904 || unfolded != (0xFFFFFFFFFFFFFFFD << 62)) { return 9; }
 
+    // L-§10-3: lock the arithmetic (sign-filling) right-shift behavior of the
+    // fold after the portability rewrite (unsigned shift + explicit sign fill,
+    // no implementation-defined signed>>). 0xFFFFFFFFFFFFFFF8 is the i64 bit
+    // pattern for -8 and takes codegen's FOLDED path (both operands are IntLit);
+    // `neg8` forces the unfolded x64 `sar` path. Both must yield -4. Pre-rewrite
+    // this was implementation-defined (but x64-correct); post-rewrite it is
+    // defined behavior that still matches x64 sar, so this assertion is a
+    // behavior lock, not a new-behavior test.
+    let neg8: i64 = 0xFFFFFFFFFFFFFFF8;
+    let rshift_folded: i64 = 0xFFFFFFFFFFFFFFF8 >> 1;
+    let rshift_runtime: i64 = neg8 >> 1;
+    if (rshift_folded != -4 || rshift_runtime != -4 || rshift_folded != rshift_runtime) { return 11; }
+
     // This constant array index also exercises sema's recursive evaluator.
     let a: i64[1];
     a[(-1 << 1) + 2] = 17;

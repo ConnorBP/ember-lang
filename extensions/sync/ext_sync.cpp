@@ -175,7 +175,12 @@ extern "C" {
     // returning i64 even for a u8). Plan S2.2.
     static int64_t n_atomic_cas(int64_t h, int64_t expected, int64_t desired) {
         auto s = atom_slot(h); if (!s) return 0;
-        uint64_t expected_bits = uint64_t(expected);
+        // M-§10-2: mask expected to the declared width, exactly like desired.
+        // Every other narrow op canonicalizes its operands; CAS alone leaving
+        // expected raw meant a should-match CAS (expected sign-extended beyond
+        // width) failed against a canonical stored value (false negative), and
+        // an expected with stray high bits could spuriously match.
+        uint64_t expected_bits = atom_mask(expected, s->width);
         uint64_t desired_bits = atom_mask(desired, s->width);
         // compare_exchange_strong modifies `expected_bits` on failure to the
         // current value -- that's a host-local var, not a script-visible
@@ -213,7 +218,8 @@ bool atomic_store_host(int64_t handle, int64_t val) {
 }
 bool atomic_cas_host(int64_t handle, int64_t expected, int64_t desired, bool* out_swapped) {
     auto s = atom_slot(handle); if (!s) return false;
-    uint64_t expected_bits = uint64_t(expected);
+    // M-§10-2: mask expected to the declared width (same as the native path).
+    uint64_t expected_bits = atom_mask(expected, s->width);
     uint64_t desired_bits = atom_mask(desired, s->width);
     *out_swapped = s->v.compare_exchange_strong(expected_bits, desired_bits,
                     std::memory_order_acq_rel, std::memory_order_acquire);

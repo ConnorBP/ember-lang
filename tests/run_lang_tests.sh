@@ -130,5 +130,17 @@ for f in tests/lang/import_nested.ember tests/lang/import_diamond.ember \
     esac
 done
 
+# Doc-consistency regression: the shipped defer implementation is
+# lexical-block-exit LIFO (CODEGEN_SPEC.md Section 13). Catch a future
+# reintroduction of the stale "function-exit" + defer framing in non-audit
+# docs (audit .md files legitimately quote the stale text when reporting it).
+if grep -rn 'function-exit' docs/ --exclude='AUDIT_*' | grep -i defer; then
+    printf "FAIL  docs still say defer is function-exit LIFO (should be lexical-block-exit)\n"
+    fail=$((fail+1))
+else
+    printf "PASS  docs defer semantic is lexical-block-exit (no stale function-exit framing)\n"
+    pass=$((pass+1))
+fi
+
 printf "\n%d passed, %d failed, %d skipped\n" "$pass" "$fail" "$skip"
 [ $fail -eq 0 ]

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <vector>
 #include <atomic>
+#include <stdexcept>
 
 namespace ember {
 
@@ -18,6 +19,14 @@ struct DispatchTable {
     }
 
     void set(size_t slot, void* fn) {
+        // A null dispatch entry would be dereferenced by the generated
+        // `call [base + slot*8]` and fault with 0xC0000005 outside Ember's
+        // trap model. Reject it at publication time as a host-API misuse so
+        // the error is a recoverable C++ exception (catchable by the host)
+        // rather than a process fault. HotReloadDomain::publish already
+        // rejects null before reaching here; this guards direct host writes.
+        if (!fn)
+            throw std::invalid_argument("DispatchTable::set: null function");
         slots[slot].store(fn, std::memory_order_release);
     }
 

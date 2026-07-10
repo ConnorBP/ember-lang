@@ -59,9 +59,20 @@ is not recoverable.
   entry, after the frame, hidden return pointer, and parameters are safely
   established and before annotations/body execution. Existing
   body-cost charges on taken loop back-edges (`while`, `for`, and
-  `do-while`) remain, so repeated work continues to consume budget. This is
-  a coarse static statement-cost model, not a cycle or exact instruction
-  count; native function bodies are trusted and are not assigned a cost.
+  `do-while`) remain, so repeated work continues to consume budget. The
+  estimator is **reach-aware**: it counts not only AST statements but the
+  emitted work they reach - expression node count (`expr_cost` recurses
+  BinExpr/UnaryExpr/CallExpr/CastExpr/Ident/literal operands), native-call
+  setup (+2 per call site) plus one per marshalled argument, aggregate
+  by-value byte copies (a struct/array copy of N bytes charges ~N/8,
+  floored at 1; a slice copy charges 2), switch compare chains
+  (`sw->cases.size()`), and `for` init/step expressions. Trusted native
+  BODY execution time is intentionally OUTSIDE the unit (a single `nap()`
+  returning under budget is intended, not a counter-example): only the JIT
+  call-site setup and in-script lowering are charged. This is a coarse
+  static cost model, not a cycle or exact instruction count. The charge
+  saturates at `INT32_MAX` via `cost_add`; a large legal function can never
+  truncate into a negative or small `imm32` charge.
   ```
   sub  [budget_ptr], coarse_cost_imm32
   jg   .continue            ; budget_remaining > 0, keep going
@@ -71,6 +82,12 @@ is not recoverable.
   The recursive estimator and encoding saturate at `INT32_MAX`; a large
   legal function can never truncate into a negative or small `imm32` charge.
   In B1 mode the counter is addressed through the per-call `r14` context.
+  The `while` back-edge charge runs on a **dedicated charged latch** label
+  that is also the `continue` target (mirroring `for`'s step label and
+  `do-while`'s cond label), so a `while (true) { ...; continue; }` loop
+  charges every iteration rather than jumping straight to the condition and
+  bypassing the charge. `for`- and `do-while`-`continue` already charged
+  correctly through their own latch labels.
 - **Exhaustion behavior**: traps via the shared budget-trap stub,
   same non-local unwind as bounds/div-by-zero (Section 2). The host's
   checkpoint wrapper resumes and observes "budget exceeded" through
@@ -114,9 +131,18 @@ is not recoverable.
   script calls another native, those active edges compose into one combined
   stack depth. Sequential calls that return are therefore never mistaken for
   nesting or accumulated as a lifetime call count.
+  In **B1 mode** (`use_context_reg = true`) the max is loaded **per-context**
+  from `[r14 + context_offsets::max_depth()]` at each check, so two contexts
+  sharing one compiled body observe different runtime depth limits. The
+  emitted sequence is `inc dword [r14+off_depth]`; `mov eax, [r14+off_max_depth]`;
+  `cmp [r14+off_depth], eax`; `jge .trap`. The compile-time
+  `CodeGenCtx::max_call_depth` is retained **only** for the legacy baked
+  (non-context-reg) branch, where `max` is an `imm32` baked at compile time.
   ```
   inc  [call_depth_ptr]
-  cmp  [call_depth_ptr], max_call_depth_imm
+  ; B1:  mov eax, [r14+off_max_depth]  ; load per-context max
+  ;       cmp  [r14+off_depth], eax
+  ; baked: cmp  [call_depth_ptr], max_call_depth_imm
   jge  .depth_trap          ; does not return
   call ...
   dec  [call_depth_ptr]

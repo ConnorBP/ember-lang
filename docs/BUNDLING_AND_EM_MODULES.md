@@ -133,13 +133,19 @@ The shipped `reload_function` helper takes one complete replacement function
 and recompiles it by name. With textual inclusion, the function belongs to the
 merged `Program`, but reload remains per-function:
 
-- **Single-function reload** (`reload_function`): unchanged.
-  The host hands the new body of *one* function; includes don't
-  participate (a function's body doesn't contain includes - includes
-  are top-level only, Section 1.2). The host is responsible for re-resolving
-  includes itself if the reloaded function now calls a symbol that
-  came from an included file - but that symbol is already in the
-  module's slot table from the initial compile, so the reload just
+- **Single-function reload** (`reload_function`): **changed in v1.0**
+  (breaking source-API bump). The helper now takes a `HotReloadDomain&` as its
+  fourth argument and `ReloadResult` no longer returns a caller-owned
+  `old_entry` pointer; the domain owns the replaced page from publication and
+  frees it after a guarded quiescent point. See `docs/HOT_RELOAD.md` Section 0
+  for the migration recipe (persistent domain beside the table; guard before
+  every outer call; disown the old `CompiledFn`; `reclaim()`/`quiesce()`; drain
+  guards then quiesce before freeing current pages). The host still hands the
+  new body of *one* function; includes don't participate (a function's body
+  doesn't contain includes - includes are top-level only, Section 1.2). The host
+  is responsible for re-resolving includes itself if the reloaded function now
+  calls a symbol that came from an included file - but that symbol is already in
+  the module's slot table from the initial compile, so the reload just
   resolves the call against the existing slots. **No include
   machinery runs on reload.**
 - **Whole-module reload:** deferred. A future implementation would need to

@@ -135,7 +135,8 @@ Non-goals for v1:
   stack-exhaustion fix), int32 struct-sizing overflow rejection (V6-overflow).
   Second: the non-local abort primitive + quantity budgets from
   `SAFETY_AND_SANDBOX.md` §2-§4 — `context_t` (setjmp/`__builtin_longjmp`
-  checkpoint), instruction budget (sub+jg at loop back-edges only),
+  checkpoint), instruction budget (sub+jg charged at function entry AND loop
+  back-edges),
   stack-depth guard (inc/cmp/jcc at script-to-script calls), PERM_FFI
   sema gating, and trap-surface unification (all traps route through a
   host trap-stub → longjmp, fixing red-team V7 `@obf_keyed` forced

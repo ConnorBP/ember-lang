@@ -381,13 +381,12 @@ COMPILER_PIPELINE.md Section 2)
   body - eliminates the entire C-fallthrough footgun class at the
   grammar level, GAP_ANALYSIS.md Section 5). `default` optional. Lowering
   and jump-table vs cascade decision in CODEGEN_SPEC.md Section 12.
-- `defer expr;` - the shipped v1 implementation is **function-exit LIFO**.
-  Deferred expressions run in reverse registration order on ordinary function
-  return/fallthrough. They do not run at nested lexical block exits,
-  `break`/`continue`, or trap unwind; a defer in a loop is registered at most
-  once by the current lowering. To keep frame references valid, sema permits
-  deferred expressions to reference only parameters and globals. Lexical
-  cleanup edges remain deferred rather than being implied by this syntax.
+- `defer expr;` - the shipped v1 implementation is **lexical-block-exit LIFO**;
+  deferred expressions run in reverse declaration/reach order on block
+  fallthrough, `break`, `continue`, `return`, and ordinary function return.
+  A defer inside a loop body runs on every reached iteration (reset-on-entry);
+  trap/`longjmp` bypass is unchanged (no exception unwinding through JIT
+  frames). See `CODEGEN_SPEC.md` Section 13 for the full emission contract.
 
 ### 11.7 String interpolation `f"...{expr}..."`
 

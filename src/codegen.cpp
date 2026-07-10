@@ -15,6 +15,16 @@
 
 namespace ember {
 
+// Bit-preserving uint64_t -> int64_t conversion (L-§10-3 portability):
+// `int64_t(uint64_t(x))` for an out-of-range x is implementation-defined per
+// [conv.integral]. memcpy reinterprets the bit pattern with defined behavior
+// and is identical on every two's-complement target (x64/MinGW included).
+static int64_t bit_cast_i64(uint64_t u) {
+    int64_t i;
+    std::memcpy(&i, &u, sizeof(i));
+    return i;
+}
+
 // Read CPUID.1:EAX (the CPU signature the obfuscation pass keys on).
 int64_t current_cpuid_signature() {
 #if defined(_MSC_VER)
@@ -329,10 +339,16 @@ struct CG {
         e.bind(cont);
     }
 
-    // Coarse recursive function/block cost: count statements (each ~a few
-    // emitted instructions). Floors at 1 and saturates at positive imm32 max.
+    // Reach-aware recursive function/block cost: counts statements PLUS the
+    // emitted work they reach (expression nodes, native-call setup + arg
+    // marshalling, aggregate byte copies, switch compares, for init/step).
+    // Trusted native body execution time is intentionally OUTSIDE the unit
+    // (a single nap() under budget is intended, not a counter-example) - only
+    // the JIT call-site setup is charged. Floors at 1 and saturates at the
+    // positive imm32 consumed by emit_budget_check (never wrap negative).
     int64_t block_cost(const Block& b);
     int64_t stmt_cost(const Stmt& s);
+    int64_t expr_cost(const Expr& e);
 
     // v0.4/M4 combined call-depth guard (SAFETY_AND_SANDBOX.md §4). Emitted
     // for every script-issued script or native call. Native re-entry therefore
@@ -351,11 +367,20 @@ struct CG {
         if (!ctx.use_context_reg && non_serializable_reason.empty())
             non_serializable_reason = "call-depth storage is process-local";
         if (ctx.use_context_reg) {
-            // B1: inc dword [r14+off_depth]; cmp dword [r14+off_depth], max.
+            // B1: inc dword [r14+off_depth]; then compare call_depth to the
+            // PER-CONTEXT max_call_depth loaded from [r14+off_max_depth] (NOT
+            // the compile-time ctx.max_call_depth baked as imm32). This lets two
+            // contexts share one compiled body and observe different runtime
+            // depth limits. Compile-time ctx.max_call_depth is retained only for
+            // the legacy baked branch below.
             // inc r/m = FF /0 (modrm.reg=0). rm=r14(low3=6, REX.B). modrm(10,000,110)=0x86.
             e.byte(0x41); e.byte(0xFF); e.byte(0x86); e.imm32(context_offsets::depth());
-            // cmp r/m,imm32 = 81 /7 (modrm.reg=7). modrm(10,111,110)=0xBE.
-            e.byte(0x41); e.byte(0x81); e.byte(0xBE); e.imm32(context_offsets::depth()); e.imm32(int32_t(ctx.max_call_depth));
+            // mov eax, dword [r14+off_max_depth]: 8B /r(eax=0), rm=r14(REX.B).
+            // modrm(10,000,110)=0x86.
+            e.byte(0x41); e.byte(0x8B); e.byte(0x86); e.imm32(context_offsets::max_depth());
+            // cmp dword [r14+off_depth], eax: 39 /r(eax=0), rm=r14(REX.B).
+            // modrm(10,000,110)=0x86.
+            e.byte(0x41); e.byte(0x39); e.byte(0x86); e.imm32(context_offsets::depth());
         } else {
             e.mov_reg_imm64(Reg::rax, int64_t(ctx.depth_ptr));
             e.byte(0xFF); e.byte(0x00);                  // inc dword ptr [rax]
@@ -1268,6 +1293,12 @@ void CG::eval(const Expr& ex) {
             return;
         }
         const Type* lt = b->lhs->ty;
+        // is_cmp is computed before the fold so the fold early return can use
+        // it (H-§10-1): a folded integer result is normalized to the target
+        // width exactly as the runtime path is at the end of this function,
+        // so a folded i32 reaches the ABI boundary sign-normalized instead of
+        // zero-extended. The fold only reads li->v/ri->v/b->op, never is_cmp.
+        bool is_cmp = (b->op>=BinExpr::Op::Eq && b->op<=BinExpr::Op::Ge);
         // constant folding (7.1): both operands are literals - compute at
         // compile time instead of emitting a runtime sequence. Deliberately
         // narrow: Div/Mod on integer literals are excluded (a literal-zero
@@ -1280,35 +1311,55 @@ void CG::eval(const Expr& ex) {
             if (auto* ri = dynamic_cast<const IntLit*>(b->rhs.get())) {
                 bool folded = true;
                 int64_t result = 0;
-                // Add/Sub/Mul go through uint64_t first: script-level integer
-                // overflow is expected to wrap (edge_cases2.ember already
-                // exercises this at the runtime-add level, where it's just a
-                // hardware `add` - no UB), but `int64_t + int64_t` overflow
-                // is undefined in the C++ that's doing the folding here.
-                // Unsigned overflow is well-defined (wraps mod 2^64), and
-                // produces the identical bit pattern - so casting through
-                // uint64_t keeps the fold's result identical to the runtime
-                // path's while removing the UB from the *host* computation.
+                // Add/Sub/Mul/Shl go through uint64_t first then bit_cast_i64
+                // (L-§10-3): script-level integer overflow is expected to wrap
+                // (edge_cases2.ember already exercises this at the runtime-add
+                // level, where it's just a hardware `add` - no UB), but
+                // `int64_t + int64_t` overflow is undefined in the C++ that's
+                // doing the folding here. Unsigned overflow is well-defined
+                // (wraps mod 2^64) and produces the identical bit pattern, so
+                // computing in uint64_t and bit-casting (NOT an
+                // implementation-defined `int64_t(uint64_t(...))` conversion)
+                // keeps the fold's result identical to the runtime path's
+                // while removing both the UB and the portability hazard from
+                // the *host* computation.
                 switch (b->op) {
-                case BinExpr::Op::Add: result = int64_t(uint64_t(li->v) + uint64_t(ri->v)); break;
-                case BinExpr::Op::Sub: result = int64_t(uint64_t(li->v) - uint64_t(ri->v)); break;
-                case BinExpr::Op::Mul: result = int64_t(uint64_t(li->v) * uint64_t(ri->v)); break;
+                case BinExpr::Op::Add: result = bit_cast_i64(uint64_t(li->v) + uint64_t(ri->v)); break;
+                case BinExpr::Op::Sub: result = bit_cast_i64(uint64_t(li->v) - uint64_t(ri->v)); break;
+                case BinExpr::Op::Mul: result = bit_cast_i64(uint64_t(li->v) * uint64_t(ri->v)); break;
                 case BinExpr::Op::And: result = li->v & ri->v; break;
                 case BinExpr::Op::Or:  result = li->v | ri->v; break;
                 case BinExpr::Op::Xor: result = li->v ^ ri->v; break;
                 // x86 shl/sar mask the shift count to 0-63 for a 64-bit
                 // operand; replicate that so folded and unfolded code agree.
-                case BinExpr::Op::Shl: result = int64_t(uint64_t(li->v) << (ri->v & 63)); break;
-                case BinExpr::Op::Shr: result = li->v >> (ri->v & 63); break;
+                // Shl is the unsigned left shift (no sign behavior) bit_cast
+                // back; Shr is an arithmetic right shift implemented as an
+                // unsigned shift plus an explicit sign fill (L-§10-3): a
+                // signed `int64_t >> count` of a negative value is
+                // implementation-defined per [expr.shift], so we compute it
+                // from the unsigned bit pattern and OR in the sign bits
+                // ourselves, which is defined behavior and matches x64 sar.
+                case BinExpr::Op::Shl: result = bit_cast_i64(uint64_t(li->v) << (ri->v & 63)); break;
+                case BinExpr::Op::Shr: {
+                    int sh = int(ri->v & 63);
+                    uint64_t ur = uint64_t(li->v) >> sh;
+                    if (sh != 0 && li->v < 0) ur |= ~((1ULL << (64 - sh)) - 1);
+                    result = bit_cast_i64(ur);
+                    break;
+                }
                 default: folded = false; break;
                 }
-                if (folded) { e.mov_reg_imm64(Reg::rax, result); return; }
+                // H-§10-1: normalize the folded immediate to the target width
+                // BEFORE returning, exactly as the runtime integer path does
+                // at the end of this function. Without this a folded i32
+                // (e.g. an enum i32 value shifted into the sign bit) reaches the
+                // ABI boundary zero-extended instead of sign-normalized.
+                if (folded) { e.mov_reg_imm64(Reg::rax, result); if (!is_cmp) normalize_rax(lt); return; }
             }
         }
         // Float expressions deliberately use the normal typed SSE path below;
         // avoiding a second constant implementation keeps f32/f64 width exact.
         bool is_logical = (b->op==BinExpr::Op::LAnd||b->op==BinExpr::Op::LOr);
-        bool is_cmp = (b->op>=BinExpr::Op::Eq && b->op<=BinExpr::Op::Ge);
         bool is_float = lt && lt->is_float();
 
         if (is_logical) {
@@ -2297,7 +2348,12 @@ void CG::exec_stmt(const Stmt& s) {
         return;
     }
     if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) {
-        Label top = e.alloc_label(), end = e.alloc_label();
+        // H-M4-1: a dedicated charged `latch` label is the `continue` target
+        // (NOT `top`), so the back-edge budget charge runs before the
+        // condition is re-evaluated - mirroring the for/do-while latches.
+        // Pre-fix `continue` jumped to `top` and skipped the charge, so a
+        // `while(true){...;continue;}` loop completed under any budget.
+        Label top = e.alloc_label(), latch = e.alloc_label(), end = e.alloc_label();
         e.bind(top);
         eval(*ws->cond);
         e.cmp_reg_imm32(Reg::rax, 0);
@@ -2323,10 +2379,11 @@ void CG::exec_stmt(const Stmt& s) {
                 set_pin_here = true;
             }
         }
-        loops.push_back({top, end, false, cleanup_scopes.size()});
+        loops.push_back({latch, end, false, cleanup_scopes.size()});
         exec_block(ws->body);
         loops.pop_back();
         if (set_pin_here) active_pin.reset();
+        e.bind(latch);
         emit_budget_check(block_cost(ws->body), "budget exceeded at loop back-edge");
         e.jmp(top);
         e.bind(end);
@@ -2451,29 +2508,122 @@ void CG::exec_stmt(const Stmt& s) {
 }
 
 // v0.4/M4 instruction-budget cost estimator (SAFETY_AND_SANDBOX.md §3).
-// Coarse statement count of a block/stmt — the spec's "how much work happened"
-// proxy. It now feeds function-entry charges as well as loop back-edges.
-// Saturating arithmetic keeps arbitrarily large legal ASTs encodable as the
-// positive imm32 consumed by emit_budget_check (never truncate/wrap negative).
+// Reach-aware recursive cost: counts statements PLUS the emitted work they
+// reach - expression nodes (each lowered operand emits real instructions),
+// native-call setup + arg marshalling, aggregate byte copies, switch compare
+// chains, and for init/step. Trusted native BODY execution time is explicitly
+// OUTSIDE the unit (a single nap() returning under budget is intended, not a
+// counter-example): only the JIT call-site setup is charged. Saturating
+// arithmetic keeps arbitrarily large legal ASTs encodable as the positive
+// imm32 consumed by emit_budget_check (never truncate/wrap negative).
 static int64_t cost_add(int64_t a, int64_t b) {
     const int64_t cap = std::numeric_limits<int32_t>::max();
     return a >= cap - b ? cap : a + b;
+}
+// Charge for a struct/array copy of N bytes: proportional to N (one emitted
+// load/store chunk per 8 bytes), floored at 1 so a 1-byte copy still charges.
+// Slices are always a 2-word {ptr,len} copy regardless of element count.
+static int64_t aggregate_copy_cost(const Type* t, const StructLayoutTable* structs) {
+    if (!t) return 1;
+    if (t->is_slice) return 2;
+    int32_t bytes = CG::value_bytes(t, structs);
+    int64_t n = (int64_t(bytes) + 7) / 8;
+    return n < 1 ? 1 : n;
 }
 int64_t CG::block_cost(const Block& b) {
     int64_t n = 0;
     for (auto& s : b.stmts) n = cost_add(n, cost_add(1, stmt_cost(*s)));
     return n < 1 ? 1 : n;  // floor at 1: empty functions/loops still charge
 }
+// Count AST expression nodes plus native-call setup + arg marshalling. Each
+// node ~one lowered instruction; each CallExpr site adds setup+call (+2) plus
+// one per marshalled arg; aggregate by-value args add their byte-copy cost.
+int64_t CG::expr_cost(const Expr& ex) {
+    if (auto* li = dynamic_cast<const IntLit*>(&ex))    { (void)li; return 1; }
+    if (dynamic_cast<const FloatLit*>(&ex))             return 1;
+    if (dynamic_cast<const BoolLit*>(&ex))              return 1;
+    if (dynamic_cast<const StringLit*>(&ex))           return 1;
+    if (dynamic_cast<const Ident*>(&ex))               return 1;
+    if (dynamic_cast<const FnHandleExpr*>(&ex))         return 1;
+    if (dynamic_cast<const SizeofExpr*>(&ex))          return 1;
+    if (dynamic_cast<const OffsetofExpr*>(&ex))        return 1;
+    if (dynamic_cast<const EnumAccessExpr*>(&ex))      return 1;
+    if (auto* b = dynamic_cast<const BinExpr*>(&ex)) {
+        int64_t n = 1;  // the binop itself
+        n = cost_add(n, expr_cost(*b->lhs));
+        n = cost_add(n, expr_cost(*b->rhs));
+        if (b->is_overload) n = cost_add(n, 2);  // overload dispatch = native call site
+        return n;
+    }
+    if (auto* u = dynamic_cast<const UnaryExpr*>(&ex))
+        return cost_add(1, expr_cost(*u->operand));
+    if (auto* c = dynamic_cast<const CastExpr*>(&ex))
+        return cost_add(1, expr_cost(*c->operand));
+    if (auto* t = dynamic_cast<const TernaryExpr*>(&ex))
+        return cost_add(cost_add(cost_add(1, expr_cost(*t->cond)), expr_cost(*t->then_e)), expr_cost(*t->else_e));
+    if (auto* a = dynamic_cast<const AssignExpr*>(&ex)) {
+        int64_t n = cost_add(1, expr_cost(*a->value));
+        if (a->target) n = cost_add(n, expr_cost(*a->target));
+        return n;
+    }
+    if (auto* ix = dynamic_cast<const IndexExpr*>(&ex))
+        return cost_add(cost_add(1, expr_cost(*ix->base)), expr_cost(*ix->index));
+    if (auto* fx = dynamic_cast<const FieldExpr*>(&ex))
+        return cost_add(1, expr_cost(*fx->base));
+    if (auto* v = dynamic_cast<const ViewExpr*>(&ex))
+        return cost_add(1, expr_cost(*v->base));
+    if (auto* sl = dynamic_cast<const StructLit*>(&ex)) {
+        int64_t n = 1;
+        for (auto& kv : sl->fields) n = cost_add(n, expr_cost(*kv.second));
+        return n;
+    }
+    if (auto* c = dynamic_cast<const CallExpr*>(&ex)) {
+        // Call-site setup + the call itself (+2), plus one per marshalled arg,
+        // plus aggregate byte-copy cost for any by-value struct/array arg.
+        int64_t n = 2;
+        if (c->receiver) n = cost_add(n, expr_cost(*c->receiver));
+        for (auto& a : c->args) {
+            n = cost_add(n, expr_cost(*a));
+            n = cost_add(n, 1);  // arg marshalling
+            if (a) n = cost_add(n, aggregate_copy_cost(a->ty, ctx.structs));
+        }
+        if (c->indirect_target) n = cost_add(n, expr_cost(*c->indirect_target));
+        return n;
+    }
+    return 1;  // unknown leaf expression
+}
 int64_t CG::stmt_cost(const Stmt& s) {
     if (auto* bs = dynamic_cast<const BlockStmt*>(&s))  return block_cost(bs->block);
-    if (auto* is = dynamic_cast<const IfStmt*>(&s))   return cost_add(block_cost(is->then_b), is->has_else ? block_cost(is->else_b) : 0);
-    if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) return block_cost(ws->body);
-    if (auto* fs = dynamic_cast<const ForStmt*>(&s))  return block_cost(fs->body);
-    if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) return block_cost(ds->body);
-    if (auto* sw = dynamic_cast<const SwitchStmt*>(&s)) {
-        int64_t n = 0; for (auto& c : sw->cases) n = cost_add(n, block_cost(c.body)); return n;
+    if (auto* is = dynamic_cast<const IfStmt*>(&s))
+        return cost_add(cost_add(1, is->cond ? expr_cost(*is->cond) : 0),
+                        cost_add(block_cost(is->then_b), is->has_else ? block_cost(is->else_b) : 0));
+    if (auto* ws = dynamic_cast<const WhileStmt*>(&s))
+        return cost_add(cost_add(1, ws->cond ? expr_cost(*ws->cond) : 0), block_cost(ws->body));
+    if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
+        int64_t n = cost_add(1, block_cost(fs->body));
+        if (fs->cond) n = cost_add(n, expr_cost(*fs->cond));
+        if (fs->step)  n = cost_add(n, expr_cost(*fs->step));
+        if (fs->init)  n = cost_add(n, stmt_cost(*fs->init));
+        return n;
     }
-    return 1;
+    if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s))
+        return cost_add(cost_add(1, ds->cond ? expr_cost(*ds->cond) : 0), block_cost(ds->body));
+    if (auto* sw = dynamic_cast<const SwitchStmt*>(&s)) {
+        // subject eval + one compare per case + each case body.
+        int64_t n = sw->subject ? expr_cost(*sw->subject) : 0;
+        n = cost_add(n, int64_t(sw->cases.size()));  // compare chain
+        for (auto& c : sw->cases) n = cost_add(n, block_cost(c.body));
+        return n;
+    }
+    if (auto* ls = dynamic_cast<const LetStmt*>(&s))
+        return ls->init ? cost_add(1, expr_cost(*ls->init)) : 1;
+    if (auto* rs = dynamic_cast<const ReturnStmt*>(&s))
+        return rs->value ? cost_add(1, expr_cost(*rs->value)) : 1;
+    if (auto* es = dynamic_cast<const ExprStmt*>(&s))
+        return cost_add(1, expr_cost(*es->expr));
+    if (auto* ds = dynamic_cast<const DeferStmt*>(&s))
+        return ds->expr ? cost_add(1, expr_cost(*ds->expr)) : 1;
+    return 1;  // Break/Continue and other leaf statements
 }
 
 } // namespace

@@ -119,6 +119,43 @@ bool count_fits_u32(size_t n, std::string* err, const char* ctx) {
     return true;
 }
 
+// Mirror of the loader's parse_type shape validation. A hand-built Type whose
+// prim/flags-equivalent fields are internally inconsistent must be rejected at
+// write time, not serialized for the loader to catch. This is the write-side
+// half of the M-H14-1 canonical-type consistency gate; the loader enforces the
+// same invariants against the on-disk flags/len fields before any allocation.
+bool validate_canonical_type(const Type& t, std::string* err, unsigned depth = 0) {
+    if (depth > 16) { if (err) *err = "em_writer: type nesting too deep"; return false; }
+    // The writer derives flag bits from exactly these fields; a Type that does
+    // not match the derivation would serialize a flag the loader would reject.
+    const bool is_struct = !t.struct_name.empty();
+    const bool is_array  = t.array_len != 0;
+    // A slice/array is characterized by its element; its own prim must be Void.
+    // A struct name does NOT constrain prim: a script struct has Prim::Void
+    // while a host handle (`bind_handle`) is Prim::I64 with a struct-name tag.
+    if ((t.is_slice || is_array) && t.prim != Prim::Void) { if (err) *err = "em_writer: inconsistent canonical type: slice/array must have Prim::Void"; return false; }
+    if (t.is_slice && is_array) { if (err) *err = "em_writer: inconsistent canonical type: type is both slice and array"; return false; }
+    if (t.is_slice && !t.elem) { if (err) *err = "em_writer: inconsistent canonical type: slice requires an element type"; return false; }
+    if (is_array && !t.elem) { if (err) *err = "em_writer: inconsistent canonical type: fixed array requires an element type"; return false; }
+    if (t.is_fn_handle && t.prim != Prim::I64) { if (err) *err = "em_writer: inconsistent canonical type: function handle requires Prim::I64"; return false; }
+    if (t.has_recorded_sig && !t.is_fn_handle) { if (err) *err = "em_writer: inconsistent canonical type: recorded signature requires function handle"; return false; }
+    if (t.elem && !validate_canonical_type(*t.elem, err, depth + 1)) return false;
+    if (t.is_fn_handle && t.has_recorded_sig) {
+        if (t.recorded_params.size() > 1024) { if (err) *err = "em_writer: inconsistent canonical type: function type parameter count"; return false; }
+        for (const auto& p : t.recorded_params)
+            if (!p || !validate_canonical_type(*p, err, depth + 1)) { if (err) *err = "em_writer: inconsistent canonical type: recorded parameter missing"; return false; }
+        if (!t.recorded_ret || !validate_canonical_type(*t.recorded_ret, err, depth + 1)) { if (err) *err = "em_writer: inconsistent canonical type: recorded return type missing"; return false; }
+    }
+    return true;
+}
+
+bool validate_signature(const EmSignature& sig, std::string* err) {
+    if (sig.params.size() > 1024) { if (err) *err = "em_writer: signature parameter count"; return false; }
+    if (!validate_canonical_type(sig.ret, err)) return false;
+    for (const Type& p : sig.params) if (!validate_canonical_type(p, err)) return false;
+    return true;
+}
+
 } // namespace
 
 bool write_em_file(const EmModule& mod, const char* path, std::string* err) {
@@ -146,10 +183,12 @@ bool write_em_file(const EmModule& mod, const char* path, std::string* err) {
         if (!count_fits_u32(f.relocs.size(),  err, "reloc_count")) return false;
         if (!count_fits_u32(f.native_bindings.size(), err, "native_binding_count")) return false;
         if (!count_fits_u32(f.signature.params.size(), err, "signature param_count")) return false;
+        if (!validate_signature(f.signature, err)) { if (err) *err = "em_writer: function \"" + f.name + "\" has an inconsistent canonical type: " + *err; return false; }
         for (const auto& b : f.native_bindings) {
             if (b.name.empty()) { if (err) *err = "em_writer: native binding has no symbolic name"; return false; }
             if (!name_fits_u16(b.name, err, "native binding")) return false;
             if (uint64_t(b.offset) + 8 > f.code.size()) { if (err) *err = "em_writer: native binding offset out of range"; return false; }
+            if (!validate_signature(b.signature, err)) { if (err) *err = "em_writer: native binding \"" + b.name + "\" has an inconsistent canonical type: " + *err; return false; }
         }
         rodata_total_acc += f.rodata.size();
     }

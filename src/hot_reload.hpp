@@ -102,8 +102,24 @@ public:
         void* old_entry = table.get(slot);
         if (old_entry == new_entry || epoch_ == std::numeric_limits<uint64_t>::max()) return info;
 
-        const uint64_t next_epoch = epoch_ + 1;
+        // An executable page must be uniquely bound to one (domain, table, slot)
+        // for retirement ownership to be sound. If old_entry is still current in
+        // another slot of this table, retiring it here would let reclaim free a
+        // page that the other slot still publishes — a guarded call through
+        // that other slot would then jump to decommitted memory. Scan every
+        // other slot before retiring: if any still holds old_entry, do NOT retire
+        // it to retired_ (the page stays current via that other slot and will be
+        // retired only when its last publishing slot is replaced).
+        bool old_still_aliased = false;
         if (old_entry) {
+            for (size_t i = 0; i < table.slots.size(); ++i) {
+                if (i == slot) continue;
+                if (table.get(i) == old_entry) { old_still_aliased = true; break; }
+            }
+        }
+
+        const uint64_t next_epoch = epoch_ + 1;
+        if (old_entry && !old_still_aliased) {
             try {
                 retired_.push_back({old_entry, next_epoch});
             } catch (...) {
@@ -120,8 +136,8 @@ public:
 
         info.ok = true;
         info.publication_epoch = next_epoch;
-        info.old_page_retired = old_entry != nullptr;
-        info.retirement_epoch = old_entry ? next_epoch : 0;
+        info.old_page_retired = old_entry != nullptr && !old_still_aliased;
+        info.retirement_epoch = (old_entry && !old_still_aliased) ? next_epoch : 0;
         cv_.notify_all();
         return info;
     }

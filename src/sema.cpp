@@ -2,10 +2,21 @@
 #include "binding_builder.hpp"  // PERM_FFI constant (v0.4 sema gating)
 #include <cassert>
 #include <climits>
+#include <cstring>
 #include <unordered_set>
 #include <string>
 
 namespace ember {
+
+// Bit-preserving uint64_t -> int64_t conversion (L-§10-3 portability):
+// `int64_t(uint64_t(x))` for an out-of-range x is implementation-defined per
+// [conv.integral]. memcpy reinterprets the bit pattern with defined behavior
+// and is identical on every two's-complement target.
+static int64_t bit_cast_i64(uint64_t u) {
+    int64_t i;
+    std::memcpy(&i, &u, sizeof(i));
+    return i;
+}
 
 // Per-frame byte budget (red-team V6-DoS mitigation): a single local or the
 // running frame total must not exceed this, or a script can declare a huge
@@ -130,7 +141,7 @@ bool try_eval_const_i64(const Expr& e, int64_t& out) {
         int64_t v;
         if (!try_eval_const_i64(*u->operand, v)) return false;
         switch (u->op) {
-        case UnaryExpr::Op::Neg:    out = int64_t(uint64_t(0) - uint64_t(v)); return true;
+        case UnaryExpr::Op::Neg:    out = bit_cast_i64(uint64_t(0) - uint64_t(v)); return true;
         case UnaryExpr::Op::BitNot: out = ~v; return true;
         default: return false; // Not (!) is bool-only, never reaches an int context
         }
@@ -140,14 +151,26 @@ bool try_eval_const_i64(const Expr& e, int64_t& out) {
         if (!try_eval_const_i64(*b->lhs, l)) return false;
         if (!try_eval_const_i64(*b->rhs, r)) return false;
         switch (b->op) {
-        case BinExpr::Op::Add: out = int64_t(uint64_t(l) + uint64_t(r)); return true;
-        case BinExpr::Op::Sub: out = int64_t(uint64_t(l) - uint64_t(r)); return true;
-        case BinExpr::Op::Mul: out = int64_t(uint64_t(l) * uint64_t(r)); return true;
+        case BinExpr::Op::Add: out = bit_cast_i64(uint64_t(l) + uint64_t(r)); return true;
+        case BinExpr::Op::Sub: out = bit_cast_i64(uint64_t(l) - uint64_t(r)); return true;
+        case BinExpr::Op::Mul: out = bit_cast_i64(uint64_t(l) * uint64_t(r)); return true;
         case BinExpr::Op::And: out = l & r; return true;
         case BinExpr::Op::Or:  out = l | r; return true;
         case BinExpr::Op::Xor: out = l ^ r; return true;
-        case BinExpr::Op::Shl: out = int64_t(uint64_t(l) << (r & 63)); return true;
-        case BinExpr::Op::Shr: out = l >> (r & 63); return true;
+        case BinExpr::Op::Shl: out = bit_cast_i64(uint64_t(l) << (r & 63)); return true;
+        // Arithmetic right shift as an unsigned shift plus explicit sign fill
+        // (L-§10-3): signed `int64_t >> count` of a negative value is
+        // implementation-defined per [expr.shift]; computing from the
+        // unsigned bit pattern and OR-ing the sign bits is defined behavior
+        // and matches x64 sar. (This evaluator never feeds codegen emission -
+        // see the comment above - so it needs no normalize_rax, only the
+        // portability hardening.)
+        case BinExpr::Op::Shr: {
+            int sh = int(r & 63);
+            uint64_t ur = uint64_t(l) >> sh;
+            if (sh != 0 && l < 0) ur |= ~((1ULL << (64 - sh)) - 1);
+            out = bit_cast_i64(ur); return true;
+        }
         // Div/Mod excluded on purpose (see comment above) - a literal-zero
         // divisor must still hit the real runtime trap, never a compile-time
         // fold that would either misbehave or need to replicate the trap here.

@@ -555,6 +555,46 @@ jmp  .after
   unsigned types in this language, matching C semantics for `u*`
   types) - no check emitted in either build mode.
 
+### 10.1 Constant folding and target-width normalization
+
+When both operands of a `BinExpr` are integer literals (the `IntLit`/`IntLit`
+case, reachable via ordinary literals and via enum members, which sema lowers
+to typed `i32` `IntLit` at `sema.cpp:503-506`), `Add`/`Sub`/`Mul`/`And`/`Or`/``Xor`/`Shl`/`Shr` are folded at compile time to a single immediate:
+- The folded immediate is emitted with `mov rax, imm64`, then **`normalize_rax(lt)`
+  runs before the early return**, exactly as the runtime integer path does at the
+  end of the `BinExpr` lowering. A folded `i32` therefore reaches the host/ABI
+  boundary sign-normalized to the full register (`movsxd rax, eax`), not
+  zero-extended. Without this a folded `i32` whose sign bit is set (e.g.
+  `1073741824_i32 << 1`) would expose `0x0000000080000000` (2147483648) to a
+  host caller instead of the sign-normalized `0xffffffff80000000` (-2147483648).
+  Comparisons (`Eq`..`Ge`) are excluded from the fold and skip normalization
+  (their result is a canonical 0/1), matching the runtime path's `is_cmp` guard.
+- The fold's host-side arithmetic is defined behavior on every target, not
+  implementation-defined: `Add`/`Sub`/`Mul`/`Shl` compute in `uint64_t` (well-defined
+  wrap mod 2^64) and bit-preserving `memcpy` (not an out-of-range
+  `int64_t(uint64_t(...))` conversion) reinterprets the result to `int64_t`. The
+  `Shr` fold is an unsigned right shift plus an explicit sign fill (OR-ing the
+  sign bits when the operand was negative and the count is nonzero), not a
+  signed `int64_t >> count` (which is implementation-defined per [expr.shift]).
+  On x64/MinGW these produce the identical bit patterns to the previous
+  `int64_t(uint64_t(...))`/arithmetic-shift forms; the rewrite is purely a
+  portability hardening (closes L-§10-3). `sema`'s `try_eval_const_i64` uses the
+  same bit-preserving conversions; it never feeds codegen emission (only
+  compile-time bounds/assert decisions), so it needs no `normalize_rax`.
+
+### 10.2 Narrow atomic CAS width contract
+
+The sync extension (`extensions/sync`) canonicalizes every narrow atomic
+(8/16/32-bit) operand to the declared width via `atom_mask`: `atomic_new`/`store`/`fetch_add`/`fetch_sub`/`swap` and the `desired` operand of `atomic_cas` are all masked. `atomic_cas` **also masks the `expected`
+operand** to the declared width, in both the script-facing native
+(`n_atomic_cas`) and the host API (`atomic_cas_host`). A CAS therefore matches
+iff the low `width` bits of `expected` equal the low `width` bits of the stored
+value; an `expected` that is sign-extended beyond the width (e.g. `-1` for an
+`aint8` holding `0xFF`) matches, and an `expected` with stray high bits whose
+low bits differ does not. Without this masking a should-match CAS false-
+negatively failed and a stray-high-bit `expected` could spuriously match
+(closes M-§10-2).
+
 ## 11. Function-call site argument spilling for >4 args
 
 When a script or native call has more than 4 total argument slots
@@ -628,10 +668,14 @@ The implemented M5 semantics are lexical-block-exit LIFO cleanup:
   generated cleanup edge followed by normal fallthrough from running it twice.
 - Normal block fallthrough emits that block's cleanup. `break` emits cleanup
   only for scopes crossed on the way to the selected nearest loop or switch
-  break target. `continue` skips intervening switch frames, cleans through the
-  nearest loop-body scope, then jumps to that loop's condition (`while`),
-  bottom condition (`do`), or step (`for`). `return` cleans all active scopes
-  from innermost through the function body.
+  break target. `continue` skips intervening switch frames, cleans through
+  the nearest loop-body scope, then jumps to that loop's charged back-edge
+  latch: the `while` **latch** (which runs the budget charge then jumps to the
+  condition), the `do` bottom condition (which runs the charge then re-tests),
+  or the `for` step label (which runs the step, then the charge, then re-tests
+  the condition). `continue` therefore never bypasses a loop's back-edge
+  budget charge. `return` cleans all active scopes from innermost through the
+  function body.
 - Return values are evaluated before cleanup and preserved across cleanup
   expressions in a 16-byte-aligned stack temporary: scalars and f32/f64 occupy
   its first word, while slices preserve both pointer and length. Keeping the

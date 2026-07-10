@@ -277,6 +277,77 @@ int main() {
     std::filesystem::remove(bind_path);bool binding_rejection_ok=missing_rejected&&incompatible_rejected;
     std::printf("[4c] missing/incompatible native bindings rejected: %s\n",passfail(binding_rejection_ok));if(!binding_rejection_ok)failures++;
 
+    // [4e] Per-dimension canonical_type_same mutation tests at the LOADER
+    // boundary. Each case builds a v2 module with a native binding whose
+    // recorded signature differs from the host allowlist in EXACTLY ONE
+    // canonical Type dimension and asserts the load REJECTS with a
+    // signature-mismatch error. If canonical_type_same skipped that dim the
+    // load would succeed, so each is a real non-circular regression for one
+    // dim. The binding has zero params so the ret-type comparison is isolated.
+    auto dim_path = tmp; dim_path += ".dim";
+    auto dim_reject = [&](const char* tag, const Type& recorded_ret,
+                          const std::vector<Type>& recorded_params,
+                          const Type& allow_ret,
+                          const std::vector<Type>& allow_params) {
+        EmModule dm; EmFunctionRecord df; df.name="bound"; df.slot_index=0;
+        df.code={0x48,0xB8,0,0,0,0,0,0,0,0,0xC3};
+        df.signature.ret=make_prim(Prim::I64);
+        EmNativeBinding db; db.offset=2; db.name="host_bound";
+        db.signature.ret=recorded_ret;
+        for (const auto& p:recorded_params) db.signature.params.push_back(p);
+        df.native_bindings.push_back(db);
+        dm.functions.push_back(df); dm.entry_slot=0; dm.name_table={{"bound",0}};
+        std::string dwerr; bool dw=write_em_file(dm, dim_path.string().c_str(), &dwerr);
+        NativeSig allow; allow.name="host_bound";
+        allow.fn_ptr=reinterpret_cast<void*>(uintptr_t(1));
+        allow.ret=allow_ret;
+        allow.params=allow_params;
+        std::unordered_map<std::string,NativeSig> allow_list{{allow.name,allow}};
+        LoadedModule amod; std::string aerr;
+        bool rejected = dw && !load_em_file(dim_path.string().c_str(),amod,&aerr,nullptr,&allow_list)
+                            && amod.pages.empty()
+                            && aerr.find("signature mismatch")!=std::string::npos;
+        std::printf("[4e-%s] %s\n", tag, passfail(rejected));
+        if (!rejected) failures++;
+        std::filesystem::remove(dim_path);
+    };
+    // (a) slice-vs-array: recorded ret is_slice, allowlist ret array_len.
+    { Type rr=make_slice(std::make_shared<Type>(make_prim(Prim::I8)));
+      Type ar=make_array(std::make_shared<Type>(make_prim(Prim::I8)),1);
+      dim_reject("slice_vs_array", rr, {}, ar, {}); }
+    // (b) struct_name mismatch: recorded ret struct "A", allowlist struct "B".
+    { Type rr=make_struct("A"); Type ar=make_struct("B");
+      dim_reject("struct_name", rr, {}, ar, {}); }
+    // (c) fn_handle mismatch: recorded ret is_fn_handle, allowlist not.
+    { Type rr; rr.prim=Prim::I64; rr.is_fn_handle=true;
+      Type ar=make_prim(Prim::I64);
+      dim_reject("fn_handle", rr, {}, ar, {}); }
+    // (d) recorded_sig mismatch: recorded ret has_recorded_sig, allowlist not.
+    { Type rr; rr.prim=Prim::I64; rr.is_fn_handle=true; rr.has_recorded_sig=true;
+      rr.recorded_ret=std::make_shared<Type>(make_prim(Prim::I64));
+      Type ar; ar.prim=Prim::I64; ar.is_fn_handle=true;
+      dim_reject("recorded_sig", rr, {}, ar, {}); }
+    // (e) recorded_params arity: 1 vs 2.
+    { Type rr; rr.prim=Prim::I64; rr.is_fn_handle=true; rr.has_recorded_sig=true;
+      rr.recorded_params.push_back(std::make_shared<Type>(make_prim(Prim::I64)));
+      rr.recorded_ret=std::make_shared<Type>(make_prim(Prim::I64));
+      Type ar; ar.prim=Prim::I64; ar.is_fn_handle=true; ar.has_recorded_sig=true;
+      ar.recorded_params.push_back(std::make_shared<Type>(make_prim(Prim::I64)));
+      ar.recorded_params.push_back(std::make_shared<Type>(make_prim(Prim::I64)));
+      ar.recorded_ret=std::make_shared<Type>(make_prim(Prim::I64));
+      dim_reject("recorded_params_arity", rr, {}, ar, {}); }
+    // (f) recorded_ret prim: I64 vs I32.
+    { Type rr; rr.prim=Prim::I64; rr.is_fn_handle=true; rr.has_recorded_sig=true;
+      rr.recorded_ret=std::make_shared<Type>(make_prim(Prim::I64));
+      Type ar; ar.prim=Prim::I64; ar.is_fn_handle=true; ar.has_recorded_sig=true;
+      ar.recorded_ret=std::make_shared<Type>(make_prim(Prim::I32));
+      dim_reject("recorded_ret", rr, {}, ar, {}); }
+    // (g) elem recursion: slice of I8 vs slice of I16.
+    { Type rr=make_slice(std::make_shared<Type>(make_prim(Prim::I8)));
+      Type ar=make_slice(std::make_shared<Type>(make_prim(Prim::I16)));
+      dim_reject("elem_recursion", rr, {}, ar, {}); }
+
+
     // Explicit v1 compatibility: rewrite the v2 source artifact is not valid
     // because record layouts differ, so construct the minimal historical v1.
     auto v1 = tmp; v1 += ".v1";

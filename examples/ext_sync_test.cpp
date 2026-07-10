@@ -231,6 +231,59 @@ int main() {
         check(ok, "T2c aint64 INT64_MAX+1 and INT64_MIN-1 wrap");
     }
 
+    // Test 2d: M-§10-2 narrow CAS masks the expected operand to the declared
+    // width (same as desired). Pre-fix CAS compared `expected` raw, so (a) a
+    // CAS whose expected was sign-extended beyond width FAILED against a
+    // canonical stored value (false negative) and (b) an expected with stray
+    // high bits could spuriously match. Post-fix expected is masked, so a CAS
+    // matches iff the low `width` bits of expected equal the low `width` bits
+    // of the stored value. Both the script-facing atomic_cas native AND the
+    // host atomic_cas_host API are exercised. This test FAILS with the fix
+    // reverted (the should-match CAS returns 0, the should-fail returns 1).
+    {
+        auto A_new   = native_ptr<int64_t(*)(int64_t,int64_t)>(NATIVES,"atomic_new");
+        auto A_load  = native_ptr<int64_t(*)(int64_t)>(NATIVES,"atomic_load");
+        auto A_store = native_ptr<void(*)(int64_t,int64_t)>(NATIVES,"atomic_store");
+        auto A_cas   = native_ptr<int64_t(*)(int64_t,int64_t,int64_t)>(NATIVES,"atomic_cas");
+        auto A_free  = native_ptr<void(*)(int64_t)>(NATIVES,"atomic_free");
+        bool ok = true;
+        // For each narrow width: store a canonical value (width(-1) == all-ones
+        // in the low bits), then probe CAS with an out-of-range expected that
+        // SHOULD match (low bits == all-ones) and an out-of-range expected that
+        // should NOT match (low bits differ).
+        struct W { int w; uint64_t mask; };
+        W ws[] = {{8,0xFFull},{16,0xFFFFull},{32,0xFFFFFFFFull}};
+        for (auto z : ws) {
+            int64_t h = A_new(z.w, -1);  // init = width(-1) = all-ones
+            ok &= (uint64_t(A_load(h)) == z.mask);  // init masked to width
+            // (a) expected=-1 (all-ones everywhere): low bits match the stored
+            // all-ones, so CAS MUST SUCCEED (return 1). Pre-fix expected was
+            // compared raw as uint64_t(-1)=0xFFFF...FFFF which != the width-masked
+            // stored value (e.g. 0xFF), so this FALSE-NEGATIVELY returned 0.
+            ok &= (A_cas(h, -1, 7) == 1);
+            ok &= (uint64_t(A_load(h)) == (uint64_t(7) & z.mask));
+            // restore canonical all-ones via store (which masks) for the next probe
+            A_store(h, -1);
+            ok &= (uint64_t(A_load(h)) == z.mask);
+            // (b) expected with stray HIGH bits beyond the width whose low bits
+            // do NOT match all-ones: MUST FAIL (return 0). Use a value whose low
+            // `width` bits are 0 (e.g. 1<<width) so it cannot equal all-ones.
+            int64_t nomatch = int64_t(uint64_t(1) << z.w);  // low width bits == 0
+            ok &= (A_cas(h, nomatch, 9) == 0);
+            ok &= (uint64_t(A_load(h)) == z.mask);  // unchanged on failure
+            // (c) host CAS path: expected=-1 MUST swap against all-ones.
+            bool swapped = false;
+            ok &= ext_sync::atomic_cas_host(h, -1, 5, &swapped) && swapped;
+            ok &= (uint64_t(A_load(h)) == (uint64_t(5) & z.mask));
+            // (d) host CAS path: a should-not-match expected MUST NOT swap.
+            swapped = true;
+            ok &= ext_sync::atomic_cas_host(h, nomatch, 11, &swapped) && !swapped;
+            ok &= (uint64_t(A_load(h)) == (uint64_t(5) & z.mask));
+            A_free(h);
+        }
+        check(ok, "T2d M-§10-2 narrow CAS masks expected to declared width (native + host)");
+    }
+
     // Test 3: swapbuf write/swap/read double-swap frame ordering (JIT).
     {
         bool trapped=false;
