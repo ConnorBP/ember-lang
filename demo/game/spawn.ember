@@ -1,0 +1,66 @@
+// spawn.ember — a dynamically-registered spawner routine (the lifecycle
+// extension's register_routine / unregister_routine).
+//
+// The @on_tick annotation is the STATIC per-tick path: the host discovers
+// @on_tick fns at load and calls them every frame. register_routine is the
+// DYNAMIC path: the script chooses AT RUNTIME what the host should call per
+// frame, by passing a `&fn` handle + an opaque data arg. The host's --tick
+// loop re-snapshots the registered routines each tick and calls each with
+// its data.
+//
+// This sim uses the dynamic spawner to seed a NEW entity every few ticks
+// until the arena is full — a behavior the static @on_tick alone couldn't
+// express (a spawner that turns itself off once the arena is saturated).
+// @entry registers the spawner; the spawner unregisters itself when the
+// arena is full (unregister_routine(id) -> 1).
+
+import "entity.ember";
+
+// The spawner's bookkeeping globals. The routine id is stored here so the
+// spawner can unregister itself when the arena fills.
+global spawner_id : i64 = 0;
+global spawner_seed : i64 = 0;       // increments per spawn, seeds new entity velocity
+global spawner_enabled : i64 = 1;    // 1 = spawner still active
+
+// The spawner routine. The host calls it every tick with `data` (the spawn
+// interval in ticks — we ignore it here and spawn on a fixed cadence; `data`
+// is the channel by which @entry parameterized the routine).
+fn spawner(data: i64) -> i64 {
+    if (spawner_enabled == 0) { return 0; }
+
+    // Spawn a new entity every `data` ticks, up to max_entities.
+    // We gate on frame_counter (the per-tick counter main increments) so
+    // the spawner is deterministic: a new entity at frames data, 2*data, ...
+    if (frame_counter > 0 && frame_counter % data == 0) {
+        if (entity_count < max_entities) {
+            // Seed entity `entity_count` at the origin with a small outward
+            // velocity derived from spawner_seed (deterministic).
+            let i : i64 = entity_count;
+            let ang : f32 = (spawner_seed as f32) * 0.1f;   // deterministic angle
+            let vx : f32 = ang * 1.0f;
+            let vy : f32 = (spawner_seed as f32) + 1.0f;
+            let ok : i64 = seed_entity(i, 0.0f, 0.0f, vx, vy);
+            if (ok == 1) {
+                entity_count = entity_count + 1;
+                spawner_seed = spawner_seed + 1;
+            }
+        } else {
+            // Arena full: unregister ourselves (the dynamic lifecycle's
+            // self-removal path). unregister_routine(id) -> 1 on success.
+            let removed : i64 = unregister_routine(spawner_id);
+            if (removed == 1) {
+                spawner_enabled = 0;
+            }
+        }
+    }
+    return 0;
+}
+
+// Register the spawner with the host. `interval` is the spawn cadence (in
+// ticks), passed as the routine's `data` arg. Returns the routine id.
+fn register_spawner(interval: i64) -> i64 {
+    let h = &spawner;                  // fn handle (&spawner -> `fn` type)
+    let id : i64 = register_routine(h, interval);
+    spawner_id = id;
+    return id;
+}

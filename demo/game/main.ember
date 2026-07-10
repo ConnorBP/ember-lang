@@ -1,0 +1,163 @@
+// main.ember — @entry setup + @on_tick step + the deterministic assertion.
+//
+// This is the sim's entry point. @entry seeds the initial entities (the
+// known state the sim integrates from) and registers the dynamic spawner.
+// @on_tick steps every live entity (integrate + bounce) and bumps the frame
+// counter. After a fixed target tick count, @on_tick runs the deterministic
+// assertion: entity 0 must be at a closed-form-computed position, and the
+// frame counter must equal the tick count.
+//
+// The assertion's observable channel: ember's standard CLI registers no
+// `print`/`log` native, and the host's --tick loop discards @on_tick return
+// values. So the only host-observable failure signal a tick-time assertion
+// can raise is the RECOVERABLE TRAP surface (REDSHELL V6/V7): on assertion
+// failure we raise a deliberate integer divide-by-zero, which the tick
+// thread catches via longjmp + the CLI reports as a trapped tick. On
+// success the sim runs cleanly to --tick-count N with no trap.
+//
+// Run:  ./buildt/ember_cli.exe run demo/game/main.ember --tick --tick-count 20 --tick-interval 1
+//   - success: "stopped after 20 ticks" (no "trapped" qualifier), exit 1
+//   - failure: "stopped after 19 ticks (a tick trapped ...)" exit 70
+//     (the trap fires at tick 20 before the count increments to 20, so the
+//     printed count is 19; the exit code 70 is the harness-observable signal)
+
+import "entity.ember";
+import "spawn.ember";
+
+// --- sim parameters (deterministic; closed-form assertion uses these) ---
+const dt : f32 = 0.1f;               // per-tick timestep
+const target_ticks : i64 = 20;       // when the assertion fires
+const n_seed_entities : i64 = 3;     // entities @entry seeds before ticking
+
+// Entity 0's deterministic initial state (the closed-form assertion target).
+//   pos0 = (0, 50), vel0 = (5, 10)
+// The sim uses SEMI-IMPLICIT EULER: velocity is updated FIRST (vy += g*dt),
+// THEN position uses the NEW velocity (pos += vel_new*dt). So the discrete
+// closed form (what the sim actually computes) is, per step k=1..t:
+//   v_k = v_0 + k*g*dt        (v_1 = v_0 + g*dt, ..., v_t = v_0 + t*g*dt)
+//   p_t = p_0 + dt * sum_{k=1}^{t} v_k
+//      = p_0 + v_0*dt*t + 0.5*g*dt^2*t*(t+1)
+// (NOT the continuous kinematic 0.5*g*dt^2*t^2 — that's a different integrator;
+//  and NOT t*(t-1) — that's sum_{k=0}^{t-1}, off by one for this integrator.)
+// At t=20: px = 5*0.1*20 = 10.0,
+//         py = 50 + 10*0.1*20 + 0.5*(-9.8)*0.01*20*21 = 50 + 20 - 20.58 = 49.42.
+// We assert entity 0 lands at (px=10.0, py~=49.42) at tick 20.
+const e0_px0 : f32 = 0.0f;
+const e0_py0 : f32 = 50.0f;
+const e0_vx0 : f32 = 5.0f;
+const e0_vy0 : f32 = 10.0f;
+
+// Assertion globals: 0 = not yet checked, 1 = pass, -1 = fail. The host can't
+// read these (no print native), but they make the assertion self-documenting
+// in the source, and the trap on -1 is the observable signal.
+global g_assert_state : i64 = 0;
+global g_assert_fail_reason : i64 = 0;
+
+// The closed-form expected position of entity 0 at tick `t` (the discrete
+// semi-implicit-Euler sum — matches the sim's integrator exactly).
+// Per step k=1..t: v_k = v_0 + k*g*dt; p_t = p_0 + dt*sum_{k=1}^{t} v_k
+//   = p_0 + v_0*dt*t + 0.5*g*dt^2*t*(t+1)
+fn expected_px(t: i64) -> f32 { return e0_vx0 * (dt * (t as f32)); }
+fn expected_py(t: i64) -> f32 {
+    let tt : f32 = t as f32;
+    let sum_vy : f32 = e0_vy0 * dt * tt + 0.5f * gravity * dt * dt * tt * (tt + 1.0f);
+    return e0_py0 + sum_vy;
+}
+
+// Compare two f32s with a small epsilon (f32 accumulation drift). The sim
+// does N vec3/struct round-trips per tick; we allow 1e-3 slack.
+fn approx_eq(a: f32, b: f32) -> i64 {
+    let mut d : f32 = a - b;
+    if (d < 0.0f) { d = -d; }
+    if (d < 0.001f) { return 1; }
+    return 0;
+}
+
+// The assertion. Runs at tick == target_ticks. Checks entity 0 against the
+// closed form, and the frame counter == tick count. On fail, sets the reason
+// and returns -1; the caller raises the trap. On pass, returns 1.
+fn run_assertion(t: i64) -> i64 {
+    if (frame_counter != t) { g_assert_fail_reason = 1; return -1; }
+
+    let px : f32 = entity_pos_x(0);
+    let py : f32 = entity_pos_y(0);
+    let expx : f32 = expected_px(t);
+    let expy : f32 = expected_py(t);
+
+    if (approx_eq(px, expx) == 0) { g_assert_fail_reason = 2; return -1; }
+    if (approx_eq(py, expy) == 0) { g_assert_fail_reason = 3; return -1; }
+
+    // Also confirm the spawner did its job: entity_count grew beyond the seed
+    // (the dynamic routine fired). The spawner seeds every `spawn_interval`
+    // ticks; with spawn_interval=5 and target=20 it fires at 5,10,15,20 -> up
+    // to +4 entities, capped by max_entities. Just assert it grew at all.
+    if (entity_count <= n_seed_entities) { g_assert_fail_reason = 4; return -1; }
+
+    return 1;
+}
+
+// Raise the assertion failure as a recoverable trap. The only host-observable
+// failure channel in --tick mode (no print native; @on_tick return discarded).
+// 1/0 -> integer divide by zero -> tick thread longjmps -> CLI reports it.
+fn raise_assert_trap() -> i64 {
+    let z : i64 = 0;
+    return 1 / z;
+}
+
+@entry
+fn main() -> i64 {
+    // 1. init the SoA store (array<f32> + array<i64> handles).
+    let ok : i64 = init_store(max_entities);
+    if (ok == 0) { return -1; }     // alloc failed -> unload
+
+    // 2. probe the vec/quat/mat extensions are wired (not used by physics, but
+    //    the mandate is to exercise them together on the game-entity path).
+    let ext_ok : i64 = probe_extensions();
+    if (ext_ok == 0) { return -2; }
+
+    // 3. seed the deterministic initial entities.
+    //    Entity 0: the assertion target. Entities 1,2: extra bodies so the
+    //    sim isn't a single-particle trivial case.
+    let s0 : i64 = seed_entity(0, e0_px0, e0_py0, e0_vx0, e0_vy0);
+    let s1 : i64 = seed_entity(1, 10.0f, 0.0f, -3.0f, 8.0f);
+    let s2 : i64 = seed_entity(2, -20.0f, 20.0f, 2.0f, -5.0f);
+    if (s0 + s1 + s2 != 3) { return -3; }
+    entity_count = n_seed_entities;
+
+    // 4. register the dynamic spawner (lifecycle extension). Cadence = 5 ticks.
+    let sid : i64 = register_spawner(5);
+    if (sid < 1) { return -4; }      // register_routine returns 1-based id
+
+    return 1;   // >0 = stay loaded (LIFECYCLE.md §1) so --tick ticks @on_tick
+}
+
+// Per-tick: step every live entity + bump the frame counter. At the target
+// tick, run the deterministic assertion and raise a trap on failure.
+@on_tick
+fn on_tick() -> i64 {
+    let n : i64 = entity_count;
+    let mut i : i64 = 0;
+    while (i < n) {
+        // only step active entities (the spawner may have just added one)
+        let act : i64 = array_get_i64(store_active, i);
+        if (act == 1) {
+            step_entity(i, dt);
+        }
+        i = i + 1;
+    }
+
+    frame_counter = frame_counter + 1;
+
+    // At the target tick, assert. (frame_counter is now == ticks elapsed.)
+    if (frame_counter == target_ticks) {
+        let res : i64 = run_assertion(frame_counter);
+        if (res == 1) {
+            g_assert_state = 1;     // pass (not host-observable; documented)
+            return 0;
+        }
+        g_assert_state = -1;
+        raise_assert_trap();        // observable: tick traps, CLI reports it
+        return 0;                  // unreachable (trap), satisfies sema
+    }
+    return 0;
+}

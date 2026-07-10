@@ -1,0 +1,26 @@
+// lifecycle_tick_trap_exit.ember — regression for the --tick trap-exit bug
+// surfaced by demo/game. A tick-time trap (e.g. an assertion that raises a
+// deliberate divide-by-zero on invariant failure) used to print
+// "(a tick trapped ...)" but exit with @entry's positive stay-loaded return
+// (e.g. 1), so a test harness could not distinguish a clean tick run from a
+// tick-time assertion failure by exit code. The fix sets the process exit
+// code to 70 (the same trap code used for a trap in the main @entry call)
+// when a tick traps, making tick-time assertions harness-observable.
+//
+// This script's @on_tick raises a deliberate div-by-zero on tick 3; the
+// harness asserts the run exits 70 (the recoverable-trap code) AND prints
+// "(a tick trapped ...)".
+global c : i64 = 0;
+
+@on_tick
+fn tick() -> i64 {
+    c = c + 1;
+    if (c == 3) {
+        let z : i64 = 0;
+        return 1 / z;   // deliberate recoverable trap (the assertion signal)
+    }
+    return 0;
+}
+
+@entry
+fn main() -> i64 { return 1; }   // > 0 = stay loaded so --tick runs

@@ -130,6 +130,28 @@ for f in tests/lang/import_nested.ember tests/lang/import_diamond.ember \
     esac
 done
 
+# --- --tick lifecycle regressions (surfaced by demo/game) ---
+# Two CLI fixes the game-entity sim surfaced, each with its own regression:
+#  1. lifecycle_entry_unload: @entry returning <= 0 must NOT start the tick
+#     loop (LIFECYCLE.md §1). Before the fix the return-sign clamp misread a
+#     negative unload signal as stay-loaded. Assert: no "stopped after" line
+#     (no tick ran) + the "module unloaded (no tick)" line is printed.
+#  2. lifecycle_tick_trap_exit: a tick-time trap must exit 70 (the recoverable-
+#     trap code), not @entry's positive stay-loaded return, so a harness can
+#     detect a tick-time assertion failure. Assert: rc==70 + "a tick trapped".
+out=$("$CLI" run tests/lang/lifecycle_entry_unload.ember --tick --tick-count 5 --tick-interval 1 2>&1); rc=$?
+if printf '%s' "$out" | grep -q 'module unloaded (no tick)' && ! printf '%s' "$out" | grep -q 'stopped after'; then
+    printf "PASS  lifecycle_entry_unload.ember (negative @entry did not start tick)\n"; pass=$((pass+1))
+else
+    printf "FAIL  lifecycle_entry_unload.ember (negative @entry should NOT tick)\n%s\n" "$out"; fail=$((fail+1))
+fi
+out=$("$CLI" run tests/lang/lifecycle_tick_trap_exit.ember --tick --tick-count 10 --tick-interval 1 2>&1); rc=$?
+if [ $rc -eq 70 ] && printf '%s' "$out" | grep -q 'a tick trapped'; then
+    printf "PASS  lifecycle_tick_trap_exit.ember (tick trap -> exit 70)\n"; pass=$((pass+1))
+else
+    printf "FAIL  lifecycle_tick_trap_exit.ember (expected rc=70 + tick-trap print, got rc=%d)\n%s\n" "$rc" "$out"; fail=$((fail+1))
+fi
+
 # Doc-consistency regression: the shipped defer implementation is
 # lexical-block-exit LIFO (CODEGEN_SPEC.md Section 13). Catch a future
 # reintroduction of the stale "function-exit" + defer framing in non-audit

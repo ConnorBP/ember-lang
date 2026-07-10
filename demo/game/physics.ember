@@ -1,0 +1,153 @@
+// physics.ember — integration + collision.
+//
+// This module is where the vec/quat/mat extensions get their headline
+// exercise. We use THREE representations of a 2D position/velocity, on
+// purpose, to show them interplaying:
+//
+//   1. The host vec3 extension: opaque i64 handles (vec3_new/vec3_x/...).
+//      We lift a 2D position into a vec3 (z=0) to do vector add with the
+//      overloaded `+` operator, then read components back. This is the
+//      extension the language shipped for game math.
+//
+//   2. A script-level V3 struct (the same shape as demo/math/vec.ember),
+//      exchanged by value across modules. We do a struct-by-value add here
+//      (v3_add) to keep the struct-ABI surface exercised.
+//
+//   3. The array<f32> SoA store in entity.ember — the bulk backing store.
+//
+// We also call mat4_identity + mat4_get (mat extension) and quat_new +
+// quat_w (quat extension) in probe_extensions, to prove those surfaces are
+// wired AND their handles are live/readable, even though the sim is 2D —
+// they're the headline-use-case extensions and the demo proves they work
+// end-to-end, not just that they're registered.
+
+struct V3 {
+    x: f32;
+    y: f32;
+    z: f32;
+}
+
+// A 2D point lifted into the host vec3 extension. Returns an opaque i64
+// handle (z=0 for a 2D sim). The host owns {x,y,z}; we read back via vec3_x/y.
+fn to_vec3(x: f32, y: f32) -> vec3 {
+    return vec3_new(x, y, 0.0f);
+}
+
+// Add two host vec3 handles with the operator-overloaded `+` (vec3_add).
+// Both operands are vec3-typed locals (opaque i64 handles); the overload
+// resolves at sema to the vec3_add native and returns a vec3 handle.
+fn vec3_plus(a: vec3, b: vec3) -> vec3 {
+    return a + b;
+}
+
+// Script-level V3 add (struct-by-value args must be locals — ABI restriction).
+fn v3_add(a: V3, b: V3) -> V3 {
+    let r : V3 = V3 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z };
+    return r;
+}
+
+// Integrate one entity by dt: position += velocity * dt; velocity.y += g*dt.
+// Takes + returns an Entity struct (struct ABI: return via local).
+// We compute the new velocity using the host vec3 extension (lift vel, add
+// gravity-vector, read back) to exercise the vec surface on the hot path —
+// not because 2D needs vec3, but because the demo's job is to prove the vec
+// extension works end-to-end on the game-entity path.
+fn integrate(e: Entity, dt: f32) -> Entity {
+    // --- velocity integration via host vec3 extension ---
+    // lift current velocity into a vec3 handle (vx, vy, 0). The handle is
+    // an opaque i64 typed `vec3` by sema (bind_handle tags struct_name).
+    let vel_h : vec3 = to_vec3(e.vel_x, e.vel_y);
+    // gravity as a vec3 (0, g*dt, 0)
+    let gdt : f32 = gravity * dt;
+    let grav_h : vec3 = vec3_new(0.0f, gdt, 0.0f);
+    // vel + grav via the overloaded + (operator -> vec3_add native)
+    let new_vel_h : vec3 = vec3_plus(vel_h, grav_h);
+    let nvx : f32 = vec3_x(new_vel_h);
+    let nvy : f32 = vec3_y(new_vel_h);
+
+    // --- position integration via script V3 struct + host vec3, interplaying ---
+    // Build a script V3 for the old position.
+    let old_pos : V3 = V3 { x: e.pos_x, y: e.pos_y, z: 0.0f };
+    // delta = vel * dt as a script V3.
+    let dx : f32 = nvx * dt;
+    let dy : f32 = nvy * dt;
+    let delta : V3 = V3 { x: dx, y: dy, z: 0.0f };
+    // new_pos = old_pos + delta (script V3 add — struct-by-value, both locals)
+    let np : V3 = v3_add(old_pos, delta);
+
+    let r : Entity = Entity { pos_x: np.x, pos_y: np.y, vel_x: nvx, vel_y: nvy, active: e.active };
+    return r;
+}
+
+// Elastic bounce off the arena walls (x in [-bounds_x, bounds_x],
+// y in [-bounds_y, bounds_y]). On a wall hit, clamp position to the wall
+// and flip the velocity component. Pure 2D; no vec needed here. We DO call
+// sqrt (the math extension) once on the speed to keep the math native on
+// the exercised path; it's a no-op on the result but proves sqrt is
+// callable in the sim. (sin/cos are registered too but unused — calling
+// them with a thrown-away angle would add noise without proving more.)
+fn bounce(e: Entity) -> Entity {
+    // locals must be `mut` to reassign — bindings are immutable by default.
+    let mut px : f32 = e.pos_x;
+    let mut py : f32 = e.pos_y;
+    let mut vx : f32 = e.vel_x;
+    let mut vy : f32 = e.vel_y;
+
+    // x walls
+    if (px > bounds_x) {
+        px = bounds_x;
+        vx = -vx;
+    } else {
+        if (px < -bounds_x) {
+            px = -bounds_x;
+            vx = -vx;
+        }
+    }
+    // y walls
+    if (py > bounds_y) {
+        py = bounds_y;
+        vy = -vy;
+    } else {
+        if (py < -bounds_y) {
+            py = -bounds_y;
+            vy = -vy;
+        }
+    }
+
+    // Exercise the math extension: sqrt of the speed (discarded — it's
+    // here to prove the math native is callable on the entity path, not
+    // for physics). A 2D sim doesn't need it; the demo needs it.
+    let spd_sq : f32 = vx * vx + vy * vy;
+    let _spd : f32 = sqrt(spd_sq);
+
+    let r : Entity = Entity { pos_x: px, pos_y: py, vel_x: vx, vel_y: vy, active: e.active };
+    return r;
+}
+
+// One full physics step for entity i: load -> integrate -> bounce -> store.
+fn step_entity(i: i64, dt: f32) -> i64 {
+    let e : Entity = load_entity(i);
+    let moved : Entity = integrate(e, dt);
+    let bounded : Entity = bounce(moved);
+    return store_entity(i, bounded);
+}
+
+// Demonstrate the mat + quat extensions are wired (not used by the 2D sim
+// physics, but the demo's mandate is to exercise vec/quat/mat together).
+// Returns 1 if all three extension entry points are callable + return valid
+// handles (we read a component from each to prove the handle is live, since
+// tagged handles can't be compared to integer 0 — they're nominal types).
+fn probe_extensions() -> i64 {
+    // mat4_identity -> opaque mat4 handle (mat extension). Identity's [0][0]
+    // is 1.0; mat4_get reads it back, proving the handle is live.
+    let m : mat4 = mat4_identity();
+    let m00 : f32 = mat4_get(m, 0, 0);
+    // quat_new(x, y, z, w) -> opaque quat handle (quat extension). The
+    // identity quaternion is (0,0,0,1); quat_w reads w back, proving the
+    // handle is live. (Note the x,y,z,w param order — not w,x,y,z.)
+    let q : quat = quat_new(0.0f, 0.0f, 0.0f, 1.0f);
+    let qw : f32 = quat_w(q);
+    if (m00 != 1.0f) { return 0; }
+    if (qw != 1.0f) { return 0; }
+    return 1;
+}

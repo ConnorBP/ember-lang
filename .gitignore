@@ -5,3 +5,5 @@
 /buildt
 # demo build artifacts (harnesses relinked from buildt libs)
 demo/**/*.exe
+# ember .em binary bundles (emit-em output) — never commit the binary, only the .ember source
+*.em

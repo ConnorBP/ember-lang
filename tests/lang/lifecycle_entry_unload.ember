@@ -1,0 +1,17 @@
+// lifecycle_entry_unload.ember — regression for the @entry return-sign bug
+// surfaced by demo/game. @entry returning <= 0 means UNLOAD (LIFECYCLE.md
+// §1): the host must NOT start the --tick loop. Before the fix, the CLI's
+// `exit_code = int(r & 0x7fffffff)` clamp turned a negative return (e.g. -1)
+// into a large positive (0x7fffffff), so `entry_says_stay = exit_code > 0`
+// was TRUE and the tick thread started anyway — ticking a module that had
+// asked to unload. The fix uses the SIGNED return for the lifecycle decision.
+//
+// This script returns -1 (unload) but declares an @on_tick that, if the bug
+// regressed, would run and print "stopped after N ticks". The harness asserts
+// the run does NOT print "stopped after" (no tick) and DOES print the
+// "module unloaded (no tick)" line.
+@on_tick
+fn tick() -> i64 { return 1; }
+
+@entry
+fn main() -> i64 { return -1; }

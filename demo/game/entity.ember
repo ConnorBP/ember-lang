@@ -1,0 +1,100 @@
+// entity.ember — entity struct + SoA backing store (array<f32> extension).
+//
+// The sim stores entity state in a host-owned array<f32> (SoA: positions then
+// velocities), addressed by entity index. This is the array<T> extension's
+// headline use: a resizable, bounds-checked host store behind an i64 handle.
+//
+// We also keep a script-level `Entity` struct (AoS view) for cross-module
+// struct-by-value exchange, AND we interplay with the host vec3 extension:
+// a position can be lifted into an opaque vec3 handle (vec3_new) for vector
+// math, then read back. Three representations of the same concept, on purpose
+// — the demo exercises the vec/quat/mat extensions and the array<T> extension
+// together, which is the language's headline game-entity use case.
+
+import "physics.ember";
+
+// Script-side AoS view of one entity. We exchange these by value across
+// modules (struct-by-value args/returns — the Win64 ABI restrictions apply:
+// struct returns go through a local, struct-by-value args are locals).
+struct Entity {
+    pos_x: f32;
+    pos_y: f32;
+    vel_x: f32;
+    vel_y: f32;
+    active: i64;
+}
+
+// Globals: scalars only (audit M11 — no aggregate global initializers).
+// These are the sim's configuration. A host or @entry seeds the non-const
+// ones (ember does not run global initializers at load for non-const inits;
+// const inits like `gravity` are baked — v1.0 eval_global_initializers).
+const gravity : f32 = -9.8f;
+global bounds_x : f32 = 100.0f;     // arena half-width  (bounce walls at +/- bounds_x)
+global bounds_y : f32 = 100.0f;     // arena half-height
+global max_entities : i64 = 64;     // capacity of the SoA store
+
+// SoA backing store: one array<f32> handle holding, for entity i:
+//   [i*4 + 0] = pos_x   (f32)
+//   [i*4 + 1] = pos_y   (f32)
+//   [i*4 + 2] = vel_x   (f32)
+//   [i*4 + 3] = vel_y   (f32)
+// Four f32s per entity; elem_size=4 bytes. The `active` flag is tracked in a
+// separate array<i64> so we don't mix element sizes in one store.
+global store_pos_vel : i64 = 0;    // array<f32> handle, set by init
+global store_active : i64 = 0;    // array<i64> handle, set by init
+global frame_counter : i64 = 0;   // per-tick atomic-style counter (script-side global)
+global entity_count : i64 = 0;    // live entity count
+
+// --- store lifecycle: init/resize/seed ---
+
+fn init_store(capacity: i64) -> i64 {
+    // array_new(elem_size, count) -> i64 handle (1-based; 0 = alloc failed).
+    // elem_size=4 bytes for f32; capacity entities * 4 floats.
+    let cells : i64 = capacity * 4;
+    store_pos_vel = array_new(4, cells);
+    store_active = array_new(8, capacity);
+    if (store_pos_vel == 0) { return 0; }
+    if (store_active == 0) { return 0; }
+    return 1;
+}
+
+// Seed entity i with a position + velocity. Writes the four f32 cells +
+// marks the entity active. Used by @entry to set up the deterministic
+// initial state the sim then integrates from.
+fn seed_entity(i: i64, px: f32, py: f32, vx: f32, vy: f32) -> i64 {
+    if (store_pos_vel == 0) { return 0; }
+    let base : i64 = i * 4;
+    array_set_f32(store_pos_vel, base + 0, px);
+    array_set_f32(store_pos_vel, base + 1, py);
+    array_set_f32(store_pos_vel, base + 2, vx);
+    array_set_f32(store_pos_vel, base + 3, vy);
+    array_set_i64(store_active, i, 1);
+    return 1;
+}
+
+// Load entity i into an AoS Entity struct (struct return via local — ABI).
+fn load_entity(i: i64) -> Entity {
+    let base : i64 = i * 4;
+    let px : f32 = array_get_f32(store_pos_vel, base + 0);
+    let py : f32 = array_get_f32(store_pos_vel, base + 1);
+    let vx : f32 = array_get_f32(store_pos_vel, base + 2);
+    let vy : f32 = array_get_f32(store_pos_vel, base + 3);
+    let act : i64 = array_get_i64(store_active, i);
+    let r : Entity = Entity { pos_x: px, pos_y: py, vel_x: vx, vel_y: vy, active: act };
+    return r;
+}
+
+// Store an Entity struct back into the SoA store at index i.
+fn store_entity(i: i64, e: Entity) -> i64 {
+    let base : i64 = i * 4;
+    array_set_f32(store_pos_vel, base + 0, e.pos_x);
+    array_set_f32(store_pos_vel, base + 1, e.pos_y);
+    array_set_f32(store_pos_vel, base + 2, e.vel_x);
+    array_set_f32(store_pos_vel, base + 3, e.vel_y);
+    array_set_i64(store_active, i, e.active);
+    return 1;
+}
+
+// Read just entity i's position x/y (the values the assertion checks).
+fn entity_pos_x(i: i64) -> f32 { return array_get_f32(store_pos_vel, i * 4 + 0); }
+fn entity_pos_y(i: i64) -> f32 { return array_get_f32(store_pos_vel, i * 4 + 1); }
