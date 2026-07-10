@@ -601,8 +601,44 @@ struct Checker {
         scopes.back().push_back({n, t, is_const, local_array_view});
     }
 
+    // NOTE (slice-escape safety, stage 1 vs stage 2): this function tracks
+    // stack-backed slices (ViewExpr over a fixed array, a StringLit that
+    // resolved to slice<u8>, and aliases through Ident/Ternary). The escape
+    // GUARDS that consume it are: return (ReturnStmt), global-Ident-store
+    // (AssignExpr Ident target), and global-rooted FieldExpr/IndexExpr-store
+    // (AssignExpr else-if branch) — these close C1/C2a/C2b for both the
+    // local_array_view class and the StringLit class.
+    //
+    // STAGE 2 (deferred): C3 (a stack-backed slice passed to a NATIVE that may
+    // retain the ptr) and C5 (a stack-backed slice passed to a script fn /
+    // fn-handle / cross-module call that may retain it) are NOT guarded at the
+    // call-arg sites. A blanket reject there was rejected because it breaks
+    // the legitimate synchronous pattern `return_slice_defer(return_values[..])`
+    // (a fn that takes a slice and returns it for the caller to read within the
+    // caller's own frame — see tests/lang/runtime_language_features.ember).
+    // Closing C3/C5 needs a real borrow/escape analysis: propagate the
+    // localview bit through a call's RETURN value (so the caller's binding of
+    // the result is itself a stack-backed slice), then reject only at the
+    // ACTUAL escape point (return/store of that propagated result), and add a
+    // `borrows`/`retains` annotation to NativeSig so C3 can distinguish
+    // copying natives (string_from_slice) from retaining ones. See
+    // demo/SLICE_ESCAPE_SAFETY_INVESTIGATION.md §6.3/§8 and the stage-2 roadmap
+    // entry. Until then C3/C5 are open at the call site (no shipped native
+    // retains, and a retaining script fn is the residual live hole).
     bool is_local_array_view(const Expr& e) const {
         if (dynamic_cast<const ViewExpr*>(&e)) return true;
+        // A StringLit that resolved to slice<u8> (NOT promoted to a `string`
+        // handle via implicit_to_string) backs into a compiler-hidden stack
+        // temp frame slot (codegen's alloc_str_temp) — the same lifetime shape
+        // as a ViewExpr over a fixed array. Track it so the existing escape
+        // guards (return, global-store) and the FieldExpr-global-store guard
+        // below cover StringLit-derived slices too. A StringLit promoted to a
+        // `string` handle has ty->is_slice == false (its ty is the `string`
+        // struct type), so this returns false for it — correct (the handle is
+        // owned and persistent). sl->ty is set in the StringLit check_expr
+        // case before any guard can run.
+        if (auto* sl = dynamic_cast<const StringLit*>(&e))
+            return sl->ty && sl->ty->is_slice;
         if (auto* id = dynamic_cast<const Ident*>(&e)) {
             for (int i = int(scopes.size()) - 1; i >= 0; --i)
                 for (const auto& v : scopes[size_t(i)])
@@ -1287,8 +1323,39 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
             } else {
                 auto gi = globals.find(tid->name);
                 if (gi != globals.end() && local_view)
-                    err("cannot store a slice/view derived from a local fixed array in a global",
+                    err("cannot store a slice/view derived from a stack local in a global",
                         a->loc.line, a->loc.col);
+            }
+        } else if (rt && rt->is_slice && is_local_array_view(*a->value)) {
+            // C2b: the target is a FieldExpr (gs.data = s;) or IndexExpr
+            // (garr[0] = s;). Chase to the root base; if it is a GLOBAL, the
+            // store escapes the frame (the slice ptr would dangle into the
+            // dead frame once the backing local's frame is torn down). A
+            // LOCAL-struct/local-array target is only unsafe if the local
+            // itself escapes — that is the harder escape analysis and is a
+            // follow-on; for v1 the conservative-and-correct cut rejects only
+            // the global-rooted case, matching the existing global-store guard
+            // above. Use a SINGLE loop peeling both FieldExpr and IndexExpr so
+            // interleaved access (gs.arr[0].data) is chased all the way to the
+            // root (two sequential loops would stop at the first IndexExpr and
+            // miss an inner FieldExpr). If the root is not an Ident (a call
+            // result, a literal, ...) we cannot prove it is a global, so we
+            // conservatively ALLOW — you may only reject when you can PROVE
+            // the target is a global.
+            const Expr* root = a->target.get();
+            while (true) {
+                if (auto* fe = dynamic_cast<const FieldExpr*>(root)) { root = fe->base.get(); continue; }
+                if (auto* ix = dynamic_cast<const IndexExpr*>(root)) { root = ix->base.get(); continue; }
+                break;
+            }
+            if (auto* rid = dynamic_cast<const Ident*>(root)) {
+                if (!lookup_local_var(rid->name)) {
+                    auto gi = globals.find(rid->name);
+                    if (gi != globals.end())
+                        err("cannot store a slice/view derived from a stack local into a "
+                            "field/element of a global '" + rid->name + "'",
+                            a->loc.line, a->loc.col);
+                }
             }
         }
         if (a->compound && lt && lt->is_float()) {
@@ -1599,7 +1666,7 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
                 err("return type mismatch (got " + vt->to_string() + ", fn returns " + ret_ty->to_string() + ")",
                     rs->loc.line, rs->loc.col);
             if (vt && vt->is_slice && is_local_array_view(*rs->value))
-                err("cannot return a slice/view derived from a local fixed array",
+                err("cannot return a slice/view derived from a stack local",
                     rs->loc.line, rs->loc.col);
             // A struct-returning function's `return` value may be (a) a bare
             // local (codegen copies its bytes through the hidden return

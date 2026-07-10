@@ -333,6 +333,38 @@ here so the decision and its evidence have a tracked home.
   `../demo/STRING_ENCRYPTION_ANALYSIS.md` for the original analysis + the
   probe that demonstrated the old heap-residency leak.
 
+- **Slice-of-stack-local escape safety — STAGE 1 DONE (2026-07-10), STAGE 2
+  DEFERRED.** A stack-backed slice (a `ViewExpr` over a fixed array, or an
+  encrypted `StringLit` temp) could escape its frame — returned, stored to a
+  global, stored into a global struct's field — and dangle. `is_local_array_view`
+  guarded only 2 of 5 escape categories, and `StringLit`-derived slices were
+  invisible to it entirely (all 5 open). Stage 1 (this pass, sema-only, no
+  codegen): (1) `is_local_array_view` now covers a `StringLit` whose resolved
+  type is `slice<u8>` (closes C1 return + C2a global-store for StringLit via
+  the existing guards); (2) a new `AssignExpr` guard chases a `FieldExpr`/
+  `IndexExpr` target to its root base and rejects when the root is a global
+  (closes C2b for BOTH classes, incl. nested `go.inner.data = a[..]`); (3)
+  updated the C1/C2a error messages from "local fixed array" to "stack local".
+  **Stage 2 (deferred): C3 (stack-backed slice passed to a native that may
+  retain the ptr) and C5 (stack-backed slice passed to a script fn / fn-handle
+  / cross-module call that may retain it) are NOT yet guarded** — a blanket
+  reject there would break the legitimate synchronous pattern
+  `return_slice_defer(return_values[..])` (a fn that returns its slice arg for
+  the caller to read within the caller's own frame). Closing C3/C5 needs a real
+  borrow/escape analysis: propagate the localview bit through a call's return
+  value, reject only at the actual escape point (return/store of the
+  propagated result), and add a `borrows`/`retains` annotation to `NativeSig`
+  so C3 can distinguish copying natives (`string_from_slice`) from retaining
+  ones. No shipped native retains a slice ptr today, so C3 is "accidentally
+  safe"; C5 (a retaining script fn) is the residual live hole. See
+  `../demo/SLICE_ESCAPE_SAFETY_INVESTIGATION.md` (the 5-category escape matrix,
+  probe evidence, and the full fix design) and `../demo/STRING_CONST_MODE_
+  INVESTIGATION.md` (which established that the const-mode classification is
+  subsumed by this fix — the owned `string`-handle path is already correct, so
+  no separate const-mode feature is needed). Verified: ctest 22/22, lang
+  255/0/0 (incl. 5 new `sema_invalid_*` regression tests for the closed
+  categories).
+
 ## What will never be added (hard non-goals)
 
 - **`goto`** - structured control only; complicates liveness, scope,

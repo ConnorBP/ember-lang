@@ -1,0 +1,10 @@
+// sema_invalid_struct_field_global_store_stringlit.ember — regression for the
+// C2b FieldExpr-target escape hole (StringLit class). Before the fix, storing
+// a StringLit-derived slice into a global struct's field (gs.data = "lit";)
+// compiled silently (the FieldExpr dyn_cast missed it AND is_local_array_view
+// did not recognize the StringLit). The fix covers both: is_local_array_view
+// now recognizes StringLit, and the FieldExpr-target root-base chase rejects
+// when the root is a global.
+struct S { data: u8[]; }
+global gs : S = S { data: "" };
+fn bad() -> i64 { gs.data = "dangles"; return 0; }

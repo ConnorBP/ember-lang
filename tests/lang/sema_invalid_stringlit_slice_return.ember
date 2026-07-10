@@ -1,0 +1,7 @@
+// sema_invalid_stringlit_slice_return.ember — regression for the StringLit
+// slice-escape hole (C1). Before the fix, is_local_array_view did not
+// recognize a StringLit, so `return "lit"` as a slice<u8> compiled silently and
+// returned a DANGLING stack ptr into the callee's reclaimed frame temp (the
+// inline-stack-XOR slot). is_local_array_view now covers a StringLit whose
+// resolved type is slice<u8>, so the existing return guard fires.
+fn bad() -> u8[] { return "dangles"; }

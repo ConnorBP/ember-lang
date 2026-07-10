@@ -1,0 +1,7 @@
+// sema_invalid_stringlit_global_store.ember — regression for the StringLit
+// slice-escape hole (C2a). Before the fix, storing a StringLit-derived slice
+// into a global u8[] compiled silently and SEGFAULTED at runtime (the global
+// slice's ptr dangled into the dead frame temp). is_local_array_view now
+// covers StringLit, so the existing global-store guard fires.
+global out: u8[] = "";
+fn bad() -> i64 { out = "dangles"; return 0; }
