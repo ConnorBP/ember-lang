@@ -1,0 +1,112 @@
+// compiler/main.ember — the driver for the µ interpreter.
+// Owns the fn-local node pool (5 fixed arrays + a meta array) and the symbol
+// table (a fixed 26-slot array), because aggregate/slice storage can't live at
+// global scope (M11) and slices derived from local arrays can't escape (return/
+// global-store). Drives lex → parse → eval and asserts a deterministic result.
+//
+// The demo program parsed is `let a = 1 + 2 * 3; a + 10` → 17. run() returns
+// that; the CLI exit code is the return value. main() wraps run() so the
+// default entry (`main`) is what the CLI calls.
+//
+// FEATURES STRESSED (the point of the demo — ember hosting itself):
+//   enum        Tok (lex), NodeK (parse)            — token/node kinds, switch dispatch
+//   struct      Token                                — returned by value via local (ABI)
+//   switch      lex_one, eval_node, eval_binop      — char/kind/op dispatch + trailing return
+//   slices      the 5 pool slices + meta + sym      — passed by value, element-wise read/write
+//   fixed arrays pool[256] + sym[26]               — the backing storage, fn-local
+//   recursion   parse_expr/term/factor, eval_node   — tree walk
+//   fn-ref      `let h: fn = &eval_binop;` in eval  — the node-eval dispatch table
+//   import      lex→parse→eval→main, +math/vec      — flat namespace, sibling path
+
+import "lex.ember";
+import "parse.ember";
+import "eval.ember";
+import "../math/vec.ember";
+
+// The canonical µ program the interpreter evaluates. `let a = 1 + 2 * 3;
+// a + 10` → precedence gives a = 7, then a + 10 = 17.
+global mu_program : string = "let a = 1 + 2 * 3; a + 10";
+
+// A second, richer program exercising parens, subtraction, division, multiple
+// lets, and identifier reuse. `let a = 2; let b = (a + 10) * 3; b / 4 - 1`
+// → b = 36, 36 / 4 = 9, 9 - 1 = 8.
+global mu_program2 : string = "let a = 2; let b = (a + 10) * 3; b / 4 - 1";
+
+// The expected results, as scalars (so they can be globals).
+global expect1 : i64 = 17;
+global expect2 : i64 = 8;
+
+// Run the interpreter on a single source string. Owns the fn-local pools,
+// passes slice views to lex/parse/eval. Returns the program's result, or a
+// negative sentinel on lex/parse/eval error.
+fn run_src(src: string) -> i64 {
+    // 1. lex: initialize the streaming lexer.
+    lex_init(src);
+
+    // 2. parse + eval share these fn-local pools. 256 nodes is generous for
+    //    the tiny demo programs; 26 symbol slots cover a..z.
+    let mut kinds: i64[256];
+    let mut vals:  i64[256];
+    let mut lft:   i64[256];
+    let mut rgt:   i64[256];
+    let mut nxt:   i64[256];
+    let mut meta:  i64[2];
+    let mut sym:   i64[26];
+
+    // zero the meta slice (count=0, err=0) and the symbol table.
+    meta[0] = 0;
+    meta[1] = 0;
+    let mut i: i64 = 0;
+    while (i < 26) { sym[i] = 0; i = i + 1; }
+
+    // slice views of the fixed arrays (passed by value: ptr,len to the fns).
+    let k_slice: i64[] = kinds[..];
+    let v_slice: i64[] = vals[..];
+    let l_slice: i64[] = lft[..];
+    let r_slice: i64[] = rgt[..];
+    let n_slice: i64[] = nxt[..];
+    let m_slice: i64[] = meta[..];
+    let s_slice: i64[] = sym[..];
+
+    // 3. parse.
+    let head: i64 = parse_program(k_slice, v_slice, l_slice, r_slice, n_slice, m_slice);
+    if (head < 0 || m_slice[1] != 0) {
+        return -1; // parse error
+    }
+    // also check the lexer didn't flag an error during parsing.
+    if (lx_err != 0) {
+        return -1;
+    }
+
+    // 4. eval.
+    let result: i64 = eval_program(k_slice, v_slice, l_slice, r_slice, n_slice, m_slice, s_slice, head);
+    if (m_slice[1] != 0) {
+        return -2; // eval error
+    }
+    return result;
+}
+
+// The default CLI entry. Runs both programs, asserts the deterministic results,
+// and returns 0 on success or a nonzero error code.
+fn main() -> i64 {
+    let r1: i64 = run_src(mu_program);
+    if (r1 != expect1) { return 100 + r1; } // lex/parse/eval bug or wrong result
+
+    let r2: i64 = run_src(mu_program2);
+    if (r2 != expect2) { return 200 + r2; }
+
+    // Sanity: a bare expression with no lets: `7 * 6 - 1` → 41.
+    let r3: i64 = run_src("7 * 6 - 1");
+    if (r3 != 41) { return 300 + r3; }
+
+    // Parens override precedence: `(2 + 3) * 4` → 20.
+    let r4: i64 = run_src("(2 + 3) * 4");
+    if (r4 != 20) { return 400 + r4; }
+
+    // Division: `100 / 5 / 2` → 10 (left-assoc).
+    let r5: i64 = run_src("100 / 5 / 2");
+    if (r5 != 10) { return 500 + r5; }
+
+    // All deterministic results match → ember hosted itself.
+    return 0;
+}

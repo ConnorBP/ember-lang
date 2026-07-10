@@ -368,7 +368,17 @@ int main(int argc, char** argv) {
     // at 10, not 0). Non-const inits (g = some_fn();) stay zero — a host or
     // @entry seeds those. The v1.0 integration found this gap; see
     // docs/v0.6_INTEGRATION_NOTES.md.
-    eval_global_initializers(pr.program, GlobalInitCtx{gb_store, gb.index, gb.types});
+    // v1.0+: seed `string`-typed globals' literal initializers too, by
+    // materializing the literal into a live string handle via the string
+    // extension (the extension owns the handle store). Before this, a
+    // `global g : string = "...";` compiled but its handle was never baked —
+    // the first read saw a null handle (string_length 0). The compiler demo
+    // surfaced this; the fix is the optional string_alloc_fn hook in
+    // GlobalInitCtx.
+    auto string_alloc_thunk = [](const char* bytes, int64_t len) -> int64_t {
+        return ember::ext_string::alloc(std::string(bytes, size_t(len > 0 ? len : 0)));
+    };
+    eval_global_initializers(pr.program, GlobalInitCtx{gb_store, gb.index, gb.types, string_alloc_thunk});
 
     // ---- dispatch table + codegen ctx (mirrors em_roundtrip_test) ----
     DispatchTable table(pr.program.funcs.size());

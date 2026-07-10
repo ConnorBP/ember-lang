@@ -32,6 +32,13 @@ struct GlobalInitCtx {
     std::vector<uint8_t>& bytes;                              // the globals block (8 * #globals)
     const std::unordered_map<std::string, uint32_t>& index;   // name -> global index
     const std::unordered_map<std::string, const Type*>& types;// name -> Type (from the host's GlobalsBlock)
+    // Optional host hook to materialize a `string`-typed global's string-literal
+    // initializer into an opaque i64 handle at load (the string extension owns
+    // the handle store; this helper stays free of that dependency). Receives the
+    // literal's raw bytes + length and returns a 1-based handle (0 = null).
+    // When null, string-typed globals are left zero (the pre-fix behavior — no
+    // host that doesn't wire this regresses).
+    int64_t (*string_alloc_fn)(const char* bytes, int64_t len) = nullptr;
 };
 
 // Evaluate every global's const initializer and write it into `gic.bytes`.
@@ -69,6 +76,20 @@ inline size_t eval_global_initializers(const Program& prog, GlobalInitCtx gic) {
             if (try_eval_const_bool(*g.init, v)) {
                 int64_t iv = v ? 1 : 0;
                 std::memcpy(slot, &iv, 8);
+                ++baked;
+            }
+        } else if (t && t->prim == Prim::I64 && t->struct_name == "string" && gic.string_alloc_fn) {
+            // A `string`-typed global (opaque i64 handle into the string
+            // extension's host store). Only a bare string-literal initializer is
+            // materializable at load — the literal's bytes go straight to the
+            // host hook, which returns the handle; we bake that handle (8 bytes)
+            // into the global slot so the first script read sees a live string.
+            // (Globals with non-literal string initializers, e.g. `global g =
+            //  make_str();`, stay zero — the JIT'd fn doesn't exist at load, same
+            // as the int/float/bool non-const case above.)
+            if (auto* lit = dynamic_cast<const StringLit*>(g.init.get())) {
+                int64_t h = gic.string_alloc_fn(lit->s.c_str(), int64_t(lit->s.size()));
+                std::memcpy(slot, &h, 8);
                 ++baked;
             }
         }

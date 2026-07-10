@@ -1,0 +1,203 @@
+// compiler/lex.ember — the streaming lexer for the µ language.
+// Hosts itself in ember: enum for token kinds, struct for Token, switch for
+// char dispatch, recursion over the source string, scalar-globals cursor.
+// (The fn-ref dispatch table is in eval.ember; the char classifiers here are
+// plain fns.)
+//
+// µ tokens: numbers, + - * / ( ), `let`, identifiers (single lowercase letter),
+// and `;`. The lexer streams tokens: the parser pulls one at a time via
+// lex_one(). The cursor (src, pos, len) lives in scalar globals because ember
+// rejects aggregate globals (audit M11) and there are no ref params — so
+// cross-fn mutable state uses globals, the same pattern the other demos use.
+//
+// Strings are opaque handles; we read bytes via string_char_at(src, i) -> i64.
+
+import "../math/vec.ember";
+
+// Token kinds for µ. Enum values are i32 constants usable in switch (Tier 1).
+enum Tok {
+    Num    = 1,   // integer literal (value carries the number)
+    Plus   = 2,   // +
+    Minus  = 3,   // -
+    Star   = 4,   // *
+    Slash  = 5,   // /
+    LParen = 6,   // (
+    RParen = 7,   // )
+    Let    = 8,   // 'let' keyword
+    Ident  = 9,   // identifier (ident carries the ASCII code)
+    Semi   = 10,  // ;
+    Eq     = 11,  // = (the let-binding separator)
+    Eof    = 12   // end of input
+}
+
+// A lexed token. Kept as a struct so lexer helper fns can return it by value
+// (struct-return-via-local ABI: build the literal in a local, return the local).
+struct Token {
+    kind: i32;    // a Tok value
+    value: i64;   // numeric value for Num
+    ident: i64;   // ASCII code for Ident, 0 otherwise; -1 flags a lex error
+}
+
+fn blank_token() -> Token {
+    let t: Token = Token { kind: Tok::Eof as i32, value: 0, ident: 0 };
+    return t;
+}
+
+// Build a punctuation/operator token of the given kind (value=0, ident=0).
+// Used so the lex_one switch can be in the supported statement form
+// (`case N: return tok(...);`) instead of block-form cases.
+fn tok(kind: i64) -> Token {
+    let t: Token = Token { kind: kind as i32, value: 0, ident: 0 };
+    return t;
+}
+
+// Build a lex-error sentinel token (Eof with value=-1, ident=-1).
+fn tok_err() -> Token {
+    let t: Token = Token { kind: Tok::Eof as i32, value: -1, ident: -1 };
+    return t;
+}
+
+// --- the lexer cursor (scalar globals; aggregate globals rejected, M11) ---
+global lx_src  : string = "";
+global lx_pos  : i64 = 0;
+global lx_len  : i64 = 0;
+global lx_err  : i64 = 0; // 1 once a lex error has been flagged
+
+// --- char classifiers. These are referenced by fn-ref handles in eval.ember
+//     (the eval dispatch table), to exercise the fn-ref surface. ---
+
+fn is_digit(ch: i64) -> i64 {
+    if (ch >= 48 && ch <= 57) { return 1; } // '0'..'9'
+    return 0;
+}
+
+fn is_alpha(ch: i64) -> i64 {
+    if ((ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95) {
+        return 1; // 'A'..'Z' | 'a'..'z' | '_'
+    }
+    return 0;
+}
+
+fn is_space(ch: i64) -> i64 {
+    if (ch == 32 || ch == 9 || ch == 10 || ch == 13) { return 1; }
+    return 0;
+}
+
+// Initialize the lexer with a source string.
+fn lex_init(src: string) -> i64 {
+    lx_src = src;
+    lx_pos = 0;
+    lx_len = string_length(src);
+    lx_err = 0;
+    return 0;
+}
+
+// Advance lx_pos past whitespace.
+fn skip_space() -> i64 {
+    let mut go: i64 = 1;
+    while (go == 1) {
+        if (lx_pos >= lx_len) { return 0; }
+        let ch: i64 = string_char_at(lx_src, lx_pos);
+        if (is_space(ch) == 1) {
+            lx_pos = lx_pos + 1;
+        } else {
+            go = 0;
+        }
+    }
+    return 0;
+}
+
+// Lex a number at lx_pos. Mutates lx_pos; returns the Token.
+fn lex_number() -> Token {
+    let mut v: i64 = 0;
+    let mut go: i64 = 1;
+    while (go == 1) {
+        if (lx_pos >= lx_len) { go = 0; }
+        let mut ch: i64 = 0;
+        if (lx_pos < lx_len) { ch = string_char_at(lx_src, lx_pos); }
+        if (lx_pos < lx_len && is_digit(ch) == 1) {
+            v = v * 10 + (ch - 48);
+            lx_pos = lx_pos + 1;
+        } else {
+            go = 0;
+        }
+    }
+    let t: Token = Token { kind: Tok::Num as i32, value: v, ident: 0 };
+    return t;
+}
+
+// Lex a word (identifier or `let`) at lx_pos. Mutates lx_pos; returns the Token.
+fn lex_word() -> Token {
+    let start: i64 = lx_pos;
+    let mut len: i64 = 0;
+    let mut first: i64 = 0;
+    let mut go: i64 = 1;
+    while (go == 1) {
+        if (lx_pos >= lx_len) { go = 0; }
+        let mut ch: i64 = 0;
+        if (lx_pos < lx_len) { ch = string_char_at(lx_src, lx_pos); }
+        if (lx_pos < lx_len && is_alpha(ch) == 1) {
+            if (len == 0) { first = ch; }
+            len = len + 1;
+            lx_pos = lx_pos + 1;
+        } else {
+            go = 0;
+        }
+    }
+    // "let" = l(108) e(101) t(116), length 3.
+    if (len == 3 && first == 108) {
+        let c1: i64 = string_char_at(lx_src, start + 1);
+        let c2: i64 = string_char_at(lx_src, start + 2);
+        if (c1 == 101 && c2 == 116) {
+            let t: Token = Token { kind: Tok::Let as i32, value: 0, ident: 0 };
+            return t;
+        }
+    }
+    // Otherwise an identifier. µ restricts identifiers to a single lowercase
+    // letter so the symbol table can be a fixed array indexed by (char - 'a').
+    if (len != 1) {
+        lx_err = 1;
+        let t: Token = Token { kind: Tok::Eof as i32, value: -1, ident: -1 };
+        return t;
+    }
+    let t: Token = Token { kind: Tok::Ident as i32, value: 0, ident: first };
+    return t;
+}
+
+// Lex one token at lx_pos and advance the cursor. The main lexer step.
+fn lex_one() -> Token {
+    skip_space();
+    if (lx_pos >= lx_len) {
+        let t: Token = Token { kind: Tok::Eof as i32, value: 0, ident: 0 };
+        return t;
+    }
+    let ch: i64 = string_char_at(lx_src, lx_pos);
+    if (is_digit(ch) == 1) {
+        return lex_number();
+    }
+    if (is_alpha(ch) == 1) {
+        return lex_word();
+    }
+    lx_pos = lx_pos + 1;
+    switch (ch) {
+        case 43: return tok(Tok::Plus as i64);    // '+'
+        case 45: return tok(Tok::Minus as i64);   // '-'
+        case 42: return tok(Tok::Star as i64);    // '*'
+        case 47: return tok(Tok::Slash as i64);   // '/'
+        case 40: return tok(Tok::LParen as i64);  // '('
+        case 41: return tok(Tok::RParen as i64);  // ')'
+        case 59: return tok(Tok::Semi as i64);    // ';'
+        case 61: return tok(Tok::Eq as i64);     // '='
+        default: lx_err = 1; return tok_err();
+    }
+    return blank_token(); // switch default:return not recognized exhaustive (M7-adjacent)
+}
+
+// Peek the next token WITHOUT consuming it (save/restore the cursor). Used by
+// the parser to decide between a let-statement and a bare expression.
+fn lex_peek() -> Token {
+    let saved_pos: i64 = lx_pos;
+    let t: Token = lex_one();
+    lx_pos = saved_pos;
+    return t;
+}

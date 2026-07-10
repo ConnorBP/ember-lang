@@ -1,0 +1,93 @@
+// compiler/eval.ember — the tree-walking evaluator for the µ language.
+// Walks the AST built by parse.ember by node index. Uses:
+//   - recursion (eval_node calls itself for child node indices)
+//   - switch on node kind (NodeK) for dispatch
+//   - a fn-ref dispatch table: a small set of `fn`-typed locals bound to the
+//     per-node-kind helpers, selected by switch and called through the handle.
+//     This exercises the first-class fn-ref surface (Tier 2: &fn / handle /
+//     fn type keyword) the way the buffer demo's apply_twice does.
+//   - a symbol table: a fixed i64[26] array (one slot per lowercase letter),
+//     fn-local in run(), passed as a slice. let writes a slot; Var reads it.
+//
+// eval_node returns the i64 value of the node (for expressions) or 0 (for
+// statements); on any error it sets meta[1] and returns a sentinel. Division
+// by zero is caught at eval time and flagged (the host trap surface would
+// also catch it, but we surface it cleanly through meta[1]).
+
+import "parse.ember";
+
+// The error sentinel returned by eval when meta[1] is set. Chosen so a
+// successful program can't accidentally produce it (programs return small
+// positive numbers in the demo).
+global eval_err_sentinel : i64 = -9000;
+
+// Apply a binary operator to two already-evaluated operands. Takes only
+// (op, l, r) — three i64s — so the fn-ref call that dispatches here stays
+// within the 4-register Win64 convention (fn-ref calls with 5+ args are a
+// known-broken codegen path — see demo/compiler/NOTES.md; kept to ≤4 args
+// as the supported surface). This is the fn the fn-ref handle in eval_node
+// is bound to — the node-eval dispatch table.
+fn apply_binop(op: i64, l: i64, r: i64) -> i64 {
+    switch (op) {
+        case 2: return l + r;   // Tok::Plus
+        case 3: return l - r;   // Tok::Minus
+        case 4: return l * r;   // Tok::Star
+        case 5:                  // Tok::Slash — check divide-by-zero
+            if (r == 0) { return eval_err_sentinel; }
+            return l / r;
+        default: return eval_err_sentinel;
+    }
+    return eval_err_sentinel; // switch default:return not recognized exhaustive (M7-adjacent)
+}
+
+// Evaluate a single node by index. The central dispatch. For BinOp it builds
+// a fn-ref handle bound to apply_binop and calls it — the dispatch table.
+fn eval_node(kinds: i64[], vals: i64[], left: i64[], right: i64[], next: i64[], meta: i64[], sym: i64[], idx: i64) -> i64 {
+    if (idx < 0) {
+        meta[1] = 1;
+        return eval_err_sentinel;
+    }
+    let k: i64 = kinds[idx];
+    switch (k) {
+        case 1: return vals[idx];                       // NodeK::Num
+        case 2: return sym[vals[idx]];                  // NodeK::Var
+        case 3:                                         // NodeK::BinOp
+            let op: i64 = vals[idx];
+            let l: i64 = eval_node(kinds, vals, left, right, next, meta, sym, left[idx]);
+            if (meta[1] != 0) { return eval_err_sentinel; }
+            let r: i64 = eval_node(kinds, vals, left, right, next, meta, sym, right[idx]);
+            if (meta[1] != 0) { return eval_err_sentinel; }
+            // fn-ref dispatch: bind a handle to apply_binop and call through it.
+            let h: fn = &apply_binop;
+            let v: i64 = h(op, l, r);
+            if (v == eval_err_sentinel) { meta[1] = 1; }
+            return v;
+        case 4:                                         // NodeK::Let
+            let v: i64 = eval_node(kinds, vals, left, right, next, meta, sym, left[idx]);
+            if (meta[1] != 0) { return eval_err_sentinel; }
+            sym[vals[idx]] = v;   // store into the var's slot
+            return 0;
+        case 5:                                         // NodeK::ExprSt
+            return eval_node(kinds, vals, left, right, next, meta, sym, left[idx]);
+        case 6: return 0;                               // NodeK::Nil
+        default: meta[1] = 1; return eval_err_sentinel;
+    }
+    return eval_err_sentinel; // switch default:return not recognized exhaustive (M7-adjacent)
+}
+
+// Evaluate a whole statement list rooted at `head` (linked via `next`).
+// Returns the value of the LAST expression statement (the program's result),
+// or eval_err_sentinel on error. let statements contribute 0 and don't
+// change the running "last expr" value.
+fn eval_program(kinds: i64[], vals: i64[], left: i64[], right: i64[], next: i64[], meta: i64[], sym: i64[], head: i64) -> i64 {
+    let mut cur: i64 = head;
+    let mut last: i64 = 0;
+    while (cur >= 0) {
+        let k: i64 = kinds[cur];
+        let v: i64 = eval_node(kinds, vals, left, right, next, meta, sym, cur);
+        if (meta[1] != 0) { return eval_err_sentinel; }
+        if (k == 5) { last = v; }   // record expression-statement results
+        cur = next[cur];
+    }
+    return last;
+}

@@ -103,6 +103,7 @@ run_import_cli() {
 # Executable language regressions use main's exit code as their assertion.
 for spec in "runtime_audit_semantics.ember:77" "runtime_cast_regressions.ember:42" \
             "runtime_division_forms.ember:78" "runtime_integer_boundaries.ember:79" "runtime_language_features.ember:93" \
+            "runtime_global_string_init.ember:42" \
             "sema_valid_basics.ember:6" "sema_valid_defer_local_ref.ember:94"; do
     f=${spec%%:*}; exp=${spec##*:}; out=$("$CLI" run "tests/lang/$f" 2>&1); rc=$?
     if [ $rc -eq "$exp" ]; then printf "PASS  %s (explicit expected rc=%d)\n" "$f" "$rc"; pass=$((pass+1))

@@ -1,0 +1,196 @@
+// compiler/parse.ember — the parser for the µ language.
+// Consumes tokens from lex.ember (via lex_one / lex_peek) and builds an AST
+// in a flat node pool: five parallel slices (kinds, vals, left, right, next)
+// plus a meta slice holding [count, err]. All six slices are fn-local in
+// run() and passed BY VALUE (ptr,len) to the parse_* fns; element writes
+// through a slice hit the backing array, so appended nodes are visible to the
+// caller. This is the supported shape — slice globals are aggregate globals
+// (rejected, M11), and slices derived from local arrays can't escape (return/
+// global-store), so the pool must live in the fn that drives parse + eval.
+//
+// Grammar (recursive descent, precedence climbing):
+//   program     := stmt_list EOF
+//   stmt_list   := stmt { ';' stmt }            // `;` separates statements
+//   stmt        := 'let' ident '=' expr         // a let binding
+//                | expr                          // a bare expression stmt
+//   expr        := term { ('+' | '-') term }
+//   term        := factor { ('*' | '/') factor }
+//   factor      := number | ident | '(' expr ')'
+
+import "lex.ember";
+
+// AST node kinds for µ.
+enum NodeK {
+    Num    = 1,   // literal:           val = the number
+    Var    = 2,   // variable reference: val = the var slot index (0..25)
+    BinOp  = 3,   // binary op:         val = a Tok value (Plus/Minus/Star/Slash),
+                  //                     left/right = operand node indices
+    Let    = 4,   // let binding:       val = var slot index, left = init expr,
+                  //                     next = next stmt index
+    ExprSt = 5,  // expression stmt:    left = expr, next = next stmt index
+    Nil    = 6    // empty / sentinel
+}
+
+// meta slice layout: meta[0] = node count, meta[1] = error flag.
+// (Kept in a slice so a parser fn can bump the count by writing meta[0].)
+
+// Allocate one node in the pool. Writes kind/val/left/right/next = Nil and
+// bumps meta[0]. Returns the new node's index, or -1 on overflow / error.
+fn alloc_node(kinds: i64[], vals: i64[], left: i64[], right: i64[], next: i64[], meta: i64[], kind: i64) -> i64 {
+    let idx: i64 = meta[0];
+    if (idx >= 256) {
+        meta[1] = 1;
+        return -1;
+    }
+    kinds[idx] = kind;
+    vals[idx]  = 0;
+    left[idx]  = -1;
+    right[idx] = -1;
+    next[idx]  = -1;
+    meta[0] = idx + 1;
+    return idx;
+}
+
+// --- recursive-descent parser. Each parse_* fn takes the pool + meta slices
+//     and returns the index of the root node it built (or -1 on error). ---
+
+// factor := number | ident | '(' expr ')'
+fn parse_factor(kinds: i64[], vals: i64[], left: i64[], right: i64[], next: i64[], meta: i64[]) -> i64 {
+    let t: Token = lex_one();
+    if (t.kind == (Tok::Num as i32)) {
+        let idx: i64 = alloc_node(kinds, vals, left, right, next, meta, NodeK::Num as i64);
+        if (idx < 0) { return -1; }
+        vals[idx] = t.value;
+        return idx;
+    }
+    if (t.kind == (Tok::Ident as i32)) {
+        let idx: i64 = alloc_node(kinds, vals, left, right, next, meta, NodeK::Var as i64);
+        if (idx < 0) { return -1; }
+        // var slot = (ascii - 'a'); µ idents are a single lowercase letter.
+        vals[idx] = t.ident - 97;
+        return idx;
+    }
+    if (t.kind == (Tok::LParen as i32)) {
+        let e: i64 = parse_expr(kinds, vals, left, right, next, meta);
+        if (e < 0) { return -1; }
+        let close: Token = lex_one();
+        if (close.kind != (Tok::RParen as i32)) {
+            meta[1] = 1;
+            return -1;
+        }
+        return e;
+    }
+    // unexpected token
+    meta[1] = 1;
+    return -1;
+}
+
+// term := factor { ('*' | '/') factor }
+fn parse_term(kinds: i64[], vals: i64[], left: i64[], right: i64[], next: i64[], meta: i64[]) -> i64 {
+    let lhs: i64 = parse_factor(kinds, vals, left, right, next, meta);
+    if (lhs < 0) { return -1; }
+    let mut go: i64 = 1;
+    let mut acc: i64 = lhs;
+    while (go == 1) {
+        let t: Token = lex_peek();
+        if (t.kind == (Tok::Star as i32) || t.kind == (Tok::Slash as i32)) {
+            let op: Token = lex_one(); // consume the operator
+            let rhs: i64 = parse_factor(kinds, vals, left, right, next, meta);
+            if (rhs < 0) { return -1; }
+            let node: i64 = alloc_node(kinds, vals, left, right, next, meta, NodeK::BinOp as i64);
+            if (node < 0) { return -1; }
+            vals[node] = op.kind as i64;
+            left[node] = acc;
+            right[node] = rhs;
+            acc = node;
+        } else {
+            go = 0;
+        }
+    }
+    return acc;
+}
+
+// expr := term { ('+' | '-') term }
+fn parse_expr(kinds: i64[], vals: i64[], left: i64[], right: i64[], next: i64[], meta: i64[]) -> i64 {
+    let lhs: i64 = parse_term(kinds, vals, left, right, next, meta);
+    if (lhs < 0) { return -1; }
+    let mut go: i64 = 1;
+    let mut acc: i64 = lhs;
+    while (go == 1) {
+        let t: Token = lex_peek();
+        if (t.kind == (Tok::Plus as i32) || t.kind == (Tok::Minus as i32)) {
+            let op: Token = lex_one(); // consume the operator
+            let rhs: i64 = parse_term(kinds, vals, left, right, next, meta);
+            if (rhs < 0) { return -1; }
+            let node: i64 = alloc_node(kinds, vals, left, right, next, meta, NodeK::BinOp as i64);
+            if (node < 0) { return -1; }
+            vals[node] = op.kind as i64;
+            left[node] = acc;
+            right[node] = rhs;
+            acc = node;
+        } else {
+            go = 0;
+        }
+    }
+    return acc;
+}
+
+// stmt := 'let' ident '=' expr | expr
+// Returns the stmt node index, or -1 on error.
+fn parse_stmt(kinds: i64[], vals: i64[], left: i64[], right: i64[], next: i64[], meta: i64[]) -> i64 {
+    let t: Token = lex_peek();
+    if (t.kind == (Tok::Let as i32)) {
+        let kw: Token = lex_one(); // consume 'let' (kw unused; just advancing)
+        let name: Token = lex_one();
+        if (name.kind != (Tok::Ident as i32)) {
+            meta[1] = 1;
+            return -1;
+        }
+        let eq: Token = lex_one();
+        if (eq.kind != (Tok::Eq as i32)) {
+            meta[1] = 1;
+            return -1;
+        }
+        let init: i64 = parse_expr(kinds, vals, left, right, next, meta);
+        if (init < 0) { return -1; }
+        let node: i64 = alloc_node(kinds, vals, left, right, next, meta, NodeK::Let as i64);
+        if (node < 0) { return -1; }
+        vals[node] = name.ident - 97;
+        left[node] = init;
+        return node;
+    }
+    // bare expression statement
+    let e: i64 = parse_expr(kinds, vals, left, right, next, meta);
+    if (e < 0) { return -1; }
+    let node: i64 = alloc_node(kinds, vals, left, right, next, meta, NodeK::ExprSt as i64);
+    if (node < 0) { return -1; }
+    left[node] = e;
+    return node;
+}
+
+// program := stmt { ';' stmt } EOF
+// Parses the whole program, linking statements via `next`. Returns the head
+// stmt index, or -1 on error. The trailing EOF token is consumed.
+fn parse_program(kinds: i64[], vals: i64[], left: i64[], right: i64[], next: i64[], meta: i64[]) -> i64 {
+    let head: i64 = parse_stmt(kinds, vals, left, right, next, meta);
+    if (head < 0) { return -1; }
+    let mut cur: i64 = head;
+    let mut go: i64 = 1;
+    while (go == 1) {
+        let t: Token = lex_peek();
+        if (t.kind == (Tok::Eof as i32)) {
+            go = 0;
+        } else {
+            if (t.kind != (Tok::Semi as i32)) {
+                meta[1] = 1;
+                return -1;
+            }
+            let semi: Token = lex_one(); // consume ';'
+            let s: i64 = parse_stmt(kinds, vals, left, right, next, meta);
+            if (s < 0) { return -1; }
+            next[cur] = s;
+            cur = s;
+        }
+    }
+    return head;
+}
