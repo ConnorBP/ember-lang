@@ -237,6 +237,52 @@ host-callable functions (mirrors the surveyed native-JIT language's `runtime_err
   simplification (one code path to get right, one thing to test)
   rather than N special-cased error-propagation mechanisms.
 
+### 7a. Call-target provenance (first-class function refs — REDSHELL guard #6, shipped v1.0)
+
+First-class function references (`&fn` / `handle(args)` / the `fn` type
+keyword, `ROADMAP.md` Tier 2 ✓ shipped) open a new runtime surface: a
+script can carry an i64 around and later use it as a call target. The
+i64-as-call-target surface (the V2 vector the REDSHELL writeup names)
+gets two guards, one at each layer:
+
+- **Compile-time first line** (sema, `src/sema.cpp`): i64 ↔ fn
+  assignment is forbidden either direction — a script cannot forge a fn
+  handle by writing an arbitrary i64 into a `fn`-typed slot. A `&fn`
+  handle is the only way to produce a fn-typed value; a native that
+  returns `fn` (the `register_routine`-style shape) is the other trusted
+  source.
+- **Runtime last line** (codegen, `src/codegen.cpp` `emit_call_target_guard`):
+  the JIT'd code validates the handle against a host-built bitset
+  **allowlist** before indexing the dispatch table.
+
+> **Call-target provenance (Tier 2).** A first-class function handle is an
+> i64 = dispatch-table slot index. At every indirect call site (`handle(args)`),
+> the JIT'd code validates the handle against a host-built bitset allowlist
+> (one bit per registered script-fn slot, set by sema at compile time) before
+> indexing the dispatch table. A handle that is out of range or whose bit is
+> clear traps via `emit_trap(BadCallTarget)` (longjmp to the `ember_call`
+> checkpoint). The JIT'd code never executes `call rax` / `call [table + h*8]`
+> with an unvalidated script-supplied i64. This is the runtime backstop for
+> the V2 ("i64-as-call-target") surface that first-class function references
+> open; the type-level rule (no i64-to-fn assignment) is the compile-time
+> first line, the bitset guard is the runtime last line.
+
+`BadCallTarget` is a `TrapReason` (`src/context.hpp`) routed through the
+same shared unwind as every other trap (Section 7 / Section 2). The allowlist
+is built by `build_fn_allowlist(script_slots, slot_count)` in
+`src/codegen.hpp`; the host pins its `.data()` base for the module's
+lifetime and sets `CodeGenCtx::fn_allowlist_base` / `fn_slot_count` before
+compiling. The guard is a **no-op (zero emitted)** when no allowlist is
+configured (`fn_slot_count == 0`), so every existing module that doesn't use
+function refs pays nothing. See `examples/function_refs_test.cpp` (ctest
+target `function_refs`) for the out-of-range and in-range-unregistered
+handle trap tests. Two open items are documented at `ROADMAP.md` Tier 2:
+the **bare-`fn` signature hole** (a `fn`-typed param with no recorded sig
+does not type-check args — a type-soundness hole, not a sandbox violation;
+the guard still validates the handle, the called code still obeys all
+budgets/bounds) and **cross-module handles** (deferred to v2+; the allowlist
+is per-module).
+
 ## 8. What is explicitly NOT checked (documented gaps, not oversights)
 
 - **Native function argument validity beyond type/arity.** If a host
@@ -248,14 +294,86 @@ host-callable functions (mirrors the surveyed native-JIT language's `runtime_err
   types, matches CODEGEN_SPEC.md's calling-convention placement), not
   domain-level validity of the values.
 - **Aliasing/data-race safety across threads.** DESIGN.md non-goals
-  already exclude multithreaded execution inside one context; if a
-  host runs multiple `context_t`s on multiple threads against the
-  same `module_t` (allowed - the dispatch table and JIT'd code are
-  read-only after compilation except during a hot-reload slot swap,
-  HOT_RELOAD.md Section 5), that slot-swap's atomicity is the only
-  thread-safety guarantee made; script-visible global mutable state
-  shared across contexts is a host-design question, not something
-  ember arbitrates (there is no script-level threading primitive to
-  even create a race from script's own perspective in v1).
+  already exclude multithreaded execution **inside one `context_t`**;
+  v1.0 adds the multi-context model (Option D + B1, see Section 8a
+  below) so a host may run **one `context_t` per worker thread** against
+  shared compiled code — the dispatch table and JIT'd code are read-only
+  after compilation except during a hot-reload slot swap
+  (`HOT_RELOAD.md` Section 5); that slot-swap's atomicity is the only
+  thread-safety guarantee made on that shared state. Script-visible global
+  mutable state shared across contexts is a host-design question, not
+  something ember arbitrates. There is no script-level primitive to create
+  a data race **between two threads on one context** — running two ember-
+  calling threads against a *single* `context_t` still races (a trap on one
+  could longjmp to the other's checkpoint — the generalized `--tick` bug);
+  the discipline is one-context-per-thread (Section 8a), not in-context
+  threading. The sync-queue primitives (`extensions/sync/`) let a script
+  coordinate with host threads on host-owned shared state behind i64
+  handles under the **U2 contract** (script side single-threaded per
+  context; host producer/consumer threads touch only the queue HOST storage
+  via the `_host` accessors, never the context) — they do not make a
+  `context_t` safe for concurrent calls.
 - **Speculative-execution/side-channel classes** (Section 1) - out of scope,
   consistent with every other embedded-scripting engine surveyed.
+
+## 8a. Context thread-safety (Option D + B1 — shipped v1.0)
+
+The non-local-abort machinery in Sections 2–4 was originally
+single-threaded-by-assumption: a checkpoint, a budget counter, and a
+depth counter lived on one `context_t`, and a trap longjmp'd to that
+context's checkpoint. v1.0 makes the per-`ember_call` state
+**per-thread** so one compiled module can serve N concurrent caller
+threads, each with its own `context_t`. Two pieces (plan:
+`docs/plan_CONTEXT_THREADSAFETY.md`):
+
+- **Option D — one `context_t` per thread.** Each concurrent caller
+  thread allocates its own `context_t` (private `checkpoint` /
+  `budget_remaining` / `call_depth` / `last_trap`); they share the
+  dispatch table, JIT'd code, and module registry, all of which are
+  read-only after compile. A trap on thread B longjmps to thread B's own
+  checkpoint — no cross-thread checkpoint corruption. `context_t`
+  (`src/context.hpp`) is restructured to a **POD prefix** — the JIT-read
+  fields (`budget_remaining`, `call_depth`, `max_call_depth`, then
+  `last_trap`) come first and are POD, so `[ctx_reg + offsetof(field)]`
+  is standard and stable across compilers (the trailing `std::string`
+  `last_error` is non-POD and stays out of the offset math).
+  `context_offsets()` gives the exact byte offsets the codegen bakes
+  into `[r14 + off]`.
+- **Option B1 — the per-call context register.** With
+  `CodeGenCtx::use_context_reg = true`, the budget/depth/trap emits
+  (`emit_budget_check`, `emit_depth_check`, `emit_depth_leave`,
+  `emit_trap` in `src/codegen.cpp`) read `context_t` fields through `r14`
+  — the per-call context register, set by the host at entry and
+  **callee-saved** so a script-to-script call forwards it (the callee
+  inherits the same ctx). The trap stub's first arg (`rcx`) is loaded
+  from `r14` rather than a baked imm64 pointer. The load-bearing
+  consequence: **one compiled body serves N per-thread `context_t`s** —
+  no per-context recompile. The host sets `r14 = ctx` at entry via the
+  `ember_call_void` / `ember_call_i64` inline-asm helpers
+  (`src/engine.{hpp,cpp}`); legacy non-B1 hosts keep the baked-pointer
+  behavior (`use_context_reg = false` is the default).
+
+The globals-lookup emit-time fix that came with it: codegen now prefers
+`ctx.globals_index` / `ctx.globals_types` (threaded through `CodeGenCtx`)
+over the legacy process-wide `g_globals_for_codegen` pointer (which races
+under parallel compilation); the legacy pointer stays as a null-by-default
+backward-compat fallback so existing hosts keep working.
+
+Pinned by `examples/thread_safety_test.cpp` (ctest target `thread_safety`):
+the keystone two-thread proof — thread A (big budget) finishes and returns,
+thread B (tiny budget) traps `BudgetExceeded` on its **own** `context_t`,
+and neither thread's longjmp corrupts the other (the `--tick` bug,
+generalized). The CLI `--tick` path is the first host to consume B1: commit
+`c6457cd` wired `ember_cli --tick` to compile with `use_context_reg = true`,
+call `@entry` via `ember_call_void(entry, &ectx)`, and run the tick thread on
+its **own** `context_t` (`tick_ctx`) via `ember_call_void(f, &tick_ctx)` —
+fully isolated from the main thread's `ectx`, so a tick trap stops the tick
+thread, never the main thread. See `docs/v1.0_INTEGRATION_NOTES.md` §1/§5.
+
+**What this does NOT change.** The shared compiled code is read-only
+after compile except during a hot-reload slot swap (`HOT_RELOAD.md` Section 5);
+in-context multithreaded execution (two ember-calling threads on one
+`context_t`) is still a non-goal and still races — the model is
+one-context-per-thread, not in-context threading. The sync-queue primitives
+in `extensions/sync/` coordinate on host-owned shared state under the U2
+contract; they do not remove the one-context-per-thread rule.

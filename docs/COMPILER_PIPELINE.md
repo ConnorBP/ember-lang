@@ -16,21 +16,34 @@ Literals:   INT_LIT (e.g. 42, 42u, 42i64 - optional type suffix,
             see Section 6 default-type rule), FLOAT_LIT (e.g. 1.0, 1.0f),
             STRING_LIT ("..."), BOOL_LIT (true/false)
 Identifiers: IDENT
-Keywords:   fn struct global if else while for break continue return
-            as auto true false bool i8 i16 i32 i64 u8 u16 u32 u64
-            f32 f64 void
-Punctuation: ( ) { } [ ] , ; : -> . ..
+Keywords:   fn struct global enum if else while do for switch case
+            default break continue return as auto defer const constexpr
+            link true false bool i8 i16 i32 i64 u8 u16 u32 u64
+            f32 f64 void sizeof offsetof
+            (v1.0: `enum` + `link`/`switch`/`case`/`default`/`do`/`defer`/
+            `const`/`constexpr`/`sizeof`/`offsetof` were all added as the frontend
+            grew past the v0.1 spec this list was written against; see the
+            v0.2–v1.0 milestones in `DESIGN.md`. The `fn` keyword is
+            overloaded: a *declaration* (`fn name(...) -> ret`) starts at
+            `parse_top`, a *type* (`fn`, in `parse_type`) is the v1.0
+            function-handle type — i64 with `is_fn_handle=true`, a bare
+            handle that accepts any fn — see Section 2's `&fn`/`handle(args)`.)
+Punctuation: ( ) { } [ ] , ; : -> . .. ::
+            (`::` is the v0.5 cross-module selector `mod::fn` AND the v1.0
+            enum-variant access `E::A`; the one-token lookahead split is in
+            Section 2.)
 Operators:  + - * / % = == != < <= > >= && || ! & | ^ ~ << >> += -=
-            *= /= %=
+            *= /= %=  (v1.0: prefix `&` in `parse_unary` is
+            function-handle-take `&fn_name`, distinct from the bitwise-AND
+            `&` binary operator in `parse_band`; see Section 2.)
 Annotation: @ (starts an annotation, followed by IDENT and optional
             parenthesized literal-list, TYPE_SYSTEM.md Section 10)
 ```
-- No `class`, `enum`, `switch`, `do`, `goto`, `const`, `static`,
-  `typedef`/`using`, `template`, `namespace`, `#include`/preprocessor
-  - none exist in v1 grammar (matches DESIGN.md non-goals; `switch`
-  specifically omitted because `if/else` chains cover it and adding
-  switch-with-fallthrough semantics is pure extra surface with no
-  demonstrated need yet - YAGNI, easy additive grammar change later).
+- No `class`, `goto`, `do`-while-top-level, `typedef`/`using`, `template`,
+  `namespace`, `#include`/preprocessor - none exist in v1 grammar (matches
+  DESIGN.md non-goals). (`switch`/`case`/`default`/`do` shipped v0.2–v0.5;
+  `enum` shipped v1.0 — the original v0.1 spec's "no enum/switch" note is
+  superseded, see DESIGN.md non-goals.)
 - Comments: `//` line and `/* */` block, stripped by the lexer,
   never reach the parser (no doc-comment/attribute-comment special
   handling in v1).
@@ -177,6 +190,13 @@ struct BinaryExpr { BinOp op; unique_ptr<Expr> lhs, rhs; };
 struct UnaryExpr  { UnOp op; unique_ptr<Expr> operand; };
 struct CastExpr    { unique_ptr<Expr> operand; TypeRef target; };
 struct CallExpr    { string name; vector<Expr> args; };            // free fn or method (method desugared at sema, BINDING_API.md Section 3)
+                   // v1.0 Tier 2: also the indirect call `handle(args)` —
+                   //   `indirect_target` (ExprPtr) + `is_indirect` (bool),
+                   //   `name` empty; built by `parse_postfix` when the call
+                   //   target is none of the named forms (a runtime i64
+                   //   handle). `FnHandleExpr` (`&fn_name`) is a separate node.
+struct EnumAccessExpr { string enum_name; string variant; };    // v1.0 Tier 1: `E::A`, exists only parse→sema; sema rewrites it in place to an IntLit.
+struct FnHandleExpr   { ExprPtr operand; int slot = -1; };      // v1.0 Tier 2: `&fn_name` — sema bakes the slot as an i64 literal (no codegen case needs to know it's a handle).
 struct IndexExpr   { unique_ptr<Expr> base; unique_ptr<Expr> index; };
 struct FieldExpr   { unique_ptr<Expr> base; string field; };
 struct ViewExpr    { unique_ptr<Expr> base; };                     // arr[..]
@@ -185,6 +205,51 @@ struct LiteralExpr { LiteralValue value; };
 struct StructLiteralExpr { string type_name; vector<pair<string,Expr>> fields; };
 struct AssignExpr  { unique_ptr<Expr> target; optional<BinOp> compound_op; unique_ptr<Expr> value; };
 ```
+
+(`EnumDecl` + `EnumVariant` — `enum E { A, B, C }` / `variant = constexpr_int` —
+live on `Program` (Tier 1, `src/ast.hpp`); `CallExpr::indirect_target`/
+`is_indirect` and the standalone `FnHandleExpr` node are Tier 2.)
+
+### 2a. New v1.0 surface syntax (Tier 1 enums + Tier 2 function refs)
+
+The grammar grew two top-level / expression forms in the v1.0 concurrency +
+Tier 2 batch, all verified in `src/parser.cpp`:
+
+- **Enum declaration** (top-level, `parse_enum`): `enum IDENT { (variant (',' variant)* ','?)? }`
+  where `variant := IDENT ('=' constexpr_int_expr)?`. Auto-increment from 0
+  (or from the last explicit value); explicit-value expr is parsed as a full
+  `parse_expr()` and restricted to a compile-time integer by sema's
+  `try_eval_const_i64`. Trailing comma allowed.
+- **Enum-variant access** (postfix `::`, `parse_postfix`): `IDENT :: IDENT`
+  where the second IDENT is **not** followed by `(` → `EnumAccessExpr`
+  (a value). The one-token lookahead split keeps `mod::fn(args)` (the v0.5
+  cross-module call, second IDENT followed by `(`) on its existing path.
+- **Function-handle-take** (prefix `&` in `parse_unary`): `& IDENT` →
+  `FnHandleExpr`. The operand is parsed as unary so `&&fib`-style nesting is
+  structurally parseable then rejected by sema (which only accepts an
+  `Ident` naming a script function of this module).
+- **Indirect call** (`parse_postfix` `(` case): `<expr>(args)` where `<expr>`
+  is none of the named forms (a bare `Ident` fn name, a `FieldExpr`
+  method, or a `mod::fn` cross-module call) → `CallExpr` with `indirect_target`
+  set + `name` empty. A bare `Ident(args)` that resolves at sema to a
+  *local fn-typed variable* (the `let h = &fn; h(args);` case) is promoted to
+  the indirect path at sema.
+- **`fn` type keyword** (`parse_type`): a bare `fn` is the function-handle
+  type — `Prim::I64` with `is_fn_handle=true` (a bare handle that accepts any
+  fn). A parameterized `fn(i64)->i64` form is v2+.
+
+Sema: `EnumAccessExpr` is rewritten **in place** to an `IntLit` (value i32,
+sign-extended into the `IntLit`'s i64 `v` field) by `lower_enum_access_expr`
+before any function body is checked, so codegen, the const-folder, the switch
+case-value check, and the globals initializer evaluator all see an ordinary
+integer literal. `FnHandleExpr` bakes the slot as an i64 literal and records
+the source fn's signature on the type for arg checking. The indirect
+`CallExpr` path checks args against the recorded signature when present
+(bare `fn`-typed targets accept any args at the type level — the runtime
+guard is the backstop; documented as an open item in `ROADMAP.md` Tier 2).
+**i64 ↔ fn assignment is forbidden either direction** (closes forging at the
+type level). Codegen validates the runtime i64 against a host-built bitset
+allowlist before dispatch (REDSHELL guard #6, `SAFETY_AND_SANDBOX.md` §7a).
 
 - **Annotation** node: `struct Annotation { string name; vector<LiteralValue> args; };`  - 
   attached to `FuncDecl` only (TYPE_SYSTEM.md Section 10/Section 2 grammar - struct
@@ -208,6 +273,26 @@ succeeded)
    (calling a function declared later in the file) resolve correctly
    (CODEGEN_SPEC.md Section 7's forward-reference handling depends on this
    ordering).
+   - **Pass 1.5 — enum resolution (v1.0 Tier 1, `resolve_enums`):** resolve
+     every `EnumDecl`'s variant values (auto-increment from 0 or from the
+     last explicit `= constexpr_int_expr`, evaluated with the existing
+     `try_eval_const_i64`; duplicate enum names / duplicate variant names
+     within one enum / duplicate explicit values are errors, stricter than C).
+     Builds the `(enum_name -> (variant -> i32 value))` table used by
+     `lower_enum_access_expr` and the `enum_names` set used by pass 1.6.
+   - **Pass 1.6 — type-position enum rejection (`check_declared_types_not_enum`):**
+     an enum name is **not** a type in v1 — `let x: Color = ...`, a struct
+     field, a fn param, a return type, a global declared with an enum name
+     is a clean sema error (the hook typed enums later flip to accept).
+   - **EnumAccessExpr lowering (`lower_enum_access_*`, runs as a sema-internal
+     pass over every ExprPtr slot, NOT deferred to codegen):** rewrite each
+     `E::A` to an `IntLit` carrying the variant's i32 value (sign-extended
+     into the i64 `v` field), so by the time `check_expr` runs there are no
+     `EnumAccessExpr` nodes left anywhere — codegen, the const-folder, the
+     switch case-value literal check, and the globals initializer evaluator
+     all see an ordinary integer literal. Unknown enum / unknown variant are
+     errors (and the node is still rewritten to a placeholder `IntLit` so
+     `check_expr` doesn't double-report via its catch-all).
 3. **Per-function body check** (name resolution + type check,
    single pass, left-to-right, no unification/solver - matches
    "monomorphic types only so simple," DESIGN.md Section 3):
@@ -225,6 +310,18 @@ succeeded)
      registered operator overload by `(op, lhs_type, rhs_type)` in the
      `TypeBuilder`-populated operator table (BINDING_API.md Section 3)  - 
      missing/ambiguous overload is a compile error here.
+   - **v1.0 Tier 2 function refs:** `FnHandleExpr` (`&fn_name`) is checked
+     here — the operand must be an `Ident` naming a script function of this
+     module (a native or unknown name is an error); the slot is baked onto
+     the node as an i64 literal and the source fn's signature is recorded on
+     the type. An indirect `CallExpr` (`indirect_target` set) type-checks the
+     target as a fn handle and checks args against the recorded signature
+     when present (a bare-`fn`-typed target accepts any args at the type
+     level — the runtime allowlist guard is the backstop). A named call
+     `name(args)` that resolves to a *local fn-typed variable* is promoted
+     to the indirect path. **i64 ↔ fn assignment is forbidden either
+     direction** (assignment + `let` init), closing V3-style forging at the
+     type level; the runtime guard (`SAFETY_AND_SANDBOX.md` §7a) is the last line.
    - Method/property call desugaring (`obj.method(args)` ->
      synthesized native-call-with-implicit-self, BINDING_API.md Section 3)
      happens here, rewriting the `FieldExpr`+`CallExpr` combination

@@ -18,7 +18,9 @@ calling-convention mapping, error reporting across the boundary.
 > the current implementation. v0.3 ships the **working binding API**:
 > `src/binding_builder.hpp`'s `BindingBuilder` + the existing
 > `NativeSig`/`OpOverload` map that `sema()` already consumes, used by
-> the six standard extensions in `extensions/`. The spec text below is
+> the eight standard extensions in `extensions/` (vec/quat/mat/string/array/
+> math/sync/lifecycle — `sync` + `lifecycle` were added in the v1.0 batch +
+> its follow-on). The spec text below is
 > the target design those extensions move toward; it is preserved
 > unchanged. The call-ABI mapping in Section 4 **IS implemented and
 > proven** in the v0.3 `binding_abi_test` suite (script→native
@@ -54,7 +56,7 @@ SemaResult sr = sema(prog, t.natives, slots, 0, &t.overloads, &layouts);
   one declarative call per native. This is the "bindings like
   AngelScript" floor: `RegisterGlobalFunction("sig", &fn)` shape over
   the direct `NativeSig` map. Replaces the per-extension I/H/add
-  boilerplate the six extensions each redefined (six copies deduped).
+  boilerplate the eight extensions each redefined (eight copies deduped).
 - **`add_overload(type_name, int(BinExpr::Op::X), ret, fn)`** —
   registers an operator overload for a struct-tagged opaque-handle type.
 - **`bind_prim(Prim)` / `bind_handle("struct")`** — convenience `Type`
@@ -98,10 +100,11 @@ No `t_array`/`t_map`/`t_class`/`t_enum`/`t_lambda`/`t_pointer`/`t_auto`
 enum, RESEARCH_NOTES.md) - v1 deliberately has a much smaller type
 surface: fixed arrays are a compile-time-sized variant of struct
 layout (TYPE_SYSTEM.md Section 3) not a distinct *binding*-visible kind,
-maps/classes/lambdas are non-goals (DESIGN.md Section 1), enums are deferred
-(no script `enum` keyword in v1 grammar - a host wanting enum-like
-behavior exposes named `i32` constants via `set_global`, DESIGN.md
-Section 8), pointers/null don't exist as a script-visible concept
+maps/classes/lambdas are non-goals (DESIGN.md Section 1), script-side
+`enum` **shipped in v1.0** but as plain `i32`/`i64`-typed values (an enum
+variant is an `IntLit` post-sema, no new `TypeId` kind — see
+`COMPILER_PIPELINE.md` Section 2a), so no `t_enum` belongs in this table
+either; pointers/null don't exist as a script-visible concept
 (TYPE_SYSTEM.md Section 5). Extend this enum additively later if a real need
 appears (YAGNI).
 
@@ -305,11 +308,15 @@ support) - kept as a separate class rather than folded into
 data struct, no behavior" is a useful declared intent, matching
 a typical native-JIT scripting language's data-vs-behavior split (RESEARCH_NOTES.md).
 
-`EnumBuilder`: **dropped from v1** - no `enum` keyword in the v1
-grammar (COMPILER_PIPELINE.md Section 2's token/grammar list has no `enum`).
-Host-side named constants use `set_global`. Revisit if script-side
-enum syntax is added later (would need both a grammar addition and
-this builder - YAGNI to add the builder alone first).
+`EnumBuilder`: **not needed / still dropped.** Script-side `enum E { A, B, C }`
+**shipped in v1.0** (`ROADMAP.md` Tier 1 ✓, `COMPILER_PIPELINE.md` Section 2a),
+but it is a pure source-text feature — an enum variant is rewritten to an
+`IntLit` at sema (no new `TypeId`, no host-side state, no binding surface),
+so there is nothing for an `EnumBuilder` to build. Host-side named constants
+still use `set_global`. A host wanting enum-like behavior with reflection
+(a `name_from_value` lookup, iteration over variants) would be a separate
+future addition; that is the only case a builder would earn, and it is
+YAGNI until a concrete binding asks for it.
 
 ## 6. Slice argument convention edge cases
 

@@ -55,9 +55,9 @@ cases. JIT only, no bytecode interpreter fallback.
 | `SAFETY_AND_SANDBOX.md` | Threat/trust model stated explicitly. Instruction budget mechanism (where counters live, what trap-on-exhaustion does), stack depth guard, bounds checking policy, `PERM_FFI` compile-time gating, the single non-local-unwind primitive that all traps funnel through, what is explicitly *not* checked (documented gaps, not oversights). |
 | `HOT_RELOAD.md` | Dispatch table layout, slot-index stability invariant, single-function reload protocol (atomic slot swap, old page retired not overwritten), in-flight call behavior, recursive-function-mid-recursion reload semantics, whole-module reload, globals preserved across reload, epoch-based reclamation of retired code pages. |
 | `MEMORY_AND_GC.md` | Ownership taxonomy (frame-local / host-owned / module-global / arena), the `arr[..]`-slice escape check that's the one place ember can introduce a dangling slice, module-global storage layout, string representation (rodata in the function's own code page), arena allocator design (reserved, not built in v1), explicit v2-GC deferral rationale. |
-| `LIFECYCLE.md` | The native-JIT-language-equivalent of `main()` + `register_routine(cast(fn))` expressed ember's way: `@entry`/`@on_tick`/`@event(...)` annotation-based discovery + host name/slot lookup, no script-side function references needed (those are v2). |
+| `LIFECYCLE.md` | The native-JIT-language-equivalent of `main()` + `register_routine(cast(fn))` expressed ember's way: `@entry`/`@on_tick`/`@event(...)` annotation-based discovery + host name/slot lookup. (Script-side first-class function references — `&fn` / `handle(args)` / the `fn` type — shipped in v1.0; see `ROADMAP.md` Tier 2 and `SAFETY_AND_SANDBOX.md` §7a.) |
 | `GAP_ANALYSIS.md` | Systematic completeness audit: every original-request requirement → where satisfied; every feature of the surveyed native-JIT language → v1 has / deferred-with-plan / out-of-scope. Includes the honest performance caveat (ember v1 is baseline JIT, won't match an optimizing native-JIT language's speed, but beats AngelScript's bytecode interpreter). |
-| `ROADMAP.md` | Every v2+ deferral with a **re-entry trigger** (the signal that says "now build this") and a **dependency** (what else must exist first). Tiered: Tier 0 standard addon set (ships v1.0), Tier 1 small lang extensions, Tier 2 function refs, Tier 3 OOP, Tier 4 GC, Tier 5 concurrency/exceptions, Tier 6 ecosystem, plus hard non-goals. |
+| `ROADMAP.md` | Every v2+ deferral with a **re-entry trigger** (the signal that says "now build this") and a **dependency** (what else must exist first). Tiered: Tier 0 standard addon set (ships v1.0), Tier 1 small lang extensions (`enum` ✓ shipped v1.0), Tier 2 function refs (✓ shipped v1.0, two open items), Tier 3 OOP, Tier 4 GC, Tier 5 concurrency/exceptions (sync queues + context thread-safety ✓ shipped v1.0), Tier 6 ecosystem, plus hard non-goals. |
 
 ## Goals / non-goals (restated; full reasoning in detail docs)
 
@@ -75,8 +75,9 @@ Goals:
 
 Non-goals for v1:
 - Generics / templates. Closures. A tracing GC. Multithreaded
-  execution inside one context. Arbitrary pointer casts. Script-side
-  `enum`/`switch`/`class`. Self-hosting.
+  execution inside one context. Arbitrary pointer casts. Self-hosting.
+  (Script-side `enum` and first-class function references **are now in v1.0**
+  — see the v1.0 milestone below and `ROADMAP.md`; `switch` landed in v0.2.)
 
 ## Milestones
 
@@ -171,6 +172,54 @@ Non-goals for v1:
   analysis `docs/v0.3_DEFERRED_BINDING_ANALYSIS.md`), docs, example
   game-engine integration (event hooks via annotations).
 
+  **Concurrency + Tier 2 batch shipped v1.0 (commit e5d1814 + follow-ons,
+  17/17 ctest green):** four features, each verified in source/tests —
+  - **Context thread-safety (Option D + B1)** — `context_t` restructured
+    to a POD prefix; `CodeGenCtx::use_context_reg` makes the budget/depth/
+    trap emits read `context_t` fields through `r14` (the per-call context
+    register, callee-saved) so **one compiled body serves N per-thread
+    contexts**; `ember_call_void`/`ember_call_i64` (`src/engine.{hpp,cpp}`)
+    set `r14 = ctx` at entry. Keystone proof: `examples/thread_safety_test.cpp`
+    (per-thread context, no cross-thread longjmp). `g_globals_for_codegen`
+    superseded by `ctx.globals_index`/`ctx.globals_types` (parallel-compile-
+    safe; legacy pointer kept as a null fallback). See `SAFETY_AND_SANDBOX.md`
+    §8a, `docs/plan_CONTEXT_THREADSAFETY.md`.
+  - **Enums (Tier 1)** — `enum E { A, B, C }` top-level decl + `E::A`
+    qualified access; sema rewrites `EnumAccessExpr` → `IntLit` in place
+    (no codegen change). Pinned by `tests/lang/{valid_enums,sema_valid_enums,
+    sema_invalid_enum_unknown_enum,sema_invalid_enum_unknown_variant}.ember`.
+    See `docs/plan_ENUMS.md`.
+  - **Sync queue primitives (`extensions/sync/`)** — atomics
+    (`aint8/16/32/64`), swap buffer (double-buffer), SPSC/MPSC/MPMC queues
+    behind i64 handles, internally synchronized host storage; script side
+    single-threaded per context (U2 contract). 16 tests in
+    `examples/ext_sync_test.cpp` (multi-thread stress incl. 10k SPSC, MPMC
+    contention). See `docs/plan_SYNC_QUEUES.md`.
+  - **First-class function refs (Tier 2)** — `&fn` take-handle,
+    `handle(args)` indirect call, `fn` type keyword; `emit_call_target_guard`
+    validates the runtime i64 against a host-built bitset allowlist before
+    dispatch (REDSHELL guard #6), `BadCallTarget` trap on a bad handle.
+    Pinned by `examples/function_refs_test.cpp`. Two open items documented at
+    `ROADMAP.md` Tier 2 (bare-`fn` signature hole → `fn(...)->...` typed fn
+    params v2+; cross-module handles → v2+). See `docs/plan_FUNCTION_REFS.md`.
+
+  The four new syntax forms (`&fn`, `handle(args)`, the `fn` type keyword,
+  `enum E { ... }` / `E::A`) are documented at `COMPILER_PIPELINE.md` Section 1.
+
+  **Follow-on commits** then built the dynamic-registration extension the
+  Tier 2 fn-refs feature enables — `extensions/lifecycle/`
+  (`register_routine`/`unregister_routine` + the `host_routines()` accessor;
+  `LIFECYCLE.md` §2; pinned by `examples/ext_lifecycle_test.cpp`, the 17th
+  ctest target) — and wired the CLI `--tick` to the B1 per-call context model
+  (the `--tick` thread-safety bug, fixed; the CLI is now a B1 host). Demo
+  script: `examples/scripts/dynamic_registration.ember`. See
+  `docs/v1.0_INTEGRATION_NOTES.md` §5.
+
+  (The original v1.0 fluent-API milestone scope — `TypeBuilder`/
+  `StructBuilder`/`engine_t` — is itself still trigger-gated on "a host wants
+  script-visible C++ struct types," per the v0.6 integration notes; the
+  concurrency + Tier 2 batch shipped under the v1.0 banner regardless.)
+
 ## Explicitly skipped (YAGNI ladder - full per-item reasoning in the
 detail docs, summarized here)
 
@@ -182,8 +231,10 @@ detail docs, summarized here)
   one-line call site (`BINDING_API.md` Section 1-Section 2).
 - No tracing GC v1 - every reference category has a non-tracing
   lifetime (`MEMORY_AND_GC.md` Section 1, Section 8).
-- No generics/closures/enum/switch v1 - no game-scripting use case
-  demands them yet (`DESIGN.md` non-goals, `COMPILER_PIPELINE.md` Section 1).
+- No generics/closures v1 (script-side `enum` shipped v1.0; `switch` shipped
+  v0.2) - no game-scripting use case demands generics/closures yet
+  (`DESIGN.md` non-goals, `COMPILER_PIPELINE.md` Section 1); `enum` and `switch`
+  moved off the non-goal list when measured demand arrived (`ROADMAP.md`).
 - No bytecode interpreter fallback - JIT only, one execution path
   (`RESEARCH_NOTES.md` on AngelScript's bytecode-VM-by-default being
   the differentiator).
@@ -197,9 +248,12 @@ detail docs, summarized here)
 - No templates/classes/coroutines/exceptions/heap/lambdas/modules in v1
   - each is a tracked deferral with a re-entry trigger in `ROADMAP.md`,
   not a forgotten gap (`GAP_ANALYSIS.md` Section 2).
-- No script-side function references / dynamic routine registration in v1
-  - annotation-based static discovery covers the game-loop case
-  (`LIFECYCLE.md`); dynamic registration is Tier 2 (`ROADMAP.md`).
+- Script-side first-class function references shipped **v1.0** (`&fn` /
+  `handle(args)` / the `fn` type keyword, `ROADMAP.md` Tier 2 ✓), with the
+  REDSHELL guard #6 call-target-provenance invariant (`SAFETY_AND_SANDBOX.md`
+  §7a) as the runtime backstop. Dynamic `register_routine`-style registration
+  is host-defined (no ember core change) once a real mod wants it;
+  annotation-based static discovery covers the game-loop case (`LIFECYCLE.md`).
 - No builtins for arrays/maps/strings - exposed as **native addons**
   on host-owned memory (Tier 0, ships with v1.0, `GAP_ANALYSIS.md` Section 3,
   `ROADMAP.md`), not language builtins needing GC.

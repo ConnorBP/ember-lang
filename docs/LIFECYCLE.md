@@ -8,8 +8,12 @@ The native-JIT-language-equivalent of `main()` + `register_routine(cast(fn), dat
 > `CODEGEN_SPEC.md` Section 12 + Section 15 for the acceptance suite. This doc's
 > content is the target design, not a claim of current implementation.
 (`RESEARCH_NOTES.md`), expressed ember's way: **annotation-based
-discovery + host name/slot lookup**, no script-side function references
-required (function references are v2, `ROADMAP.md` Tier 2).
+discovery + host name/slot lookup**. Script-side first-class function
+references (`&fn` / `handle(args)` / the `fn` type) shipped in v1.0
+(`ROADMAP.md` Tier 2 ✓), which is what enables the dynamic
+`register_routine(&fn, data)` path in Section 2 — v1's annotation model
+is the static half, the dynamic-registration extension is the runtime
+half, both shipped v1.0.
 
 ## 1. Entry point
 
@@ -69,11 +73,22 @@ fn on_player_hit(info: HitInfo) { ... }
   carry literal args only, no type info; the *function signature* is
   the type contract, queried separately).
 - **Dynamic registration** (script decides at runtime what to hook,
-  unregister later) is **not v1** - it needs function references
-  (`ROADMAP.md` Tier 2). v1's annotation model covers the common game
-  case: "this function is the physics tick, always, for this module's
-  whole loaded lifetime." Dynamic registration is for tooling/scripts
-  that hot-swap handlers at runtime - rare, deferred.
+  unregister later) **shipped v1.0** as `extensions/lifecycle/`
+  (`register_routine(&fn, data) -> id` / `unregister_routine(id)`), enabled
+  by the Tier 2 first-class function refs that shipped in the same batch.
+  The fn-handle param is typed (`is_fn_handle`) so sema rejects a forged
+  plain i64; the slot's provenance was validated at the `&fn` site, so the
+  host trusts it the way it trusts any sema-resolved slot and calls it via
+  the dispatch table — the SAME call mechanism as the static `@on_tick`
+  path, just discovered by the script at runtime. The host's
+  `ext_lifecycle::host_routines()` accessor returns the `(slot, data)`
+  pairs for the host to iterate + call per frame. Pinned by
+  `examples/ext_lifecycle_test.cpp` (ctest target `ext_lifecycle`); demo
+  script `examples/scripts/dynamic_registration.ember`. v1's static
+  annotation model covers the common game case: "this function is the
+  physics tick, always, for this module's whole loaded lifetime." Dynamic
+  registration is for tooling/scripts that hot-swap handlers at runtime —
+  rare in games, now in-tree as an extension rather than deferred.
 
 ## 3. Unload
 

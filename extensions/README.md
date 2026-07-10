@@ -44,6 +44,8 @@ The general-purpose extensions relocated out of prism, matching the
 | `string/` | `ember_ext_string` | mutable `string` host-store type + `Add`(concat)/`Eq` overloads + `from_slice`/`from_i64`/`from_f32`/`from_f64`/`from_bool`/`identity`/`length`/`char_at` | `prism_script_host.cpp` string block |
 | `array/` | `ember_ext_array` | `array<T>` host-store type + `new`/`length`/`resize`/`set_u8`/`get_u8`/`set_f32`/`get_f32`/`set_i64`/`get_i64`/`push_u8` + the `GetArrayBytes` accessor | `prism_script_host.cpp` array block |
 | `math/` | `ember_ext_math` | `sqrt`/`sin`/`cos`/`tan` (f32) - pure functions, no host store | `prism_script_host.cpp` math block |
+| `sync/` | `ember_ext_sync` | cross-thread sync primitives: `aint8/16/32/64` atomics (load/store/fetch_add/cas/swap), swap buffer (double-buffer + atomic flip), SPSC/MPSC/MPMC queues — all behind opaque i64 handles, internally synchronized host storage (`std::atomic` / lock-free ring / host-internal `std::mutex` for MPMC). No operator overloads. | new (v1.0); no prism origin — added for the host↔script coordination pattern |
+| `lifecycle/` | `ember_ext_lifecycle` | dynamic routine registration: `register_routine(fn h, i64 data) -> id` / `unregister_routine(id)` — the Tier 2 fn-refs feature's host-native half. The `fn` param is typed (`is_fn_handle`) so sema rejects a forged plain i64; the host calls a stored routine via the dispatch table (the SAME call mechanism as the static `@on_tick` path, just discovered by the script at runtime). No operator overloads. | new (v1.0 follow-on); no prism origin — added once Tier 2 fn-refs shipped (`LIFECYCLE.md` §2) |
 
 Each is a self-contained C++ TU that depends only on ember's *public*
 headers (`ast.hpp`, `sema.hpp` - for `Type`/`make_prim`/`make_slice`/
@@ -101,6 +103,8 @@ std::unordered_map<std::string, ember::NativeSig> BuildScriptHostNatives() {
     ember::ext_string::register_natives(m);
     ember::ext_array::register_natives(m);
     ember::ext_math::register_natives(m);
+    ember::ext_sync::register_natives(m);     // atomics, swap buffer, SPSC/MPSC/MPMC queues (v1.0)
+    ember::ext_lifecycle::register_natives(m); // register_routine/unregister_routine (v1.0 follow-on)
     return m;
 }
 
@@ -109,7 +113,7 @@ void RegisterScriptHostOverloads(ember::OpOverloadTable& t) {
     ember::ext_quat::register_overloads(t);
     ember::ext_mat::register_overloads(t);
     ember::ext_string::register_overloads(t);  // string + ==
-}
+    // ext_sync + ext_lifecycle have no operator overloads (method-call natives, like ext_array).
 
 // Host-store types keep per-run state (opaque i64 handles index into a
 // host-owned vector). A host that wants each run independent calls the
@@ -121,6 +125,8 @@ void ResetScriptHostState() {
     ember::ext_mat::reset();
     ember::ext_string::reset();
     ember::ext_array::reset();
+    ember::ext_sync::reset();
+    ember::ext_lifecycle::reset();
     // math is stateless - no reset.
     // ... host's own state reset ...
 }
@@ -147,6 +153,24 @@ extension exposes a small accessor in its public header:
 - `ember::ext_string::slot(int64_t handle)` - prism's `n_print_string`
   (the host-sink-coupled `print_string` native, which stays in prism)
   uses this to read a `string` handle's content.
+- `ember::ext_sync::*_host(...)` (v1.0) - the sync primitives expose a full
+  set of host-side accessors (`atomic_load_host`/`atomic_store_host`/
+  `atomic_cas_host`, `swapbuf_back_ptr`/`swapbuf_front_index_host`/
+  `swapbuf_front_write_host`/`swapbuf_swap_host`, `spsc/mpsc/mpmc_push_host`/
+  `*_try_pop_host`) for the **U2 contract**: host producer/consumer threads
+  that touch the queue/swap-buffer/atomic HOST storage WITHOUT calling ember
+  (the script side stays single-threaded per context — see `ext_sync.hpp`'s
+  S0 scope statement). These share the same underlying impl as the
+  ember-facing natives; the `_host` suffix marks them as host-reach-in
+  entries (the naming discipline that keeps `ext_array::get_bytes` clearly a
+  host-reach-in vs an ember-callable `array_get_*`).
+- `ember::ext_lifecycle::host_routines()` / `host_count()` (v1.0 follow-on) -
+  the dynamic-registration extension exposes these so a host's tick/render
+  loop iterates the currently-registered `(slot, data)` pairs and calls each
+  via the dispatch table per frame (the SAME call mechanism as the static
+  `@on_tick` path, just discovered by the script at runtime). The slot came
+  from a `&fn` sema-validated at the take-handle site, so the host trusts it
+  the way it trusts any sema-resolved slot. See `LIFECYCLE.md` §2.
 
 The vec/quat/mat stores are entirely internal to their extension; no
 prism native reaches into them by handle outside the registered
@@ -156,11 +180,13 @@ accessor natives, so they expose no accessor.
 
 `ember/CMakeLists.txt` defines one static library per extension
 (`ember_ext_vec`, `ember_ext_quat`, `ember_ext_mat`, `ember_ext_string`,
-`ember_ext_array`, `ember_ext_math`). Each links `ember_frontend`
-PUBLIC (for `make_prim`/`make_slice`/`Type` symbols, defined in
-`ember_frontend`'s `types.cpp`) and exposes its `ext_*.hpp` header via
-a PUBLIC include directory. A consumer links whichever extensions it
-wants; prism links all six.
+`ember_ext_array`, `ember_ext_math`, `ember_ext_sync`, `ember_ext_lifecycle`).
+Each links `ember_frontend` PUBLIC (for `make_prim`/`make_slice`/`Type` symbols,
+defined in `ember_frontend`'s `types.cpp`) and exposes its `ext_*.hpp` header via
+a PUBLIC include directory. A consumer links whichever extensions it wants;
+prism links the original six (sync + lifecycle are host-arranged per consumer
+— see `examples/ext_sync_test.cpp` / `examples/ext_lifecycle_test.cpp` for
+the wiring; the standalone `ember` CLI links all eight).
 
 ## Purity
 

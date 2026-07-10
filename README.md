@@ -3,7 +3,8 @@
 C-style scripting language, JIT-compiles to native x86-64. AngelScript
 ergonomics, an optimizing native-JIT language's speed. Game-engine/modding embedding target.
 
-Status: **v0.5** - the full frontend + binding API + safe execution + live modules.
+Status: **v1.0** - the full frontend + binding API + safe execution + live
+  modules + lifecycle/hot reload + the concurrency + Tier 2 batch.
   v0.2: lexer/parser/sema/tree-walking codegen, `.em` bundling, standard
   extensions (vec/quat/mat/string/array/math), standalone `ember` CLI +
   language regression suite. v0.3: binding-ABI correctness suite +
@@ -13,21 +14,32 @@ Status: **v0.5** - the full frontend + binding API + safe execution + live modul
   recoverable, not process death); a red-team writeup ships at the workspace
   root. v0.5: live modules — bidirectional script↔`.em` cross-module linking
   (`link "foo.em" as foo;` + `foo::bar()`) through the real grammar.
-  Script-to-script calls run through the dispatch table by slot; the `.em`
-  binary bundling format (serialize→load→run round-trip) and cross-module
-  textual `import "path";` inclusion both work. The canonical tree is
-  standalone-buildable and standalone-testable. See `src/` for the frontend,
-  `extensions/` for the addons, `examples/` for the CLI + check exes +
-  sample scripts.
+  v0.6: lifecycle annotation runtime effect + single-function hot reload +
+  the example game-engine integration (`examples/game_host.cpp`) that proved
+  embeddability, the float-global-write bug fix, and const global
+  initializer evaluation at load (see `docs/v0.6_INTEGRATION_NOTES.md`).
+  v1.0: the concurrency + Tier 2 batch (commit e5d1814) — **context
+  thread-safety** (Option D + B1: per-thread `context_t`, `r14` context
+  register, one compiled body serves N contexts), **enums** (`enum E {...}` +
+  `E::A`, rewritten to an `IntLit` at sema), **sync queue primitives**
+  (`extensions/sync/`: atomics, swap buffer, SPSC/MPSC/MPMC queues behind
+  i64 handles, internally synchronized host storage), and **first-class
+  function refs** (`&fn` / `handle(args)` / the `fn` type keyword + the
+  REDSHELL guard #6 call-target-provenance invariant). Three follow-on
+  commits then shipped **dynamic routine registration**
+  (`extensions/lifecycle/`: `register_routine`/`unregister_routine`) — the
+  Tier 2 fn-refs feature's host-native half — and wired the CLI `--tick` to
+  the B1 per-call context model (the `--tick` thread-safety bug, fixed; the
+  CLI is now a B1 host). See `src/` for the
+  frontend, `extensions/` for the addons (now eight: +`sync` +`lifecycle`), `examples/`
+  for the CLI + check exes + sample scripts, and `docs/v1.0_INTEGRATION_NOTES.md`
+  for the batch + follow-on notes.
 
-  Next milestone: **v0.6** - benchmark harness vs AngelScript (the gate the
-  SSA-lite IR + linear-scan regalloc refactor is deferred to). Open v0.4
-  items (lifecycle annotation runtime effect, single-function hot reload)
-  have complete specs (`LIFECYCLE.md`, `HOT_RELOAD.md`) and may land first.
-
-Next milestone: **v0.3** - native binding API correctness + host↔script
-calling-convention validation (struct/annotation machinery already landed in
-the v0.2 overshot; v0.3 is the binding-correctness milestone).
+  Next milestone: **v1.0+** - the SSA-lite IR + linear-scan regalloc refactor
+  remains gated on the v0.6 benchmark harness vs AngelScript proving it
+  matters (no speculative optimization). The fluent `TypeBuilder`/
+  `StructBuilder`/`engine_t` surface stays trigger-gated on a host wanting
+  script-visible C++ struct types (the v0.6 integration didn't fire it).
 
 ## Docs (read `docs/DESIGN.md` first - it's the index)
 
@@ -50,7 +62,12 @@ the v0.2 overshot; v0.3 is the binding-correctness milestone).
   script-type→Win64-slot mapping, slice convention.
 - `docs/SAFETY_AND_SANDBOX.md` - threat model, budgets, stack-depth
   guard, bounds checks, `PERM_FFI`, the single non-local-unwind
-  primitive, documented gaps.
+  primitive, the v1.0 call-target-provenance guard (#6) + context
+  thread-safety (§7a/§8a), documented gaps.
+- `docs/ROADMAP.md` - every v2+ deferral with a re-entry trigger and
+  dependency, tiered by likely build order; hard non-goals listed;
+  Tier 1 `enum` / Tier 2 function refs / Tier 5 sync queues + context
+  thread-safety all marked ✓ shipped v1.0 with their open items.
 - `docs/HOT_RELOAD.md` - dispatch table, slot stability, reload
   protocol, in-flight calls, epoch reclamation.
 - `docs/MEMORY_AND_GC.md` - ownership taxonomy, slice-escape check,
@@ -75,19 +92,24 @@ x86-64, composable chunks via the dispatch table, safety, AngelScript-
 style bindings, hot reload, GC deferral) has a detail doc with edge
 cases spelled out. `GAP_ANALYSIS.md` is the audit confirming nothing
 the original request asked for is missing; `ROADMAP.md` is the tracked
-list of what's deliberately deferred and when each comes back.
+list of what's deliberately deferred and when each comes back. The v1.0
+concurrency + Tier 2 batch (context thread-safety, enums, sync queues,
+first-class function refs) is documented at `docs/v1.0_INTEGRATION_NOTES.md`;
+the four `plan_*.md` files are the historical plans for that batch.
 
-Status: **v0.5** (full frontend + binding API + safe execution + live modules).
-standalone CLI + language regression suite). The spec docs are stable;
-`src/` contains the implementation, `extensions/` the addons, `examples/`
-the CLI + check exes + sample scripts.
+Status: **v1.0** (full frontend + binding API + safe execution + live
+modules + lifecycle/hot reload + concurrency + Tier 2). The spec docs are
+stable; `src/` contains the implementation, `extensions/` the eight addons
+(vec/quat/mat/string/array/math/sync/lifecycle), `examples/` the CLI + check exes +
+sample scripts.
 
-## Building v0.2
+## Building
 
 C++17, no external deps beyond `Windows.h` (VirtualAlloc). Builds clean
 on MinGW g++ 15.2.0 + Ninja (the config this tree is tested on); MSVC
-VS 2022 also supported. The build produces three static libs, six
-extension libs, four round-trip/registration test exes, the standalone
+VS 2022 also supported. The build produces three static libs, eight
+extension libs (vec/quat/mat/string/array/math/sync/lifecycle), four
+round-trip/registration test exes, the standalone
 `ember` CLI, and two language-check exes:
 
 ```bash
@@ -96,11 +118,13 @@ mkdir build && cd build
 # MinGW g++ + Ninja:
 cmake -G Ninja -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++..exe ..
 cmake --build .          # or: ninja
-ctest                    # 5 targets: em_roundtrip, import_roundtrip,
-                         # ext_runtime, ext_registration, lang_suite
+ctest                    # 17 targets (see the list below)
 ```
 
-`ctest` is 5 targets and all must pass:
+`ctest` is 17 targets and all must pass (the v1.0 concurrency + Tier 2
+batch took it from 14 to 16 by adding `thread_safety` and `function_refs`;
+`ext_sync` was wired in the preceding WIP commit; `ext_lifecycle` added the
+17th when dynamic registration shipped in a follow-on commit):
 - `em_roundtrip` - JIT→serialize→`load_em_file`→run round-trip on a real
   parsed function (double_it + recursive fib), asserting the loaded
   module matches the JIT'd one.
@@ -109,18 +133,32 @@ ctest                    # 5 targets: em_roundtrip, import_roundtrip,
   link step.
 - `ext_runtime` - a standard-extension native (math `sqrt`) runs through
   the full parse→sema→codegen→JIT→call path.
-- `ext_registration` - all six extensions register their `NativeSig` +
+- `ext_sync` - the v1.0 sync primitives (atomics, swap buffer, SPSC/MPSC/MPMC
+  queues behind i64 handles): 16 tests incl. multi-thread stress (10k SPSC,
+  MPMC contention, no lost/dup).
+- `ext_lifecycle` - the v1.0 dynamic routine registration (`register_routine`/
+  `unregister_routine`, the `host_routines()` accessor): register → host calls
+  via dispatch → unregister → free-list reuse → reset.
+- `ext_registration` - all eight extensions register their `NativeSig` +
   `OpOverloadTable` entries (the binding surface the CLI/sema_check use).
+- `v0_4_hardening` - the safe-execution trap surface (budget/depth/bounds
+  traps funnel through one longjmp).
+- `thread_safety` - the v1.0 context thread-safety keystone (per-thread
+  `context_t`, `r14` indirection, no cross-thread longjmp corruption).
+- `function_refs` - the v1.0 first-class function refs (handle creation,
+  multi-arg dispatch, recursion via handle, the REDSHELL #6 guard).
+- `v0_5_live_modules`, `binding_abi`, `lang_suite`, `bench_ember_vs_as`,
+  `v0_6_lifecycle`, `v0_6_hot_reload`, `game_host_integration`,
+  `float_global_regression` - the rest of the v0.3–v1.0 suite.
 - `lang_suite` - the language regression suite (`tests/run_lang_tests.sh`)
   classifies `tests/lang/{valid,invalid,sema_valid,sema_invalid,import_*}.ember`
-  against `ember_check` (parse-only) and `sema_check` (parse+sema) - 110
-  pass / 0 fail / 1 skip (the skip is a prism-native-surface mismatch,
-  documented in the runner output).
+  (70 `.ember` files; the v1.0 batch added the four enum tests) against
+  `ember_check` (parse-only) and `sema_check` (parse+sema).
 
 ## CLI
 
 `ember_cli` is the standalone script runner - prism-decoupled, links only
-ember + ember_frontend + the six extension libs (no prism natives, no VFS,
+ember + ember_frontend + the eight extension libs (no prism natives, no VFS,
 no backends):
 
 ```
@@ -134,6 +172,16 @@ ember_cli run <file.ember> [--fn <name>] [--dump]
 - `--fn <name>` overrides the entry (default `main`).
 - `--dump` prints each compiled function's slot, byte size, and reloc
   count.
+- `--tick` (v0.6, B1-wired v1.0) runs the module's `@on_tick` fns on a tick
+  thread at `--tick-interval <ms>` (default 16, ~60fps) until a keybind is
+  pressed; `--tick-count <N>` auto-stops after N ticks (for tests/
+  non-interactive). v1.0: the CLI compiles with `use_context_reg = true` and
+  the tick thread runs on its own `context_t` via `ember_call_void`, isolated
+  from the main thread's `context_t` — a budget/overflow trap in a tick stops
+  the tick thread, never the main thread (the `--tick` thread-safety bug,
+  fixed; see `docs/v1.0_INTEGRATION_NOTES.md` §1). The CLI also drives any
+  routines a script registered via `register_routine(&fn, data)` (the
+  dynamic-registration path, `examples/scripts/dynamic_registration.ember`).
 
 `import "path";` in a script is resolved as textual inclusion before
 lexing (cycle-detected, `seen`-set deduped) - multi-file scripts work.
@@ -152,13 +200,17 @@ sema_check  <file.ember>     # exit 0 = parse+sema ok, nonzero = sema error
 
 ## Honest performance caveat
 
-ember v0.2 is a **baseline** JIT (tree-walking codegen, stack-spilling,
+ember is a **baseline** JIT (tree-walking codegen, stack-spilling,
 no opt passes, no inlining, no loop opts). AngelScript is a bytecode
 interpreter; even baseline native code beats a bytecode interpreter on
 tight loops by typically 5-50×, which comfortably satisfies "much faster"
-for hot game-logic. Matching an optimizing native-JIT language's speed is
-a v2+ goal, deferred to after the v0.5 benchmark harness exists to prove
-where ember is slow and justify adding opt passes (`DESIGN.md` Section 9 -
-no speculative optimization). The codegen is correctness-first today; the
-SSA-lite IR + linear-scan regalloc in `COMPILER_PIPELINE.md` Section 5 is
-the target the tree-walker lowers toward conceptually, landed at v0.5.
+for hot game-logic — the v0.6 benchmark harness (`examples/bench_ember_vs_as.cpp`,
+ctest target `bench_ember_vs_as`) measured it: ember ~0.15× AngelScript's
+time on `fib(32)` / `tight_loop(1e8)` / `nested_calls(1e7)`, 0.55× on
+mandelbrot (results in `v0.6_BENCHMARK_RESULTS.md`). Matching an optimizing
+native-JIT language's speed is a v2+ goal, gated on a benchmark-proven
+need — the SSA-lite IR + linear-scan regalloc refactor
+(`COMPILER_PIPELINE.md` Section 5) is the target the tree-walker lowers
+toward conceptually, deferred until the bench shows where ember is slow.
+No speculative optimization (`DESIGN.md` Section 9). The codegen is
+correctness-first today.
