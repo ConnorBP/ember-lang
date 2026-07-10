@@ -7,3 +7,7 @@
 demo/**/*.exe
 # ember .em binary bundles (emit-em output) — never commit the binary, only the .ember source
 *.em
+# per-path bench artifacts: g++ -O2 baseline DLL (compiled from source each run —
+# never commit the binary) + results (machine-specific, regenerated each run)
+bench/*.dll
+bench/results_codegen_paths.*

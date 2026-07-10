@@ -313,6 +313,57 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/sdk/angelscript/source/as_atomi
 
 endif()
 
+# ---- per-path codegen bench harness (docs/spec/BENCHMARK_SYSTEM_DESIGN.md) ----
+# The evidence-gathering infra the codegen-optimization gate is gated on
+# (docs/planning/DESIGN.md §9: "no speculative optimization before the bench
+# proves it matters"; docs/spec/COMPILER_PIPELINE.md §5 defers SSA-lite IR +
+# linear-scan regalloc until "stronger benchmarks show where Ember is slow").
+# A CONSUMER of the existing JIT (no src/ changes), the v0_4_hardening_test /
+# bench_ember_vs_as shape: compiles each path fn in BOTH safety-off and safety-on
+# modes, times warmup+N-iters (fresh checkpoint per iter, min/median/p99 stats),
+# and times a g++ -O2 baseline DLL doing the SAME work, reporting the ember/g++-O2
+# ratio per path. The g++ -O2 baseline (bench/baseline_paths.cpp) is compiled to a
+# DLL at BUILD time by the custom command below (ctest path) OR at runtime by
+# bench/run_bench.sh (ad-hoc path) — either way, stale-probe discipline: from
+# source each build/run, never a checked-in binary.
+# PASS = ran + wrote results (the bench_ember_vs_as shape), NEVER an assertion on
+# a ratio — fails only on a compile/run/IO error. TIMEOUT 600 covers the g++ -O2
+# baseline compile + the 24 timed cells. See bench/run_bench.sh.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/bench_codegen_paths.cpp)
+    add_executable(bench_codegen_paths bench/bench_codegen_paths.cpp)
+    target_link_libraries(bench_codegen_paths PRIVATE
+        ember ember_frontend ember_import
+        ember_ext_vec ember_ext_quat ember_ext_mat
+        ember_ext_string ember_ext_array ember_ext_math)
+    if(WIN32)
+        target_link_libraries(bench_codegen_paths PRIVATE kernel32)
+    endif()
+    # Build the g++ -O2 baseline DLL from source at BUILD time (stale-probe
+    # discipline: recompiled each build, never a checked-in binary). Uses the
+    # same MinGW g++ CMake selected as CMAKE_CXX_COMPILER, with the anti-fold
+    # flags (-fno-tree-vectorize / -fno-tree-loop-distribute-patterns) so the
+    # baseline measures the scalar codegen path, not vectorization.
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/baseline_paths.dll
+        COMMAND ${CMAKE_CXX_COMPILER} -O2 -std=c++17 -shared -fPIC
+                -fno-tree-vectorize -fno-tree-loop-distribute-patterns
+                ${CMAKE_CURRENT_SOURCE_DIR}/bench/baseline_paths.cpp
+                -o ${CMAKE_CURRENT_BINARY_DIR}/baseline_paths.dll
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/bench/baseline_paths.cpp
+        COMMENT "g++ -O2 baseline DLL for per-path bench"
+        VERBATIM)
+    add_custom_target(bench_baseline_dll
+        DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/baseline_paths.dll)
+    add_dependencies(bench_codegen_paths bench_baseline_dll)
+    # PASS = ran + wrote results (the bench_ember_vs_as shape), NEVER an assertion
+    # on a ratio — fails only on a compile/run/IO error. Run in the build dir so
+    # the DLL path resolves + results_*.csv/.md land in the build dir (gitignored).
+    add_test(NAME bench_codegen_paths COMMAND bench_codegen_paths
+        "${CMAKE_CURRENT_BINARY_DIR}/baseline_paths.dll")
+    set_tests_properties(bench_codegen_paths PROPERTIES TIMEOUT 600
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+endif()
+
 # These correctness/integration tests do not use AngelScript. Keep only the
 # actual comparison benchmark conditional on SDK availability.
 add_executable(v0_6_lifecycle_test examples/v0_6_lifecycle_test.cpp)
