@@ -55,7 +55,10 @@ actually writable (`planning/GAP_ANALYSIS.md` Section 3):
 - **`array`** ✓ limited v1 API — opaque i64 buffer handle with new/length/
   resize, typed u8/f32/i64 get/set, push_u8/f32/i64, pop_u8/f32/i64, clear,
   remove. ✓ full v1 API shipped (push/pop/clear/remove added 2026-07-11).
-- **`map<K,V>`** — deferred; no map extension exists.
+- **`map<K,V>`** ✓ shipped 2026-07-11 — opaque i64 handle backed by a host-
+  side `unordered_map<i64,i64>`. API: map_new, map_set, map_get, map_contains,
+  map_length, map_remove, map_clear. K and V are i64 (v1 convention; typed
+  keys/values are a v2 concern).
 - **`string`** ✓ limited v1 API — opaque nominal handle with construction,
   from-slice/scalar conversion, length/character access, identity, concat,
   equality, find, substr. ✓ find/substr shipped 2026-07-11; general format

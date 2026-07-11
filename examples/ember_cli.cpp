@@ -60,6 +60,7 @@
 #include "ext_string.hpp"
 #include "ext_array.hpp"
 #include "ext_math.hpp"
+#include "ext_map.hpp"
 #include "ext_sync.hpp"
 #include "ext_lifecycle.hpp"
 #include "ext_opt.hpp"        // Stage C: register_passes (IR optimization passes)
@@ -131,6 +132,7 @@ static void register_standard_bindings(
     ext_vec::register_natives(natives); ext_quat::register_natives(natives);
     ext_mat::register_natives(natives); ext_string::register_natives(natives);
     ext_array::register_natives(natives); ext_math::register_natives(natives);
+    ext_map::register_natives(natives);
     ember::ext_sync::register_natives(natives); ember::ext_lifecycle::register_natives(natives);
     OpOverloadTable overloads;
     ext_vec::register_overloads(overloads); ext_quat::register_overloads(overloads);

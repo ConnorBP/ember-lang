@@ -150,6 +150,7 @@ ember_add_extension(mat       extensions/mat/ext_mat.cpp)
 ember_add_extension(string   extensions/string/ext_string.cpp)
 ember_add_extension(array    extensions/array/ext_array.cpp)
 ember_add_extension(math     extensions/math/ext_math.cpp)
+ember_add_extension(map      extensions/map/ext_map.cpp)
 ember_add_extension(sync     extensions/sync/ext_sync.cpp)
 ember_add_extension(lifecycle extensions/lifecycle/ext_lifecycle.cpp)
 ember_add_extension(opt extensions/opt/ext_opt.cpp)         # Stage C: IR optimization passes
@@ -353,7 +354,7 @@ target_link_libraries(ember_cli PRIVATE
     ember ember_frontend ember_import
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
-    ember_ext_sync ember_ext_lifecycle ember_ext_opt ember_ext_obf)
+    ember_ext_sync ember_ext_lifecycle ember_ext_opt ember_ext_obf ember_ext_map)
 
 # End-to-end H12 regression: invoke the real CLI emit-em path, then load the
 # artifact and inspect its nonzero initialized-global bytes.
