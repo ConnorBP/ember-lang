@@ -1,0 +1,13 @@
+// valid_for_each_empty_body — for-each with an empty body.
+// The loop iterates all three elements but the body block is empty. This
+// verifies the desugared while-loop (index advance, bounds check, element
+// load into the loop variable) runs to completion without a body and that
+// execution continues normally past the loop.
+// expect: 7
+fn main() -> i64 {
+    let a: i64[3] = [1, 2, 3];
+    let s: i64[] = a[..];
+    for (x in s) {
+    }
+    return 7;
+}

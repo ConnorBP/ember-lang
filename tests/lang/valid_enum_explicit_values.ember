@@ -1,0 +1,11 @@
+// valid_enum_explicit_values — enum with explicit values.
+// Each variant is given an explicit integer; auto-increment is not used.
+// expect: 1
+enum Code { Alpha = 100, Beta = 200, Gamma = 300 }
+
+fn main() -> i64 {
+    if (Code::Alpha != 100) { return 0; }
+    if (Code::Beta != 200) { return 0; }
+    if (Code::Gamma != 300) { return 0; }
+    return 1;
+}

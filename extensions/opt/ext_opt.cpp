@@ -1,4 +1,4 @@
-// ext_opt.cpp — Stage C: the three IR optimization passes.
+// ext_opt.cpp — Stage C: the four IR optimization passes.
 // See ext_opt.hpp for the design. All passes are value-preserving and
 // conservative — when in doubt, do not transform.
 

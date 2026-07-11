@@ -1,6 +1,6 @@
 # ember — composable pass architecture design (Stage C)
 
-**Status:** shipped (Steps 1-5). The research basis is `docs/LLVM_PASS_SYSTEM_RESEARCH.md` (LLVM 18.1.8 pass-manager patterns). The extension-pattern basis is `src/binding_builder.hpp` + the `register_natives` / `ember_add_extension` CMake pattern.
+**Status:** shipped (Steps 1-5, 2026-07-11; Steps 4-5 partial — `EmberAnalysisManager` and the `FlatteningPass`/`MBAPass` obfuscation passes remain FUTURE, see §8). The research basis is `docs/LLVM_PASS_SYSTEM_RESEARCH.md` (LLVM 18.1.8 pass-manager patterns). The extension-pattern basis is `src/binding_builder.hpp` + the `register_natives` / `ember_add_extension` CMake pattern.
 
 ## 0. What this is
 
@@ -309,9 +309,9 @@ The pass manager is an optional field on `CodeGenCtx` (default nullptr = no pass
 - **Step 1 — SHIPPED (2026-07-11).** `src/ember_pass.hpp` + `src/ember_pass.cpp` + `src/ember_pass_registry.hpp` + `src/ember_pass_pipeline.hpp` — the infrastructure (pass manager, registry, pipeline parser, instrumentation, PreservedAnalyses). `examples/ember_pass_test.cpp` (ctest `ember_pass`) pins it with 25 checks across 7 sections.
 - **Step 2 — SHIPPED (2026-07-11).** `extensions/opt/ext_opt.{hpp,cpp}` (a new `ember_ext_opt` extension lib) + `ConstPropPass` + `DeadCodeElimPass` + `CSEPass`. `examples/ir_passes_test.cpp` (ctest `ir_passes`) verifies each pass is value-preserving + instr-count-reducing.
 - **Step 3 — SHIPPED (2026-07-11).** Pass manager wired into `CodeGenCtx` (src/codegen.hpp + codegen.cpp); CLI `--passes constprop,cse,dce` (examples/ember_cli.cpp); benchmark harness `EMBER_IR_PASS` env var (bench/bench_codegen_paths.cpp). End-to-end verified: code-size reductions visible (constprop_fold 406→318B, dce 382→326B, cse 418→404B).
-- **Step 4 — SHIPPED (2026-07-11).** `LICMPass` (loop-invariant code motion) in `extensions/opt/ext_opt.cpp`. Detects natural loops via back-edges, hoists invariant pure instructions to the pre-header. Value-preserving on all workloads.
-- **Step 5 — SHIPPED (2026-07-11).** `SubstitutionPass` (MBA obfuscation) in `extensions/obf/ext_obf.cpp`. Replaces integer Add with `(a^b) + 2*(a&b)`. `is_required = true`.
-- **Step 6 — FUTURE.** More obfuscation passes (bogus control flow, control flow flattening).
+- **Step 4 — SHIPPED (2026-07-11, partial).** `LICMPass` (loop-invariant code motion), registered as `"licm"` in `extensions/opt/ext_opt.cpp` and exercised by `examples/ir_passes_test.cpp` (ctest `ir_passes`). Detects natural loops via back-edges, hoists invariant pure instructions to the pre-header. Value-preserving on all workloads. `EmberAnalysisManager` (§6) remains FUTURE — `LICMPass` works by direct IR traversal, no analyses needed yet.
+- **Step 5 — SHIPPED (2026-07-11, partial).** `SubstitutionPass` (MBA obfuscation), registered as `"subst"` in `extensions/obf/ext_obf.cpp` with `is_required = true`, exercised by `examples/ir_passes_test.cpp`. Replaces integer Add with `(a^b) + 2*(a&b)`. `FlatteningPass` and `MBAPass` remain FUTURE (Step 6).
+- **Step 6 — FUTURE.** More obfuscation passes: `FlatteningPass` (control-flow flattening), `MBAPass`, and bogus control flow.
 
 Each step is independently testable: the gate is the benchmark (does the pass reduce instr count / runtime?) + a correctness test (the pass is value-preserving — the IR path still produces the same i64 return).
 

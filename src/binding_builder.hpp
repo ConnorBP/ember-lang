@@ -25,7 +25,8 @@
 // native call site before codegen; there is no runtime permission branch.
 #pragma once
 #include "ast.hpp"        // Type, Prim, BinExpr::Op, make_prim, make_struct
-#include "sema.hpp"        // NativeSig, OpOverload, OpOverloadTable
+#include "sema.hpp"        // NativeSig, OpOverload, OpOverloadTable, StructLayoutTable, StructLayout
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -45,6 +46,60 @@ inline Type bind_prim(Prim p) { return make_prim(p); }
 // the type-system tag for operator-overload resolution).
 inline Type bind_handle(const char* struct_name) {
     Type t; t.prim = Prim::I64; t.struct_name = struct_name; return t;
+}
+
+// ─── Host C++ struct registration (first-class by-value types) ───
+// register_struct adds a host C++ struct to the StructLayoutTable with
+// C++-compatible layout (alignment + padding + trailing padding), so it
+// can be passed by value to/from natives with the correct byte layout.
+// The struct is visible in script as a named type (e.g. `Vec3`), and
+// sema/codegen treat it as a first-class by-value struct (same as script-
+// declared structs).
+//
+// Usage:
+//   StructLayoutTable layouts = build_struct_layouts(prog);
+//   register_struct(layouts, "Vec3", {
+//       {"x", bind_prim(Prim::F32)},
+//       {"y", bind_prim(Prim::F32)},
+//       {"z", bind_prim(Prim::F32)},
+//   });
+//   sema(prog, natives, slots, 0, &overloads, &layouts);
+//
+// The layout uses C++ alignment rules: each field is aligned to its
+// natural alignment, padding is inserted between fields, and the struct
+// size is rounded up to the struct's alignment (trailing padding).
+struct HostStructField {
+    const char* name;
+    Type ty;
+};
+inline void register_struct(StructLayoutTable& table, const char* name,
+                            std::vector<HostStructField> fields) {
+    StructLayout layout;
+    int32_t off = 0;
+    uint32_t struct_align = 1;
+    for (auto& f : fields) {
+        uint32_t a = f.ty.align();
+        if (a > struct_align) struct_align = a;
+        // Align the field offset to the field's alignment.
+        off = (off + int32_t(a) - 1) & ~int32_t(a - 1);
+        // Store the field layout. The Type is owned by the layout via
+        // shared_ptr so the const Type* pointer stays valid.
+        auto sp = std::make_shared<Type>(std::move(f.ty));
+        layout.fields[f.name] = StructFieldLayout{sp.get(), off};
+        layout.field_names.push_back(f.name);
+        layout.owned_field_types.push_back(sp);  // keep alive
+        off += int32_t(sp->byte_size());
+    }
+    // Trailing padding: round up to struct alignment.
+    off = (off + int32_t(struct_align) - 1) & ~int32_t(struct_align - 1);
+    layout.size = off;
+    table[name] = std::move(layout);
+}
+
+// Convenience: make a by-value struct type (prim=Void, struct_name set).
+// This is the type a script variable/argument would have for a host struct.
+inline Type bind_struct(const char* struct_name) {
+    Type t; t.prim = Prim::Void; t.struct_name = struct_name; return t;
 }
 
 // The built binding table handed to sema().

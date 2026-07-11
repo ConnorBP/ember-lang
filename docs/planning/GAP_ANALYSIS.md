@@ -43,9 +43,9 @@ Section 3 below + `../ROADMAP.md`.
 | Compound assign (`+=` etc.) | ✓ v1 (semantics added this pass) | `../spec/TYPE_SYSTEM.md` Section 11 |
 | `if`/`else`/`while`/`for`/`break`/`continue`/`return` | ✓ v1 | `../spec/COMPILER_PIPELINE.md` Section 2 |
 | `do-while` | ✓ v1 (added this pass) | `../spec/COMPILER_PIPELINE.md` Section 2 |
-| `for-each` | ✗ v1 | needs iterable protocol; add with `iterable` TypeBuilder hook in v2, `../ROADMAP.md` |
+| `for-each` | ✓ v1 (shipped 2026-07-11) | `for (x in slice)` over a slice `T[]` — slice-specific, no `iterable` protocol; the general `iterable()` TypeBuilder hook stays v2. `tests/lang/valid_for_each.ember`, `../ROADMAP.md` |
 | `switch` | ✓ v1 (added this pass) | `../spec/COMPILER_PIPELINE.md` Section 2, `../spec/CODEGEN_SPEC.md` Section 12 |
-| `match` (pattern) | ✗ v1 | `switch` covers v1; pattern match is v2+, `../ROADMAP.md` |
+| `match` (pattern) | ✓ v1 (shipped 2026-07-11) | `match (expr) { pat => body, _ => default }` — integer/bool literal patterns + `_` wildcard, no fallthrough. `tests/lang/valid_match.ember`, `../ROADMAP.md` |
 | `goto` | ✗ v1 (deliberate) | structured control flow only; goto complicates liveness/scope, no need |
 | `defer` | ✓ v1 (added this pass) | `../spec/CODEGEN_SPEC.md` Section 13, `../spec/COMPILER_PIPELINE.md` Section 6 |
 | Default args | ✗ v1 | host registers overloads or takes slice; `../spec/BINDING_API.md` Section 2 |

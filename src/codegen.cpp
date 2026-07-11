@@ -1,4 +1,5 @@
 #include "codegen.hpp"
+#include "stmt_walk.hpp"  // walk_if: shared IfStmt traversal for prescan/count passes
 #include "engine.hpp"
 #include "context.hpp"   // TrapReason (unified trap surface, v0.4)
 #include "peephole.hpp"  // Stage 1: post-emit peephole pipeline (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4.5)
@@ -576,8 +577,7 @@ struct CG {
         if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) { if (rs->value) prescan_expr(*rs->value); return; }
         if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) { prescan_expr(*ds->expr); return; }
         if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
-            prescan_expr(*is->cond); prescan_block(is->then_b);
-            if (is->has_else) prescan_block(is->else_b);
+            walk_if(*is, [&](const Expr& e){ prescan_expr(e); }, [&](const Block& b){ prescan_block(b); });
             return;
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { prescan_expr(*ws->cond); prescan_block(ws->body); return; }
@@ -648,8 +648,7 @@ struct CG {
         }
         if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) { count_struct_temps_expr(*ds->expr, total); return; }
         if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
-            count_struct_temps_expr(*is->cond, total); count_struct_temps_block(is->then_b, total);
-            if (is->has_else) count_struct_temps_block(is->else_b, total);
+            walk_if(*is, [&](const Expr& e){ count_struct_temps_expr(e, total); }, [&](const Block& b){ count_struct_temps_block(b, total); });
             return;
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_struct_temps_expr(*ws->cond, total); count_struct_temps_block(ws->body, total); return; }
@@ -721,8 +720,7 @@ struct CG {
         if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) { if (rs->value) count_arr_temps_expr(*rs->value, total); return; }
         if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) { count_arr_temps_expr(*ds->expr, total); return; }
         if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
-            count_arr_temps_expr(*is->cond, total); count_arr_temps_block(is->then_b, total);
-            if (is->has_else) count_arr_temps_block(is->else_b, total);
+            walk_if(*is, [&](const Expr& e){ count_arr_temps_expr(e, total); }, [&](const Block& b){ count_arr_temps_block(b, total); });
             return;
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_arr_temps_expr(*ws->cond, total); count_arr_temps_block(ws->body, total); return; }
@@ -789,8 +787,7 @@ struct CG {
         if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) { if (rs->value) count_str_temps_expr(*rs->value, total); return; }
         if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) { count_str_temps_expr(*ds->expr, total); return; }
         if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
-            count_str_temps_expr(*is->cond, total); count_str_temps_block(is->then_b, total);
-            if (is->has_else) count_str_temps_block(is->else_b, total);
+            walk_if(*is, [&](const Expr& e){ count_str_temps_expr(e, total); }, [&](const Block& b){ count_str_temps_block(b, total); });
             return;
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_str_temps_expr(*ws->cond, total); count_str_temps_block(ws->body, total); return; }
@@ -847,8 +844,7 @@ struct CG {
         if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) { if (rs->value) count_pin_refs_expr(*rs->value, counts); return; }
         if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) { count_pin_refs_expr(*ds->expr, counts); return; }
         if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
-            count_pin_refs_expr(*is->cond, counts); count_pin_refs_block(is->then_b, counts);
-            if (is->has_else) count_pin_refs_block(is->else_b, counts);
+            walk_if(*is, [&](const Expr& e){ count_pin_refs_expr(e, counts); }, [&](const Block& b){ count_pin_refs_block(b, counts); });
             return;
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_pin_refs_expr(*ws->cond, counts); count_pin_refs_block(ws->body, counts); return; }

@@ -74,6 +74,10 @@ struct StructLayout {
     int32_t size = 0;
     std::vector<std::string> field_names;   // declaration order
     std::unordered_map<std::string, StructFieldLayout> fields;
+    // Host-registered structs own their field Types via shared_ptrs so the
+    // const Type* pointers in `fields` remain valid for the table's lifetime.
+    // Script-declared structs don't need this (their Types live in Program).
+    std::vector<std::shared_ptr<Type>> owned_field_types;
 };
 using StructLayoutTable = std::unordered_map<std::string, StructLayout>;
 

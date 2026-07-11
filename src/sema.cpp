@@ -382,10 +382,15 @@ struct Checker {
     void reject_large_native_aggregate(const Type* want, const Loc& loc) {
         if (!is_registered_struct(want)) return;
         auto it = structs->find(want->struct_name);
-        if (it != structs->end() && it->second.size > 8)
+        // The Win64 ABI passes structs >8 bytes by hidden pointer (caller
+        // allocates, passes ptr in first arg slot, callee fills). Ember's
+        // codegen already implements this for script structs. Host-registered
+        // structs (registered via register_struct) also use this path.
+        // Limit: 128 bytes (enough for Mat4 = 64 bytes, with room for larger).
+        if (it != structs->end() && it->second.size > 128)
             err("native by-value argument '" + want->struct_name + "' is " +
-                std::to_string(it->second.size) + " bytes; Ember v1 supports native "
-                "aggregate arguments only through 8 bytes", loc.line, loc.col);
+                std::to_string(it->second.size) + " bytes; maximum is 128 bytes",
+                loc.line, loc.col);
     }
 
     // --- Tier 1 enums (docs/planning/plan_ENUMS.md) ---
@@ -1523,11 +1528,13 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
             if (!found) err("struct literal for '" + sl->type_name + "' is missing field '" + fname + "'",
                             sl->loc.line, sl->loc.col);
         }
-        // matches the parser's own convention for struct_name-bearing types
-        // (handle types like vec3 are also prim=I64 - see parse_type()'s
-        // Ident case) so Type::same() compares equal against a `let p: Point`
-        // declared-type slot.
-        Type st; st.prim = Prim::I64; st.struct_name = sl->type_name;
+        // The struct type: prim=Void for registered (by-value) structs
+        // (in the StructLayoutTable), prim=I64 for opaque handles (not in
+        // the table). This matches bind_struct (prim=Void) for host-registered
+        // structs and bind_handle (prim=I64) for opaque handles.
+        Type st;
+        st.prim = (structs && structs->count(sl->type_name)) ? Prim::Void : Prim::I64;
+        st.struct_name = sl->type_name;
         e.ty = intern(st);
         return e.ty;
     }
@@ -1982,6 +1989,48 @@ SemaResult sema(Program& prog,
     c.structs = structs;
     c.module_exports = module_exports;
     c.prog = &prog;
+
+    // Resolve named types: the parser sets prim=Void for all named types.
+    // A named type that IS in the StructLayoutTable is a by-value struct
+    // (prim stays Void). A named type that is NOT in the table is an opaque
+    // handle (prim → I64). This must happen before any type checking.
+    if (structs) {
+        auto resolve_type = [&](Type& t) {
+            if (t.prim == Prim::Void && !t.struct_name.empty() &&
+                structs->find(t.struct_name) == structs->end())
+                t.prim = Prim::I64;
+        };
+        // Resolve types in function signatures + local let types + globals.
+        // The parser sets prim=Void for all named types; sema resolves to
+        // I64 for opaque handles (not in the StructLayoutTable).
+        for (auto& fn : prog.funcs) {
+            if (fn.ret) resolve_type(*fn.ret);
+            for (auto& p : fn.params) if (p.ty) resolve_type(*p.ty);
+            // Walk the function body for LetStmt types.
+            std::function<void(Block&)> resolve_block = [&](Block& b) {
+                for (auto& s : b.stmts) {
+                    if (auto* ls = dynamic_cast<LetStmt*>(s.get())) {
+                        if (ls->ty) resolve_type(*ls->ty);
+                    }
+                    if (auto* is = dynamic_cast<IfStmt*>(s.get())) {
+                        resolve_block(is->then_b);
+                        if (is->has_else) resolve_block(is->else_b);
+                    }
+                    if (auto* ws = dynamic_cast<WhileStmt*>(s.get())) resolve_block(ws->body);
+                    if (auto* fs = dynamic_cast<ForStmt*>(s.get())) resolve_block(fs->body);
+                    if (auto* ds = dynamic_cast<DoWhileStmt*>(s.get())) resolve_block(ds->body);
+                    if (auto* fe = dynamic_cast<ForEachStmt*>(s.get())) resolve_block(fe->body);
+                    if (auto* sw = dynamic_cast<SwitchStmt*>(s.get()))
+                        for (auto& c : sw->cases) resolve_block(c.body);
+                    if (auto* ms = dynamic_cast<MatchStmt*>(s.get()))
+                        for (auto& arm : ms->arms) resolve_block(arm.body);
+                    if (auto* bs = dynamic_cast<BlockStmt*>(s.get())) resolve_block(bs->block);
+                }
+            };
+            resolve_block(fn.body);
+        }
+        for (auto& g : prog.globals) if (g.ty) resolve_type(*g.ty);
+    }
 
     // register globals (stable type pointers via intern)
     for (auto& g : prog.globals) {

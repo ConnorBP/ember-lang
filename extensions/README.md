@@ -41,11 +41,21 @@ The general-purpose extensions relocated out of prism, matching the
 | `vec/` | `ember_ext_vec` | `vec2`/`vec3`/`vec4` host-store types + `Add`/`Sub`/`Mul`/`Eq` operator overloads | `prism_script_host.cpp` vec2/vec3/vec4 blocks |
 | `quat/` | `ember_ext_quat` | `quat` host-store type + `Add`/`Sub`/`Mul`(Hamilton)/`Eq` overloads | `prism_script_host.cpp` quat block |
 | `mat/` | `ember_ext_mat` | `mat4` host-store type + `Mul`(4×4 product)/`Eq` overloads | `prism_script_host.cpp` mat4 block |
-| `string/` | `ember_ext_string` | mutable `string` host-store type + `Add`(concat)/`Eq` overloads + `from_slice`/`from_i64`/`from_f32`/`from_f64`/`from_bool`/`identity`/`length`/`char_at` | `prism_script_host.cpp` string block |
-| `array/` | `ember_ext_array` | `array<T>` host-store type + `new`/`length`/`resize`/`set_u8`/`get_u8`/`set_f32`/`get_f32`/`set_i64`/`get_i64`/`push_u8` + the `GetArrayBytes` accessor | `prism_script_host.cpp` array block |
-| `math/` | `ember_ext_math` | `sqrt`/`sin`/`cos`/`tan` (f32) - pure functions, no host store | `prism_script_host.cpp` math block |
+| `string/` | `ember_ext_string` | mutable `string` host-store type + `Add`(concat)/`Eq` overloads + `from_slice`/`from_i64`/`from_f32`/`from_f64`/`from_bool`/`identity`/`length`/`char_at`/`find`/`substr` | `prism_script_host.cpp` string block |
+| `array/` | `ember_ext_array` | `array<T>` host-store type + `new`/`length`/`resize`/`set_u8`/`get_u8`/`set_f32`/`get_f32`/`set_i64`/`get_i64`/`push_u8`/`push_f32`/`push_i64`/`pop_u8`/`pop_f32`/`pop_i64`/`clear`/`remove` + the `GetArrayBytes` accessor | `prism_script_host.cpp` array block |
+| `math/` | `ember_ext_math` | `sqrt`/`sin`/`cos`/`tan` (f32) + `sqrt_f64`/`sin_f64`/`cos_f64`/`tan_f64`/`floor_f64`/`ceil_f64`/`abs_f64`/`pow_f64` (f64) + `abs_i64` - pure functions, no host store | `prism_script_host.cpp` math block |
 | `sync/` | `ember_ext_sync` | cross-thread sync primitives: `aint8/16/32/64` atomics (load/store/fetch_add/cas/swap), swap buffer (double-buffer + atomic flip), SPSC/MPSC/MPMC queues — all behind opaque i64 handles, internally synchronized host storage (`std::atomic` / lock-free ring / host-internal `std::mutex` for MPMC). No operator overloads. | new (v1.0); no prism origin — added for the host↔script coordination pattern |
 | `lifecycle/` | `ember_ext_lifecycle` | dynamic routine registration: `register_routine(fn h, i64 data) -> id` / `unregister_routine(id)` — the Tier 2 fn-refs feature's host-native half. The `fn` param is typed (`is_fn_handle`) so sema rejects a forged plain i64; the host calls a stored routine via the dispatch table (the SAME call mechanism as the static `@on_tick` path, just discovered by the script at runtime). No operator overloads. | new (v1.0 follow-on); no prism origin — added once Tier 2 fn-refs shipped (`../docs/LIFECYCLE.md` §2) |
+| `map/` | `ember_ext_map` | `map<K,V>` host-store type — opaque i64 handle backed by a host-side `unordered_map<i64,i64>` + `map_new`/`map_set`/`map_get`/`map_contains`/`map_length`/`map_remove`/`map_clear` (K and V are i64 in v1; typed keys/values are v2). No operator overloads. | new (v1.0); no prism origin — added for the Tier 0 standard addon set (`../docs/ROADMAP.md` Tier 0) |
+
+**Pass extensions (a separate category).** `extensions/opt/` (`ember_ext_opt`) and
+`extensions/obf/` (`ember_ext_obf`) are NOT `NativeSig` addons — they register
+IR→IR transforms over `ThinFunction` via `register_passes(EmberPassRegistry&)`
+(not `register_natives`). `opt` ships `ConstPropPass`/`DeadCodeElimPass`/
+`CSEPass`/`LICMPass`; `obf` ships `SubstitutionPass` (`is_required = true`).
+See `../docs/spec/PASS_SYSTEM_DESIGN.md` §8. They do not fit the "what an
+extension is" definition above (they are not host-side natives); they are
+listed here for completeness.
 
 Each is a self-contained C++ TU that depends only on ember's *public*
 headers (`ast.hpp`, `sema.hpp` - for `Type`/`make_prim`/`make_slice`/
@@ -105,6 +115,7 @@ std::unordered_map<std::string, ember::NativeSig> BuildScriptHostNatives() {
     ember::ext_math::register_natives(m);
     ember::ext_sync::register_natives(m);     // atomics, swap buffer, SPSC/MPSC/MPMC queues (v1.0)
     ember::ext_lifecycle::register_natives(m); // register_routine/unregister_routine (v1.0 follow-on)
+    ember::ext_map::register_natives(m);       // map_new/map_set/map_get/map_contains/map_length/map_remove/map_clear (v1.0)
     return m;
 }
 
@@ -113,7 +124,7 @@ void RegisterScriptHostOverloads(ember::OpOverloadTable& t) {
     ember::ext_quat::register_overloads(t);
     ember::ext_mat::register_overloads(t);
     ember::ext_string::register_overloads(t);  // string + ==
-    // ext_sync + ext_lifecycle have no operator overloads (method-call natives, like ext_array).
+    // ext_sync + ext_lifecycle + ext_map have no operator overloads (method-call natives, like ext_array).
 
 // Host-store types keep per-run state (opaque i64 handles index into a
 // host-owned vector). A host that wants each run independent calls the
@@ -127,6 +138,7 @@ void ResetScriptHostState() {
     ember::ext_array::reset();
     ember::ext_sync::reset();
     ember::ext_lifecycle::reset();
+    ember::ext_map::reset();
     // math is stateless - no reset.
     // ... host's own state reset ...
 }
@@ -180,13 +192,15 @@ accessor natives, so they expose no accessor.
 
 `ember/CMakeLists.txt` defines one static library per extension
 (`ember_ext_vec`, `ember_ext_quat`, `ember_ext_mat`, `ember_ext_string`,
-`ember_ext_array`, `ember_ext_math`, `ember_ext_sync`, `ember_ext_lifecycle`).
-Each links `ember_frontend` PUBLIC (for `make_prim`/`make_slice`/`Type` symbols,
+`ember_ext_array`, `ember_ext_math`, `ember_ext_sync`, `ember_ext_lifecycle`,
+`ember_ext_map`, plus the `ember_ext_opt`/`ember_ext_obf` pass-extension
+libs). Each links `ember_frontend` PUBLIC (for `make_prim`/`make_slice`/`Type` symbols,
 defined in `ember_frontend`'s `types.cpp`) and exposes its `ext_*.hpp` header via
 a PUBLIC include directory. A consumer links whichever extensions it wants;
-prism links the original six (sync + lifecycle are host-arranged per consumer
+prism links the original six (sync + lifecycle + map are host-arranged per consumer
 — see `examples/ext_sync_test.cpp` / `examples/ext_lifecycle_test.cpp` for
-the wiring; the standalone `ember` CLI links all eight).
+the wiring; the standalone `ember` CLI links all nine addon extensions, plus the
+`opt`/`obf` pass extensions).
 
 ## Purity
 

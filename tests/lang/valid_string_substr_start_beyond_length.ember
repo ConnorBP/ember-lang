@@ -1,0 +1,9 @@
+// valid_string_substr_start_beyond_length — string_substr with start past the
+// end returns an empty string (length 0). "hello" has length 5; start=100
+// is beyond the bounds, so the result is empty.
+// expect: 0
+fn main() -> i64 {
+    let h: string = string_from_slice("hello");
+    let s: string = string_substr(h, 100, 3);
+    return string_length(s);
+}

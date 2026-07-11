@@ -104,8 +104,10 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
 - **`match` (pattern)** ✓ shipped 2026-07-11 (Tier 1, v1 form) —
   `match (expr) { pattern => body, _ => default }`. Patterns: integer/bool
   literals + `_` wildcard. Each arm is a separate branch (no fallthrough, no
-  break). Body can be a block or single statement. Struct destructure + guards
-  are a later refinement.
+  break). Body can be a block or single statement. The IR backend marks
+  functions using match as non_serializable (falls back to the tree-walker) —
+  `src/thin_lower.cpp` treats `MatchStmt` the same as `ForEachStmt` for Stage A.
+  Struct destructure + guards are a later refinement.
 - **`static_assert(cond, msg)`** - compile-time assertion. Trigger:
   binding code wants to verify struct layout assumptions at compile.
   Dep: `constexpr` evaluation broadened beyond literals (below).

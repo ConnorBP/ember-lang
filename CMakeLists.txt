@@ -612,6 +612,15 @@ add_executable(ember_pass_test examples/ember_pass_test.cpp)
 target_link_libraries(ember_pass_test PRIVATE ember ember_frontend)
 add_test(NAME ember_pass COMMAND ember_pass_test)
 
+# host_struct_test - proof-of-concept: host C++ struct types as first-class
+# by-value script arguments (register_struct + C++-compatible layout).
+add_executable(host_struct_test examples/host_struct_test.cpp)
+target_link_libraries(host_struct_test PRIVATE ember ember_frontend)
+if(WIN32)
+    target_link_libraries(host_struct_test PRIVATE kernel32)
+endif()
+add_test(NAME host_struct COMMAND host_struct_test)
+
 # ir_passes_test - Stage C: the IR optimization passes value-preservation +
 # instr-count-reduction gate. Compiles the four IR-pass workloads, lowers each
 # to ThinFunction, runs each pass (constprop/dce/cse) via the registry,

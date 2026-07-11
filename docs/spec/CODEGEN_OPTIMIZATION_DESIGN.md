@@ -978,21 +978,26 @@ PreservedAnalyses, AnalysisManager, PassInstrumentation, pipeline parsing) and
 designed in `docs/spec/PASS_SYSTEM_DESIGN.md` (the mixture architecture:
 extension-style discovery + LLVM-style pass interface).
 
-**Stage C SHIPPED (2026-07-11, Steps 1-3).** The composable pass system + the
-first three IR optimization passes:
+**Stage C SHIPPED (2026-07-11, Steps 1-5; Steps 4-5 partial).** The composable
+pass system + the first four IR optimization passes (+ the `SubstitutionPass`
+obfuscation pass):
 - `src/ember_pass.{hpp,cpp}` + `src/ember_pass_registry.hpp` +
   `src/ember_pass_pipeline.hpp` — the infrastructure (type-erased pass manager,
   CRTP mix-in, PreservedAnalyses, registry, pipeline string parser,
   instrumentation callbacks). `examples/ember_pass_test.cpp` (ctest `ember_pass`).
 - `extensions/opt/ext_opt.{hpp,cpp}` (ember_ext_opt) — `ConstPropPass`,
-  `DeadCodeElimPass`, `CSEPass`, registered by name via `register_passes`.
-  `examples/ir_passes_test.cpp` (ctest `ir_passes`) verifies value-preservation
-  + instr-count-reduction.
+  `DeadCodeElimPass`, `CSEPass`, `LICMPass`, registered by name via
+  `register_passes`. `examples/ir_passes_test.cpp` (ctest `ir_passes`) verifies
+  value-preservation + instr-count-reduction (LICM is value-preserving; it
+  hoists, it does not remove instrs).
 - Pass manager wired into `CodeGenCtx` (compile_func runs passes between
   lower_function and emit_x64). CLI `--passes constprop,cse,dce`. Bench
   `EMBER_IR_PASS` env var. Code-size reductions verified: constprop_fold
   406→318B, dce 382→326B, cse 418→404B.
-Steps 4-5 (AnalysisManager + LICM, obfuscation passes) remain FUTURE.
+Steps 4-5 partially shipped (2026-07-11): `LICMPass` (Step 4) and
+`SubstitutionPass` (Step 5, `extensions/obf/ext_obf.cpp`, `is_required = true`)
+shipped. `EmberAnalysisManager` (§6) and the remaining obfuscation passes
+(`FlatteningPass`, `MBAPass`, bogus control flow) remain FUTURE.
 
 The design sections (§4 architecture, §5 pass interface, §6 representation, §7
 migration) are unchanged; §4.3/§4.6/§4.7 are the design as written pre-ship (the

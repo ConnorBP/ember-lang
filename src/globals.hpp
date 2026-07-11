@@ -244,7 +244,6 @@ inline size_t eval_global_initializers(const Program& prog, GlobalInitCtx gic) {
                     if (bit != gic.backing_offsets->end()) {
                         size_t back_off = bit->second;
                         if (auto* al = dynamic_cast<const ArrayLit*>(g.init.get())) {
-                            const Type* elem_ty = t->elem.get();
                             write_aggregate_init(*al, t, gic.bytes.data(), back_off, *gic.structs);
                             // seed the {ptr,len} slot: ptr = backing_off (relative),
                             // len = element count.

@@ -370,7 +370,7 @@ static void test_struct_by_value_arg() {
     using namespace ember;
     BindingBuilder b;
     b.add("add_pair8", make_prim(Prim::I64),
-          { bind_handle("Pair8") },
+          { bind_struct("Pair8") },
           (void*)&n_add_pair8);
     NativeTable tab = b.build();
 
@@ -401,7 +401,7 @@ static void test_struct_by_value_arg() {
 static void test_nested_packed_arg() {
     using namespace ember;
     BindingBuilder b;
-    b.add("read_packed", make_prim(Prim::I64), { bind_handle("PackedOuter") },
+    b.add("read_packed", make_prim(Prim::I64), { bind_struct("PackedOuter") },
           (void*)&n_read_packed);
     NativeTable tab = b.build();
     const std::string src =
@@ -436,12 +436,18 @@ static void expect_sema_reject(const std::string& src, const ember::NativeTable&
 
 static void test_rejected_aggregate_shapes() {
     using namespace ember;
+    // [1c] native by-value aggregate argument >128 bytes rejected.
+    // (The old >8-byte limit was raised to 128 to support host C++ structs
+    // like Mat4 = 64 bytes. A struct with 17 i64s = 136 bytes exceeds it.)
     BindingBuilder b;
-    b.add("take_big", make_prim(Prim::I64), { bind_handle("Big") }, (void*)&n_add_pair8);
+    b.add("take_huge", make_prim(Prim::I64), { bind_struct("Huge") }, (void*)&n_add_pair8);
     NativeTable tab = b.build();
     expect_sema_reject(
-        "struct Big { a: i64; b: i64; } fn main() -> i64 { let v: Big = Big { a: 1, b: 2 }; return take_big(v); }\n",
-        tab, "[1c] native by-value aggregate argument >8 bytes rejected");
+        "struct Huge { a: i64; b: i64; c: i64; d: i64; e: i64; f: i64; g: i64; h: i64;"
+        " i: i64; j: i64; k: i64; l: i64; m: i64; n: i64; o: i64; p: i64; q: i64; }"
+        " fn main() -> i64 { let v: Huge = Huge { a:1,b:2,c:3,d:4,e:5,f:6,g:7,h:8,"
+        " i:9,j:10,k:11,l:12,m:13,n:14,o:15,p:16,q:17 }; return take_huge(v); }\n",
+        tab, "[1c] native by-value aggregate argument >128 bytes rejected");
     NativeTable empty;
     expect_sema_reject(
         "struct Node { value: i64; next: Node; } fn main() -> i64 { return 0; }\n",
@@ -451,7 +457,7 @@ static void test_rejected_aggregate_shapes() {
 static void test_struct_by_value_ret() {
     using namespace ember;
     BindingBuilder b;
-    b.add("make_vec3s", bind_handle("Vec3s"),
+    b.add("make_vec3s", bind_struct("Vec3s"),
           { make_prim(Prim::F32), make_prim(Prim::F32), make_prim(Prim::F32) },
           (void*)&n_make_vec3s);
     NativeTable tab = b.build();

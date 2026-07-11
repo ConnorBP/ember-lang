@@ -1,6 +1,6 @@
 // ext_opt.hpp — Stage C: the IR optimization passes extension.
 //
-// Three IR→IR optimization passes over ThinFunction, registered by name via
+// Four IR→IR optimization passes over ThinFunction, registered by name via
 // register_passes (the extension-style discovery pattern, mirroring
 // register_natives). The host wires it:
 //   EmberPassRegistry reg;
@@ -18,8 +18,14 @@
 // - CSEPass ("cse"): local common-subexpression elimination within a block.
 //   Coalesces redundant pure instrs (same op + operands + meta) by remapping
 //   uses of the second's dst to the first's dst, then removing the second.
+// - LICMPass ("licm"): loop-invariant code motion. Detects natural loops via
+//   back-edges, finds the pre-header, and hoists invariant pure instrs
+//   (ConstInt/ConstBool/ConstFloat, pure binops with invariant operands,
+//   LoadFrame from a slot never written in the loop, Move of an invariant
+//   vreg) to the end of the pre-header. Does NOT hoist stores. Works by
+//   direct IR traversal (no EmberAnalysisManager needed yet).
 //
-// All three are VALUE-PRESERVING: after the pass, emit_x64 produces the same
+// All four are VALUE-PRESERVING: after the pass, emit_x64 produces the same
 // i64 result. They return EmberPreserved::none() if they changed the IR,
 // Preserved::all() if they did nothing.
 #pragma once

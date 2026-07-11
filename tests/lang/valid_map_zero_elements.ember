@@ -1,0 +1,11 @@
+// valid_map_zero_elements — a freshly-created map with no insertions.
+// length is 0, contains returns 0 for any key, and get returns 0 (the
+// missing-key default) for any key.
+// expect: 1
+fn main() -> i64 {
+    let m: i64 = map_new();
+    if (map_length(m) != 0) { return 0; }
+    if (map_contains(m, 1) != 0) { return 0; }
+    if (map_get(m, 1) != 0) { return 0; }
+    return 1;
+}

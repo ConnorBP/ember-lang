@@ -1,0 +1,27 @@
+// valid_map_lifecycle — full map lifecycle: new, set, get, contains, length,
+// remove, clear. Each step is asserted; the function returns 42 only if every
+// intermediate state is correct.
+//   new       -> length 0
+//   set 1/2/3 -> length 3, contains 2, not contains 99
+//   remove 2  -> length 2, not contains 2, get 1 and 3 intact
+//   clear     -> length 0, not contains 1
+// expect: 42
+fn main() -> i64 {
+    let m: i64 = map_new();
+    if (map_length(m) != 0) { return 1; }
+    map_set(m, 1, 10);
+    map_set(m, 2, 20);
+    map_set(m, 3, 30);
+    if (map_length(m) != 3) { return 2; }
+    if (map_contains(m, 2) != 1) { return 3; }
+    if (map_contains(m, 99) != 0) { return 4; }
+    map_remove(m, 2);
+    if (map_contains(m, 2) != 0) { return 5; }
+    if (map_length(m) != 2) { return 6; }
+    if (map_get(m, 1) != 10) { return 7; }
+    if (map_get(m, 3) != 30) { return 8; }
+    map_clear(m);
+    if (map_length(m) != 0) { return 9; }
+    if (map_contains(m, 1) != 0) { return 10; }
+    return 42;
+}

@@ -68,9 +68,12 @@ struct P {
             // declaration could start (that path consumes Kw_fn at parse_top).
             t->prim = Prim::I64; t->is_fn_handle = true; adv(); break;
         case Tk::Ident:
-            // named struct type (resolved in sema) - or a registered handle
-            // type alias (vec3, vec2, mat4 - i64 handles with operator overloads)
-            t->prim = Prim::I64;  // handle types are i64 under the hood
+            // named struct type (resolved in sema) — prim=Void is the neutral
+            // "named type" marker. Sema resolves it: prim=Void stays for
+            // by-value structs (in the StructLayoutTable), prim=I64 for opaque
+            // handles (not in the table). This lets Type::same() distinguish
+            // by-value structs from opaque handles with the same name.
+            t->prim = Prim::Void;
             t->struct_name = tk.text;
             adv();
             break;

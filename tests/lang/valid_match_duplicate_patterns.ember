@@ -1,0 +1,15 @@
+// valid_match_duplicate_patterns — match with duplicate literal patterns.
+// Two arms share the pattern 5. The codegen compares patterns in order and
+// jumps to the first match, so the first arm (r = 10) wins over the second
+// (r = 20).
+// expect: 10
+fn main() -> i64 {
+    let x: i64 = 5;
+    let mut r: i64 = 0;
+    match (x) {
+        5 => { r = 10; },
+        5 => { r = 20; },
+        _ => { r = 99; }
+    }
+    return r;
+}

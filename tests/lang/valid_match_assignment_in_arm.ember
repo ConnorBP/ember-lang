@@ -1,0 +1,18 @@
+// valid_match_assignment_in_arm — match arm body performs an assignment,
+// not just a return. The matched arm mutates a variable declared outside the
+// match; execution then falls through to a post-match statement that adjusts
+// the result. Subject 3 matches the third arm (r = r + 30 = 30); then r is
+// incremented to 31.
+// expect: 31
+fn main() -> i64 {
+    let x: i64 = 3;
+    let mut r: i64 = 0;
+    match (x) {
+        1 => { r = 10; },
+        2 => { r = 20; },
+        3 => { r = r + 30; },
+        _ => { r = 99; }
+    }
+    r = r + 1;
+    return r;
+}

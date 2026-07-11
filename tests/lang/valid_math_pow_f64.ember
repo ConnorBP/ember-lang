@@ -1,0 +1,8 @@
+// valid_math_pow_f64 — pow_f64(2.0, 10.0) equals 1024.0.
+// 2^10 = 1024; the f64 result is compared against the expected value.
+// expect: 1
+fn main() -> i64 {
+    let p: f64 = pow_f64(2.0, 10.0);
+    if (p != 1024.0) { return 0; }
+    return 1;
+}

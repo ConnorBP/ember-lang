@@ -1,0 +1,10 @@
+// valid_string_find_missing — string_find on a missing substring returns -1.
+// "hello" does not contain "xyz", so find returns -1. Adding 100 turns the
+// -1 into 99, isolating the result from an all-zero pass.
+// expect: 99
+fn main() -> i64 {
+    let h: string = string_from_slice("hello");
+    let n: string = string_from_slice("xyz");
+    let p: i64 = string_find(h, n);
+    return p + 100;
+}

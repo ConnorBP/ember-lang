@@ -1,0 +1,13 @@
+// valid_for_each_single — for-each over a single-element slice.
+// The loop body runs exactly once; the sole element is captured into the
+// loop variable and accumulated.
+// expect: 42
+fn main() -> i64 {
+    let a: i64[1] = [42];
+    let s: i64[] = a[..];
+    let mut found: i64 = 0;
+    for (x in s) {
+        found = x;
+    }
+    return found;
+}

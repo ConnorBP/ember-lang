@@ -1,0 +1,14 @@
+// valid_array_negative_index — a negative index is safely rejected.
+// array_get_i64 and array_set_i64 bounds-check the index (i >= 0); a
+// negative index is a no-op for set and returns 0 for get, leaving existing
+// elements untouched.
+// expect: 10
+fn main() -> i64 {
+    let a: i64 = array_new(8, 0);
+    array_push_i64(a, 10);
+    let v: i64 = array_get_i64(a, -1);
+    if (v != 0) { return 0; }
+    array_set_i64(a, -1, 99);
+    let v2: i64 = array_get_i64(a, 0);
+    return v2;
+}

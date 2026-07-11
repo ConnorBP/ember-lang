@@ -96,10 +96,12 @@ ember run --load-em <file.em> [--fn NAME]
   one-shot "does this parse/sema-check?" tools the lang regression suite drives.
 
 `import "path";` is textual inclusion before lexing (cycle-detected, deduped),
-so multi-file scripts work. There is no CLI `--load-em` *action* in v1 — loading
-is via the host `load_em_file`/`link_em_file` API and the `link "mod.em" as m;`
-source directive. A v1 `.em` carries embedded process-local pointers, so it is
-ABI/process-trusted, not a portable interchange format.
+so multi-file scripts work. The CLI `run --load-em <file.em>` action loads a
+pre-compiled `.em` bundle (see the CLI reference above); the host
+`load_em_file`/`link_em_file` API and the `link "mod.em" as m;` source
+directive are the embedding-side equivalents. A v1 `.em` carries embedded
+process-local pointers, so it is ABI/process-trusted, not a portable
+interchange format.
 
 ## Docs
 
@@ -111,6 +113,8 @@ ABI/process-trusted, not a portable interchange format.
 - `BINDING_API.md` — the shipped `BindingBuilder`/`NativeSig` API, Win64 slot mapping, slice convention
 - `MEMORY_AND_GC.md` — ownership taxonomy, slice-escape check, globals, the v2-GC deferral rationale
 - `BENCHMARK_SYSTEM_DESIGN.md` — the bench harness design, the g++ -O2 axis, methodology
+- `PASS_SYSTEM_DESIGN.md` — the composable pass architecture: extension-style discovery + LLVM-style pass interface, the shipped opt/obf passes
+- `CODEGEN_OPTIMIZATION_DESIGN.md` — the codegen optimization design: per-path waste mapping, staged SSA-lite IR plan, pass interface
 
 **Usage**
 - `docs/BUNDLING_AND_EM_MODULES.md` — the `.em` binary bundling format: `EMBL` container, relocations, writer/loader
@@ -135,8 +139,9 @@ backed by the dispatch table.
 **Syntax (Rust-like).**
 - Bindings: `let x: i64 = 0;`, `let mut x = 0;`, `const N: u64 = sizeof(i64);`
 - Functions: `fn name(p: i64) -> i64 { ... }`; default+trailing-optional params
-- Control: `if`/`else`, `while`, `for (init; cond; step)`, `do { } while(cond);`,
-  `switch`/`case`/`default`/`break`, `continue`, `return`
+- Control: `if`/`else`, `while`, `for (init; cond; step)`, `for (x in slice)`,
+  `do { } while(cond);`, `switch`/`case`/`default`/`break`,
+  `match (expr) { pat => body, _ => default }`, `continue`, `return`
 - `defer` — cleanup runs at **lexical-block exit** (LIFO), including on
   `break`/`continue`/`return` edges
 - Operators: `+ - * / %`, comparisons, `&& ||`, `as` casts, `++/--`, `+=` etc.
@@ -158,8 +163,10 @@ ABI/process-trusted (process-local pointers), not a portable format —
 cross-process portability is a versioned-relocation v2+ item.
 
 **Binding API.** Register natives with `BindingBuilder` + `NativeSig`; the
-host maps script types to Win64 slots and ships a slice convention. The eight
-extensions (`vec`/`quat`/`mat`/`string`/`array`/`math`/`sync`/`lifecycle`)
-register their `NativeSig` + `OpOverloadTable` entries the same way. The fluent
-`TypeBuilder`/`StructBuilder` surface stays trigger-gated on a host needing
-script-visible C++ struct types.
+host maps script types to Win64 slots and ships a slice convention. The nine
+`NativeSig` extensions (`vec`/`quat`/`mat`/`string`/`array`/`math`/`sync`/`lifecycle`/`map`)
+register their `NativeSig` + `OpOverloadTable` entries the same way. Two pass
+extensions (`opt`, `obf`) are a separate category — they register IR→IR
+transforms via `register_passes` (not `register_natives`); see
+`docs/spec/PASS_SYSTEM_DESIGN.md`. The fluent `TypeBuilder`/`StructBuilder`
+surface stays trigger-gated on a host needing script-visible C++ struct types.
