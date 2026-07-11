@@ -1,0 +1,26 @@
+// runtime_struct_reassign_single — regression for the struct-local
+// REASSIGNMENT codegen bug (t113 false-negative: a prior agent concluded the
+// crash did not exist; it segfaulted 20/20).
+//
+// Trigger: an AssignExpr whose target is a struct-typed local (`s`) and whose
+// value is a struct-returning call (`mk()`). The generic CallExpr eval() path
+// has no Win64 hidden-return-pointer ABI, so `mk()` was called with rcx unset
+// (the hidden pointer) -> it wrote its 8-byte result to an unmapped address ->
+// segfault 139, 20/20 (both `ember run` and `ember bench`). The `let s = mk()`
+// INITIALIZATION path worked (LetStmt uses eval_struct_returning_call with
+// rax=&local); only the `s = mk()` REASSIGNMENT path was broken.
+//
+// Fix (src/codegen.cpp AssignExpr eval case): detect a struct-returning
+// CallExpr assigned to a struct-typed local/global, LEA the target's address
+// into rax as the hidden word-0 pointer, and call eval_struct_returning_call
+// (mirroring the LetStmt-init path) instead of generic eval() + store_rax.
+//
+// Expected rc: 42 (s.v after `s = mk()` where mk returns S{v:42}). Kept < 256
+// so the lang runner's 8-bit exit-code reading is exact.
+struct S { v: i64; }
+fn mk() -> S { return S { v: 42 }; }
+fn main() -> i64 {
+    let mut s: S = S { v: 0 };
+    s = mk();
+    return s.v;
+}

@@ -64,7 +64,9 @@ done
 for f in tests/lang/sema_valid_*.ember tests/lang/runtime_audit_semantics.ember \
          tests/lang/runtime_cast_regressions.ember tests/lang/runtime_division_forms.ember tests/lang/runtime_integer_boundaries.ember \
          tests/lang/runtime_language_features.ember tests/lang/import_test.ember \
-         tests/lang/valid_structs_slices.ember; do
+         tests/lang/valid_structs_slices.ember \
+         tests/lang/runtime_struct_reassign_single.ember tests/lang/runtime_struct_reassign_loop.ember \
+         tests/lang/runtime_struct_reassign_multi.ember; do
     run "$SEMA" "$f" ok
 done
 for f in tests/lang/sema_invalid_*.ember; do
@@ -106,6 +108,9 @@ for spec in "runtime_audit_semantics.ember:77" "runtime_cast_regressions.ember:4
             "runtime_global_string_init.ember:42" \
             "runtime_string_encryption.ember:42" \
             "runtime_string_encryption_long.ember:42" \
+            "runtime_struct_reassign_single.ember:42" \
+            "runtime_struct_reassign_loop.ember:50" \
+            "runtime_struct_reassign_multi.ember:3" \
             "sema_valid_basics.ember:6" "sema_valid_defer_local_ref.ember:94" \
             "sema_valid_priv_fn_intra_module.ember:42"; do
     f=${spec%%:*}; exp=${spec##*:}; out=$("$CLI" run "tests/lang/$f" 2>&1); rc=$?

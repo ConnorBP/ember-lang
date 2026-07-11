@@ -1,0 +1,19 @@
+// runtime_struct_reassign_multi — regression for the struct-local
+// REASSIGNMENT codegen bug, 3x reassignment with no loop (the "case D" shape
+// from the isolation). Confirms the fix holds across multiple consecutive
+// struct-returning-call reassignments to the same local, each overwriting the
+// prior value (the hidden pointer is re-LEA'd per assignment, so each call
+// writes into the same target slot). Before the fix, the first `s = mk(1);`
+// segfaulted; now all three complete and the last value wins.
+//
+// Expected rc: 3 (last assignment mk(3) sets s.v=3). Kept < 256 so the lang
+// runner's 8-bit exit-code reading is exact.
+struct S { v: i64; }
+fn mk(x: i64) -> S { return S { v: x }; }
+fn main() -> i64 {
+    let mut s: S = S { v: 0 };
+    s = mk(1);
+    s = mk(2);
+    s = mk(3);
+    return s.v;
+}

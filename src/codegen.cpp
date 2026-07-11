@@ -2025,6 +2025,46 @@ void CG::eval(const Expr& ex) {
                 normalize_rax(tt);
             }
         } else {
+            // struct-local/global REASSIGNMENT (`s = mk();` where mk() returns a
+            // struct and s is a struct-typed local/global): the RHS is a
+            // struct-returning CallExpr, which uses the Win64 hidden-pointer
+            // ABI (rcx = &return_buffer; the callee writes the struct there).
+            // The generic eval() CallExpr path has no such ABI - it would call
+            // mk() with rcx unset (garbage), so mk() writes its result to an
+            // unmapped address -> segfault, then stores a stray rax into s.
+            // Mirror the LetStmt-init struct-return path (see compile_stmt):
+            // load the TARGET's address into rax as the hidden word-0 pointer,
+            // eval_struct_returning_call writes the struct directly into the
+            // target slot - no register result, no rax store, no postfix.
+            if (auto* call = dynamic_cast<const CallExpr*>(a->value.get())) {
+                const Type* ct = call->ty;
+                if (ct && !ct->struct_name.empty() && ctx.structs && ctx.structs->count(ct->struct_name)) {
+                    if (auto* id = dynamic_cast<Ident*>(a->target.get())) {
+                        auto it = locals.find(id->name);
+                        if (it != locals.end()) {
+                            // struct local target: hidden ptr = &local.
+                            e.byte(0x48); e.byte(0x8D); e.byte(0x85); e.imm32(it->second); // lea rax, [rbp+off]
+                            eval_struct_returning_call(*call);
+                            return;
+                        }
+                        // struct GLOBAL target: hidden ptr = globals_base + goff.
+                        const auto* gidx = ctx.globals_index ? ctx.globals_index : (g_globals_for_codegen ? &g_globals_for_codegen->index : nullptr);
+                        const auto* goffsets = ctx.globals_offsets ? ctx.globals_offsets : (g_globals_for_codegen ? &g_globals_for_codegen->offsets : nullptr);
+                        const auto* gtypes = ctx.globals_types ? ctx.globals_types : (g_globals_for_codegen ? &g_globals_for_codegen->types : nullptr);
+                        if (gidx && gtypes) {
+                            int32_t goff = 0; bool found = false;
+                            if (goffsets) { auto oit = goffsets->find(id->name); if (oit != goffsets->end()) { goff = int32_t(oit->second); found = true; } }
+                            if (!found) { auto gi = gidx->find(id->name); if (gi != gidx->end()) { goff = int32_t(gi->second) * 8; found = true; } }
+                            if (found) {
+                                e.mov_reg_imm64_external(Reg::r11, AbsFixup::GlobalsBase);
+                                e.byte(0x49); e.byte(0x8D); e.byte(0x83); e.imm32(goff); // lea rax, [r11+goff]
+                                eval_struct_returning_call(*call);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
             eval(*a->value);
         }
         // Postfix forms return the pre-update value.  The parser's minimal

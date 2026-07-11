@@ -303,30 +303,86 @@ stable across runs — slice/string/loop/call are always 5-9x, struct ~3x, int_d
 - **struct_by_value is 3.0x but NOISY** (300 vs 100 ns, both near steady_clock
   resolution at n=20). The number is directionally consistent (ember slower)
   but the full matrix should rerun this path with a higher-resolution timer
-  (e.g. `__rdtsc`) or a workload sized above the corruption threshold (see 8.4).
+  (e.g. `__rdtsc`) or a larger workload (see 8.4 for why correctness on this
+  path must be asserted via `ember bench`'s full `result` line, not the
+  `ember run` exit code, which is 8-bit-truncated by the shell).
 
-### 8.4 Bonus finding: a struct-by-value-in-loop codegen corruption
+### 8.4 Real finding: a struct-local REASSIGNMENT codegen segfault (fixed)
 
-While sizing the struct_by_value path, the bench surfaced a real codegen bug:
-a struct-by-value ARG + struct-by-value RETURN reassigned in a loop miscompiles
-at inner-loop counts >= ~25 (the result is a constant ~0.1467x of the correct
-value, independent of the count — a frame/temp-slot collision that corrupts
-the accumulator after a threshold). Reproducer (`ember_cli run`):
+While sizing the struct_by_value path, the bench surfaced a real codegen bug
+— but it is NOT the "temp-slot collision / 0.1467x miscompile" an earlier
+draft of this section diagnosed. That earlier diagnosis was wrong on two
+counts, and this section now records the corrected finding so the
+Stage-1 codegen-optimization work doesn't chase a non-bug.
+
+**The real bug** is a 100%-reproducible segfault (exit 139, 20/20, both
+`ember run` and `ember bench`) on struct-local REASSIGNMENT where the RHS is a
+struct-returning call:
 ```
-struct P { a: i32; b: i32; c: i32; }
-fn mkp(a: i32, b: i32, c: i32) -> P { let p: P = P { a: a, b: b, c: c }; return p; }
-fn sump(p: P) -> i64 { return (p.a as i64) + (p.b as i64) + (p.c as i64); }
-fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; while (i < 100) { let r: i64 = sump(mkp(1, 2, 3)); s = s + r; i = i + 1; } return s; }
+struct S { v: i64; }
+fn mk() -> S { return S { v: 42 }; }
+fn main() -> i64 {
+    let mut s: S = S { v: 0 };
+    s = mk();          // <-- AssignExpr: target is a struct local, value is a struct-returning call
+    return s.v;
+}
 ```
-  - n=10, n=20: correct (60, 120).
-  - n=50: returns 44 (expect 300). n=100: returns 88 (expect 600). n=200: 176 (expect 1200).
-  - The wrong values 44/88/176 are a constant 0.1467x of expected → a temp-slot
-    collision corrupting `s` after a frame-size threshold, not a logic error.
-  - The bench path uses n=20 (correct) so its timing is clean; the corruption is
-    recorded here as a finding the full codegen-optimization work should fix
-    (it's exactly the kind of correctness issue the SSA-lite IR's structured
-    temp-slot management would address — `COMPILER_PIPELINE.md` §5's
-    `alloc_struct_temp` / `LoadFrameSlot`/`StoreFrameSlot` design).
+Isolation (all confirmed 20/20):
+  - `let s = mk()` (INITIALIZATION via LetStmt) → works (returns 42).
+  - `s = mk()` (REASSIGNMENT via AssignExpr) → SEGFAULT. In a loop or a single
+    statement; with or without struct-by-value args in the same function.
+  - A struct-by-value ARG in a loop (no struct return) → works.
+  - A struct-returning call in a loop WITHOUT reassigning a struct local → works.
+
+Root cause (src/codegen.cpp, AssignExpr eval case): the RHS `mk()` is a
+struct-returning CallExpr, which on Win64 uses the hidden-pointer struct-return
+ABI — rcx = `&return_buffer`, the callee writes the struct there, and rax
+returns the hidden pointer. The LetStmt-init path handles this correctly
+(`eval_struct_returning_call` with `lea rax, [rbp+off]` as the hidden word-0).
+The AssignExpr path did NOT: it called the generic `eval()` CallExpr case,
+which has no hidden-pointer ABI, so `mk()` was called with rcx UNSET (garbage)
+→ `mk()` wrote its 8-byte result to an unmapped address → segfault; then the
+AssignExpr stored a stray rax into `s`.
+Fix (surgical, AssignExpr eval case only): detect a struct-returning CallExpr
+assigned to a struct-typed local/global, LEA the target's address into rax as
+the hidden word-0 pointer, and call `eval_struct_returning_call` (mirroring
+the LetStmt-init path) instead of generic `eval()` + `store_rax`. The struct
+return path (initialization `let s = mk()`) was already correct and is
+unchanged.
+Regression tests: `tests/lang/runtime_struct_reassign_single.ember` (rc=42),
+`runtime_struct_reassign_loop.ember` (rc=50, the §8.4 shape in a loop),
+`runtime_struct_reassign_multi.ember` (rc=3, 3x reassign no loop). All three
+segfault (139) with the fix reverted and pass with it applied; wired into
+`tests/run_lang_tests.sh`'s sema + explicit-rc lists.
+
+**Why the earlier "0.1467x miscompile" diagnosis was wrong.** The earlier
+draft's reproducer was a SCALAR accumulator (`let mut s: i64 = 0; ... s = s + r;`)
+with `let r: i64 = sump(mkp(1,2,3));` — i.e. `let r =` (INIT, not struct
+reassign) and `s = s + r` (SCALAR reassign, not struct). That program returns
+the correct 600, but `ember run`'s exit code is `return & 0x7fffffff` further
+8-bit-truncated by the shell, so 600 reads back as `600 & 0xFF = 88`, and
+88/600 = 0.1467 — the "0.1467x" was a mod-256 exit-code artifact of the
+CORRECT value, not a miscompile. `ember bench`'s full `result` line confirms:
+`result 600` (correct). There was no temp-slot collision and no miscompile in
+that shape.
+
+**The struct temp machinery is NOT the culprit.** `alloc_struct_temp` /
+`count_struct_temps_block` (the compiler-hidden temp frame slots for
+struct-by-value general-expression args and struct-literal return values) are
+correct: they hand out distinct `$`-tagged names (no aliasing), are pre-sized
+into the frame by the counting pass, and are unrelated to the AssignExpr path
+(the reassignment bug was in the call-site ABI, not in temp-slot management).
+The earlier draft's suggestion that the SSA-lite IR's `LoadFrameSlot`/
+`StoreFrameSlot` would fix this is moot — the bug was a missing hidden-pointer
+ABI in one code path, not a temp-slot collision.
+
+**Bench correctness assertions must use the full `result` line.** Because the
+`ember run` exit code is `return & 0x7fffffff` further 8-bit-truncated by the
+shell, any bench correctness check that reads the process exit code is limited
+to values < 256. Either (a) keep the expected return value < 256 (the lang
+runner's explicit-rc tests do this), or (b) assert correctness via `ember bench`'s
+full `result` line (which prints the untruncated i64). The §8.4 reproducer's
+600 is only visible correctly via (b); `ember run` would show 88.
 
 ### 8.5 Caveat — the gate is NOT closed by the prototype alone
 
@@ -336,7 +392,7 @@ paths × both safety modes × ember-vs-g++-O2, with a higher-resolution timer fo
 the sub-µs paths), not on this 6-path prototype. The prototype is the seed that
 (a) proves the harness works end-to-end, (b) gives the first evidence that the
   call/loop/slice/string paths are 5-9x slow and int_div is adequate, and (c)
-  surfaces the struct-by-value corruption. The remaining ~9 paths (float
+  surfaces the struct-local-reassignment segfault (§8.4, now fixed). The remaining ~9 paths (float
   arithmetic, float sqrt, local load/store, native call overhead, array
   literals, defer, switch dispatch, f-string) must be added per the §5.1 pattern
   and run before the IR refactor is started — the prototype's 5-9x on 4 paths is
