@@ -5,6 +5,8 @@
 #include "ext_quat.hpp"
 #include "ast.hpp"
 #include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
+#include <new>
+#include <stdexcept>
 #include <vector>
 
 using namespace ember;  // bind_handle, BindingBuilder, type_* singletons
@@ -14,7 +16,16 @@ namespace ember::ext_quat {
 // --- quat host store (opaque i64 handle; host owns {float x,y,z,w}) ---
 struct Quat { float x, y, z, w; };
 static std::vector<Quat> g_quats;
-static int64_t q_new(float x, float y, float z, float w) { g_quats.push_back({x,y,z,w}); return int64_t(g_quats.size()); }
+static int64_t q_new(float x, float y, float z, float w) noexcept {
+    try {
+        g_quats.push_back({x,y,z,w});
+        return int64_t(g_quats.size());
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::length_error&) {
+        return 0;
+    }
+}
 static Quat* q_slot(int64_t h) { if (h<1 || h>int64_t(g_quats.size())) return nullptr; return &g_quats[size_t(h-1)]; }
 extern "C" {
     static int64_t n_quat_new(float x, float y, float z, float w) { return q_new(x,y,z,w); }

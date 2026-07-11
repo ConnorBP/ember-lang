@@ -116,7 +116,10 @@ extern "C" {
         size_t s = size_t(start);
         if (s >= x->size()) return str_new("");
         size_t actual_len = (len < 0) ? (x->size() - s) : std::min(size_t(len), x->size() - s);
-        return str_new(x->substr(s, actual_len));
+        try {
+            return str_new(x->substr(s, actual_len));
+        } catch (const std::bad_alloc&) { return 0; }
+        catch (const std::length_error&) { return 0; }
     }
 }
 

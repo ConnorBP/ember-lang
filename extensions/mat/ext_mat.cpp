@@ -5,6 +5,8 @@
 #include "ext_mat.hpp"
 #include "ast.hpp"
 #include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
+#include <new>
+#include <stdexcept>
 #include <vector>
 
 using namespace ember;  // bind_handle, BindingBuilder, type_* singletons
@@ -14,12 +16,27 @@ namespace ember::ext_mat {
 // --- mat4 host store (opaque i64 handle; host owns 16 floats, row-major) ---
 struct Mat4 { float m[16]; };
 static std::vector<Mat4> g_mat4s;
-static int64_t m4_new_zero() { Mat4 z{}; g_mat4s.push_back(z); return int64_t(g_mat4s.size()); }
-static int64_t m4_new_identity() {
-    Mat4 id{};
-    id.m[0]=1; id.m[5]=1; id.m[10]=1; id.m[15]=1;
-    g_mat4s.push_back(id);
-    return int64_t(g_mat4s.size());
+static int64_t m4_new_zero() noexcept {
+    try {
+        Mat4 z{}; g_mat4s.push_back(z);
+        return int64_t(g_mat4s.size());
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::length_error&) {
+        return 0;
+    }
+}
+static int64_t m4_new_identity() noexcept {
+    try {
+        Mat4 id{};
+        id.m[0]=1; id.m[5]=1; id.m[10]=1; id.m[15]=1;
+        g_mat4s.push_back(id);
+        return int64_t(g_mat4s.size());
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::length_error&) {
+        return 0;
+    }
 }
 static Mat4* m4_slot(int64_t h) { if (h<1 || h>int64_t(g_mat4s.size())) return nullptr; return &g_mat4s[size_t(h-1)]; }
 extern "C" {

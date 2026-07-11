@@ -7,6 +7,8 @@
 #include "ext_vec.hpp"
 #include "ast.hpp"       // ember public: Type, make_prim, make_slice, Prim
 #include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
+#include <new>
+#include <stdexcept>
 #include <vector>
 
 using namespace ember;  // bind_handle, BindingBuilder, type_* singletons
@@ -16,7 +18,16 @@ namespace ember::ext_vec {
 // --- vec3 host store (opaque i64 handle; host owns {float x,y,z}) ---
 struct Vec3 { float x, y, z; };
 static std::vector<Vec3> g_vec3s;
-static int64_t v3_new(float x, float y, float z) { g_vec3s.push_back({x,y,z}); return int64_t(g_vec3s.size()); }
+static int64_t v3_new(float x, float y, float z) noexcept {
+    try {
+        g_vec3s.push_back({x,y,z});
+        return int64_t(g_vec3s.size());
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::length_error&) {
+        return 0;
+    }
+}
 static Vec3* v3_slot(int64_t h) { if (h<1 || h>int64_t(g_vec3s.size())) return nullptr; return &g_vec3s[size_t(h-1)]; }
 extern "C" {
     static int64_t n_vec3_new(float x, float y, float z) { return v3_new(x,y,z); }
@@ -35,7 +46,16 @@ extern "C" {
 // --- vec2 host store (opaque i64 handle; host owns {float x,y}) ---
 struct Vec2 { float x, y; };
 static std::vector<Vec2> g_vec2s;
-static int64_t v2_new(float x, float y) { g_vec2s.push_back({x,y}); return int64_t(g_vec2s.size()); }
+static int64_t v2_new(float x, float y) noexcept {
+    try {
+        g_vec2s.push_back({x,y});
+        return int64_t(g_vec2s.size());
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::length_error&) {
+        return 0;
+    }
+}
 static Vec2* v2_slot(int64_t h) { if (h<1 || h>int64_t(g_vec2s.size())) return nullptr; return &g_vec2s[size_t(h-1)]; }
 extern "C" {
     static int64_t n_vec2_new(float x, float y) { return v2_new(x,y); }
@@ -52,7 +72,16 @@ extern "C" {
 // --- vec4 host store (opaque i64 handle; host owns {float x,y,z,w}) ---
 struct Vec4 { float x, y, z, w; };
 static std::vector<Vec4> g_vec4s;
-static int64_t v4_new(float x, float y, float z, float w) { g_vec4s.push_back({x,y,z,w}); return int64_t(g_vec4s.size()); }
+static int64_t v4_new(float x, float y, float z, float w) noexcept {
+    try {
+        g_vec4s.push_back({x,y,z,w});
+        return int64_t(g_vec4s.size());
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::length_error&) {
+        return 0;
+    }
+}
 static Vec4* v4_slot(int64_t h) { if (h<1 || h>int64_t(g_vec4s.size())) return nullptr; return &g_vec4s[size_t(h-1)]; }
 extern "C" {
     static int64_t n_vec4_new(float x, float y, float z, float w) { return v4_new(x,y,z,w); }
