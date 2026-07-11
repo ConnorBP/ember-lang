@@ -154,6 +154,7 @@ static void usage(FILE* out) {
         "usage:\n"
         "  ember run <input.ember> [--fn NAME] [--dump] [--emit-em OUTPUT.em]\n"
         "                          [--tick [--tick-count N] [--tick-interval MS]]\n"
+        "                          [--passes SPEC]\n"
         "  ember emit-em <input.ember> <output.em>\n"
         "  ember run --load-em <input.em> [--fn NAME]\n"
         "  ember bench <input.ember> [--fn NAME] [--iters N] [--warmup N]\n"
@@ -169,7 +170,8 @@ static void usage(FILE* out) {
         "  --emit-em PATH      run-mode precompile output; compile and write without running\n"
         "  --tick              run @on_tick and dynamic routines on a tick thread\n"
         "  --tick-count N      stop automatically after N ticks (default: keypress)\n"
-        "  --tick-interval MS  tick interval in milliseconds (default: 16)\n");
+        "  --tick-interval MS  tick interval in milliseconds (default: 16)\n"
+        "  --passes SPEC      run IR optimization passes (e.g. constprop,cse,dce,licm,subst)\n");
 }
 
 // Compute the TYPED globals-block layout (chunk c3): per-global (offset, size)
