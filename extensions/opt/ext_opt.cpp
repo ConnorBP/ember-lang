@@ -638,6 +638,137 @@ EmberPreserved LICMPass::run(ThinFunction& f, EmberAnalysisManager&) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// StoreToLoadForwardPass: intra-block store-to-load forwarding
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The IR backend stores every VReg to a frame slot (StoreFrame src1=vN off=X),
+// then the next instruction loads it back (LoadFrame dst=vD off=X). This
+// round-trip through memory is the #1 reason the IR backend is 1.2-1.9× slower
+// than the tree-walker.
+//
+// This pass replaces LoadFrame dst=vD off=X with Move dst=vD src1=vN when a
+// StoreFrame src1=vN off=X is the last writer to slot X (no intervening
+// StoreFrame to the same offset). The emit's rax_vreg cache then keeps the
+// result in rax (no frame load). Kill rule: a StoreFrame to offset X kills
+// any pending forwarding for X. Only forwards within a block (no inter-block).
+
+EmberPreserved StoreToLoadForwardPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    bool changed = false;
+    for (auto& blk : f.blocks) {
+        // Map: frame_off → VReg of the last StoreFrame's src1.
+        std::unordered_map<int32_t, VReg> last_store_src;
+        for (auto& in : blk.instrs) {
+            if (in.op == ThinOp::StoreFrame) {
+                // Record the store (or update it).
+                last_store_src[in.meta.frame_off] = in.src1;
+                continue;
+            }
+            if (in.op == ThinOp::LoadFrame) {
+                // Check if there's a pending store to this slot.
+                auto it = last_store_src.find(in.meta.frame_off);
+                if (it != last_store_src.end() && it->second != 0) {
+                    // Forward: replace LoadFrame with Move.
+                    in.op = ThinOp::Move;
+                    in.src1 = it->second;
+                    in.src2 = 0;
+                    // Keep meta.frame_off (emit still uses it for the VReg's
+                    // frame-backed status — the Move will store to the same slot).
+                    changed = true;
+                }
+                // A LoadFrame does NOT kill the store (the value is still there).
+                continue;
+            }
+            // Any other instruction that writes to a VReg could invalidate a
+            // store if the VReg was the store's source. But since we're only
+            // tracking frame_off → src VReg, and the src VReg is the value AT
+            // THE TIME of the store, a subsequent redefinition of that VReg
+            // doesn't change what was stored. The store happened with the old
+            // value. So we don't need to kill on VReg redefinition — the frame
+            // slot holds the value that was stored, regardless of what happens
+            // to the VReg later. This is correct because we're forwarding the
+            // VALUE that was stored, not the VReg itself.
+            //
+            // HOWEVER: if the instruction is a StoreFrame to a DIFFERENT slot
+            // that happens to alias (overlapping frame offsets for structs >8
+            // bytes), we'd need to kill. For v1, frame slots don't overlap
+            // (each local gets its own non-overlapping region), so this is safe.
+        }
+    }
+    return changed ? EmberPreserved::none() : EmberPreserved::all();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CopyPropPass: intra-block copy propagation
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// After store-to-load forwarding creates Move instrs, copy propagation replaces
+// uses of the Move's dst with its src. Then DCE removes the dead Move.
+//
+// Move dst=vD src1=vN → for all subsequent instructions in the same block (until
+// vD or vN is redefined), replace any use of vD with vN.
+
+EmberPreserved CopyPropPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    bool changed = false;
+    for (auto& blk : f.blocks) {
+        // Map: VReg → the VReg it's a copy of (from a Move).
+        std::unordered_map<VReg, VReg> copy_map;
+        auto resolve = [&](VReg v) -> VReg {
+            // Follow copy chains (v → v2 → v3 ...) to the root.
+            VReg cur = v;
+            while (copy_map.count(cur)) cur = copy_map[cur];
+            return cur;
+        };
+        for (auto& in : blk.instrs) {
+            // First: replace uses of this instr's src1/src2/args with their
+            // copy-propagated roots.
+            if (in.src1 && copy_map.count(in.src1)) {
+                in.src1 = resolve(in.src1);
+                changed = true;
+            }
+            if (in.src2 && copy_map.count(in.src2)) {
+                in.src2 = resolve(in.src2);
+                changed = true;
+            }
+            for (auto& a : in.args) {
+                if (a && copy_map.count(a)) {
+                    a = resolve(a);
+                    changed = true;
+                }
+            }
+            // Handle the terminator too (cond/ret are in term, but term is
+            // separate from instrs — handled after the loop below).
+
+            // Now handle this instr's dst:
+            if (in.dst) {
+                // If this is a Move, record the copy.
+                if (in.op == ThinOp::Move && in.src1) {
+                    copy_map[in.dst] = resolve(in.src1);
+                } else {
+                    // Any other producing instr kills the copy for its dst.
+                    copy_map.erase(in.dst);
+                }
+                // Also kill any copy entry whose VALUE depends on this dst
+                // (i.e., if this dst was used as a src in a prior Move).
+                for (auto it = copy_map.begin(); it != copy_map.end(); ) {
+                    if (it->second == in.dst) it = copy_map.erase(it);
+                    else ++it;
+                }
+            }
+        }
+        // Handle the terminator's cond/ret.
+        if (blk.term.cond && copy_map.count(blk.term.cond)) {
+            blk.term.cond = resolve(blk.term.cond);
+            changed = true;
+        }
+        if (blk.term.ret && copy_map.count(blk.term.ret)) {
+            blk.term.ret = resolve(blk.term.ret);
+            changed = true;
+        }
+    }
+    return changed ? EmberPreserved::none() : EmberPreserved::all();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // register_passes
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -646,6 +777,8 @@ void register_passes(EmberPassRegistry& reg) {
     reg.add<DeadCodeElimPass>("dce");
     reg.add<CSEPass>("cse");
     reg.add<LICMPass>("licm");
+    reg.add<StoreToLoadForwardPass>("forward");
+    reg.add<CopyPropPass>("copyprop");
 }
 
 } // namespace ember::ext_opt

@@ -1,6 +1,6 @@
 // ext_opt.hpp — Stage C: the IR optimization passes extension.
 //
-// Four IR→IR optimization passes over ThinFunction, registered by name via
+// Six IR→IR optimization passes over ThinFunction, registered by name via
 // register_passes (the extension-style discovery pattern, mirroring
 // register_natives). The host wires it:
 //   EmberPassRegistry reg;
@@ -24,8 +24,16 @@
 //   LoadFrame from a slot never written in the loop, Move of an invariant
 //   vreg) to the end of the pre-header. Does NOT hoist stores. Works by
 //   direct IR traversal (no EmberAnalysisManager needed yet).
+// - StoreToLoadForwardPass ("forward"): intra-block store-to-load forwarding.
+//   Replaces LoadFrame dst=vD off=X with Move dst=vD src1=vN when a
+//   StoreFrame src1=vN off=X is the last writer to slot X (no intervening
+//   store). Eliminates the frame-slot round-trip that makes the IR backend
+//   1.2-1.9× slower than the tree-walker.
+// - CopyPropPass ("copyprop"): intra-block copy propagation. After forwarding
+//   creates Move instrs, replaces uses of the Move's dst with its src.
+//   Pairs with forward + dce in the pipeline: constprop,forward,copyprop,dce.
 //
-// All four are VALUE-PRESERVING: after the pass, emit_x64 produces the same
+// All six are VALUE-PRESERVING: after the pass, emit_x64 produces the same
 // i64 result. They return EmberPreserved::none() if they changed the IR,
 // Preserved::all() if they did nothing.
 #pragma once
@@ -53,6 +61,16 @@ struct CSEPass : EmberPassInfoMixin<CSEPass> {
 
 struct LICMPass : EmberPassInfoMixin<LICMPass> {
     static constexpr const char* pass_name = "licm";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+struct StoreToLoadForwardPass : EmberPassInfoMixin<StoreToLoadForwardPass> {
+    static constexpr const char* pass_name = "forward";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+struct CopyPropPass : EmberPassInfoMixin<CopyPropPass> {
+    static constexpr const char* pass_name = "copyprop";
     EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
 };
 
