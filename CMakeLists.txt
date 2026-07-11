@@ -335,6 +335,21 @@ if(WIN32)
 endif()
 add_test(NAME function_refs COMMAND function_refs_test)
 
+# Tier 4: in-language exceptions (try/catch/throw). try { ... } catch (name) { ... }
+# + throw expr; with JIT-emitted setjmp/longjmp over a per-context catch stack
+# (context_t::catch_bufs). A throw with no enclosing try/catch unwinds to the
+# host checkpoint as a TrapReason::UnhandledThrow (a recoverable runtime trap).
+# Mirrors function_refs_test's harness (B1 context-register model, six extensions).
+add_executable(try_catch_test examples/try_catch_test.cpp)
+target_link_libraries(try_catch_test PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_vec ember_ext_quat ember_ext_mat
+    ember_ext_string ember_ext_array ember_ext_math)
+if(WIN32)
+    target_link_libraries(try_catch_test PRIVATE kernel32)
+endif()
+add_test(NAME try_catch COMMAND try_catch_test)
+
 # v1.0 Tier 2 parameterized function types: `fn(Args)->Ret` as a type, closing
 # the bare-fn signature hole. A fn-typed param/variable WITH a signature
 # type-checks its args at the call site; a bare `fn` stays the unsound
@@ -367,6 +382,22 @@ if(WIN32)
     target_link_libraries(v0_5_live_modules_test PRIVATE kernel32)
 endif()
 add_test(NAME v0_5_live_modules COMMAND v0_5_live_modules_test)
+
+# v1.0 Tier 2 cross-module function handles (`&mod::fn` / `mod::fn` returning a
+# handle that works across module boundaries). Proves cross-module handle
+# creation + call, handle-passed-to-fn + called, out-of-range / unregistered
+# forged handles trapping via BadCallTarget, and the intra/cross distinct-
+# spaces type rule. Mirrors v0_5's registry/export wiring + function_refs'
+# allowlist + trap-checkpoint harness.
+add_executable(cross_module_handles_test examples/cross_module_handles_test.cpp)
+target_link_libraries(cross_module_handles_test PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_vec ember_ext_quat ember_ext_mat
+    ember_ext_string ember_ext_array ember_ext_math)
+if(WIN32)
+    target_link_libraries(cross_module_handles_test PRIVATE kernel32)
+endif()
+add_test(NAME cross_module_handles COMMAND cross_module_handles_test)
 
 # F1 pub/priv visibility (docs/spec/SPEC_AUDIT_2026-07-10.md F1): a bundled .em
 # module's exported surface is a SUBSET of its functions. `pub fn`/bare `fn`

@@ -1495,6 +1495,60 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
     // reification, not a runtime value. We stash the slot on the AST node for
     // codegen; the first-class-ness lives at the CALL site (handle(args)), not here.
     if (auto* h = dynamic_cast<FnHandleExpr*>(&e)) {
+        // v1.0 Tier 2 cross-module handle `&mod::fn` (docs/MODULES.md + plan_FUNCTION_REFS.md):
+        // resolve against the host-provided ModuleExportTable, stamp the
+        // target module's registry id + the fn's slot, and build a
+        // cross-module-tagged fn-handle type carrying the export's recorded
+        // signature. Unlike a cross-module CALL (which defers an unresolved
+        // module to a runtime trap — the module may register later), a HANDLE
+        // bakes its (module_id, slot) into the call site at the `&mod::fn`
+        // point; if the module/fn is not resolvable NOW there is no valid value
+        // to bake, so it is a hard sema error (not a deferred trap). The
+        // runtime guard still validates a (forged) cross-module handle against
+        // the target module's allowlist before dispatch (REDSHELL #6 lifted
+        // cross-module), so forged out-of-range / unregistered handles trap.
+        if (h->is_cross_module) {
+            if (!module_exports) {
+                err("'&" + h->module_alias + "::" + h->fn_name +
+                    "' cannot resolve: no modules are linked in this module",
+                    h->loc.line, h->loc.col);
+                e.ty = intern(type_void()); return e.ty;
+            }
+            auto mit = module_exports->find(h->module_alias);
+            if (mit == module_exports->end()) {
+                err("'&" + h->module_alias + "::" + h->fn_name +
+                    "' cannot resolve module '" + h->module_alias +
+                    "' (it is not linked; a cross-module handle requires the "
+                    "target module to be registered at compile time)",
+                    h->loc.line, h->loc.col);
+                e.ty = intern(type_void()); return e.ty;
+            }
+            for (const auto& exp : mit->second) {
+                if (exp.fn_name == h->fn_name) {
+                    h->cross_module_unresolved = false;
+                    h->cross_module_id = exp.module_id;
+                    h->cross_module_slot = exp.slot;
+                    Type t = type_i64();
+                    t.is_fn_handle = true;
+                    t.is_cross_module_handle = true;
+                    if (!exp.unknown_sig) {
+                        t.has_recorded_sig = true;
+                        for (const auto& p : exp.params)
+                            t.recorded_params.push_back(std::make_shared<Type>(p));
+                        t.recorded_ret = std::make_shared<Type>(exp.ret);
+                    }
+                    e.ty = intern(t); return e.ty;
+                }
+            }
+            // F1 visibility (mirrors the cross-module CALL path): the module IS
+            // registered but no exported fn matches — the target is private or
+            // undefined, so it is not part of the module's public surface.
+            err("'&" + h->module_alias + "::" + h->fn_name +
+                "' targets a function that is not exported by module '" +
+                h->module_alias + "' (it is private or undefined)",
+                h->loc.line, h->loc.col);
+            e.ty = intern(type_void()); return e.ty;
+        }
         auto* id = dynamic_cast<Ident*>(h->operand.get());
         if (!id) {
             err("'&' may only be applied to a function name, not an expression", h->loc.line, h->loc.col);
@@ -2869,6 +2923,44 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
             pop_scope();
         }
         returns = false;
+        return;
+    }
+    // Tier 4: try { ... } catch (name) { ... } — in-language exceptions.
+    // The try body + catch body are each checked in their own scope. The
+    // catch_name is bound as an i64 local in the catch block's scope (the
+    // thrown value is always i64 in v1). A throw is a terminator (sets
+    // `returns`), so `returns` for the whole try/catch is true only if BOTH
+    // the try body and the catch body always terminate — conservative but
+    // correct (if the try can complete normally, the try/catch can fall
+    // through; if the try throws and the catch completes normally, the
+    // try/catch also falls through). A throw outside any try/catch is NOT a
+    // sema error — it's a valid runtime behavior (unwinds to the host as a
+    // TrapReason::UnhandledThrow, mirroring runtime_error), so no enclosing-
+    // try check is performed here.
+    if (auto* tc = dynamic_cast<TryCatchStmt*>(&s)) {
+        push_scope();
+        bool try_ret = false;
+        check_block(tc->try_body, ret_ty, try_ret);
+        pop_scope();
+        push_scope();
+        declare(tc->catch_name, &type_i64(), false, false, tc->loc);
+        bool catch_ret = false;
+        check_block(tc->catch_body, ret_ty, catch_ret);
+        pop_scope();
+        returns = try_ret && catch_ret;
+        return;
+    }
+    // Tier 4: throw expr; — raises an exception (i64 value for v1) that
+    // unwinds to the nearest enclosing catch, or to the host if none. The
+    // throw expr must be i64. throw is a terminator (like return), so it
+    // sets `returns=true` — check_block's unreachable-code guard flags any
+    // statement after a throw in the same block.
+    if (auto* th = dynamic_cast<ThrowStmt*>(&s)) {
+        const Type* vt = check_expr(*th->value);
+        if (!vt->is_int() || !is_plain_integer(vt))
+            err("throw value must be an i64 integer (got " + vt->to_string() + ")",
+                th->loc.line, th->loc.col);
+        returns = true;
         return;
     }
 }

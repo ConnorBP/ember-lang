@@ -47,6 +47,15 @@ struct Type {
     bool has_recorded_sig = false;
     std::vector<std::shared_ptr<Type>> recorded_params;  // empty unless is_fn_handle
     std::shared_ptr<Type> recorded_ret;                  // null unless is_fn_handle
+    // v1.0 Tier 2 cross-module handles (`&mod::fn`): a cross-module handle is
+    // a fn handle tagged is_cross_module_handle=true. Type::same() treats a
+    // cross-module handle and an intra-module handle (with matching recorded
+    // sigs) as DISTINCT — the two handle spaces do not intermix at the type
+    // level (a `let h: fn(i64)->i64 = &lib::double;` is a sema error). A BARE
+    // `fn` (has_recorded_sig=false) accepts either kind — the "any fn" escape
+    // hatch — so a cross-module handle can still be passed to a `fn`-typed
+    // parameter and called (the runtime guard routes on bit 63, not the type).
+    bool is_cross_module_handle = false;
 
     bool is_int() const;            // any i*/u*
     bool is_uint() const;          // any u*
@@ -138,7 +147,29 @@ struct CastExpr : Expr { ExprPtr operand; std::shared_ptr<Type> to; };
 // produces a function handle. Sema resolves the operand to a script fn slot,
 // bakes it as an i64 literal (slot). NOT a runtime computation — a compile-time
 // reification. `slot` is filled by sema; codegen emits `mov rax, imm64(slot)`.
-struct FnHandleExpr : Expr { ExprPtr operand; int slot = -1; };
+//
+// v1.0 Tier 2 cross-module handles: `&mod::fn` produces a CROSS-MODULE handle.
+// The parser sets is_cross_module=true + module_alias + fn_name directly (the
+// operand is null for the cross-module form). Sema resolves it against the
+// host-provided ModuleExportTable, stamping cross_module_id/slot from the
+// matched export. Codegen bakes the handle as `(1<<63)|(module_id<<32)|slot`
+// — bit 63 is the cross-module flag (an intra-module handle is a bare slot,
+// never has bit 63 set, so the two spaces never collide). The call-target
+// guard tests bit 63 to route: clear -> intra-module allowlist (existing path);
+// set -> look up the per-module handle-records table for the target module's
+// dispatch table + allowlist + slot_count, validate, and dispatch via that
+// table (a handle from module A is meaningless against module B's table).
+struct FnHandleExpr : Expr {
+    ExprPtr operand;          // &fn: an Ident naming a script fn. &mod::fn: null.
+    int slot = -1;            // intra-module slot (set by sema for &fn)
+    // &mod::fn cross-module form (set by the parser, resolved by sema):
+    bool is_cross_module = false;
+    std::string module_alias;        // the `mod` in `&mod::fn`
+    std::string fn_name;             // the `fn` in `&mod::fn`
+    uint32_t cross_module_id = 0;    // target module's registry id (sema)
+    int cross_module_slot = -1;      // target fn's slot in that module (sema)
+    bool cross_module_unresolved = false;  // sema couldn't resolve (hard error for handles)
+};
 struct CallExpr : Expr { std::string name; std::vector<ExprPtr> args;
                          // sema-resolved target (native fn ptr or script slot)
                          bool is_native = false; void* native_fn = nullptr;
@@ -279,6 +310,18 @@ struct MatchStmt : Stmt { ExprPtr subject; std::vector<MatchArm> arms; };
 // parse_stmt, checked in check_stmt) and at top level (parsed in parse_program,
 // stored on Program::static_asserts, checked in a dedicated sema pass). Produces
 // NO runtime code in either position.
+// Tier 4: in-language exceptions (try/catch/throw). A `try { ... } catch (name) { ... }`
+// establishes a catch handler for the try body; a `throw expr;` raises an exception
+// (i64 value for v1) that unwinds to the nearest enclosing catch. The catch_name is
+// bound as an i64 local in the catch block (sema), holding the thrown value (codegen
+// reads it from context_t::thrown_value after the longjmp-to-catch resumes).
+// The unwind is a JIT-emitted setjmp/longjmp over a per-context stack of save buffers
+// (context_t::catch_bufs); a throw with no enclosing try falls through to the host
+// checkpoint as a TrapReason::UnhandledThrow (a recoverable runtime trap, not a sema
+// error — the script may legitimately throw from a function with no try, expecting a
+// host-level caller to handle it, exactly like a runtime_error).
+struct TryCatchStmt : Stmt { Block try_body; std::string catch_name; Block catch_body; };
+struct ThrowStmt    : Stmt { ExprPtr value; };
 struct StaticAssertStmt : Stmt { ExprPtr cond; std::string msg; };
 
 // Tier 1 namespace: `namespace Name { fn... global... struct... enum... }`.

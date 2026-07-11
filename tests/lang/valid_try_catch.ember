@@ -1,0 +1,11 @@
+// expect: 42
+// Tier 4: basic try/catch/throw — a throw in the try block is caught by the
+// catch block, the thrown value is bound to the catch variable, and the catch
+// returns it. main returns 42 (the caught value).
+fn main() -> i64 {
+    try {
+        throw 42;
+    } catch (e) {
+        return e;
+    }
+}

@@ -132,6 +132,20 @@ struct CodeGenCtx {
     // Both 0 = no allowlist -> the guard is skipped (function refs unused).
     int64_t fn_allowlist_base = 0;
     int64_t fn_slot_count = 0;
+    // v1.0 Tier 2 cross-module handles (`&mod::fn`): the per-process module
+    // handle-records table (ModuleRegistry::handle_records_base()) — a raw
+    // imm64 baked into the cross-module guard/dispatch, indexed by the
+    // module_id extracted from a cross-module handle (bit 63 set). Each record
+    // gives the TARGET module's (dispatch_base, allowlist_base, slot_count) so
+    // the guard validates a cross-module handle against the correct module's
+    // allowlist and dispatches via that module's table. Process-local (like the
+    // allowlist) -> functions using cross-module handles are non-serializable to
+    // .em. Both 0 = cross-module handles not supported -> the guard is the
+    // existing intra-only path (a cross-module handle, bit 63 set / huge, fails
+    // the intra range check and traps, which is correct: no valid cross-module
+    // handles exist in a module that did not wire the records table).
+    int64_t module_handle_records_base = 0;
+    int64_t module_handle_records_count = 0;
 
     // --- Stage 1 codegen optimization (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4) ---
     // Two independent flags, BOTH default false -> the codegen is BYTE-IDENTICAL

@@ -66,7 +66,10 @@ for f in tests/lang/sema_valid_*.ember tests/lang/runtime_audit_semantics.ember 
          tests/lang/runtime_language_features.ember tests/lang/import_test.ember \
          tests/lang/valid_structs_slices.ember tests/lang/valid_fn_types.ember \
          tests/lang/runtime_struct_reassign_single.ember tests/lang/runtime_struct_reassign_loop.ember \
-         tests/lang/runtime_struct_reassign_multi.ember; do
+         tests/lang/runtime_struct_reassign_multi.ember \
+         tests/lang/valid_try_catch.ember tests/lang/valid_throw_nested.ember tests/lang/valid_throw_value.ember \
+         tests/lang/valid_try_return.ember tests/lang/valid_catch_return.ember tests/lang/valid_throw_in_catch.ember \
+         tests/lang/valid_nested_try_catch.ember tests/lang/runtime_trap_throw_uncaught.ember; do
     run "$SEMA" "$f" ok
 done
 for f in tests/lang/sema_invalid_*.ember; do
@@ -128,7 +131,14 @@ for spec in "runtime_audit_semantics.ember:77" "runtime_cast_regressions.ember:4
             "valid_namespaces_intra_call.ember:30" \
             "valid_namespaces_two_ns.ember:7" \
             "valid_struct_destructure.ember:142" \
-            "valid_match_guards.ember:3"; do
+            "valid_match_guards.ember:3" \
+            "valid_try_catch.ember:42" \
+            "valid_throw_nested.ember:99" \
+            "valid_throw_value.ember:7" \
+            "valid_try_return.ember:100" \
+            "valid_catch_return.ember:200" \
+            "valid_throw_in_catch.ember:55" \
+            "valid_nested_try_catch.ember:44"; do
     f=${spec%%:*}; exp=${spec##*:}; out=$("$CLI" run "tests/lang/$f" 2>&1); rc=$?
     if [ $rc -eq "$exp" ]; then printf "PASS  %s (explicit expected rc=%d)\n" "$f" "$rc"; pass=$((pass+1))
     else printf "FAIL  %s (rc=%d, expected %d)\n%s\n" "$f" "$rc" "$exp" "$out"; fail=$((fail+1)); fi

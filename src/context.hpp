@@ -55,6 +55,8 @@ enum class TrapReason : uint8_t {
     DivByZero,         // (reserved; current div traps are ud2-based too)
     BadCallTarget,     // v1.0 function-ref provenance guard: an i64 used as a
                        // call target wasn't a registered fn (REDSHELL guard #6)
+    UnhandledThrow,    // Tier 4: a `throw` with no enclosing try/catch unwound
+                       // to the host checkpoint (mirrors runtime_error severity)
 };
 
 struct context_t {
@@ -69,10 +71,37 @@ struct context_t {
     int32_t max_call_depth = DEFAULT_MAX_CALL_DEPTH;  // §4
     TrapReason last_trap = TrapReason::None;          // set by the trap stub
 
+    // Tier 4: in-language try/catch/throw catch stack (JIT-read/written).
+    // catch_depth = number of active try/catch handlers on the catch stack.
+    // A try block increments it (after saving state into catch_bufs[depth]);
+    // normal try completion or a throw-to-catch decrements it. thrown_value
+    // holds the most recently thrown i64 — the catch block reads it to bind
+    // to the catch variable. Both live in the POD prefix so the JIT can
+    // read/write them via [r14 + off] without a host call.
+    int32_t catch_depth = 0;
+    int32_t _catch_pad = 0;       // explicit 4-byte pad so thrown_value is 8-aligned
+    int64_t thrown_value = 0;
+
     // ---- checkpoint + host-side state (NOT read by JIT'd [ctx_reg+off]) ----
     jmp_buf checkpoint{};
     bool has_checkpoint = false;     // host sets true after setjmp, before raw B1 call
     std::string last_error;          // human-readable detail for last_trap
+
+    // ---- Tier 4: try/catch save buffers (JIT-emitted setjmp/longjmp) ----
+    // Each try block saves callee-saved regs (rbx, rbp, r12, r13, r14, r15) +
+    // rsp + the catch-entry rip into catch_bufs[catch_depth] (a custom
+    // 64-byte buffer — we control both the save and the restore, so no libc
+    // jmp_buf format dependency). catch_saved_call_depths[catch_depth]
+    // snapshots call_depth at try-entry so a throw-to-catch that unwinds
+    // across frames restores the catching frame's call_depth (the abandoned
+    // frames' depth increments are discarded, mirroring reset_for_call).
+    // MAX_CATCH_DEPTH bounds the stack; a try at depth == MAX is a sema
+    // error (or would overflow here) — v1 sets it high enough that a script
+    // can't reasonably hit it.
+    static constexpr int32_t MAX_CATCH_DEPTH = 256;
+    // 8 × int64_t = 64 bytes per entry: [rbx, rbp, r12, r13, r14, r15, rsp, rip]
+    int64_t catch_bufs[MAX_CATCH_DEPTH][8]{};
+    int32_t catch_saved_call_depths[MAX_CATCH_DEPTH]{};
 
     void reset_for_call() {
         // Required after longjmp recovery: balanced leave instructions on the
@@ -80,6 +109,13 @@ struct context_t {
         call_depth = 0;
         last_trap = TrapReason::None;
         last_error.clear();
+        // Tier 4: a host-level trap recovery (longjmp to the host checkpoint)
+        // abandons the entire JIT call stack, so any active try/catch handlers
+        // are gone too. Discard the catch stack so a subsequent call starts
+        // clean (a throw with no try after a trap-recovered call must unwind
+        // to the host, not to a stale buffer from the previous call).
+        catch_depth = 0;
+        thrown_value = 0;
         // budget_remaining is NOT reset here — a host may set one budget for
         // a whole batch of calls; reset is the host's responsibility.
     }
@@ -92,6 +128,12 @@ struct context_offsets {
     static int32_t budget()    { return int32_t(offsetof(context_t, budget_remaining)); }
     static int32_t depth()     { return int32_t(offsetof(context_t, call_depth)); }
     static int32_t max_depth() { return int32_t(offsetof(context_t, max_call_depth)); }
+    // Tier 4: try/catch catch stack (POD-prefix fields)
+    static int32_t catch_depth()     { return int32_t(offsetof(context_t, catch_depth)); }
+    static int32_t thrown_value()    { return int32_t(offsetof(context_t, thrown_value)); }
+    static int32_t catch_bufs()      { return int32_t(offsetof(context_t, catch_bufs)); }
+    static int32_t catch_saved_depths() { return int32_t(offsetof(context_t, catch_saved_call_depths)); }
+    static int32_t catch_buf_stride()   { return 64; }  // 8 × int64_t per entry
 };
 
 // The trap-stub function signature: a host-provided C function the JIT'd
@@ -111,6 +153,7 @@ inline const char* trap_reason_str(TrapReason r) {
     case TrapReason::IllegalInstruction: return "illegal instruction";
     case TrapReason::DivByZero:          return "divide by zero";
     case TrapReason::BadCallTarget:      return "bad call target";
+    case TrapReason::UnhandledThrow:     return "unhandled throw";
     }
     return "unknown";
 }

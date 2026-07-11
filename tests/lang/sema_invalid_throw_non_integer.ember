@@ -1,0 +1,11 @@
+// expect: SEMA ERROR
+// Tier 4: throw value must be an i64 integer. Throwing a float or bool is a
+// sema error (v1 only supports integer throw values). This test throws a
+// float literal, which sema must reject.
+fn main() -> i64 {
+    try {
+        throw 3.14f;
+    } catch (e) {
+        return e;
+    }
+}

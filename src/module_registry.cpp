@@ -23,11 +23,18 @@ ModuleRegistry::ModuleRegistry(uint32_t capacity)
     entries_.assign(static_cast<size_t>(capacity), nullptr);
     names_.resize(static_cast<size_t>(capacity));
     by_name_.reserve(static_cast<size_t>(capacity));
+    // v1.0 Tier 2: size the handle-records array up front too (same stability
+    // invariant — handle_records_base() must never move). Zero-filled so an
+    // unregistered id has a null dispatch / 0 slot_count (a cross-module handle
+    // into it fails the guard's range or slot_count check and traps).
+    handle_records_.assign(static_cast<size_t>(capacity), ModuleHandleRecord{nullptr, nullptr, 0});
 }
 
 uint32_t ModuleRegistry::register_module(const std::string& name,
                                          void* dispatch_table_base,
-                                         std::string* err) {
+                                         std::string* err,
+                                         void* allowlist_base,
+                                         int64_t slot_count) {
     // Reload (Section 4): same name -> update the existing entry's table pointer,
     // keep the id. Callers that cached (module_id, slot) pick up the new table
     // on the next call.
@@ -35,6 +42,7 @@ uint32_t ModuleRegistry::register_module(const std::string& name,
     if (it != by_name_.end()) {
         uint32_t id = it->second;
         entries_[id] = dispatch_table_base;
+        handle_records_[id] = ModuleHandleRecord{dispatch_table_base, allowlist_base, slot_count};
         return id;
     }
 
@@ -50,6 +58,7 @@ uint32_t ModuleRegistry::register_module(const std::string& name,
     uint32_t id = next_id_++;
     entries_[id] = dispatch_table_base;
     names_[id]  = name;
+    handle_records_[id] = ModuleHandleRecord{dispatch_table_base, allowlist_base, slot_count};
     by_name_.emplace(name, id);
     return id;
 }
@@ -75,6 +84,18 @@ const std::string& ModuleRegistry::name_of(uint32_t module_id) const {
     static const std::string empty;
     if (module_id >= next_id_) return empty;
     return names_[module_id];
+}
+
+// v1.0 Tier 2 cross-module handles: the per-module records table accessors.
+void* ModuleRegistry::handle_records_base() const {
+    return const_cast<void*>(static_cast<const void*>(handle_records_.data()));
+}
+
+uint32_t ModuleRegistry::handle_records_count() const { return next_id_; }
+
+ModuleHandleRecord ModuleRegistry::handle_record(uint32_t module_id) const {
+    if (module_id >= next_id_) return ModuleHandleRecord{nullptr, nullptr, 0};
+    return handle_records_[module_id];
 }
 
 } // namespace ember

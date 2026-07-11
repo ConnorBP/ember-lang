@@ -537,8 +537,28 @@ struct P {
         // handle. `&fn_name` is a compile-time reification (sema bakes the slot
         // as an i64 literal), not a runtime deref. Parse the operand as unary so
         // `&&fib`-style nesting is structurally parseable then rejected by sema.
+        //
+        // v1.0 Tier 2 cross-module handles: `&mod::fn` (no call parens) is a
+        // cross-module handle. Detect Ident `::` Ident NOT followed by `(` and
+        // build a FnHandleExpr with is_cross_module=true directly — the operand
+        // is null for this form (sema resolves module_alias+fn_name against the
+        // host ModuleExportTable). `&mod::fn(args)` would parse `mod::fn(args)`
+        // as a cross-module CALL (the `::` postfix + `(` case) and wrap THAT in
+        // a FnHandleExpr; sema rejects it (operand is a CallExpr, not an Ident).
         if (k==Tk::Amp) {
             adv();
+            if (peek().kind==Tk::Ident && peek(1).kind==Tk::DoubleColon
+                && peek(2).kind==Tk::Ident && peek(3).kind!=Tk::LParen) {
+                auto h = std::make_unique<FnHandleExpr>();
+                h->loc = loc(peek());
+                h->is_cross_module = true;
+                h->module_alias = peek().text;
+                adv();  // consume module alias Ident
+                adv();  // consume '::'
+                h->fn_name = peek().text;
+                adv();  // consume fn name Ident
+                return h;
+            }
             ExprPtr e = parse_unary();
             auto h = std::make_unique<FnHandleExpr>();
             h->loc = e->loc;
@@ -1030,6 +1050,27 @@ struct P {
         case Tk::Kw_return: { adv(); auto s=std::make_unique<ReturnStmt>(); s->loc=loc(t); if (!at(Tk::Semicolon)) s->value=parse_expr(); expect(Tk::Semicolon,"';'"); return s; }
         case Tk::Kw_break: { adv(); expect(Tk::Semicolon,"';'"); auto s=std::make_unique<BreakStmt>(); s->loc=loc(t); return s; }
         case Tk::Kw_continue: { adv(); expect(Tk::Semicolon,"';'"); auto s=std::make_unique<ContinueStmt>(); s->loc=loc(t); return s; }
+        // Tier 4: try { ... } catch (name) { ... } + throw expr;
+        case Tk::Kw_try: {
+            adv();
+            auto s = std::make_unique<TryCatchStmt>();
+            s->loc = loc(t);
+            s->try_body = parse_block();
+            expect(Tk::Kw_catch, "'catch' after try block");
+            expect(Tk::LParen, "'(' after catch");
+            s->catch_name = expect(Tk::Ident, "catch variable name").text;
+            expect(Tk::RParen, "')'");
+            s->catch_body = parse_block();
+            return s;
+        }
+        case Tk::Kw_throw: {
+            adv();
+            auto s = std::make_unique<ThrowStmt>();
+            s->loc = loc(t);
+            s->value = parse_expr();
+            expect(Tk::Semicolon, "';'");
+            return s;
+        }
         case Tk::LBrace: { auto s=std::make_unique<BlockStmt>(); s->loc=loc(t); s->block=parse_block(); return s; }
         default: break;
         }

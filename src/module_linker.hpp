@@ -92,6 +92,22 @@ inline uint32_t register_jit_module(ModuleRegistry& reg, const std::string& name
     return reg.register_module(name, dispatch_table_base, err);
 }
 
+// v1.0 Tier 2 cross-module handles: register a JIT module AND publish its fn
+// allowlist + slot_count so other modules can take `&name::fn` handles into it
+// (the cross-module guard validates those handles against this module's
+// allowlist before dispatch). `allowlist` is the host-owned byte array from
+// build_fn_allowlist (the caller must keep it alive for the registry's
+// lifetime, same as the dispatch table). A module registered via the plain
+// register_jit_module above does NOT publish an allowlist, so cross-module
+// handles into it trap (it did not opt into being a handle target).
+inline uint32_t register_jit_module_with_handles(ModuleRegistry& reg, const std::string& name,
+                                                  void* dispatch_table_base,
+                                                  void* allowlist_base,
+                                                  int64_t slot_count,
+                                                  std::string* err = nullptr) {
+    return reg.register_module(name, dispatch_table_base, err, allowlist_base, slot_count);
+}
+
 // Register a .em module: load the file, register it, apply its kind-2 relocs
 // against the registry (load_em_file does this when given the registry), and
 // return the LoadedModule (caller owns it — keep it alive for the registry's

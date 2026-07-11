@@ -66,6 +66,13 @@ bool Type::same(const Type& o) const {
     if (is_fn_handle != o.is_fn_handle) return false;
     if (is_fn_handle) {
         if (has_recorded_sig && o.has_recorded_sig) {
+            // v1.0 Tier 2 cross-module handles: a cross-module handle and an
+            // intra-module handle are DISTINCT spaces — even with matching
+            // recorded sigs, is_cross_module_handle must agree. A bare `fn`
+            // (one or both has_recorded_sig=false) still accepts either kind
+            // (the "any fn" escape hatch), so this check only fires when BOTH
+            // sides carry a recorded signature.
+            if (is_cross_module_handle != o.is_cross_module_handle) return false;
             if (recorded_params.size() != o.recorded_params.size()) return false;
             for (size_t i = 0; i < recorded_params.size(); ++i)
                 if (!recorded_params[i]->same(*o.recorded_params[i])) return false;

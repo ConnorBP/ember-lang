@@ -507,6 +507,28 @@ struct CG {
         if (non_serializable_reason.empty())
             non_serializable_reason = "function-reference allowlist storage is process-local";
         Label trap = e.alloc_label();
+        // v1.0 Tier 2 cross-module handles: if the per-module records table is
+        // configured, a handle with bit 63 set is a cross-module handle — it is
+        // NOT validated here (this is the INTRA-module allowlist). The cross-
+        // module validation + dispatch happens at the call site
+        // (emit_cross_module_indirect_dispatch, below) which reads the target
+        // module's own allowlist from the records table. Skip the intra range /
+        // bit checks for a cross-module handle so a valid `&mod::fn` (a huge
+        // value with bit 63 set) does not wrongly fail THIS module's range check.
+        // When the records table is NOT configured (cross-module handles
+        // unsupported), no bit-63 test is emitted — a cross-module handle (huge)
+        // fails the intra range check below and traps, which is correct (no
+        // valid cross-module handles exist in a module that did not wire the
+        // records table). `bt rax, 63` sets CF=bit63; jc (Cond::b) -> cross.
+        const bool cross_aware = (ctx.module_handle_records_base != 0);
+        Label cross_skip;  // cross handle jumps past the intra guard body to here
+        if (cross_aware) {
+            cross_skip = e.alloc_label();
+            // bt rax, 63: REX.W 0F BA /4 ib. rm=rax(0), reg=4(/4), mod=11, imm8=63.
+            //   modrm = (11<<6)|(4<<3)|0 = 0xE0. REX = 0x48 (W only).
+            e.byte(0x48); e.byte(0x0F); e.byte(0xBA); e.byte(0xE0); e.byte(0x3F);  // bt rax, 63
+            e.jcc(Cond::b, cross_skip);  // bit 63 set -> cross: skip the intra guard
+        }
         // 1. Range: cmp rax, slot_count; jae .trap (unsigned). cmp r64,imm32: REX.W 81 /7.
         e.byte(0x48); e.byte(0x81); e.byte(0xF8); e.imm32(int32_t(ctx.fn_slot_count));  // cmp rax, imm32
         e.jcc(Cond::ae, trap);                 // unsigned >= -> out of range -> trap
@@ -532,6 +554,8 @@ struct CG {
         emit_trap(int(TrapReason::BadCallTarget),
                   "call-target provenance: handle is not a registered function");
         e.bind(after);
+        if (cross_aware)
+            e.bind(cross_skip);  // cross handle's skip target lands here (past the intra guard)
     }
 
     // v0.5 cross-module call (docs/MODULES.md §3). The kind-2 sequence: one registry
@@ -556,6 +580,74 @@ struct CG {
         // mov r11, [r11 + slot*8]  ; r11 = callee's entry address
         e.load_reg_mem(Reg::r11, Reg::r11, int32_t(c.cross_module_slot) * 8);
         e.call_reg(Reg::r11);
+    }
+
+    // v1.0 Tier 2 cross-module indirect dispatch (`&mod::fn` called via handle).
+    // Called from the indirect-call dispatch path when the runtime handle has
+    // bit 63 set (a cross-module handle). rax = the handle on entry:
+    //   handle = (1<<63) | (module_id << 32) | slot
+    // This validates the handle against the TARGET module's allowlist (looked up
+    // from the per-module handle-records table by module_id) and leaves r11 = the
+    // callee's entry address, so the caller's `call r11` dispatches via the
+    // target module's dispatch table. A forged handle (out-of-range module_id,
+    // out-of-range slot, or an unregistered slot) traps via BadCallTarget
+    // (longjmp to the checkpoint), NOT a raw call-of-garbage crash — the same
+    // REDSHELL #6 invariant as the intra-module guard, lifted cross-module.
+    //
+    // Register allocation (args already in rcx/rdx/r8/r9 + stack — none may be
+    // clobbered; only rax/r10/r11 are free at the dispatch point):
+    //   r11 = slot (extracted, kept for the final lea+load)
+    //   r10 = record_ptr (handle_records_base + module_id*24; kept for field loads)
+    //   rax = scratch (mod_id -> slot_count -> allowlist_base -> dispatch_base)
+    void emit_cross_module_indirect_dispatch() {
+        Label trap = e.alloc_label();
+        // r11 = slot = handle & 0xFFFFFFFF (low 32 bits). NB: `and r64, imm32`
+        // (81 /4 id) SIGN-EXTENDS the imm32 to 64 bits, so `and r11, 0xFFFFFFFF`
+        // would AND with 0xFFFFFFFFFFFFFFFF (a no-op). Instead zero-extend the
+        // low 32 bits with `mov r11d, r11d` (a 32-bit reg move clears the high
+        // 32 bits of r11) — the canonical "mask to low 32" idiom.
+        e.mov_reg_reg(Reg::r11, Reg::rax);                 // mov r11, rax  (49 89 C3)
+        // mov r11d, r11d: 32-bit mov r/m32, r32 (89 /r, no REX.W) zero-extends
+        //   the low 32 bits into r11 (clears bits 32-63). rm=r11d(B ext, low3=3),
+        //   reg=r11d(R ext, low3=3); REX = 0x45 (R=1 + B=1, no W); modrm = 0xDB.
+        //   (REX 0x44 would have B=0 -> rm=ebx, clobbering rbx; 0x45 is correct.)
+        e.byte(0x45); e.byte(0x89); e.byte(0xDB);          // mov r11d, r11d  -> r11 = slot
+        // rax = module_id = (handle >> 32) & 0x7FFFFFFF  (strip the cross-module flag, now bit 31)
+        e.shr_reg_imm8(Reg::rax, 32);                      // shr rax, 32  (48 C1 E8 20)
+        // and rax, 0x7FFFFFFF: the accumulator form REX.W 25 id (no modrm)
+        e.byte(0x48); e.byte(0x25); e.imm32(int32_t(0x7FFFFFFF));
+        // Range-check module_id < records_count (unsigned). cmp rax, imm32: REX.W 81 /7 id
+        e.cmp_reg_imm32(Reg::rax, int32_t(ctx.module_handle_records_count));
+        e.jcc(Cond::ae, trap);                             // mod_id >= count -> out of range -> trap
+        // r10 = handle_records_base + module_id * 24 (record_ptr)
+        e.mov_reg_imm64(Reg::r10, ctx.module_handle_records_base);   // mov r10, records_base (49 BA ..)
+        // imul rax, rax, 24: three-operand REX.W 69 /r id. reg=rm=rax(0) -> modrm 11_000_000=0xC0, REX=0x48
+        e.byte(0x48); e.byte(0x69); e.byte(0xC0); e.imm32(24);
+        e.add_reg_reg(Reg::r10, Reg::rax);                 // add r10, rax  (49 01 C2)  -> r10 = record_ptr
+        // Validate slot < slot_count = [record_ptr + 16]
+        e.load_reg_mem(Reg::rax, Reg::r10, 16);            // mov rax, [r10+16]  (rax = slot_count)
+        e.cmp_reg_reg(Reg::r11, Reg::rax);                 // cmp r11, rax      (slot vs slot_count)
+        e.jcc(Cond::ae, trap);                             // slot >= slot_count -> trap
+        // Validate the allowlist bit: bt [allowlist_base], slot
+        //   x86 `bt [mem], reg` tests bit (reg & 7) at byte (mem + reg>>3) — the
+        //   index scales by 8 automatically, so `bt [rax], r11` with rax =
+        //   allowlist_base and r11 = slot is exactly bit (slot&7) at (base+slot/8).
+        e.load_reg_mem(Reg::rax, Reg::r10, 8);             // mov rax, [r10+8]  (rax = allowlist_base)
+        // bt [rax], r11: 0F AB /r. reg=r11(low3=3, R ext), rm=rax(0, mod=00).
+        //   modrm = (00<<6)|(3<<3)|0 = 0x18; REX = W + R(r11) = 0x4C
+        e.byte(0x4C); e.byte(0x0F); e.byte(0xAB); e.byte(0x18);  // bt [rax], r11; CF = tested bit
+        e.jcc(Cond::ae, trap);                             // CF=0 (bit clear) -> not registered -> trap
+        // Dispatch: dispatch_base = [record_ptr + 0]; r11 = [dispatch_base + slot*8]
+        e.load_reg_mem(Reg::rax, Reg::r10, 0);             // mov rax, [r10]    (rax = dispatch_base)
+        e.lea_reg_mem_sib(Reg::r11, Reg::rax, Reg::r11, 3);// lea r11, [rax + r11*8]  (dispatch_base + slot*8)
+        e.load_reg_mem(Reg::r11, Reg::r11, 0);             // mov r11, [r11]    (callee entry)
+        // (fall through: caller emits `call r11`)
+        Label after = e.alloc_label();
+        e.jmp(after);
+        e.bind(trap);
+        emit_trap(int(TrapReason::BadCallTarget),
+                  "cross-module call-target provenance: handle is not a registered function in the target module");
+        e.bind(after);
     }
 
     int32_t alloc_local(const std::string& n, const Type* t) {
@@ -604,6 +696,16 @@ struct CG {
         if (auto* ms = dynamic_cast<const MatchStmt*>(&s)) {
             prescan_expr(*ms->subject);
             for (auto& arm : ms->arms) prescan_block(arm.body);
+            return;
+        }
+        // Tier 4: recurse into try/catch bodies; prescan the throw expr.
+        if (auto* tc = dynamic_cast<const TryCatchStmt*>(&s)) {
+            prescan_block(tc->try_body);
+            prescan_block(tc->catch_body);
+            return;
+        }
+        if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) {
+            if (th->value) prescan_expr(*th->value);
             return;
         }
     }
@@ -671,6 +773,16 @@ struct CG {
         if (auto* sw = dynamic_cast<const SwitchStmt*>(&s)) {
             count_struct_temps_expr(*sw->subject, total);
             for (auto& c : sw->cases) count_struct_temps_block(c.body, total);
+            return;
+        }
+        // Tier 4: recurse into try/catch bodies for struct-temp counting.
+        if (auto* tc = dynamic_cast<const TryCatchStmt*>(&s)) {
+            count_struct_temps_block(tc->try_body, total);
+            count_struct_temps_block(tc->catch_body, total);
+            return;
+        }
+        if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) {
+            if (th->value) count_struct_temps_expr(*th->value, total);
             return;
         }
     }
@@ -746,6 +858,16 @@ struct CG {
             for (auto& c : sw->cases) count_arr_temps_block(c.body, total);
             return;
         }
+        // Tier 4: recurse into try/catch bodies for array-temp counting.
+        if (auto* tc = dynamic_cast<const TryCatchStmt*>(&s)) {
+            count_arr_temps_block(tc->try_body, total);
+            count_arr_temps_block(tc->catch_body, total);
+            return;
+        }
+        if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) {
+            if (th->value) count_arr_temps_expr(*th->value, total);
+            return;
+        }
     }
     void count_arr_temps_expr(const Expr& ex, int32_t& total) {
         if (auto* al = dynamic_cast<const ArrayLit*>(&ex)) {
@@ -814,6 +936,16 @@ struct CG {
             for (auto& c : sw->cases) count_str_temps_block(c.body, total);
             return;
         }
+        // Tier 4: recurse into try/catch bodies for string-temp counting.
+        if (auto* tc = dynamic_cast<const TryCatchStmt*>(&s)) {
+            count_str_temps_block(tc->try_body, total);
+            count_str_temps_block(tc->catch_body, total);
+            return;
+        }
+        if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) {
+            if (th->value) count_str_temps_expr(*th->value, total);
+            return;
+        }
     }
     void count_str_temps_expr(const Expr& ex, int32_t& total) {
         if (auto* lit = dynamic_cast<const StringLit*>(&ex)) {
@@ -870,6 +1002,16 @@ struct CG {
         if (auto* sw = dynamic_cast<const SwitchStmt*>(&s)) {
             count_pin_refs_expr(*sw->subject, counts);
             for (auto& c : sw->cases) count_pin_refs_block(c.body, counts);
+            return;
+        }
+        // Tier 4: recurse into try/catch bodies for pin-ref counting.
+        if (auto* tc = dynamic_cast<const TryCatchStmt*>(&s)) {
+            count_pin_refs_block(tc->try_body, counts);
+            count_pin_refs_block(tc->catch_body, counts);
+            return;
+        }
+        if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) {
+            if (th->value) count_pin_refs_expr(*th->value, counts);
             return;
         }
     }
@@ -2036,7 +2178,23 @@ void CG::eval(const Expr& ex) {
     // The first-class-ness is at the CALL site (handle(args)), not here: this is
     // just a constant load. (The advisor flagged making sure this eval case exists
     // for the `&fib(42)` direct-call-without-let form.)
+    //
+    // v1.0 Tier 2 cross-module handles (`&mod::fn`): sema stamped cross_module_id
+    // + cross_module_slot from the linked-module export table. Bake the handle as
+    // `(1<<63)|(module_id<<32)|slot` — bit 63 is the cross-module flag (an
+    // intra-module handle is a bare slot, never bit 63 set, so the spaces never
+    // collide). The call-target guard tests bit 63 to route cross-module handles
+    // to the records-table validation + cross-module dispatch.
     if (auto* h = dynamic_cast<const FnHandleExpr*>(&ex)) {
+        if (h->is_cross_module) {
+            uint64_t handle = (uint64_t(1) << 63)
+                            | (uint64_t(h->cross_module_id) << 32)
+                            | uint64_t(uint32_t(h->cross_module_slot));
+            e.mov_reg_imm64(Reg::rax, int64_t(handle));
+            if (non_serializable_reason.empty())
+                non_serializable_reason = "cross-module function handle requires process-local module-records storage";
+            return;
+        }
         e.mov_reg_imm64(Reg::rax, int64_t(h->slot));
         return;
     }
@@ -2582,12 +2740,38 @@ void CG::eval(const Expr& ex) {
             // through the runtime handle. emit_depth_check may clobber rax
             // (non-B1 mode), so RELOAD the handle from [rsp+stash_size] AFTER it
             // (the advisor's ordering correction), then lea+load+call the slot.
+            //
+            // v1.0 Tier 2 cross-module handles: if the records table is configured,
+            // test bit 63 of the reloaded handle. A cross-module handle (bit 63
+            // set) routes to emit_cross_module_indirect_dispatch, which validates
+            // against the target module's allowlist + dispatches via that
+            // module's table; an intra-module handle (bit 63 clear) takes the
+            // existing lea+load path. Both converge on `call r11`. When the
+            // records table is NOT configured, only the intra path is emitted
+            // (byte-identical to the pre-cross-module code) — a cross-module
+            // handle already trapped at the guard's intra range check.
             emit_depth_check();                        // v0.4 stack-depth guard (SAFETY §4)
             e.load_reg_mem(Reg::rax, Reg::rsp, stash_size);  // reload handle AFTER depth check
-            e.mov_reg_imm64_external(Reg::r11, AbsFixup::DispatchTableBase);
-            e.lea_reg_mem_sib(Reg::r11, Reg::r11, Reg::rax, 3);  // lea r11, [r11 + rax*8]
-            e.load_reg_mem(Reg::r11, Reg::r11, 0);               // mov r11, [r11] (load the entry)
-            e.call_reg(Reg::r11);                                  // call r11
+            if (ctx.module_handle_records_base != 0) {
+                Label cross = e.alloc_label(), after = e.alloc_label();
+                // bt rax, 63: REX.W 0F BA /4 ib (sets CF=bit63)
+                e.byte(0x48); e.byte(0x0F); e.byte(0xBA); e.byte(0xE0); e.byte(0x3F);
+                e.jcc(Cond::b, cross);                 // bit 63 set -> cross-module dispatch
+                // intra: r11 = [dispatch_base + handle*8]
+                e.mov_reg_imm64_external(Reg::r11, AbsFixup::DispatchTableBase);
+                e.lea_reg_mem_sib(Reg::r11, Reg::r11, Reg::rax, 3);  // lea r11, [r11 + rax*8]
+                e.load_reg_mem(Reg::r11, Reg::r11, 0);               // mov r11, [r11] (entry)
+                e.jmp(after);
+                e.bind(cross);
+                emit_cross_module_indirect_dispatch();   // validates + sets r11 = target entry (or traps)
+                e.bind(after);
+                e.call_reg(Reg::r11);                                // call r11 (common)
+            } else {
+                e.mov_reg_imm64_external(Reg::r11, AbsFixup::DispatchTableBase);
+                e.lea_reg_mem_sib(Reg::r11, Reg::r11, Reg::rax, 3);  // lea r11, [r11 + rax*8]
+                e.load_reg_mem(Reg::r11, Reg::r11, 0);               // mov r11, [r11] (load the entry)
+                e.call_reg(Reg::r11);                                  // call r11
+            }
             emit_depth_leave();
         } else {
             // call [dispatch_base + slot*8] - dispatch-table base is a
@@ -3737,6 +3921,175 @@ void CG::exec_stmt(const Stmt& s) {
         return;
     }
     if (auto* bs = dynamic_cast<const BlockStmt*>(&s)) { exec_block(bs->block); return; }
+    // Tier 4: try { ... } catch (name) { ... } — in-language exceptions.
+    // Emits an inline setjmp (save callee-saved regs + rsp + catch-entry rip
+    // into context_t::catch_bufs[catch_depth]), increments catch_depth, runs
+    // the try body, then on normal completion decrements catch_depth and jumps
+    // past the catch. A throw (see ThrowStmt below) restores the saved state
+    // + longjmps to the catch-entry rip, which lands here at the catch label.
+    // The catch block reads context_t::thrown_value and binds it to catch_name.
+    //
+    // The save buffer is 8 × int64_t: [rbx, rbp, r12, r13, r14, r15, rsp, rip].
+    // We control both the save (here) and the restore (ThrowStmt), so no libc
+    // jmp_buf format dependency. catch_saved_call_depths[depth] snapshots
+    // call_depth at try-entry so a cross-frame throw restores the catching
+    // frame's call_depth (the abandoned frames' depth incs are discarded).
+    //
+    // Only emitted when ctx.use_context_reg (the B1 per-context model) — the
+    // catch stack lives in context_t, so the JIT'd code must access it via r14.
+    // Without a context register, try/catch falls back to a trap (the host
+    // didn't opt into the context-register model, so in-language exceptions
+    // are unavailable — a clear, loud failure, not a silent miscompile).
+    if (auto* tc = dynamic_cast<const TryCatchStmt*>(&s)) {
+        if (!ctx.use_context_reg) {
+            emit_trap(int(TrapReason::IllegalInstruction),
+                      "try/catch requires a context register (use_context_reg)");
+            return;
+        }
+        Label catch_label = e.alloc_label();
+        Label end_label   = e.alloc_label();
+
+        // --- inline setjmp: save state into catch_bufs[catch_depth] ---
+        // r8 = &catch_bufs[catch_depth] = r14 + catch_bufs_off + catch_depth*64
+        int32_t cd_off = context_offsets::catch_depth();
+        int32_t cb_off = context_offsets::catch_bufs();
+        int32_t csd_off = context_offsets::catch_saved_depths();
+        // rax = catch_depth (current, before increment)
+        e.load_reg_mem(Reg::rax, Reg::r14, cd_off);       // mov eax, [r14+cd_off]
+        // r8 = rax * 64 (buffer stride)
+        e.imul_reg_imm32(Reg::r8, Reg::rax, 64);           // imul r8, rax, 64
+        // r8 = r14 + catch_bufs_off + r8
+        e.mov_reg_reg(Reg::r9, Reg::r14);                  // r9 = r14 (ctx)
+        e.add_reg_imm32(Reg::r9, cb_off);                  // r9 = &catch_bufs[0]
+        e.add_reg_reg(Reg::r9, Reg::r8);                   // r9 = &catch_bufs[depth]
+        // save callee-saved regs + rbp into the buffer
+        // [0]=rbx [1]=rbp [2]=r12 [3]=r13 [4]=r14 [5]=r15 [6]=rsp [7]=rip
+        e.store_reg_mem(Reg::r9, 0,  Reg::rbx);            // [r9+0] = rbx
+        e.store_reg_mem(Reg::r9, 8,  Reg::rbp);            // [r9+8] = rbp
+        e.store_reg_mem(Reg::r9, 16, Reg::r12);           // [r9+16] = r12
+        e.store_reg_mem(Reg::r9, 24, Reg::r13);           // [r9+24] = r13
+        e.store_reg_mem(Reg::r9, 32, Reg::r14);           // [r9+32] = r14
+        e.store_reg_mem(Reg::r9, 40, Reg::r15);           // [r9+40] = r15
+        e.store_reg_mem(Reg::r9, 48, Reg::rsp);           // [r9+48] = rsp
+        // save catch-entry rip: lea rax, [rip + catch_label]; store [r9+56]
+        e.lea_reg_rip(Reg::rax, catch_label);              // rax = &catch_label
+        e.store_reg_mem(Reg::r9, 56, Reg::rax);           // [r9+56] = catch_entry_rip
+        // save call_depth into catch_saved_call_depths[catch_depth]
+        // r10 = catch_depth (reload — rax was clobbered by lea); r10 is volatile
+        e.load_reg_mem(Reg::r10, Reg::r14, cd_off);       // r10 = catch_depth
+        // r11 = &catch_saved_call_depths[0] + r10*4
+        e.mov_reg_reg(Reg::r11, Reg::r14);
+        e.add_reg_imm32(Reg::r11, csd_off);
+        e.imul_reg_imm32(Reg::r11, Reg::r10, 4);           // r11 = catch_depth*4 (clobbers old r11)
+        // r11 = r14 + csd_off + catch_depth*4
+        e.mov_reg_reg(Reg::rax, Reg::r14);
+        e.add_reg_imm32(Reg::rax, csd_off);
+        e.add_reg_reg(Reg::rax, Reg::r11);
+        // store current call_depth into [rax]
+        e.load_reg_mem(Reg::r11, Reg::r14, context_offsets::depth()); // r11 = call_depth
+        e.store_reg_mem(Reg::rax, 0, Reg::r11);
+        // increment catch_depth
+        e.add_reg_imm32(Reg::r10, 1);                      // r10 = catch_depth + 1
+        e.store_reg_mem(Reg::r14, cd_off, Reg::r10);       // [r14+cd_off] = catch_depth+1
+
+        // --- normal path: run the try body ---
+        exec_block(tc->try_body);
+
+        // --- normal try completion: pop the catch handler + jump past catch ---
+        e.load_reg_mem(Reg::rax, Reg::r14, cd_off);       // rax = catch_depth
+        e.sub_reg_imm32(Reg::rax, 1);                      // rax = catch_depth - 1
+        e.store_reg_mem(Reg::r14, cd_off, Reg::rax);       // catch_depth--
+        e.jmp(end_label);
+
+        // --- catch entry: a throw longjmps here with registers restored ---
+        e.bind(catch_label);
+        // On entry here: rbx/rbp/r12-r15/rsp are restored to the try-entry
+        // state, call_depth is restored (by the throw), and thrown_value has
+        // the thrown i64. Bind thrown_value to the catch variable's frame slot.
+        // The catch_name was declared as an i64 local by sema in the catch
+        // block's scope; exec_block will push a scope and the catch_name is
+        // the first local. But exec_block uses alloc_local for lets inside
+        // the block — the catch_name itself is NOT a let inside catch_body,
+        // it's a sema-declared binding. We must alloc the slot HERE (before
+        // exec_block) so the catch_name is a real frame slot the catch body
+        // can reference via the locals map.
+        //
+        // The catch block's scope: sema pushed a scope + declared catch_name
+        // as i64 before checking catch_body. Codegen mirrors this: alloc the
+        // catch_name slot here, then exec_block(catch_body) runs in a scope
+        // that includes it. exec_block snapshots/restores locals, so we set
+        // up catch_name in `locals` before exec_block and it's visible inside.
+        {
+            auto saved_locals = locals;
+            auto saved_types = local_types;
+            int32_t catch_off = alloc_local(tc->catch_name, &type_i64());
+            // load thrown_value into the catch variable's slot
+            e.load_reg_mem(Reg::rax, Reg::r14, context_offsets::thrown_value());
+            store_rax_to_rbp(*this, catch_off);
+            // run the catch body (catch_name is now a visible local)
+            exec_block(tc->catch_body);
+            locals = std::move(saved_locals);
+            local_types = std::move(saved_types);
+        }
+        e.bind(end_label);
+        return;
+    }
+    // Tier 4: throw expr; — raises an i64 exception that unwinds to the
+    // nearest enclosing catch (or to the host if none). Eval the expr, store
+    // it in context_t::thrown_value, then: if catch_depth > 0, restore the
+    // saved state from catch_bufs[catch_depth-1] and longjmp to the catch
+    // entry rip; if catch_depth == 0, trap via UnhandledThrow (the host's
+    // trap stub longjmps to the host checkpoint, mirroring runtime_error).
+    if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) {
+        if (!ctx.use_context_reg) {
+            emit_trap(int(TrapReason::IllegalInstruction),
+                      "throw requires a context register (use_context_reg)");
+            return;
+        }
+        // eval the throw expression (i64 result in rax)
+        eval(*th->value);
+        // store the thrown value in context_t::thrown_value
+        e.store_reg_mem(Reg::r14, context_offsets::thrown_value(), Reg::rax);
+        // check catch_depth: if 0, no handler -> trap (UnhandledThrow)
+        e.load_reg_mem(Reg::rax, Reg::r14, context_offsets::catch_depth());
+        e.cmp_reg_imm32(Reg::rax, 0);
+        Label no_handler = e.alloc_label();
+        e.jcc(Cond::e, no_handler);
+        // --- has a handler: longjmp to catch_bufs[catch_depth-1] ---
+        // rax = catch_depth - 1 (the handler index)
+        e.sub_reg_imm32(Reg::rax, 1);                      // rax = catch_depth - 1
+        e.store_reg_mem(Reg::r14, context_offsets::catch_depth(), Reg::rax); // catch_depth--
+        // restore call_depth from catch_saved_call_depths[rax]
+        // r11 = r14 + catch_saved_depths_off + rax*4
+        e.mov_reg_reg(Reg::r11, Reg::r14);
+        e.add_reg_imm32(Reg::r11, context_offsets::catch_saved_depths());
+        e.imul_reg_imm32(Reg::r9, Reg::rax, 4);            // r9 = (catch_depth-1)*4
+        e.add_reg_reg(Reg::r11, Reg::r9);                  // r11 = &catch_saved_call_depths[cd-1]
+        e.load_reg_mem(Reg::r9, Reg::r11, 0);             // r9 = saved call_depth
+        e.store_reg_mem(Reg::r14, context_offsets::depth(), Reg::r9); // call_depth = saved
+        // r8 = &catch_bufs[catch_depth-1] = r14 + catch_bufs_off + rax*64
+        e.imul_reg_imm32(Reg::r8, Reg::rax, 64);           // r8 = (cd-1)*64
+        e.mov_reg_reg(Reg::r9, Reg::r14);
+        e.add_reg_imm32(Reg::r9, context_offsets::catch_bufs());
+        e.add_reg_reg(Reg::r9, Reg::r8);                  // r9 = &catch_bufs[cd-1]
+        // load the saved catch-entry rip into rax (before restoring regs)
+        e.load_reg_mem(Reg::rax, Reg::r9, 56);            // rax = saved rip
+        // restore callee-saved registers from the buffer
+        e.load_reg_mem(Reg::rbx, Reg::r9, 0);             // rbx = saved
+        e.load_reg_mem(Reg::rbp, Reg::r9, 8);             // rbp = saved
+        e.load_reg_mem(Reg::r12, Reg::r9, 16);            // r12 = saved
+        e.load_reg_mem(Reg::r13, Reg::r9, 24);            // r13 = saved
+        e.load_reg_mem(Reg::r14, Reg::r9, 32);            // r14 = saved (same ctx ptr)
+        e.load_reg_mem(Reg::r15, Reg::r9, 40);            // r15 = saved
+        // restore rsp LAST (this switches to the catching frame's stack)
+        e.load_reg_mem(Reg::rsp, Reg::r9, 48);            // rsp = saved
+        // jump to the catch-entry rip (rax was loaded before the reg restores)
+        e.jmp_reg(Reg::rax);
+        // --- no handler: trap (unhandled throw -> host checkpoint) ---
+        e.bind(no_handler);
+        emit_trap(int(TrapReason::UnhandledThrow), "unhandled throw (no enclosing try/catch)");
+        return;
+    }
     if (dynamic_cast<const BreakStmt*>(&s)) {
         if (!loops.empty()) {
             emit_cleanups_to(loops.back().cleanup_depth);
@@ -3894,6 +4247,12 @@ int64_t CG::stmt_cost(const Stmt& s) {
         return cost_add(1, expr_cost(*es->expr));
     if (auto* ds = dynamic_cast<const DeferStmt*>(&s))
         return ds->expr ? cost_add(1, expr_cost(*ds->expr)) : 1;
+    // Tier 4: try/catch setjmp/longjmp overhead + both body blocks.
+    if (auto* tc = dynamic_cast<const TryCatchStmt*>(&s))
+        return cost_add(cost_add(20, block_cost(tc->try_body)), block_cost(tc->catch_body));
+    // Tier 4: throw — expr eval + longjmp sequence (~15 instructions).
+    if (auto* th = dynamic_cast<const ThrowStmt*>(&s))
+        return cost_add(15, th->value ? expr_cost(*th->value) : 0);
     return 1;  // Break/Continue and other leaf statements
 }
 
@@ -3921,7 +4280,32 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
         for (auto& ann : f.annotations) {
             if (ann.name == "obf" || ann.name == "obf_keyed") { uses_obf = true; break; }
         }
-        if (!uses_obf && !(ctx.obf.mba || ctx.obf.opaque || ctx.obf.keyed)) {
+        // Tier 4: the IR path (thin_lower) does not lower try/catch/throw yet.
+        // If the function body contains a TryCatchStmt or ThrowStmt anywhere
+        // (recursively, in any nested block), fall back to the tree-walker
+        // which handles them via the inline setjmp/longjmp catch stack.
+        std::function<bool(const Block&)> has_try_catch = [&](const Block& b) -> bool {
+            for (auto& s : b.stmts) {
+                if (dynamic_cast<const TryCatchStmt*>(s.get()) ||
+                    dynamic_cast<const ThrowStmt*>(s.get())) return true;
+                if (auto* is = dynamic_cast<const IfStmt*>(s.get())) {
+                    if (has_try_catch(is->then_b)) return true;
+                    if (is->has_else && has_try_catch(is->else_b)) return true;
+                }
+                if (auto* ws = dynamic_cast<const WhileStmt*>(s.get())) { if (has_try_catch(ws->body)) return true; }
+                if (auto* ds = dynamic_cast<const DoWhileStmt*>(s.get())) { if (has_try_catch(ds->body)) return true; }
+                if (auto* fe = dynamic_cast<const ForEachStmt*>(s.get())) { if (has_try_catch(fe->body)) return true; }
+                if (auto* fs = dynamic_cast<const ForStmt*>(s.get())) { if (has_try_catch(fs->body)) return true; }
+                if (auto* bs = dynamic_cast<const BlockStmt*>(s.get())) { if (has_try_catch(bs->block)) return true; }
+                if (auto* sw = dynamic_cast<const SwitchStmt*>(s.get()))
+                    for (auto& c : sw->cases) if (has_try_catch(c.body)) return true;
+                if (auto* ms = dynamic_cast<const MatchStmt*>(s.get()))
+                    for (auto& arm : ms->arms) if (has_try_catch(arm.body)) return true;
+            }
+            return false;
+        };
+        bool uses_try_catch = has_try_catch(f.body);
+        if (!uses_obf && !uses_try_catch && !(ctx.obf.mba || ctx.obf.opaque || ctx.obf.keyed)) {
             ThinFunction thf = lower_function(f, ctx);
             if (!thf.blocks.empty()) {
                 // Stage C: run IR optimization passes between lower and emit.
@@ -3981,6 +4365,14 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
             }
             if (auto* sw = dynamic_cast<const SwitchStmt*>(s.get()))
                 for (auto& c : sw->cases) sum_bytes(c.body);
+            // Tier 4: each try/catch allocates one i64 catch-variable slot
+            // (alloc_local in exec_stmt's TryCatchStmt case). Recurse into
+            // both try + catch bodies for nested locals.
+            if (auto* tc = dynamic_cast<const TryCatchStmt*>(s.get())) {
+                locals_area += 8;  // catch_name (i64)
+                sum_bytes(tc->try_body);
+                sum_bytes(tc->catch_body);
+            }
         }
     };
     sum_bytes(f.body);
@@ -4029,6 +4421,8 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
             if (auto* fs = dynamic_cast<const ForStmt*>(s.get())) collect_defers(fs->body);
             if (auto* sw = dynamic_cast<const SwitchStmt*>(s.get())) for (auto& c : sw->cases) collect_defers(c.body);
             if (auto* ms = dynamic_cast<const MatchStmt*>(s.get())) for (auto& arm : ms->arms) collect_defers(arm.body);
+            // Tier 4: recurse into try/catch bodies for defer collection.
+            if (auto* tc = dynamic_cast<const TryCatchStmt*>(s.get())) { collect_defers(tc->try_body); collect_defers(tc->catch_body); }
         }
     };
     collect_defers(f.body);

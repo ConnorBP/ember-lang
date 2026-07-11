@@ -1,0 +1,12 @@
+// expect: SEMA ERROR
+// Tier 4: throw is a terminator (like return). Code after a throw in the same
+// block is unreachable and must be flagged as a sema error. This mirrors the
+// existing unreachable-code-after-return guard in check_block.
+fn main() -> i64 {
+    try {
+        throw 42;
+        return 999;  // unreachable — sema must reject this
+    } catch (e) {
+        return e;
+    }
+}

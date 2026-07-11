@@ -356,6 +356,51 @@ public:
         byte(uint8_t((scale_log2 & 3) << 6) | ((uint8_t(index) & 7) << 3) | (uint8_t(base) & 7));
     }
 
+    // lea r64, [base + disp32] -> REX.W 8D /r mod=10 (for computing buffer
+    // addresses like &ctx->catch_bufs[depth] in a single instruction).
+    void lea_reg_mem_disp(Reg dst, Reg base, int32_t disp) {
+        byte(rex(true, is_extended(dst), false, is_extended(base)));
+        byte(0x8D);
+        if ((uint8_t(base) & 7) == 4) { // rsp/r12 need SIB
+            byte(modrm(0b10, dst, Reg(4)));
+            byte(0x24);
+        } else {
+            byte(modrm(0b10, dst, base));
+        }
+        imm32(disp);
+    }
+
+    // lea r64, [rip + rel32] -> REX.W 8D /r mod=00 rm=5 (RIP-relative).
+    // Loads the absolute address of a label into a register. Used by the
+    // try/catch setjmp to save the catch-entry rip into the save buffer;
+    // the longjmp (at the throw site) jumps to it. The rel32 is a pending
+    // fixup resolved by resolve_fixups(), exactly like jmp/jcc.
+    void lea_reg_rip(Reg dst, Label l) {
+        byte(rex(true, is_extended(dst), false, false));
+        byte(0x8D);
+        byte(modrm(0b00, dst, Reg(5)));  // rm=5 = RIP-relative, mod=00
+        pending.push_back({uint32_t(code.size()), l.id, false});
+        imm32(0);
+    }
+
+    // imul r64, r/m64, imm32 -> REX.W 69 /r id (three-operand multiply:
+    // dst = src * imm32, sign-extended). Used by try/catch to scale catch_depth
+    // by the 64-byte buffer stride when computing &catch_bufs[depth].
+    void imul_reg_imm32(Reg dst, Reg src, int32_t imm) {
+        byte(rex(true, is_extended(dst), false, is_extended(src)));
+        byte(0x69);
+        byte(modrm(0b11, dst, src));
+        imm32(imm);
+    }
+
+    // jmp r/m64 -> FF /4 (indirect jump through a register). Used by the
+    // try/catch longjmp to jump to the saved catch-entry rip.
+    void jmp_reg(Reg r) {
+        if (is_extended(r)) byte(rex(false, false, false, true));
+        byte(0xFF);
+        byte(modrm(0b11, Reg(4), r));
+    }
+
     // script->native call: mov rax, imm64; call rax
     void call_imm64(int64_t target) {
         mov_reg_imm64(Reg::rax, target);
