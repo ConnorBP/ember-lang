@@ -280,6 +280,7 @@ struct ThinLowerer {
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { prescan_expr(*ws->cond); prescan_block(ws->body); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { prescan_block(ds->body); prescan_expr(*ds->cond); return; }
+        if (auto* fe = dynamic_cast<const ForEachStmt*>(&s)) { prescan_expr(*fe->iter); prescan_block(fe->body); return; }
         if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
             if (fs->init) prescan_stmt(*fs->init);
             if (fs->cond) prescan_expr(*fs->cond);
@@ -935,6 +936,32 @@ struct ThinLowerer {
             out.non_serializable_reason =
                 "obfuscation transforms (MBA/opaque/keyed) have no ThinOp representation; "
                 "falling back to tree-walker at Stage A";
+            out.blocks.clear();
+            return out;
+        }
+
+        // ForEachStmt fallback: for-each is not yet lowered to ThinFunction IR
+        // (it's a tree-walker-only feature for now). If the function uses for-each,
+        // fall back to the tree-walker.
+        // (A simple recursive check — the body is small.)
+        std::function<bool(const Block&)> has_for_each = [&](const Block& b) -> bool {
+            for (const auto& st : b.stmts) {
+                if (dynamic_cast<const ForEachStmt*>(st.get())) return true;
+                if (auto* is = dynamic_cast<const IfStmt*>(st.get())) {
+                    if (has_for_each(is->then_b)) return true;
+                    if (is->has_else && has_for_each(is->else_b)) return true;
+                }
+                if (auto* ws = dynamic_cast<const WhileStmt*>(st.get())) { if (has_for_each(ws->body)) return true; }
+                if (auto* fs = dynamic_cast<const ForStmt*>(st.get())) { if (has_for_each(fs->body)) return true; }
+                if (auto* ds = dynamic_cast<const DoWhileStmt*>(st.get())) { if (has_for_each(ds->body)) return true; }
+            }
+            return false;
+        };
+        if (has_for_each(f.body)) {
+            out.non_serializable = true;
+            out.non_serializable_reason =
+                "for-each loop is not yet lowered to ThinFunction IR; "
+                "falling back to tree-walker";
             out.blocks.clear();
             return out;
         }

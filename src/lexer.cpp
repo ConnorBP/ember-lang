@@ -15,7 +15,7 @@ static const std::unordered_map<std::string, Tk>& keywords() {
         {"if",Tk::Kw_if},{"else",Tk::Kw_else},{"while",Tk::Kw_while},{"do",Tk::Kw_do},
         {"for",Tk::Kw_for},{"switch",Tk::Kw_switch},{"case",Tk::Kw_case},{"default",Tk::Kw_default},
         {"break",Tk::Kw_break},{"continue",Tk::Kw_continue},{"return",Tk::Kw_return},
-        {"as",Tk::Kw_as},{"auto",Tk::Kw_auto},
+        {"as",Tk::Kw_as},{"auto",Tk::Kw_auto},{"in",Tk::Kw_in},
         {"true",Tk::Kw_true},{"false",Tk::Kw_false},
         {"sizeof",Tk::Kw_sizeof},{"offsetof",Tk::Kw_offsetof},
         {"link",Tk::Kw_link},

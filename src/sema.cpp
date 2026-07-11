@@ -1774,6 +1774,23 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
         if (ds->cond) { const Type* ct = check_expr(*ds->cond); if(!ct->is_bool()) err("do-while cond must be bool", ds->loc.line, ds->loc.col); }
         return;
     }
+    if (auto* fe = dynamic_cast<ForEachStmt*>(&s)) {
+        // for (x in iter): iter must be a slice T[]; x gets the element type.
+        const Type* iter_ty = check_expr(*fe->iter);
+        if (!iter_ty->is_slice)
+            err("for-each iterable must be a slice (got " + iter_ty->to_string() + ")",
+                fe->iter->loc.line, fe->iter->loc.col);
+        const Type* elem_ty = iter_ty->elem.get();
+        if (!elem_ty) elem_ty = &type_i64();  // fallback
+        ++loop_depth;
+        push_scope();
+        declare(fe->var, elem_ty, false, false, fe->loc);
+        bool r = false;
+        check_block(fe->body, ret_ty, r);
+        pop_scope();
+        --loop_depth;
+        return;
+    }
     if (auto* sw = dynamic_cast<SwitchStmt*>(&s)) {
         const Type* subj_ty = check_expr(*sw->subject);
         if (!subj_ty->is_int() && !subj_ty->is_bool())
@@ -1892,6 +1909,11 @@ void Checker::lower_enum_access_stmt(Stmt& s) {
     if (auto* ds = dynamic_cast<DoWhileStmt*>(&s)) {
         lower_enum_access_block(ds->body);
         if (ds->cond) lower_enum_access_expr(ds->cond);
+        return;
+    }
+    if (auto* fe = dynamic_cast<ForEachStmt*>(&s)) {
+        lower_enum_access_expr(fe->iter);
+        lower_enum_access_block(fe->body);
         return;
     }
     if (auto* sw = dynamic_cast<SwitchStmt*>(&s)) {

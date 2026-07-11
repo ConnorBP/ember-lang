@@ -14,6 +14,7 @@ struct P {
     std::vector<ParseErrorEntry> err_entries;  // same errors as `errs`, individually positioned
 
     const Token& peek() const { return toks[i]; }
+    const Token& peek(int off) const { return toks[std::min(size_t(i + off), toks.size() - 1)]; }
     const Token& at(size_t k) const { return toks[std::min(k, toks.size()-1)]; }
     const Token& adv() { return toks[i < toks.size()-1 ? i++ : i]; }
     bool at(Tk k) const { return toks[i].kind == k; }
@@ -764,10 +765,25 @@ struct P {
         case Tk::Kw_do: { adv(); auto s=std::make_unique<DoWhileStmt>(); s->loc=loc(t); s->body=parse_block(); expect(Tk::Kw_while,"'while'"); expect(Tk::LParen,"'('"); s->cond=parse_expr(); expect(Tk::RParen,"')'"); expect(Tk::Semicolon,"';'"); return s; }
         case Tk::Kw_for: {
             // for ( [let NAME [: TYPE] [= EXPR]] ; [COND] ; [STEP] ) { BODY }
+            // — OR —
+            // for ( NAME in EXPR ) { BODY }   (Tier 1 for-each over a slice)
             adv();
+            expect(Tk::LParen, "'('");
+            // Detect for-each: IDENT 'in' ...
+            if (at(Tk::Ident) && peek(1).kind == Tk::Kw_in) {
+                auto s = std::make_unique<ForEachStmt>();
+                s->loc = loc(peek());
+                s->var = peek().text;
+                adv();  // IDENT
+                adv();  // 'in'
+                s->iter = parse_expr();
+                expect(Tk::RParen, "')'");
+                s->body = parse_block();
+                return s;
+            }
+            // C-style for
             auto s = std::make_unique<ForStmt>();
             s->loc = loc(t);
-            expect(Tk::LParen, "'('");
             if (at(Tk::Kw_let) || at(Tk::Kw_auto) || at(Tk::Kw_const)) {
                 const Token& initTok = peek();
                 s->init = parse_let_stmt(initTok);   // consumes its own trailing ';'

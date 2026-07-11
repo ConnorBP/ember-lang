@@ -580,6 +580,7 @@ struct CG {
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { prescan_expr(*ws->cond); prescan_block(ws->body); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { prescan_block(ds->body); prescan_expr(*ds->cond); return; }
+        if (auto* fe = dynamic_cast<const ForEachStmt*>(&s)) { prescan_expr(*fe->iter); prescan_block(fe->body); return; }
         if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
             if (fs->init) prescan_stmt(*fs->init);
             if (fs->cond) prescan_expr(*fs->cond);
@@ -645,6 +646,7 @@ struct CG {
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_struct_temps_expr(*ws->cond, total); count_struct_temps_block(ws->body, total); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_struct_temps_block(ds->body, total); count_struct_temps_expr(*ds->cond, total); return; }
+        if (auto* fe = dynamic_cast<const ForEachStmt*>(&s)) { count_struct_temps_expr(*fe->iter, total); count_struct_temps_block(fe->body, total); return; }
         if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
             if (fs->init) count_struct_temps_stmt(*fs->init, total);
             if (fs->cond) count_struct_temps_expr(*fs->cond, total);
@@ -716,6 +718,7 @@ struct CG {
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_arr_temps_expr(*ws->cond, total); count_arr_temps_block(ws->body, total); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_arr_temps_block(ds->body, total); count_arr_temps_expr(*ds->cond, total); return; }
+        if (auto* fe = dynamic_cast<const ForEachStmt*>(&s)) { count_arr_temps_expr(*fe->iter, total); count_arr_temps_block(fe->body, total); return; }
         if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
             if (fs->init) count_arr_temps_stmt(*fs->init, total);
             if (fs->cond) count_arr_temps_expr(*fs->cond, total);
@@ -782,6 +785,7 @@ struct CG {
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_str_temps_expr(*ws->cond, total); count_str_temps_block(ws->body, total); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_str_temps_block(ds->body, total); count_str_temps_expr(*ds->cond, total); return; }
+        if (auto* fe = dynamic_cast<const ForEachStmt*>(&s)) { count_str_temps_expr(*fe->iter, total); count_str_temps_block(fe->body, total); return; }
         if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
             if (fs->init) count_str_temps_stmt(*fs->init, total);
             if (fs->cond) count_str_temps_expr(*fs->cond, total);
@@ -838,6 +842,7 @@ struct CG {
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_pin_refs_expr(*ws->cond, counts); count_pin_refs_block(ws->body, counts); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_pin_refs_block(ds->body, counts); count_pin_refs_expr(*ds->cond, counts); return; }
+        if (auto* fe = dynamic_cast<const ForEachStmt*>(&s)) { count_pin_refs_expr(*fe->iter, counts); count_pin_refs_block(fe->body, counts); return; }
         if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
             if (fs->init) count_pin_refs_stmt(*fs->init, counts);
             if (fs->cond) count_pin_refs_expr(*fs->cond, counts);
@@ -3165,6 +3170,56 @@ void CG::exec_stmt(const Stmt& s) {
         e.bind(end);
         return;
     }
+    if (auto* fe = dynamic_cast<const ForEachStmt*>(&s)) {
+        // for (x in iter) { body } — desugars to a while loop over the slice.
+        // The iter is a slice {ptr, len}; x gets the element at each index.
+        const Type* iter_ty = fe->iter->ty;
+        const Type* elem_ty = iter_ty && iter_ty->elem ? iter_ty->elem.get() : nullptr;
+        int32_t esz = value_bytes(elem_ty, ctx.structs);
+        if (esz <= 0) esz = 8;
+        // Static i64 type for the ptr/len/index slots.
+        static const Type i64_ty = make_prim(Prim::I64);
+        // Alloc frame slots for: ptr, len, index, var.
+        int32_t ptr_off = alloc_local("__fe_ptr", &i64_ty);
+        int32_t len_off = alloc_local("__fe_len", &i64_ty);
+        int32_t idx_off = alloc_local("__fe_idx", &i64_ty);
+        int32_t var_off = alloc_local(fe->var, elem_ty ? elem_ty : &i64_ty);
+        // Evaluate the iterable → rax=ptr, rdx=len (the slice ABI).
+        eval(*fe->iter);
+        e.store_reg_mem(Reg::rbp, ptr_off, Reg::rax);
+        e.mov_reg_reg(Reg::rax, Reg::rdx);
+        e.store_reg_mem(Reg::rbp, len_off, Reg::rax);
+        e.mov_reg_imm64(Reg::rax, 0);
+        e.store_reg_mem(Reg::rbp, idx_off, Reg::rax);
+        // The loop.
+        Label top = e.alloc_label(), latch = e.alloc_label(), end = e.alloc_label();
+        e.bind(top);
+        e.load_reg_mem(Reg::rax, Reg::rbp, idx_off);
+        e.load_reg_mem(Reg::rdx, Reg::rbp, len_off);
+        e.cmp_reg_reg(Reg::rax, Reg::rdx);
+        e.jcc(Cond::ge, end);
+        // Load element at [ptr + index*esz].
+        e.load_reg_mem(Reg::rax, Reg::rbp, ptr_off);   // rax = ptr
+        e.load_reg_mem(Reg::rcx, Reg::rbp, idx_off);   // rcx = index
+        uint8_t scale = 0;
+        if (esz == 1) scale = 0; else if (esz == 2) scale = 1;
+        else if (esz == 4) scale = 2; else scale = 3;
+        e.lea_reg_mem_sib(Reg::rax, Reg::rax, Reg::rcx, scale);  // rax = ptr + index*esz
+        e.load_elem_to_rax(Reg::rax, 0, esz, false);  // rax = element
+        // Store to var's slot.
+        e.store_rax_elem(Reg::rbp, var_off, esz);
+        loops.push_back({latch, end, false, cleanup_scopes.size()});
+        exec_block(fe->body);
+        loops.pop_back();
+        e.bind(latch);
+        e.load_reg_mem(Reg::rax, Reg::rbp, idx_off);
+        e.add_reg_imm32(Reg::rax, 1);
+        e.store_reg_mem(Reg::rbp, idx_off, Reg::rax);
+        emit_budget_check(block_cost(fe->body), "budget exceeded at for-each back-edge");
+        e.jmp(top);
+        e.bind(end);
+        return;
+    }
     if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
         // for (init; cond; step) { body } desugars to:
         //   init; L_cond: if(!cond) goto L_end; body; L_step: step; goto L_cond; L_end:
@@ -3369,6 +3424,8 @@ int64_t CG::stmt_cost(const Stmt& s) {
     }
     if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s))
         return cost_add(cost_add(1, ds->cond ? expr_cost(*ds->cond) : 0), block_cost(ds->body));
+    if (auto* fe = dynamic_cast<const ForEachStmt*>(&s))
+        return cost_add(cost_add(cost_add(1, fe->iter ? expr_cost(*fe->iter) : 0), 1), block_cost(fe->body));
     if (auto* sw = dynamic_cast<const SwitchStmt*>(&s)) {
         // subject eval + one compare per case + each case body.
         int64_t n = sw->subject ? expr_cost(*sw->subject) : 0;
@@ -3458,6 +3515,13 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
             if (auto* is = dynamic_cast<const IfStmt*>(s.get())) { sum_bytes(is->then_b); if(is->has_else) sum_bytes(is->else_b); }
             if (auto* ws = dynamic_cast<const WhileStmt*>(s.get())) sum_bytes(ws->body);
             if (auto* ds = dynamic_cast<const DoWhileStmt*>(s.get())) sum_bytes(ds->body);
+            if (auto* fe = dynamic_cast<const ForEachStmt*>(s.get())) {
+                // for-each allocates: ptr(8) + len(8) + idx(8) + var(elem_width)
+                locals_area += 24;  // ptr + len + idx
+                const Type* et = fe->iter && fe->iter->ty && fe->iter->ty->elem ? fe->iter->ty->elem.get() : nullptr;
+                locals_area += CG::local_width_bytes(et, ctx.structs);  // var
+                sum_bytes(fe->body);
+            }
             if (auto* bs = dynamic_cast<const BlockStmt*>(s.get())) sum_bytes(bs->block);
             if (auto* fs = dynamic_cast<const ForStmt*>(s.get())) {
                 if (fs->init) locals_area += CG::local_width_bytes(fs->init->init ? fs->init->init->ty : fs->init->ty.get(), ctx.structs);
@@ -3508,6 +3572,7 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
             if (auto* is = dynamic_cast<const IfStmt*>(s.get())) { collect_defers(is->then_b); if (is->has_else) collect_defers(is->else_b); }
             if (auto* ws = dynamic_cast<const WhileStmt*>(s.get())) collect_defers(ws->body);
             if (auto* ds = dynamic_cast<const DoWhileStmt*>(s.get())) collect_defers(ds->body);
+            if (auto* fe = dynamic_cast<const ForEachStmt*>(s.get())) collect_defers(fe->body);
             if (auto* bs = dynamic_cast<const BlockStmt*>(s.get())) collect_defers(bs->block);
             if (auto* fs = dynamic_cast<const ForStmt*>(s.get())) collect_defers(fs->body);
             if (auto* sw = dynamic_cast<const SwitchStmt*>(s.get())) for (auto& c : sw->cases) collect_defers(c.body);

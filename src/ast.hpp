@@ -214,6 +214,9 @@ struct IfStmt   : Stmt { ExprPtr cond; Block then_b; bool has_else=false; Block 
 struct WhileStmt: Stmt { ExprPtr cond; Block body; };
 struct ForStmt  : Stmt { std::unique_ptr<LetStmt> init; ExprPtr cond; ExprPtr step; Block body; };
 struct DoWhileStmt:Stmt { Block body; ExprPtr cond; };
+// Tier 1: for-each over a slice T[]. `iter` must be a slice; `var` gets the
+// element type. Desugared by codegen to a while loop with indexing.
+struct ForEachStmt: Stmt { std::string var; ExprPtr iter; Block body; };
 struct ReturnStmt:Stmt { ExprPtr value; };          // nullptr = void return
 struct BreakStmt: Stmt {};
 struct ContinueStmt:Stmt {};
