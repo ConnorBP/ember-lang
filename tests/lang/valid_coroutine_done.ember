@@ -1,0 +1,21 @@
+// expect: 6
+// #21 coroutines / yield — coroutine_done: the done flag flips true once the
+// fn returns. gen() yields 1, 2, 3 then returns 0 (done). main loops
+// coroutine_next while !coroutine_done, summing the consumed values
+// (1+2+3+0=6 — the done return is consumed because coroutine_done only flips
+// AFTER the next() that runs the fn to its return), then returns the sum.
+fn gen() -> i64 {
+    yield 1;
+    yield 2;
+    yield 3;
+    return 0;
+}
+
+fn main() -> i64 {
+    let c = coroutine_start(&gen, 0);
+    let mut sum: i64 = 0;
+    while (!coroutine_done(c)) {
+        sum = sum + coroutine_next(c);
+    }
+    return sum;
+}

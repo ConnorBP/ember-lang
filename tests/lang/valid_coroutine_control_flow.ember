@@ -1,0 +1,24 @@
+// expect: 2
+// #21 coroutines / yield — control flow (if/else) inside a coroutine, + the
+// arg selecting the branch. classify(n) yields 1 if n>0 else -1, then returns
+// 0 (done). main starts one with +5 (yields 1) and one with -5 (yields -1),
+// consumes each yield + each done return: (1 + 0) + (-1 + 0) = 0. Plus 2 = 2.
+fn classify(n: i64) -> i64 {
+    if (n > 0) {
+        yield 1;
+    } else {
+        yield -1;
+    }
+    return 0;
+}
+
+fn main() -> i64 {
+    let a = coroutine_start(&classify, 5);
+    let b = coroutine_start(&classify, 0 - 5);
+    let mut sum: i64 = 0;
+    sum = sum + coroutine_next(a);  // 1  (5 > 0)
+    sum = sum + coroutine_next(a);  // 0  (done)
+    sum = sum + coroutine_next(b);  // -1 (-5 <= 0)
+    sum = sum + coroutine_next(b);  // 0  (done)
+    return sum + 2;
+}

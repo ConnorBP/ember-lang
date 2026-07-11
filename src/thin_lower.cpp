@@ -983,6 +983,20 @@ struct ThinLowerer {
             return out;
         }
 
+        // #21 coroutines: yield is lowered by the tree-walker (to a
+        // __ember_coro_yield native call). The IR path does not lower it yet,
+        // so a coroutine fn falls back to the tree-walker. compile_func's
+        // is_coroutine gate already prevents lower_function from being
+        // called, but this is a defensive guard for any direct caller.
+        if (f.is_coroutine) {
+            out.non_serializable = true;
+            out.non_serializable_reason =
+                "coroutine (yield) is not yet lowered to ThinFunction IR; "
+                "falling back to tree-walker";
+            out.blocks.clear();
+            return out;
+        }
+
         // --- frame plan (mirror compile_func) ---
         prescan_block(f.body);
 

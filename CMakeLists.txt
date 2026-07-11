@@ -160,6 +160,7 @@ ember_add_extension(math     extensions/math/ext_math.cpp)
 ember_add_extension(map      extensions/map/ext_map.cpp)
 ember_add_extension(sync     extensions/sync/ext_sync.cpp)
 ember_add_extension(thread   extensions/thread/ext_thread.cpp)   # Tier 4: in-context threads (thread_spawn/join + call_mutex serialization)
+ember_add_extension(coroutine extensions/coroutine/ext_coroutine.cpp) # #21 coroutines with yield (Windows fibers: coroutine_start/next/done)
 ember_add_extension(lifecycle extensions/lifecycle/ext_lifecycle.cpp)
 ember_add_extension(opt extensions/opt/ext_opt.cpp)         # Stage C: IR optimization passes
 ember_add_extension(obf extensions/obf/ext_obf.cpp)           # Stage C Step 5: IR obfuscation passes
@@ -499,7 +500,7 @@ target_link_libraries(ember_cli PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_opt ember_ext_obf ember_ext_map
-    ember_ext_io)
+    ember_ext_io ember_ext_coroutine)
 
 # ---- standalone exe bundler (docs/planning/plan_STANDALONE_BUNDLER.md) ----
 # The stub: a pre-built runtime that links ember + ember_frontend + the
@@ -514,7 +515,7 @@ target_link_libraries(ember_stub_main PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_map
-    ember_ext_io)
+    ember_ext_io ember_ext_coroutine)
 
 # The bundler tool: compiles a .ember -> .em (the emit-em pipeline), copies
 # the stub to <output.exe>, appends the .em + footer. Links the same libs as
@@ -526,7 +527,7 @@ target_link_libraries(ember_bundle PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_map
-    ember_ext_io)
+    ember_ext_io ember_ext_coroutine)
 
 # End-to-end bundler test: bundle .ember scripts into standalone exes, run
 # them, assert exit codes. Covers simple scripts, multi-function, imports,

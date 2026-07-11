@@ -719,6 +719,15 @@ struct CG {
             if (th->value) prescan_expr(*th->value);
             return;
         }
+        // #21 coroutine yield: the yield value may contain calls (max_args /
+        // makes_calls must see them) — recurse like ThrowStmt. yield itself
+        // is lowered to a native call (__ember_coro_yield), so it makes calls.
+        if (auto* ys = dynamic_cast<const YieldStmt*>(&s)) {
+            makes_calls = true;            // the __ember_coro_yield native call
+            max_args = std::max(max_args, 1);  // 1 i64 arg
+            if (ys->value) prescan_expr(*ys->value);
+            return;
+        }
     }
     void prescan_expr(const Expr& ex) {
         if (auto* c = dynamic_cast<const CallExpr*>(&ex)) {
@@ -794,6 +803,10 @@ struct CG {
         }
         if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) {
             if (th->value) count_struct_temps_expr(*th->value, total);
+            return;
+        }
+        if (auto* ys = dynamic_cast<const YieldStmt*>(&s)) {
+            if (ys->value) count_struct_temps_expr(*ys->value, total);
             return;
         }
     }
@@ -887,6 +900,10 @@ struct CG {
             if (th->value) count_arr_temps_expr(*th->value, total);
             return;
         }
+        if (auto* ys = dynamic_cast<const YieldStmt*>(&s)) {
+            if (ys->value) count_arr_temps_expr(*ys->value, total);
+            return;
+        }
     }
     void count_arr_temps_expr(const Expr& ex, int32_t& total) {
         if (auto* al = dynamic_cast<const ArrayLit*>(&ex)) {
@@ -965,6 +982,10 @@ struct CG {
             if (th->value) count_str_temps_expr(*th->value, total);
             return;
         }
+        if (auto* ys = dynamic_cast<const YieldStmt*>(&s)) {
+            if (ys->value) count_str_temps_expr(*ys->value, total);
+            return;
+        }
     }
     void count_str_temps_expr(const Expr& ex, int32_t& total) {
         if (auto* lit = dynamic_cast<const StringLit*>(&ex)) {
@@ -1031,6 +1052,10 @@ struct CG {
         }
         if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) {
             if (th->value) count_pin_refs_expr(*th->value, counts);
+            return;
+        }
+        if (auto* ys = dynamic_cast<const YieldStmt*>(&s)) {
+            if (ys->value) count_pin_refs_expr(*ys->value, counts);
             return;
         }
     }
@@ -4303,6 +4328,57 @@ void CG::exec_stmt(const Stmt& s) {
         emit_trap(int(TrapReason::UnhandledThrow), "unhandled throw (no enclosing try/catch)");
         return;
     }
+    // #21 coroutine yield: `yield expr;` suspends the coroutine + hands `expr`
+    // to the caller as the next() value. Lowered to a call to the internal
+    // native __ember_coro_yield(i64): the native stores the value on the
+    // current coroutine + SwitchToFibers back to the caller's fiber; when the
+    // caller resumes the coroutine (coroutine_next -> SwitchToFiber to this
+    // coro's fiber), __ember_coro_yield returns + the fn continues after this
+    // statement. No JIT'd context-switch code — the fiber switch is entirely
+    // inside the native, so this is just a single-i64-arg native call.
+    //
+    // Sema guarantees the enclosing fn is a coroutine (is_coroutine) + the
+    // yield value's type matches coroutine_yield_type (i64 for v1). A void
+    // yield (`yield;`) passes 0. The native's return (i64) is ignored — the
+    // value is stashed on the coroutine, not returned through rax.
+    if (auto* ys = dynamic_cast<const YieldStmt*>(&s)) {
+        // Eval the yield value into rax (i64). For a void yield, pass 0.
+        if (ys->value) {
+            eval(*ys->value);  // result in rax (int) / xmm0 (float) — v1 is i64
+        } else {
+            e.mov_reg_imm64(Reg::rax, 0);
+        }
+        // Set up the call to __ember_coro_yield with the value in rcx (the
+        // Win64 first-arg register). Keep rsp 16-aligned: at this point rsp is
+        // 16-aligned (the frame is round16-aligned after the prologue), so a
+        // plain `sub rsp, 32` reserves the mandatory Win64 shadow space AND
+        // preserves alignment (32 is a multiple of 16). Stash the value in
+        // [rsp] across the depth check (emit_depth_check clobbers rax/eax in
+        // the context-register path — it loads max_call_depth into eax — so
+        // the value must not live in rax across it; rcx is NOT clobbered by
+        // the depth check, so moving it to rcx first is also safe).
+        e.sub_reg_imm32(Reg::rsp, 32);          // shadow space (keeps rsp%16==0)
+        e.mov_reg_reg(Reg::rcx, Reg::rax);      // arg 0 = yield value
+        // Look up the native binding (sema registered __ember_coro_yield via
+        // ext_coroutine::register_natives). emit_counted_named_native emits
+        // the depth check + `mov rax, native_ptr; call rax` + depth leave.
+        const NativeSig* ysig = native_named("__ember_coro_yield");
+        if (ysig && ysig->fn_ptr) {
+            emit_counted_named_native(ysig->fn_ptr, "__ember_coro_yield",
+                                      "coroutine yield");
+        } else {
+            // No binding registered (the host did not call
+            // ext_coroutine::register_natives) -> trap loudly. A silent no-op
+            // would miscompile (yield drops the value + continues without
+            // suspending). This is a host-setup error, not a script error.
+            emit_trap(int(TrapReason::IllegalInstruction),
+                      "yield requires the coroutine extension to be registered");
+        }
+        e.add_reg_imm32(Reg::rsp, 32);          // reclaim shadow space
+        // __ember_coro_yield returned (the coroutine was resumed). Continue
+        // to the next statement — the fn's frame is intact on the coro stack.
+        return;
+    }
     if (dynamic_cast<const BreakStmt*>(&s)) {
         if (!loops.empty()) {
             emit_cleanups_to(loops.back().cleanup_depth);
@@ -4466,6 +4542,11 @@ int64_t CG::stmt_cost(const Stmt& s) {
     // Tier 4: throw — expr eval + longjmp sequence (~15 instructions).
     if (auto* th = dynamic_cast<const ThrowStmt*>(&s))
         return cost_add(15, th->value ? expr_cost(*th->value) : 0);
+    // #21 coroutine yield — expr eval + native-call setup (shadow space +
+    // arg marshal + the __ember_coro_yield call). Same shape as a 1-arg
+    // native call (~5 instructions of setup + the call).
+    if (auto* ys = dynamic_cast<const YieldStmt*>(&s))
+        return cost_add(6, ys->value ? expr_cost(*ys->value) : 0);
     return 1;  // Break/Continue and other leaf statements
 }
 
@@ -4518,7 +4599,14 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
             return false;
         };
         bool uses_try_catch = has_try_catch(f.body);
-        if (!uses_obf && !uses_try_catch && !(ctx.obf.mba || ctx.obf.opaque || ctx.obf.keyed)) {
+        // #21 coroutines: the IR path (thin_lower) does not lower yield yet
+        // (yield is lowered by the tree-walker to a __ember_coro_yield native
+        // call with shadow-space setup). If the fn is a coroutine (sema set
+        // is_coroutine when it saw a yield), fall back to the tree-walker.
+        // This mirrors the try/catch fallback: the tree-walker is the
+        // correctness path for features the IR backend has not lowered.
+        bool is_coroutine = f.is_coroutine;
+        if (!uses_obf && !uses_try_catch && !is_coroutine && !(ctx.obf.mba || ctx.obf.opaque || ctx.obf.keyed)) {
             ThinFunction thf = lower_function(f, ctx);
             if (!thf.blocks.empty()) {
                 // Stage C: run IR optimization passes between lower and emit.

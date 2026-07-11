@@ -1,0 +1,23 @@
+// expect: 32
+// #21 coroutines / yield — basic: a coroutine yields 3 values then returns -1.
+// counter(10) yields 10, 11, 12 then returns -1 (done). main sums the four
+// values: 10 + 11 + 12 + (-1) = 32. Validates coroutine_start + coroutine_next
+// (first-next starts the fn + runs to the first yield; later nexts resume) +
+// the final return value reaching the caller as the done value.
+fn counter(start: i64) -> i64 {
+    let mut i: i64 = start;
+    while (i < start + 3) {
+        yield i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn main() -> i64 {
+    let c = coroutine_start(&counter, 10);
+    let a: i64 = coroutine_next(c);
+    let b: i64 = coroutine_next(c);
+    let d: i64 = coroutine_next(c);
+    let e: i64 = coroutine_next(c);
+    return a + b + d + e;
+}

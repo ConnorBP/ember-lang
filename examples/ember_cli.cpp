@@ -67,6 +67,7 @@
 #include "ext_opt.hpp"        // Stage C: register_passes (IR optimization passes)
 #include "ext_obf.hpp"         // Stage C Step 5: register_passes (IR obfuscation passes)
 #include "ext_io.hpp"          // OS I/O (console + file + path), core subset
+#include "ext_coroutine.hpp"     // #21 coroutines with yield (Windows fibers)
 #include "../src/ember_pass.hpp"       // Stage C: EmberPassManager
 #include "../src/ember_pass_registry.hpp" // Stage C: EmberPassRegistry
 #include "../src/ember_pass_pipeline.hpp" // Stage C: build_pipeline_from_string
@@ -137,6 +138,7 @@ static void register_standard_bindings(
     ext_map::register_natives(natives);
     ember::ext_sync::register_natives(natives); ember::ext_lifecycle::register_natives(natives);
     ember::ext_io::register_natives(natives);
+    ember::ext_coroutine::register_natives(natives);
     OpOverloadTable overloads;
     ext_vec::register_overloads(overloads); ext_quat::register_overloads(overloads);
     ext_mat::register_overloads(overloads); ext_string::register_overloads(overloads);
@@ -312,6 +314,7 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
         ember::ext_sync::reset();
         ember::ext_lifecycle::reset();
         ember::ext_io::reset();
+        ember::ext_coroutine::coroutine_reset();
         // ext_math is stateless (no reset()).
     };
 
@@ -505,6 +508,15 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
     if (opts.emit_em_path.empty()) {
         ctx.fn_allowlist_base = int64_t(fn_allowlist.data());
         ctx.fn_slot_count = int64_t(slots.size());
+    }
+
+    // #21 coroutines: register the context + dispatch table the coroutine
+    // natives call into, + convert the calling thread to a fiber (fibers
+    // require the thread to be a fiber first so GetCurrentFiber() returns the
+    // caller's fiber — coroutine_next uses it as the yield switch-back
+    // target). Only in the JIT run path (emit-em is a pre-compile, no run).
+    if (opts.emit_em_path.empty()) {
+        ember::ext_coroutine::coroutine_init(&ectx, table.base(), int64_t(slots.size()));
     }
 
     // Stage C: --passes <spec>
