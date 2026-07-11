@@ -87,6 +87,11 @@ add_library(ember STATIC
     # dependency. Both em_writer.cpp and em_loader.cpp now #include it.
     src/thin_ir.cpp
     src/em_type_codec.cpp
+    # Stage B c1b: the ThinFunction serializer/deserializer (thin_ir_ser.{hpp,cpp}).
+    # Turns a ThinFunction into an opaque byte blob (the ir_blob a v5 .em
+    # per-function record carries) and back. Self-contained: touches Type only
+    # via em_type_codec (emit_type/parse_type) + ThinFunction public members.
+    src/thin_ir_ser.cpp
 )
 target_include_directories(ember PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ember PUBLIC ember_ed25519)  # F2 .em content authentication
@@ -556,6 +561,19 @@ add_executable(thin_ir_struct_test examples/thin_ir_struct_test.cpp)
 target_link_libraries(thin_ir_struct_test PRIVATE ember)
 add_test(NAME thin_ir_struct COMMAND thin_ir_struct_test)
 
+# thin_ir_ser_test - Stage B c1b (IL-.em): the IR SERIALIZER round-trip gate.
+# Hand-builds a ThinFunction + uses the real lower_function path (fib) to
+# prove serialize->deserialize->validate->re-emit->execute works end-to-end,
+# then malformed-blob rejection (bad magic, truncated, invalid ThinOp, OOB
+# target, no terminator, empty blob). Links ember (thin_ir_ser/em_type_codec/
+# thin_ir) + ember_frontend (lower_function/emit_x64/sema).
+add_executable(thin_ir_ser_test examples/thin_ir_ser_test.cpp)
+target_link_libraries(thin_ir_ser_test PRIVATE ember ember_frontend)
+if(WIN32)
+    target_link_libraries(thin_ir_ser_test PRIVATE kernel32)
+endif()
+add_test(NAME thin_ir_ser COMMAND thin_ir_ser_test)
+
 # aggregate_global_test - pins aggregate globals (chunk c3): struct globals
 # `global cfg : Config = Config{...};`, fixed-array globals `global arr : i64[3]
 # = [10,20,30];`, slice globals `global s : i64[] = [1,2,3];`. Compiles tiny
@@ -577,4 +595,5 @@ add_test(NAME aggregate_global COMMAND aggregate_global_test)
 set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
     v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
     array_lit aggregate_global em_signed codegen_opt thin_ir_struct thin_ir
+    thin_ir_ser
     PROPERTIES TIMEOUT 30)
