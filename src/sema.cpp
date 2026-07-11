@@ -6,6 +6,7 @@
 #include <unordered_set>
 #include <set>
 #include <string>
+#include <algorithm>
 
 namespace ember {
 
@@ -393,6 +394,8 @@ struct Checker {
         std::set<size_t> retained_params;  // C5: slice params stored to a global inside the fn
     };
     std::unordered_map<std::string, ScriptSig> script_sigs;
+    std::unordered_set<std::string> namespace_names;  // Tier 1: namespace names (for Foo::bar resolution)
+    std::string current_ns;  // Tier 1: the namespace of the fn currently being checked ("" = top-level)
 
     // owning type store (lives on the Program so it outlives sema + codegen;
     // raw `ty` pointers stashed on AST nodes stay valid until codegen finishes).
@@ -705,8 +708,9 @@ struct Checker {
         }
         std::unordered_set<std::string> fn_names;
         for (auto& f : prog->funcs) {
-            if (!fn_names.insert(f.name).second)
-                err("duplicate function declaration '" + f.name + "'", f.loc.line, f.loc.col);
+            std::string decl_key = f.ns.empty() ? f.name : (f.ns + "::" + f.name);
+            if (!fn_names.insert(decl_key).second)
+                err("duplicate function declaration '" + decl_key + "'", f.loc.line, f.loc.col);
             std::unordered_set<std::string> params;
             for (auto& p : f.params) {
                 if (!params.insert(p.name).second)
@@ -717,8 +721,9 @@ struct Checker {
         }
         std::unordered_set<std::string> global_names;
         for (auto& g : prog->globals) {
-            if (!global_names.insert(g.name).second)
-                err("duplicate global declaration '" + g.name + "'", g.loc.line, g.loc.col);
+            std::string gkey = g.ns.empty() ? g.name : (g.ns + "::" + g.name);
+            if (!global_names.insert(gkey).second)
+                err("duplicate global declaration '" + gkey + "'", g.loc.line, g.loc.col);
             if (contains_void(g.ty.get()))
                 err("global '" + g.name + "' cannot have void type", g.loc.line, g.loc.col);
             // Aggregate globals (struct / fixed-array / slice) are accepted in
@@ -746,6 +751,29 @@ struct Checker {
     void lower_enum_access_expr(ExprPtr& slot) {
         if (!slot) return;
         if (auto* ea = dynamic_cast<EnumAccessExpr*>(slot.get())) {
+            // Tier 1 namespaces: Foo::x where Foo is a namespace (not an enum)
+            // is a namespace-global access. Rewrite to an Ident with the
+            // qualified name so check_expr resolves it as a global.
+            if (namespace_names.count(ea->enum_name)) {
+                std::string qualified = ea->enum_name + "::" + ea->variant;
+                // check if the qualified global exists
+                auto git = std::find_if(prog->globals.begin(), prog->globals.end(),
+                    [&](const GlobalDecl& g) { return g.ns == ea->enum_name && g.name == ea->variant; });
+                if (git != prog->globals.end()) {
+                    auto id = std::make_unique<Ident>();
+                    id->loc = ea->loc;
+                    id->name = qualified;
+                    slot = std::move(id);
+                    return;
+                }
+                err("namespace '" + ea->enum_name + "' has no global '" + ea->variant + "'",
+                    ea->loc.line, ea->loc.col);
+                auto lit = std::make_unique<IntLit>();
+                lit->loc = ea->loc; lit->v = 0;
+                lit->ty = intern(type_i64());
+                slot = std::move(lit);
+                return;
+            }
             auto eit = enum_values.find(ea->enum_name);
             if (eit == enum_values.end()) {
                 err("unknown enum '" + ea->enum_name + "'", ea->loc.line, ea->loc.col);
@@ -1590,6 +1618,27 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
         // module may register later, §5 step 1/3); ret type is i64 (the handle/
         // int default — arg checking is skipped, codegen emits a trap stub).
         if (!c->module_alias.empty()) {
+            // Tier 1 namespaces: if the alias is a namespace (not a module),
+            // resolve Foo::bar as a same-module call to the qualified name.
+            if (namespace_names.count(c->module_alias)) {
+                std::string qualified = c->module_alias + "::" + c->name;
+                auto ssi = script_sigs.find(qualified);
+                if (ssi != script_sigs.end()) {
+                    // Found a namespaced fn. Rewrite as a same-module call:
+                    // clear module_alias, set name to qualified, fall through
+                    // to the normal same-module resolution + arg type-check.
+                    c->module_alias.clear();
+                    c->cross_module_unresolved = false;
+                    c->name = qualified;
+                    goto namespace_resolved;
+                } else {
+                    err("namespace '" + c->module_alias + "' has no function '" + c->name + "'",
+                        c->loc.line, c->loc.col);
+                    for (auto& a : c->args) check_expr(*a);
+                    e.ty = intern(type_i64());
+                    return e.ty;
+                }
+            }
             c->cross_module_unresolved = true;  // assume unresolved until found
             if (module_exports) {
                 auto mit = module_exports->find(c->module_alias);
@@ -1664,10 +1713,25 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
             e.ty = intern(type_i64());
             return e.ty;
         }
+        namespace_resolved:
         // resolve: native first, then script function
         auto nit = natives->find(c->name);
         auto sit = script_slots->find(c->name);
         if (nit == natives->end() && sit == script_slots->end()) {
+            // Tier 1 namespaces: if we're inside a namespace, try the qualified
+            // name (CurrentNs::fn) before giving up.
+            if (!current_ns.empty()) {
+                std::string qualified = current_ns + "::" + c->name;
+                auto qsit = script_slots->find(qualified);
+                auto qnit = natives->find(qualified);
+                if (qsit != script_slots->end() || qnit != natives->end()) {
+                    c->name = qualified;
+                    sit = qsit;
+                    nit = qnit;
+                    // fall through to the normal resolution below with the qualified name
+                    goto resolved_qualified;
+                }
+            }
             // v1.0 Tier 2 (docs/planning/plan_FUNCTION_REFS.md §4.3): `name(args)` where `name`
             // is neither a native nor a script fn — but it might be a LOCAL
             // VARIABLE of fn-handle type (the `let h = &fn; h(args);` case, which
@@ -1726,6 +1790,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
             err("unknown function '" + c->name + "'", c->loc.line, c->loc.col);
             e.ty = intern(type_void()); return e.ty;
         }
+        resolved_qualified:
         const Type* ret_ty;
         const std::vector<Type>* params;
         if (nit != natives->end()) {
@@ -2779,6 +2844,7 @@ void Checker::check_block(Block& b, const Type* ret_ty, bool& returns) {
 }
 
 void Checker::check_func(FuncDecl& f) {
+    current_ns = f.ns;  // Tier 1: track the current namespace for bare-call resolution
     scopes.clear();
     push_scope();
     // Struct-by-value params/returns are supported (shipped; see
@@ -3365,6 +3431,8 @@ SemaResult sema(Program& prog,
     c.structs = structs;
     c.module_exports = module_exports;
     c.prog = &prog;
+    // Tier 1 namespaces: build the namespace-name set for Foo::bar resolution.
+    for (const auto& ns : prog.namespaces) c.namespace_names.insert(ns.name);
 
     // Tier 1 typed enums (docs/planning/plan_ENUMS.md §6): register typed
     // enum names + their backing Prim BEFORE resolve_type runs, so a typed
@@ -3433,6 +3501,8 @@ SemaResult sema(Program& prog,
     // register globals (stable type pointers via intern)
     for (auto& g : prog.globals) {
         if (!c.globals.count(g.name)) c.globals[g.name] = {c.intern(*g.ty), g.is_const};
+        // Tier 1 namespaces: also register the qualified name (Ns::global).
+        if (!g.ns.empty()) c.globals[g.ns + "::" + g.name] = {c.intern(*g.ty), g.is_const};
     }
     // Tier 1 enums (docs/planning/plan_ENUMS.md Section 4): pass 1.5 resolve variant values
     // + build the (enum,variant)->i32 table and the enum_names set; pass 1.6
@@ -3497,7 +3567,14 @@ SemaResult sema(Program& prog,
                                 p.loc.line, p.loc.col);
             }
         }
-        c.script_sigs[f.name] = ss;
+        // Tier 1 namespaces: namespaced fns are registered under the
+        // qualified name only (Ns::fn), not the bare name. They are callable
+        // via Foo::bar() from anywhere (inside or outside the namespace).
+        if (!f.ns.empty()) {
+            c.script_sigs[f.ns + "::" + f.name] = ss;
+        } else {
+            c.script_sigs[f.name] = ss;
+        }
     }
 
     // Slice-escape safety Stage 2 (C5): compute per-fn borrowed_params /

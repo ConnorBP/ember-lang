@@ -292,6 +292,65 @@ struct P {
     // (try_eval_const_i64), identical to how GlobalDecl::init and array
     // sizes are handled - the parser stays dumb. Trailing comma allowed.
     // The optional `: type` declares a TYPED enum (§6): the enum name becomes
+    // Tier 1 namespace: `namespace Name { fn... global... struct... enum... }`.
+    // Flattens the namespace body into the Program's existing vectors,
+    // stamping each member's `ns` field with the namespace name. Sema
+    // resolves `Name::member` against the qualified names.
+    void parse_namespace() {
+        expect(Tk::Kw_namespace, "'namespace'");
+        auto name = expect(Tk::Ident, "namespace name").text;
+        expect(Tk::LBrace, "'{' after namespace name");
+        prog.namespaces.push_back({name, {peek().line, peek().col}});
+        std::string prefix = name;
+        while (!at(Tk::RBrace) && !at(Tk::Eof)) {
+            // collect annotations (namespaces can contain @on_tick fns etc.)
+            std::vector<Annotation> anns;
+            while (at(Tk::At)) anns.push_back(parse_annotation());
+            bool is_priv = accept(Tk::Kw_priv);
+            bool is_constexpr = accept(Tk::Kw_constexpr);
+            if (at(Tk::Kw_fn)) {
+                auto fn = parse_func(std::move(anns));
+                fn->is_exported = !is_priv;
+                fn->is_constexpr = is_constexpr;
+                fn->ns = prefix;
+                prog.funcs.push_back(std::move(*fn));
+            } else if (at(Tk::Kw_struct)) {
+                if (!anns.empty()) throw ParseError("annotations on structs not supported v1", peek().line, peek().col);
+                auto sd = parse_struct();
+                sd->name = prefix + "::" + sd->name;  // qualify the struct name
+                prog.structs.push_back(std::move(*sd));
+            } else if (at(Tk::Kw_global) || at(Tk::Kw_const)) {
+                if (!anns.empty()) throw ParseError("annotations on globals not supported v1", peek().line, peek().col);
+                bool is_const = accept(Tk::Kw_const);
+                if (!is_const) accept(Tk::Kw_global);
+                auto g = std::make_unique<GlobalDecl>();
+                g->name = expect(Tk::Ident, "global name").text;
+                g->ns = prefix;
+                expect(Tk::Colon, "':' after global name");
+                g->ty = parse_type();
+                expect(Tk::Assign, "'=' after global type");
+                g->init = parse_expr();
+                g->is_const = is_const;
+                g->loc = {peek().line, peek().col};
+                expect(Tk::Semicolon, "';' after global");
+                prog.globals.push_back(std::move(*g));
+            } else if (at(Tk::Kw_enum)) {
+                if (!anns.empty()) throw ParseError("annotations on enums not supported v1", peek().line, peek().col);
+                auto ed = parse_enum();
+                ed->name = prefix + "::" + ed->name;  // qualify the enum name
+                prog.enums.push_back(std::move(*ed));
+            } else if (at(Tk::Kw_static_assert)) {
+                if (!anns.empty()) throw ParseError("annotations on static_assert not supported v1", peek().line, peek().col);
+                prog.static_asserts.push_back(parse_static_assert());
+            } else if (at(Tk::Semicolon)) {
+                adv();
+            } else {
+                throw ParseError("expected fn/struct/global/enum inside namespace", peek().line, peek().col);
+            }
+        }
+        expect(Tk::RBrace, "'}' after namespace body");
+    }
+
     // a real type backed by the named integer type. sema validates the
     // backing type is an integer. null backing_type = untyped (backward compat).
     std::unique_ptr<EnumDecl> parse_enum() {
@@ -1044,6 +1103,9 @@ struct P {
                 } else if (at(Tk::Kw_static_assert)) {
                     if (!anns.empty()) throw ParseError("annotations on static_assert not supported v1", peek().line, peek().col);
                     prog.static_asserts.push_back(parse_static_assert());
+                } else if (at(Tk::Kw_namespace)) {
+                    if (!anns.empty()) throw ParseError("annotations on namespace not supported", peek().line, peek().col);
+                    parse_namespace();
                 } else if (at(Tk::Semicolon)) {
                     adv(); // empty top-level stmt
                 } else {

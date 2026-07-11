@@ -268,6 +268,16 @@ struct MatchStmt : Stmt { ExprPtr subject; std::vector<MatchArm> arms; };
 // NO runtime code in either position.
 struct StaticAssertStmt : Stmt { ExprPtr cond; std::string msg; };
 
+// Tier 1 namespace: `namespace Name { fn... global... struct... enum... }`.
+// A namespace is a naming prefix — its members are qualified as `Name::member`.
+// The parser flattens a namespace decl into the Program's existing vectors,
+// stamping each member's `ns` field with the namespace name. Sema resolves
+// `Name::member` calls/accesses against the qualified slot/global table.
+struct NamespaceDecl {
+    std::string name;
+    Loc loc;
+};
+
 // declarations
 // A literal default value for a parameter (v1: literals only - arbitrary
 // expression defaults would need either a generic AST-clone mechanism
@@ -296,6 +306,7 @@ struct FuncDecl {
     Block body;
     Loc loc;
     int slot = -1;                 // sema-assigned dispatch slot
+    std::string ns;               // namespace prefix ("" = top-level; "Foo" = inside namespace Foo)
     // F1 visibility (docs/spec/SPEC_AUDIT_2026-07-10.md F1): is this fn part of
     // the module's EXPORTED surface (published to the .em name table / the JIT
     // export table, callable cross-module via `mod::fn()`), or a module-private
@@ -331,6 +342,7 @@ struct GlobalDecl {
     ExprPtr init;
     Loc loc;
     bool is_const = false;
+    std::string ns;               // namespace prefix ("" = top-level)
 };
 
 // v0.5 live-module link declaration (docs/MODULES.md §6). `link "foo.em" as foo;`
@@ -380,6 +392,7 @@ struct Program {
     std::vector<LinkDecl> links;   // v0.5 live-module link declarations (docs/MODULES.md §6)
     std::vector<EnumDecl> enums;   // Tier 1 script-side enums (docs/planning/plan_ENUMS.md)
     std::vector<StaticAssertStmt> static_asserts;  // Tier 1 top-level static_assert (in-body ones live inside their fn's Block)
+    std::vector<NamespaceDecl> namespaces;         // Tier 1 namespace decls (members are flattened into funcs/globals/structs/enums with ns prefix)
     // type store: owns synthesized Types created by sema (slices, adapted
     // literal types) so the raw `ty` pointers stashed on AST nodes survive
     // until codegen finishes (sema's local Checker would otherwise free them).

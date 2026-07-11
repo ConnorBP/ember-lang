@@ -1,0 +1,14 @@
+// valid_namespaces — Tier 1 namespace scoping.
+// expect: 52 (Math::double_it(5) = 10 + Math::val = 42)
+namespace Math {
+    global val: i64 = 42;
+    fn double_it(x: i64) -> i64 {
+        return x * 2;
+    }
+}
+
+fn main() -> i64 {
+    let a: i64 = Math::double_it(5);
+    let b: i64 = Math::val;
+    return a + b;
+}

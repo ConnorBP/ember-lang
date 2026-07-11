@@ -369,7 +369,18 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
     // ---- slot assignment (mirror em_roundtrip_test + prism_script_host) ----
     std::unordered_map<std::string, int> slots;
     int si = 0;
-    for (auto& fn : pr.program.funcs) { slots[fn.name] = si++; fn.slot = slots[fn.name]; }
+    for (auto& fn : pr.program.funcs) {
+        if (fn.ns.empty()) {
+            slots[fn.name] = si++;
+        } else {
+            // Tier 1 namespaces: namespaced fns are only accessible via the
+            // qualified name (Ns::fn), not the bare name. This avoids slot
+            // collisions between a top-level fn and a namespaced fn with the
+            // same short name.
+            slots[fn.ns + "::" + fn.name] = si++;
+        }
+        fn.slot = si - 1;
+    }
 
     // ---- register ALL eight extensions: natives + overloads ----
     std::unordered_map<std::string, NativeSig> natives;
@@ -440,6 +451,14 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
             gb.types[g.name] = g.ty.get();
             gb.offsets[g.name] = tgl.offsets[g.name];
             gb.sizes[g.name] = tgl.sizes[g.name];
+            // Tier 1 namespaces: also register the qualified name.
+            if (!g.ns.empty()) {
+                std::string qn = g.ns + "::" + g.name;
+                gb.index[qn] = gb.index[g.name];
+                gb.types[qn] = gb.types[g.name];
+                gb.offsets[qn] = gb.offsets[g.name];
+                gb.sizes[qn] = gb.sizes[g.name];
+            }
         }
     }
     std::vector<uint8_t> gb_store(size_t(tgl.total_size), 0);
@@ -909,7 +928,14 @@ static std::unique_ptr<CompiledScript> compile_script(
 
     std::unordered_map<std::string, int> slots;
     int si = 0;
-    for (auto& fn : cs->prog.funcs) { slots[fn.name] = si++; fn.slot = slots[fn.name]; }
+    for (auto& fn : cs->prog.funcs) {
+        if (fn.ns.empty()) {
+            slots[fn.name] = si++;
+        } else {
+            slots[fn.ns + "::" + fn.name] = si++;
+        }
+        fn.slot = si - 1;
+    }
     cs->slots = slots;
 
     cs->struct_layouts = build_struct_layouts(cs->prog);
@@ -950,6 +976,13 @@ static std::unique_ptr<CompiledScript> compile_script(
             cs->gb.types[g.name] = g.ty.get();
             cs->gb.offsets[g.name] = tgl.offsets[g.name];
             cs->gb.sizes[g.name] = tgl.sizes[g.name];
+            if (!g.ns.empty()) {
+                std::string qn = g.ns + "::" + g.name;
+                cs->gb.index[qn] = cs->gb.index[g.name];
+                cs->gb.types[qn] = cs->gb.types[g.name];
+                cs->gb.offsets[qn] = cs->gb.offsets[g.name];
+                cs->gb.sizes[qn] = cs->gb.sizes[g.name];
+            }
         }
     }
     g_globals_for_codegen = nullptr;

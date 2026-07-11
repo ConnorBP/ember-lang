@@ -123,7 +123,10 @@ for spec in "runtime_audit_semantics.ember:77" "runtime_cast_regressions.ember:4
             "valid_typed_enum.ember:0" "valid_typed_enum_match.ember:20" \
             "valid_enum_from_constexpr.ember:42" \
             "valid_type_stress.ember:123" \
-            "valid_fn_types.ember:250"; do
+            "valid_fn_types.ember:250" \
+            "valid_namespaces.ember:52" \
+            "valid_namespaces_intra_call.ember:30" \
+            "valid_namespaces_two_ns.ember:7"; do
     f=${spec%%:*}; exp=${spec##*:}; out=$("$CLI" run "tests/lang/$f" 2>&1); rc=$?
     if [ $rc -eq "$exp" ]; then printf "PASS  %s (explicit expected rc=%d)\n" "$f" "$rc"; pass=$((pass+1))
     else printf "FAIL  %s (rc=%d, expected %d)\n%s\n" "$f" "$rc" "$exp" "$out"; fail=$((fail+1)); fi

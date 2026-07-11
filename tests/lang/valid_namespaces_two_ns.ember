@@ -1,0 +1,12 @@
+// valid_namespaces_two_ns — two namespaces with same fn name (no collision).
+// expect: 7 (A::foo() = 3, B::foo() = 4, 3 + 4 = 7)
+namespace A {
+    fn foo() -> i64 { return 3; }
+}
+namespace B {
+    fn foo() -> i64 { return 4; }
+}
+
+fn main() -> i64 {
+    return A::foo() + B::foo();
+}
