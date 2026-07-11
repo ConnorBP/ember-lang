@@ -261,6 +261,58 @@ int main() {
         std::unordered_map<std::string, NativeSig> empty_natives;
         try_load_blob(nat_blob, empty_natives, "unknown native name -> rejected, no exec page (v5 security gate)");
     }
+    // (e) Item 2 fix: natives == nullptr + CallNative in IR. The dead-code
+    //     guard (checking pf.ir_blob which was cleared) is now fixed to scan
+    //     thf.blocks. Load with nullptr natives — must reject, no exec page.
+    {
+        // Reuse the nat_blob from case (d) — it has a CallNative to my_op.
+        // Build it again (case (d)'s locals are out of scope).
+        std::unordered_map<std::string, NativeSig> nat_with_op2;
+        NativeSig op_sig2;
+        op_sig2.fn_ptr = reinterpret_cast<void*>(0xDEAD);
+        op_sig2.ret = Type{Prim::I64};
+        op_sig2.params.push_back(Type{Prim::I64});
+        nat_with_op2["my_op"] = op_sig2;
+        const std::string nat_src2 = "fn f(x: i64) -> i64 { return my_op(x); }\n";
+        auto nlr2 = tokenize(nat_src2, "<nat_test2>");
+        auto npr2 = parse(std::move(nlr2.toks));
+        std::unordered_map<std::string, int> nslots2;
+        for (auto& fn : npr2.program.funcs) { fn.slot = 0; nslots2[fn.name] = 0; }
+        auto nlayouts2 = build_struct_layouts(npr2.program);
+        auto nsr2 = sema(npr2.program, nat_with_op2, nslots2, 0, nullptr, &nlayouts2);
+        if (!nsr2.ok) { std::printf("FAIL: nat2 sema\n"); failures++; goto done; }
+        CodeGenCtx nctx2;
+        nctx2.natives = &nat_with_op2; nctx2.script_slots = &nslots2;
+        nctx2.structs = &nlayouts2; nctx2.enable_ir_backend = true;
+        ThinFunction nthf2 = lower_function(npr2.program.funcs[0], nctx2);
+        if (nthf2.blocks.empty()) { std::printf("FAIL: nat2 lower\n"); failures++; goto done; }
+        std::vector<uint8_t> nat_blob2;
+        std::string nse2;
+        if (!serialize_thin_function(nthf2, nat_blob2, &nse2)) { std::printf("FAIL: nat2 serialize\n"); failures++; goto done; }
+        // Write a v5 .em with this blob, then load with natives == nullptr.
+        EmModule bad_mod2;
+        EmFunctionRecord rec2;
+        rec2.name = "f"; rec2.slot_index = 0; rec2.ir_blob = nat_blob2;
+        rec2.signature.ret = Type{Prim::I64}; rec2.signature.params.push_back(Type{Prim::I64});
+        bad_mod2.functions.push_back(std::move(rec2));
+        bad_mod2.globals = {}; bad_mod2.entry_slot = 0;
+        bad_mod2.name_table.emplace_back("f", 0u);
+        auto path2 = std::filesystem::temp_directory_path() / "em_v5_nullptr_nat.em";
+        std::string we2;
+        if (!write_em_file_v5(bad_mod2, path2.string().c_str(), &we2)) {
+            std::printf("  [SKIP] natives==nullptr: writer rejected\n");
+            std::filesystem::remove(path2);
+        } else {
+            LoadedModule bad_lm2;
+            std::string le2;
+            // Pass nullptr for native_bindings — the Item 2 fix must reject.
+            bool ok2 = load_em_file(path2.string().c_str(), bad_lm2, &le2, nullptr, nullptr);
+            std::filesystem::remove(path2);
+            bool pass2 = !ok2 && bad_lm2.pages.empty();
+            check(pass2, "natives==nullptr + CallNative -> rejected, no exec page (Item 2 fix)");
+            if (!pass2) std::printf("       (ok=%d pages=%zu err=%s)\n", ok2, bad_lm2.pages.size(), le2.c_str());
+        }
+    }
 
 done:
     std::printf("\n%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);

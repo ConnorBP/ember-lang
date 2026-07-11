@@ -124,9 +124,15 @@
 // deserializes + validates the IR (structural well-formedness + a type-check
 // against the host native table) and re-lowers it to x86 via emit_x64
 // (src/thin_emit.hpp) BEFORE alloc_executable_rw — so a tampered or malformed
-// v5 .em is REJECTED at IR validation with NO executable page allocated (the
-// raw-x86 fallback path is the v4 path, which still verifies its v4 signature
-// first when a keyring is present). v5 is OFF-BY-DEFAULT and INERT until the
+// v5 .em is REJECTED at IR validation with NO executable page allocated. The
+// raw-x86 fallback (is_ir=0) is the v4 per-fn body, but v5 is UNSIGNED for
+// Stage B: a v5 module is NOT routed through the v4 Ed25519 verification
+// path (the loader checks version==4 for the signed path; v5 falls into the
+// unsigned branch). In signed-only mode the entire v5 module is rejected; in
+// dev mode the raw-x86 fallback is accepted without signature verification
+// (same as v3). A v5-signed variant (v5 + the additive Ed25519 block) is
+// FUTURE work that would give the raw-x86 fallback v4-level content
+// authentication. v5 is OFF-BY-DEFAULT and INERT until the
 // Stage-B writer/loader land: EM_VERSION stays 4 (the default writer version),
 // and no v5 code path exists in em_writer.cpp / em_loader.cpp yet. The
 // constants + the ir_blob field + this layout spec are the contract those

@@ -451,6 +451,57 @@ static bool validation_edge_cases() {
         if (validate_thin_function(bad, &verr)) return false;
         if (verr.find("VReg out of range") == std::string::npos) return false;
     }
+    // Item 11: negative len for ConstStringRef.
+    {
+        auto bad = base;
+        bad.rodata.resize(16);
+        ThinInstr sr;
+        sr.op = ThinOp::ConstStringRef;
+        sr.meta.addend = 0;
+        sr.meta.len = -1;  // negative — must be rejected
+        bad.blocks[0].instrs.push_back(sr);
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("negative len") == std::string::npos) return false;
+    }
+    // Item 12h: negative len for BoundsCheck.
+    {
+        auto bad = base;
+        ThinInstr bc;
+        bc.op = ThinOp::BoundsCheck;
+        bc.meta.len = -1;  // negative — disables the bounds check
+        bad.blocks[0].instrs.push_back(bc);
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("negative len") == std::string::npos) return false;
+    }
+    // Item 12a: frame_off out of frame bounds (positive — above rbp).
+    {
+        auto bad = base;
+        ThinInstr lf;
+        lf.op = ThinOp::LoadFrame;
+        lf.dst = 4;
+        lf.meta.frame_off = 100;  // positive — above rbp (return address area)
+        lf.meta.width = 8;
+        bad.blocks[0].instrs.push_back(lf);
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("frame_off") == std::string::npos) return false;
+    }
+    // Item 12a: frame_off out of frame bounds (too negative — below frame).
+    {
+        auto bad = base;
+        bad.frame.frame_size = 16;
+        ThinInstr sf;
+        sf.op = ThinOp::StoreFrame;
+        sf.src1 = 1;
+        sf.meta.frame_off = -100000;  // way below the 16-byte frame
+        sf.meta.width = 8;
+        bad.blocks[0].instrs.push_back(sf);
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("frame_off") == std::string::npos) return false;
+    }
     // Positive: the base function validates clean (sanity check).
     {
         std::string verr;
@@ -493,7 +544,7 @@ int main() {
 
     // Part 4: validation edge cases (the audit-found checks).
     std::printf("Part 4: validation edge cases (C1/C2/P2/P3/P4/P7)\n");
-    check(validation_edge_cases(), "all validation edge cases rejected (bad block.id, empty native_name, rodata OOB, slot OOB, mod_id OOB, bad cmp, bad frame_size, bad rbx_save_offset, VReg exceeds declared bound)");
+    check(validation_edge_cases(), "all validation edge cases rejected (bad block.id, empty native_name, rodata OOB, slot OOB, mod_id OOB, bad cmp, bad frame_size, bad rbx_save_offset, VReg exceeds declared bound, negative len rodata, negative len BoundsCheck, frame_off OOB)");
 
     std::printf("\n%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

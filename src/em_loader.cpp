@@ -708,14 +708,16 @@ bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
                         }
                     }
                 }
-            } else if (!pf.ir_blob.empty()) {
-                // An IR function with CallNative instrs but no host native
-                // table — check whether any CallNative exists.
+            } else {
+                // No host native table provided. An IR function with any
+                // CallNative instr is REJECTED — the native_fn would stay
+                // null and the generated x64 would call through null. This
+                // scan uses thf.blocks (NOT pf.ir_blob, which was cleared
+                // above for efficiency) so the guard is NOT dead code.
                 bool has_native_call = false;
                 for (const auto& blk : thf.blocks)
                     for (const auto& in : blk.instrs)
-                        if (in.op == ThinOp::CallNative && !in.meta.native_name.empty())
-                            { has_native_call = true; break; }
+                        if (in.op == ThinOp::CallNative) { has_native_call = true; break; }
                 if (has_native_call) {
                     set_error(err, "em_loader: v5 IR: function \"" + pf.name +
                                    "\" calls a native but host provided no native table");
@@ -764,8 +766,8 @@ bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
                 b.signature.params = nf.params;
                 pf.native_bindings.push_back(std::move(b));
             }
-            pf.ir_blob.clear();  // already cleared after deserialize (efficiency)
-            pf.ir_blob.shrink_to_fit();
+            // pf.ir_blob was already cleared after deserialize (efficiency);
+            // no second clear needed.
         }
     }
 

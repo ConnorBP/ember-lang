@@ -613,11 +613,41 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err,
                 if (err) *err = "thin_ir_ser: validate: CallNative with empty native_name";
                 return false;
             }
+            // Item 11 fix: len must be >= 0 for ConstStringRef/StringDecrypt
+            // (a negative len sign-extends to a huge uint64 in the bounds
+            // check below, which can wrap and bypass it).
+            if ((in.op == ThinOp::ConstStringRef || in.op == ThinOp::StringDecrypt) &&
+                in.meta.len < 0) {
+                if (err) *err = "thin_ir_ser: validate: negative len for rodata instr";
+                return false;
+            }
             // P2 fix: ConstStringRef AND StringDecrypt rodata bounds.
             if (in.op == ThinOp::ConstStringRef || in.op == ThinOp::StringDecrypt) {
                 uint64_t end_off = uint64_t(in.meta.addend) + uint64_t(in.meta.len);
                 if (end_off > thf.rodata.size()) {
                     if (err) *err = "thin_ir_ser: validate: rodata reference out of bounds";
+                    return false;
+                }
+            }
+            // Item 12h fix: BoundsCheck len must be >= 0 (a negative len
+            // disables the bounds check — the emitted `cmp rcx, len; jae
+            // trap` with a negative len (huge unsigned) never traps).
+            if (in.op == ThinOp::BoundsCheck && in.meta.len < 0) {
+                if (err) *err = "thin_ir_ser: validate: negative len for BoundsCheck";
+                return false;
+            }
+            // Item 12a fix: frame_off must be within the function's frame for
+            // instrs that use it as an rbp-relative displacement. An
+            // attacker-controlled frame_off can read/write outside the stack
+            // frame (stack smash/leak). frame_off must be negative (stack
+            // grows down) and >= -frame_size.
+            if ((in.op == ThinOp::LoadFrame || in.op == ThinOp::StoreFrame ||
+                 in.op == ThinOp::CopyBytes || in.op == ThinOp::FieldAddr ||
+                 in.op == ThinOp::IndexAddr || in.op == ThinOp::StructLitInit ||
+                 in.op == ThinOp::ArrayLitInit) &&
+                thf.frame.frame_size > 0) {
+                if (in.meta.frame_off >= 0 || in.meta.frame_off < -thf.frame.frame_size) {
+                    if (err) *err = "thin_ir_ser: validate: frame_off out of frame bounds";
                     return false;
                 }
             }
