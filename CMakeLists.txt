@@ -581,6 +581,20 @@ if(WIN32)
 endif()
 add_test(NAME thin_ir_ser COMMAND thin_ir_ser_test)
 
+# em_v5_ir_test - Stage B c3 (IL-.em): the v5 IR .em end-to-end integration
+# test. Compiles a function via the IR path (lower_function), serializes to a
+# v5 .em (write_em_file_v5), loads it (load_em_file deserializes + validates +
+# re-emits + exec page), and asserts value-equivalence. Then malformed-blob
+# rejection: bad magic, truncated, empty, unknown native name -> load returns
+# false with NO exec page. Links ember + ember_frontend (the loader's v5 IR
+# re-emit path is in ember_frontend).
+add_executable(em_v5_ir_test examples/em_v5_ir_test.cpp)
+target_link_libraries(em_v5_ir_test PRIVATE ember ember_frontend)
+if(WIN32)
+    target_link_libraries(em_v5_ir_test PRIVATE kernel32)
+endif()
+add_test(NAME em_v5_ir COMMAND em_v5_ir_test)
+
 # aggregate_global_test - pins aggregate globals (chunk c3): struct globals
 # `global cfg : Config = Config{...};`, fixed-array globals `global arr : i64[3]
 # = [10,20,30];`, slice globals `global s : i64[] = [1,2,3];`. Compiles tiny
@@ -602,5 +616,5 @@ add_test(NAME aggregate_global COMMAND aggregate_global_test)
 set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
     v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
     array_lit aggregate_global em_signed codegen_opt thin_ir_struct thin_ir
-    thin_ir_ser
+    thin_ir_ser em_v5_ir
     PROPERTIES TIMEOUT 30)
