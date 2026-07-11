@@ -20,6 +20,7 @@ static const std::unordered_map<std::string, Tk>& keywords() {
         {"sizeof",Tk::Kw_sizeof},{"offsetof",Tk::Kw_offsetof},
         {"link",Tk::Kw_link},
         {"enum",Tk::Kw_enum},
+        {"match",Tk::Kw_match},
         {"bool",Tk::Kw_bool},
         {"i8",Tk::Kw_i8},{"i16",Tk::Kw_i16},{"i32",Tk::Kw_i32},{"i64",Tk::Kw_i64},
         {"u8",Tk::Kw_u8},{"u16",Tk::Kw_u16},{"u32",Tk::Kw_u32},{"u64",Tk::Kw_u64},
@@ -39,7 +40,7 @@ const char* tok_spelling(Tk k) {
     case Tk::LBrace: return "{"; case Tk::RBrace: return "}";
     case Tk::LBracket: return "["; case Tk::RBracket: return "]";
     case Tk::Comma: return ","; case Tk::Semicolon: return ";";
-    case Tk::Colon: return ":"; case Tk::DoubleColon: return "::"; case Tk::Arrow: return "->";
+    case Tk::Colon: return ":"; case Tk::DoubleColon: return "::"; case Tk::Arrow: return "->"; case Tk::FatArrow: return "=>";
     case Tk::Dot: return "."; case Tk::DotDot: return "..";
     case Tk::Plus: return "+"; case Tk::Minus: return "-";
     case Tk::Star: return "*"; case Tk::Slash: return "/";
@@ -59,6 +60,7 @@ const char* tok_spelling(Tk k) {
     case Tk::AmpAssign: return "&="; case Tk::PipeAssign: return "|=";
     case Tk::CaretAssign: return "^="; case Tk::ShlAssign: return "<<="; case Tk::ShrAssign: return ">>=";
     case Tk::Kw_enum: return "enum";
+    case Tk::Kw_match: return "match";
     case Tk::Kw_priv: return "priv";
     default: return "kw";
     }
@@ -344,7 +346,7 @@ LexResult tokenize(std::string_view src, const char*) {
         case '*': if (two('*','=',Tk::StarAssign)) continue; push(Tk::Star,"*"); adv(1); continue;
         case '/': if (two('/','=',Tk::SlashAssign)) continue; push(Tk::Slash,"/"); adv(1); continue;
         case '%': if (two('%','=',Tk::PercentAssign)) continue; push(Tk::Percent,"%"); adv(1); continue;
-        case '=': if (two('=','=',Tk::Eq)) continue; push(Tk::Assign,"="); adv(1); continue;
+        case '=': if (two('=','=',Tk::Eq)) continue; if (two('=','>',Tk::FatArrow)) continue; push(Tk::Assign,"="); adv(1); continue;
         case '!': if (two('!','=',Tk::Neq)) continue; push(Tk::Not,"!"); adv(1); continue;
         case '<': if (three('<','<','=',Tk::ShlAssign)) continue;
                   if (two('<','<',Tk::Shl)) continue;

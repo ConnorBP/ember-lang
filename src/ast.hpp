@@ -228,6 +228,12 @@ struct BlockStmt: Stmt { Block block; };
 struct SwitchCase { ExprPtr value; bool is_default = false; Block body; };
 struct SwitchStmt: Stmt { ExprPtr subject; std::vector<SwitchCase> cases; };
 
+// Tier 1: match — pattern matching. Like switch but without break (each arm
+// is a separate branch) and with => syntax. Patterns: integer literals,
+// bool literals, `_` (wildcard/default). No struct destructure in v1.
+struct MatchArm { ExprPtr pattern; bool is_wildcard = false; Block body; };
+struct MatchStmt : Stmt { ExprPtr subject; std::vector<MatchArm> arms; };
+
 // declarations
 // A literal default value for a parameter (v1: literals only - arbitrary
 // expression defaults would need either a generic AST-clone mechanism

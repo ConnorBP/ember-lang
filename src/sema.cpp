@@ -1830,6 +1830,33 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
         returns = false;
         return;
     }
+    if (auto* ms = dynamic_cast<MatchStmt*>(&s)) {
+        const Type* subj_ty = check_expr(*ms->subject);
+        if (!subj_ty->is_int() && !subj_ty->is_bool())
+            err("match subject must be an integer or bool (got " + subj_ty->to_string() + ")",
+                ms->loc.line, ms->loc.col);
+        bool seen_wildcard = false;
+        for (auto& arm : ms->arms) {
+            if (arm.is_wildcard) {
+                if (seen_wildcard) err("match has more than one '_' wildcard arm", ms->loc.line, ms->loc.col);
+                seen_wildcard = true;
+            } else {
+                if (!dynamic_cast<IntLit*>(arm.pattern.get()) && !dynamic_cast<BoolLit*>(arm.pattern.get()))
+                    err("match pattern must be a literal constant",
+                        arm.pattern->loc.line, arm.pattern->loc.col);
+                const Type* pt = check_expr(*arm.pattern, subj_ty);
+                if (!pt->same(*subj_ty) && !(pt->is_int() && subj_ty->is_int()))
+                    err("match pattern type mismatch (match on " + subj_ty->to_string() + ", pattern is " + pt->to_string() + ")",
+                        arm.pattern->loc.line, arm.pattern->loc.col);
+            }
+            push_scope();
+            bool r = false;
+            check_block(arm.body, ret_ty, r);
+            pop_scope();
+        }
+        returns = false;
+        return;
+    }
 }
 
 void Checker::check_block(Block& b, const Type* ret_ty, bool& returns) {
@@ -1921,6 +1948,14 @@ void Checker::lower_enum_access_stmt(Stmt& s) {
         for (auto& c : sw->cases) {
             if (!c.is_default) lower_enum_access_expr(c.value);
             lower_enum_access_block(c.body);
+        }
+        return;
+    }
+    if (auto* ms = dynamic_cast<MatchStmt*>(&s)) {
+        lower_enum_access_expr(ms->subject);
+        for (auto& arm : ms->arms) {
+            if (!arm.is_wildcard) lower_enum_access_expr(arm.pattern);
+            lower_enum_access_block(arm.body);
         }
         return;
     }

@@ -947,6 +947,7 @@ struct ThinLowerer {
         std::function<bool(const Block&)> has_for_each = [&](const Block& b) -> bool {
             for (const auto& st : b.stmts) {
                 if (dynamic_cast<const ForEachStmt*>(st.get())) return true;
+                if (dynamic_cast<const MatchStmt*>(st.get())) return true;
                 if (auto* is = dynamic_cast<const IfStmt*>(st.get())) {
                     if (has_for_each(is->then_b)) return true;
                     if (is->has_else && has_for_each(is->else_b)) return true;
@@ -954,13 +955,14 @@ struct ThinLowerer {
                 if (auto* ws = dynamic_cast<const WhileStmt*>(st.get())) { if (has_for_each(ws->body)) return true; }
                 if (auto* fs = dynamic_cast<const ForStmt*>(st.get())) { if (has_for_each(fs->body)) return true; }
                 if (auto* ds = dynamic_cast<const DoWhileStmt*>(st.get())) { if (has_for_each(ds->body)) return true; }
+                if (auto* sw = dynamic_cast<const SwitchStmt*>(st.get())) { for (auto& c : sw->cases) if (has_for_each(c.body)) return true; }
             }
             return false;
         };
         if (has_for_each(f.body)) {
             out.non_serializable = true;
             out.non_serializable_reason =
-                "for-each loop is not yet lowered to ThinFunction IR; "
+                "for-each or match is not yet lowered to ThinFunction IR; "
                 "falling back to tree-walker";
             out.blocks.clear();
             return out;

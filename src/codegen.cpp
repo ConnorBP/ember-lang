@@ -594,6 +594,11 @@ struct CG {
             for (auto& c : sw->cases) prescan_block(c.body);
             return;
         }
+        if (auto* ms = dynamic_cast<const MatchStmt*>(&s)) {
+            prescan_expr(*ms->subject);
+            for (auto& arm : ms->arms) prescan_block(arm.body);
+            return;
+        }
     }
     void prescan_expr(const Expr& ex) {
         if (auto* c = dynamic_cast<const CallExpr*>(&ex)) {
@@ -3308,6 +3313,34 @@ void CG::exec_stmt(const Stmt& s) {
         e.bind(end_label);
         return;
     }
+    if (auto* ms = dynamic_cast<const MatchStmt*>(&s)) {
+        // match (expr) { pattern => body, ... _ => default }
+        // Like switch but each arm is a separate branch (no fallthrough, no
+        // break needed). The subject is compared against each pattern in order;
+        // the first match jumps to its arm. The wildcard (_) is the default.
+        eval(*ms->subject);
+        e.mov_reg_reg(Reg::r10, Reg::rax);  // hold subject in volatile r10
+        std::vector<Label> arm_labels;
+        for (size_t i = 0; i < ms->arms.size(); ++i) arm_labels.push_back(e.alloc_label());
+        Label end_label = e.alloc_label();
+        int wildcard_idx = -1;
+        for (size_t i = 0; i < ms->arms.size(); ++i) {
+            if (ms->arms[i].is_wildcard) { wildcard_idx = int(i); continue; }
+            eval(*ms->arms[i].pattern);
+            e.cmp_reg_reg(Reg::r10, Reg::rax);
+            e.jcc(Cond::e, arm_labels[i]);
+        }
+        e.jmp(wildcard_idx >= 0 ? arm_labels[size_t(wildcard_idx)] : end_label);
+        for (size_t i = 0; i < ms->arms.size(); ++i) {
+            e.bind(arm_labels[i]);
+            loops.push_back({Label{0}, end_label, true, cleanup_scopes.size()});
+            exec_block(ms->arms[i].body);
+            loops.pop_back();
+            e.jmp(end_label);  // no fallthrough — each arm jumps to end
+        }
+        e.bind(end_label);
+        return;
+    }
     if (auto* bs = dynamic_cast<const BlockStmt*>(&s)) { exec_block(bs->block); return; }
     if (dynamic_cast<const BreakStmt*>(&s)) {
         if (!loops.empty()) {
@@ -3438,6 +3471,12 @@ int64_t CG::stmt_cost(const Stmt& s) {
         int64_t n = sw->subject ? expr_cost(*sw->subject) : 0;
         n = cost_add(n, int64_t(sw->cases.size()));  // compare chain
         for (auto& c : sw->cases) n = cost_add(n, block_cost(c.body));
+        return n;
+    }
+    if (auto* ms = dynamic_cast<const MatchStmt*>(&s)) {
+        int64_t n = ms->subject ? expr_cost(*ms->subject) : 0;
+        n = cost_add(n, int64_t(ms->arms.size()));  // compare chain
+        for (auto& arm : ms->arms) n = cost_add(n, block_cost(arm.body));
         return n;
     }
     if (auto* ls = dynamic_cast<const LetStmt*>(&s))
@@ -3583,6 +3622,7 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
             if (auto* bs = dynamic_cast<const BlockStmt*>(s.get())) collect_defers(bs->block);
             if (auto* fs = dynamic_cast<const ForStmt*>(s.get())) collect_defers(fs->body);
             if (auto* sw = dynamic_cast<const SwitchStmt*>(s.get())) for (auto& c : sw->cases) collect_defers(c.body);
+            if (auto* ms = dynamic_cast<const MatchStmt*>(s.get())) for (auto& arm : ms->arms) collect_defers(arm.body);
         }
     };
     collect_defers(f.body);

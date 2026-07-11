@@ -825,6 +825,35 @@ struct P {
             expect(Tk::RBrace, "'}'");
             return s;
         }
+        case Tk::Kw_match: {
+            // match (expr) { pattern => body, ... _ => default }
+            adv();
+            auto s = std::make_unique<MatchStmt>();
+            s->loc = loc(t);
+            expect(Tk::LParen, "'('");
+            s->subject = parse_expr();
+            expect(Tk::RParen, "')'");
+            expect(Tk::LBrace, "'{'");
+            while (!at(Tk::RBrace) && !at(Tk::Eof)) {
+                MatchArm arm;
+                if (at(Tk::Ident) && peek().text == "_") {
+                    arm.is_wildcard = true;
+                    adv();
+                } else {
+                    arm.pattern = parse_expr();
+                }
+                expect(Tk::FatArrow, "'=>'");
+                if (at(Tk::LBrace)) {
+                    arm.body = parse_block();
+                } else {
+                    arm.body.stmts.push_back(parse_stmt());
+                }
+                s->arms.push_back(std::move(arm));
+                accept(Tk::Comma);
+            }
+            expect(Tk::RBrace, "'}'");
+            return s;
+        }
         case Tk::Kw_return: { adv(); auto s=std::make_unique<ReturnStmt>(); s->loc=loc(t); if (!at(Tk::Semicolon)) s->value=parse_expr(); expect(Tk::Semicolon,"';'"); return s; }
         case Tk::Kw_break: { adv(); expect(Tk::Semicolon,"';'"); auto s=std::make_unique<BreakStmt>(); s->loc=loc(t); return s; }
         case Tk::Kw_continue: { adv(); expect(Tk::Semicolon,"';'"); auto s=std::make_unique<ContinueStmt>(); s->loc=loc(t); return s; }
