@@ -88,6 +88,7 @@ add_library(ember_frontend STATIC
     src/parser.cpp
     src/sema.cpp
     src/codegen.cpp
+    src/thin_lower.cpp
     src/peephole.cpp
 )
 target_include_directories(ember_frontend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
