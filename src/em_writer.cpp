@@ -15,7 +15,12 @@
 //      code_size, rodata_size, code, rodata, reloc_count, relocs.
 //   3. Globals block (global_size bytes).
 //   4. Name directory: name_table_count, then { name_len, name, slot_index }
-//      per entry.
+//      per entry. From v3 (F1 visibility, docs/spec/SPEC_AUDIT_2026-07-10.md F1)
+//      the name directory IS the module's EXPORT TABLE: the caller populates
+//      `mod.name_table` with only the `is_exported` (`pub fn`/bare `fn`)
+//      entries, so a `priv fn` is serialized (its code/relocs are in section 2)
+//      but is absent from the directory and therefore not callable cross-
+//      module. v1/v2 directories listed every function.
 //
 // The writer always writes EM_VERSION / EM_MAGIC. No on-the-fly validation of
 // those constants (Section 2.7: validation is the loader's job).

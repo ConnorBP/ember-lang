@@ -846,8 +846,20 @@ struct P {
                 // gather annotations
                 std::vector<Annotation> anns;
                 while (at(Tk::At)) anns.push_back(parse_annotation());
+                // F1 visibility modifier: an optional `priv` before `fn` opts a
+                // function out of the module's exported surface (a bundled .em
+                // name table / the JIT export table). Bare `fn` stays EXPORTED by
+                // default (backward compat - existing cross-module tests/demos use
+                // bare `fn` and call across modules). `priv` is only meaningful on
+                // a function declaration; it is consumed here, not on let/global.
+                bool is_priv = accept(Tk::Kw_priv);
+                if (is_priv && !at(Tk::Kw_fn)) {
+                    throw ParseError("'priv' modifier is only valid on a function declaration ('priv fn')",
+                                     peek().line, peek().col);
+                }
                 if (at(Tk::Kw_fn)) {
                     prog.funcs.push_back(std::move(*parse_func(std::move(anns))));
+                    prog.funcs.back().is_exported = !is_priv;
                 } else if (at(Tk::Kw_struct)) {
                     if (!anns.empty()) throw ParseError("annotations on structs not supported v1", peek().line, peek().col);
                     prog.structs.push_back(std::move(*parse_struct()));

@@ -293,11 +293,24 @@ call_external := IDENT '::' IDENT '(' arg_list? ')'     // modname::fn
   code and makes the IR op choice (`CallScript` vs
   `CallScriptExternal`, Section 3) a trivial parse-time decision rather than
   a name-resolution guess.
-- **No `pub`/`export`.** Visibility remains deferred; every
-  function in a registered module is callable cross-module, matching
-  C `#include`'s "everything included is visible" stance
-  (`BUNDLING_AND_EM_MODULES.md` Section 1.3) and the existing flat module
-  scope (`spec/COMPILER_PIPELINE.md` Section 4).
+- **`pub`/`priv` visibility (F1, implemented 2026-07-10).** A bundled/linked
+  module's exported surface is now a SUBSET of its functions, not "every
+  function." A `pub fn` or a bare `fn` is EXPORTED (callable cross-module via
+  `mod::fn()`); a `priv fn` is a module-private helper — still callable within
+  its own module (intra-module visibility is unchanged) but NOT published to
+  the `.em` name directory / the JIT export table, so other modules cannot
+  resolve it. A cross-module `mod::priv_fn()` call is a sema ERROR ("targets a
+  function that is not exported by module 'mod'"), distinct from a not-yet-
+  registered module (which stays a deferred trap). Backward-compat decision: a
+  bare `fn` stays exported by default (preserves existing cross-module tests/
+  demos); `priv fn` opts out. The `.em` format is v3 (v1/v2 still load). ~~No
+  `pub`/`export`. Visibility remains deferred; every function in a registered
+  module is callable cross-module, matching C `#include`'s "everything
+  included is visible" stance (~~`BUNDLING_AND_EM_MODULES.md` Section 1.3~~
+  Section 4 + this section)~~. See `spec/SPEC_AUDIT_2026-07-10.md` F1 +
+  `pub_priv_test` (ctest). In-module name scoping (namespaces, `ROADMAP.md`
+  Tier 6) remains a separate language concern; the exported surface of a
+  bundled module is the bundling concern F1 corrects.
 
 ---
 

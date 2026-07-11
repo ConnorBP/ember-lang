@@ -26,14 +26,20 @@
 namespace ember {
 
 // Build the ModuleExportTable entry for a JIT-compiled module: one export per
-// function in `prog.funcs`, carrying its slot, the module_id (assigned on
-// registration), and its signature (ret + param types) for sema's cross-module
-// arg/return type-checking. Call AFTER slot assignment + sema (so FuncDecl::ret
-// and param types are resolved) and AFTER registration (so module_id is known).
+// EXPORTED function in `prog.funcs` (F1 visibility, docs/spec/SPEC_AUDIT_2026-07-10.md
+// F1), carrying its slot, the module_id (assigned on registration), and its
+// signature (ret + param types) for sema's cross-module arg/return type-
+// checking. A `priv fn` (is_exported==false) is intentionally OMITTED: it is
+// still callable from its own module (intra-module visibility is unchanged)
+// but is not published to other modules. Backward compat: a bare `fn` is
+// is_exported==true, so every existing JIT module's surface is unchanged.
+// Call AFTER slot assignment + sema (so FuncDecl::ret and param types are
+// resolved) and AFTER registration (so module_id is known).
 inline std::vector<ModuleExport> build_jit_exports(const Program& prog, uint32_t module_id) {
     std::vector<ModuleExport> out;
     out.reserve(prog.funcs.size());
     for (const auto& fn : prog.funcs) {
+        if (!fn.is_exported) continue;  // F1: `priv fn` is not part of the export surface
         ModuleExport exp;
         exp.fn_name = fn.name;
         exp.module_id = module_id;
@@ -48,6 +54,16 @@ inline std::vector<ModuleExport> build_jit_exports(const Program& prog, uint32_t
 // Build one export per name-directory entry. v2 looks up its canonical
 // signature by slot, so aliases remain typed and duplicate names cannot shadow
 // metadata. v1 stores no signatures and remains ABI-TRUSTED UNKNOWN.
+//
+// F1 visibility (docs/spec/SPEC_AUDIT_2026-07-10.md F1): from v3 onward the
+// `.em` name directory IS the module's EXPORT TABLE - the writer/host populates
+// `LoadedModule::name_table` from only the `is_exported` (`pub fn`) functions,
+// so a `priv fn` is absent from the directory and therefore absent from the
+// exports built here. v1/v2 name directories historically listed every
+// function (no visibility), and those files keep loading with every function
+// exported - backward compat. `build_em_exports` does not itself filter; it
+// trusts the name_table it is handed (the filtering happens at EmModule
+// construction, see ember_cli's --emit-em path / the test helpers).
 inline std::vector<ModuleExport> build_em_exports(const LoadedModule& mod, uint32_t module_id) {
     std::vector<ModuleExport> out;
     out.reserve(mod.name_table.size());

@@ -202,6 +202,22 @@ if(WIN32)
 endif()
 add_test(NAME v0_5_live_modules COMMAND v0_5_live_modules_test)
 
+# F1 pub/priv visibility (docs/spec/SPEC_AUDIT_2026-07-10.md F1): a bundled .em
+# module's exported surface is a SUBSET of its functions. `pub fn`/bare `fn`
+# are exported; `priv fn` is hidden from the .em name directory (the export
+# table) and a cross-module `mod::priv_fn()` call is a sema error. Non-circular:
+# cases A-D fail with the F1 fix reverted (see the test's header comment for
+# the per-case break). Pins the backward-compat decision (fn=public, priv=private).
+add_executable(pub_priv_test examples/pub_priv_test.cpp)
+target_link_libraries(pub_priv_test PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_vec ember_ext_quat ember_ext_mat
+    ember_ext_string ember_ext_array ember_ext_math)
+if(WIN32)
+    target_link_libraries(pub_priv_test PRIVATE kernel32)
+endif()
+add_test(NAME pub_priv COMMAND pub_priv_test)
+
 # ---- lang regression suite: ember_check (parse-only) + sema_check (parse+sema) +
 # the run_lang_tests.sh runner that classifies tests/lang/{valid,invalid,sema_valid,
 # sema_invalid,import_*}.ember against the two check exes. Ported from prism's

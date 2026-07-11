@@ -70,9 +70,17 @@ field_decl   := IDENT ':' type ';'
 
 global_decl  := 'global' IDENT ':' type '=' literal ';'
 
-func_decl    := 'fn' IDENT '(' param_list? ')' ('->' type)? block
+func_decl    := ('priv')? 'fn' IDENT '(' param_list? ')' ('->' type)? block
 param_list   := param (',' param)*
 param        := IDENT ':' type
+
+// F1 visibility (docs/spec/SPEC_AUDIT_2026-07-10.md F1): an optional leading
+// `priv` on a func_decl opts the function out of the module's EXPORTED surface
+// (the .em name directory / the JIT export table). A bare `fn` is EXPORTED by
+// default (backward compat); `priv fn` is module-private (still callable within
+// its own module, not published cross-module). `pub` is the implicit default and
+// has no keyword. This is a BUNDLING/linking concern (what the loader/linker
+// honors), distinct from in-module name scoping (namespaces, ROADMAP Tier 6).
 
 type         := prim_type | IDENT              // IDENT = struct name
                | type '[' INT_LIT ']'          // fixed array
@@ -160,7 +168,7 @@ a semantic property, not a parseable one).
 
 ```cpp
 struct Program { vector<StructDecl> structs; vector<GlobalDecl> globals; vector<FuncDecl> funcs; };
-struct FuncDecl { string name; vector<Param> params; TypeRef ret; vector<Annotation> annotations; Block body; SourceLoc loc; };
+struct FuncDecl { string name; vector<Param> params; TypeRef ret; vector<Annotation> annotations; Block body; SourceLoc loc; bool is_exported=true; };  // F1: is_exported=false for `priv fn`
 struct StructDecl { string name; vector<FieldDecl> fields; SourceLoc loc; };
 struct GlobalDecl { string name; TypeRef type; Expr init; SourceLoc loc; };
 

@@ -238,7 +238,7 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
         set_error(err, "em_loader: format: bad magic");
         return false;
     }
-    if (version != EM_VERSION_V1 && version != EM_VERSION) {
+    if (version != EM_VERSION_V1 && version != EM_VERSION_V2 && version != EM_VERSION) {
         set_error(err, "em_loader: format: unsupported version " + std::to_string(version)); return false;
     }
     mod.version = version;
@@ -340,7 +340,7 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
         }
         f.relocs.resize(reloc_count);
         for (EmReloc& r : f.relocs) {
-            if (!rd.u32(r.offset) || !rd.u8(r.kind) || (version == EM_VERSION && !rd.u32(r.addend))) {
+            if (!rd.u32(r.offset) || !rd.u8(r.kind) || (version != EM_VERSION_V1 && !rd.u32(r.addend))) {
                 set_error(err, "em_loader: format: truncated relocation");
                 return false;
             }
@@ -364,7 +364,10 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
                 return false;
             }
         }
-        if(version==EM_VERSION) {
+        // v2+ records carry a canonical export signature + symbolic native
+        // bindings (v3 keeps the v2 per-function layout byte-identical; only
+        // the name directory's contents differ - F1 visibility).
+        if(version >= EM_VERSION_V2) {
             if(!parse_signature(rd,f.signature,err))return false;
             uint32_t binding_count=0;if(!rd.u32(binding_count)){set_error(err,"em_loader: format: truncated native binding count");return false;}
             if(binding_count>MAX_RELOCS_PER_FN){set_error(err,"em_loader: limit: native binding count");return false;}
@@ -492,7 +495,7 @@ bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
     staged.names = std::move(parsed.names);
     staged.entry_slot = parsed.entry_slot;
     staged.version = parsed.version;
-    if(parsed.version==EM_VERSION) {
+    if(parsed.version >= EM_VERSION_V2) {
         staged.signatures_by_slot.resize(parsed.dispatch_size);
         for(const auto& f:parsed.functions)
             staged.signatures_by_slot[f.slot_index]=f.signature;

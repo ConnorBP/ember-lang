@@ -13,7 +13,7 @@ enum class Tk : uint16_t {
     IntLit, FloatLit, StringLit, FStringLit, RawStringLit, BoolLit,
     Ident,
     // keywords
-    Kw_fn, Kw_struct, Kw_global, Kw_let, Kw_mut, Kw_const, Kw_constexpr, Kw_defer,
+    Kw_fn, Kw_struct, Kw_global, Kw_let, Kw_mut, Kw_const, Kw_constexpr, Kw_defer, Kw_priv,
     Kw_if, Kw_else, Kw_while, Kw_do, Kw_for, Kw_switch, Kw_case, Kw_default,
     Kw_break, Kw_continue, Kw_return, Kw_as, Kw_auto,
     Kw_true, Kw_false,

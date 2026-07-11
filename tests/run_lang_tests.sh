@@ -106,7 +106,8 @@ for spec in "runtime_audit_semantics.ember:77" "runtime_cast_regressions.ember:4
             "runtime_global_string_init.ember:42" \
             "runtime_string_encryption.ember:42" \
             "runtime_string_encryption_long.ember:42" \
-            "sema_valid_basics.ember:6" "sema_valid_defer_local_ref.ember:94"; do
+            "sema_valid_basics.ember:6" "sema_valid_defer_local_ref.ember:94" \
+            "sema_valid_priv_fn_intra_module.ember:42"; do
     f=${spec%%:*}; exp=${spec##*:}; out=$("$CLI" run "tests/lang/$f" 2>&1); rc=$?
     if [ $rc -eq "$exp" ]; then printf "PASS  %s (explicit expected rc=%d)\n" "$f" "$rc"; pass=$((pass+1))
     else printf "FAIL  %s (rc=%d, expected %d)\n%s\n" "$f" "$rc" "$exp" "$out"; fail=$((fail+1)); fi

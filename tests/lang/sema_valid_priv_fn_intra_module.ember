@@ -1,0 +1,17 @@
+// F1 visibility (docs/spec/SPEC_AUDIT_2026-07-10.md F1): a `priv fn` is a
+// module-private helper - NOT published to the module's export table, so other
+// modules cannot call it cross-module - but it is still callable from WITHIN
+// its own module (intra-module visibility is unchanged). This positive case
+// sema-checks and runs: main calls the private helper locally and returns 42.
+//
+// Non-circular: with the F1 fix reverted (no `priv` keyword), `priv` lexes as
+// an identifier and the parser rejects "expected fn/struct/global at top
+// level" - both the sema_check (ok) and the CLI run (rc=42) assertions fail.
+priv fn helper(x: i64) -> i64 {
+    return x * 6;
+}
+
+fn main() -> i64 {
+    let v: i64 = helper(7);
+    return v;  // 7 * 6 = 42
+}

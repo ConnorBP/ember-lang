@@ -932,6 +932,23 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                             return e.ty;
                         }
                     }
+                    // F1 visibility (docs/spec/SPEC_AUDIT_2026-07-10.md F1): the
+                    // module IS registered (its alias is in the export table) but
+                    // no exported fn matches `c->name`. The callee is either a
+                    // module-private helper (`priv fn`) or does not exist; either
+                    // way it is NOT part of the module's public surface, so a cross-
+                    // module call to it is a compile error, not a deferred trap. The
+                    // deferred-trap path below is reserved for a module that has not
+                    // registered YET (may register later, §5 step 1/3).
+                    err("cross-module call '" + c->module_alias + "::" + c->name +
+                        "' targets a function that is not exported by module '" +
+                        c->module_alias + "' (it is private or undefined)",
+                        c->loc.line, c->loc.col);
+                    // Type the call so downstream expr use doesn't cascade; args are
+                    // still checked standalone to surface any other errors.
+                    for (auto& a : c->args) check_expr(*a);
+                    e.ty = intern(type_i64());
+                    return e.ty;
                 }
             }
             // unresolved: deferred trap. Default ret type to i64 so the call

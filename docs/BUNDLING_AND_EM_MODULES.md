@@ -119,9 +119,16 @@ across the whole merge."
 - No namespace / module-name concept. All included names land in one
   flat module scope (matches `spec/COMPILER_PIPELINE.md` Section 4's existing
   flat module scope; namespaces are `ROADMAP.md` Tier 6).
-- No visibility / `pub` / `export` - everything included is visible
-  (matches C `#include`; a private-include model is a language
-  extension with no v1 use case).
+- No visibility / `pub` / `export` on textual `import` - everything included
+  is visible (matches C `#include`; a private-include model is a language
+  extension with no v1 use case). **This is specifically about textual
+  `import` (which inlines to one flat module scope, like C `#include`). The
+  BUNDLED `.em`/`link` surface DOES now have pub/priv visibility — see Section 4
+  + `MODULES.md` §6 (F1, implemented 2026-07-10): `pub fn`/bare `fn` are
+  exported; `priv fn` is hidden from the `.em` name directory and a cross-module
+  `mod::priv_fn()` call is a sema error. In-module name scoping (namespaces,
+  `ROADMAP.md` Tier 6) remains a language concern; the exported surface of a
+  bundled module is a bundling/linking concern — the two are siblings.**
 - No include guards / `#pragma once` - the `seen` set is the guard.
 - No conditional includes - `include` is unconditional; conditional
   composition is `engine.define` + `const`/`constexpr` territory
@@ -514,8 +521,19 @@ baking a process pointer.
 - **No host-configured textual-import search path.** Imports resolve relative
   to the current file.
 - **No namespace/visibility on `include`.** All included names land in
-  one flat module scope (`spec/COMPILER_PIPELINE.md` Section 4). `pub`/`priv` is a
-  language extension, not a bundling concern.
+  one flat module scope (`spec/COMPILER_PIPELINE.md` Section 4). ~~`pub`/`priv` is a
+  language extension, not a bundling concern.~~ **CORRECTED (F1, implemented
+  2026-07-10):** textual `include` remains flat (no visibility, like C
+  `#include`) — that IS a language/scope concern. But the BUNDLED `.em`/`link`
+  module surface now HAS pub/priv visibility as a BUNDLING concern: a `pub fn` /
+  bare `fn` is published to the `.em` name directory (the export table) and is
+  callable cross-module; a `priv fn` is serialized (its code occupies a dispatch
+  slot for intra-module calls) but is absent from the name directory, so other
+  modules cannot resolve it and a `mod::priv_fn()` call is a sema error. The `.em`
+  format is v3 (v1/v2 still load — backward compat). In-module name scoping
+  (namespaces) stays a language concern; the exported surface of a bundled
+  module is a bundling concern. See `spec/SPEC_AUDIT_2026-07-10.md` F1 +
+  `MODULES.md` §6 + `pub_priv_test` (ctest).
 
 ---
 

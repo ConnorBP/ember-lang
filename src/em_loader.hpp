@@ -30,7 +30,12 @@
 // signatures. v2 is cross-process bindable: it checks deterministic compiler/
 // target identities before allocation, carries canonical export signatures,
 // function-local rodata relocations, and resolves symbolic natives exclusively
-// through the host allowlist. This is still native code, not a sandbox or an
+// through the host allowlist. v3 (F1 visibility, docs/spec/SPEC_AUDIT_2026-07-10.md
+// F1) keeps the v2 per-function record layout byte-identical and repurposes the
+// name directory as the module's EXPORT TABLE (only `pub fn`/bare-`fn` entries;
+// `priv fn` helpers are serialized but absent from the directory, so they are
+// not callable cross-module and `build_em_exports` does not export them). The
+// loader accepts v1, v2, and v3. This is still native code, not a sandbox or an
 // authenticated untrusted-code container.
 //
 // prism port note (docs/planning/RESTRUCTURE_PLAN.md Section 5): the standalone loader used an
@@ -79,12 +84,14 @@ struct LoadedModule {
     std::vector<void*>                             dispatch;     // dispatch[i] = entry addr of slot i
     std::vector<uint8_t>                            globals;      // the globals block (initial values copied in)
     std::vector<void*>                             pages;        // owns the exec pages (one per function)
-    std::vector<std::pair<std::string, uint32_t>>   name_table;  // name -> slot (for ember_call by name)
+    std::vector<std::pair<std::string, uint32_t>>   name_table;  // name -> slot; v3: the EXPORT TABLE (only pub fns)
     uint32_t                                       entry_slot = EM_NO_ENTRY;
     uint32_t                                       format_version = EM_VERSION_V1;
-    // v2 canonical signatures indexed by dispatch slot. Name-directory aliases
+    // v2+ canonical signatures indexed by dispatch slot. Name-directory aliases
     // resolve to a slot first, so duplicate/aliased names cannot lose metadata.
     // Empty for v1 (whose signatures are intentionally ABI-trusted unknown).
+    // v3 carries the same per-slot signatures as v2; the difference is which
+    // names appear in `name_table` (the export table), not the signature shape.
     std::vector<EmSignature>                       signatures_by_slot;
 
     LoadedModule() = default;
@@ -95,8 +102,9 @@ struct LoadedModule {
     LoadedModule& operator=(LoadedModule&& other) noexcept;
 
     // Look up a function's entry by name (returns nullptr if not found).
-    // O(n) linear scan of name_table; n is small (one entry per exported
-    // function). Matches the writer's name_table convention (Section 2.2).
+    // O(n) linear scan of name_table; n is small (one entry per EXPORTED
+    // function - v3's name_table IS the export table, so a `priv fn` is not
+    // reachable here). Matches the writer's name_table convention (Section 2.2).
     void* entry_by_name(const char* name) const;
 
     // The @entry function's entry (nullptr if no entry, i.e. entry_slot ==

@@ -573,7 +573,16 @@ int main(int argc, char** argv) {
         if (entry_slot == EM_NO_ENTRY) { auto sit = slots.find("main"); if (sit != slots.end()) entry_slot = uint32_t(sit->second); }
         mod.entry_slot = entry_slot;
         mod.name_table.reserve(pr.program.funcs.size());
-        for (const auto& fn : pr.program.funcs) mod.name_table.push_back({fn.name, uint32_t(fn.slot)});
+        // F1 visibility (docs/spec/SPEC_AUDIT_2026-07-10.md F1): the .em name
+        // directory IS the module's EXPORT TABLE from v3. Publish only the
+        // `is_exported` fns (bare `fn` is exported by default; `priv fn` is
+        // hidden). A `priv fn` is still serialized above (its code/relocs are in
+        // mod.functions, occupying its dispatch slot for intra-module calls) -
+        // it is simply absent from the name directory, so other modules cannot
+        // resolve it cross-module.
+        for (const auto& fn : pr.program.funcs)
+            if (fn.is_exported)
+                mod.name_table.push_back({fn.name, uint32_t(fn.slot)});
         std::string werr;
         if (!write_em_file(mod, emit_em_path.c_str(), &werr)) {
             std::fprintf(stderr, "ember: --emit-em write failed: %s\n", werr.c_str());
@@ -594,7 +603,6 @@ int main(int argc, char** argv) {
                         fn.name.c_str(), fn.slot, cf.bytes.size(), cf.abs_fixups.size());
         }
     }
-
     // ---- locate the entry function ----
     auto sit = slots.find(fn_name);
     if (sit == slots.end()) {

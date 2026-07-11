@@ -1,0 +1,13 @@
+// F1 visibility (docs/spec/SPEC_AUDIT_2026-07-10.md F1): the `priv` modifier is
+// ONLY valid on a function declaration (`priv fn`). Applying it to a global
+// (or a let/struct/enum) is a PARSE error. This pins the modifier's scope so a
+// future grammar widening doesn't silently accept `priv global` as a no-op.
+//
+// Classified invalid_*.ember -> must PARSE ERROR (the runner asserts parse
+// fails). With the F1 fix reverted (no `priv` keyword) `priv` lexes as an
+// identifier and the parser still rejects "expected fn/struct/global" - so the
+// parse-error assertion holds either way for THIS input; the load-bearing
+// non-circular signal for the modifier itself is the POSITIVE
+// sema_valid_priv_fn_intra_module test (which needs `priv` to parse + sema OK).
+priv global bad : i64 = 5;
+fn main() -> i64 { return bad; }

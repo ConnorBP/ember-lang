@@ -11,7 +11,7 @@
 //
 //   Header (40 bytes):
 //     magic           : u32 = 0x454D424C  ("EMBL")
-//     version         : u32 = 2 (loader also accepts historical v1)
+//     version         : u32 = 3 (loader also accepts historical v1 and v2)
 //     flags           : u32 = 0           (bit 0 reserved: embeds source)
 //     function_count  : u32
 //     global_size     : u32
@@ -50,8 +50,13 @@
 // COMPATIBILITY NOTE: v1 remains ABI/process-trusted. v2 records canonical
 // signatures, symbolic native bindings and function-local rodata relocations;
 // unsupported trap/allowlist process state is rejected by the writer. v2 also
-// binds to a deterministic compiler/build identity and target ABI. Neither
-// version authenticates native code or makes it an untrusted-code container.
+// binds to a deterministic compiler/build identity and target ABI. v3 (F1,
+// docs/spec/SPEC_AUDIT_2026-07-10.md F1) keeps the v2 per-function record layout
+// byte-identical and repurposes the name directory as the module's EXPORT TABLE
+// (only `pub fn`/bare-`fn` entries; `priv fn` helpers are serialized but absent
+// from the directory, so they are not callable cross-module). The loader accepts
+// v1, v2, and v3. Neither version authenticates native code or makes it an
+// untrusted-code container.
 
 #pragma once
 
@@ -69,8 +74,9 @@ namespace ember {
 // "EMBL" - ember bundle, loadable. Read as a little-endian u32 this is
 // 'E','M','B','L' = 0x4C,0x42,0x4D,0x45 -> 0x454D424C.
 constexpr uint32_t EM_MAGIC    = 0x454D424Cu;
-constexpr uint32_t EM_VERSION  = 2u;
-constexpr uint32_t EM_VERSION_V1 = 1u;
+constexpr uint32_t EM_VERSION  = 3u;       // v3: name directory IS the export table (F1 pub/priv visibility)
+constexpr uint32_t EM_VERSION_V2 = 2u;     // historical v2: canonical signatures, native bindings, rodata relocs
+constexpr uint32_t EM_VERSION_V1 = 1u;     // historical v1: ABI-trusted, unknown signatures
 constexpr uint32_t EM_NO_ENTRY = 0xFFFFFFFFu; // entry_slot when no @entry fn
 
 // v2 binding identity. These are deliberately derived from stable compiler /
@@ -218,6 +224,10 @@ struct EmFunctionRecord {
 // `entry_slot` is
 // `EM_NO_ENTRY` if the module has no @entry function. `name_table` is the
 // name->slot directory (for `ember_call` by name, docs/HOT_RELOAD.md Section 7).
+// From v3 (F1 visibility, docs/spec/SPEC_AUDIT_2026-07-10.md F1) `name_table` is
+// also the module's EXPORT TABLE: the writer/host populates it from only the
+// `is_exported` (`pub fn` / bare `fn`) functions, so a `priv fn` is absent and
+// is not callable cross-module. v1/v2 directories listed every function.
 struct EmModule {
     std::vector<EmFunctionRecord>                functions;
     std::vector<uint8_t>                         globals;

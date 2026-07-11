@@ -19,7 +19,7 @@
 
 | ID | Severity | Doc | One-line claim |
 |---|---|---|---|
-| F1 | High | `../BUNDLING_AND_EM_MODULES.md` §1.3 (:122), §4 (:517), `../MODULES.md` §6 (:296) | "No visibility / pub / export — everything included is visible" / "pub/priv is a language extension, not a bundling concern" — mis-scoped; pub/priv visibility IS a bundling concern. |
+| F1 | High | `../BUNDLING_AND_EM_MODULES.md` §1.3 (:122), §4 (:517), `../MODULES.md` §6 (:296) | "No visibility / pub / export — everything included is visible" / "pub/priv is a language extension, not a bundling concern" — mis-scoped; pub/priv visibility IS a bundling concern. **DONE (implemented 2026-07-10; backward-compat: fn=public, priv=private).** |
 | F2 | High | `../BUNDLING_AND_EM_MODULES.md` §2 (Part 2), `CODEGEN_SPEC.md` §15, `SAFETY_AND_SANDBOX.md` §1 | `.em` is raw x86-64 native code (code-injection risk); the spec frames this as an acceptable "ABI/process-trusted" tradeoff with no in-scope fix. Should be in scope. |
 | F3 | High | `MEMORY_AND_GC.md` §4 (:88-90) | "v1 global storage supports scalar/handle globals only… Sema rejects slice, fixed-array, and by-value struct globals; a typed aggregate global layout remains deferred" — factually wrong; aggregate globals shipped 2026-07-10. |
 | F4 | Medium | `MEMORY_AND_GC.md` §3 (:74-77), `COMPILER_PIPELINE.md` §4 (:326-333) | Slice-escape provenance check is described as a single complete mechanism blocking "the two escape routes (return, global-store)"; call-arg passing is called "perfectly fine." C3 (native arg) and C5 (script-fn arg) are an unguarded open hole. |
@@ -29,9 +29,11 @@
 
 ---
 
-## F1 — pub/priv visibility IS a bundling concern (mis-scoped)
+## F1 — pub/priv visibility IS a bundling concern (mis-scoped) — DONE (implemented 2026-07-10)
 
 **Severity:** High (mis-scoped; the user raised this as a confirmed example).
+
+**STATUS: DONE.** Implemented as a bundling concern per the audit's F1 design (commit after this audit): a `priv fn` declaration modifier + a v3 `.em` export table. **Backward-compat decision (documented in the commit):** a bare `fn` stays EXPORTED by default (preserves every existing cross-module test/demo — `v0_5_live_modules_test`, `em_roundtrip_test`, all `import_*`/demo scripts use bare `fn` and call across modules); `priv fn` opts OUT of the export surface. The audit leaned toward `fn`-private-by-default (the safer default for a bundled module), but evaluating that against the existing gate broke `v0_5_live_modules_test` (bare-`fn` `.em` modules called cross-module via `lib::double`) and `em_roundtrip_test`, so the pragmatic backward-compat path (`fn`=public, `priv fn`=private) was taken. Either way the LANGUAGE now HAS visibility and the spec's "no visibility" claim is corrected. Details: `FuncDecl::is_exported` (default true) on the AST; `priv` lexer keyword + parser modifier; sema rejects a cross-module `mod::priv_fn()` call ("targets a function that is not exported by module 'mod'"), distinguishing a registered-but-not-exported callee (sema error) from a not-yet-registered module (deferred trap, unchanged); the v3 `.em` name directory IS the export table (the writer/host populates it from only `is_exported` fns; the loader publishes only those to `LoadedModule::name_table`); `build_jit_exports`/`build_em_exports` filter to the exported subset; the CLI `--emit-em` path filters `EmModule::name_table` to `is_exported`. Regression: `pub_priv_test` (ctest) cases A-D + `tests/lang/sema_valid_priv_fn_intra_module.ember` + `tests/lang/invalid_priv_not_fn.ember`. Gate: ctest 24/24 (was 23), lang 259/0/0 (was 255/0/0).
 
 **The claim (three locations, all agreeing):**
 
@@ -232,7 +234,7 @@ The following spec claims were checked against the source and found **accurate**
 
 ## Recommended remediation order
 
-1. **F1 doc change** (make the pub/priv gap honest in BUNDLING §1.3/§4 + MODULES §6) — lands immediately, zero source risk. F1 implementation (export table + `pub` modifier + loader/linker filter) is the larger remediation, scheduled after review.
+1. **F1 doc change** (make the pub/priv gap honest in BUNDLING §1.3/§4 + MODULES §6) — lands immediately, zero source risk. ~~F1 implementation (export table + `pub` modifier + loader/linker filter) is the larger remediation, scheduled after review.~~ **DONE (implemented 2026-07-10):** `priv fn` modifier + v3 `.em` export table + sema cross-module rejection + linker/loader filter; backward-compat decision `fn`=public / `priv fn`=private (see the F1 section header). See `pub_priv_test` (ctest) + `tests/lang/sema_valid_priv_fn_intra_module.ember` + `tests/lang/invalid_priv_not_fn.ember`.
 2. **F3 doc change** (update MEMORY_AND_GC §4 to the shipped typed-globals model) — lands immediately; it is a pure stale-text fix that aligns MEMORY_AND_GC with the already-shipped TYPE_SYSTEM §12.2 / CODEGEN_SPEC §16.4.
 3. **F5 doc change** (lead TYPE_SYSTEM §9 with the `auto` deprecation) — lands immediately.
 4. **F6 doc change** (20→22 CTest count) — lands immediately; verify the absent-SDK count first.
@@ -241,4 +243,4 @@ The following spec claims were checked against the source and found **accurate**
 7. **F2 doc change** (name `.em` as a distinct code-injection surface in SAFETY §1 + BUNDLING §2.5.1; state the v1 guarantee is identity + type-signature compatibility, not content authentication) — lands immediately.
 8. **F2 implementation** (signed raw-x86 `.em` — Ed25519 over SHA-256 of the code/rodata/reloc/globals/name-table bytes, verified before `alloc_executable_rw`) — the load-bearing security remediation, scheduled after review. F2 secondary (IL-`.em` re-lowering) is deferred until the SSA-lite IR ships AND a concrete threat justifies the larger loader surface.
 
-Doc changes 1, 3, 4, 5, 6, 7 are all pure stale-text / under-statement fixes with no source side effect and no gate impact. F1-impl and F2-impl are the two real implementation changes; both are scheduled for after-review, not part of this read-only audit.
+Doc changes 1, 3, 4, 5, 6, 7 are all pure stale-text / under-statement fixes with no source side effect and no gate impact. ~~F1-impl and F2-impl are the two real implementation changes; both are scheduled for after-review, not part of this read-only audit.~~ **F1-impl DONE (2026-07-10).** F2-impl (signed raw-x86 `.em`) remains the one real implementation change still scheduled for after-review.

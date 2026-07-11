@@ -253,6 +253,17 @@ struct FuncDecl {
     Block body;
     Loc loc;
     int slot = -1;                 // sema-assigned dispatch slot
+    // F1 visibility (docs/spec/SPEC_AUDIT_2026-07-10.md F1): is this fn part of
+    // the module's EXPORTED surface (published to the .em name table / the JIT
+    // export table, callable cross-module via `mod::fn()`), or a module-private
+    // internal helper? Backward-compat decision: a bare `fn` is EXPORTED by
+    // default (preserves every existing cross-module test/demo that uses bare
+    // `fn` and calls across modules); `priv fn` opts OUT of the export surface.
+    // Intra-module visibility is unchanged - a `priv fn` is still callable from
+    // its own module; it is simply not published to other modules. The CLI /
+    // native `engine.define` surface is unaffected (pub/priv is a script-module
+    // bundling concern, not a native-binding concern).
+    bool is_exported = true;
 };
 
 struct StructDecl {
