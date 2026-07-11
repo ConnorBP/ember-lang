@@ -1,4 +1,4 @@
-// ext_opt.cpp — Stage C: the four IR optimization passes.
+// ext_opt.cpp — Stage C: the IR optimization passes.
 // See ext_opt.hpp for the design. All passes are value-preserving and
 // conservative — when in doubt, do not transform.
 
@@ -769,6 +769,202 @@ EmberPreserved CopyPropPass::run(ThinFunction& f, EmberAnalysisManager&) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// InstCombinePass: intra-block identity-fold of binary ops
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Identity-fold binary ops where one operand is a known constant. Iterate
+// within each block, tracking a VReg→constant-value map from ConstInt/
+// ConstBool/ConstFloat defs. When a BinOp has a constant operand that makes
+// it an identity, replace it with a Move (or ConstInt 0 for self-annihilation).
+// Keep meta.frame_off on the replacement Move so emit still treats the dst as
+// frame-backed. Kill a constant-map entry when its VReg is redefined by a
+// non-ConstInt instr.
+
+EmberPreserved InstCombinePass::run(ThinFunction& f, EmberAnalysisManager&) {
+    bool changed = false;
+    for (auto& blk : f.blocks) {
+        // VReg → known constant int value. Only int constants are tracked
+        // (the identity folds below are all integer ops). ConstFloat is not
+        // tracked here — float identity folds are a separate concern.
+        std::unordered_map<VReg, int64_t> vreg_const;
+        auto is_const = [&](VReg v) -> bool {
+            return v != 0 && vreg_const.count(v);
+        };
+        auto get_const = [&](VReg v) -> int64_t {
+            auto it = vreg_const.find(v);
+            return it != vreg_const.end() ? it->second : 0;
+        };
+
+        for (auto& in : blk.instrs) {
+            // Record constants from ConstInt / ConstBool defs.
+            if (in.op == ThinOp::ConstInt || in.op == ThinOp::ConstBool) {
+                if (in.dst) vreg_const[in.dst] = in.imm.i;
+                continue;
+            }
+
+            // The set of foldable int binops (matches ConstPropPass's set).
+            if (!is_foldable_int_binop(in.op)) {
+                // Non-foldable producing instr: kill the dst's constant entry.
+                if (in.dst) vreg_const.erase(in.dst);
+                continue;
+            }
+
+            // Resolve the two operands. src2==0 means the immediate form
+            // (the constant is in imm.i) — that's a known constant too.
+            bool a_const = is_const(in.src1);
+            bool b_const = (in.src2 == 0) || is_const(in.src2);
+            int64_t a_val = get_const(in.src1);
+            int64_t b_val = (in.src2 == 0) ? in.imm.i : get_const(in.src2);
+
+            // Helper: build a Move dst=dst src1=other, keeping meta.frame_off.
+            auto make_move = [&](VReg other) {
+                in.op = ThinOp::Move;
+                in.src1 = other;
+                in.src2 = 0;
+                // imm is irrelevant for Move; leave meta intact (frame_off,
+                // width, etc. — emit still treats the dst as frame-backed).
+            };
+            auto make_const0 = [&]() {
+                in.op = ThinOp::ConstInt;
+                in.imm.i = 0;
+                in.src1 = 0;
+                in.src2 = 0;
+                // Keep meta (frame_off so emit still backs the dst).
+            };
+
+            bool folded = false;
+            switch (in.op) {
+            case ThinOp::Add:
+                // x+0 → x, 0+x → x
+                if (b_const && b_val == 0) { make_move(in.src1); folded = true; }
+                else if (a_const && a_val == 0) { make_move(in.src2); folded = true; }
+                break;
+            case ThinOp::Sub:
+                // x-0 → x
+                if (b_const && b_val == 0) { make_move(in.src1); folded = true; }
+                // x-x → 0 (both operands the same VReg)
+                else if (in.src1 != 0 && in.src1 == in.src2) { make_const0(); folded = true; }
+                break;
+            case ThinOp::Mul:
+                // x*1 → x, 1*x → x
+                if (b_const && b_val == 1) { make_move(in.src1); folded = true; }
+                else if (a_const && a_val == 1) { make_move(in.src2); folded = true; }
+                // x*0 → 0, 0*x → 0 (either operand const 0)
+                else if ((a_const && a_val == 0) || (b_const && b_val == 0)) {
+                    make_const0(); folded = true;
+                }
+                break;
+            case ThinOp::Div:
+                // x/1 → x. Do NOT fold x/0.
+                if (b_const && b_val == 1) { make_move(in.src1); folded = true; }
+                break;
+            case ThinOp::Or:
+                // x|0 → x, 0|x → x
+                if (b_const && b_val == 0) { make_move(in.src1); folded = true; }
+                else if (a_const && a_val == 0) { make_move(in.src2); folded = true; }
+                // x|x → x
+                else if (in.src1 != 0 && in.src1 == in.src2) { make_move(in.src1); folded = true; }
+                break;
+            case ThinOp::And:
+                // x&-1 → x (all-ones), -1&x → x
+                if (b_const && b_val == -1) { make_move(in.src1); folded = true; }
+                else if (a_const && a_val == -1) { make_move(in.src2); folded = true; }
+                // x&x → x
+                else if (in.src1 != 0 && in.src1 == in.src2) { make_move(in.src1); folded = true; }
+                // x&0 → 0, 0&x → 0
+                else if ((a_const && a_val == 0) || (b_const && b_val == 0)) {
+                    make_const0(); folded = true;
+                }
+                break;
+            case ThinOp::Xor:
+                // x^0 → x, 0^x → x
+                if (b_const && b_val == 0) { make_move(in.src1); folded = true; }
+                else if (a_const && a_val == 0) { make_move(in.src2); folded = true; }
+                // x^x → 0
+                else if (in.src1 != 0 && in.src1 == in.src2) { make_const0(); folded = true; }
+                break;
+            case ThinOp::Shl:
+            case ThinOp::Shr:
+                // x<<0 → x, x>>0 → x. Do NOT fold shift-by-const-nonzero here.
+                if (b_const && b_val == 0) { make_move(in.src1); folded = true; }
+                break;
+            default:
+                break;
+            }
+
+            if (folded) {
+                changed = true;
+                // The dst is now either a Move of an existing VReg (not a known
+                // constant in general) or a ConstInt 0. Update the map.
+                if (in.op == ThinOp::ConstInt) {
+                    if (in.dst) vreg_const[in.dst] = in.imm.i;
+                } else {
+                    // Move: propagate the constant if the src is constant.
+                    if (in.dst) {
+                        if (is_const(in.src1)) vreg_const[in.dst] = get_const(in.src1);
+                        else vreg_const.erase(in.dst);
+                    }
+                }
+            } else {
+                // Not folded: the BinOp's dst is not a known constant.
+                if (in.dst) vreg_const.erase(in.dst);
+            }
+        }
+    }
+    return changed ? EmberPreserved::none() : EmberPreserved::all();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DeadStoreElimPass: intra-block dead store elimination
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Within each block, track the last StoreFrame to each frame_off. When a
+// SECOND StoreFrame to the same off=X appears with NO intervening LoadFrame
+// off=X, the FIRST StoreFrame was overwritten before being read → it's dead,
+// remove it. The second then becomes the new "last store". Iterate to fixpoint
+// within each block.
+
+EmberPreserved DeadStoreElimPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    bool changed = false;
+    for (auto& blk : f.blocks) {
+        bool block_changed = true;
+        while (block_changed) {
+            block_changed = false;
+            // Map: frame_off → index of the last StoreFrame to that off (in the
+            // current instr vector). A LoadFrame of the same off kills the
+            // pending store (it was read, so it's not dead).
+            std::unordered_map<int32_t, size_t> last_store_idx;
+            auto& instrs = blk.instrs;
+            for (size_t i = 0; i < instrs.size(); ++i) {
+                ThinInstr& in = instrs[i];
+                if (in.op == ThinOp::StoreFrame) {
+                    int32_t off = in.meta.frame_off;
+                    auto it = last_store_idx.find(off);
+                    if (it != last_store_idx.end()) {
+                        // A prior StoreFrame to this off with no intervening
+                        // LoadFrame → the prior store is dead. Remove it.
+                        size_t dead_idx = it->second;
+                        instrs.erase(instrs.begin() + ptrdiff_t(dead_idx));
+                        // We erased an earlier instr; the current index i has
+                        // shifted down by 1. Restart this block's scan.
+                        block_changed = true;
+                        changed = true;
+                        break;
+                    }
+                    last_store_idx[off] = i;
+                } else if (in.op == ThinOp::LoadFrame) {
+                    // A load reads the slot → the last store is not dead.
+                    last_store_idx.erase(in.meta.frame_off);
+                }
+                // Any other instr does not affect store-liveness for our
+                // purposes (we only track StoreFrame/LoadFrame per off).
+            }
+        }
+    }
+    return changed ? EmberPreserved::none() : EmberPreserved::all();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // register_passes
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -779,6 +975,8 @@ void register_passes(EmberPassRegistry& reg) {
     reg.add<LICMPass>("licm");
     reg.add<StoreToLoadForwardPass>("forward");
     reg.add<CopyPropPass>("copyprop");
+    reg.add<InstCombinePass>("instcombine");
+    reg.add<DeadStoreElimPass>("dse");
 }
 
 } // namespace ember::ext_opt

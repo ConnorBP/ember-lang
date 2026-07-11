@@ -48,6 +48,14 @@ static const char* SRC_CSE_REDUNDANT =
     "fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; while (i < 100) { let a: i64 = i * 7; s = s + a + a; i = i + 1; } return s; }\n";
 static const char* SRC_LICM_INVARIANT =
     "fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; while (i < 100) { let k: i64 = 100 * 200; s = s + k + i; i = i + 1; } return s; }\n";
+// LLVM-4: InstCombine workload — identity folds (x+0, x*1, x*0, x-x).
+// The foldable ops become Moves/ConstInts; with dce they get removed.
+static const char* SRC_INSTCOMBINE_FOLD =
+    "fn main() -> i64 { let x: i64 = 7; let a: i64 = x + 0; let b: i64 = x * 1; let c: i64 = x * 0; let d: i64 = x - x; return a + b + d; }\n";
+// LLVM-5: DSE workload — two stores to the same slot, no intervening load
+// (the first store is overwritten before read -> dead).
+static const char* SRC_DSE_OVERWRITE =
+    "fn main() -> i64 { let mut x: i64 = 5; x = 9; return x; }\n";
 
 // ─── Test infrastructure (modeled on thin_ir_test.cpp) ───
 
@@ -188,6 +196,8 @@ int main() {
     ck(reg.has("cse"), "registry has \"cse\"");
     ck(reg.has("licm"), "registry has \"licm\"");
     ck(reg.has("subst"), "registry has \"subst\" (obf)");
+    ck(reg.has("instcombine"), "registry has \"instcombine\"");
+    ck(reg.has("dse"), "registry has \"dse\"");
 
     // The four workloads.
     struct Workload { const char* name; const char* src; };
@@ -196,8 +206,10 @@ int main() {
         {"dce_dead_store", SRC_DCE_DEAD_STORE},
         {"cse_redundant",  SRC_CSE_REDUNDANT},
         {"licm_invariant", SRC_LICM_INVARIANT},
+        {"instcombine_fold", SRC_INSTCOMBINE_FOLD},
+        {"dse_overwrite", SRC_DSE_OVERWRITE},
     };
-    const int NW = 4;
+    const int NW = 6;
 
     // For each pass: (a) value-preserving on all 4 workloads, (b) instr-count
     // reduction on its target workload (except LICM which moves, not removes).
@@ -207,6 +219,8 @@ int main() {
         {"dce",       "dce_dead_store", true},
         {"cse",       "cse_redundant",  true},
         {"licm",      "licm_invariant", false},  // LICM hoists, doesn't remove
+        {"instcombine", "instcombine_fold", false},  // folds to Move/ConstInt (same count; DCE removes)
+        {"dse",         "dse_overwrite",    true},
     };
 
     for (const auto& pt : passes) {
@@ -670,6 +684,131 @@ int main() {
 
         // block2 still has both instrs (StoreFrame + LoadFrame).
         ck(tf.blocks[2].instrs.size() == 2, "D7b: loop body still has 2 instrs (nothing hoisted)");
+    }
+
+    // -----------------------------------------------------------------
+    // D8 (LLVM-4): InstCombine identity-fold hand-built tests.
+    // Build a ThinFunction with BinOps that have a constant operand and
+    // verify instcombine folds them to Move/ConstInt (instr-count drops or
+    // BinOp count drops).
+    // -----------------------------------------------------------------
+    std::printf("\n--- D8: InstCombine identity folds ---\n");
+    {
+        // block0: ConstInt v0=7, ConstInt v1=0, ConstInt v2=1,
+        //         BinOp Add  v3=v0+v1  (x+0 -> Move v3=v0)
+        //         BinOp Mul  v4=v0*v2  (x*1 -> Move v4=v0)
+        //         BinOp Mul  v5=v0*v1  (x*0 -> ConstInt v5=0)
+        //         BinOp Sub  v6=v0-v0  (x-x -> ConstInt v6=0)
+        //         Return v3
+        ThinFunction tf;
+        tf.name = "instcombine_test";
+        const VReg v0=1, v1=2, v2=3, v3=4, v4=5, v5=6, v6=7;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg dst, int64_t imm) -> ThinInstr {
+            ThinInstr x; x.op = ThinOp::ConstInt; x.dst = dst; x.imm.i = imm; x.meta.width = 8; return x;
+        };
+        auto bin = [&](ThinOp op, VReg dst, VReg s1, VReg s2) -> ThinInstr {
+            ThinInstr x; x.op = op; x.dst = dst; x.src1 = s1; x.src2 = s2; x.meta.width = 8; return x;
+        };
+        b0.instrs.push_back(ci(v0, 7));
+        b0.instrs.push_back(ci(v1, 0));
+        b0.instrs.push_back(ci(v2, 1));
+        b0.instrs.push_back(bin(ThinOp::Add, v3, v0, v1));
+        b0.instrs.push_back(bin(ThinOp::Mul, v4, v0, v2));
+        b0.instrs.push_back(bin(ThinOp::Mul, v5, v0, v1));
+        b0.instrs.push_back(bin(ThinOp::Sub, v6, v0, v0));
+        b0.term.kind = TermKind::Return; b0.term.ret = v3;
+        tf.blocks.push_back(std::move(b0));
+
+        size_t orig = total_instrs(tf);
+        size_t orig_binops = 0;
+        for (const auto& blk : tf.blocks)
+            for (const auto& in : blk.instrs)
+                if (in.op == ThinOp::Add || in.op == ThinOp::Sub || in.op == ThinOp::Mul)
+                    ++orig_binops;
+
+        EmberAnalysisManager am;
+        auto pc = reg.create("instcombine");
+        EmberPreserved pres = pc->run(tf, am);
+        ck(!pres.all_preserved(), "D8.1: instcombine returns Preserved::none() (folds happened)");
+
+        // After instcombine: the 4 BinOps should become Move/ConstInt.
+        // Count remaining BinOps (Add/Sub/Mul) — should be 0.
+        size_t after_binops = 0;
+        for (const auto& blk : tf.blocks)
+            for (const auto& in : blk.instrs)
+                if (in.op == ThinOp::Add || in.op == ThinOp::Sub || in.op == ThinOp::Mul)
+                    ++after_binops;
+        char msg[128];
+        std::snprintf(msg, sizeof msg,
+            "D8.2: instcombine removed all identity BinOps (before=%zu after=%zu)",
+            orig_binops, after_binops);
+        ck(after_binops == 0, msg);
+        ck(after_binops < orig_binops, "D8.3: instcombine reduced BinOp count");
+
+        // Verify the fold results: v5 (x*0) and v6 (x-x) should be ConstInt 0;
+        // v3 (x+0) and v4 (x*1) should be Move.
+        bool v5_is_const0 = false, v6_is_const0 = false;
+        bool v3_is_move = false, v4_is_move = false;
+        for (const auto& in : tf.blocks[0].instrs) {
+            if (in.dst == v5 && in.op == ThinOp::ConstInt && in.imm.i == 0) v5_is_const0 = true;
+            if (in.dst == v6 && in.op == ThinOp::ConstInt && in.imm.i == 0) v6_is_const0 = true;
+            if (in.dst == v3 && in.op == ThinOp::Move) v3_is_move = true;
+            if (in.dst == v4 && in.op == ThinOp::Move) v4_is_move = true;
+        }
+        ck(v5_is_const0, "D8.4: x*0 folded to ConstInt 0");
+        ck(v6_is_const0, "D8.5: x-x folded to ConstInt 0");
+        ck(v3_is_move, "D8.6: x+0 folded to Move");
+        ck(v4_is_move, "D8.7: x*1 folded to Move");
+    }
+
+    // -----------------------------------------------------------------
+    // D9 (LLVM-5): Dead store elimination hand-built test.
+    // block0: ConstInt v0=5, StoreFrame v0 off=-8,
+    //         ConstInt v1=9, StoreFrame v1 off=-8,  (overwrites - no load between)
+    //         LoadFrame v2 off=-8, Return v2.
+    // The first StoreFrame is dead (overwritten before read) -> dse removes it.
+    // -----------------------------------------------------------------
+    std::printf("\n--- D9: Dead store elimination ---\n");
+    {
+        ThinFunction tf;
+        tf.name = "dse_test";
+        const VReg v0=1, v1=2, v2=3;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg dst, int64_t imm) -> ThinInstr {
+            ThinInstr x; x.op = ThinOp::ConstInt; x.dst = dst; x.imm.i = imm; x.meta.width = 8; return x;
+        };
+        auto st = [&](VReg src, int32_t off) -> ThinInstr {
+            ThinInstr x; x.op = ThinOp::StoreFrame; x.src1 = src; x.meta.frame_off = off; x.meta.width = 8; return x;
+        };
+        b0.instrs.push_back(ci(v0, 5));
+        b0.instrs.push_back(st(v0, -8));   // dead store (overwritten)
+        b0.instrs.push_back(ci(v1, 9));
+        b0.instrs.push_back(st(v1, -8));   // live store (read by LoadFrame)
+        ThinInstr ld; ld.op = ThinOp::LoadFrame; ld.dst = v2; ld.meta.frame_off = -8; ld.meta.width = 8;
+        b0.instrs.push_back(std::move(ld));
+        b0.term.kind = TermKind::Return; b0.term.ret = v2;
+        tf.blocks.push_back(std::move(b0));
+
+        size_t orig = total_instrs(tf);
+        size_t orig_stores = 0;
+        for (const auto& in : tf.blocks[0].instrs)
+            if (in.op == ThinOp::StoreFrame) ++orig_stores;
+
+        EmberAnalysisManager am;
+        auto pc = reg.create("dse");
+        EmberPreserved pres = pc->run(tf, am);
+        ck(!pres.all_preserved(), "D9.1: dse returns Preserved::none() (store removed)");
+
+        size_t after_stores = 0;
+        for (const auto& in : tf.blocks[0].instrs)
+            if (in.op == ThinOp::StoreFrame) ++after_stores;
+        char msg[128];
+        std::snprintf(msg, sizeof msg,
+            "D9.2: dse removed dead store (before=%zu after=%zu)", orig_stores, after_stores);
+        ck(after_stores == 1, msg);
+        ck(after_stores < orig_stores, "D9.3: dse reduced store count");
+        ck(total_instrs(tf) < orig, "D9.4: dse reduced total instr count");
     }
 
     std::printf("\n%s\n", g_fail ? "FAIL" : "PASS");

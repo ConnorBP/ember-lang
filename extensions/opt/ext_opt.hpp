@@ -1,6 +1,6 @@
 // ext_opt.hpp — Stage C: the IR optimization passes extension.
 //
-// Six IR→IR optimization passes over ThinFunction, registered by name via
+// Eight IR→IR optimization passes over ThinFunction, registered by name via
 // register_passes (the extension-style discovery pattern, mirroring
 // register_natives). The host wires it:
 //   EmberPassRegistry reg;
@@ -32,8 +32,18 @@
 // - CopyPropPass ("copyprop"): intra-block copy propagation. After forwarding
 //   creates Move instrs, replaces uses of the Move's dst with its src.
 //   Pairs with forward + dce in the pipeline: constprop,forward,copyprop,dce.
+// - InstCombinePass ("instcombine"): intra-block identity-fold of binary ops
+//   where one operand is a known constant (x+0→x, x*1→x, x*0→0, x-x→0, x|x→x,
+//   x&-1→x, x^x→0, x<<0→x, etc.). Replaces the BinOp with a Move (or ConstInt 0
+//   for the self-annihilating cases), keeping meta.frame_off so emit still
+//   treats the dst as frame-backed. Pairs with dce to remove the resulting
+//   dead Moves.
+// - DeadStoreElimPass ("dse"): intra-block dead store elimination. When a
+//   second StoreFrame to the same frame_off appears with NO intervening
+//   LoadFrame of that off, the FIRST StoreFrame was overwritten before being
+//   read → remove it. Iterates to fixpoint within each block.
 //
-// All six are VALUE-PRESERVING: after the pass, emit_x64 produces the same
+// All eight are VALUE-PRESERVING: after the pass, emit_x64 produces the same
 // i64 result. They return EmberPreserved::none() if they changed the IR,
 // Preserved::all() if they did nothing.
 #pragma once
@@ -71,6 +81,16 @@ struct StoreToLoadForwardPass : EmberPassInfoMixin<StoreToLoadForwardPass> {
 
 struct CopyPropPass : EmberPassInfoMixin<CopyPropPass> {
     static constexpr const char* pass_name = "copyprop";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+struct InstCombinePass : EmberPassInfoMixin<InstCombinePass> {
+    static constexpr const char* pass_name = "instcombine";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+struct DeadStoreElimPass : EmberPassInfoMixin<DeadStoreElimPass> {
+    static constexpr const char* pass_name = "dse";
     EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
 };
 

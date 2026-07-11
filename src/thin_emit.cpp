@@ -1469,12 +1469,24 @@ struct EmitCtx {
                 e.byte(0x48); e.byte(0x31); e.byte(0xC8); // xor rax,rcx
                 break;
             case ThinOp::Shl:
-                e.mov_reg_imm64(Reg::rcx, imm);
-                e.byte(0x48); e.byte(0xD3); e.byte(0xE0); // shl rax,cl
+                if (imm >= 1 && imm <= 63) {
+                    // shl rax, imm8: REX.W C1 /4 ib (4 bytes — the short form)
+                    e.byte(0x48); e.byte(0xC1); e.byte(0xE0); e.byte(uint8_t(imm));
+                } else {
+                    e.mov_reg_imm64(Reg::rcx, imm);
+                    e.byte(0x48); e.byte(0xD3); e.byte(0xE0); // shl rax,cl
+                }
                 break;
             case ThinOp::Shr:
-                e.mov_reg_imm64(Reg::rcx, imm);
-                e.byte(0x48); e.byte(0xD3); e.byte(is_unsigned ? 0xE8 : 0xF8); // shr/sar rax,cl
+                if (imm >= 1 && imm <= 63) {
+                    // shr/sar rax, imm8: REX.W C1 /5|/7 ib (4 bytes — the short form)
+                    e.byte(0x48); e.byte(0xC1);
+                    e.byte(is_unsigned ? 0xE8 : 0xF8);
+                    e.byte(uint8_t(imm));
+                } else {
+                    e.mov_reg_imm64(Reg::rcx, imm);
+                    e.byte(0x48); e.byte(0xD3); e.byte(is_unsigned ? 0xE8 : 0xF8); // shr/sar rax,cl
+                }
                 break;
             default: break;
             }
