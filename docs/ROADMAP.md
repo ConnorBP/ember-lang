@@ -1,10 +1,14 @@
-# ember - roadmap (v2+ deferrals)
+# ember - roadmap
 
-Every feature deliberately not in v1, with the **re-entry trigger**
-(the concrete signal that says "now build this") and the **dependency**
-(what else must exist first). Ordered roughly by when each is likely
-to become worth building. Nothing here is scheduled; this exists so a
-deferral is a tracked decision, not a forgotten one.
+Every feature not yet shipped, ordered roughly by dependency and value.
+As of 2026-07-11, **all items below are active TODOs** — the trigger-gated
+"deferral" phase is over; we are working through the list. Each item carries
+its **dependency** (what else must exist first) and its **status** (TODO,
+in-progress, or blocked). ember is a **C-style procedural language**: structs
++ free functions, not classes/inheritance/vtables (OOP is a hard non-goal —
+see the bottom). The long-term north star is **self-hosting**: an ember
+compiler written in ember (work started — `demo/compiler/` is a µ-language
+lexer/parser/evaluator all in ember source).
 
 ## Shipped ahead of plan (between v0.1 and v0.2)
 
@@ -47,6 +51,39 @@ configures 36). The four `plan_*.md` files in `docs/` are historical design
 records; shipped contracts in the main docs take precedence where those plans
 describe earlier states.
 
+## Self-hosting (the north star — work started)
+
+**Status: IN PROGRESS (foundation laid).** The long-term goal is an ember
+compiler written in ember — the language hosting itself. This is NOT a
+non-goal (corrected from an earlier roadmap revision that listed it there);
+it is the direction the language is growing toward.
+
+**Work already done:** `demo/compiler/` is a complete µ-language
+lexer/parser/evaluator written entirely in ember source (`lex.ember`,
+`parse.ember`, `eval.ember`, `main.ember`). It stresses the pure-compute
+language surface — enum, struct, switch, slices, recursion, fn-ref handles,
+fixed arrays, import — and proves ember can host a compiler. The demo parses
+`let a = 1 + 2 * 3; a + 10` → 17 with correct precedence, left-associativity,
+parens, and divide-by-zero detection.
+
+**The path to full self-hosting** (each step is a TODO below or in the tiers):
+1. **`constexpr` function evaluation** (Tier 1) — compile-time fn eval is the
+   foundation a self-hosting compiler needs (macro-like transforms, constant
+   folding of compiler data structures).
+2. **String + I/O maturity** (io extension shipped; string extension shipped)
+   — a compiler reads/writes files and manipulates strings heavily.
+3. **Map extension** (shipped) — symbol tables, AST node pools.
+4. **Lambdas with capture** (Tier 3/GC) — a real compiler uses closures for
+   visitor patterns, scope chains, error accumulators.
+5. **The ember-written ember lexer/parser/sema** — port the C++ frontend to
+   ember, one stage at a time, validating each against the C++ reference.
+6. **The ember-written ember codegen** — emit x86-64 (or ThinFunction IR)
+   from ember. This needs the JIT/memory natives (shipped as host extensions)
+   and is the final self-hosting milestone.
+
+This is a multi-month effort, not a single feature. Every language feature
+shipped (constexpr, lambdas, GC, the standard addons) is a step toward it.
+
 ## Tier 0 - standard addon set (ships with v1.0, host C++ side)
 
 These are not language features - they're `NativeFn` addons using the
@@ -63,7 +100,7 @@ actually writable (`planning/GAP_ANALYSIS.md` Section 3):
 - **`string`** ✓ limited v1 API — opaque nominal handle with construction,
   from-slice/scalar conversion, length/character access, identity, concat,
   equality, find, substr. ✓ find/substr shipped 2026-07-11; general format
-  natives still deferred. F-strings lower
+  natives are a TODO. F-strings lower
   through `__fstring_to_string` to `string_from_*`/identity; no `__fmt` exists.
 - **`math`** ✓ limited v1 API — f32 `sqrt`/`sin`/`cos`/`tan`; f64 `sqrt_f64`/
   `sin_f64`/`cos_f64`/`tan_f64`/`floor_f64`/`ceil_f64`/`abs_f64`/`pow_f64` +
@@ -117,14 +154,25 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
   functions using match as non_serializable (falls back to the tree-walker) —
   `src/thin_lower.cpp` treats `MatchStmt` the same as `ForEachStmt` for Stage A.
   Struct destructure + guards are a later refinement.
-- **`static_assert(cond, msg)`** - compile-time assertion. Trigger:
-  binding code wants to verify struct layout assumptions at compile.
-  Dep: `constexpr` evaluation broadened beyond literals (below).
-- **`constexpr` function evaluation** - full compile-time fn eval
-  (recursive `const` fns), enabling `static_assert`, complex array
-  sizes, compile-time string building. Trigger: `static_assert` or
-  `enum`-from-expr demand it. Dep: a const-eval interpreter (small,
-  but a real subsystem).
+- **`static_assert(cond, msg)`** - **TODO** (blocked on constexpr).
+  Compile-time assertion. Binding code wants to verify struct layout
+  assumptions at compile. Dep: `constexpr` evaluation (below).
+- **`constexpr` function evaluation** - **TODO** (foundational — unblocks
+  static_assert, typed enums, enum-from-expr, and is a prerequisite for
+  self-hosting). Full compile-time fn eval (recursive `const` fns),
+  enabling `static_assert`, complex array sizes, compile-time string
+  building. Dep: a const-eval interpreter (small, but a real subsystem).
+- **Typed enums (`enum E : i32`) + `enum`-from-expr** - **TODO** (blocked on
+  constexpr). A later refinement of the shipped `enum`: typed enums make an
+  enum name a real type (`let x: Color = ...` works); enum-from-expr lets a
+  variant value be computed from a constexpr expression. Dep: constexpr.
+- **`iterable()` TypeBuilder hook** - **TODO.** General collection iteration
+  for `for (x in collection)` beyond slices. The shipped for-each is slice-
+  specific; this generalizes it to any type that registers an `iterable()`
+  hook (arrays, maps, host collections). Dep: the TypeBuilder hook surface.
+- **Struct destructure + guards in match** - **TODO.** A later refinement of
+  the shipped `match`: let a pattern destructure a struct (`Point{ x, y } =>`)
+  and carry a guard (`Point{ x, y } if x > 0 =>`). Dep: parser + sema work.
 
 ## Tier 2 - function references + dynamic registration
 
@@ -162,10 +210,10 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
     with `rcx=1, rdx=garbage` and returns a garbage result with no sema
     error). The fix is `fn(i64)->i64` parameterized function types (a
     real type-system expansion — signature equality, parameterized
-    types); deferred to v2+. The guard ensures the *call target* is always
+    types) — **TODO**. The guard ensures the *call target* is always
     safe; the *args* are the caller's responsibility at the bare-`fn`
     type, same as a C function pointer with no prototype.
-  - **Cross-module function handles — deferred to v2+.** `&mod::fn` /
+  - **Cross-module function handles — TODO.** `&mod::fn` /
     `mod::fn` returning a handle is not in scope: the allowlist is
     per-module (built from this module's `script_slots`), and a handle
     from another module is that module's slot index, meaningless against
@@ -193,62 +241,43 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
   runtime-decided callbacks" — the v0.6 integration + the Tier 2 fn-refs
   batch together fired that trigger, so it shipped in-tree as an extension.)
 
-## Tier 3 - OOP / polymorphism
+## Tier 3 - heap + GC (was Tier 4; OOP Tier 3 moved to non-goals)
 
-- **Classes (reference types) + single inheritance + vtables.**
-  Trigger: a real game has >1 entity types sharing a base interface
-  and the struct+free-function pattern gets unwieldy. Dep: **heap/GC**
-  (Tier 4) - class instances are reference types, need managed
-  lifetime; can't ship classes without a GC.
-- **Interfaces** - abstract method contracts, dispatch via vtable.
-  Trigger: with classes, multiple types share a contract. Dep: classes.
-- **Mixins** - add methods to an existing type externally. Trigger:
-  cross-cutting concerns (logging, serialization) across many types.
-  Dep: classes.
-- **Templates / monomorphization** - `fn foo<T>(x: T)`. Trigger:
-  container addons (`array<T>`) want to be type-safe per-element
-  without per-type native registration. Dep: monomorphization pass in
-  the compiler (duplicate IR per instantiation - moderate complexity).
+OOP/polymorphism (classes, interfaces, mixins, templates) was moved to the
+hard non-goals (ember is C-style procedural, not OOP). GC stays — it unlocks
+lambdas-with-capture and coroutines, not classes.
 
-## Tier 4 - heap + GC
-
-- **Tracing GC** - the v2 feature that unlocks classes, lambdas,
-  dynamic object graphs. `spec/MEMORY_AND_GC.md` Section 8 has the deferral
-  rationale. Trigger: Tier 3 (classes) lands, requiring managed
-  reference-object lifetimes. Dep: a write-barrier or
-  safepoint-based GC (mark-sweep or incremental), root scanning
-  across JIT frames (needs frame-layout metadata retained per
+- **Tracing GC** - TODO. Unlocks lambdas with by-reference capture and
+  coroutines (suspended-frame heap storage), NOT classes (OOP is a non-goal).
+  `spec/MEMORY_AND_GC.md` Section 8 has the design rationale. Dep: a
+  write-barrier or safepoint-based GC (mark-sweep or incremental), root
+  scanning across JIT frames (needs frame-layout metadata retained per
   function - `spec/CODEGEN_SPEC.md` Section 2 already specifies the frame layout
-  in a GC-friendly shape, so the metadata is derivable). Significant
-  subsystem; only build when Tier 3 forces it.
-- **`new`/`delete` + lambdas with capture** - depend on GC. Lambdas
-  that capture by value can be done without GC (capture is a struct
-  copy); by-reference capture needs GC for the captured refs' lifetime.
-  Trigger: closure-style callbacks in real demand. Dep: GC.
+  in a GC-friendly shape, so the metadata is derivable). Significant subsystem.
+- **`new`/`delete` + lambdas with capture** - TODO, depends on GC. Lambdas
+  that capture by value can be done without GC (capture is a struct copy);
+  by-reference capture needs GC for the captured refs' lifetime. Dep: GC.
 
-## Tier 5 - concurrency + exceptions (largest, least certain)
+## Tier 4 - concurrency + exceptions (was Tier 5)
 
-- **Coroutines / `yield`** - needs suspended-frame storage (copy a
-  frame off the native stack into a heap allocation on `yield`,
-  restore on `next()`). Trigger: a real game wants script-driven
-  cutscenes/AI with sequential-looking code. Dep: heap/GC for the
-  suspended frame storage (Tier 4). Moderate.
-- **Exceptions `try`/`catch`/`throw`** - v1's `runtime_error`/
+- **Coroutines / `yield`** - **TODO** (blocked on GC/heap). Needs suspended-
+  frame storage (copy a frame off the native stack into a heap allocation on
+  `yield`, restore on `next()`). A real game wants script-driven cutscenes/AI
+  with sequential-looking code. Dep: heap/GC for the suspended frame storage
+  (Tier 3). Moderate.
+- **Exceptions `try`/`catch`/`throw`** - **TODO.** v1's `runtime_error`/
   `runtime_exception` host-signal + non-local unwind
   (`spec/SAFETY_AND_SANDBOX.md` Section 7) covers host→script abort. In-language
-  `try`/`catch` is a different thing (script catches script-thrown
-  errors at specific frames). Trigger: real script wants
-  local recovery rather than whole-call abort. Dep: per-frame
-  catch-handler registration (extends the checkpoint stack in
-  `spec/SAFETY_AND_SANDBOX.md` Section 2). Moderate, but complicates the
-  unwind machinery - only if there's real demand.
-- **Threads (`thread` addon, `aint*` atomics)** - multithreaded
-  script execution inside one context is a v1 non-goal
-  (`spec/SAFETY_AND_SANDBOX.md` Section 8). Trigger: a compute-heavy mod needs
-  parallelism beyond running multiple `context_t`s. Dep: GC
-  thread-safety, per-context arena, the whole memory model gets
-  harder. Large; defer as long as possible - multi-context
-  parallelism covers most real cases without in-context threading.
+  `try`/`catch` is a different thing (script catches script-thrown errors at
+  specific frames). Dep: per-frame catch-handler registration (extends the
+  checkpoint stack in `spec/SAFETY_AND_SANDBOX.md` Section 2). Moderate, but
+  complicates the unwind machinery.
+- **In-context threads (`thread` addon, `aint*` atomics)** - **TODO** (largest,
+  highest-risk). Multithreaded script execution inside one context. Dep: GC
+  thread-safety, per-context arena, the whole memory model gets harder.
+  Multi-context parallelism (shipped) covers most real cases without in-
+  context threading; this is the residual case for compute-heavy mods that
+  need parallelism within one script context.
 
   **Shipped v1.0 (the two pieces short of in-context threading):**
   - **Context thread-safety (Option D + B1).** A `context_t` is per-thread
@@ -302,8 +331,9 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
 ## Tier 6 - language ecosystem (never strictly required)
 
 - **Modules / live `link`** ✓ shipped in v0.5 — bidirectional script↔`.em` cross-module linking. `link "foo.em" as foo;` loads+registers a pre-compiled `.em` (or `link "foo" as foo;` links to an already-registered module); `foo::bar(args)` is the cross-module call. The runtime half (ModuleRegistry + kind-2 reloc) was built earlier; v0.5 added the source half (grammar, sema resolution, codegen emission, a linker/loader, an `--emit-em` pre-compile CLI mode). See `MODULES.md` (now implemented, not just a design sketch) + `examples/v0_5_live_modules_test.cpp`. The *textual* `import "path";` (parse-time source merge into one module) is unchanged and remains the one-file-bundle mechanism. Open: the `link` to an already-registered module (bare-name form) is host-driven in v0.5 (a host pre-registers); a future linker could resolve bare-name links against a module search path.
-- **Namespaces** - name scoping within a module. Trigger: module
-  size makes flat scope crowded. Dep: modules (now shipped), or usable standalone.
+- **Namespaces** - **TODO.** Name scoping within a module. Dep: modules
+  (now shipped), or usable standalone. Trigger: module size makes flat scope
+  crowded.
 - **Preprocessor** - deliberately never; `engine.define(name,value)`
   (`planning/DESIGN.md` Section 8) + `const`/`constexpr` cover the legitimate
   compile-time-conditional needs without C-preprocessor footguns.
@@ -356,7 +386,7 @@ here so the decision and its evidence have a tracked home.
   probe that demonstrated the old heap-residency leak.
 
 - **Slice-of-stack-local escape safety — STAGE 1 DONE (2026-07-10), STAGE 2
-  DEFERRED.** A stack-backed slice (a `ViewExpr` over a fixed array, or an
+  TODO.** A stack-backed slice (a `ViewExpr` over a fixed array, or an
   encrypted `StringLit` temp) could escape its frame — returned, stored to a
   global, stored into a global struct's field — and dangle. `is_local_array_view`
   guarded only 2 of 5 escape categories, and `StringLit`-derived slices were
@@ -393,11 +423,13 @@ here so the decision and its evidence have a tracked home.
   baseline JIT: a tree-walker that lowers the AST directly to x86-64 with a
   stack-spilling value convention (every value goes through rax/memory, no
   register allocation across expressions). The SSA-lite IR + linear-scan
-  regalloc (COMPILER_PIPELINE §5) is the documented target but is EXPLICITLY
-  DEFERRED — `../planning/DESIGN.md` §9: "no speculative optimization before the bench
-  proves it matters." A benchmark system (`bench/`, `../spec/BENCHMARK_SYSTEM_
-  DESIGN.md`) now PROVES the need per path, so the optimization design is no
-  longer speculative — it is evidence-gated. The full design is
+  regalloc (COMPILER_PIPELINE §5) is the documented target — was EXPLICITLY
+  DEFERRED per `../planning/DESIGN.md` §9 ("no speculative optimization before
+  the bench proves it matters"), but a benchmark system (`bench/`,
+  `../spec/BENCHMARK_SYSTEM_DESIGN.md`) PROVED the need per path, so the
+  optimization is no longer speculative. Stage A (thin-IR backend), Stage B
+  (.em v5 IR serialization), and Stage C (8 IR optimization passes) all
+  SHIPPED. The full design is
   `../spec/CODEGEN_OPTIMIZATION_DESIGN.md` (LLVM pass survey × JIT-scripting
   relevance, per-path waste mapping with line numbers, three architecture
   options, a staged recommendation, pass interface, migration plan). The
@@ -456,10 +488,11 @@ here so the decision and its evidence have a tracked home.
     rename + linear-scan) remain the still-future upgrade path, gated on Stage
     A's insufficiency or cross-block evidence. See
     `../spec/CODEGEN_OPTIMIZATION_DESIGN.md` §8 (Stage A status).
-  - **Stage 3** — full SSA-lite rename + linear-scan regalloc (COMPILER_PIPELINE
-    §5's target). Gated on Stage 2's insufficiency. Gate: Stage 2 insufficient
-    on a spill-heavy workload (CODEGEN_SPEC §5 acceptance criteria become the
-    test surface).
+  - **Stage 3** — **TODO.** Full SSA-lite rename + linear-scan regalloc
+    (COMPILER_PIPELINE §5's target). Dep: Stage 2/Stage A insufficiency on a
+    spill-heavy workload (CODEGEN_SPEC §5 acceptance criteria become the test
+    surface). The intra-block passes (Stage C, shipped) cover most waste;
+    Stage 3 is the cross-block + register-allocation upgrade.
 
   - **Stage C — SHIPPED (steps 1-5 + 4 additional passes, 2026-07-10/11).** The
     composable IR pass system over the `ThinFunction`, wired into `CodeGenCtx`
@@ -519,11 +552,25 @@ here so the decision and its evidence have a tracked home.
   and `defer` emission for no benefit over `break`/`continue`/`switch`.
 - **C-preprocessor** - `define`/`ifdef`/`include`/`pragma`. Use
   `engine.define` + `const`/`constexpr` + modules.
-- **Multiple inheritance / diamond** - even the surveyed native-JIT language disallows diamonds;
-  single inheritance (Tier 3) is the ceiling.
-- **Self-hosting** - the compiler stays C++; no benefit to making
-  ember its own implementation language for an embedded scripting
-  use case.
+- **OOP / polymorphism (classes, inheritance, vtables, interfaces,
+  mixins, templates/monomorphization)** - ember is a **C-style procedural
+  language**: structs + free functions, not classes/inheritance/vtables.
+  This is a deliberate design decision (2026-07-11): the struct +
+  free-function pattern is ergonomic for ember's embedded-scripting +
+  game-modding use case, and OOP would bring managed-reference lifetime
+  complexity (vtables, dynamic dispatch, single-inheritance object graphs)
+  that the GC tier exists to serve for lambdas/coroutines, not for classes.
+  `fn`-typed values (`&fn`) + the dispatch-table guard cover the indirect-
+  call case; struct fields + free functions cover the data + behavior case.
+  If a real workload needs polymorphic dispatch, a tagged-union + match
+  pattern (which ember has) is the C-style answer, not virtual methods.
+- **Multiple inheritance / diamond** - subsumed by the OOP non-goal above;
+  no inheritance at all, single or multiple.
+- **Self-hosting is NOT a non-goal** — it is the long-term north star (see
+  the Self-Hosting section above). This entry existed in an earlier roadmap
+  revision and is corrected here: the compiler staying C++ forever is NOT
+  the plan. Work has started (`demo/compiler/` is a µ-language
+  lexer/parser/evaluator written entirely in ember).
 
 ## Re-evaluation cadence
 
@@ -643,7 +690,7 @@ pervasive and error-prone.
 
 ---
 
-## CLI tooling (Family A built; B shipped; C deferred)
+## CLI tooling (Family A built; B shipped; C TODO)
 
 ### Family A — compute-engine CLI (no new natives; shipped/next)
 
@@ -654,8 +701,8 @@ pervasive and error-prone.
   benchmark-methodology gap** (was: one mean, no variance/CI, no machine
   metadata, report written as a test side-effect; bench writes to stdout on
   request only, never as a side-effect). Zero new natives.
-- **`ember test`** — NEXT. A native test runner over a directory of `.ember`
-  files classified by expected exit code (the convention
+- **`ember test`** — **TODO (NEXT).** A native test runner over a directory of
+  `.ember` files classified by expected exit code (the convention
   `tests/run_lang_tests.sh` already uses). Replaces the bash harness with a
   fast, parallel, TAP-ish runner. Zero new natives. Blocked on a small
   refactor: extracting the compile-to-entry flow from `main` into a reusable
@@ -701,17 +748,23 @@ scope/state notes and `docs/planning/plan_OS_IO_EXTENSIONS.md` for the
 full-plan extension surface (directory listing + subprocess execution as
 separate sub-registration functions, still future).
 
-### Family C — ember as a unique compute module/pipeline tool (DEFERRED)
+### Family C — ember as a unique compute module/pipeline tool (TODO)
 
-- **`ember pipe`** — a dataflow pipeline runner: load several `.em` modules,
-  wire their functions into a directed graph (`A.process -> B.reduce`), run a
-  stream of i64 values through it, report the transformed result. Exercises
-  the bundler + module linking + the array/sync extensions. "ember as a
-  dataflow compute kernel" — distinct from a general script runner.
-- **`ember live`** — a live-coding/reload runner: `--tick` + hot-reload
-  watching a `.ember` file, recompiling on change, showing the tick output
-  evolve. Turns the hot-reload demo into a tool.
+- **`ember pipe`** — **TODO.** A dataflow pipeline runner: load several `.em`
+  modules, wire their functions into a directed graph (`A.process -> B.reduce`),
+  run a stream of i64 values through it, report the transformed result.
+  Exercises the bundler + module linking + the array/sync extensions. "ember as
+  a dataflow compute kernel" — distinct from a general script runner.
+- **`ember live`** — **TODO.** A live-coding/reload runner: `--tick` +
+  hot-reload watching a `.ember` file, recompiling on change, showing the tick
+  output evolve. Turns the hot-reload demo into a tool.
 
-  Deferred: both lean on surfaces whose demos (t91 hot-reload, t92
-  concurrency) are still validating the ergonomics. Build after those demos
-  prove the underlying APIs are pleasant enough to expose as a tool.
+### Standalone exe bundler — TODO
+
+- **Standalone exe bundler** — **TODO.** Bundle a `.ember` script + the ember
+  runtime + the JIT'd code into a single self-contained `.exe` that runs
+  without a separate ember install. A full 793-line design exists at
+  `docs/planning/plan_STANDALONE_BUNDLER.md` (the embed-the-VM + serialize-
+  the-IR + stub-main approach). Unlocks ember as a distribution format for
+  CLI tools and game mods. Dep: the `.em` v5 IR format (shipped) + a small
+  stub `main` that loads + runs the embedded module.
