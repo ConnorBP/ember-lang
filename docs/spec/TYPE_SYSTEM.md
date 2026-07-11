@@ -614,17 +614,27 @@ no-fallthrough arms (unlike `switch`). The type rules:
 `for (x in slice) { body }` — iterates a slice, binding each element to `x`.
 The type rules:
 
-- **Iterable type.** The iterable expression must be a **slice** `T[]`
-  (`is_slice == true`). Any other iterable type (fixed array, struct, scalar)
-  is a **compile error** ("for-each iterable must be a slice"). v1 for-each is
-  slice-specific; iterating a fixed array directly requires a `arr[..]` view
-  first (the whole-array view produces a slice, §4). The `iterable()`
-  `TypeBuilder` hook for general collection iteration is still deferred.
-- **Element variable type.** `x` gets the slice's **element type** (`T` from
-  `T[]`), declared in a fresh per-iteration scope (the loop body's scope, with
-  `x` declared before the body is checked). `x` is immutable per iteration
-  (reassigning it is allowed but overwritten on the next iteration — it is a
-  regular local, not a `const`).
+- **Iterable type (the `iterable()` hook).** Two iterable kinds are accepted:
+  - a **slice** `T[]` (`is_slice == true`); or
+  - an **array<T> handle** — an opaque `i64` from the array extension
+    (`extensions/array/`) that sema has **proven** comes from `array_new`
+    (an inline `array_new(esz, n)` call, or a `let` whose initializer is one,
+    including a bare `let b = a;` alias of a tagged handle). A plain `i64`
+    that isn't a provable array handle is a **compile error** ("for-each
+    iterable must be a slice or array handle") — so `for (x in 42)` stays an
+    error. Iterating a fixed array directly still requires an `arr[..]` view
+    first (the whole-array view produces a slice, §4).
+  Any other iterable type (struct, bool, float, a non-array-handle integer) is
+  a compile error. The general `iterable()` hook for further collection types
+  (map, host collections) is documented in `../ROADMAP.md`; only the slice and
+  array cases are implemented now.
+- **Element variable type.** For a slice, `x` gets the slice's **element
+  type** (`T` from `T[]`). For an array handle, `x` gets the **inferred
+  element type** — `u8`/`f32`/`i64` from the `array_new` `elem_size` (1→u8,
+  4→f32, 8→i64). In both cases `x` is declared in a fresh per-iteration scope
+  (the loop body's scope, with `x` declared before the body is checked). `x`
+  is immutable per iteration (reassigning it is allowed but overwritten on the
+  next iteration — it is a regular local, not a `const`).
 - **Loop variable scoping.** `x` is in scope only inside the loop body
   (pushed/popped scope per `for-each`); it is not visible after the loop.
   `break`/`continue` inside the body target the for-each (break exits, continue

@@ -964,12 +964,26 @@ The globals block is no longer a flat `i64[]` of 8-byte scalar slots; it is a
 
 ## 17. `for-each` lowering (2026-07-11)
 
-`for (x in slice)` (Tier 1, `ForEachStmt`) desugars to a while-loop-with-
-indexing over the slice's `{ptr, len}` representation. The iterable must be a
-slice `T[]` (sema rejects non-slice iterables, `TYPE_SYSTEM.md` §13); `x` gets
-the element type. The lowering runs in the tree-walker only — the IR backend
-marks a function using for-each as `non_serializable` (falls back to the
-tree-walker), so this section describes the only shipped lowering.
+`for (x in iter)` (Tier 1, `ForEachStmt`) desugars to a while loop. The
+iterable() hook recognizes two iterable kinds (sema selects the branch and
+records it on `ForEachStmt::array_elem_ty`; codegen reads that field):
+
+- **slice T[]** — `array_elem_ty` is null; the slice path runs (the original
+  shipped lowering, 17a below). The iterable must be a slice `T[]`; `x` gets
+  the element type.
+- **array<T> handle** — `array_elem_ty` is set (u8/f32/i64, inferred by sema
+  from the `array_new` elem_size); the array path runs (the iterable() hook's
+  array case, 17b below). The iterable is an opaque i64 handle that sema has
+  PROVEN comes from the array extension (an inline `array_new` call or a `let`
+  tagged at its declaration — a bare i64 that isn't a provable array handle is
+  rejected, so `for (x in 42)` stays an error). `x` gets the inferred element
+  type.
+
+Both lowerings run in the tree-walker only — the IR backend marks a function
+using for-each as `non_serializable` (falls back to the tree-walker), so this
+section describes the only shipped lowering(s).
+
+### 17a. slice for-each (the shipped path)
 
 Frame layout (one set of compiler-hidden locals per for-each, uniquely named
 with a per-function counter so nested for-each never collide):
@@ -1001,10 +1015,42 @@ Emission:
    "budget exceeded at for-each back-edge")`) at the back-edge, then `jmp top`.
 6. **End** (`end` label): fall through to whatever follows the for-each.
 
-The loop context pushed for `break`/`continue` carries `latch` as the continue
-target (so `continue` runs the index increment + budget charge, never skipping
-them) and `end` as the break target. The budget check is at the back-edge (the
-same place `while`'s is), so a for-each is budget-charged once per iteration.
+### 17b. array-handle for-each (the iterable() hook, array case)
+
+The loop shape mirrors 17a but uses the array extension's length + typed-get
+natives instead of ptr+len indexing. `array_get_*` is selected by the inferred
+`array_elem_ty`: u8 → `array_get_u8`, f32 → `array_get_f32`, i64 →
+`array_get_i64`.
+
+Frame layout:
+- `__fe_h$N`   — an i64 slot holding the array handle.
+- `__fe_len$N` — an i64 slot holding `array_length(h)`.
+- `__fe_idx$N` — an i64 slot holding the current index (starts at 0).
+- `x` — the loop variable slot (an 8-byte scalar slot per `local_width_bytes`,
+  the same as any scalar local; `store_slot` writes the native's result at the
+  element width).
+
+Emission:
+1. Evaluate the iterable expression → `rax = handle` (the i64 from an Ident
+   or an inline `array_new` call). Store it to `__fe_h$N`.
+2. `len = array_length(h)`: `sub rsp, 32` (Win64 shadow space; rsp is 16-aligned
+   in the body), load the handle into `rcx`, `emit_counted_named_native`
+   (`array_length`), `add rsp, 32`; store `rax` to `__fe_len$N`.
+3. Store immediate `0` to `__fe_idx$N`.
+4. **Loop top** (`top`): load `idx` and `len`, `cmp`, `jcc ge, end` (same
+   bounds check as 17a step 2).
+5. **Element load.** `sub rsp, 32`, load `h` into `rcx` and `idx` into `rdx`,
+   `emit_counted_named_native` (`array_get_*`), `add rsp, 32`. The result is in
+   `rax` (u8/i64) or `xmm0` (f32); `store_slot(var_off, elem_ty)` writes it to
+   `x`'s slot (normalize_rax + 8-byte mov for ints, movss_mem_xmm for f32).
+6. **Body / latch / end** — identical to 17a steps 4–6 (same `break`/
+   `continue` targets, same back-edge budget check).
+
+The native calls use the same counted-call wrapper (`emit_counted_named_native`)
+as ordinary script-issued native calls, so the call-depth guard and the
+native-binding fixup apply. The 32-byte shadow `sub`/`add` is balanced per call
+and 16-aligned, matching the existing direct-native-call idiom (operator
+overloads, string-conversion natives).
 
 ## 18. `match` lowering (2026-07-11)
 
