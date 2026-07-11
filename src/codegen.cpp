@@ -2,6 +2,8 @@
 #include "engine.hpp"
 #include "context.hpp"   // TrapReason (unified trap surface, v0.4)
 #include "peephole.hpp"  // Stage 1: post-emit peephole pipeline (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4.5)
+#include "thin_lower.hpp"  // Stage A c2: AST -> ThinFunction lowering (the IR-backend path)
+#include "thin_emit.hpp"   // Stage A c3: ThinFunction -> x86-64 emit (the IR-backend path)
 #include <cassert>
 #include <cstring>
 #include <algorithm>
@@ -3400,6 +3402,21 @@ std::vector<uint8_t> build_fn_allowlist(
 }
 
 CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
+    if (ctx.enable_ir_backend) {
+        // Obf fallback: the IR path does not handle @obf_keyed/mba/opaque in
+        // Stage A (host-DLL build-time phase). If the function uses obf, fall
+        // back to the tree-walker for correctness.
+        bool uses_obf = false;
+        for (auto& ann : f.annotations) {
+            if (ann.name == "obf" || ann.name == "obf_keyed") { uses_obf = true; break; }
+        }
+        if (!uses_obf && !(ctx.obf.mba || ctx.obf.opaque || ctx.obf.keyed)) {
+            ThinFunction thf = lower_function(f, ctx);
+            if (!thf.blocks.empty()) return emit_x64(thf, ctx);
+            // empty body / lowering gave up (non_serializable) -> fall through to tree-walker
+        }
+    }
+    // ... existing CG tree-walk continues unchanged (default-off path) ...
     CG cg(ctx, f);
     // prescan: find max_args, makes_calls
     cg.prescan_block(f.body);

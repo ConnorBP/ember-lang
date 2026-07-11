@@ -160,6 +160,18 @@ struct CodeGenCtx {
     // second volatile accumulator, every no-call integer BinExpr".
     bool enable_peephole = false;
     bool enable_local_regalloc = false;
+
+    // --- Stage A: thin three-address IR backend (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4.3 Stage 2) ---
+    // A compile-time AST -> ThinFunction -> x86 path, alternative to the
+    // tree-walker. Default false -> compile_func runs the existing CG tree-walk
+    // UNCHANGED (byte-identical to pre-Stage-A; the ctest gate + lang suite hold).
+    // When true, compile_func calls lower_function() then emit_x64() instead.
+    // The IR path is VALUE-EQUIVALENT (not byte-identical); it is the foundation
+    // for Stage B (.em IR serialization) and Stage C (IR optimization passes).
+    // Composes with enable_peephole (the IR path runs the same post-emit
+    // peephole). Obfuscated functions (@obf_keyed/mba/opaque) fall back to the
+    // tree-walker (the lowering marks them non_serializable; see thin_lower.hpp).
+    bool enable_ir_backend = false;
 };
 
 // Compile one function. Returns the JIT'd bytes + (after finalize) entry.
