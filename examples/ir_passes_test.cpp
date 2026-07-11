@@ -155,6 +155,26 @@ static int64_t call0_i64(M& m, const std::string& fn) {
     return reinterpret_cast<F>(e)();
 }
 
+// ─── D6/D7 helpers (hand-built ThinFunction pass tests) ───
+// Count total instrs across all blocks.
+static size_t total_instrs(const ThinFunction& f) {
+    size_t n = 0;
+    for (const auto& blk : f.blocks) n += blk.instrs.size();
+    return n;
+}
+
+// Run a single named pass on a COPY of f (the original is untouched).
+// Returns {all_preserved, instr_count_after}.
+struct SinglePassResult { bool all_preserved; size_t instr_count; };
+static SinglePassResult run_single_pass(const EmberPassRegistry& reg,
+                                        const char* name, ThinFunction f) {
+    EmberAnalysisManager am;
+    auto pc = reg.create(name);
+    if (!pc) return {false, 0};  // pass not found
+    EmberPreserved pres = pc->run(f, am);
+    return {pres.all_preserved(), total_instrs(f)};
+}
+
 int main() {
     std::printf("=== ir_passes_test: Stage C IR optimization passes ===\n");
 
@@ -283,6 +303,373 @@ int main() {
         } else {
             ck(false, "subst target compile failed");
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // D6: No-op pass paths — passes on functions with no optimizable patterns.
+    // Each pass must return Preserved::all() and leave the IR unchanged.
+    // ═══════════════════════════════════════════════════════════════════════
+    std::printf("\n--- D6: no-op pass paths ---\n");
+
+    // D6a: trivial function fn main()->i64 { return 7; }
+    //   block0: ConstInt dst=v0 imm=7, Return ret=v0.
+    // No optimizable pattern: constprop has nothing to fold (no binop), dce has
+    // no dead defs (v0 is used by Return), cse has no redundancy, licm has no
+    // loop (<3 blocks), forward has no store-load pair, copyprop has no Move.
+    {
+        ThinFunction tf;
+        tf.name = "trivial";
+        ThinBlock b0;
+        b0.id = 0;
+        ThinInstr ci;
+        ci.op = ThinOp::ConstInt;
+        ci.dst = 1;            // v0
+        ci.imm.i = 7;
+        ci.meta.width = 8;
+        b0.instrs.push_back(std::move(ci));
+        b0.term.kind = TermKind::Return;
+        b0.term.ret = 1;       // return v0
+        tf.blocks.push_back(std::move(b0));
+
+        size_t orig = total_instrs(tf);
+        ck(orig == 1, "D6 trivial: original instr count is 1");
+
+        const char* pnames[] = {"constprop", "dce", "cse", "licm", "forward", "copyprop"};
+        for (const char* pn : pnames) {
+            auto r = run_single_pass(reg, pn, tf);
+            char msg[160];
+            std::snprintf(msg, sizeof(msg), "D6 trivial: %s returns Preserved::all()", pn);
+            ck(r.all_preserved, msg);
+            std::snprintf(msg, sizeof(msg), "D6 trivial: %s instr count unchanged (%zu->%zu)",
+                          pn, orig, r.instr_count);
+            ck(r.instr_count == orig, msg);
+        }
+    }
+
+    // D6b: empty-body function (no instrs, void return).
+    //   block0: Return ret=0 (void).
+    // Every pass should return Preserved::all() with zero instrs.
+    {
+        ThinFunction tf;
+        tf.name = "empty";
+        ThinBlock b0;
+        b0.id = 0;
+        b0.term.kind = TermKind::Return;
+        b0.term.ret = 0;       // void return
+        tf.blocks.push_back(std::move(b0));
+
+        size_t orig = total_instrs(tf);
+        ck(orig == 0, "D6 empty: original instr count is 0");
+
+        const char* pnames[] = {"constprop", "dce", "cse", "licm", "forward", "copyprop"};
+        for (const char* pn : pnames) {
+            auto r = run_single_pass(reg, pn, tf);
+            char msg[160];
+            std::snprintf(msg, sizeof(msg), "D6 empty: %s returns Preserved::all()", pn);
+            ck(r.all_preserved, msg);
+            std::snprintf(msg, sizeof(msg), "D6 empty: %s instr count unchanged (%zu->%zu)",
+                          pn, orig, r.instr_count);
+            ck(r.instr_count == orig, msg);
+        }
+    }
+
+    // D6c: function with side-effecting instrs (CallNative + StoreFrame).
+    //   block0:
+    //     v0 = ConstInt 42
+    //     v1 = CallNative "side_effect" args=[v0]   (side-effecting; v1 unused)
+    //     StoreFrame src1=v0 off=-8                 (store to slot -8)
+    //     v2 = LoadFrame off=-8                     (read back — keeps store alive)
+    //     Return v2
+    // DCE must NOT remove the CallNative (side-effecting) or the StoreFrame
+    // (slot -8 is read by LoadFrame → not a dead store). CSE must NOT coalesce
+    // them (CallNative is not pure; StoreFrame is special-cased).
+    {
+        ThinFunction tf;
+        tf.name = "sideeffect";
+        ThinBlock b0;
+        b0.id = 0;
+
+        ThinInstr ci;
+        ci.op = ThinOp::ConstInt;
+        ci.dst = 1;            // v0
+        ci.imm.i = 42;
+        ci.meta.width = 8;
+        b0.instrs.push_back(std::move(ci));
+
+        ThinInstr call;
+        call.op = ThinOp::CallNative;
+        call.dst = 2;          // v1 (unused — tests unused-dst side-effecting calls survive)
+        call.args = {1};       // arg = v0
+        call.arg_frame_offs = {-1};
+        call.meta.native_name = "side_effect";
+        b0.instrs.push_back(std::move(call));
+
+        ThinInstr st;
+        st.op = ThinOp::StoreFrame;
+        st.src1 = 1;           // v0
+        st.meta.frame_off = -8;
+        st.meta.width = 8;
+        b0.instrs.push_back(std::move(st));
+
+        ThinInstr ld;
+        ld.op = ThinOp::LoadFrame;
+        ld.dst = 3;            // v2
+        ld.meta.frame_off = -8;
+        ld.meta.width = 8;
+        b0.instrs.push_back(std::move(ld));
+
+        b0.term.kind = TermKind::Return;
+        b0.term.ret = 3;       // return v2
+        tf.blocks.push_back(std::move(b0));
+
+        size_t orig = total_instrs(tf);
+        ck(orig == 4, "D6 sideeffect: original instr count is 4");
+
+        // DCE must not remove the CallNative or the non-dead StoreFrame.
+        {
+            ThinFunction copy = tf;
+            EmberAnalysisManager am;
+            auto pc = reg.create("dce");
+            EmberPreserved pres = pc->run(copy, am);
+            ck(pres.all_preserved(), "D6 sideeffect: dce returns Preserved::all()");
+            char msg[160];
+            std::snprintf(msg, sizeof(msg), "D6 sideeffect: dce instr count unchanged (%zu->%zu)",
+                          orig, total_instrs(copy));
+            ck(total_instrs(copy) == orig, msg);
+            bool has_call = false, has_store = false;
+            for (const auto& blk : copy.blocks)
+                for (const auto& in : blk.instrs) {
+                    if (in.op == ThinOp::CallNative) has_call = true;
+                    if (in.op == ThinOp::StoreFrame) has_store = true;
+                }
+            ck(has_call, "D6 sideeffect: dce does not remove CallNative");
+            ck(has_store, "D6 sideeffect: dce does not remove StoreFrame (slot is read)");
+        }
+        // CSE must not coalesce the CallNative or the StoreFrame.
+        {
+            ThinFunction copy = tf;
+            EmberAnalysisManager am;
+            auto pc = reg.create("cse");
+            EmberPreserved pres = pc->run(copy, am);
+            ck(pres.all_preserved(), "D6 sideeffect: cse returns Preserved::all()");
+            char msg[160];
+            std::snprintf(msg, sizeof(msg), "D6 sideeffect: cse instr count unchanged (%zu->%zu)",
+                          orig, total_instrs(copy));
+            ck(total_instrs(copy) == orig, msg);
+            bool has_call = false, has_store = false;
+            for (const auto& blk : copy.blocks)
+                for (const auto& in : blk.instrs) {
+                    if (in.op == ThinOp::CallNative) has_call = true;
+                    if (in.op == ThinOp::StoreFrame) has_store = true;
+                }
+            ck(has_call, "D6 sideeffect: cse does not coalesce CallNative");
+            ck(has_store, "D6 sideeffect: cse does not coalesce StoreFrame");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // D7: LICM hoist verification — assert the invariant actually moves from
+    // the loop body to the pre-header, not just value-preservation.
+    // ═══════════════════════════════════════════════════════════════════════
+    std::printf("\n--- D7: LICM hoist verification ---\n");
+
+    // D7a: loop with an invariant Mul — LICM must hoist it from the loop body
+    // to the pre-header.
+    //
+    //   block0 (pre-header): ConstInt v0=100, ConstInt v1=200, Jmp -> block1
+    //   block1 (header):     ConstBool v_cond=1, CondBranch ? block2 : block3
+    //   block2 (latch/body): Mul v2=v0*v1  (INVARIANT), Jmp -> block1 (back-edge)
+    //   block3 (exit):       Return v2
+    //
+    // The invariant (Mul v2=v0*v1) starts in block2 (loop body, NOT the header
+    // — LICM skips the header for hoisting). After LICM it must be in block0
+    // (pre-header) and absent from block2.
+    {
+        ThinFunction tf;
+        tf.name = "licm_loop";
+
+        const VReg v0 = 1, v1 = 2, v2 = 3, v_cond = 4;
+
+        // block0: pre-header
+        ThinBlock b0;
+        b0.id = 0;
+        {
+            ThinInstr c0;
+            c0.op = ThinOp::ConstInt; c0.dst = v0; c0.imm.i = 100; c0.meta.width = 8;
+            b0.instrs.push_back(std::move(c0));
+        }
+        {
+            ThinInstr c1;
+            c1.op = ThinOp::ConstInt; c1.dst = v1; c1.imm.i = 200; c1.meta.width = 8;
+            b0.instrs.push_back(std::move(c1));
+        }
+        b0.term.kind = TermKind::Jmp;
+        b0.term.target = 1;
+        tf.blocks.push_back(std::move(b0));
+
+        // block1: header (CondBranch to block2 or block3)
+        ThinBlock b1;
+        b1.id = 1;
+        {
+            ThinInstr cb;
+            cb.op = ThinOp::ConstBool; cb.dst = v_cond; cb.imm.i = 1;
+            b1.instrs.push_back(std::move(cb));
+        }
+        b1.term.kind = TermKind::Branch;
+        b1.term.cond = v_cond;
+        b1.term.target = 2;       // true  -> block2 (loop body)
+        b1.term.false_target = 3; // false -> block3 (exit)
+        tf.blocks.push_back(std::move(b1));
+
+        // block2: latch/body (Mul v2=v0*v1 + back-edge)
+        ThinBlock b2;
+        b2.id = 2;
+        {
+            ThinInstr mul;
+            mul.op = ThinOp::Mul; mul.dst = v2; mul.src1 = v0; mul.src2 = v1; mul.meta.width = 8;
+            b2.instrs.push_back(std::move(mul));
+        }
+        b2.term.kind = TermKind::Jmp;
+        b2.term.target = 1;       // back-edge -> block1
+        tf.blocks.push_back(std::move(b2));
+
+        // block3: exit (Return v2)
+        ThinBlock b3;
+        b3.id = 3;
+        b3.term.kind = TermKind::Return;
+        b3.term.ret = v2;
+        tf.blocks.push_back(std::move(b3));
+
+        // Helper: does a block contain a Mul with the given src vregs?
+        auto block_has_mul = [](const ThinBlock& blk, VReg s1, VReg s2) -> bool {
+            for (const auto& in : blk.instrs)
+                if (in.op == ThinOp::Mul && in.src1 == s1 && in.src2 == s2)
+                    return true;
+            return false;
+        };
+
+        // Before LICM: Mul is in block2 (loop body), NOT in block0 (pre-header).
+        ck(!block_has_mul(tf.blocks[0], v0, v1), "D7a before: Mul NOT in pre-header (block0)");
+        ck(block_has_mul(tf.blocks[2], v0, v1), "D7a before: Mul IS in loop body (block2)");
+
+        // Run LICM.
+        EmberAnalysisManager am;
+        auto pc = reg.create("licm");
+        EmberPreserved pres = pc->run(tf, am);
+        ck(!pres.all_preserved(), "D7a: licm returns Preserved::none() (changed)");
+
+        // After LICM: Mul is in block0 (pre-header), NOT in block2 (loop body).
+        ck(block_has_mul(tf.blocks[0], v0, v1), "D7a after: Mul IS in pre-header (block0)");
+        ck(!block_has_mul(tf.blocks[2], v0, v1), "D7a after: Mul NOT in loop body (block2)");
+
+        // The hoisted Mul preserves dst + operands + width (value-preservation
+        // at the IR-structure level — the instruction is identical, just moved).
+        bool found_hoisted = false;
+        for (const auto& in : tf.blocks[0].instrs) {
+            if (in.op == ThinOp::Mul && in.src1 == v0 && in.src2 == v1) {
+                found_hoisted = true;
+                ck(in.dst == v2, "D7a: hoisted Mul preserves dst vreg");
+                ck(in.meta.width == 8, "D7a: hoisted Mul preserves width");
+            }
+        }
+        ck(found_hoisted, "D7a: hoisted Mul found in pre-header with correct operands");
+
+        // block2 (loop body) is now empty — its only instr was hoisted.
+        ck(tf.blocks[2].instrs.empty(), "D7a: loop body (block2) empty after hoist");
+
+        // The header's ConstBool was NOT hoisted (LICM skips the header).
+        bool header_has_constbool = false;
+        for (const auto& in : tf.blocks[1].instrs)
+            if (in.op == ThinOp::ConstBool) { header_has_constbool = true; break; }
+        ck(header_has_constbool, "D7a: header ConstBool NOT hoisted (LICM skips header)");
+
+        // The pre-header's ConstInts are still there (LICM doesn't move them).
+        bool prehdr_has_100 = false, prehdr_has_200 = false;
+        for (const auto& in : tf.blocks[0].instrs) {
+            if (in.op == ThinOp::ConstInt && in.imm.i == 100) prehdr_has_100 = true;
+            if (in.op == ThinOp::ConstInt && in.imm.i == 200) prehdr_has_200 = true;
+        }
+        ck(prehdr_has_100, "D7a: pre-header ConstInt 100 still present");
+        ck(prehdr_has_200, "D7a: pre-header ConstInt 200 still present");
+    }
+
+    // D7b: loop with NO invariant instrs — LICM must return Preserved::all()
+    // and hoist nothing.
+    //
+    //   block0 (pre-header): ConstInt v0=1, Jmp -> block1
+    //   block1 (header):     ConstBool v_cond=1, CondBranch ? block2 : block3
+    //   block2 (latch/body): StoreFrame src1=v0 off=-8, LoadFrame dst=v1 off=-8,
+    //                        Jmp -> block1 (back-edge)
+    //   block3 (exit):       Return v1
+    //
+    // The LoadFrame reads a slot written inside the loop (StoreFrame off=-8) →
+    // NOT invariant. StoreFrame is never hoisted. So nothing is hoistable.
+    {
+        ThinFunction tf;
+        tf.name = "licm_no_invariant";
+
+        const VReg v0 = 1, v_cond = 2, v1 = 3;
+
+        // block0: pre-header
+        ThinBlock b0;
+        b0.id = 0;
+        {
+            ThinInstr c0;
+            c0.op = ThinOp::ConstInt; c0.dst = v0; c0.imm.i = 1; c0.meta.width = 8;
+            b0.instrs.push_back(std::move(c0));
+        }
+        b0.term.kind = TermKind::Jmp;
+        b0.term.target = 1;
+        tf.blocks.push_back(std::move(b0));
+
+        // block1: header
+        ThinBlock b1;
+        b1.id = 1;
+        {
+            ThinInstr cb;
+            cb.op = ThinOp::ConstBool; cb.dst = v_cond; cb.imm.i = 1;
+            b1.instrs.push_back(std::move(cb));
+        }
+        b1.term.kind = TermKind::Branch;
+        b1.term.cond = v_cond;
+        b1.term.target = 2;
+        b1.term.false_target = 3;
+        tf.blocks.push_back(std::move(b1));
+
+        // block2: latch/body (StoreFrame + LoadFrame — neither is invariant)
+        ThinBlock b2;
+        b2.id = 2;
+        {
+            ThinInstr st;
+            st.op = ThinOp::StoreFrame; st.src1 = v0; st.meta.frame_off = -8; st.meta.width = 8;
+            b2.instrs.push_back(std::move(st));
+        }
+        {
+            ThinInstr ld;
+            ld.op = ThinOp::LoadFrame; ld.dst = v1; ld.meta.frame_off = -8; ld.meta.width = 8;
+            b2.instrs.push_back(std::move(ld));
+        }
+        b2.term.kind = TermKind::Jmp;
+        b2.term.target = 1;   // back-edge
+        tf.blocks.push_back(std::move(b2));
+
+        // block3: exit
+        ThinBlock b3;
+        b3.id = 3;
+        b3.term.kind = TermKind::Return;
+        b3.term.ret = v1;
+        tf.blocks.push_back(std::move(b3));
+
+        size_t orig = total_instrs(tf);
+
+        EmberAnalysisManager am;
+        auto pc = reg.create("licm");
+        EmberPreserved pres = pc->run(tf, am);
+        ck(pres.all_preserved(), "D7b: licm returns Preserved::all() (no invariant to hoist)");
+        ck(total_instrs(tf) == orig, "D7b: licm instr count unchanged (nothing hoisted)");
+
+        // block2 still has both instrs (StoreFrame + LoadFrame).
+        ck(tf.blocks[2].instrs.size() == 2, "D7b: loop body still has 2 instrs (nothing hoisted)");
     }
 
     std::printf("\n%s\n", g_fail ? "FAIL" : "PASS");
