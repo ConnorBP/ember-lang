@@ -355,8 +355,10 @@ integer-only).
 ### 11.4 `sizeof` / `offsetof`
 
 `sizeof(T)` and `offsetof(T, field_name)` are **compile-time
-constants** of type `u64`, usable wherever a `constexpr` is (array
-sizes, `switch` case labels, `constexpr` initializers, Section 11.7).
+constants** of type `u64`, folded to literals at sema (usable as array
+sizes where an integer literal is required, in `switch` case-label
+positions, and in other compile-time-constant contexts — note `constexpr`
+itself is a reserved keyword with no support, Section 11.5).
 `sizeof` works on any type (primitives, structs, arrays, slices  - 
 slice `sizeof` is 16, the two-word `{ptr,len}` representation,
 TYPE_SYSTEM.md Section 4). `offsetof` works only on struct types
@@ -396,7 +398,8 @@ COMPILER_PIPELINE.md Section 2)
   must be `bool`). Budget check placed at the back-edge to the top of
   the body, same as `while` (SAFETY_AND_SANDBOX.md Section 3).
 - `switch (e) { case L: ...; break; ... }` - `e` integer-typed, `L`
-  constexpr integer literals, unique within the switch, in-range for
+  compile-time-constant integer literals (foldable via `try_eval_const_i64`;
+  `constexpr` itself is a reserved keyword with no support, §11.5), unique within the switch, in-range for
   `e`'s type. **No fallthrough**: each case must end in
   `break` or `return` (sema rejects falling off a case
   body - eliminates the entire C-fallthrough footgun class at the
@@ -516,14 +519,16 @@ initialized in a fn (`v3_up()`, `make_config()`).
   folded field-by-field; a **fixed-array** global initializer element-by-element;
   a **slice** global initializer materializes the backing store and folds
   `{ptr, len}`. The folding rule is: a **non-const** field/element initializer
-  (one that is not a literal or a constexpr-foldable expression) folds to
+  (one that is not a literal or a `try_eval_const_i64`-foldable expression) folds to
   **zero** for that field/element, and the rest fold normally. Concretely,
   `global cfg : Config = Config { name_id: 42, scale: 0.0f };` bakes `name_id
   = 42` and `scale = 0.0f` into the struct global's slot; a field whose
   initializer is a call or a runtime expression folds to zero. This is the
   same const-fold restriction the v1 scalar-globals path already enforced
-  (§11.5: v1 restricts `constexpr` to literals, `sizeof`/`offsetof`, and
-  integer arithmetic on other `constexpr` values), extended to aggregate
+  (a const-foldable initializer is a literal or a `try_eval_const_i64`-foldable
+  expression — literals, `sizeof`/`offsetof`, and integer arithmetic on other
+  foldable values; note `constexpr` itself is a reserved keyword with no
+  support, §11.5), extended to aggregate
   fields/elements. A handle-typed global (e.g. a sync `spsc` handle) still
   needs a call initializer for the type-check and still starts at 0 until
   `@entry` reassigns it (the aggregate-globals pass did not add a handle

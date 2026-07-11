@@ -605,8 +605,9 @@ struct IrFunction {
   non-local and bypasses defer cleanup; no exception unwinding is implemented.
 - **`switch` statement**: scrutinee is a compile-time-known integer
   type (signed or unsigned, any width) - non-integer scrutinee is a
-  compile error. Case labels must be `constexpr` integer literals
-  (TYPE_SYSTEM.md Section 11), unique within the switch, and within the
+  compile error. Case labels must be compile-time-constant integer
+  literals (`try_eval_const_i64`-foldable; TYPE_SYSTEM.md Section 11),
+  unique within the switch, and within the
   scrutinee type's range. Lowering: if the case-label set is dense
   (max-min < ~2×count, heuristic) emit a jump table (rodata array of
   rel32 targets, indexed by `scrutinee - min`); else emit a
