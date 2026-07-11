@@ -44,27 +44,74 @@ wiring to the B1 model (the `--tick` thread-safety bug, fixed), and a demo
 script (`examples/scripts/dynamic_registration.ember`). See
 `planning/v1.0_INTEGRATION_NOTES.md` §5.
 
-The current tree configures 42 CTest targets total (40 excluding the two
+The current tree configures 54 CTest targets total (52 excluding the two
 bench targets `bench_codegen_paths` and `bench_ember_vs_as`; the latter is
 only configured when the AngelScript SDK is present, so a no-SDK build
-configures 41). The four `plan_*.md` files in `docs/` are historical design
+configures 53). `cd buildt && ctest -E bench --timeout 30` → 52/52 pass.
+The four `plan_*.md` files in `docs/` are historical design
 records; shipped contracts in the main docs take precedence where those plans
 describe earlier states.
 
-## Self-hosting (the north star — work started)
+## Self-hosting (the north star — MILESTONE REACHED 2026-07-11)
 
-**Status: IN PROGRESS (foundation laid).** The long-term goal is an ember
+**Status: SELF-HOSTING MILESTONE REACHED.** The long-term goal is an ember
 compiler written in ember — the language hosting itself. This is NOT a
 non-goal (corrected from an earlier roadmap revision that listed it there);
-it is the direction the language is growing toward.
+it is the direction the language is growing toward, and the first concrete
+milestone is now done: **a single ember script chains all four self-hosted
+compiler stages (lexer + parser + sema + codegen, each written IN ember) and
+EXECUTES the emitted x64 via the host `call_raw` native** — ember source
+compiled by the ember-written compiler, then run. See
+`self_hosted/full_pipeline.ember` (the demo) + `self_hosted/full_pipeline_test.ember`
+(the 13-check test, exits 0):
 
-**Work already done:** `demo/compiler/` is a complete µ-language
-lexer/parser/evaluator written entirely in ember source (`lex.ember`,
-`parse.ember`, `eval.ember`, `main.ember`). It stresses the pure-compute
-language surface — enum, struct, switch, slices, recursion, fn-ref handles,
-fixed arrays, import — and proves ember can host a compiler. The demo parses
-`let a = 1 + 2 * 3; a + 10` → 17 with correct precedence, left-associativity,
-parens, and divide-by-zero detection.
+    ./buildt/ember_cli.exe run self_hosted/full_pipeline.ember      --fn run_demo --ffi   # -> 7
+    ./buildt/ember_cli.exe run self_hosted/full_pipeline_test.ember --fn main    --ffi   # -> 0
+
+The canonical proof: `fn main() -> i64 { return 1 + 2 * 3; }` is lexed,
+parsed, type-checked, codegen'd to x64 bytes, copied to a W^X executable
+page (`make_executable`), and invoked (`call_raw`) — returning 7
+(1 + (2*3)), the correct precedence-respecting result.
+
+**The four self-hosted stages (each written in ember, each with its own
+passing test):**
+- **Stage 1 — lexer** (`self_hosted/lex.ember`, 910 lines): a full port of
+  `src/lexer.cpp`. Lexes ember's complete v1 token set (every keyword,
+  operator, literal, comment form) → a flat token store. Test:
+  `self_hosted/lex_test.ember` (9 tests, exits 0).
+- **Stage 2 — parser** (`self_hosted/parse.ember`, 2015 lines): a port of
+  `src/parser.cpp`. Recursive-descent, builds an AST in a flat node pool
+  (first-child + next-sibling linking). Test: `self_hosted/parse_test.ember`
+  (exits 0).
+- **Stage 3 — sema** (`self_hosted/sema.ember`, 1226 lines): a port of the
+  core passes of `src/sema.cpp`. Type-checks fn/let/if/while/for/return,
+  arithmetic + bitwise + comparison + logical ops, unary, calls, globals.
+  Test: `self_hosted/sema_test.ember` (12 positive + 10 negative, exits 0).
+- **Stage 4 — codegen** (`self_hosted/codegen.ember`, 1337 lines): a port of
+  the core x64 emission of `src/codegen.cpp` + `src/x64_emitter.hpp`. Emits
+  x64 bytes into an `array<u8>` (prologue/epilogue, locals, binary/unary ops,
+  calls, control flow, short-circuit logic). Test:
+  `self_hosted/codegen_test.ember` (21 byte-pattern checks, exits 0).
+- **Execution bridge** (`extensions/call_raw/`): three PERM_FFI-gated host
+  natives — `make_executable(array<u8>) -> fn_ptr` (copies bytes to a W^X RX
+  page), `call_raw(fn_ptr, arg) -> i64` (invokes the entry),
+  `free_executable_ptr(ptr)` (releases the page). This is the gap the
+  `plan_SELF_HOSTING.md` Stage 4 entry identified; it is now closed.
+
+**Current state — a SUBSET, not the full language.** The self-hosted
+compiler handles a deliberate v1 subset of ember: i64/bool/void params +
+returns, let (typed + auto), if/while/for, return, arithmetic + bitwise +
+comparison + logical binary ops, unary `-`/`!`/`~`, calls to i64→i64 fns (up
+to 4 Win64-register args), int/bool literals, identifiers. Struct/enum/
+field-access/indexing/slice type-checking, lambdas, coroutines, the IR
+backend, and the full native/overload surface are NOT yet ported — expanding
+the self-hosted compiler to the full language is the ongoing work. The
+codegen also emits call targets as a placeholder `mov rax, 0; call rax` (the
+fn entry address the host fills at JIT time); `make_executable` copies bytes
+verbatim without patching placeholders, so the end-to-end demo uses a single
+self-contained fn (no calls) whose bytes are directly executable. Closing
+that (a self-hosted dispatch-table patch, or a self-hosted linker) is part of
+the subset→full expansion.
 
 **The path to full self-hosting** (each step is a TODO below or in the tiers;
 steps marked ✓ are done):
@@ -76,14 +123,83 @@ steps marked ✓ are done):
 3. **Map extension** (shipped) — symbol tables, AST node pools.
 4. **Lambdas with capture** (Tier 3/GC) — a real compiler uses closures for
    visitor patterns, scope chains, error accumulators.
-5. **The ember-written ember lexer/parser/sema** — port the C++ frontend to
-   ember, one stage at a time, validating each against the C++ reference.
-6. **The ember-written ember codegen** — emit x86-64 (or ThinFunction IR)
-   from ember. This needs the JIT/memory natives (shipped as host extensions)
-   and is the final self-hosting milestone.
+5. **The ember-written ember lexer/parser/sema** ✓ shipped 2026-07-11 —
+   all three stages ported to ember (`self_hosted/lex.ember`,
+   `parse.ember`, `sema.ember`), each validated against the C++ reference.
+6. **The ember-written ember codegen** ✓ shipped 2026-07-11 — emits x86-64
+   from ember (`self_hosted/codegen.ember`) + the `call_raw`/
+   `make_executable` execution natives. **The self-hosting milestone is
+   reached**: `full_pipeline.ember` compiles + runs ember end-to-end.
+7. **Subset → full language** (ongoing) — expand the self-hosted compiler
+   from the v1 subset to ember's full surface (struct/enum/field-access/
+   indexing/slices, lambdas, the IR backend, the native/overload table),
+   + a self-hosted dispatch/linker so multi-fn programs execute end-to-end.
+   This is the work that turns the milestone into a bootstrap.
 
 This is a multi-month effort, not a single feature. Every language feature
-shipped (constexpr, lambdas, GC, the standard addons) is a step toward it.
+shipped (constexpr, lambdas, GC, the standard addons) is a step toward it,
+and the milestone reached this session is the first concrete proof that the
+path is real: ember can compile + run ember.
+
+## Session 2026-07-11 summary — self-hosting milestone + .em hardening
+
+This session landed the self-hosting milestone (above) + a red-team `.em`
+format hardening pass + several fixes. The full commit log (oldest → newest):
+
+- **Plan: self-hosting** (`b07841a`) — `docs/planning/plan_SELF_HOSTING.md`,
+  the 4-stage port path (lex → parse → sema → codegen → bootstrap) with the
+  `call_raw` native identified as the Stage 4 execution gap.
+- **Red team: `.em` format security audit** (`6dfd8f8`) —
+  `docs/audit/EM_FORMAT_RED_TEAM_2026-07-11.md`. Answered the two open
+  questions: (1) almost every ember safety property is compile-side-only (a
+  hand-crafted `.em` bypasses sema/the lowerer/codegen guard-emission; the
+  loader trusts the bytes); (2) raw x86 (v1–v4) is an arbitrary-code-
+  execution surface by construction. Documented two new confirmed
+  vulnerabilities (Finding A + B, fixed in the next commit) + the full
+  compile-side/load-side classification + the raw-x86/IR attack-surface
+  analysis. Added `examples/em_redteam_audit_test.cpp` (ctest `em_redteam_audit`).
+- **Security: `.em` Finding A + B fixed + raw x86 v1–v4 dropped** (`fd5304d`):
+  - **Finding A** — the v5 IR validator's `frame_off` bounds check was
+    skipped when `frame_size == 0`, so a hand-crafted IR could write outside
+    the frame (overwrite the return address). Fixed: the check now applies
+    regardless of `frame_size`.
+  - **Finding B** — `PERM_FFI` / native permission bits were compile-side-
+    only (sema enforced them); the loader's native binding resolution never
+    read `NativeSig::permission`, so a hand-crafted `.em` could reference
+    `PERM_FFI`-gated natives without the permission. Fixed: load-side
+    permission enforcement added.
+  - **Raw x86 v1–v4 dropped** — the historical raw-x86 format versions (an
+    arbitrary-code-execution surface by construction, accepted in dev mode)
+    are no longer accepted. The v5 IR path (re-lowered + validated at load
+    time) is the only code-carrying path.
+- **Self-hosting Stage 1 — lexer** (`ac7425f`) — `self_hosted/lex.ember`
+  (910 lines) + `lex_test.ember`.
+- **Self-hosting Stage 2 — parser** (`0022102` + `bfa1ffe`) —
+  `self_hosted/parse.ember` (2015 lines) + `parse_test.ember`. Includes the
+  lambda-as-arg off-by-1 + nested-lambda-capture fixes (`1343786`) that the
+  parser port surfaced.
+- **Self-hosting Stage 3 — sema** (`d38a815`) — `self_hosted/sema.ember`
+  (1226 lines) + `sema_test.ember` (12 positive + 10 negative type-check
+  cases).
+- **Self-hosting Stage 4 — codegen** (`e1f81c2` + `b6c81eb`) —
+  `self_hosted/codegen.ember` (1337 lines) + `codegen_test.ember` (21
+  byte-pattern checks) + the `call_raw(fn_ptr, arg) -> i64` native
+  (`extensions/call_raw/`, `examples/call_raw_test.cpp` → ctest `call_raw`).
+- **Self-hosting milestone: end-to-end full pipeline** (`ef0f3ea`) —
+  `self_hosted/full_pipeline.ember` (the demo: ember compiles + runs ember,
+  `--fn run_demo --ffi` → 7) + `self_hosted/full_pipeline_test.ember` (13
+  checks, `--fn main --ffi` → 0). Added `make_executable` +
+  `free_executable_ptr` to the `call_raw` extension (the array<u8>→RX-page
+  bridge `call_raw` needs) + fixed a codegen epilogue-label bug (the implicit
+  `mov rax, 0` was emitted after the epilogue label bind, clobbering every
+  `return <expr>` to 0; the byte-pattern `codegen_test` never executed the
+  code so the bug was hidden — the end-to-end pipeline caught it).
+
+**Test count:** the session took ctest from 49 → 54 targets (52 excluding
+the two bench targets). `cd buildt && ctest -E bench --timeout 30` → 52/52
+pass. The five self-hosted stage + pipeline tests run via
+`./buildt/ember_cli.exe run self_hosted/<stage>_test.ember --fn main` (the
+pipeline test needs `--ffi` for the `call_raw`/`make_executable` natives).
 
 ## Tier 0 - standard addon set (ships with v1.0, host C++ side)
 
@@ -629,8 +745,13 @@ here so the decision and its evidence have a tracked home.
 - **Self-hosting is NOT a non-goal** — it is the long-term north star (see
   the Self-Hosting section above). This entry existed in an earlier roadmap
   revision and is corrected here: the compiler staying C++ forever is NOT
-  the plan. Work has started (`demo/compiler/` is a µ-language
-  lexer/parser/evaluator written entirely in ember).
+  the plan. **The first self-hosting milestone is reached (2026-07-11):**
+  all four compiler stages (lexer + parser + sema + codegen) are ported to
+  ember (`self_hosted/*.ember`), and `full_pipeline.ember` chains them into
+  an end-to-end pipeline that compiles + EXECUTES ember source via the host
+  `call_raw`/`make_executable` natives. The self-hosted compiler currently
+  handles a subset of ember; expanding it to the full language is the
+  ongoing work (step 7 of the path above).
 
 ## Re-evaluation cadence
 
