@@ -1,0 +1,22 @@
+# pipe_2stage.pipe — a 2-stage dataflow pipeline config (Family C: ember pipe).
+#
+# Config format (one directive per line, # comments):
+#   module <alias> <path>      path is .ember (compiled) or .em (loaded)
+#   stage  <alias>::<function> one stage per line, in chain order
+#   input  <start> <count>     stream: start..start+count-1 (default 1 5)
+#
+# This config wires pipe_a.process -> pipe_b.reduce and runs the stream
+# 1..5 through it:
+#   1 -> process(1)=2  -> reduce(2)=6
+#   2 -> process(2)=3  -> reduce(3)=9
+#   3 -> process(3)=4  -> reduce(4)=12
+#   4 -> process(4)=5  -> reduce(5)=15
+#   5 -> process(5)=6  -> reduce(6)=18
+#   sum = 6+9+12+15+18 = 60  (the exit code, mod 2^31)
+#
+# Run: ember pipe tests/features/pipe_2stage.pipe   (must exit 60)
+module A pipe_a.ember
+module B pipe_b.ember
+stage A::process
+stage B::reduce
+input 1 5

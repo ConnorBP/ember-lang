@@ -1,0 +1,9 @@
+// pipe_b.ember — stage B of the dataflow pipeline test (Family C: ember pipe).
+// A single-arg i64->i64 function `reduce` that triples its input. This is the
+// second stage of the linear chain A.process -> B.reduce.
+//
+// Loaded by `ember pipe tests/features/pipe_2stage.pipe`. The pipe runner
+// compiles this module, looks up `reduce` by name, and feeds A's output into it.
+fn reduce(x: i64) -> i64 {
+    return x * 3;
+}

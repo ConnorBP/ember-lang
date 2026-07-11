@@ -1,0 +1,10 @@
+// pipe_c.ember — stage C of the 3-stage dataflow pipeline test (Family C).
+// A single-arg i64->i64 function `square` that squares its input. This is the
+// third stage of the linear chain A.process -> B.reduce -> C.square, used by
+// the 3-stage pipe config to exercise a longer chain.
+//
+// Loaded by `ember pipe tests/features/pipe_3stage.pipe`. The pipe runner
+// compiles this module, looks up `square` by name, and feeds B's output into it.
+fn square(x: i64) -> i64 {
+    return x * x;
+}

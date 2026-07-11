@@ -50,6 +50,7 @@
 #include "../src/context.hpp"     // context_t, TrapStub, TrapReason (v0.4 safe execution)
 #include "../src/module_registry.hpp" // v0.5 live modules (ModuleRegistry)
 #include "../src/module_linker.hpp"  // v0.5 live modules (link_em_file, build_*_exports)
+#include "../src/hot_reload.hpp"    // Family C: `ember live` (HotReloadDomain + ExecutionGuard)
 #include "../src/em_loader.hpp"      // v0.5 live modules (LoadedModule, for linked .em modules)
 #include "../src/em_file.hpp"        // v0.5 --emit-em (EmModule/EmFunctionRecord)
 #include "../src/em_writer.hpp"       // v0.5 --emit-em (write_em_file)
@@ -161,6 +162,9 @@ static void usage(FILE* out) {
         "  ember run --load-em <input.em> [--fn NAME]\n"
         "  ember bench <input.ember> [--fn NAME] [--iters N] [--warmup N]\n"
         "  ember test [dir]     run every .ember file in <dir> (default tests/lang/)\n"
+        "  ember pipe <config>  run a dataflow pipeline (Family C)\n"
+        "  ember live <file.ember> [--tick [--tick-count N] [--tick-interval MS]\n"
+        "                       [--poll-ms MS]]  live-coding reload runner (Family C)\n"
         "\n"
         "  run                 compile and call the entry function\n"
         "  emit-em             compile without running and write <output.em>\n"
@@ -173,6 +177,20 @@ static void usage(FILE* out) {
         "                      convention), compile+run or sema-check each, compare\n"
         "                      actual vs expected, print TAP-ish summary, exit\n"
         "                      non-zero if any failed\n"
+        "  pipe                dataflow pipeline runner: load several modules (.ember\n"
+        "                      compiled or .em loaded), wire their functions into a\n"
+        "                      linear chain of i64->i64 stages, run a stream of i64\n"
+        "                      values through it, report the transformed result.\n"
+        "                      Exit code = sum of outputs (mod 2^31). Config is a\n"
+        "                      text file: `module <alias> <path>`, `stage\n"
+        "                      <alias>::<fn>`, `input <start> <count>` (default 1 5)\n"
+        "  live                live-coding/reload runner: compile <file.ember>, run\n"
+        "                      @on_tick in a loop, poll the file content, recompile +\n"
+        "                      reload on change so the tick output evolves live.\n"
+        "                      Uses HotReloadDomain + ExecutionGuard (the hot-reload\n"
+        "                      API). --tick-count N auto-stops; otherwise runs until\n"
+        "                      'q'\n"
+        "  --poll-ms MS        live: file-content poll interval (default 500)\n"
         "  --fn NAME           entry function (default: main)\n"
         "  --dump              print each compiled fn: name, slot, byte size, reloc count\n"
         "  --emit-em PATH      run-mode precompile output; compile and write without running\n"
@@ -827,6 +845,512 @@ static int run_test_command(const std::string& dir) {
     return failed > 0 ? 1 : 0;
 }
 
+// ---- Family C: shared compile-to-state helper ----
+// compile_script is the compile portion of run_ember_file (read -> imports ->
+// lex -> parse -> sema -> codegen -> finalize), returning the compiled state
+// (fns, dispatch table, slots, globals, program) WITHOUT calling any function
+// and WITHOUT cleanup. The caller owns the returned state and must keep it
+// alive for as long as any JIT'd entry is callable. Used by `ember pipe`
+// (several modules alive simultaneously) and `ember live` (recompiled on file
+// change). Mirrors run_ember_file's proven flow exactly; the difference is the
+// state is RETURNED, not consumed + cleaned up in place.
+//
+// The returned CompiledScript keeps the ModuleRegistry + linked .em modules
+// alive (their base/dispatch addresses are baked into the JIT'd code as imm64
+// relocs and dereferenced at call time), so a pipe/live module that uses live
+// `link "x.em" as x;` directives keeps working after compile returns.
+struct CompiledScript {
+    std::vector<ember::CompiledFn> fns;
+    std::unique_ptr<ember::DispatchTable> table;
+    std::unordered_map<std::string, int> slots;
+    std::unordered_map<std::string, void*> entries;  // fn name -> entry ptr
+    ember::GlobalsBlock gb;
+    std::vector<uint8_t> gb_store;
+    ember::Program prog;
+    ember::StructLayoutTable struct_layouts;
+    std::unique_ptr<ember::ModuleRegistry> registry;     // kept alive (base baked into fns)
+    std::vector<ember::LoadedModule> linked_ems;          // kept alive (dispatch baked into fns)
+    bool ok = false;
+
+    CompiledScript() = default;
+    ~CompiledScript() { for (auto& fn : fns) if (fn.exec) ember::free_executable(fn.exec); }
+    CompiledScript(const CompiledScript&) = delete;
+    CompiledScript& operator=(const CompiledScript&) = delete;
+    CompiledScript(CompiledScript&&) noexcept = default;
+    CompiledScript& operator=(CompiledScript&&) noexcept = default;
+};
+
+static std::unique_ptr<CompiledScript> compile_script(
+        const std::string& file_path,
+        const std::unordered_map<std::string, ember::NativeSig>& natives,
+        const ember::OpOverloadTable& overloads,
+        std::string& err) {
+    using namespace ember;
+    auto cs = std::make_unique<CompiledScript>();
+
+    if (!fs::exists(file_path)) { err = "no such file: " + file_path; return nullptr; }
+    std::string raw = read_file(file_path.c_str());
+    if (raw.empty() && fs::file_size(file_path) > 0) { err = "cannot read " + file_path; return nullptr; }
+    if (raw.empty()) { err = "empty file: " + file_path; return nullptr; }
+    std::string base_dir = fs::path(file_path).parent_path().string();
+    std::unordered_set<std::string> seen;
+    std::string src;
+    try {
+        seen.insert(fs::weakly_canonical(fs::path(file_path)).string());
+        src = resolve_imports(raw, base_dir, seen);
+    } catch (const std::exception& e) { err = std::string("import error: ") + e.what(); return nullptr; }
+
+    auto lr = tokenize(src, file_path.c_str());
+    if (!lr.ok) { err = "lex error (" + std::to_string(lr.err_line) + ":" + std::to_string(lr.err_col) + "): " + lr.error; return nullptr; }
+    auto pr = parse(std::move(lr.toks));
+    if (!pr.ok) { err = "parse error: " + pr.error; return nullptr; }
+    if (pr.program.funcs.empty()) { err = "no functions in " + file_path; return nullptr; }
+    cs->prog = std::move(pr.program);
+
+    std::unordered_map<std::string, int> slots;
+    int si = 0;
+    for (auto& fn : cs->prog.funcs) { slots[fn.name] = si++; fn.slot = slots[fn.name]; }
+    cs->slots = slots;
+
+    cs->struct_layouts = build_struct_layouts(cs->prog);
+    cs->prog.string_xor_key = 0xA5;
+
+    cs->registry = std::make_unique<ModuleRegistry>(64);
+    ModuleExportTable module_exports;
+    for (const auto& ld : cs->prog.links) {
+        if (ld.is_file) {
+            std::string path = ld.target;
+            if (!path.empty() && !(path[0]=='/'||path[0]=='\\') && (path.size()<2||path[1]!=':')) {
+                path = fs::weakly_canonical(fs::path(base_dir) / path).string();
+            }
+            cs->linked_ems.emplace_back();
+            std::string lerr;
+            if (!link_em_file(*cs->registry, path.c_str(), ld.alias, cs->linked_ems.back(), &lerr, &natives)) {
+                err = "link '" + ld.target + "' failed: " + lerr; return nullptr;
+            }
+            uint32_t id = cs->registry->find_by_name(ld.alias);
+            add_exports(module_exports, ld.alias, build_em_exports(cs->linked_ems.back(), id));
+        }
+    }
+
+    auto sr = sema(cs->prog, natives, slots, 0, &overloads, &cs->struct_layouts, &module_exports);
+    if (!sr.ok) {
+        err = "sema errors: ";
+        for (auto& e : sr.errors) err += "line " + std::to_string(e.line) + ": " + e.msg + "; ";
+        return nullptr;
+    }
+
+    TypedGlobalsLayout tgl = compute_typed_globals_layout(cs->prog, cs->struct_layouts);
+    cs->gb_store.assign(size_t(tgl.total_size), 0);
+    cs->gb.base = int64_t(cs->gb_store.data());
+    {
+        uint32_t gi = 0;
+        for (auto& g : cs->prog.globals) {
+            cs->gb.index[g.name] = gi++;
+            cs->gb.types[g.name] = g.ty.get();
+            cs->gb.offsets[g.name] = tgl.offsets[g.name];
+            cs->gb.sizes[g.name] = tgl.sizes[g.name];
+        }
+    }
+    g_globals_for_codegen = nullptr;
+    auto string_alloc_thunk = [](const char* bytes, int64_t len) -> int64_t {
+        return ember::ext_string::alloc(std::string(bytes, size_t(len > 0 ? len : 0)));
+    };
+    GlobalInitCtx gic{cs->gb_store, cs->gb.index, cs->gb.types};
+    gic.string_alloc_fn = string_alloc_thunk;
+    gic.offsets = &cs->gb.offsets;
+    gic.sizes = &cs->gb.sizes;
+    gic.backing_offsets = &tgl.backing_offsets;
+    gic.structs = &cs->struct_layouts;
+    eval_global_initializers(cs->prog, gic);
+
+    cs->table = std::make_unique<DispatchTable>(cs->prog.funcs.size());
+    CodeGenCtx ctx;
+    ctx.globals_base = cs->gb.base;
+    ctx.globals_index = &cs->gb.index;
+    ctx.globals_types = &cs->gb.types;
+    ctx.globals_offsets = &cs->gb.offsets;
+    ctx.dispatch_base = int64_t(cs->table->base());
+    ctx.natives = &natives;
+    ctx.script_slots = &cs->slots;
+    ctx.structs = &cs->struct_layouts;
+    ctx.registry_base = int64_t(cs->registry->base());
+    // safe-execution (match run_ember_file: context reg + budgets + trap stub)
+    ctx.trap_stub = reinterpret_cast<void*>(&ember_cli_trap);
+    ctx.use_context_reg = true;
+    ctx.emit_budget_checks = true;
+    ctx.max_call_depth = 512;
+    ctx.emit_depth_checks = true;
+    std::vector<uint8_t> fn_allowlist = build_fn_allowlist(cs->slots, int(cs->slots.size()));
+    ctx.fn_allowlist_base = int64_t(fn_allowlist.data());
+    ctx.fn_slot_count = int64_t(cs->slots.size());
+
+    cs->fns.reserve(cs->prog.funcs.size());
+    for (auto& fn : cs->prog.funcs) {
+        CompiledFn cf = compile_func(fn, ctx);
+        if (!finalize(cf)) { err = "alloc_executable failed for " + fn.name; return nullptr; }
+        cs->table->set(fn.slot, cf.entry);
+        cs->entries[fn.name] = cf.entry;
+        cs->fns.push_back(std::move(cf));
+    }
+    cs->ok = true;
+    return cs;
+}
+
+// ---- Family C: `ember pipe` — dataflow pipeline runner ----
+// (docs/ROADMAP.md Family C). Loads several modules (.ember compiled from
+// source or .em loaded via the bundler), wires their named functions into a
+// linear chain of single-arg i64->i64 stages, runs a stream of i64 values
+// through it, and reports the transformed result (each value's final output +
+// the sum). The exit code is the sum (mod 2^31) so a test harness can verify
+// the pipeline by exit code. Exercises the bundler (load_em_file for .em
+// modules) + module linking (the host wires module outputs to module inputs)
+// + the compile path. The host orchestrates the chain (call stage[0](value) ->
+// stage[1](result) -> ...) — no script-to-script cross-module calls needed for
+// v1's linear chain, so each module is compiled standalone against its own
+// dispatch table + registry.
+//
+// Config format (a simple text file, one directive per line, `#` comments):
+//   module <alias> <path>      path is .ember (compiled) or .em (loaded)
+//   stage  <alias>::<function> one stage per line, in chain order
+//   input  <start> <count>     stream: start..start+count-1 (default: 1 5)
+// Module paths are resolved relative to the config file's directory.
+static int run_pipe_command(const std::string& config_path) {
+    using namespace ember;
+    if (!fs::exists(config_path)) {
+        std::fprintf(stderr, "ember pipe: no such config: %s\n", config_path.c_str());
+        return 2;
+    }
+    std::ifstream cf(config_path);
+    if (!cf) { std::fprintf(stderr, "ember pipe: cannot read %s\n", config_path.c_str()); return 2; }
+    std::string config_dir = fs::path(config_path).parent_path().string();
+
+    struct StageDecl { std::string alias; std::string fn; };
+    struct ModuleDecl { std::string alias; std::string path; };
+    std::vector<ModuleDecl> modules;
+    std::vector<StageDecl> stages;
+    long long input_start = 1; long long input_count = 5;
+
+    std::string line;
+    while (std::getline(cf, line)) {
+        auto hash = line.find('#');
+        if (hash != std::string::npos) line = line.substr(0, hash);
+        auto first = line.find_first_not_of(" \t\r");
+        if (first == std::string::npos) continue;
+        line = line.substr(first);
+        std::istringstream iss(line);
+        std::string kw; iss >> kw;
+        if (kw == "module") {
+            ModuleDecl m; iss >> m.alias >> m.path;
+            if (m.alias.empty() || m.path.empty()) {
+                std::fprintf(stderr, "ember pipe: bad module line (need <alias> <path>)\n"); return 2;
+            }
+            modules.push_back(m);
+        } else if (kw == "stage") {
+            std::string ref; iss >> ref;
+            auto sep = ref.find("::");
+            if (sep == std::string::npos) {
+                std::fprintf(stderr, "ember pipe: bad stage '%s' (expected alias::fn)\n", ref.c_str()); return 2;
+            }
+            StageDecl s; s.alias = ref.substr(0, sep); s.fn = ref.substr(sep + 2);
+            if (s.alias.empty() || s.fn.empty()) {
+                std::fprintf(stderr, "ember pipe: bad stage '%s'\n", ref.c_str()); return 2;
+            }
+            stages.push_back(s);
+        } else if (kw == "input") {
+            iss >> input_start >> input_count;
+            if (input_count < 0) input_count = 0;
+        } else if (!kw.empty()) {
+            std::fprintf(stderr, "ember pipe: unknown directive '%s'\n", kw.c_str()); return 2;
+        }
+    }
+
+    if (modules.empty()) { std::fprintf(stderr, "ember pipe: no modules declared\n"); return 2; }
+    if (stages.empty()) { std::fprintf(stderr, "ember pipe: no stages declared\n"); return 2; }
+
+    // resolve module paths relative to the config file's directory
+    for (auto& m : modules) {
+        if (!m.path.empty() && !(m.path[0]=='/'||m.path[0]=='\\') && (m.path.size()<2||m.path[1]!=':')) {
+            m.path = fs::weakly_canonical(fs::path(config_dir) / m.path).string();
+        }
+    }
+
+    // register standard bindings once (shared across all modules — the native
+    // fn_ptrs are stable process-global C functions; rebuilding the map is
+    // idempotent. Each module bakes the same fn_ptrs into its JIT code).
+    std::unordered_map<std::string, NativeSig> natives;
+    OpOverloadTable overloads;
+    register_standard_bindings(natives, &overloads);
+
+    // compile/load each module. .ember -> compile_script; .em -> load_em_file
+    // (exercises the bundler). Both populate the entries map (name -> entry).
+    std::vector<std::unique_ptr<CompiledScript>> mods;
+    std::unordered_map<std::string, CompiledScript*> mod_by_alias;
+    std::vector<LoadedModule> em_mods;  // keep .em modules alive (own their pages)
+    em_mods.reserve(modules.size());     // no reallocation: dispatch buffer addrs stay stable
+    mods.reserve(modules.size());
+    for (auto& m : modules) {
+        auto cs = std::make_unique<CompiledScript>();
+        std::string ext = fs::path(m.path).extension().string();
+        if (ext == ".em") {
+            em_mods.emplace_back();
+            std::string lerr;
+            if (!load_em_file(m.path.c_str(), em_mods.back(), &lerr, nullptr, &natives)) {
+                std::fprintf(stderr, "ember pipe: module '%s' (.em load) failed: %s\n", m.alias.c_str(), lerr.c_str());
+                return 2;
+            }
+            LoadedModule& lm = em_mods.back();
+            for (const auto& kv : lm.name_table) {
+                if (kv.second < lm.dispatch.size())
+                    cs->entries[kv.first] = lm.dispatch[kv.second];
+            }
+        } else {
+            std::string cerr;
+            auto compiled = compile_script(m.path, natives, overloads, cerr);
+            if (!compiled) {
+                std::fprintf(stderr, "ember pipe: module '%s' failed: %s\n", m.alias.c_str(), cerr.c_str());
+                return 2;
+            }
+            cs = std::move(compiled);
+        }
+        mod_by_alias[m.alias] = cs.get();
+        mods.push_back(std::move(cs));
+    }
+
+    // resolve stages -> entry pointers
+    struct StageEntry { std::string alias, fn; void* entry; };
+    std::vector<StageEntry> chain;
+    for (auto& s : stages) {
+        auto it = mod_by_alias.find(s.alias);
+        if (it == mod_by_alias.end()) {
+            std::fprintf(stderr, "ember pipe: stage '%s::%s' references unknown module '%s'\n",
+                         s.alias.c_str(), s.fn.c_str(), s.alias.c_str()); return 2;
+        }
+        auto eit = it->second->entries.find(s.fn);
+        if (eit == it->second->entries.end()) {
+            std::fprintf(stderr, "ember pipe: stage function '%s::%s' not found\n", s.alias.c_str(), s.fn.c_str());
+            return 2;
+        }
+        StageEntry se; se.alias = s.alias; se.fn = s.fn; se.entry = eit->second;
+        chain.push_back(se);
+    }
+
+    std::printf("ember pipe: %zu stage(s), %lld value(s)\n", chain.size(), input_count);
+    for (auto& se : chain)
+        std::printf("  stage %s::%s\n", se.alias.c_str(), se.fn.c_str());
+
+    // run the stream through the chain. One context_t for the whole run;
+    // call_depth is reset before each top-level stage call (the raw B1 thunk
+    // does not reset it). Traps are recoverable via the checkpoint (matches
+    // run_ember_file's safe-execution model).
+    context_t ectx;
+    ectx.budget_remaining = 100000000;
+    ectx.max_call_depth = 512;
+    int64_t sum = 0;
+    bool trapped = false;
+    for (long long i = 0; i < input_count; ++i) {
+        int64_t value = int64_t(input_start + i);
+        int64_t out = value;
+        ectx.has_checkpoint = true;
+        if (__builtin_setjmp(ectx.checkpoint)) {
+            std::fprintf(stderr, "ember pipe: RUNTIME TRAP at value %lld: %s (%s)\n",
+                         (long long)value, ectx.last_error.c_str(), trap_reason_str(ectx.last_trap));
+            trapped = true; break;
+        }
+        for (auto& se : chain) {
+            ectx.call_depth = 0;
+            out = ember_call_i64(se.entry, &ectx, out);
+        }
+        ectx.has_checkpoint = false;
+        std::printf("[%lld] -> %lld\n", (long long)value, (long long)out);
+        sum += out;
+    }
+    ectx.has_checkpoint = false;
+    if (trapped) return 70;
+    std::printf("pipe result sum: %lld\n", (long long)sum);
+    return int(uint64_t(sum) & 0x7fffffff);
+}
+
+// ---- Family C: `ember live` — live-coding/reload runner ----
+// (docs/ROADMAP.md Family C). Compiles <file.ember>, runs @on_tick in a loop
+// (printing each tick's return value so the output evolves), polls the file's
+// mtime/content every poll_ms, and on change recompiles + swaps the module so the tick
+// output reflects the new code. Uses the hot-reload API (HotReloadDomain +
+// ExecutionGuard around each tick call — the documented recipe) for safe page
+// retirement; the full recompile + swap is a v1 simplification (per-function
+// reload_function would require source-span tracking, deferred). --tick-count N
+// auto-stops (for tests/non-interactive); otherwise runs until 'q'.
+//
+// @entry (if present) is called once at load; if it returns <= 0 the module
+// unloads and live exits (matches the --tick stay-loaded contract). If there
+// is no @entry, live starts ticking immediately (a live-coding file can be
+// just @on_tick).
+struct LiveModule {
+    std::unique_ptr<CompiledScript> script;   // the compiled state (fns, table, globals, prog)
+    ember::HotReloadDomain domain;                    // ExecutionGuard around each tick call (hot-reload API)
+    std::vector<ember::AnnotatedFn> ticks;            // @on_tick functions (resolved against script->slots)
+    int tick_slot = -1;                        // the (first) @on_tick slot for fast per-tick call
+};
+
+static std::unique_ptr<LiveModule> make_live_module(
+        const std::string& file_path,
+        const std::unordered_map<std::string, ember::NativeSig>& natives,
+        const ember::OpOverloadTable& overloads,
+        std::string& err) {
+    using namespace ember;
+    auto compiled = compile_script(file_path, natives, overloads, err);
+    if (!compiled) return nullptr;
+    auto lm = std::make_unique<LiveModule>();
+    lm->script = std::move(compiled);
+    auto ticks = get_annotated_functions(lm->script->prog, "@on_tick");
+    if (ticks.empty()) { err = "no @on_tick functions (nothing to live-code)"; return nullptr; }
+    lm->ticks = std::move(ticks);
+    lm->tick_slot = lm->ticks.front().slot;
+    return lm;
+}
+
+static int run_live_command(const std::string& file_path,
+                            int tick_interval_ms, int tick_max, int poll_ms) {
+    using namespace ember;
+    if (!fs::exists(file_path)) {
+        std::fprintf(stderr, "ember live: no such file: %s\n", file_path.c_str());
+        return 2;
+    }
+    std::unordered_map<std::string, NativeSig> natives;
+    OpOverloadTable overloads;
+    register_standard_bindings(natives, &overloads);
+
+    std::string err;
+    auto lm = make_live_module(file_path, natives, overloads, err);
+    if (!lm) {
+        std::fprintf(stderr, "ember live: compile failed: %s\n", err.c_str());
+        return 2;
+    }
+
+    // @entry: call once if present. If it returns <= 0, the module unloads
+    // (no live tick). If no @entry, start ticking immediately.
+    auto entry_fns = get_annotated_functions(lm->script->prog, "@entry");
+    if (!entry_fns.empty()) {
+        void* entry = lm->script->table->get(entry_fns.front().slot);
+        if (entry) {
+            context_t ectx; ectx.budget_remaining = 100000000; ectx.max_call_depth = 512;
+            ectx.has_checkpoint = true;
+            int64_t entry_ret = 0;
+            if (__builtin_setjmp(ectx.checkpoint)) {
+                std::fprintf(stderr, "ember live: @entry trap: %s (%s)\n",
+                             ectx.last_error.c_str(), trap_reason_str(ectx.last_trap));
+                return 70;
+            }
+            entry_ret = ember_call_void(entry, &ectx);
+            ectx.has_checkpoint = false;
+            if (entry_ret <= 0) {
+                std::printf("ember live: @entry returned %lld (<= 0), module unloaded\n",
+                            (long long)entry_ret);
+                return 0;
+            }
+        }
+    }
+
+    std::printf("ember live: %s — %zu @on_tick fn(s), %dms tick, %dms poll. ",
+                file_path.c_str(), lm->ticks.size(), tick_interval_ms, poll_ms);
+    if (tick_max > 0) std::printf("--tick-count %d\n", tick_max);
+    else std::printf("press 'q' to quit\n");
+
+    // Change detection: compare the file CONTENT, not just the mtime. Windows
+    // NTFS caches/delays last-write-time updates, so an mtime-only check misses
+    // rapid edits (verified: a 60ms-gap overwrite can leave mtime unchanged).
+    // Reading the (small) file each poll and string-comparing is robust and
+    // cheap. `last_source` is the source the current module was compiled from.
+    std::string last_source = read_file(file_path.c_str());
+    uint64_t tick_count = 0;
+    int exit_code = 0;
+    bool stopped = false;
+    auto last_poll = std::chrono::steady_clock::now();
+
+    while (!stopped) {
+        if (tick_max > 0 && tick_count >= uint64_t(tick_max)) break;
+        // ---- run one tick under an ExecutionGuard (hot-reload API recipe) ----
+        int64_t tick_ret = 0;
+        bool tick_trapped = false;
+        {
+            auto guard = lm->domain.guard();
+            context_t ectx; ectx.budget_remaining = 100000000; ectx.max_call_depth = 512;
+            ectx.call_depth = 0;
+            ectx.has_checkpoint = true;
+            if (__builtin_setjmp(ectx.checkpoint)) {
+                std::fprintf(stderr, "ember live: tick %llu trap: %s (%s)\n",
+                             (unsigned long long)tick_count, ectx.last_error.c_str(),
+                             trap_reason_str(ectx.last_trap));
+                tick_trapped = true; exit_code = 70;
+            } else {
+                void* f = lm->script->table->get(lm->tick_slot);
+                if (f) tick_ret = ember_call_void(f, &ectx);
+            }
+            ectx.has_checkpoint = false;
+        }
+        ++tick_count;
+        std::printf("tick %llu: %lld\n", (unsigned long long)tick_count, (long long)tick_ret);
+        std::fflush(stdout);
+        if (tick_trapped) break;
+
+        // ---- poll the file content every poll_ms; reload on change ----
+        // (mtime is unreliable on Windows for short intervals — see the note
+        // above last_source. Content comparison is the real detector. The poll
+        // is throttled to poll_ms so a fast tick loop doesn't re-read the file
+        // every tick.)
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_poll).count() >= poll_ms) {
+            last_poll = now;
+            std::string cur_source = read_file(file_path.c_str());
+            if (cur_source != last_source) {
+                last_source = cur_source;
+                std::printf("ember live: file changed, recompiling...\n");
+                std::string rerr;
+                auto new_lm = make_live_module(file_path, natives, overloads, rerr);
+                if (new_lm) {
+                    // re-run @entry of the new module if present (a reload is a fresh
+                    // load: @entry re-fires so globals/state reseed). If it returns
+                    // <= 0, keep the old module (the new one chose to unload).
+                    auto new_entry = get_annotated_functions(new_lm->script->prog, "@entry");
+                    bool keep_new = true;
+                    if (!new_entry.empty()) {
+                        void* e = new_lm->script->table->get(new_entry.front().slot);
+                        if (e) {
+                            context_t ectx; ectx.budget_remaining = 100000000; ectx.max_call_depth = 512;
+                            ectx.has_checkpoint = true;
+                            int64_t er = 0;
+                            if (__builtin_setjmp(ectx.checkpoint)) {
+                                std::fprintf(stderr, "ember live: reloaded @entry trap: %s (%s)\n",
+                                             ectx.last_error.c_str(), trap_reason_str(ectx.last_trap));
+                                keep_new = false;
+                            } else {
+                                er = ember_call_void(e, &ectx);
+                            }
+                            ectx.has_checkpoint = false;
+                            if (keep_new && er <= 0) keep_new = false;
+                        }
+                    }
+                    if (keep_new) {
+                        lm = std::move(new_lm);  // old module destroyed (frees its pages; no active guard)
+                        std::printf("ember live: reloaded (epoch %llu)\n",
+                                    (unsigned long long)lm->domain.epoch());
+                    } else {
+                        std::printf("ember live: reloaded module @entry returned <= 0; keeping old module\n");
+                    }
+                } else {
+                    std::fprintf(stderr, "ember live: recompile failed (%s); keeping old module\n", rerr.c_str());
+                }
+            }
+        }
+
+        // ---- keybind (non-interactive: --tick-count auto-stops above) ----
+        if (tick_max <= 0 && _kbhit()) { int c = _getch(); if (c == 'q' || c == 'Q') stopped = true; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(tick_interval_ms > 0 ? tick_interval_ms : 16));
+    }
+    std::printf("ember live: stopped after %llu ticks\n", (unsigned long long)tick_count);
+    return exit_code;
+}
+
 int main(int argc, char** argv) {
     using namespace ember;
 
@@ -846,6 +1370,7 @@ int main(int argc, char** argv) {
     int bench_warmup = 5;       // --warmup N (untimed warmup iterations)
     bool ffi_mode = false;      // --ffi: grant PERM_FFI to sema so I/O natives (print/file/path) are callable
     std::string test_dir;        // Family A: `ember test [dir]` (default tests/lang)
+    int poll_ms = 500;           // Family C: `ember live` file-content poll interval (default 500ms)
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--fn") {
@@ -871,6 +1396,12 @@ int main(int argc, char** argv) {
         } else if (a == "--tick-count") {
             if (++i >= argc) { std::fprintf(stderr, "ember: --tick-count needs N\n"); return 2; }
             tick_max = std::atoi(argv[i]);
+        } else if (a == "--poll-ms") {
+            // Family C: `ember live` file-content poll interval. Smaller = more
+            // responsive reload (tests use a small value); default 500ms. The poll
+            // compares file content (mtime is unreliable on Windows for short gaps).
+            if (++i >= argc) { std::fprintf(stderr, "ember: --poll-ms needs MS\n"); return 2; }
+            poll_ms = std::atoi(argv[i]); if (poll_ms < 0) poll_ms = 500;
         } else if (a == "--iters") {
             if (++i >= argc) { std::fprintf(stderr, "ember: --iters needs N\n"); return 2; }
             bench_iters = std::atoi(argv[i]); if (bench_iters < 1) bench_iters = 20;
@@ -892,6 +1423,10 @@ int main(int argc, char** argv) {
             action = a;                 // first positional = action ("run"/"emit-em"/"bench"/"test")
         } else if (action == "test" && test_dir.empty()) {
             test_dir = a;               // `ember test <dir>` — optional directory positional
+        } else if (action == "pipe" && file.empty()) {
+            file = a;                   // `ember pipe <config>` — config path positional
+        } else if (action == "live" && file.empty()) {
+            file = a;                   // `ember live <file.ember>` — script path positional
         } else if (file.empty()) {
             file = a;                    // second positional = input path
         } else if (action == "emit-em" && emit_em_path.empty()) {
@@ -902,6 +1437,17 @@ int main(int argc, char** argv) {
     }
     if (action == "test") {
         return run_test_command(test_dir.empty() ? "tests/lang" : test_dir);
+    }
+    if (action == "pipe") {
+        // `ember pipe <config>` — dataflow pipeline runner (Family C).
+        if (file.empty()) { std::fprintf(stderr, "ember: pipe needs <config>\n"); usage(stderr); return 2; }
+        return run_pipe_command(file);
+    }
+    if (action == "live") {
+        // `ember live <file.ember>` — live-coding/reload runner (Family C).
+        // --tick is implied; --tick-count/--tick-interval/--poll-ms apply.
+        if (file.empty()) { std::fprintf(stderr, "ember: live needs <file.ember>\n"); usage(stderr); return 2; }
+        return run_live_command(file, tick_interval_ms, tick_max, poll_ms);
     }
     if (action != "run" && action != "emit-em" && action != "bench") { usage(stderr); return 2; }
     if (action == "bench") { bench_mode = true; tick_mode = false; }

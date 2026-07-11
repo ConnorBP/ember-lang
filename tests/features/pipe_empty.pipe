@@ -1,0 +1,12 @@
+# pipe_empty.pipe — an empty-stream dataflow pipeline config (Family C).
+#
+# Same 2-stage wiring as pipe_2stage.pipe, but input count = 0 (empty stream).
+# The pipe runner runs zero values through the chain, so the sum is 0 and the
+# exit code is 0. Exercises the empty-stream edge case (no stage calls made).
+#
+# Run: ember pipe tests/features/pipe_empty.pipe   (must exit 0)
+module A pipe_a.ember
+module B pipe_b.ember
+stage A::process
+stage B::reduce
+input 1 0

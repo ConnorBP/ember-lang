@@ -1,0 +1,19 @@
+# pipe_3stage.pipe — a 3-stage dataflow pipeline config (Family C: ember pipe).
+#
+# Wires pipe_a.process -> pipe_b.reduce -> pipe_c.square and runs the stream
+# 1..5 through it:
+#   1 -> +1=2  -> *3=6  -> sq=36
+#   2 -> +1=3  -> *3=9  -> sq=81
+#   3 -> +1=4  -> *3=12 -> sq=144
+#   4 -> +1=5  -> *3=15 -> sq=225
+#   5 -> +1=6  -> *3=18 -> sq=324
+#   sum = 36+81+144+225+324 = 810  (the exit code, mod 2^31)
+#
+# Run: ember pipe tests/features/pipe_3stage.pipe   (must exit 810)
+module A pipe_a.ember
+module B pipe_b.ember
+module C pipe_c.ember
+stage A::process
+stage B::reduce
+stage C::square
+input 1 5

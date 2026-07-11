@@ -488,6 +488,22 @@ target_link_libraries(em_cli_emit_test PRIVATE ember)
 add_test(NAME em_cli_emit COMMAND em_cli_emit_test $<TARGET_FILE:ember_cli>)
 set_tests_properties(em_cli_emit PROPERTIES TIMEOUT 30)
 
+# ---- Family C: ember pipe + ember live CLI regression ----
+# End-to-end test harness for the two Family C CLI subcommands (docs/ROADMAP.md
+# Family C) added in examples/ember_cli.cpp. Invokes the real ember_cli.exe as
+# a subprocess and verifies the exit code + stdout of: pipe 2-stage (exit 60),
+# pipe 3-stage (exit 810), pipe empty stream (exit 0), pipe missing module
+# module (exit 2), pipe through a .em-bundled stage (exercises the bundler),
+# live tick loop (tick 1:11/2:12/3:13), and live file-change (v1->overwrite v2
+# mid-run -> stdout has both + a reload marker). The test .ember scripts +
+# pipe configs live in tests/features/ (not tests/lang/, so `ember test` does
+# not scan them). The harness takes <ember_cli> <source_dir> so it can resolve
+# tests/features/ paths.
+add_executable(ember_cli_pipe_live_test examples/ember_cli_pipe_live_test.cpp)
+add_test(NAME ember_cli_pipe_live COMMAND ember_cli_pipe_live_test
+    $<TARGET_FILE:ember_cli> ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(ember_cli_pipe_live PROPERTIES TIMEOUT 60)
+
 # ---- binding ABI correctness suite (BINDING_API.md Sec 4) ----
 # Pins the script->native Win64 call ABI (struct-by-value arg <=8B,
 # struct-by-value return >8B hidden-pointer, >4-arg stack spill, f32 in xmm

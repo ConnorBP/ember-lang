@@ -1,0 +1,17 @@
+// live_tick.ember — a live-coding tick-loop test (Family C: ember live).
+//
+// Has an @on_tick function that advances a global counter and returns a value
+// derived from it, so each tick's return value is observable + deterministic.
+// Used by `ember live tests/features/live_tick.ember --tick-count N` to verify
+// the tick loop runs @on_tick N times and prints the evolving output:
+//   tick 1: 11, tick 2: 12, tick 3: 13, ...
+//
+// No @entry: `ember live` starts ticking immediately when there is no @entry
+// (a live-coding file can be just @on_tick).
+global count : i64 = 0;
+
+@on_tick
+fn tick() -> i64 {
+    count = count + 1;
+    return 10 + count;
+}

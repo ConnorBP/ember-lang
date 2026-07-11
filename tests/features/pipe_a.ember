@@ -1,0 +1,10 @@
+// pipe_a.ember — stage A of the dataflow pipeline test (Family C: ember pipe).
+// A single-arg i64->i64 function `process` that adds 1 to its input. This is
+// the first stage of the linear chain A.process -> B.reduce (-> C.square).
+//
+// Loaded by `ember pipe tests/features/pipe_2stage.pipe` (and the 3-stage /
+// .em-bundler configs). The pipe runner compiles this module, looks up
+// `process` by name, and calls it per stream value.
+fn process(x: i64) -> i64 {
+    return x + 1;
+}

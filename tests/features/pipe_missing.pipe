@@ -1,0 +1,10 @@
+# pipe_missing.pipe — a pipeline config referencing a missing module (Family C).
+#
+# The module `A` points at a nonexistent file. The pipe runner must report the
+# load/compile failure and exit 2 (the error code), exercising the missing-
+# module error-handling path.
+#
+# Run: ember pipe tests/features/pipe_missing.pipe   (must exit 2)
+module A pipe_nonexistent_module.ember
+stage A::process
+input 1 3
