@@ -113,6 +113,12 @@ add_library(ember_frontend STATIC
     # em_loader.hpp stays in src/ (available to both libs); only the .cpp moved.
     # em_writer.cpp stays in the core lib (it has no frontend dependencies).
     src/em_loader.cpp
+    # Stage C: the composable pass system infrastructure (ember_pass.{hpp,cpp}).
+    # The pass manager, type-erased PassConcept/PassModel, PreservedAnalyses,
+    # CRTP EmberPassInfoMixin, and instrumentation callbacks. Passes operate on
+    # ThinFunction (core) but the pass system is a frontend concern (passes run
+    # at compile time over the IR produced by lower_function).
+    src/ember_pass.cpp
 )
 target_include_directories(ember_frontend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ember_frontend PUBLIC ember)
@@ -595,6 +601,14 @@ if(WIN32)
 endif()
 add_test(NAME em_v5_ir COMMAND em_v5_ir_test)
 
+# ember_pass_test - Stage C: the composable pass system infrastructure test.
+# Pins the pass manager, registry, pipeline parser, instrumentation,
+# PreservedAnalyses, is_required, and run_to_fixpoint — no real passes yet.
+# Links ember + ember_frontend (ember_pass.cpp lives in ember_frontend).
+add_executable(ember_pass_test examples/ember_pass_test.cpp)
+target_link_libraries(ember_pass_test PRIVATE ember ember_frontend)
+add_test(NAME ember_pass COMMAND ember_pass_test)
+
 # aggregate_global_test - pins aggregate globals (chunk c3): struct globals
 # `global cfg : Config = Config{...};`, fixed-array globals `global arr : i64[3]
 # = [10,20,30];`, slice globals `global s : i64[] = [1,2,3];`. Compiles tiny
@@ -616,5 +630,5 @@ add_test(NAME aggregate_global COMMAND aggregate_global_test)
 set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
     v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
     array_lit aggregate_global em_signed codegen_opt thin_ir_struct thin_ir
-    thin_ir_ser em_v5_ir
+    thin_ir_ser em_v5_ir ember_pass
     PROPERTIES TIMEOUT 30)
