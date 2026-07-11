@@ -992,8 +992,28 @@ struct P {
                 if (at(Tk::Ident) && peek().text == "_") {
                     arm.is_wildcard = true;
                     adv();
+                } else if (at(Tk::Ident) && peek(1).kind == Tk::LBrace) {
+                    // Tier 1 struct destructure pattern: TypeName{field, field: literal, ...}
+                    arm.has_struct_pat = true;
+                    arm.struct_pat.struct_name = adv().text;  // the type name
+                    expect(Tk::LBrace, "'{' after struct pattern name");
+                    while (!at(Tk::RBrace) && !at(Tk::Eof)) {
+                        StructPatternField spf;
+                        spf.name = expect(Tk::Ident, "field name in struct pattern").text;
+                        if (accept(Tk::Colon)) {
+                            spf.literal = parse_expr();  // field: literal (match value)
+                        }
+                        arm.struct_pat.fields.push_back(std::move(spf));
+                        if (!accept(Tk::Comma)) break;
+                    }
+                    expect(Tk::RBrace, "'}' after struct pattern fields");
                 } else {
                     arm.pattern = parse_expr();
+                }
+                // Tier 1 match guards: optional `if guard_expr` before =>
+                if (at(Tk::Kw_if)) {
+                    adv();
+                    arm.guard = parse_expr();
                 }
                 expect(Tk::FatArrow, "'=>'");
                 if (at(Tk::LBrace)) {

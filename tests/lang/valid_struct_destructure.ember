@@ -1,0 +1,19 @@
+// valid_struct_destructure — Tier 1 struct destructure in match patterns.
+// expect: 142 (classify(origin)=1 + classify(on_y)=42 + classify(other)=99)
+struct Point { x: i64; y: i64; }
+
+fn classify(p: Point) -> i64 {
+    match (p) {
+        Point{x: 0, y: 0} => { return 1; },
+        Point{x: 0, y} => { return y; },
+        _ => { return 99; }
+    }
+    return 0;
+}
+
+fn main() -> i64 {
+    let origin: Point = Point{x: 0, y: 0};
+    let on_y: Point = Point{x: 0, y: 42};
+    let other: Point = Point{x: 5, y: 10};
+    return classify(origin) + classify(on_y) + classify(other);
+}

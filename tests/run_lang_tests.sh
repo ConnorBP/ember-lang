@@ -126,7 +126,9 @@ for spec in "runtime_audit_semantics.ember:77" "runtime_cast_regressions.ember:4
             "valid_fn_types.ember:250" \
             "valid_namespaces.ember:52" \
             "valid_namespaces_intra_call.ember:30" \
-            "valid_namespaces_two_ns.ember:7"; do
+            "valid_namespaces_two_ns.ember:7" \
+            "valid_struct_destructure.ember:142" \
+            "valid_match_guards.ember:3"; do
     f=${spec%%:*}; exp=${spec##*:}; out=$("$CLI" run "tests/lang/$f" 2>&1); rc=$?
     if [ $rc -eq "$exp" ]; then printf "PASS  %s (explicit expected rc=%d)\n" "$f" "$rc"; pass=$((pass+1))
     else printf "FAIL  %s (rc=%d, expected %d)\n%s\n" "$f" "$rc" "$exp" "$out"; fail=$((fail+1)); fi

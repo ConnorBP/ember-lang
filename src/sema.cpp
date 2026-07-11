@@ -2784,14 +2784,57 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
     }
     if (auto* ms = dynamic_cast<MatchStmt*>(&s)) {
         const Type* subj_ty = check_expr(*ms->subject);
-        if (!subj_ty->is_int() && !subj_ty->is_bool())
-            err("match subject must be an integer or bool (got " + subj_ty->to_string() + ")",
-                ms->loc.line, ms->loc.col);
+        // Tier 1 struct destructure: the subject can be a struct (for struct
+        // patterns) OR an int/bool (for literal patterns). A match with struct
+        // patterns requires a struct subject; a match with literal patterns
+        // requires int/bool.
+        bool has_struct_pat = false;
+        for (auto& arm : ms->arms) if (arm.has_struct_pat) { has_struct_pat = true; break; }
+        if (has_struct_pat) {
+            // struct destructure match: subject must be a struct
+            if (subj_ty->struct_name.empty())
+                err("match with struct patterns requires a struct subject (got " + subj_ty->to_string() + ")",
+                    ms->loc.line, ms->loc.col);
+        } else {
+            if (!subj_ty->is_int() && !subj_ty->is_bool())
+                err("match subject must be an integer or bool (got " + subj_ty->to_string() + ")",
+                    ms->loc.line, ms->loc.col);
+        }
         bool seen_wildcard = false;
         for (auto& arm : ms->arms) {
             if (arm.is_wildcard) {
                 if (seen_wildcard) err("match has more than one '_' wildcard arm", ms->loc.line, ms->loc.col);
                 seen_wildcard = true;
+            } else if (arm.has_struct_pat) {
+                // Tier 1 struct destructure: type-check the pattern against the subject struct.
+                // Look up the struct layout.
+                if (structs && structs->count(arm.struct_pat.struct_name)) {
+                    const auto& layout = structs->at(arm.struct_pat.struct_name);
+                    // Verify the pattern's struct name matches the subject's struct type.
+                    if (subj_ty->struct_name != arm.struct_pat.struct_name) {
+                        err("match struct pattern '" + arm.struct_pat.struct_name +
+                            "' does not match subject type '" + subj_ty->to_string() + "'",
+                            ms->loc.line, ms->loc.col);
+                    }
+                    for (auto& spf : arm.struct_pat.fields) {
+                        auto fit = layout.fields.find(spf.name);
+                        if (fit == layout.fields.end()) {
+                            err("struct '" + arm.struct_pat.struct_name + "' has no field '" + spf.name + "'",
+                                ms->loc.line, ms->loc.col);
+                        } else if (spf.literal) {
+                            // field: literal — type-check the literal against the field type
+                            const Type* pt = check_expr(*spf.literal, fit->second.ty);
+                            if (!pt->same(*fit->second.ty) && !(pt->is_int() && fit->second.ty->is_int()))
+                                err("struct pattern field '" + spf.name + "' type mismatch (field is " +
+                                    fit->second.ty->to_string() + ", pattern is " + pt->to_string() + ")",
+                                    spf.literal->loc.line, spf.literal->loc.col);
+                        }
+                        // else: capture-only — the field is bound as a local in the arm body scope.
+                    }
+                } else {
+                    err("match struct pattern references unknown struct '" + arm.struct_pat.struct_name + "'",
+                        ms->loc.line, ms->loc.col);
+                }
             } else {
                 if (!dynamic_cast<IntLit*>(arm.pattern.get()) && !dynamic_cast<BoolLit*>(arm.pattern.get()))
                     err("match pattern must be a literal constant",
@@ -2802,6 +2845,25 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
                         arm.pattern->loc.line, arm.pattern->loc.col);
             }
             push_scope();
+            // Tier 1 struct destructure: bind captured fields as locals.
+            if (arm.has_struct_pat && structs && structs->count(arm.struct_pat.struct_name)) {
+                const auto& layout = structs->at(arm.struct_pat.struct_name);
+                for (auto& spf : arm.struct_pat.fields) {
+                    if (!spf.literal) {  // capture-only
+                        auto fit = layout.fields.find(spf.name);
+                        if (fit != layout.fields.end()) {
+                            declare(spf.name, fit->second.ty, false, false, ms->loc);
+                        }
+                    }
+                }
+            }
+            // Tier 1 match guards: type-check the guard as bool.
+            if (arm.guard) {
+                const Type* gt = check_expr(*arm.guard);
+                if (!gt->is_bool())
+                    err("match guard must be a bool expression (got " + gt->to_string() + ")",
+                        arm.guard->loc.line, arm.guard->loc.col);
+            }
             bool r = false;
             check_block(arm.body, ret_ty, r);
             pop_scope();

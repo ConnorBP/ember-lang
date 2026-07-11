@@ -3639,9 +3639,80 @@ void CG::exec_stmt(const Stmt& s) {
     }
     if (auto* ms = dynamic_cast<const MatchStmt*>(&s)) {
         // match (expr) { pattern => body, ... _ => default }
-        // Like switch but each arm is a separate branch (no fallthrough, no
-        // break needed). The subject is compared against each pattern in order;
-        // the first match jumps to its arm. The wildcard (_) is the default.
+        // Two forms: (1) literal patterns on int/bool subject (existing),
+        // (2) struct destructure patterns on a struct subject (Tier 1).
+        bool has_struct_pat = false;
+        for (auto& arm : ms->arms) if (arm.has_struct_pat) { has_struct_pat = true; break; }
+        if (has_struct_pat) {
+            // Tier 1 struct destructure match.
+            // The subject must be a local struct variable. Get its frame offset.
+            int32_t subj_off = 0; const Type* subj_ty = nullptr;
+            if (!local_value_offset(*ms->subject, subj_off, subj_ty) || !subj_ty || subj_ty->struct_name.empty()) {
+                // Fallback: evaluate the subject (it's in rax as a... struct values
+                // aren't in rax). For v1, require the subject to be a local struct.
+                // (A non-local subject would need a temp materialization — future work.)
+                emit_trap(int(TrapReason::IllegalInstruction), "match struct subject must be a local struct variable");
+                return;
+            }
+            const auto& layout = ctx.structs->at(subj_ty->struct_name);
+            std::vector<Label> arm_labels;
+            for (size_t i = 0; i < ms->arms.size(); ++i) arm_labels.push_back(e.alloc_label());
+            Label end_label = e.alloc_label();
+            int wildcard_idx = -1;
+            // For each arm: compare literal-matched fields + eval guard.
+            for (size_t i = 0; i < ms->arms.size(); ++i) {
+                if (ms->arms[i].is_wildcard) { wildcard_idx = int(i); continue; }
+                if (!ms->arms[i].has_struct_pat) continue;  // mixed literal+struct not supported in v1
+                // Compare ALL literal-matched fields. Per-arm fail label:
+                // if any field mismatches, jump to the next arm's check.
+                Label fail_label = e.alloc_label();
+                for (auto& spf : ms->arms[i].struct_pat.fields) {
+                    if (!spf.literal) continue;  // capture-only, no comparison
+                    auto fit = layout.fields.find(spf.name);
+                    if (fit == layout.fields.end()) continue;
+                    // Load the subject's field value into rax, hold in r10.
+                    load_slot(subj_off + fit->second.offset, fit->second.ty);
+                    e.mov_reg_reg(Reg::r10, Reg::rax);
+                    // Load the literal pattern value into rax.
+                    eval(*spf.literal);
+                    e.cmp_reg_reg(Reg::r10, Reg::rax);
+                    e.jcc(Cond::ne, fail_label);  // mismatch -> fail this arm
+                }
+                // Guard check (if present): eval the guard, fail if false.
+                if (ms->arms[i].guard) {
+                    eval(*ms->arms[i].guard);
+                    e.cmp_reg_imm32(Reg::rax, 0);
+                    e.jcc(Cond::e, fail_label);  // guard false -> fail
+                }
+                // All fields matched (+ guard true): jump to the arm body.
+                e.jmp(arm_labels[i]);
+                e.bind(fail_label);
+            }
+            e.jmp(wildcard_idx >= 0 ? arm_labels[size_t(wildcard_idx)] : end_label);
+            for (size_t i = 0; i < ms->arms.size(); ++i) {
+                e.bind(arm_labels[i]);
+                // Bind captured fields as locals: allocate a frame slot + copy
+                // the subject's field value into it.
+                if (ms->arms[i].has_struct_pat) {
+                    for (auto& spf : ms->arms[i].struct_pat.fields) {
+                        if (!spf.literal) {  // capture-only
+                            auto fit = layout.fields.find(spf.name);
+                            if (fit != layout.fields.end()) {
+                                int32_t cap_off = alloc_local(spf.name, fit->second.ty);
+                                copy_bytes(Reg::rbp, cap_off, Reg::rbp, subj_off + fit->second.offset, value_bytes(fit->second.ty, ctx.structs));
+                            }
+                        }
+                    }
+                }
+                loops.push_back({Label{0}, end_label, true, cleanup_scopes.size()});
+                exec_block(ms->arms[i].body);
+                loops.pop_back();
+                e.jmp(end_label);
+            }
+            e.bind(end_label);
+            return;
+        }
+        // Literal-pattern match (existing path).
         eval(*ms->subject);
         e.mov_reg_reg(Reg::r10, Reg::rax);  // hold subject in volatile r10
         std::vector<Label> arm_labels;

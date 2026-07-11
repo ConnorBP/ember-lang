@@ -254,7 +254,20 @@ struct SwitchStmt: Stmt { ExprPtr subject; std::vector<SwitchCase> cases; };
 // Tier 1: match — pattern matching. Like switch but without break (each arm
 // is a separate branch) and with => syntax. Patterns: integer literals,
 // bool literals, `_` (wildcard/default). No struct destructure in v1.
-struct MatchArm { ExprPtr pattern; bool is_wildcard = false; Block body; };
+// Tier 1 struct destructure + match guards. A match arm can have a struct
+// destructure pattern (Point{x, y} or Point{x: 0, y: 0}) + an optional guard
+// (Point{x, y} if x > 0 => ...). The pattern captures fields as locals +
+// matches literal field values. The guard is a bool expr over the captures.
+struct StructPatternField { std::string name; ExprPtr literal; };  // literal = null means capture-only
+struct StructPattern { std::string struct_name; std::vector<StructPatternField> fields; };
+struct MatchArm {
+    ExprPtr pattern;          // IntLit/BoolLit for literal patterns (existing)
+    bool is_wildcard = false;
+    StructPattern struct_pat;  // used when pattern is a struct destructure (struct_name non-empty)
+    bool has_struct_pat = false;
+    ExprPtr guard;             // optional guard expr (null = no guard)
+    Block body;
+};
 struct MatchStmt : Stmt { ExprPtr subject; std::vector<MatchArm> arms; };
 // Tier 1: static_assert(cond, "msg") — a compile-time assertion. Sema folds
 // `cond` (constexpr calls + enum variants are already IntLits by the time the
