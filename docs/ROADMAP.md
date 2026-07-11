@@ -94,10 +94,13 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
   `spec/BINDING_API.md` Section 5 stays dropped: script enums need no host-side
   builder (the variants live entirely in the script). Typed enums (`enum E : i32`)
   and `enum`-from-expr remain a later refinement.
-- **`for-each`** + `iterable()` TypeBuilder hook - `for (x in coll)`
-  sugar over a length+index protocol. Trigger: `array<T>` addon use
-  shows the manual index loop is a real friction point. Dep: `array<T>`
-  addon exists.
+- **`for-each`** ✓ shipped 2026-07-11 (Tier 1) — `for (x in slice)` over a
+  slice T[]. The iterable must be a slice; x gets the element type. The
+  tree-walker evaluates the slice → {ptr, len} and emits a while loop with
+  element indexing at [ptr + index*elem_size]. The IR backend marks functions
+  using for-each as non_serializable (falls back to the tree-walker). The
+  `iterable()` TypeBuilder hook for general collection iteration is still
+  deferred (the current for-each is slice-specific).
 - **`match` (pattern)** - richer than `switch` (struct destructure,
   guard). Trigger: `switch` plus nested `if` guards get unreadable in
   real handler code. Dep: `switch` (v1) proven.
