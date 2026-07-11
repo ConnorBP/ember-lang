@@ -209,18 +209,24 @@ memory-indirection concept in the whole language.
   no safety benefit (shift-amount type doesn't affect result type or
   introduce precision loss).
 - **Index expression type rule**: `arr[i]` / `slice[i]` requires `i`
-  to be an unsigned integer type (`u8/u16/u32/u64`) - signed integer
-  indices are a **compile error**, must cast explicitly (`arr[i as
-  u64]`). This is what makes CODEGEN_SPEC.md Section 9's claim "no negative
-  index reaches codegen" true by construction rather than by a runtime
-  check: it's impossible to type-check a negative-index expression as
-  well-typed in the first place, since a signed value used as an
-  index is rejected before codegen ever sees it, and an unsigned value
-  cannot represent a compile-time-literal-negative number (the lexer
-  never produces a negative unsigned literal - `-1u` is a unary-minus
-  applied to `1u`, which for unsigned types wraps at *runtime* per Section 6,
-  i.e. it's a huge positive number, correctly caught by the ordinary
-  runtime bounds check, not a special case).
+  to be an **integer type** (signed or unsigned: `i8/i16/i32/i64` or
+  `u8/u16/u32/u64`) — the implementation accepts any integer index (sema
+  checks `is_int()`, not `is_unsigned()`; `COMPILER_PIPELINE.md` §4 records
+  the relaxation). A non-integer index (float, struct, slice, `bool`) is a
+  **compile error**. There is no separate signedness restriction: a signed
+  index is accepted as-is, no `arr[i as u64]` cast required. This keeps the
+  CODEGEN_SPEC.md Section 9 bounds check a single **unsigned** `cmp`/`jae`: a
+  negative signed index (e.g. `-1` as `i64`) reaches codegen as a huge
+  unsigned value (two's-complement bit pattern) that is `>= len` under the
+  unsigned compare, so the one `jae` bounds trap catches it — the same trap
+  that catches an unsigned underflow (`i - 1` where `i == 0`, which wraps to
+  a huge positive number at runtime per Section 6). No separate `< 0` check
+  is emitted: one unsigned compare handles both the negative-signed and the
+  over-large-unsigned cases, which is why codegen never needs a two-check
+  `< 0 && < len` sequence. (The earlier spec claim that index expressions
+  are constrained to unsigned types only — making "negative index" a type
+  error at sema — is **superseded**; signed indices are now accepted and a
+  negative signed index is a runtime bounds trap, not a compile error.)
 - Operator overloading for struct types (`bin_add` etc. registered via
   `TypeBuilder`, BINDING_API.md Section 3) resolves to a native function call
   - sema resolves the operator to the registered `NativeFn` at

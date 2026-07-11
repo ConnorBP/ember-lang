@@ -209,8 +209,8 @@ ABI/process-trusted (process-local pointers), not a portable format —
 cross-process portability is a versioned-relocation v2+ item.
 
 **Binding API.** Register natives with `BindingBuilder` + `NativeSig`; the
-host maps script types to Win64 slots and ships a slice convention. The nine
-`NativeSig` extensions (`vec`/`quat`/`mat`/`string`/`array`/`math`/`sync`/`lifecycle`/`map`)
+host maps script types to Win64 slots and ships a slice convention. The ten
+`NativeSig` extensions (`vec`/`quat`/`mat`/`string`/`array`/`math`/`map`/`sync`/`lifecycle`/`io`)
 register their `NativeSig` + `OpOverloadTable` entries the same way. Two pass
 extensions (`opt`, `obf`) are a separate category — they register IR→IR
 transforms via `register_passes` (not `register_natives`); see

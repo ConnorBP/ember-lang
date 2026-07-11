@@ -392,7 +392,18 @@ compatibility contract, not a live gap.
   the signatures. v1 `.em` exports are `unknown_sig` and ABI-trusted (no metadata,
   no identity check) — the v1 compatibility contract, retained for backward
   compat. Portable, verified `.em` linking is therefore a shipped v2 guarantee,
-  not a future redesign.
+  not a future redesign. **v5 IR `.em` (Stage B, IL-`.em`)** is a separate,
+  additive format version that carries the thin three-address IR on disk
+  instead of raw x86 (the per-function `is_ir` byte + the `ir_blob` record);
+  the loader deserializes + validates + re-emits the IR to x64 via `emit_x64`
+  BEFORE `alloc_executable_rw` (the re-emit-at-load security model). v5 is
+  unsigned for Stage B and shares the v3/v4 header + globals block + name
+  directory; a v5 module may mix IR and raw-x86 functions per-function (mixed
+  mode). The full v5 format + security model is documented in
+  `BUNDLING_AND_EM_MODULES.md` §2.5.2 (see `src/em_file.hpp` `EM_VERSION_V5` +
+  `src/thin_ir_ser.{hpp,cpp}` for the codec). v5 does not change the
+  cross-module call mechanism this doc specifies — it changes only what a
+  per-function record carries on disk, not the registry/linker/slot model.
 
 ---
 

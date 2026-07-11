@@ -48,7 +48,7 @@ Section 3 below + `../ROADMAP.md`.
 | `match` (pattern) | ✓ v1 (shipped 2026-07-11) | `match (expr) { pat => body, _ => default }` — integer/bool literal patterns + `_` wildcard, no fallthrough. `tests/lang/valid_match.ember`, `../ROADMAP.md` |
 | `goto` | ✗ v1 (deliberate) | structured control flow only; goto complicates liveness/scope, no need |
 | `defer` | ✓ v1 (added this pass) | `../spec/CODEGEN_SPEC.md` Section 13, `../spec/COMPILER_PIPELINE.md` Section 6 |
-| Default args | ✗ v1 | host registers overloads or takes slice; `../spec/BINDING_API.md` Section 2 |
+| Default args | ✓ v1 (shipped) | trailing-optional defaulted params: `fn f(a: i64, b: i64 = 10)` — a default value must be a bare literal (int/float/bool/string), defaulted params must trail non-defaulted ones (trailing-defaults-only), and sema splices the synthesized literal for any missing trailing arg at the call site (arity is a range). See `../spec/COMPILER_PIPELINE.md` Section 2 (grammar) + Section 4 (sema); `ast.hpp` `DefaultValue`/`Param::default_val` |
 | Reference `&` / `out` params | ✗ v1 (idiom instead) | pass `slice<T>` of len 1, `../spec/TYPE_SYSTEM.md` Section 5 |
 | Variadic fns | ✗ v1 | `../spec/BINDING_API.md` Section 2 (fixed arity; variadic via slice) |
 | `extern` | ✗ v1 | FFI via `PERM_FFI`-gated natives, not extern decls |
@@ -77,8 +77,8 @@ Section 3 below + `../ROADMAP.md`.
 
 ## 3. Standard addon reality and deferred data structures
 
-The nine shipped host-side extensions are `vec`, `quat`, `mat`, `string`,
-`array`, `map`, `math`, `sync`, and `lifecycle`. Their actual script APIs are:
+The ten shipped host-side extensions are `vec`, `quat`, `mat`, `string`,
+`array`, `map`, `math`, `sync`, `lifecycle`, and `io`. Their actual script APIs are:
 
 - vec2/vec3/vec4 constructors and component get/set; vec add/sub/mul/equality;
   quat construction/access plus add/sub/mul/equality; mat4 construction,
@@ -95,8 +95,16 @@ The nine shipped host-side extensions are `vec`, `quat`, `mat`, `string`,
 - lifecycle `register_routine`/`unregister_routine`.
 - map `map_new`/`map_set`/`map_get`/`map_contains`/`map_length`/`map_remove`/
   `map_clear` (shipped 2026-07-11; K and V are i64, see `../ROADMAP.md` Tier 0).
+- io `print`/`println`/`print_i64`/`print_f64`/`read_line`/`file_read_bytes`/
+  `file_write_bytes`/`file_exists`/`path_exists`/`path_basename`/`path_dirname`
+  (shipped 2026-07-11; the core I/O subset — console + file + path; ALL
+  `PERM_FFI`-gated, stateless; see `extensions/io/` +
+  `plan_OS_IO_EXTENSIONS.md`).
 
-A `map` extension now ships (2026-07-11). General array push beyond the
+A `map` extension now ships (2026-07-11), and an `io` extension (console +
+file + path, `PERM_FFI`-gated) ships 2026-07-11 — the ROADMAP "Family B"
+re-entry trigger fired (a script blocked on output beyond the exit code).
+General array push beyond the
 u8/f32/i64 typed set, string `format` APIs, and a broader math surface are
 still deferred. These are addon gaps, not hidden language builtins. The host
 owns addon storage and scripts carry nominal opaque handles.

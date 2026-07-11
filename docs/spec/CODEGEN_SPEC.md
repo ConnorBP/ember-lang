@@ -489,10 +489,11 @@ For `slice[i]` or fixed-array `arr[i]` where `i` is a runtime value
 time instead - see edge case below):
 
 ```
-cmp  i_reg, len_reg      ; unsigned compare (indices are never negative
-                         ; in the type system - see TYPE_SYSTEM.md Section 7 -
-                         ; so this is a plain unsigned cmp, not two
-                         ; checks for <0 and >=len)
+cmp  i_reg, len_reg      ; unsigned compare (a negative signed index or an
+                         ; unsigned underflow both appear as a huge unsigned
+                         ; value >= len, so one unsigned jae catches both —
+                         ; see TYPE_SYSTEM.md Section 7. No separate <0 check
+                         ; is needed, which is why this is one cmp, not two)
 jae  .oob_trap           ; jump if i >= len (unsigned "above or equal")
 <computed address load: base + i*elem_size (+ elem_size via lea with
  scale if elem_size is 1/2/4/8, else imul then add)>
@@ -536,14 +537,18 @@ jmp  .after
   necessary consequence of what a slice *is* (TYPE_SYSTEM.md Section 4); no
   way around it, and it's still just one cheap predictable-branch
   compare.
-- **Negative index**: the language has no signed array-index type
-  reaching this code path - see TYPE_SYSTEM.md Section 7 for how index
-  expressions are constrained to unsigned integer types at the type
-  level, so "negative index" is a *type error at sema*, not a runtime
-  case codegen has to handle. (A script author computing an
-  out-of-range unsigned value via underflow, e.g. `i - 1` where `i ==
-  0`, still hits the normal `jae` bounds trap - that's correct
-  behavior, not a special case.)
+- **Negative index**: index expressions accept any integer type (signed or
+  unsigned — `TYPE_SYSTEM.md` Section 7; sema checks `is_int()`, not
+  `is_unsigned()`), so a **negative signed index CAN reach codegen** (e.g.
+  `-1` as `i64`). It is caught by the same unsigned `jae` bounds trap as an
+  over-large index: a negative signed value is a huge unsigned value under
+  two's complement, so `cmp i, len; jae .oob_trap` fires exactly once — no
+  separate `< 0` check is emitted. (An unsigned underflow, e.g. `i - 1`
+  where `i == 0`, wraps to a huge positive number at runtime and hits the
+  same `jae` trap — correct behavior, not a special case.) The earlier spec
+  claim that "the language has no signed array-index type reaching this
+  code path" / "negative index is a type error at sema" is **superseded**;
+  signed indices are accepted and a negative index is a runtime bounds trap.
 - **Zero-length slice**: `cmp i, 0; jae .oob_trap` - any index at all
   traps, which is correct (there is nothing to index).
 

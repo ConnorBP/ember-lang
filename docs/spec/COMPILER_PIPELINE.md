@@ -89,7 +89,7 @@ import_decl  := 'import' STRING_LIT ';'                               // parse-t
 
 func_decl    := ('priv')? 'fn' IDENT '(' param_list? ')' ('->' type)? block
 param_list   := param (',' param)*
-param        := IDENT ':' type
+param        := IDENT ':' type ('=' literal)?      // optional trailing default value (a bare int/float/bool/string literal); defaulted params must trail non-defaulted ones (trailing-defaults-only, enforced in the parser + sema). At a call site, sema splices the synthesized literal for any missing trailing arg, so arity is a range [required_count, param_count]. See Section 4 + `ast.hpp` `DefaultValue`/`Param::default_val`.
 
 // F1 visibility (docs/spec/SPEC_AUDIT_2026-07-10.md F1): an optional leading
 // `priv` on a func_decl opts the function out of the module's EXPORTED surface

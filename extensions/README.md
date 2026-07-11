@@ -47,14 +47,17 @@ The general-purpose extensions relocated out of prism, matching the
 | `sync/` | `ember_ext_sync` | cross-thread sync primitives: `aint8/16/32/64` atomics (load/store/fetch_add/cas/swap), swap buffer (double-buffer + atomic flip), SPSC/MPSC/MPMC queues — all behind opaque i64 handles, internally synchronized host storage (`std::atomic` / lock-free ring / host-internal `std::mutex` for MPMC). No operator overloads. | new (v1.0); no prism origin — added for the host↔script coordination pattern |
 | `lifecycle/` | `ember_ext_lifecycle` | dynamic routine registration: `register_routine(fn h, i64 data) -> id` / `unregister_routine(id)` — the Tier 2 fn-refs feature's host-native half. The `fn` param is typed (`is_fn_handle`) so sema rejects a forged plain i64; the host calls a stored routine via the dispatch table (the SAME call mechanism as the static `@on_tick` path, just discovered by the script at runtime). No operator overloads. | new (v1.0 follow-on); no prism origin — added once Tier 2 fn-refs shipped (`../docs/LIFECYCLE.md` §2) |
 | `map/` | `ember_ext_map` | `map<K,V>` host-store type — opaque i64 handle backed by a host-side `unordered_map<i64,i64>` + `map_new`/`map_set`/`map_get`/`map_contains`/`map_length`/`map_remove`/`map_clear` (K and V are i64 in v1; typed keys/values are v2). No operator overloads. | new (v1.0); no prism origin — added for the Tier 0 standard addon set (`../docs/ROADMAP.md` Tier 0) |
-| `opt/` | `ember_ext_opt` | **PASS EXTENSION** (not a `NativeSig` addon) — registers IR→IR transforms over `ThinFunction` via `register_passes(EmberPassRegistry&)` (not `register_natives`). Ships `ConstPropPass` ("constprop"), `DeadCodeElimPass` ("dce"), `CSEPass` ("cse"), `LICMPass` ("licm"). See `../docs/spec/PASS_SYSTEM_DESIGN.md` §8. | new (v1.0); no prism origin — the IR optimization pass set |
+| `io/` | `ember_ext_io` | OS I/O core subset — console (`print`/`println`/`print_i64`/`print_f64`/`read_line`), file (`file_read_bytes`/`file_write_bytes`/`file_exists`), path (`path_exists`/`path_basename`/`path_dirname`). Stateless (no host slot vector); text natives take/return `string` handles, byte natives use `array<u8>` handles. **ALL `PERM_FFI`-gated** (sema rejects every call site without the FFI bit — zero runtime cost); two layers of defense (registration: host chooses whether to register at all; permission: `PERM_FFI` gating). See `../docs/planning/plan_OS_IO_EXTENSIONS.md`. No operator overloads. | new (v1.0); no prism origin — the ROADMAP "Family B" re-entry trigger fired (a script blocked on output beyond the exit code) |
+| `opt/` | `ember_ext_opt` | **PASS EXTENSION** (not a `NativeSig` addon) — registers IR→IR transforms over `ThinFunction` via `register_passes(EmberPassRegistry&)` (not `register_natives`). Ships eight passes: `ConstPropPass` ("constprop"), `DeadCodeElimPass` ("dce"), `CSEPass` ("cse"), `LICMPass` ("licm"), `StoreToLoadForwardPass` ("forward"), `CopyPropPass` ("copyprop"), `InstCombinePass` ("instcombine"), `DeadStoreElimPass` ("dse"). See `../docs/spec/PASS_SYSTEM_DESIGN.md` §8. | new (v1.0); no prism origin — the IR optimization pass set |
 | `obf/` | `ember_ext_obf` | **PASS EXTENSION** (not a `NativeSig` addon) — registers IR→IR transforms over `ThinFunction` via `register_passes(EmberPassRegistry&)` (not `register_natives`). Ships `SubstitutionPass` ("subst", MBA mutation — `is_required = true`, bypasses skip gates). See `../docs/spec/PASS_SYSTEM_DESIGN.md` §8. | new (v1.0); no prism origin — the obfuscation pass set |
 
 **Pass extensions (a separate category).** `extensions/opt/` (`ember_ext_opt`) and
 `extensions/obf/` (`ember_ext_obf`) are NOT `NativeSig` addons — they register
 IR→IR transforms over `ThinFunction` via `register_passes(EmberPassRegistry&)`
-(not `register_natives`). `opt` ships `ConstPropPass`/`DeadCodeElimPass`/
-`CSEPass`/`LICMPass`; `obf` ships `SubstitutionPass` (`is_required = true`).
+(not `register_natives`). `opt` ships eight passes: `ConstPropPass`/
+`DeadCodeElimPass`/`CSEPass`/`LICMPass`/`StoreToLoadForwardPass`/
+`CopyPropPass`/`InstCombinePass`/`DeadStoreElimPass`; `obf` ships
+`SubstitutionPass` (`is_required = true`).
 See `../docs/spec/PASS_SYSTEM_DESIGN.md` §8. They do not fit the "what an
 extension is" definition above (they are not host-side natives); they are
 listed here for completeness.
@@ -118,6 +121,7 @@ std::unordered_map<std::string, ember::NativeSig> BuildScriptHostNatives() {
     ember::ext_sync::register_natives(m);     // atomics, swap buffer, SPSC/MPSC/MPMC queues (v1.0)
     ember::ext_lifecycle::register_natives(m); // register_routine/unregister_routine (v1.0 follow-on)
     ember::ext_map::register_natives(m);       // map_new/map_set/map_get/map_contains/map_length/map_remove/map_clear (v1.0)
+    ember::ext_io::register_natives(m);         // print/println/print_i64/print_f64/read_line/file_*/path_* — ALL PERM_FFI-gated (v1.0)
     return m;
 }
 
@@ -126,7 +130,7 @@ void RegisterScriptHostOverloads(ember::OpOverloadTable& t) {
     ember::ext_quat::register_overloads(t);
     ember::ext_mat::register_overloads(t);
     ember::ext_string::register_overloads(t);  // string + ==
-    // ext_sync + ext_lifecycle + ext_map have no operator overloads (method-call natives, like ext_array).
+    // ext_sync + ext_lifecycle + ext_map + ext_io have no operator overloads (method-call natives, like ext_array).
 
 // Host-store types keep per-run state (opaque i64 handles index into a
 // host-owned vector). A host that wants each run independent calls the
@@ -141,6 +145,7 @@ void ResetScriptHostState() {
     ember::ext_sync::reset();
     ember::ext_lifecycle::reset();
     ember::ext_map::reset();
+    ember::ext_io::reset();   // stateless core subset (no-op, provided for symmetry)
     // math is stateless - no reset.
     // ... host's own state reset ...
 }
@@ -195,13 +200,13 @@ accessor natives, so they expose no accessor.
 `ember/CMakeLists.txt` defines one static library per extension
 (`ember_ext_vec`, `ember_ext_quat`, `ember_ext_mat`, `ember_ext_string`,
 `ember_ext_array`, `ember_ext_math`, `ember_ext_sync`, `ember_ext_lifecycle`,
-`ember_ext_map`, plus the `ember_ext_opt`/`ember_ext_obf` pass-extension
+`ember_ext_map`, `ember_ext_io`, plus the `ember_ext_opt`/`ember_ext_obf` pass-extension
 libs). Each links `ember_frontend` PUBLIC (for `make_prim`/`make_slice`/`Type` symbols,
 defined in `ember_frontend`'s `types.cpp`) and exposes its `ext_*.hpp` header via
 a PUBLIC include directory. A consumer links whichever extensions it wants;
-prism links the original six (sync + lifecycle + map are host-arranged per consumer
+prism links the original six (sync + lifecycle + map + io are host-arranged per consumer
 — see `examples/ext_sync_test.cpp` / `examples/ext_lifecycle_test.cpp` for
-the wiring; the standalone `ember` CLI links all nine addon extensions, plus the
+the wiring; the standalone `ember` CLI links all ten addon extensions, plus the
 `opt`/`obf` pass extensions).
 
 ## Purity
