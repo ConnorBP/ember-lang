@@ -72,7 +72,7 @@ inline std::vector<ModuleExport> build_em_exports(const LoadedModule& mod, uint3
         exp.fn_name = name;
         exp.module_id = module_id;
         exp.slot = int(slot);
-        if (mod.format_version >= EM_VERSION && slot < mod.signatures_by_slot.size()) {
+        if (mod.format_version >= EM_VERSION_V2 && slot < mod.signatures_by_slot.size()) {
             exp.ret = mod.signatures_by_slot[slot].ret;
             exp.params = mod.signatures_by_slot[slot].params;
             exp.unknown_sig = false;
@@ -99,8 +99,9 @@ inline uint32_t register_jit_module(ModuleRegistry& reg, const std::string& name
 // On failure returns false + sets *err (out is partially filled; discard it).
 inline bool link_em_file(ModuleRegistry& reg, const char* path, const std::string& name,
                         LoadedModule& out, std::string* err = nullptr,
-                        const std::unordered_map<std::string, NativeSig>* natives = nullptr) {
-    if (!load_em_file(path, out, err, &reg, natives)) return false;
+                        const std::unordered_map<std::string, NativeSig>* natives = nullptr,
+                        const EmVerifyPolicy* verify = nullptr) {
+    if (!load_em_file(path, out, err, &reg, natives, verify)) return false;
     uint32_t id = reg.register_module(name, out.dispatch.data(), err);
     if (id == UINT32_MAX) return false;
     return true;

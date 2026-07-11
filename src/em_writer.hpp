@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <array>
+#include <cstdint>
 #include <string>
 
 #include "em_file.hpp"
@@ -26,9 +28,32 @@ namespace ember {
 // docs/BUNDLING_AND_EM_MODULES.md Section 2.2). Returns true on success, false on I/O
 // error; on failure `*err` (if non-null) is set to a short human-readable
 // message and errno may also be set by the underlying ofstream. The writer
-// always emits the current version (EM_VERSION) and the current magic
-// (EM_MAGIC); it does not validate them on the way out - validation is the
-// loader's job.
+// always emits the current magic (EM_MAGIC); it does not validate it on the way
+// out - validation is the loader's job.
+//
+// `write_em_file` emits an UNSIGNED v3 module (the name directory IS the
+// export table from F1; no signature block). v3 is the dev/unsigned artifact;
+// the loader accepts it in dev mode (no verification keys) and rejects it in
+// signed-only mode. The existing .em round-trip tests + demos use this path
+// unchanged.
 bool write_em_file(const EmModule& mod, const char* path, std::string* err);
+
+// F2 (docs/spec/SPEC_AUDIT_2026-07-10.md F2): write a SIGNED `.em` v4 module — the
+// v3 layout (header -> per-fn records -> globals -> name directory) followed by
+// an additive Ed25519 signature block (em_file.hpp `EM_SIG_BLOCK_SIZE`). The
+// signature is computed over the v3 content bytes (offset 0 .. end of name
+// directory) with the supplied expanded `priv` key + `pub` key (see
+// thirdparty/ed25519/ed25519_ember.hpp). The signing key stays OFF the host; the
+// host loader gets only `pub` (the verification key). On success a v4 file is
+// on disk at `path`; the loader verifies the signature before
+// alloc_executable_rw and rejects on mismatch.
+//
+// `pub` is the 32-byte Ed25519 public key; `priv` is the 64-byte EXPANDED
+// private key (SHA-512(seed) || pub), as orlp/ed25519's `ed25519_create_keypair`
+// emits. Derive both from a 32-byte seed via `ember::ed25519::keypair_from_seed`.
+bool write_em_file_signed(const EmModule& mod, const char* path,
+                          const std::array<uint8_t,32>& pub,
+                          const std::array<uint8_t,64>& priv,
+                          std::string* err);
 
 } // namespace ember

@@ -24,14 +24,27 @@
 //
 // The writer always writes EM_VERSION / EM_MAGIC. No on-the-fly validation of
 // those constants (Section 2.7: validation is the loader's job).
+//
+// F2 (docs/spec/SPEC_AUDIT_2026-07-10.md F2): `write_em_file` emits an UNSIGNED
+// v3 module (no signature block — the dev/unsigned artifact). `write_em_file_signed`
+// emits a v4 module: the same v3 content bytes (sections 1-4 above) followed by
+// an additive Ed25519 signature block. The signature is computed over the v3
+// content bytes (offset 0 .. end of name directory); the signature block itself
+// is NOT signed (it is appended after the signed payload). The signing key stays
+// OFF the host; the host loader gets only the verification public key.
 
 #include "em_writer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
+
+#include "../thirdparty/ed25519/ed25519_ember.hpp"
 
 namespace ember {
 
@@ -163,19 +176,13 @@ bool validate_signature(const EmSignature& sig, std::string* err) {
 
 } // namespace
 
-bool write_em_file(const EmModule& mod, const char* path, std::string* err) {
-    std::ofstream ofs(path, std::ios::binary | std::ios::out | std::ios::trunc);
-    if (!ofs) {
-        if (err) *err = std::string("em_writer: could not open output file: ") + path;
-        return false;
-    }
-
-    // ---- pre-flight size checks so we never write a truncated header ----
+// ---- shared pre-flight: bounds-check every disk-controlled count/size so we
+// never write a truncated header or a corrupt record. Pure validation — no I/O.
+bool preflight_em_module(const EmModule& mod, std::string* err, uint64_t& rodata_total_out) {
     if (!count_fits_u32(mod.functions.size(), err, "function_count")) return false;
     if (!count_fits_u32(mod.globals.size(),  err, "global_size"))      return false;
     if (!count_fits_u32(mod.name_table.size(), err, "name_table_count")) return false;
 
-    // rodata_total = sum of per-fn rodata_size (informational, Section 2.2).
     uint64_t rodata_total_acc = 0;
     for (const auto& f : mod.functions) {
         if (!f.non_serializable_reason.empty()) {
@@ -201,20 +208,30 @@ bool write_em_file(const EmModule& mod, const char* path, std::string* err) {
         if (err) *err = "em_writer: rodata_total exceeds u32";
         return false;
     }
+    rodata_total_out = rodata_total_acc;
+    for (const auto& [nm, slot] : mod.name_table)
+        if (!name_fits_u16(nm, err, "name-table entry")) return false;
+    return true;
+}
 
-    // ---- 1. Header (40 bytes) ----
+// Emit the v3/v4 CONTENT (header -> per-fn records -> globals -> name
+// directory) into `ofs`. This byte range is the SIGNED PAYLOAD for a v4
+// module (F2): a v4 file is exactly these bytes followed by the additive
+// signature block. The version word written is `version` so the unsigned path
+// writes v3 and the signed path writes v4 over otherwise-byte-identical content.
+bool emit_em_content(std::ostream& ofs, const EmModule& mod, uint32_t version,
+                     uint64_t rodata_total, std::string* err) {
     emit_u32_le(ofs, EM_MAGIC);
-    emit_u32_le(ofs, EM_VERSION);
+    emit_u32_le(ofs, version);
     emit_u32_le(ofs, /*flags=*/0u);
     emit_u32_le(ofs, static_cast<uint32_t>(mod.functions.size()));
     emit_u32_le(ofs, static_cast<uint32_t>(mod.globals.size()));
-    emit_u32_le(ofs, static_cast<uint32_t>(rodata_total_acc));
+    emit_u32_le(ofs, static_cast<uint32_t>(rodata_total));
     emit_u32_le(ofs, mod.entry_slot);
     emit_u32_le(ofs, static_cast<uint32_t>(EM_BUILD_ID));
     emit_u32_le(ofs, static_cast<uint32_t>(EM_BUILD_ID >> 32));
     emit_u32_le(ofs, EM_TARGET_ABI_HASH);
 
-    // ---- 2. Per-function records ----
     for (const auto& f : mod.functions) {
         emit_u16_le(ofs, static_cast<uint16_t>(f.name.size()));
         emit_string(ofs, f.name);
@@ -233,8 +250,6 @@ bool write_em_file(const EmModule& mod, const char* path, std::string* err) {
         emit_u32_le(ofs, static_cast<uint32_t>(f.relocs.size()));
         for (const auto& r : f.relocs) {
             emit_u32_le(ofs, r.offset);
-            // kind is a single byte; EmReloc::Kind values are AbsFixup::Kind
-            // values (0/1), already stored as uint8_t.
             uint8_t kb = r.kind;
             ofs.write(reinterpret_cast<const char*>(&kb), 1);
             emit_u32_le(ofs, r.addend);
@@ -249,29 +264,63 @@ bool write_em_file(const EmModule& mod, const char* path, std::string* err) {
         }
     }
 
-    // ---- 3. Globals block ----
     emit_bytes(ofs, mod.globals);
 
-    // ---- 4. Name directory ----
     emit_u32_le(ofs, static_cast<uint32_t>(mod.name_table.size()));
     for (const auto& [nm, slot] : mod.name_table) {
-        if (!name_fits_u16(nm, err, "name-table entry")) {
-            // We already started writing the file; signal failure so the
-            // caller knows the output is incomplete.
-            if (err) *err = "em_writer: name-table entry too long (>u16)";
-            ofs.close();
-            return false;
-        }
+        if (!name_fits_u16(nm, err, "name-table entry")) { if (err) *err = "em_writer: name-table entry too long (>u16)"; return false; }
         emit_u16_le(ofs, static_cast<uint16_t>(nm.size()));
         emit_string(ofs, nm);
         emit_u32_le(ofs, slot);
     }
+    return true;
+}
 
+bool write_em_file(const EmModule& mod, const char* path, std::string* err) {
+    uint64_t rodata_total = 0;
+    if (!preflight_em_module(mod, err, rodata_total)) return false;
+    std::ofstream ofs(path, std::ios::binary | std::ios::out | std::ios::trunc);
+    if (!ofs) { if (err) *err = std::string("em_writer: could not open output file: ") + path; return false; }
+    if (!emit_em_content(ofs, mod, EM_VERSION_V3, rodata_total, err)) { ofs.close(); return false; }
     ofs.flush();
-    if (!ofs) {
-        if (err) *err = "em_writer: I/O error during write/flush";
+    if (!ofs) { if (err) *err = "em_writer: I/O error during write/flush"; return false; }
+    return true;
+}
+
+bool write_em_file_signed(const EmModule& mod, const char* path,
+                          const std::array<uint8_t,32>& pub,
+                          const std::array<uint8_t,64>& priv,
+                          std::string* err) {
+    uint64_t rodata_total = 0;
+    if (!preflight_em_module(mod, err, rodata_total)) return false;
+    // Emit the v4 CONTENT into an in-memory buffer so we can sign it. The signed
+    // payload is exactly the bytes from offset 0 (magic) through the end of the
+    // name directory (the v3 layout). The version word is EM_VERSION (v4) so the
+    // loader routes to the signed path.
+    std::stringstream content(std::ios::binary | std::ios::out | std::ios::in);
+    if (!emit_em_content(content, mod, EM_VERSION, rodata_total, err)) return false;
+    content.flush();
+    std::string payload = content.str();
+    if (payload.size() > MAX_FILE_SIZE - EM_SIG_BLOCK_SIZE) {
+        if (err) *err = "em_writer: signed module content exceeds file size limit";
         return false;
     }
+    const uint64_t payload_len = payload.size();
+
+    ed25519::Sig signature{};
+    ed25519::sign(reinterpret_cast<const uint8_t*>(payload.data()), payload_len,
+                  pub, priv, signature);
+
+    std::ofstream ofs(path, std::ios::binary | std::ios::out | std::ios::trunc);
+    if (!ofs) { if (err) *err = std::string("em_writer: could not open output file: ") + path; return false; }
+    ofs.write(payload.data(), static_cast<std::streamsize>(payload_len));
+    // Signature block (EM_SIG_BLOCK_SIZE = 104): sig_magic | payload_len | pubkey_id | signature
+    emit_u32_le(ofs, EM_SIG_MAGIC);
+    emit_u32_le(ofs, static_cast<uint32_t>(payload_len));
+    emit_bytes(ofs, pub.data(), pub.size());
+    emit_bytes(ofs, signature.data(), signature.size());
+    ofs.flush();
+    if (!ofs) { if (err) *err = "em_writer: I/O error during write/flush"; return false; }
     return true;
 }
 

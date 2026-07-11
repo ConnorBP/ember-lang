@@ -8,6 +8,7 @@
 #include "em_loader.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <exception>
@@ -18,6 +19,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "../thirdparty/ed25519/ed25519_ember.hpp"
 
 namespace ember {
 namespace {
@@ -108,6 +111,17 @@ struct ParsedModule {
     uint32_t entry_slot = EM_NO_ENTRY;
     size_t dispatch_size = 0;
     uint32_t version = EM_VERSION_V1;
+    // F2 v4 signature block (parsed but NOT yet verified; verification runs in
+    // load_em_file_impl BEFORE alloc_executable_rw). `sig_payload_len` is the
+    // byte length of the SIGNED payload (offset 0 .. sig block start); it is
+    // cross-checked against the position the parser reached at the end of the
+    // name directory, so a lying/truncated block is rejected here. `signature`
+    // and `pubkey_id` are the block's 64- and 32-byte fields. All three stay
+    // zero/default for v1/v2/v3 (unsigned modules).
+    uint64_t sig_payload_len = 0;
+    std::array<uint8_t, EM_SIG_PUBKEY_SIZE>  pubkey_id{};
+    std::array<uint8_t, EM_SIG_SIGNATURE_SIZE> signature{};
+    bool has_signature_block = false;
 };
 
 // Owns pages until the complete module has been sealed and committed to `out`.
@@ -238,7 +252,8 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
         set_error(err, "em_loader: format: bad magic");
         return false;
     }
-    if (version != EM_VERSION_V1 && version != EM_VERSION_V2 && version != EM_VERSION) {
+    if (version != EM_VERSION_V1 && version != EM_VERSION_V2 &&
+        version != EM_VERSION_V3 && version != EM_VERSION) {
         set_error(err, "em_loader: format: unsupported version " + std::to_string(version)); return false;
     }
     mod.version = version;
@@ -428,8 +443,60 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
         mod.names.emplace_back(std::move(name), slot);
     }
 
+    // F2 (docs/spec/SPEC_AUDIT_2026-07-10.md F2): the byte position reached here
+    // is the END of the v3 content (header -> name directory) — i.e. the start
+    // of the trailing bytes, which is exactly the signed PAYLOAD length for a
+    // v4 module. Capture it before handling the trailing bytes.
+    const uint64_t payload_end = rd.pos;
+
+    // Trailing bytes: v1/v2/v3 carry NO signature block -> the file MUST end
+    // here (the historical "trailing bytes == 0" check). v4 carries exactly
+    // one additive Ed25519 signature block (em_file.hpp EM_SIG_BLOCK_SIZE =
+    // 104 bytes) starting with the EMSG sentinel; parse it here. The
+    // signature is VERIFIED later in load_em_file_impl, BEFORE
+    // alloc_executable_rw — parse_file only captures the block.
+    if (version == EM_VERSION) {
+        if (rd.remaining() != EM_SIG_BLOCK_SIZE) {
+            set_error(err, "em_loader: format: v4 module has a malformed signature block (wrong trailing size)");
+            return false;
+        }
+        uint32_t sig_magic = 0;
+        uint32_t sig_payload_len = 0;
+        if (!rd.u32(sig_magic) || !rd.u32(sig_payload_len)) {
+            set_error(err, "em_loader: format: truncated signature block header");
+            return false;
+        }
+        if (sig_magic != EM_SIG_MAGIC) {
+            set_error(err, "em_loader: format: bad signature-block sentinel");
+            return false;
+        }
+        // The block's payload_len MUST equal the position the parser reached at
+        // the end of the name directory (otherwise the signed range is a lie —
+        // a truncated or padded file would verify against a different byte range
+        // than the loader actually parsed). This is a structural cross-check;
+        // cryptographic verification happens in load_em_file_impl.
+        if (sig_payload_len != payload_end) {
+            set_error(err, "em_loader: format: signature payload length does not match content length");
+            return false;
+        }
+        const uint8_t* pk = nullptr;
+        const uint8_t* sg = nullptr;
+        if (!rd.take(EM_SIG_PUBKEY_SIZE, pk) || !rd.take(EM_SIG_SIGNATURE_SIZE, sg)) {
+            set_error(err, "em_loader: format: truncated signature block payload");
+            return false;
+        }
+        std::memcpy(mod.pubkey_id.data(), pk, EM_SIG_PUBKEY_SIZE);
+        std::memcpy(mod.signature.data(), sg, EM_SIG_SIGNATURE_SIZE);
+        mod.sig_payload_len = sig_payload_len;
+        mod.has_signature_block = true;
+    } else {
+        if (rd.remaining() != 0) {
+            set_error(err, "em_loader: format: trailing bytes after name directory");
+            return false;
+        }
+    }
     if (rd.remaining() != 0) {
-        set_error(err, "em_loader: format: trailing bytes after name directory");
+        set_error(err, "em_loader: format: trailing bytes after signature block");
         return false;
     }
     if (mod.entry_slot != EM_NO_ENTRY &&
@@ -446,7 +513,8 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
 
 bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
                        ModuleRegistry* registry,
-                       const std::unordered_map<std::string, NativeSig>* natives) {
+                       const std::unordered_map<std::string, NativeSig>* natives,
+                       const EmVerifyPolicy* verify) {
     if (!path) {
         set_error(err, "em_loader: argument: null path");
         return false;
@@ -485,6 +553,53 @@ bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
 
     ParsedModule parsed;
     if (!parse_file(file, parsed, registry, natives, err)) return false;
+
+    // F2 (docs/spec/SPEC_AUDIT_2026-07-10.md F2): verify the .em CONTENT
+    // authentication BEFORE any executable page is allocated. This is the
+    // load-bearing security fix — a maliciously-modified `.em` is rejected
+    // here, not executed. parse_file already cross-checked the v4 payload
+    // length against the name-directory end; here we do the cryptographic
+    // verify against the host's trusted keyring and the dev/signed-only policy.
+    const bool signed_only = verify && verify->signed_only();
+    if (parsed.version == EM_VERSION) {
+        // v4: signed module. Requires a verification key.
+        if (!signed_only) {
+            set_error(err, "em_loader: signature: v4 module requires a verification key; host provided none (dev mode cannot run signed code unverified)");
+            return false;
+        }
+        // Find the trusted key matching the module's pubkey_id. A v4 module
+        // with an untrusted key is rejected with a clear error rather than a
+        // generic verify-failed (so a host can tell "wrong keychain" from
+        // "tampered content").
+        const ed25519::PubKey* trusted = nullptr;
+        for (const auto& k : verify->trusted_keys) {
+            if (std::memcmp(k.data(), parsed.pubkey_id.data(), EM_SIG_PUBKEY_SIZE) == 0) {
+                trusted = &k;
+                break;
+            }
+        }
+        if (!trusted) {
+            set_error(err, "em_loader: signature: module signed by a key not in the host's trusted keyring");
+            return false;
+        }
+        // Verify the Ed25519 signature over the content bytes (0 .. payload_len).
+        // `file` holds the full file; the signed payload is the leading
+        // `sig_payload_len` bytes (header -> name directory), which parse_file
+        // cross-checked against the parser position.
+        if (!ed25519::verify(parsed.signature, file.data(), parsed.sig_payload_len, *trusted)) {
+            set_error(err, "em_loader: signature: Ed25519 verification FAILED (module content does not match its signature; possible tampering)");
+            return false;
+        }
+    } else {
+        // v1/v2/v3: unsigned module. In signed-only mode the host mandated
+        // signed modules, so reject. In dev mode (no keys) accept (the
+        // development convenience the audit names).
+        if (signed_only) {
+            set_error(err, "em_loader: signature: host mandates signed modules; this is an unsigned v" +
+                           std::to_string(parsed.version) + " module");
+            return false;
+        }
+    }
 
     // All structure, all functions, and all relocations are validated above.
     // Only now establish the stable dispatch/globals backing stores and begin
@@ -607,11 +722,12 @@ void* LoadedModule::entry() const {
 
 bool load_em_file(const char* path, LoadedModule& out, std::string* err,
                   ModuleRegistry* registry,
-                  const std::unordered_map<std::string, NativeSig>* native_bindings) {
+                  const std::unordered_map<std::string, NativeSig>* native_bindings,
+                  const EmVerifyPolicy* verify) {
     // Complete public no-throw boundary: malformed input and allocation/library
     // failures are always reported as false plus a categorized error.
     try {
-        return load_em_file_impl(path, out, err, registry, native_bindings);
+        return load_em_file_impl(path, out, err, registry, native_bindings, verify);
     } catch (const std::bad_alloc&) {
         set_error(err, "em_loader: allocation: std::bad_alloc");
     } catch (const std::length_error&) {

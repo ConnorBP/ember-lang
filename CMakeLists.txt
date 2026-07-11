@@ -9,6 +9,14 @@
 
 cmake_minimum_required(VERSION 3.16)
 project(ember VERSION 1.0.0 LANGUAGES CXX)
+# The vendored ed25519 (thirdparty/ed25519) is C99; enable the C language so
+# CMake links it correctly (F2 .em content authentication). ember itself stays C++17.
+enable_language(C)
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    set(CMAKE_C_STANDARD 99)
+    set(CMAKE_C_STANDARD_REQUIRED ON)
+    set(CMAKE_C_EXTENSIONS OFF)
+endif()
 
 if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "MSVC x64 not yet supported; use MinGW")
@@ -28,6 +36,32 @@ else()
     add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 endif()
 
+# ---- vendored Ed25519 (F2 .em content authentication, docs/spec/SPEC_AUDIT_2026-07-10.md F2) ----
+# orlp/ed25519 (public domain, see thirdparty/ed25519/license.txt) — the small,
+# portable Ed25519 implementation ember links for `.em` signature sign/verify.
+# Compiled as C99 (the sources are C; g++ compiles them in C++ mode as .c via
+# language-per-source). ED25519_NO_SEED excludes seed.c's CSPRNG (wincrypt on
+# Windows — a platform coupling the audit asked ember to avoid for portability);
+# the test harness uses a DETERMINISTIC 32-byte seed so a tamper test is
+# reproducible, and production hosts that want a CSPRNG seed provide their own
+# 32-byte seed to ember::ed25519::keypair_from_seed.
+add_library(ember_ed25519 STATIC
+    thirdparty/ed25519/fe.c
+    thirdparty/ed25519/ge.c
+    thirdparty/ed25519/sc.c
+    thirdparty/ed25519/sha512.c
+    thirdparty/ed25519/keypair.c
+    thirdparty/ed25519/sign.c
+    thirdparty/ed25519/verify.c
+    thirdparty/ed25519/add_scalar.c
+    thirdparty/ed25519/key_exchange.c
+)
+target_include_directories(ember_ed25519 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/ed25519)
+target_compile_definitions(ember_ed25519 PUBLIC ED25519_NO_SEED)
+if(NOT MSVC)
+    target_compile_options(ember_ed25519 PRIVATE -Wno-sign-compare -Wno-unused-parameter -Wno-unused-variable -Wno-missing-field-initializers)
+endif()
+
 # ---- core runtime lib: JIT memory, engine, .em serialize/load, module registry ----
 add_library(ember STATIC
     src/jit_memory.cpp
@@ -37,6 +71,7 @@ add_library(ember STATIC
     src/module_registry.cpp
 )
 target_include_directories(ember PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(ember PUBLIC ember_ed25519)  # F2 .em content authentication
 
 # ---- frontend lib: lexer, types, parser, sema, codegen ----
 add_library(ember_frontend STATIC
@@ -217,6 +252,24 @@ if(WIN32)
     target_link_libraries(pub_priv_test PRIVATE kernel32)
 endif()
 add_test(NAME pub_priv COMMAND pub_priv_test)
+
+# ---- F2: signed .em content authentication (docs/spec/SPEC_AUDIT_2026-07-10.md F2) ----
+# A NON-CIRCULAR regression for the Ed25519-over-`.em` content-auth path:
+#   - case A: a SIGNED v4 .em verifies + runs (the happy path).
+#   - case B: a TAMPERED signed .em (flip a CODE byte AFTER signing) is REJECTED
+#     at load with a clear "Ed25519 verification FAILED" error — NOT executed
+#     (no segfault, no exec page published). This is the load-bearing assertion.
+#   - case C: a signed .em whose signature block is corrupted is rejected.
+#   - case D: dev-mode (no key) rejects a v4 module; signed-only mode rejects an
+#     unsigned v3 module. Pins the key-management policy.
+#   - case E: the unsigned v3 path still loads (backward compat — F2 is additive).
+# The test links ember (which links ember_ed25519) + ember_frontend so it can
+# JIT-compile a real function, serialize it SIGNED, load it back, and tamper a
+# code byte in a temp copy. Mirrors pub_priv_test's emit_em shape. See
+# examples/em_signed_test.cpp.
+add_executable(em_signed_test examples/em_signed_test.cpp)
+target_link_libraries(em_signed_test PRIVATE ember ember_frontend)
+add_test(NAME em_signed COMMAND em_signed_test)
 
 # ---- lang regression suite: ember_check (parse-only) + sema_check (parse+sema) +
 # the run_lang_tests.sh runner that classifies tests/lang/{valid,invalid,sema_valid,
@@ -448,5 +501,5 @@ add_test(NAME aggregate_global COMMAND aggregate_global_test)
 
 set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
     v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
-    array_lit aggregate_global
+    array_lit aggregate_global em_signed
     PROPERTIES TIMEOUT 30)

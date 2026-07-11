@@ -35,8 +35,15 @@
 // name directory as the module's EXPORT TABLE (only `pub fn`/bare-`fn` entries;
 // `priv fn` helpers are serialized but absent from the directory, so they are
 // not callable cross-module and `build_em_exports` does not export them). The
-// loader accepts v1, v2, and v3. This is still native code, not a sandbox or an
-// authenticated untrusted-code container.
+// loader accepts v1, v2, and v3. v4 (F2, docs/spec/SPEC_AUDIT_2026-07-10.md F2)
+// keeps the v3 layout byte-identical and appends an additive Ed25519 signature
+// block after the name directory; the loader verifies that signature over the
+// v3 content (header -> end of name directory) BEFORE alloc_executable_rw and
+// rejects the module on mismatch — a maliciously-modified `.em` is rejected
+// rather than executed. The loader accepts v1, v2, v3, and v4. The build_id /
+// abi_hash stay the COMPATIBILITY check; the v4 signature is the CONTENT
+// authentication the v2/v3 identity hash is NOT. See `EmVerifyPolicy` for the
+// dev-mode vs signed-only key-management model.
 //
 // prism port note (docs/planning/RESTRUCTURE_PLAN.md Section 5): the standalone loader used an
 // RAII `ExecArena` per function (owning a VirtualAlloc page); prism's
@@ -49,6 +56,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -62,6 +70,32 @@
 #include "module_registry.hpp"  // ModuleRegistry (kind-2 reloc target, docs/MODULES.md Section 3)
 
 namespace ember {
+
+// F2 (docs/spec/SPEC_AUDIT_2026-07-10.md F2): the .em CONTENT-AUTHENTICATION
+// policy a host passes to load_em_file. This is the secure-boot-style opt-in:
+//
+//   - trusted_keys EMPTY  -> DEV MODE. The loader accepts unsigned v1/v2/v3
+//     modules (the development convenience the audit names). A v4 (signed)
+//     module is REJECTED with a clear error ("v4 module requires a
+//     verification key; host provided none") — a v4 module IS signed, so
+//     running it without verifying would be worse than running honest
+//     unsigned dev code. Existing tests/demos use the unsigned path here.
+//
+//   - trusted_keys NON-EMPTY -> SIGNED-ONLY MODE. v1/v2/v3 (unsigned) modules
+//     are REJECTED ("host mandates signed modules; this is an unsigned vN
+//     module"); a v4 module loads ONLY if its signature verifies against one
+//     of the trusted keys. The signing key stays OFF the host; the host gets
+//     only the verification public keys.
+//
+// `null` policy (the default arg) == DEV MODE (empty keyring) so every
+// existing caller (em_roundtrip_test, import_roundtrip_test, v0_5_live_modules_test,
+// pub_priv_test, link_em_file, the CLI without --verify-em-key) keeps working
+// unchanged against unsigned v1/v2/v3 modules. The CLI's --verify-em-key flag
+// populates a non-empty keyring to opt into signed-only mode.
+struct EmVerifyPolicy {
+    std::vector<std::array<uint8_t, 32>> trusted_keys;
+    bool signed_only() const { return !trusted_keys.empty(); }
+};
 
 // A loaded `.em` module: owns the dispatch table, the globals block, and the
 // per-function exec pages. The runtime (ember_call, hot reload) treats this
@@ -127,11 +161,39 @@ struct LoadedModule {
 // GlobalsBase) are always patched with the loaded module's own dispatch table
 // / globals - they do not need a registry.
 //
-// No-throw boundary: malformed files, I/O failures, allocation failures, and
-// standard-library exceptions all surface as `false` plus a categorized
-// `*err` message. Disk-controlled counts/sizes are bounded before allocation.
+// Load a `.em` file from `path`. Returns true and fills `out` on success;
+// returns false and sets *err on any failure (bad magic, bad version, I/O,
+// truncated read, unknown reloc kind, a kind-2 reloc with no `registry`, a v4
+// signature that fails verification). On failure `out` is unchanged: parsing,
+// signature verification, and executable pages are staged privately, and no
+// dispatch entry/page is published until every function and relocation has
+// validated, the signature (v4) has verified, patched, and sealed successfully.
+//
+// `registry` is optional (additive, default nullptr): when non-null, kind-2
+// (ModuleRegistryBase) relocs are patched with `registry->base()` (docs/MODULES.md
+// Section 3 - the cross-module call site's registry hop). When null, encountering a
+// kind-2 reloc is a load error (the module has a cross-module call site but
+// no registry was supplied to bind it). Kinds 0/1 (DispatchTableBase /
+// GlobalsBase) are always patched with the loaded module's own dispatch table
+// / globals - they do not need a registry.
+//
+// `verify` is optional (additive, default nullptr == DEV MODE, empty keyring):
+// the F2 .em content-authentication policy. See `EmVerifyPolicy`. In dev mode
+// (null OR an empty keyring) the loader accepts unsigned v1/v2/v3 modules and
+// rejects a v4 module with a clear error. In signed-only mode (a non-empty
+// keyring) the loader rejects unsigned v1/v2/v3 modules and accepts a v4
+// module only if its Ed25519 signature verifies against one of the trusted
+// keys, BEFORE any executable page is allocated. `null` is the backward-compat
+// default so every existing caller keeps working unchanged against unsigned
+// v1/v2/v3 modules.
+//
+// No-throw boundary: malformed files, I/O failures, allocation failures,
+// signature-verification failures, and standard-library exceptions all surface
+// as `false` plus a categorized `*err` message. Disk-controlled counts/sizes
+// are bounded before allocation.
 bool load_em_file(const char* path, LoadedModule& out, std::string* err,
                   ModuleRegistry* registry = nullptr,
-                  const std::unordered_map<std::string, NativeSig>* native_bindings = nullptr);
+                  const std::unordered_map<std::string, NativeSig>* native_bindings = nullptr,
+                  const EmVerifyPolicy* verify = nullptr);
 
 } // namespace ember

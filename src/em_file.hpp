@@ -11,7 +11,7 @@
 //
 //   Header (40 bytes):
 //     magic           : u32 = 0x454D424C  ("EMBL")
-//     version         : u32 = 3 (loader also accepts historical v1 and v2)
+//     version         : u32 = 4 (loader also accepts historical v1, v2, v3)
 //     flags           : u32 = 0           (bit 0 reserved: embeds source)
 //     function_count  : u32
 //     global_size     : u32
@@ -36,9 +36,22 @@
 //
 //   Globals block:    bytes[global_size]
 //
-//   Name directory:
+//   Name directory (v3: the EXPORT TABLE — only is_exported fns):
 //     name_table_count : u32
 //     entries: [ { name_len: u16, name: bytes, slot_index: u32 } ... ]
+//
+//   Signature block (v4 ONLY — additive, after the name directory):
+//     sig_magic       : u32 = 0x454D5347  ("EMSG" - ember signature sentinel)
+//     payload_len     : u32  (byte length of the SIGNED payload, i.e. the
+//                            offset where the signature block starts; the
+//                            verifier recomputes this as "end of name dir"
+//                            and cross-checks it so a truncated/lying block is
+//                            rejected)
+//     pubkey_id       : u8[32]  (the public key the signature is bound to; lets
+//                            a host with a keyring pick the matching key and
+//                            reject an untrusted-key signature with a clear
+//                            error instead of generic "verify failed")
+//     signature       : u8[64]  (Ed25519 signature over bytes[0 .. payload_len))
 //
 // `reloc.kind` mirrors `AbsFixup::Kind` (x64_emitter.hpp): 0 =
 // DispatchTableBase (patch imm64 -> &this module's DispatchTable), 1 =
@@ -54,9 +67,26 @@
 // docs/spec/SPEC_AUDIT_2026-07-10.md F1) keeps the v2 per-function record layout
 // byte-identical and repurposes the name directory as the module's EXPORT TABLE
 // (only `pub fn`/bare-`fn` entries; `priv fn` helpers are serialized but absent
-// from the directory, so they are not callable cross-module). The loader accepts
-// v1, v2, and v3. Neither version authenticates native code or makes it an
-// untrusted-code container.
+// from the directory, so they are not callable cross-module). v4 (F2,
+// docs/spec/SPEC_AUDIT_2026-07-10.md F2) keeps the v3 layout byte-identical and
+// appends an additive Ed25519 SIGNATURE BLOCK after the name directory. The
+// loader verifies the signature over the v3 content (header -> end of name
+// directory) BEFORE alloc_executable_rw and rejects the module on mismatch, so
+// a maliciously-modified `.em` is rejected rather than executed (the build_id /
+// abi_hash are still the compatibility check; the signature is the CONTENT
+// authentication the v2/v3 identity hash is NOT). The loader accepts v1, v2,
+// v3, and v4. v1/v2/v3 carry NO signature (the v3 "trailing bytes == 0" check
+// still holds); v4 carries exactly one signature block.
+//
+// KEY MANAGEMENT (F2): the signing key stays OFF the host (the build tool that
+// emits `.em` signs it). The loader takes a set of TRUSTED verification public
+// keys (a keyring). Non-empty keyring -> SIGNED-ONLY (v1/v2/v3 unsigned modules
+// rejected; v4 loads only if its signature verifies). Empty keyring -> DEV MODE
+// (unsigned v1/v2/v3 accepted; v4 rejected with a clear error — a v4 module IS
+// signed, so running it unverified is worse than honest unsigned dev code).
+// Mirrors secure-boot: keys present == signed-only; keys absent == unsigned
+// dev OK. See docs/spec/SAFETY_AND_SANDBOX.md §1 + docs/BUNDLING_AND_EM_MODULES.md
+// §2.5.1.
 
 #pragma once
 
@@ -74,10 +104,23 @@ namespace ember {
 // "EMBL" - ember bundle, loadable. Read as a little-endian u32 this is
 // 'E','M','B','L' = 0x4C,0x42,0x4D,0x45 -> 0x454D424C.
 constexpr uint32_t EM_MAGIC    = 0x454D424Cu;
-constexpr uint32_t EM_VERSION  = 3u;       // v3: name directory IS the export table (F1 pub/priv visibility)
+constexpr uint32_t EM_VERSION  = 4u;       // v4: v3 layout + Ed25519 signature block (F2 content authentication)
+constexpr uint32_t EM_VERSION_V3 = 3u;     // historical v3: name directory IS the export table (F1 pub/priv visibility)
 constexpr uint32_t EM_VERSION_V2 = 2u;     // historical v2: canonical signatures, native bindings, rodata relocs
 constexpr uint32_t EM_VERSION_V1 = 1u;     // historical v1: ABI-trusted, unknown signatures
 constexpr uint32_t EM_NO_ENTRY = 0xFFFFFFFFu; // entry_slot when no @entry fn
+
+// v4 signature-block sentinel ("EMSG" = ember signature). Read as a LE u32:
+// 'E','M','S','G' = 0x47,0x53,0x4D,0x45 -> 0x454D5347. The signature block is
+// appended AFTER the name directory in a v4 module; this sentinel lets a
+// reader distinguish a v4 trailing block from a corrupt v3 file (whose
+// trailing-bytes check is still == 0). docs/spec/SPEC_AUDIT_2026-07-10.md F2.
+constexpr uint32_t EM_SIG_MAGIC = 0x454D5347u;
+// On-disk size of the additive v4 signature block: 4 (sig_magic) + 4
+// (payload_len) + 32 (pubkey_id) + 64 (signature) = 104 bytes.
+constexpr uint32_t EM_SIG_BLOCK_SIZE = 104u;
+constexpr uint32_t EM_SIG_PUBKEY_SIZE  = 32u;
+constexpr uint32_t EM_SIG_SIGNATURE_SIZE = 64u;
 
 // v2 binding identity. These are deliberately derived from stable compiler /
 // format-ABI facts, never a timestamp, so separately launched processes built
