@@ -216,3 +216,21 @@ extensions (`opt`, `obf`) are a separate category — they register IR→IR
 transforms via `register_passes` (not `register_natives`); see
 `docs/spec/PASS_SYSTEM_DESIGN.md`. The fluent `TypeBuilder`/`StructBuilder`
 surface stays trigger-gated on a host needing script-visible C++ struct types.
+
+## License
+
+ember is **dual-licensed**:
+
+- **AGPL-3.0** for open-source and community use — if you use ember in a
+  project that you distribute or make available as a network service, you must
+  open-source your integration under AGPL-3.0. See `LICENSE`.
+
+- **Commercial license** for proprietary/commercial use — if you want to use
+  ember without the AGPL copyleft obligation (e.g., in a proprietary product or
+  commercial service), you need a commercial license. See `COMMERCIAL_LICENSE.md`
+  or contact connor.postma@gmail.com.
+
+This dual-license model ensures ember stays free for open-source development
+while allowing sustainable commercial integration. External contributions
+require a CLA (Contributor License Agreement) to preserve the ability to offer
+commercial licenses.

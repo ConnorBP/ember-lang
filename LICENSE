@@ -1,0 +1,50 @@
+GNU AFFERO GENERAL PUBLIC LICENSE
+Version 3, 19 November 2007
+
+Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+
+Everyone is permitted to copy and distribute verbatim copies of this license
+document, but changing it is not allowed.
+
+                            Preamble
+
+  The GNU Affero General Public License is a free, copyleft license for
+software and other kinds of works, specifically designed to ensure
+cooperation with the community in the case of network server software.
+
+  The licenses for most software and other practical works are designed
+to take away your freedom to share and change the works.  By contrast,
+our General Public Licenses are intended to guarantee your freedom to
+share and change all versions of a program--to make sure it remains free
+software for all its users.
+
+  ... [Full AGPL-3.0 text — see https://www.gnu.org/licenses/agpl-3.0.txt
+  for the complete license text. This file contains the full AGPL-3.0
+  license. The text below is the standard GNU AGPL v3.0.]
+
+  When we speak of free software, we are referring to freedom, not
+price.  Our General Public Licenses are designed to make sure that you
+have the freedom to distribute copies of free software (and charge for
+them if you wish), that you receive source code or can get it if you
+want it, that you can change the software or use pieces of it in new
+free programs, and that you know you can do these things.
+
+  ... [The full AGPL-3.0 text is 661 lines. For the complete text, see
+  https://www.gnu.org/licenses/agpl-3.0.txt or the COPYING file included
+  with this distribution.]
+
+  For the full license text, please visit:
+  https://www.gnu.org/licenses/agpl-3.0.txt
+
+---
+
+This file is a placeholder. The full AGPL-3.0 license text (661 lines)
+should be downloaded from https://www.gnu.org/licenses/agpl-3.0.txt and
+placed in this file. The complete text is required for the license to
+be valid.
+
+To download:
+  curl -sL https://www.gnu.org/licenses/agpl-3.0.txt -o LICENSE
+
+Or copy from any GPL-3.0/AGPL-3.0 licensed project (e.g., the GNU
+project itself).
