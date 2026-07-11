@@ -69,6 +69,14 @@ add_library(ember STATIC
     src/em_writer.cpp
     src/em_loader.cpp
     src/module_registry.cpp
+    # Stage A c1 (IL-.em): the thin three-address IR data structures' debug
+    # pretty-printer. Lives in the CORE lib (not ember_frontend) because it
+    # touches Type ONLY through public data members + the Prim enum — it never
+    # calls a Type method (those live in types.cpp / ember_frontend, and ember
+    # must not depend on ember_frontend: the link direction is one-way). Same
+    # self-contained pattern em_writer.cpp / em_loader.cpp already follow. The
+    # struct test links only `ember` and so reaches dump() directly.
+    src/thin_ir.cpp
 )
 target_include_directories(ember PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ember PUBLIC ember_ed25519)  # F2 .em content authentication
@@ -498,6 +506,19 @@ if(WIN32)
 endif()
 add_test(NAME codegen_opt COMMAND codegen_opt_test)
 
+# thin_ir_struct_test - Stage A c1 (IL-.em): pins the thin three-address IR
+# data-structure CONTRACT that the lowering (c2) and the emit (c3) will
+# independently implement against. Builds a small fib-shaped ThinFunction BY
+# HAND (no parser/sema/lowering) and asserts the invariants c2 produces and
+# c3 consumes: blocks non-empty + blocks[0] entry + every block terminated +
+# VReg 0 sentinel + dump() non-empty and names the fn. Links only the core
+# `ember` lib (thin_ir.cpp / dump() live there; no frontend symbols used) so
+# it is independent of the extension refactor and of F2 — a pure data-struct
+# pin, disjoint from c2/c3's new files (thin_lower / thin_emit).
+add_executable(thin_ir_struct_test examples/thin_ir_struct_test.cpp)
+target_link_libraries(thin_ir_struct_test PRIVATE ember)
+add_test(NAME thin_ir_struct COMMAND thin_ir_struct_test)
+
 # aggregate_global_test - pins aggregate globals (chunk c3): struct globals
 # `global cfg : Config = Config{...};`, fixed-array globals `global arr : i64[3]
 # = [10,20,30];`, slice globals `global s : i64[] = [1,2,3];`. Compiles tiny
@@ -518,5 +539,5 @@ add_test(NAME aggregate_global COMMAND aggregate_global_test)
 
 set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
     v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
-    array_lit aggregate_global em_signed codegen_opt
+    array_lit aggregate_global em_signed codegen_opt thin_ir_struct
     PROPERTIES TIMEOUT 30)
