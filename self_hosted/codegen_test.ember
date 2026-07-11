@@ -141,9 +141,10 @@ fn test_params() -> i64 {
     let len: i64 = array_length(buf);
     let r: i64 = ck_bool(len > 0, 4002); if (r != 0) { return r; }
 
-    // the param spill: mov [rbp-8], rcx = 48 89 4D F8
-    // (REX.W 89 modrm(10, rcx(1), rbp(5)) = (2<<6)|(1<<3)|5 = 0x4D, disp=-8)
-    let found_spill: i64 = cg_find_bytes(buf, 0x48, 0x89, 0x4D);
+    // the param spill: mov [rbp-8], rcx = 48 89 8D F8 FF FF FF
+    // (REX.W 89 modrm(10, rcx(1), rbp(5)) = (2<<6)|(1<<3)|5 = 0x8D, disp32=-8)
+    // mod=10 (disp32) matches the C++ reference emitter + test 3's store form.
+    let found_spill: i64 = cg_find_bytes(buf, 0x48, 0x89, 0x8D);
     let r2: i64 = ck(found_spill, 1, 4010); if (r2 != 0) { return r2; }
 
     // add rax, rcx = 48 01 C8 (REX.W 01 modrm(11, rcx(1), rax(0)) = 0xC8)

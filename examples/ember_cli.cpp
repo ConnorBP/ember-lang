@@ -68,6 +68,7 @@
 #include "ext_obf.hpp"         // Stage C Step 5: register_passes (IR obfuscation passes)
 #include "ext_io.hpp"          // OS I/O (console + file + path), core subset
 #include "ext_coroutine.hpp"     // #21 coroutines with yield (Windows fibers)
+#include "ext_call_raw.hpp"     // self-hosting Stage 4 gap: call_raw(fn_ptr,arg)->i64
 #include "../src/ember_pass.hpp"       // Stage C: EmberPassManager
 #include "../src/ember_pass_registry.hpp" // Stage C: EmberPassRegistry
 #include "../src/ember_pass_pipeline.hpp" // Stage C: build_pipeline_from_string
@@ -139,6 +140,7 @@ static void register_standard_bindings(
     ember::ext_sync::register_natives(natives); ember::ext_lifecycle::register_natives(natives);
     ember::ext_io::register_natives(natives);
     ember::ext_coroutine::register_natives(natives);
+    ember::ext_call_raw::register_natives(natives);
     OpOverloadTable overloads;
     ext_vec::register_overloads(overloads); ext_quat::register_overloads(overloads);
     ext_mat::register_overloads(overloads); ext_string::register_overloads(overloads);
@@ -315,6 +317,7 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
         ember::ext_lifecycle::reset();
         ember::ext_io::reset();
         ember::ext_coroutine::coroutine_reset();
+        ember::ext_call_raw::reset();  // stateless (no-op), for symmetry
         // ext_math is stateless (no reset()).
     };
 

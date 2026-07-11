@@ -171,6 +171,13 @@ ember_add_extension(obf extensions/obf/ext_obf.cpp)           # Stage C Step 5: 
 # one-directional (ext_io calls into them; they do not know about ext_io).
 ember_add_extension(io extensions/io/ext_io.cpp)
 target_link_libraries(ember_ext_io PUBLIC ember_ext_array ember_ext_string)
+# ext_call_raw: raw x64 function-pointer call native (call_raw(fn_ptr,arg)->i64).
+# The ONE native the self-hosting milestone (plan_SELF_HOSTING.md Stage 4 gap)
+# identified: lets the ember-written codegen's output be executed. Stateless
+# (no host slot vector); depends only on ember_frontend (BindingBuilder +
+# type_i64). PERM_FFI-gated at the sema call site (calling raw function
+# pointers is a security surface — gated the same way ext_io is).
+ember_add_extension(call_raw extensions/call_raw/ext_call_raw.cpp)
 
 # ---- tests: .em pre-compile round-trip + live import cross-module round-trip ----
 # These link only ember + ember_frontend (no prism/prism_script_host) so they
@@ -206,6 +213,16 @@ add_test(NAME em_loader_hardening COMMAND em_loader_hardening_test)
 add_executable(ext_runtime_test examples/ext_runtime_test.cpp)
 target_link_libraries(ext_runtime_test PRIVATE ember ember_frontend ember_ext_math)
 add_test(NAME ext_runtime COMMAND ext_runtime_test)
+
+# call_raw_test: runtime coverage for the call_raw native (extensions/call_raw,
+# the self-hosting Stage 4 gap from plan_SELF_HOSTING.md). Exercises call_raw
+# through the full lex->parse->sema->codegen->JIT->call path AND directly at
+# the C++ level (compile a simple fn via the C++ codegen, get its entry pointer,
+# call it via call_raw, verify the result), plus the PERM_FFI gating check.
+# Links ember_ext_call_raw directly (no prism) to prove the extension is reusable.
+add_executable(call_raw_test examples/call_raw_test.cpp)
+target_link_libraries(call_raw_test PRIVATE ember ember_frontend ember_ext_call_raw)
+add_test(NAME call_raw COMMAND call_raw_test)
 
 # for_each_array_test: pins the iterable() hook's array<T> case (Tier 1) -
 # `for (x in array_handle)` lowered to array_length(h) + array_get_*(h, i).
@@ -500,7 +517,7 @@ target_link_libraries(ember_cli PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_opt ember_ext_obf ember_ext_map
-    ember_ext_io ember_ext_coroutine)
+    ember_ext_io ember_ext_coroutine ember_ext_call_raw)
 
 # ---- standalone exe bundler (docs/planning/plan_STANDALONE_BUNDLER.md) ----
 # The stub: a pre-built runtime that links ember + ember_frontend + the
@@ -515,7 +532,7 @@ target_link_libraries(ember_stub_main PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_map
-    ember_ext_io ember_ext_coroutine)
+    ember_ext_io ember_ext_coroutine ember_ext_call_raw)
 
 # The bundler tool: compiles a .ember -> .em (the emit-em pipeline), copies
 # the stub to <output.exe>, appends the .em + footer. Links the same libs as
@@ -527,7 +544,7 @@ target_link_libraries(ember_bundle PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_map
-    ember_ext_io ember_ext_coroutine)
+    ember_ext_io ember_ext_coroutine ember_ext_call_raw)
 
 # End-to-end bundler test: bundle .ember scripts into standalone exes, run
 # them, assert exit codes. Covers simple scripts, multi-function, imports,

@@ -45,6 +45,7 @@
 #include "ext_sync.hpp"
 #include "ext_lifecycle.hpp"
 #include "ext_io.hpp"
+#include "ext_call_raw.hpp"     // self-hosting Stage 4 gap: call_raw(fn_ptr,arg)->i64
 
 #include <cstdio>
 #include <cstdint>
@@ -86,6 +87,7 @@ static void register_standard_bindings(
     ext_map::register_natives(natives);
     ext_sync::register_natives(natives); ext_lifecycle::register_natives(natives);
     ext_io::register_natives(natives);
+    ext_call_raw::register_natives(natives);
     OpOverloadTable overloads;
     ext_vec::register_overloads(overloads); ext_quat::register_overloads(overloads);
     ext_mat::register_overloads(overloads); ext_string::register_overloads(overloads);
