@@ -101,9 +101,11 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
   using for-each as non_serializable (falls back to the tree-walker). The
   `iterable()` TypeBuilder hook for general collection iteration is still
   deferred (the current for-each is slice-specific).
-- **`match` (pattern)** - richer than `switch` (struct destructure,
-  guard). Trigger: `switch` plus nested `if` guards get unreadable in
-  real handler code. Dep: `switch` (v1) proven.
+- **`match` (pattern)** ✓ shipped 2026-07-11 (Tier 1, v1 form) —
+  `match (expr) { pattern => body, _ => default }`. Patterns: integer/bool
+  literals + `_` wildcard. Each arm is a separate branch (no fallthrough, no
+  break). Body can be a block or single statement. Struct destructure + guards
+  are a later refinement.
 - **`static_assert(cond, msg)`** - compile-time assertion. Trigger:
   binding code wants to verify struct layout assumptions at compile.
   Dep: `constexpr` evaluation broadened beyond literals (below).
