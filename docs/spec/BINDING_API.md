@@ -12,9 +12,9 @@ Calling-convention mapping and boundary error responsibilities are normative.
 > the current implementation. v1.0 ships the **working binding API**:
 > `src/binding_builder.hpp`'s `BindingBuilder` + the existing
 > `NativeSig`/`OpOverload` map that `sema()` already consumes, used by
-> the eight standard extensions in `extensions/` (vec/quat/mat/string/array/
-> math/sync/lifecycle — `sync` + `lifecycle` were added in the v1.0 batch +
-> its follow-on). The spec text below is
+> the ten standard extensions in `extensions/` (vec/quat/mat/string/array/
+> math/sync/lifecycle/map/io — `sync` + `lifecycle` were added in the v1.0 batch +
+> its follow-on; `map` + `io` added 2026-07-11). The spec text below is
 > the target design those extensions move toward; it is preserved
 > unchanged. The call-ABI mapping in Section 4 **IS implemented and
 > proven** in the v0.3 `binding_abi_test` suite (script→native
@@ -297,8 +297,11 @@ a typical native-JIT scripting language's data-vs-behavior split (../RESEARCH_NO
 
 `EnumBuilder`: **not needed / still dropped.** Script-side `enum E { A, B, C }`
 **shipped in v1.0** (`../ROADMAP.md` Tier 1 ✓, `COMPILER_PIPELINE.md` Section 2a),
-but it is a pure source-text feature — an enum variant is rewritten to an
-`IntLit` at sema (no new `TypeId`, no host-side state, no binding surface),
+and the **typed** form `enum E : T` shipped 2026-07-11 (`TYPE_SYSTEM.md` §15.2).
+Both are pure source-text features — an enum variant is rewritten to an
+`IntLit` at sema (untyped: i32-typed; typed: stamped with the enum type via
+the existing `Type` struct-name mechanism, no new `TypeId` kind, no host-side
+state, no binding surface),
 so there is nothing for an `EnumBuilder` to build. Host-side named constants
 still use `set_global`. A host wanting enum-like behavior with reflection
 (a `name_from_value` lookup, iteration over variants) would be a separate

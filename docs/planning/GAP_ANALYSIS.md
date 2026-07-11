@@ -34,7 +34,7 @@ Section 3 below + `../ROADMAP.md`.
 | `char`/`wchar` | ✗ v1 | byte slices (`slice<u8>`) instead, `../spec/TYPE_SYSTEM.md` Section 1 |
 | Atomic integers | ✓ v1 addon | `sync` exposes `atomic_new/load/store/fetch_add/fetch_sub/cas/swap/free`; script-created in-context threads remain deferred |
 | `null` / `nullable` | ✗ v1 | no pointers; optional via i64 handle w/ 0=invalid idiom, `../spec/BINDING_API.md` Section 7 |
-| `const` / `constexpr` | ✓ v1 (added this pass) | `../spec/TYPE_SYSTEM.md` Section 11, `../spec/COMPILER_PIPELINE.md` Section 2 |
+| `const` / `constexpr` | ✓ v1 (added this pass) | `const` immutable local/global (`../spec/TYPE_SYSTEM.md` §11.5); `constexpr fn` compile-time fn eval shipped 2026-07-11 (`../spec/TYPE_SYSTEM.md` §11.5, `../ROADMAP.md` Tier 1) |
 | `auto` inference | ✓ v1 | `../spec/TYPE_SYSTEM.md` Section 9 |
 | Ternary `?:` | ✓ v1 (added this pass) | `../spec/COMPILER_PIPELINE.md` Section 2, `../spec/TYPE_SYSTEM.md` Section 11 |
 | `++` / `--` | ✓ v1 (added this pass) | `../spec/TYPE_SYSTEM.md` Section 11 |
@@ -43,7 +43,7 @@ Section 3 below + `../ROADMAP.md`.
 | Compound assign (`+=` etc.) | ✓ v1 (semantics added this pass) | `../spec/TYPE_SYSTEM.md` Section 11 |
 | `if`/`else`/`while`/`for`/`break`/`continue`/`return` | ✓ v1 | `../spec/COMPILER_PIPELINE.md` Section 2 |
 | `do-while` | ✓ v1 (added this pass) | `../spec/COMPILER_PIPELINE.md` Section 2 |
-| `for-each` | ✓ v1 (shipped 2026-07-11) | `for (x in slice)` over a slice `T[]` — slice-specific, no `iterable` protocol; the general `iterable()` TypeBuilder hook stays v2. `tests/lang/valid_for_each.ember`, `../ROADMAP.md` |
+| `for-each` | ✓ v1 (shipped 2026-07-11) | `for (x in slice)` over a slice `T[]` **and** `for (x in array_handle)` over an `array<T>` handle (the `iterable()` hook, array case shipped 2026-07-11); the general `iterable()` TypeBuilder hook for map/host collections stays v2. `tests/lang/valid_for_each*.ember`, `../ROADMAP.md` |
 | `switch` | ✓ v1 (added this pass) | `../spec/COMPILER_PIPELINE.md` Section 2, `../spec/CODEGEN_SPEC.md` Section 12 |
 | `match` (pattern) | ✓ v1 (shipped 2026-07-11) | `match (expr) { pat => body, _ => default }` — integer/bool literal patterns + `_` wildcard, no fallthrough. `tests/lang/valid_match.ember`, `../ROADMAP.md` |
 | `goto` | ✗ v1 (deliberate) | structured control flow only; goto complicates liveness/scope, no need |
@@ -60,7 +60,7 @@ Section 3 below + `../ROADMAP.md`.
 | Interfaces / mixins | ✗ v1 | v2+ |
 | Properties (get/set) | ✓ v1 | `../spec/BINDING_API.md` Section 3 |
 | Templates / monomorphization | ✗ v1 | `DESIGN.md` non-goal; v2+, `../ROADMAP.md` |
-| Enums | ✓ v1 (untyped constants) | `enum E { ... }` + `E::A`; variants lower to i32 literals. Typed enums and host `EnumBuilder` remain deferred |
+| Enums | ✓ v1 (untyped + typed) | `enum E { ... }` (untyped, i32 variants) + `enum E : T` (typed, shipped 2026-07-11 — `E` is a real type backed by `T`, enum→int widens, int→enum rejected); variant values may be a `constexpr fn` call. Host `EnumBuilder` stays dropped (no host-side state needed) |
 | Typedefs / `using` | ✗ v1 | YAGNI |
 | Delegates | ✗ v1 | needs function refs (v2) |
 | Namespaces | ✗ v1 | flat module scope; v2+ |
@@ -72,7 +72,7 @@ Section 3 below + `../ROADMAP.md`.
 | Modules / imports | ✓ v1 | textual `import`, `.em` bundles, and live `link`/`mod::fn`; bare-name search paths and cross-module function handles remain deferred |
 | Preprocessor | ✗ v1 (deliberate) | `engine.define(name,value)` for compile-time defines instead, `DESIGN.md` Section 8 |
 | FFI `[[dll(...)]]` | ✓ v1 (different mechanism) | `PERM_FFI`-gated `NativeFn`, `../spec/SAFETY_AND_SANDBOX.md` Section 6 |
-| `static_assert` | ✗ v1 | YAGNI; add with const-expr eval in v2 |
+| `static_assert` | ✓ v1 (shipped 2026-07-11) | `static_assert(cond, "msg");` compile-time assertion; cond may be a `constexpr fn` call; true elided, false is a compile error (`../spec/TYPE_SYSTEM.md` §11.5, `../ROADMAP.md` Tier 1) |
 | Lifecycle `main()` + routines | ✓ v1 (equivalent) | `../LIFECYCLE.md` (new this pass)  -  annotation-based, same semantics |
 
 ## 3. Standard addon reality and deferred data structures
@@ -156,11 +156,12 @@ patches landed in the noted docs:
   C-fallthrough footgun class at the grammar level).
 - **`do-while`** - `../spec/COMPILER_PIPELINE.md` Section 2 (lowered like `while`
   with the condition check at the bottom).
-- **`const`/`constexpr`** - `../spec/TYPE_SYSTEM.md` Section 11 (`const` = immutable
-  local; `constexpr` = compile-time-evaluable, usable as array sizes
-  and case labels; v1 `constexpr` is restricted to literal-and-`sizeof`/
-  `offsetof` expressions only, no full compile-time fn eval - that's
-  v2 `static_assert` territory).
+- **`const`/`constexpr`** - `../spec/TYPE_SYSTEM.md` §11.5 (`const` = immutable
+  local/global; `constexpr fn` = compile-time fn eval, shipped 2026-07-11 —
+  a `constexpr fn` with all-constant args is folded to an `IntLit` at sema;
+  `static_assert` shipped alongside it). v1 `constexpr` is scoped to the
+  `constexpr fn` modifier (i64 integer fns, bounded interpreter); it is not a
+  general expression annotation on arbitrary decls.
 - **`defer`** - `../spec/CODEGEN_SPEC.md` Section 13, `../spec/COMPILER_PIPELINE.md` Section 6
   (implemented M5 is lexical-block-exit LIFO: normal fallthrough and cleanup
   edges before `break`, `continue`, and `return`; block-entry activation reset

@@ -44,10 +44,10 @@ wiring to the B1 model (the `--tick` thread-safety bug, fixed), and a demo
 script (`examples/scripts/dynamic_registration.ember`). See
 `planning/v1.0_INTEGRATION_NOTES.md` §5.
 
-The current tree configures 37 CTest targets total (35 excluding the two
+The current tree configures 42 CTest targets total (40 excluding the two
 bench targets `bench_codegen_paths` and `bench_ember_vs_as`; the latter is
 only configured when the AngelScript SDK is present, so a no-SDK build
-configures 36). The four `plan_*.md` files in `docs/` are historical design
+configures 41). The four `plan_*.md` files in `docs/` are historical design
 records; shipped contracts in the main docs take precedence where those plans
 describe earlier states.
 
@@ -66,10 +66,11 @@ fixed arrays, import — and proves ember can host a compiler. The demo parses
 `let a = 1 + 2 * 3; a + 10` → 17 with correct precedence, left-associativity,
 parens, and divide-by-zero detection.
 
-**The path to full self-hosting** (each step is a TODO below or in the tiers):
-1. **`constexpr` function evaluation** (Tier 1) — compile-time fn eval is the
-   foundation a self-hosting compiler needs (macro-like transforms, constant
-   folding of compiler data structures).
+**The path to full self-hosting** (each step is a TODO below or in the tiers;
+steps marked ✓ are done):
+1. **`constexpr` function evaluation** (Tier 1) ✓ shipped 2026-07-11 —
+   compile-time fn eval is the foundation a self-hosting compiler needs
+   (macro-like transforms, constant folding of compiler data structures).
 2. **String + I/O maturity** (io extension shipped; string extension shipped)
    — a compiler reads/writes files and manipulates strings heavily.
 3. **Map extension** (shipped) — symbol tables, AST node pools.
@@ -129,17 +130,20 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
   rewrites the `EnumAccessExpr` to an `IntLit` **in place** (`src/sema.cpp`
   `lower_enum_access_expr`), so codegen sees an ordinary integer literal
   (no codegen change). Variants are `i32` values (auto-increment from 0,
-  optional explicit `= constexpr_int_expr`, sign-extended into the `IntLit`'s
-  i64 storage field); usable anywhere an `i64` is, exactly like an untyped
-  integer literal. An enum name is *not* a type in v1 (`let x: Color = ...`
-  is a clean sema error — the hook typed enums later flip). Duplicate
+  optional explicit `= constexpr_int_expr` or `= constexpr_fn_call`, sign-
+  extended into the `IntLit`'s i64 storage field); usable anywhere an `i64` is,
+  exactly like an untyped integer literal. An **untyped** enum name is not a
+  type (`let x: Color = ...` for an untyped `Color` is a clean sema error);
+  the **typed** enum form (`enum E : T`, see the Typed enums entry below)
+  makes the enum name a real type. Duplicate
   variant names / duplicate explicit values within one enum are errors.
   Pinned by `tests/lang/{valid_enums,sema_valid_enums,
   sema_invalid_enum_unknown_enum,sema_invalid_enum_unknown_variant}.ember`.
   **No `EnumBuilder`** — the host-binding-side `EnumBuilder` sketched in
   `spec/BINDING_API.md` Section 5 stays dropped: script enums need no host-side
-  builder (the variants live entirely in the script). Typed enums (`enum E : i32`)
-  and `enum`-from-expr remain a later refinement.
+  builder (the variants live entirely in the script). Typed enums (`enum E : T`)
+  and enum-from-constexpr-expr **shipped 2026-07-11** (see the dedicated Tier 1
+  entry below).
 - **`for-each`** ✓ shipped 2026-07-11 (Tier 1) — `for (x in slice)` over a
   slice T[], **and** `for (x in array_handle)` over an array<T> handle (the
   iterable() hook, array case, shipped 2026-07-11). For a slice, the
@@ -161,18 +165,59 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
   functions using match as non_serializable (falls back to the tree-walker) —
   `src/thin_lower.cpp` treats `MatchStmt` the same as `ForEachStmt` for Stage A.
   Struct destructure + guards are a later refinement.
-- **`static_assert(cond, msg)`** - **TODO** (blocked on constexpr).
-  Compile-time assertion. Binding code wants to verify struct layout
-  assumptions at compile. Dep: `constexpr` evaluation (below).
-- **`constexpr` function evaluation** - **TODO** (foundational — unblocks
-  static_assert, typed enums, enum-from-expr, and is a prerequisite for
-  self-hosting). Full compile-time fn eval (recursive `const` fns),
-  enabling `static_assert`, complex array sizes, compile-time string
-  building. Dep: a const-eval interpreter (small, but a real subsystem).
-- **Typed enums (`enum E : i32`) + `enum`-from-expr** - **TODO** (blocked on
-  constexpr). A later refinement of the shipped `enum`: typed enums make an
-  enum name a real type (`let x: Color = ...` works); enum-from-expr lets a
-  variant value be computed from a constexpr expression. Dep: constexpr.
+- **`static_assert(cond, msg)`** ✓ shipped 2026-07-11 (Tier 1) —
+  `static_assert(cond, "msg");` is a compile-time assertion. The condition is
+  folded at sema (it may be a literal integer/bool expression or a `constexpr
+  fn` call — the constexpr-call pre-pass folds those first). A **false** result
+  is a **compile error** carrying `msg`; a **true** result is **elided** (no
+  runtime code is emitted for the assertion). A non-constant condition is a
+  compile error ("static_assert condition must be a compile-time constant").
+  Usable both at top level (a `static_assert_decl` on `Program`) and inside a
+  function body (`StaticAssertStmt`); both positions apply the identical
+  compile-time verdict via the shared `check_static_assert`. Parser:
+  `parse_static_assert`; sema: `check_static_assert` (`src/sema.cpp`). Pinned
+  by `examples/static_assert_test.cpp` (ctest `static_assert`) +
+  `tests/lang/{valid_static_assert,valid_static_assert_constexpr,
+  sema_invalid_static_assert_false,sema_invalid_static_assert_nonconst}.ember`.
+  (Was blocked on constexpr; the two shipped together.)
+- **`constexpr` function evaluation** ✓ shipped 2026-07-11 (Tier 1) — a fn
+  declared `constexpr fn name(...) -> i64 { ... }` **can** be const-evaluated
+  at sema time when called with all-constant args. A tree-walking interpreter
+  (`eval_constexpr_fn` in `src/sema.cpp`) evaluates the call and the
+  constexpr-call pre-pass (`lower_constexpr_calls_expr` / `try_fold_constexpr_call`)
+  rewrites the call site to an `IntLit` carrying the folded result **before**
+  `check_expr` runs — so codegen, the const-folder, the switch case-value
+  check, the static_assert check, and the globals/enum initializer evaluators
+  all see an ordinary integer literal. **Bounds:** max 100000 loop iterations
+  per loop, max 256 recursion depth (nested constexpr calls); **i64 integer
+  fns only** in this increment (float/bool/struct fns skip constexpr eval and
+  fall back to a normal runtime call). A constexpr fn called with a
+  non-constant (runtime) arg also falls back to a normal runtime call — a
+  `constexpr` fn is one that **can** be const-evaluated, not one that **must**
+  be. The `constexpr` modifier is only valid on a function declaration
+  (`constexpr fn`); `priv` and `constexpr` may appear in either order before
+  `fn`. Foundational — unblocks static_assert, typed enums, enum-from-constexpr.
+  Pinned by `examples/constexpr_test.cpp` (ctest `constexpr`) +
+  `tests/lang/{valid_constexpr,valid_constexpr_in_expr,valid_constexpr_recursive,
+  valid_constexpr_runtime_fallback,invalid_constexpr_not_fn}.ember`.
+- **Typed enums (`enum E : T`) + enum-from-constexpr-expr** ✓ shipped
+  2026-07-11 (Tier 1) — a typed enum `enum E : T { ... }` (e.g. `enum Color :
+  i32`) makes the enum name a **real type** backed by the integer `T`
+  (`let c: Color = Color::Red;` works). The backing type is recorded in
+  `typed_enum_backing` / `typed_enum_types` (sema Pass 1.4, `register_typed_enums`);
+  `EnumAccessExpr` lowers to an `IntLit` carrying the variant's value typed as
+  the enum type (not a plain i32). **Conversion rule:** enum→int implicit
+  widening is allowed (a typed-enum value widens to its backing int, and on to
+  i64, via a synthesized `CastExpr` — so `return c` from an i64 fn works);
+  **int→enum is rejected** (a raw integer literal `let c: Color = 5` is a sema
+  error — a typed-enum value must come from a `Color::Variant` or another
+  `Color` binding). **Enum-from-constexpr-expr:** a variant's explicit value
+  may be a `constexpr fn` call (`X = base()` where `base` is a `constexpr fn`);
+  `resolve_enums` folds the call to an `IntLit` via the constexpr-call pre-pass
+  before the const-check, so `X = base()` resolves. Untyped enums (`enum E {
+  ... }`, i32 variants) are unchanged (backward compat). Pinned by
+  `examples/typed_enum_test.cpp` (ctest `typed_enum`) + `tests/lang/{valid_typed_enum,
+  valid_typed_enum_match,valid_enum_from_constexpr,sema_invalid_int_to_enum}.ember`.
 - **`iterable()` hook** — **PARTIAL (array case shipped 2026-07-11).**
   General collection iteration for `for (x in collection)` beyond slices. The
   shipped for-each now covers two iterable kinds: slices T[] (ptr+len
@@ -705,7 +750,7 @@ pervasive and error-prone.
 
 ---
 
-## CLI tooling (Family A built; B shipped; C TODO)
+## CLI tooling (Family A shipped; B shipped; C TODO)
 
 ### Family A — compute-engine CLI (no new natives; shipped/next)
 
@@ -716,12 +761,18 @@ pervasive and error-prone.
   benchmark-methodology gap** (was: one mean, no variance/CI, no machine
   metadata, report written as a test side-effect; bench writes to stdout on
   request only, never as a side-effect). Zero new natives.
-- **`ember test`** — **TODO (NEXT).** A native test runner over a directory of
-  `.ember` files classified by expected exit code (the convention
-  `tests/run_lang_tests.sh` already uses). Replaces the bash harness with a
-  fast, parallel, TAP-ish runner. Zero new natives. Blocked on a small
-  refactor: extracting the compile-to-entry flow from `main` into a reusable
-  helper so `test` can call it per-file without duplicating ~200 lines.
+- **`ember test`** — ✓ SHIPPED (2026-07-11). A native test runner over a
+  directory of `.ember` files classified by expected outcome (mirroring the
+  `tests/run_lang_tests.sh` convention). `ember test [dir]` (default
+  `tests/lang/`) classifies each file: a `// expect: N` comment → RUN, expect
+  exit N; `runtime_trap_*` → RUN, expect 70; `invalid_*` → parse-only,
+  expect fail; `sema_invalid_*` → sema-only, expect fail; `sema_valid_*` →
+  sema-only, expect OK; everything else → parse-only, expect OK. It reuses the
+  per-file compile flow factored into a reusable `run_one_file` helper (with
+  `sema_only`/`parse_only` modes), resets extension state between files, prints
+  a `N/M passed` summary, exits non-zero on any failure, and is wired as the
+  `ember_test_cli` ctest target. The bash `run_lang_tests.sh` stays as the
+  `lang_suite` ctest fallback. Zero new natives.
 
 ### Family B — ember as a scripting language with real I/O (SHIPPED 2026-07-11)
 

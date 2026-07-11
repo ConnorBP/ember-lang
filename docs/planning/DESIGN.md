@@ -75,9 +75,11 @@ Goals:
 
 Non-goals for v1:
 - Generics / templates. Closures. A tracing GC. Multithreaded
-  execution inside one context. Arbitrary pointer casts. Self-hosting.
-  (Script-side `enum` and first-class function references **are now in v1.0**
+  execution inside one context. Arbitrary pointer casts. (Script-side `enum`
+  and first-class function references **are now in v1.0**
   — see the v1.0 milestone below and `../ROADMAP.md`; `switch` landed in v0.2.)
+  **Self-hosting is NOT a non-goal** — it is the long-term north star (work
+  started; see `../ROADMAP.md`'s "Self-hosting" section + `demo/compiler/`).
 
 ## Milestones
 
@@ -175,8 +177,8 @@ Non-goals for v1:
   game-engine integration (event hooks via annotations).
 
   **Concurrency + Tier 2 batch shipped v1.0 (commit e5d1814 + follow-ons):**
-  four features, each verified in source/tests; the current tree has 37 CTest
-  tests (35 excluding the two benchmarks) —
+  four features, each verified in source/tests; the current tree has 42 CTest
+  tests (40 excluding the two benchmarks) —
   - **Context thread-safety (Option D + B1)** — `context_t` restructured
     to a POD prefix; `CodeGenCtx::use_context_reg` makes the budget/depth/
     trap emits read `context_t` fields through `r14` (the per-call context
@@ -246,11 +248,14 @@ detail docs, summarized here)
 - No rel8 branch shrinking, no shared-epilogue tail, no
   omit-frame-pointer, no block reordering - correctness-first v1,
   all are additive later if benchmarks justify (`../spec/CODEGEN_SPEC.md` Section 4/Section 6).
-- No `goto`, no C preprocessor, no multiple inheritance / diamonds,
-  no self-hosting - hard non-goals, never added (`../ROADMAP.md`).
-- No templates/classes/coroutines/exceptions/heap/lambdas/modules in v1
+- No `goto`, no C preprocessor, no multiple inheritance / diamonds
+  — hard non-goals, never added (`../ROADMAP.md`). **Self-hosting is NOT a
+  non-goal** (corrected from an earlier revision); it is the long-term north
+  star — see `../ROADMAP.md`'s "Self-hosting" section.
+- No templates/classes/coroutines/exceptions/heap/lambdas in v1
   - each is a tracked deferral with a re-entry trigger in `../ROADMAP.md`,
-  not a forgotten gap (`GAP_ANALYSIS.md` Section 2).
+  not a forgotten gap (`GAP_ANALYSIS.md` Section 2). (Live **modules** shipped
+  v0.5 — `link "foo.em" as foo;` + `foo::bar()`; namespaces remain Tier 6.)
 - Script-side first-class function references shipped **v1.0** (`&fn` /
   `handle(args)` / the `fn` type keyword, `../ROADMAP.md` Tier 2 ✓), with the
   the call-target-provenance guard invariant (`../spec/SAFETY_AND_SANDBOX.md`

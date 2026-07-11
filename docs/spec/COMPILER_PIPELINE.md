@@ -17,6 +17,7 @@ Keywords:   fn struct global enum if else while do for switch case
             default break continue return as auto defer const
             link true false bool i8 i16 i32 i64 u8 u16 u32 u64
             f32 f64 void sizeof offsetof in match
+            constexpr static_assert priv
             (v1.0: `enum` + `link`/`switch`/`case`/`default`/`do`/`defer`/
             `const`/`sizeof`/`offsetof`/`in`/`match` were all added as the frontend
             grew past the v0.1 spec this list was written against; see the
@@ -25,12 +26,16 @@ Keywords:   fn struct global enum if else while do for switch case
             `parse_top`, a *type* (`fn`, in `parse_type`) is the v1.0
             function-handle type — i64 with `is_fn_handle=true`, a bare
             handle that accepts any fn — see Section 2's `&fn`/`handle(args)`.
-            `constexpr` is a RESERVED keyword: it lexes as `Kw_constexpr` but
-            has NO parser or sema support — using it is a **parse error**. The
-            spec's earlier `constexpr`-works claims (TYPE_SYSTEM §11.5,
-            COMPILER_PIPELINE §6) are removed; the restricted `constexpr` form
-            is a ROADMAP Tier 1 deferral, not a shipped feature. `const`
-            (immutable local/global) DOES ship.)
+            `constexpr` is a **function-declaration modifier** (shipped
+            2026-07-11): `constexpr fn name(...) -> i64 { ... }` declares a fn
+            that **can** be const-evaluated at sema time when called with
+            all-constant args (see `TYPE_SYSTEM.md` §11.5 + Section 2a/4/6
+            below). `priv` is a function-declaration visibility modifier
+            (F1, `priv fn` is module-private — not exported cross-module).
+            `constexpr` and `priv` may appear in either order before `fn`.
+            `static_assert` is a compile-time assertion statement/decl
+            (shipped 2026-07-11): `static_assert(cond, "msg");` — see
+            Section 2a/4/6. `const` (immutable local/global) ships.)
 Punctuation: ( ) { } [ ] , ; : -> . .. :: =>
             (`::` is the v0.5 cross-module selector `mod::fn` AND the v1.0
             enum-variant access `E::A`; the one-token lookahead split is in
@@ -72,22 +77,25 @@ Annotation: @ (starts an annotation, followed by IDENT and optional
 
 ```
 program      := (annotation* func_decl | struct_decl | enum_decl
-               | global_decl | link_decl | import_decl)*
+               | global_decl | link_decl | import_decl
+               | static_assert_decl)*
 
 annotation   := '@' IDENT ('(' (literal (',' literal)*)? ')')?
 
 struct_decl  := 'struct' IDENT '{' field_decl* '}'
 field_decl   := IDENT ':' type ';'
 
-enum_decl    := 'enum' IDENT '{' (variant (',' variant)* ','?)? '}'   // Tier 1 (Section 2a)
-variant      := IDENT ('=' constexpr_int_expr)?                       // auto-increment from 0 or last explicit value
+enum_decl    := 'enum' IDENT (':' prim_type)? '{' (variant (',' variant)* ','?)? '}'   // Tier 1 (Section 2a). The optional ': T' is the TYPED-enum form (TYPE_SYSTEM §15.2).
+variant      := IDENT ('=' constexpr_int_expr | '=' constexpr_fn_call)?  // auto-increment from 0 or last explicit value; the explicit value may be a constexpr fn call (enum-from-constexpr, TYPE_SYSTEM §15.2)
 
 global_decl  := ('global'|'const') IDENT ':' type '=' expr ';'        // const = immutable global (Section 11.5)
 
 link_decl    := 'link' STRING_LIT ('as' IDENT)? ';'                   // v0.5 cross-module: link "foo.em" as foo; / link "foo" as foo;
 import_decl  := 'import' STRING_LIT ';'                               // parse-time textual inclusion (cycle-detected, deduped)
 
-func_decl    := ('priv')? 'fn' IDENT '(' param_list? ')' ('->' type)? block
+static_assert_decl := 'static_assert' '(' expr ',' STRING_LIT ')' ';'  // Tier 1 top-level compile-time assertion (Section 2a + TYPE_SYSTEM §11.5)
+
+func_decl    := ('priv'|'constexpr')* 'fn' IDENT '(' param_list? ')' ('->' type)? block   // 'priv' and 'constexpr' may appear in either order before 'fn' (both optional, both fn-only)
 param_list   := param (',' param)*
 param        := IDENT ':' type ('=' literal)?      // optional trailing default value (a bare int/float/bool/string literal); defaulted params must trail non-defaulted ones (trailing-defaults-only, enforced in the parser + sema). At a call site, sema splices the synthesized literal for any missing trailing arg, so arity is a range [required_count, param_count]. See Section 4 + `ast.hpp` `DefaultValue`/`Param::default_val`.
 
@@ -111,6 +119,7 @@ stmt         := 'let' IDENT (':' type)? '=' expr ';'      // local decl
                | 'const' IDENT ':' type '=' expr ';'       // immutable local
                | 'defer' expr ';'                          // lexical-block-exit LIFO cleanup (Section 6, CODEGEN_SPEC.md Section 13)
                | 'auto' IDENT '=' expr ';'                 // TYPE_SYSTEM.md Section 9 (deprecated)
+               | 'static_assert' '(' expr ',' STRING_LIT ')' ';'  // Tier 1 in-body compile-time assertion (Section 2a + TYPE_SYSTEM §11.5)
                | 'if' '(' expr ')' block ('else' (block|stmt))?
                | 'while' '(' expr ')' block
                | 'do' block 'while' '(' expr ')' ';'
@@ -197,17 +206,20 @@ a semantic property, not a parseable one).
 ## 3. AST node types (representative, not exhaustive C++ decl)
 
 ```cpp
-struct Program { vector<StructDecl> structs; vector<GlobalDecl> globals; vector<FuncDecl> funcs; vector<EnumDecl> enums; vector<LinkDecl> links; };   // Tier 1 enums + v0.5 link decls live on Program
-struct FuncDecl { string name; vector<Param> params; TypeRef ret; vector<Annotation> annotations; Block body; SourceLoc loc; bool is_exported=true; };  // F1: is_exported=false for `priv fn`
+struct Program { vector<StructDecl> structs; vector<GlobalDecl> globals; vector<FuncDecl> funcs; vector<EnumDecl> enums; vector<LinkDecl> links; vector<StaticAssertStmt> static_asserts; };   // Tier 1 enums + v0.5 link decls + Tier 1 top-level static_asserts live on Program
+struct FuncDecl { string name; vector<Param> params; TypeRef ret; vector<Annotation> annotations; Block body; SourceLoc loc; bool is_exported=true; bool is_constexpr=false; };  // F1: is_exported=false for `priv fn`; Tier 1: is_constexpr=true for `constexpr fn`
 struct StructDecl { string name; vector<FieldDecl> fields; SourceLoc loc; };
 struct GlobalDecl { string name; TypeRef type; Expr init; SourceLoc loc; };
+struct EnumDecl { string name; optional<Prim> backing; vector<EnumVariant> variants; SourceLoc loc; };  // Tier 1: `backing` set => typed enum `enum E : T` (TYPE_SYSTEM §15.2); unset => untyped (§15.1)
+struct EnumVariant { string name; optional<ExprPtr> explicit_value; };  // Tier 1: explicit_value may be a constexpr fn call (enum-from-constexpr)
+struct StaticAssertStmt { ExprPtr cond; string msg; SourceLoc loc; };  // Tier 1: `static_assert(cond, "msg")` — top-level (on Program) or in-body
 
 // statements
 struct LetStmt { string name; optional<TypeRef> type; Expr init; bool is_auto; SourceLoc loc; };
 struct IfStmt { Expr cond; Block then_block; optional<variant<Block, unique_ptr<Stmt>>> else_branch; };
 struct WhileStmt { Expr cond; Block body; };
 struct ForStmt { optional<LetStmt> init; optional<Expr> cond; optional<Expr> step; Block body; };
-struct ForEachStmt { string var; Expr iter; Block body; SourceLoc loc; };   // Tier 1: `for (x in slice)` — desugars to a while loop with index + bounds check (CODEGEN_SPEC.md Section 17)
+struct ForEachStmt { string var; Expr iter; Block body; SourceLoc loc; const Type* array_elem_ty = nullptr; };   // Tier 1: `for (x in slice)` or `for (x in array_handle)` — array_elem_ty set by sema for the array-handle case (the iterable() hook, CODEGEN_SPEC.md Section 17)
 struct ReturnStmt { optional<Expr> value; };
 struct BreakStmt {}; struct ContinueStmt {};
 struct ExprStmt { Expr value; };
@@ -249,16 +261,22 @@ first-class expression (Tier 1, `src/ast.hpp`, `TYPE_SYSTEM.md` §12.1);
 — are Tier 1 statements (`src/ast.hpp`, `CODEGEN_SPEC.md` §17/§18);
 `CallExpr::indirect_target`/`is_indirect` and the standalone `FnHandleExpr` node are Tier 2.)
 
-### 2a. New v1.0 surface syntax (Tier 1 enums + Tier 2 function refs)
+### 2a. New v1.0 surface syntax (Tier 1 enums/match/for-each/constexpr/static_assert + Tier 2 function refs)
 
-The grammar grew two top-level / expression forms in the v1.0 concurrency +
-Tier 2 batch, all verified in `src/parser.cpp`:
+The grammar grew several top-level / expression / statement forms across the
+v1.0 batch and the 2026-07-11 Tier 1 follow-ons, all verified in
+`src/parser.cpp`:
 
-- **Enum declaration** (top-level, `parse_enum`): `enum IDENT { (variant (',' variant)* ','?)? }`
-  where `variant := IDENT ('=' constexpr_int_expr)?`. Auto-increment from 0
-  (or from the last explicit value); explicit-value expr is parsed as a full
-  `parse_expr()` and restricted to a compile-time integer by sema's
-  `try_eval_const_i64`. Trailing comma allowed.
+- **Enum declaration** (top-level, `parse_enum`): `enum IDENT (':' prim_type)? '{' (variant (',' variant)* ','?)? '}'`
+  where `variant := IDENT ('=' constexpr_int_expr | '=' constexpr_fn_call)?`.
+  Auto-increment from 0 (or from the last explicit value); explicit-value expr
+  is parsed as a full `parse_expr()` and restricted to a compile-time integer
+  by sema's `try_eval_const_i64` (or folded from a `constexpr fn` call by the
+  constexpr-call pre-pass — enum-from-constexpr, `TYPE_SYSTEM.md` §15.2).
+  Trailing comma allowed. The optional `: prim_type` is the **typed-enum** form
+  (`enum Color : i32`, shipped 2026-07-11, `TYPE_SYSTEM.md` §15.2) — it makes
+  the enum name a real type backed by that integer. Without it the enum is
+  **untyped** (variants are plain i32 literals, `TYPE_SYSTEM.md` §15.1).
 - **Enum-variant access** (postfix `::`, `parse_postfix`): `IDENT :: IDENT`
   where the second IDENT is **not** followed by `(` → `EnumAccessExpr`
   (a value). The one-token lookahead split keeps `mod::fn(args)` (the v0.5
@@ -278,12 +296,13 @@ Tier 2 batch, all verified in `src/parser.cpp`:
   fn). A parameterized `fn(i64)->i64` form is v2+.
 - **`for-each`** (`parse_for`, Tier 1, 2026-07-11): `for (IDENT 'in' expr)
   block` — detected by `at(Ident) && peek(1).kind == Kw_in` inside the `for`
-  paren. Builds a `ForEachStmt { var, iter, body }`. The iterable must be a
-  slice `T[]` (sema rejects non-slice); `var` gets the element type. Lowers to
-  a while-loop-with-indexing over the slice's `{ptr, len}` (`CODEGEN_SPEC.md`
-  §17). The IR backend marks a function using for-each as `non_serializable`
-  (falls back to the tree-walker). See `TYPE_SYSTEM.md` §13 + `ROADMAP.md`
-  Tier 1.
+  paren. Builds a `ForEachStmt { var, iter, body }`. The iterable is a slice
+  `T[]` **or** an `array<T>` handle (the `iterable()` hook, array case —
+  `TYPE_SYSTEM.md` §13.2); `var` gets the element type. Lowers to a
+  while-loop-with-indexing over the slice's `{ptr, len}` or the array's
+  `array_length` + typed `array_get_*` (`CODEGEN_SPEC.md` §17). The IR backend
+  marks a function using for-each as `non_serializable` (falls back to the
+  tree-walker). See `TYPE_SYSTEM.md` §13 + `ROADMAP.md` Tier 1.
 - **`match`** (`parse_stmt` `Kw_match` case, Tier 1, 2026-07-11):
   `match (expr) '{' (pattern | '_') '=>' (block | stmt) (',')? '}'` — builds a
   `MatchStmt { subject, arms }` where each `MatchArm` is `{ pattern, is_wildcard,
@@ -298,6 +317,22 @@ Tier 2 batch, all verified in `src/parser.cpp`:
   position constructs an `ArrayLit` (distinct from the postfix `[` index/view
   operator); `[a, b, c]` is a fixed-array or slice literal depending on the
   declared target type (`TYPE_SYSTEM.md` §12.1).
+- **`constexpr fn`** (function-declaration modifier, Tier 1, 2026-07-11):
+  `constexpr fn name(...) -> i64 { ... }` — a `constexpr` modifier before `fn`
+  (may combine with `priv` in either order: `priv constexpr fn` /
+  `constexpr priv fn`). Declares a fn that **can** be const-evaluated at sema
+  time when called with all-constant args (`TYPE_SYSTEM.md` §11.5). Parser:
+  `parse_top` reads an optional `priv` then an optional `constexpr` (in either
+  order) before requiring `fn`; `is_constexpr` is recorded on the `FuncDecl`.
+  `constexpr` on a non-`fn` decl is a parse error. See Section 4 (the
+  constexpr-call pre-pass) + Section 6 (no runtime code for a folded call).
+- **`static_assert`** (top-level decl + in-body stmt, Tier 1, 2026-07-11):
+  `static_assert(cond, "msg");` — a compile-time assertion. At top level it
+  is a `static_assert_decl` on `Program` (`prog.static_asserts`); in a body it
+  is a `StaticAssertStmt`. Parser: `parse_static_assert` (shared by both
+  positions); the message must be a string literal. See Section 4
+  (`check_static_assert`) + Section 6 (no runtime code — true is elided) +
+  `TYPE_SYSTEM.md` §11.5.
 
 Sema: `EnumAccessExpr` is rewritten **in place** to an `IntLit` (value i32,
 sign-extended into the `IntLit`'s i64 `v` field) by `lower_enum_access_expr`
@@ -334,26 +369,57 @@ succeeded)
    (calling a function declared later in the file) resolve correctly
    (CODEGEN_SPEC.md Section 7's forward-reference handling depends on this
    ordering).
+   - **Pass 1.4 — typed-enum registration (2026-07-11, `register_typed_enums`):**
+     BEFORE `resolve_type` runs, scan every `EnumDecl` and register the typed
+     ones (those with a `: prim_type` backing). Records `enum_name -> backing
+     prim` in `typed_enum_backing` and interns the enum type in
+     `typed_enum_types` (`TYPE_SYSTEM.md` §15.2). An untyped enum (no backing)
+     is skipped here — it stays a plain i32-literal source, not a type.
    - **Pass 1.5 — enum resolution (v1.0 Tier 1, `resolve_enums`):** resolve
      every `EnumDecl`'s variant values (auto-increment from 0 or from the
      last explicit `= constexpr_int_expr`, evaluated with the existing
-     `try_eval_const_i64`; duplicate enum names / duplicate variant names
+     `try_eval_const_i64`; an explicit value may also be a `constexpr fn`
+     call, folded first by the constexpr-call pre-pass — enum-from-constexpr,
+     `TYPE_SYSTEM.md` §15.2; duplicate enum names / duplicate variant names
      within one enum / duplicate explicit values are errors, stricter than C).
      Builds the `(enum_name -> (variant -> i32 value))` table used by
      `lower_enum_access_expr` and the `enum_names` set used by pass 1.6.
-   - **Pass 1.6 — type-position enum rejection (`check_declared_types_not_enum`):**
-     an enum name is **not** a type in v1 — `let x: Color = ...`, a struct
-     field, a fn param, a return type, a global declared with an enum name
-     is a clean sema error (the hook typed enums later flip to accept).
+   - **Pass 1.6 — type-position untyped-enum rejection
+     (`check_declared_types_not_enum`):** an **untyped** enum name is **not**
+     a type — `let x: Color = ...` (for an untyped `Color`), a struct field,
+     a fn param, a return type, a global declared with an untyped enum name
+     is a clean sema error. A **typed** enum name (`enum E : T`, registered in
+     Pass 1.4) IS a valid type in these positions (`TYPE_SYSTEM.md` §15.2).
    - **EnumAccessExpr lowering (`lower_enum_access_*`, runs as a sema-internal
      pass over every ExprPtr slot, NOT deferred to codegen):** rewrite each
-     `E::A` to an `IntLit` carrying the variant's i32 value (sign-extended
-     into the i64 `v` field), so by the time `check_expr` runs there are no
+     `E::A` to an `IntLit` carrying the variant's value. For an **untyped**
+     enum the `IntLit` is i32-typed (sign-extended into the i64 `v` field);
+     for a **typed** enum (`enum E : T`) the `IntLit` is stamped with the enum
+     type from `typed_enum_types` (so `let c: Color = Color::Red` type-checks
+     — `TYPE_SYSTEM.md` §15.2). By the time `check_expr` runs there are no
      `EnumAccessExpr` nodes left anywhere — codegen, the const-folder, the
      switch case-value literal check, and the globals initializer evaluator
      all see an ordinary integer literal. Unknown enum / unknown variant are
      errors (and the node is still rewritten to a placeholder `IntLit` so
      `check_expr` doesn't double-report via its catch-all).
+   - **constexpr-call pre-pass (2026-07-11, `lower_constexpr_calls_*`):** a
+     bottom-up pass over every `ExprPtr` slot (fn bodies, globals, enum
+     variant explicit values, `static_assert` conditions) that folds a call
+     to a `constexpr fn` with all-constant args into an `IntLit` carrying the
+     evaluated result, BEFORE `check_expr` runs (`TYPE_SYSTEM.md` §11.5). A
+     constexpr call with a non-constant arg, or a non-i64-integer constexpr
+     fn, is left as a normal call (runtime fallback). This is what lets
+     `static_assert(square(7) == 49, ...)` and `enum E : i64 { X = base() }`
+     work — the constexpr call is folded to a literal before the
+     const-check.
+   - **`static_assert` check (2026-07-11, `check_static_assert`):** folds the
+     condition (after the constexpr-call pre-pass) via `try_eval_const_bool`;
+     a **false** result is a compile error carrying the message, a **true**
+     result is elided (no runtime code), a non-constant condition is a
+     compile error. Runs both for top-level `prog.static_asserts` (after
+     signatures + globals are registered) and for in-body `StaticAssertStmt`
+     nodes (during the per-function body check). Produces NO runtime code in
+     either position (`TYPE_SYSTEM.md` §11.5).
 3. **Per-function body check** (name resolution + type check,
    single pass, left-to-right, no unification/solver - matches
    "monomorphic types only so simple," ../planning/DESIGN.md Section 3):
@@ -631,14 +697,25 @@ struct IrFunction {
   subsequent assignment is rejected at sema (compile error, not a
   runtime check - `const`-ness is purely a sema-level property, zero
   runtime cost, the storage is identical to a `let` local).
-  `constexpr` is a RESERVED keyword with NO parser/sema support (Section 1):
-  using it is a **parse error**. The earlier spec claim that `constexpr`
-  folds at sema for array sizes / `offsetof`/`sizeof` args / `switch` case
-  labels is removed — that form is a ROADMAP Tier 1 deferral, not a shipped
-  feature. (`sizeof`/`offsetof` DO fold at sema to literals; array sizes must
+- **`constexpr fn` calls**: a `constexpr fn` call with all-constant args is
+  folded to an `IntLit` by the constexpr-call pre-pass (Section 4) BEFORE
+  lowering runs, so lowering sees an ordinary integer literal — **no call
+  instruction is emitted** for the folded call (zero runtime cost). A
+  `constexpr fn` called with a non-constant arg falls back to a normal
+  `CallScript` (the fn is a real fn that is also emitted normally for the
+  runtime-call case). The `constexpr` modifier is only valid on a function
+  declaration (`constexpr fn`); on a non-`fn` decl it is a parse error.
+- **`static_assert(cond, "msg");`**: produces **NO runtime code** in either
+  position (top-level or in-body). Sema folds the condition (after the
+  constexpr-call pre-pass); a true result is elided, a false result is a
+  compile error (the assertion never reaches lowering), a non-constant
+  condition is a compile error. Lowering never emits a `static_assert` —
+  there is no IR shape for it.
+- **`sizeof`/`offsetof`** DO fold at sema to literals; array sizes must
   be integer literals; `switch` case labels must be `try_eval_const_i64`-
-  foldable integer expressions — none of these require the `constexpr`
-  keyword.)
+  foldable integer expressions (or a `constexpr fn` call folded by the
+  pre-pass) — none of these require the `constexpr` keyword on the
+  expression itself (the keyword is the fn modifier).
 
 ## 7. Error reporting
 

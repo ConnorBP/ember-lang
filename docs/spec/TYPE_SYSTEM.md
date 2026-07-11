@@ -239,15 +239,21 @@ memory-indirection concept in the whole language.
 
 ## 8. Function signature types & `void` enforcement
 
-- A function's type is `(param_types...) -> return_type`. No function
-  values / function pointers as script-visible values in v1 (no
-  first-class functions, no closures - ../planning/DESIGN.md non-goals) - a
-  function name in an expression position other than a direct call is
-  a compile error. (Callback-style native APIs, e.g. "register this
-  script function as an event handler," are handled via the
-  annotation mechanism Section 2/DESIGN.md Section 6 dispatch-table slot lookup by
-  name from the host side, not by passing a function value through
-  script expressions.)
+- A function's type is `(param_types...) -> return_type`. **First-class
+  function handles shipped in v1.0** (`../ROADMAP.md` Tier 2 ✓): `&fn_name`
+  takes a handle (an i64 = dispatch-table slot index), `handle(args)` calls
+  indirectly through the dispatch table, and `fn` is the handle type keyword
+  (`Prim::I64` with `is_fn_handle=true`). A handle is produced only by `&fn`
+  (or a trusted native like `register_routine`); i64↔fn assignment is forbidden
+  either direction, and a runtime bitset-allowlist guard validates the handle
+  before dispatch (`SAFETY_AND_SANDBOX.md` §7a). A bare `fn`-typed parameter
+  (`fn h` with no recorded signature) accepts any args at the call site — a
+  type-soundness hole, not a sandbox violation (the runtime guard still
+  validates the handle); parameterized `fn(i64)->i64` types are v2+. Closures
+  (lambdas with capture) remain a non-goal for v1 (need GC, `../ROADMAP.md`
+  Tier 3). (Callback-style native APIs are also handled via the annotation
+  mechanism — `@on_tick`/`@event(...)` — discovered by name from the host
+  side, `LIFECYCLE.md`.)
 - **Non-void function must return on every path**: sema performs a
   straightforward structured-control-flow reachability check (every
   `if` needs an `else` that also returns, `while`/`for` bodies don't
@@ -363,9 +369,8 @@ integer-only).
 `sizeof(T)` and `offsetof(T, field_name)` are **compile-time
 constants** of type `u64`, folded to literals at sema (usable as array
 sizes where an integer literal is required, in `switch` case-label
-positions, and in other compile-time-constant contexts — note `constexpr`
-itself is a reserved keyword with no support, Section 11.5).
-`sizeof` works on any type (primitives, structs, arrays, slices  - 
+positions, and in other compile-time-constant contexts).
+`sizeof` works on any type (primitives, structs, arrays, slices  -  
 slice `sizeof` is 16, the two-word `{ptr,len}` representation,
 TYPE_SYSTEM.md Section 4). `offsetof` works only on struct types
 (script-declared or host-mapped) and the field must exist (sema
@@ -382,19 +387,46 @@ pass 1, COMPILER_PIPELINE.md Section 4).
   write-after-init rejected). `expr` is typechecked normally (implicit
   conversions per Section 6 apply).
 
-`constexpr` is a **RESERVED keyword with no parser/sema support** (see
-`COMPILER_PIPELINE.md` §1): using it is a **parse error**. The earlier spec
-claim that `constexpr` works as a compile-time-evaluable marker for array
-sizes / `switch` case labels / `offsetof`/`sizeof` args is **removed** — that
-restricted form is a `../ROADMAP.md` Tier 1 **deferral**, not a shipped feature.
-`const N: u32 = 256; let buf: [u8; N];` is a **parse error** today (the parser
-has no `constexpr` case and array sizes must be integer literals, not named
-constants). What DOES fold at sema without `constexpr`: `sizeof`/`offsetof`
+**`constexpr fn` — compile-time function evaluation (shipped 2026-07-11).**
+A function declared `constexpr fn name(...) -> i64 { ... }` **can** be
+const-evaluated at sema time when called with all-constant args. A bounded
+tree-walking interpreter (`eval_constexpr_fn` in `src/sema.cpp`) evaluates
+the call, and a constexpr-call pre-pass (`lower_constexpr_calls_expr`) rewrites
+the call site to an `IntLit` carrying the folded result **before** `check_expr`
+runs — so codegen, the const-folder, the `switch` case-value check, the
+`static_assert` check, and the globals/enum initializer evaluators all see an
+ordinary integer literal (no call instruction is emitted for the folded call).
+**Bounds:** max 100000 loop iterations per loop, max 256 recursion depth
+(nested constexpr calls). **i64 integer fns only** in this increment
+(float/bool/struct return fns skip constexpr eval and fall back to a normal
+runtime call). A constexpr fn called with a non-constant (runtime) arg also
+falls back to a normal runtime call — `constexpr` marks a fn as one that
+**can** be const-evaluated, not one that **must** be. The `constexpr` modifier
+is only valid on a function declaration (`constexpr fn`); `priv` and
+`constexpr` may appear in either order before `fn`. See `COMPILER_PIPELINE.md`
+§1/§2a/§4 for the grammar + sema passes. Pinned by `constexpr_test` (ctest) +
+the `valid_constexpr*` / `invalid_constexpr_not_fn` lang tests.
+
+**`static_assert(cond, "msg")` — compile-time assertion (shipped 2026-07-11).**
+`static_assert(cond, "msg");` folds `cond` at sema (cond may be a literal
+integer/bool expression or a `constexpr fn` call — the constexpr-call pre-pass
+folds those first). A **false** result is a **compile error** carrying `msg`; a
+**true** result is **elided** (no runtime code is emitted). A non-constant
+condition is a compile error ("static_assert condition must be a compile-time
+constant"). Usable at top level (a `static_assert_decl` on `Program`) and
+inside a function body (`StaticAssertStmt`); both positions share the identical
+`check_static_assert` verdict. See `COMPILER_PIPELINE.md` §1/§2a/§4. Pinned by
+`static_assert_test` (ctest) + the `valid_static_assert*` /
+`sema_invalid_static_assert_*` lang tests.
+
+What folds at sema without `constexpr`: `sizeof`/`offsetof`
 (§11.4) fold to `u64` literals; array sizes must be integer literals (§3);
 `switch` case labels must be `try_eval_const_i64`-foldable integer expressions
-(§11.6); enum variant explicit values fold via `try_eval_const_i64`.
-Full const-eval (recursive `constexpr fn`s, `static_assert`, named constants
-as array sizes) is v2 (`../ROADMAP.md` Tier 1).
+(§11.6); enum variant explicit values fold via `try_eval_const_i64` or a
+`constexpr fn` call (§15). The earlier spec claim that `constexpr` is a
+reserved keyword with no support is **superseded** — `constexpr fn` evaluation
+shipped (the `constexpr` keyword now has parser + sema support, scoped to
+function declarations).
 
 ### 11.6 `do-while` / `switch` / `defer` (semantics, grammar in
 COMPILER_PIPELINE.md Section 2)
@@ -404,8 +436,8 @@ COMPILER_PIPELINE.md Section 2)
   must be `bool`). Budget check placed at the back-edge to the top of
   the body, same as `while` (SAFETY_AND_SANDBOX.md Section 3).
 - `switch (e) { case L: ...; break; ... }` - `e` integer-typed, `L`
-  compile-time-constant integer literals (foldable via `try_eval_const_i64`;
-  `constexpr` itself is a reserved keyword with no support, §11.5), unique within the switch, in-range for
+  compile-time-constant integer literals (foldable via `try_eval_const_i64`,
+  or a `constexpr fn` call folded by the constexpr-call pre-pass — §11.5), unique within the switch, in-range for
   `e`'s type. **No fallthrough**: each case must end in
   `break` or `return` (sema rejects falling off a case
   body - eliminates the entire C-fallthrough footgun class at the
@@ -533,8 +565,8 @@ initialized in a fn (`v3_up()`, `make_config()`).
   same const-fold restriction the v1 scalar-globals path already enforced
   (a const-foldable initializer is a literal or a `try_eval_const_i64`-foldable
   expression — literals, `sizeof`/`offsetof`, and integer arithmetic on other
-  foldable values; note `constexpr` itself is a reserved keyword with no
-  support, §11.5), extended to aggregate
+  foldable values; a `constexpr fn` call also folds via the constexpr-call
+  pre-pass, §11.5), extended to aggregate
   fields/elements. A handle-typed global (e.g. a sync `spsc` handle) still
   needs a call initializer for the type-check and still starts at 0 until
   `@entry` reassigns it (the aggregate-globals pass did not add a handle
@@ -684,3 +716,65 @@ storage. See `extensions/map/ext_map.hpp` for the C++ contract +
 `examples/ext_map_test.cpp` for the ctest coverage (registration smoke +
 happy-path set/get/contains/length/remove/clear + bounds: invalid handle,
 missing key).
+
+## 15. Enums — untyped + typed (2026-07-11)
+
+ember has two enum forms. Both are C-style named-constant declarations; they
+differ in whether the enum name is a real type.
+
+### 15.1 Untyped enums (shipped v1.0)
+
+`enum E { A, B, C }` declares named constants. Variants are **i32 values**,
+auto-incrementing from 0 (or from the last explicit `= constexpr_int_expr` /
+`= constexpr_fn_call`); an explicit value sets the next base. `E::A` is an
+`EnumAccessExpr` that sema rewrites **in place** to an `IntLit` carrying the
+variant's i32 value (sign-extended into the `IntLit`'s i64 storage field), so
+by the time `check_expr` runs there are no `EnumAccessExpr` nodes left —
+codegen, the const-folder, the switch case-value check, and the globals
+initializer evaluator all see an ordinary integer literal. **An untyped enum
+name is not a type** — `let x: Color = ...` (for an untyped `Color`) is a clean
+sema error. Duplicate variant names / duplicate explicit values within one
+enum are errors (stricter than C). See `COMPILER_PIPELINE.md` §2a/§4.
+
+### 15.2 Typed enums (`enum E : T`) (shipped 2026-07-11)
+
+`enum E : T { ... }` (e.g. `enum Color : i32 { Red, Green, Blue }`) makes the
+enum name a **real type** backed by the integer `T` (`T` must be an integer
+primitive). The typed-enum registration runs in sema Pass 1.4
+(`register_typed_enums`, before `resolve_type`): it records `E -> T`'s prim in
+`typed_enum_backing` and interns the enum type in `typed_enum_types`. The type
+is distinct from its backing integer: `Type::same` distinguishes `Color` from
+`i32`, so a `Color`-typed slot and an `i32`-typed slot are not interchangeable.
+
+- **Variant literals carry the enum type.** `Color::Red` lowers to an `IntLit`
+  whose type is `Color` (not plain `i32`) — `EnumAccessExpr` looks up
+  `typed_enum_types` and stamps the `IntLit` with the enum type when present.
+  So `let c: Color = Color::Red;` type-checks (the literal is `Color`-typed).
+- **enum→int implicit widening is allowed.** A typed-enum value widens to its
+  backing integer, and on to `i64`, via a synthesized `CastExpr` — so
+  `return c;` from an `i64` fn works (codegen sign-extends the i32 backing
+  value). A typed enum also satisfies `is_int()` for `match`/`switch` subject
+  and index-position checks.
+- **int→enum is rejected.** A raw integer literal `let c: Color = 5;` is a
+  **sema error** ("let type mismatch (Color = i64)") — `adapt_int_lit`
+  refuses to re-type a raw literal to a typed-enum type, and
+  `can_implicitly_convert(Color, i64)` is false (int→enum is not implicit;
+  only enum→int widens). A typed-enum value must come from a `Color::Variant`
+  (or another `Color` binding). Explicit `as` does not synthesize int→enum
+  either (use a variant).
+- **Comparison.** A typed-enum value may be compared to an integer literal
+  (the enum widens to int for the compare); two typed-enum values of the same
+  enum compare as their backing integers.
+- **Enum-from-constexpr-expr.** A variant's explicit value may be a `constexpr
+  fn` call: `X = base()` where `base` is a `constexpr fn`. `resolve_enums`
+  folds the call to an `IntLit` via the constexpr-call pre-pass
+  (`lower_constexpr_calls_expr`, §11.5) **before** the `try_eval_const_i64`
+  const-check, so `X = base()` resolves to the folded constant. The constexpr
+  fn remains callable at runtime too (it is a normal fn that **can** be
+  const-evaluated, not one that **must** be).
+
+Untyped enums (§15.1) are unchanged (backward compat). Pinned by
+`typed_enum_test` (ctest) + `tests/lang/{valid_typed_enum,
+valid_typed_enum_match,valid_enum_from_constexpr,sema_invalid_int_to_enum}.ember`.
+See `COMPILER_PIPELINE.md` §2a (grammar) + §4 (sema passes) and `ROADMAP.md`
+Tier 1 (Typed enums entry).

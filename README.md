@@ -6,16 +6,23 @@
 machine code at runtime — no interpreter dispatch loop, no bytecode VM. A hot
 loop runs as real native instructions, not a switch-on-opcode interpreter, so
 it posts **5-9× over a bytecode interpreter** on hot loops (measured against
-AngelScript: `fib`, `tight_loop`, `nested_calls`) and ties `g++ -O2` at **1.00×**
+AngelScript: `fib`, `tight_loop`, `nested_calls`) and ties `g++ -O2` at **~1.0×**
 on straight-line integer arithmetic. Around that core it ships a real sandbox
 (per-frame byte budget, stack-depth guard, recoverable traps — a fault unwinds
 to your host, it doesn't kill the process), **hot-reload** of live modules with
 stable dispatch slots, **`.em` module bundling** (signed, native-code bundles
-with a relocation contract), and a Rust-like syntax built for game-engine /
-modding embedding. It is a **baseline** JIT — correct-first, no inlining or
-loop opts — so it will *not* match an optimizing compiler everywhere (five of
-six codegen paths are 5-9× slower than `g++ -O2`); closing that gap is a
-benchmark-gated v2+ goal, not a v1 claim. Current version: **v1.0**.
+with a relocation contract, plus a v5 IR-on-disk variant that is re-emitted to
+x64 at load time), and a Rust-like syntax built for game-engine /
+modding embedding. The **default codegen path is a baseline JIT** —
+correctness-first, tree-walking, stack-spilling, no inlining or loop opts —
+so it will *not* match an optimizing compiler everywhere (five of six codegen
+paths are 5-9× slower than `g++ -O2`); closing that gap is benchmark-gated work.
+A thin three-address IR backend, `.em` v5 IR serialization, and **eight IR
+optimization passes** (constprop/dce/cse/licm/forward/copyprop/instcombine/dse,
+plus an MBA obfuscation pass) have shipped behind flags (`enable_ir_backend`,
+`--passes`) as the staged path toward that goal — default-off, so the default
+path is the unchanged baseline tree-walker. Full SSA-lite + linear-scan
+regalloc remains the future upgrade. Current version: **v1.0**.
 
 ## What it looks like
 
@@ -24,8 +31,11 @@ for-each over slices, pattern matching, operator overloads, and native calls —
 with comments marking where ember's unique properties show:
 
 ```rust
-// Enums are untyped i32 constants (v1: no typed enums, no tag). Auto-
-// increment from 0; an explicit `= N` sets the next base.
+// Enums are C-style named constants. The untyped form (`enum E { ... }`)
+// has i32 variants auto-incrementing from 0; an explicit `= N` sets the next
+// base. The typed form `enum E : T` (e.g. `enum Color : i32`) makes the enum
+// name a real type backed by T — see the Language spec below. This example
+// uses the untyped form; `E::A` rewrites to an i64 literal at sema time.
 enum Damage { Physical, Fire = 10, Ice, Lightning }
 
 // Structs are value types with Ember's tight-packed layout (no C++ alignment).
@@ -88,7 +98,7 @@ fn main() -> i64 {
 
 **What this example shows:**
 - **Type inference** (`let total = 0`, `let d = compute_damage(...)`) — no redundant type annotations
-- **Enums** with auto-increment + explicit values (`Damage::Fire = 10`, `Damage::Ice = 11`)
+- **Enums** — untyped (`enum E { ... }`, i32 variants) + typed (`enum E : T`); auto-increment + explicit values (`Damage::Fire = 10`, `Damage::Ice = 11`); variant values may be a `constexpr fn` call
 - **Structs** as value types with field access (`e.hp`, `e.name`)
 - **for-each** over a slice (`for (hp in slice)`) — no manual index loop
 - **match** with no-fallthrough arms + wildcard (`_ => default`)
@@ -111,7 +121,7 @@ cd ember
 mkdir buildt && cd buildt
 cmake -G Ninja -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe ..
 cmake --build .          # or: ninja
-ctest                    # 37 tests (35 excluding the two benchmarks)
+ctest                    # 42 tests (40 excluding the two benchmarks)
 ```
 
 Run and bench a script (`ember` = `buildt/ember_cli.exe`):
@@ -119,14 +129,16 @@ Run and bench a script (`ember` = `buildt/ember_cli.exe`):
 ```bash
 ember run hello.ember              # compiles + calls main(); exit code = its i64 return (mod 256)
 ember bench hello.ember            # microbenchmark: warmup + N timed iters, prints min/median/mean/p99/stddev
+ember test tests/lang              # native test runner: classify + compile/run every .ember in a directory
 ```
 
 CLI reference:
 
 ```
-ember run <file.ember> [--fn NAME] [--dump] [--emit-em OUT.em] [--tick [--tick-count N] [--tick-interval MS]]
+ember run <file.ember> [--fn NAME] [--dump] [--emit-em OUT.em] [--passes P1,P2,...] [--tick [--tick-count N] [--tick-interval MS]]
 ember emit-em <file.ember> <out.em>      # precompile without running
 ember bench <file.ember> [--fn NAME] [--iters N] [--warmup N]
+ember test [dir]                        # run every .ember file in <dir> (default tests/lang/)
 ember run --load-em <file.em> [--fn NAME]
 ```
 
@@ -178,14 +190,24 @@ interchange format.
 **Type system.** Primitives `i8/i16/i32/i64`, `u8/u16/u32/u64`, `f32/f64`,
 `bool`, `string` (owned, via the string extension), and `slice[T]` (a bounded
 view — the no-raw-pointer rule). User types: `struct` (value type, field layout
-queryable via `sizeof`/`offsetof`) and `enum` (C-style untyped, `E::A` rewrites
-to an `i64` literal at sema). First-class `fn` handles (`&fn` / `handle(args)`)
+queryable via `sizeof`/`offsetof`) and `enum` — **untyped** (`enum E { ... }`,
+i32 variants, `E::A` rewrites to an `i64` literal at sema) **or typed**
+(`enum E : T`, e.g. `enum Color : i32`, makes the enum name a real type backed
+by `T`; enum→int implicit widening is allowed, int→enum is rejected). First-class `fn` handles (`&fn` / `handle(args)`)
 backed by the dispatch table.
 
 **Syntax (Rust-like).**
 - Bindings: `let x: i64 = 0;`, `let mut x = 0;`, `const N: u64 = sizeof(i64);`
-- Functions: `fn name(p: i64) -> i64 { ... }`; default+trailing-optional params
-- Control: `if`/`else`, `while`, `for (init; cond; step)`, `for (x in slice)`,
+- Functions: `fn name(p: i64) -> i64 { ... }`; default+trailing-optional params;
+  `constexpr fn name(...) -> i64 { ... }` — a fn that **can** be const-evaluated
+  at sema time when called with all-constant args (the call is rewritten to an
+  `IntLit`; bounded interpreter, i64 integer fns only, falls back to a runtime
+  call for non-constant args or float/bool/struct fns)
+- Compile-time assertions: `static_assert(cond, "msg");` — folds `cond` at
+  sema (cond may be a literal expr or a `constexpr fn` call); a false result is
+  a compile error with `msg`, a true result is elided (no runtime code)
+- Control: `if`/`else`, `while`, `for (init; cond; step)`, `for (x in slice)`
+  (and `for (x in array_handle)` via the `iterable()` hook),
   `do { } while(cond);`, `switch`/`case`/`default`/`break`,
   `match (expr) { pat => body, _ => default }`, `continue`, `return`
 - `defer` — cleanup runs at **lexical-block exit** (LIFO), including on
