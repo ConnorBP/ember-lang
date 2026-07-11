@@ -152,6 +152,7 @@ ember_add_extension(array    extensions/array/ext_array.cpp)
 ember_add_extension(math     extensions/math/ext_math.cpp)
 ember_add_extension(sync     extensions/sync/ext_sync.cpp)
 ember_add_extension(lifecycle extensions/lifecycle/ext_lifecycle.cpp)
+ember_add_extension(opt extensions/opt/ext_opt.cpp)         # Stage C: IR optimization passes
 
 # ---- tests: .em pre-compile round-trip + live import cross-module round-trip ----
 # These link only ember + ember_frontend (no prism/prism_script_host) so they
@@ -609,6 +610,22 @@ add_executable(ember_pass_test examples/ember_pass_test.cpp)
 target_link_libraries(ember_pass_test PRIVATE ember ember_frontend)
 add_test(NAME ember_pass COMMAND ember_pass_test)
 
+# ir_passes_test - Stage C: the IR optimization passes value-preservation +
+# instr-count-reduction gate. Compiles the four IR-pass workloads, lowers each
+# to ThinFunction, runs each pass (constprop/dce/cse) via the registry,
+# emit_x64's, calls main, and asserts (a) value-preserving + (b) instr-count
+# reduction on the pass's target workload. Links ember_ext_opt + six std exts.
+add_executable(ir_passes_test examples/ir_passes_test.cpp)
+target_link_libraries(ir_passes_test PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_vec ember_ext_quat ember_ext_mat
+    ember_ext_string ember_ext_array ember_ext_math
+    ember_ext_opt)
+if(WIN32)
+    target_link_libraries(ir_passes_test PRIVATE kernel32)
+endif()
+add_test(NAME ir_passes COMMAND ir_passes_test)
+
 # aggregate_global_test - pins aggregate globals (chunk c3): struct globals
 # `global cfg : Config = Config{...};`, fixed-array globals `global arr : i64[3]
 # = [10,20,30];`, slice globals `global s : i64[] = [1,2,3];`. Compiles tiny
@@ -630,5 +647,5 @@ add_test(NAME aggregate_global COMMAND aggregate_global_test)
 set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
     v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
     array_lit aggregate_global em_signed codegen_opt thin_ir_struct thin_ir
-    thin_ir_ser em_v5_ir ember_pass
+    thin_ir_ser em_v5_ir ember_pass ir_passes
     PROPERTIES TIMEOUT 30)
