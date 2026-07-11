@@ -1,0 +1,644 @@
+// self_hosted/codegen_test.ember — tests for the self-hosted ember codegen.
+//
+// TDD: every codegen path implemented in codegen.ember is exercised. The test
+// lexes + parses + type-checks + codegens known ember snippets and verifies
+// the codegen produces valid x64 bytes. main() returns 0 on full success, or a
+// nonzero code identifying the first failing check.
+//
+// Run: ./buildt/ember_cli.exe run self_hosted/codegen_test.ember --fn main
+// (exit 0 == all tests pass).
+//
+// Verification strategy:
+//   - The code buffer is non-empty (array_length > 0).
+//   - The buffer starts with the function prologue bytes:
+//       0x55             (push rbp)
+//       0x48 0x89 0xE5   (mov rbp, rsp)
+//       0x48 0x81 0xEC   (sub rsp, imm32 ...)
+//   - For specific expressions, we verify the expected instruction bytes
+//     appear in the output (e.g. mov rax, imm64 = 48 B8 + 8 bytes).
+//
+// The codegen produces x64 BYTES but does NOT execute them (that requires the
+// JIT memory natives — alloc_executable_rw + seal_executable — which are a
+// host-provided extension not yet exposed to ember scripts). For Stage 4, we
+// just produce the bytes + verify them.
+
+import "codegen.ember";
+
+// ---------------------------------------------------------------------------
+// assertion helpers. ck returns 0 to continue or a nonzero code to bail.
+// ---------------------------------------------------------------------------
+global g_pass : i64 = 0;
+
+// ck: compare two i64 values. returns 0 on match (bumps g_pass), or code on mismatch.
+fn ck(got: i64, want: i64, code: i64) -> i64 {
+    if (got == want) { g_pass = g_pass + 1; return 0; }
+    return code;
+}
+
+// ck_bool: check a boolean condition. returns 0 on true (bumps g_pass), or code on false.
+fn ck_bool(got: bool, code: i64) -> i64 {
+    if (got) { g_pass = g_pass + 1; return 0; }
+    return code;
+}
+
+// ---------------------------------------------------------------------------
+// Test 1 — the canonical program from the task spec.
+//   fn main() -> i64 { return 1 + 2 * 3; }
+//
+// Verifies: codegen succeeds, the byte array is non-empty, and it starts with
+// the prologue bytes 0x55 0x48 0x89 0xE5 (push rbp; mov rbp, rsp).
+// ---------------------------------------------------------------------------
+fn test_canonical() -> i64 {
+    let buf: i64 = codegen("fn main() -> i64 { return 1 + 2 * 3; }");
+    if (codegen_failed() != 0) { return 1001; }  // codegen error
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 1002); if (r != 0) { return r; }
+
+    // verify the prologue: 0x55 0x48 0x89 0xE5
+    let b0: i64 = array_get_u8(buf, 0) as i64;
+    let b1: i64 = array_get_u8(buf, 1) as i64;
+    let b2: i64 = array_get_u8(buf, 2) as i64;
+    let b3: i64 = array_get_u8(buf, 3) as i64;
+    let r2: i64 = ck(b0, 0x55, 1010); if (r2 != 0) { return r2; }
+    let r3: i64 = ck(b1, 0x48, 1011); if (r3 != 0) { return r3; }
+    let r4: i64 = ck(b2, 0x89, 1012); if (r4 != 0) { return r4; }
+    let r5: i64 = ck(b3, 0xE5, 1013); if (r5 != 0) { return r5; }
+
+    // verify the sub rsp, imm32 opcode follows: 0x48 0x81 0xEC
+    let b4: i64 = array_get_u8(buf, 4) as i64;
+    let b5: i64 = array_get_u8(buf, 5) as i64;
+    let b6: i64 = array_get_u8(buf, 6) as i64;
+    let r6: i64 = ck(b4, 0x48, 1014); if (r6 != 0) { return r6; }
+    let r7: i64 = ck(b5, 0x81, 1015); if (r7 != 0) { return r7; }
+    let r8: i64 = ck(b6, 0xEC, 1016); if (r8 != 0) { return r8; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 2 — integer literal return.
+//   fn main() -> i64 { return 42; }
+//
+// Verifies: the mov rax, imm64 instruction (48 B8 + 8 bytes) appears in the
+// output, encoding the value 42.
+// ---------------------------------------------------------------------------
+fn test_int_literal() -> i64 {
+    let buf: i64 = codegen("fn main() -> i64 { return 42; }");
+    if (codegen_failed() != 0) { return 2001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 10, 2002); if (r != 0) { return r; }
+
+    // search for the mov rax, 42 sequence: 48 B8 2A 00 00 00 00 00 00 00
+    // (42 = 0x2A, little-endian imm64 = 2A 00 00 00 00 00 00 00)
+    let found: i64 = cg_find_bytes(buf, 0x48, 0xB8, 0x2A);
+    let r2: i64 = ck(found, 1, 2010); if (r2 != 0) { return r2; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 3 — local variable (let + return).
+//   fn main() -> i64 { let x: i64 = 10; return x; }
+//
+// Verifies: codegen succeeds and the prologue is present. The let stores to
+// [rbp-8], the return loads from [rbp-8] into rax.
+// ---------------------------------------------------------------------------
+fn test_let_local() -> i64 {
+    let buf: i64 = codegen("fn main() -> i64 { let x: i64 = 10; return x; }");
+    if (codegen_failed() != 0) { return 3001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 3002); if (r != 0) { return r; }
+
+    // prologue present
+    let b0: i64 = array_get_u8(buf, 0) as i64;
+    let r2: i64 = ck(b0, 0x55, 3010); if (r2 != 0) { return r2; }
+
+    // the store to [rbp-8] (mov [rbp-8], rax) = 48 89 85 F8 FF FF FF
+    // (REX.W 89 /r mod=10 reg=rax(0) rm=rbp(5) + disp32)
+    let found_store: i64 = cg_find_bytes(buf, 0x48, 0x89, 0x85);
+    let r3: i64 = ck(found_store, 1, 3011); if (r3 != 0) { return r3; }
+
+    // the load from [rbp-8] (mov rax, [rbp-8]) = 48 8B 85 F8 FF FF FF
+    let found_load: i64 = cg_find_bytes(buf, 0x48, 0x8B, 0x85);
+    let r4: i64 = ck(found_load, 1, 3012); if (r4 != 0) { return r4; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 4 — function with parameters.
+//   fn add(a: i64, b: i64) -> i64 { return a + b; }
+//
+// Verifies: codegen succeeds, params are spilled from rcx/rdx to frame slots,
+// and the add instruction (48 01 C8 = add rax, rcx) appears.
+// ---------------------------------------------------------------------------
+fn test_params() -> i64 {
+    let buf: i64 = codegen("fn add(a: i64, b: i64) -> i64 { return a + b; }");
+    if (codegen_failed() != 0) { return 4001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 4002); if (r != 0) { return r; }
+
+    // the param spill: mov [rbp-8], rcx = 48 89 4D F8
+    // (REX.W 89 modrm(10, rcx(1), rbp(5)) = (2<<6)|(1<<3)|5 = 0x4D, disp=-8)
+    let found_spill: i64 = cg_find_bytes(buf, 0x48, 0x89, 0x4D);
+    let r2: i64 = ck(found_spill, 1, 4010); if (r2 != 0) { return r2; }
+
+    // add rax, rcx = 48 01 C8 (REX.W 01 modrm(11, rcx(1), rax(0)) = 0xC8)
+    let found_add: i64 = cg_find_bytes(buf, 0x48, 0x01, 0xC8);
+    let r3: i64 = ck(found_add, 1, 4011); if (r3 != 0) { return r3; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 5 — if statement.
+//   fn f(b: bool) -> i64 { if (b) { return 1; } return 0; }
+//
+// Verifies: codegen succeeds, the comparison + conditional jump are present.
+// ---------------------------------------------------------------------------
+fn test_if() -> i64 {
+    let buf: i64 = codegen("fn f(b: bool) -> i64 { if (b) { return 1; } return 0; }");
+    if (codegen_failed() != 0) { return 5001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 5002); if (r != 0) { return r; }
+
+    // cmp rax, imm32 = 48 81 F8 00 00 00 00 (REX.W 81 /7 id). Check for 48 81 F8.
+    let found_cmp: i64 = cg_find_bytes(buf, 0x48, 0x81, 0xF8);
+    let r2: i64 = ck(found_cmp, 1, 5010); if (r2 != 0) { return r2; }
+
+    // je (0F 84 xx) — check the 0F 84 prefix
+    let found_je: i64 = cg_find_bytes2(buf, 0x0F, 0x84);
+    let r3: i64 = ck(found_je, 1, 5011); if (r3 != 0) { return r3; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 6 — while loop.
+//   fn w(n: i64) -> i64 { while (n > 0) { n = n - 1; } return n; }
+//
+// Verifies: codegen succeeds, the loop back-edge (jmp) + comparison are present.
+// ---------------------------------------------------------------------------
+fn test_while() -> i64 {
+    let buf: i64 = codegen("fn w(n: i64) -> i64 { while (n > 0) { n = n - 1; } return n; }");
+    if (codegen_failed() != 0) { return 6001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 6002); if (r != 0) { return r; }
+
+    // sub rax, rcx = 48 29 C8 (for n - 1)
+    let found_sub: i64 = cg_find_bytes(buf, 0x48, 0x29, 0xC8);
+    let r2: i64 = ck(found_sub, 1, 6010); if (r2 != 0) { return r2; }
+
+    // jmp (E9) — the back-edge
+    let found_jmp: i64 = cg_find_bytes1(buf, 0xE9);
+    let r3: i64 = ck(found_jmp, 1, 6011); if (r3 != 0) { return r3; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 7 — function call.
+//   fn add(a: i64, b: i64) -> i64 { return a + b; }
+//   fn main() -> i64 { return add(1, 2); }
+//
+// Verifies: codegen succeeds, the call instruction (FF D0 = call rax) appears.
+// ---------------------------------------------------------------------------
+fn test_call() -> i64 {
+    let buf: i64 = codegen("fn add(a: i64, b: i64) -> i64 { return a + b; } fn main() -> i64 { return add(1, 2); }");
+    if (codegen_failed() != 0) { return 7001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 7002); if (r != 0) { return r; }
+
+    // call rax = FF D0 (FF /2 mod=11 reg=2 rm=rax(0) = (3<<6)|(2<<3)|0 = 0xD0)
+    let found_call: i64 = cg_find_bytes2(buf, 0xFF, 0xD0);
+    let r2: i64 = ck(found_call, 1, 7010); if (r2 != 0) { return r2; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 8 — binary ops: multiplication.
+//   fn main() -> i64 { return 3 * 4; }
+//
+// Verifies: imul rax, rcx = 48 0F AF C1 appears.
+// ---------------------------------------------------------------------------
+fn test_mul() -> i64 {
+    let buf: i64 = codegen("fn main() -> i64 { return 3 * 4; }");
+    if (codegen_failed() != 0) { return 8001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 8002); if (r != 0) { return r; }
+
+    // imul rax, rcx = 48 0F AF C1 (REX.W 0F AF modrm(11, rax(0), rcx(1)) = 0xC1)
+    let found_imul: i64 = cg_find_bytes(buf, 0x48, 0x0F, 0xAF);
+    let r2: i64 = ck(found_imul, 1, 8010); if (r2 != 0) { return r2; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 9 — bitwise ops: AND, OR, XOR.
+//   fn main() -> i64 { return (1 & 2) | (3 ^ 4); }
+// ---------------------------------------------------------------------------
+fn test_bitwise() -> i64 {
+    let buf: i64 = codegen("fn main() -> i64 { return (1 & 2) | (3 ^ 4); }");
+    if (codegen_failed() != 0) { return 9001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 9002); if (r != 0) { return r; }
+
+    // and rax, rcx = 48 21 C8
+    let found_and: i64 = cg_find_bytes(buf, 0x48, 0x21, 0xC8);
+    let r2: i64 = ck(found_and, 1, 9010); if (r2 != 0) { return r2; }
+
+    // xor rax, rcx = 48 31 C8
+    let found_xor: i64 = cg_find_bytes(buf, 0x48, 0x31, 0xC8);
+    let r3: i64 = ck(found_xor, 1, 9011); if (r3 != 0) { return r3; }
+
+    // or rax, rcx = 48 09 C8
+    let found_or: i64 = cg_find_bytes(buf, 0x48, 0x09, 0xC8);
+    let r4: i64 = ck(found_or, 1, 9012); if (r4 != 0) { return r4; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 10 — comparison yielding bool.
+//   fn c(x: i64) -> bool { return x < 10; }
+//
+// Verifies: cmp + setcc + movzx are present.
+// ---------------------------------------------------------------------------
+fn test_comparison() -> i64 {
+    let buf: i64 = codegen("fn c(x: i64) -> bool { return x < 10; }");
+    if (codegen_failed() != 0) { return 10001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 10002); if (r != 0) { return r; }
+
+    // cmp rax, rcx = 48 39 C8 (REX.W 39 modrm(11, rcx(1), rax(0)) = 0xC8)
+    let found_cmp: i64 = cg_find_bytes(buf, 0x48, 0x39, 0xC8);
+    let r2: i64 = ck(found_cmp, 1, 10010); if (r2 != 0) { return r2; }
+
+    // setl al = 0F 9C C0 (setcc with cc=0xC for "less")
+    let found_setcc: i64 = cg_find_bytes2(buf, 0x0F, 0x9C);
+    let r3: i64 = ck(found_setcc, 1, 10011); if (r3 != 0) { return r3; }
+
+    // movzx rax, al = 48 0F B6 C0
+    let found_movzx: i64 = cg_find_bytes(buf, 0x48, 0x0F, 0xB6);
+    let r4: i64 = ck(found_movzx, 1, 10012); if (r4 != 0) { return r4; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 11 — epilogue bytes present.
+//   fn main() -> i64 { return 0; }
+//
+// Verifies: the epilogue (mov rsp, rbp = 48 89 EC; pop rbp = 5D; ret = C3)
+// appears at the end of the code.
+// ---------------------------------------------------------------------------
+fn test_epilogue() -> i64 {
+    let buf: i64 = codegen("fn main() -> i64 { return 0; }");
+    if (codegen_failed() != 0) { return 11001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 10, 11002); if (r != 0) { return r; }
+
+    // the epilogue: 48 89 EC 5D C3
+    // (mov rsp, rbp; pop rbp = 5D; ret = C3)
+    // check the last 5 bytes
+    let last: i64 = len - 1;
+    let r_ret: i64 = ck(array_get_u8(buf, last) as i64, 0xC3, 11010); if (r_ret != 0) { return r_ret; }
+    let r_pop: i64 = ck(array_get_u8(buf, last - 1) as i64, 0x5D, 11011); if (r_pop != 0) { return r_pop; }
+    let r_mov: i64 = ck(array_get_u8(buf, last - 2) as i64, 0xEC, 11012); if (r_mov != 0) { return r_mov; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 12 — unary negation.
+//   fn main() -> i64 { return -5; }
+//
+// Verifies: neg rax = 48 F7 D8 appears.
+// ---------------------------------------------------------------------------
+fn test_unary_neg() -> i64 {
+    let buf: i64 = codegen("fn main() -> i64 { return -5; }");
+    if (codegen_failed() != 0) { return 12001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 12002); if (r != 0) { return r; }
+
+    // neg rax = 48 F7 D8 (REX.W F7 modrm(11, 3, rax(0)) = (3<<6)|(3<<3)|0 = 0xD8)
+    let found_neg: i64 = cg_find_bytes(buf, 0x48, 0xF7, 0xD8);
+    let r2: i64 = ck(found_neg, 1, 12010); if (r2 != 0) { return r2; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 13 — shift operations.
+//   fn main() -> i64 { return 1 << 4; }
+//
+// Verifies: shl rax, cl = 48 D3 E0 appears.
+// ---------------------------------------------------------------------------
+fn test_shift() -> i64 {
+    let buf: i64 = codegen("fn main() -> i64 { return 1 << 4; }");
+    if (codegen_failed() != 0) { return 13001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 13002); if (r != 0) { return r; }
+
+    // shl rax, cl = 48 D3 E0 (REX.W D3 modrm(11, 4, rax(0)) = (3<<6)|(4<<3)|0 = 0xE0)
+    let found_shl: i64 = cg_find_bytes(buf, 0x48, 0xD3, 0xE0);
+    let r2: i64 = ck(found_shl, 1, 13010); if (r2 != 0) { return r2; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 14 — multiple functions (each gets its own prologue/epilogue).
+//   fn f() -> i64 { return 1; }
+//   fn g() -> i64 { return 2; }
+//   fn main() -> i64 { return f() + g(); }
+//
+// Verifies: the code contains at least 3 prologues (3 functions).
+// ---------------------------------------------------------------------------
+fn test_multi_fn() -> i64 {
+    let buf: i64 = codegen("fn f() -> i64 { return 1; } fn g() -> i64 { return 2; } fn main() -> i64 { return f() + g(); }");
+    if (codegen_failed() != 0) { return 14001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 14002); if (r != 0) { return r; }
+
+    // count occurrences of the prologue sequence 0x55 0x48 0x89 0xE5
+    let count: i64 = cg_count_prologues(buf);
+    let r2: i64 = ck_bool(count >= 3, 14010); if (r2 != 0) { return r2; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 15 — for loop.
+//   fn fl() -> i64 { for (let i: i64 = 0; i < 10; i = i + 1) { } return 0; }
+//
+// Verifies: codegen succeeds (the for loop is compiled without error).
+// ---------------------------------------------------------------------------
+fn test_for_loop() -> i64 {
+    let buf: i64 = codegen("fn fl() -> i64 { for (let i: i64 = 0; i < 10; i = i + 1) { } return 0; }");
+    if (codegen_failed() != 0) { return 15001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 15002); if (r != 0) { return r; }
+
+    // prologue present
+    let b0: i64 = array_get_u8(buf, 0) as i64;
+    let r2: i64 = ck(b0, 0x55, 15010); if (r2 != 0) { return r2; }
+
+    // jmp back-edge present (E9)
+    let found_jmp: i64 = cg_find_bytes1(buf, 0xE9);
+    let r3: i64 = ck(found_jmp, 1, 15011); if (r3 != 0) { return r3; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 16 — assignment expression.
+//   fn main() -> i64 { let x: i64 = 5; x = x + 1; return x; }
+//
+// Verifies: codegen succeeds, the add instruction is present.
+// ---------------------------------------------------------------------------
+fn test_assignment() -> i64 {
+    let buf: i64 = codegen("fn main() -> i64 { let x: i64 = 5; x = x + 1; return x; }");
+    if (codegen_failed() != 0) { return 16001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 16002); if (r != 0) { return r; }
+
+    // add rax, rcx = 48 01 C8 (for x + 1)
+    let found_add: i64 = cg_find_bytes(buf, 0x48, 0x01, 0xC8);
+    let r2: i64 = ck(found_add, 1, 16010); if (r2 != 0) { return r2; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 17 — logical && (short-circuit).
+//   fn g(b: bool) -> bool { return b && true; }
+// ---------------------------------------------------------------------------
+fn test_logical_and() -> i64 {
+    let buf: i64 = codegen("fn g(b: bool) -> bool { return b && true; }");
+    if (codegen_failed() != 0) { return 17001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 17002); if (r != 0) { return r; }
+
+    // je (0F 84) for the short-circuit false branch
+    let found_je: i64 = cg_find_bytes2(buf, 0x0F, 0x84);
+    let r2: i64 = ck(found_je, 1, 17010); if (r2 != 0) { return r2; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 18 — bitwise NOT (~).
+//   fn main() -> i64 { return ~5; }
+//
+// Verifies: not rax = 48 F7 D0 appears.
+// ---------------------------------------------------------------------------
+fn test_bitnot() -> i64 {
+    let buf: i64 = codegen("fn main() -> i64 { return ~5; }");
+    if (codegen_failed() != 0) { return 18001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 18002); if (r != 0) { return r; }
+
+    // not rax = 48 F7 D0 (REX.W F7 modrm(11, 2, rax(0)) = (3<<6)|(2<<3)|0 = 0xD0)
+    let found_not: i64 = cg_find_bytes(buf, 0x48, 0xF7, 0xD0);
+    let r2: i64 = ck(found_not, 1, 18010); if (r2 != 0) { return r2; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 19 — division.
+//   fn main() -> i64 { return 10 / 2; }
+//
+// Verifies: cqo + idiv rcx = 48 99 48 F7 F9 appears.
+// ---------------------------------------------------------------------------
+fn test_div() -> i64 {
+    let buf: i64 = codegen("fn main() -> i64 { return 10 / 2; }");
+    if (codegen_failed() != 0) { return 19001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 19002); if (r != 0) { return r; }
+
+    // cqo = 48 99
+    let found_cqo: i64 = cg_find_bytes2(buf, 0x48, 0x99);
+    let r2: i64 = ck(found_cqo, 1, 19010); if (r2 != 0) { return r2; }
+
+    // idiv rcx = 48 F7 F9
+    let found_idiv: i64 = cg_find_bytes(buf, 0x48, 0xF7, 0xF9);
+    let r3: i64 = ck(found_idiv, 1, 19011); if (r3 != 0) { return r3; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 20 — nested function calls.
+//   fn sq(n: i64) -> i64 { return n * n; }
+//   fn main() -> i64 { return sq(3) + sq(4); }
+//
+// Verifies: codegen succeeds, at least 2 call instructions (one per sq call).
+// ---------------------------------------------------------------------------
+fn test_nested_calls() -> i64 {
+    let buf: i64 = codegen("fn sq(n: i64) -> i64 { return n * n; } fn main() -> i64 { return sq(3) + sq(4); }");
+    if (codegen_failed() != 0) { return 20001; }
+    let len: i64 = array_length(buf);
+    let r: i64 = ck_bool(len > 0, 20002); if (r != 0) { return r; }
+
+    // count call rax (FF D0) occurrences — should be at least 2
+    let count: i64 = cg_count_calls(buf);
+    let r2: i64 = ck_bool(count >= 2, 20010); if (r2 != 0) { return r2; }
+
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 21 — return type mismatch error detection.
+//   fn main() -> i64 { return true; }
+//   (should fail at sema, so codegen should report an error)
+// ---------------------------------------------------------------------------
+fn test_sema_error() -> i64 {
+    let buf: i64 = codegen("fn main() -> i64 { return true; }");
+    // this should fail (sema error: return type mismatch)
+    let r: i64 = ck(codegen_failed(), 1, 21010); if (r != 0) { return r; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ===========================================================================
+// byte-pattern search helpers (for verifying x64 instruction encoding).
+// ===========================================================================
+
+// search for a 3-byte sequence (b0 b1 b2) in the buffer. returns 1 if found.
+fn cg_find_bytes(buf: i64, b0: i64, b1: i64, b2: i64) -> i64 {
+    let n: i64 = array_length(buf);
+    if (n < 3) { return 0; }
+    let mut i: i64 = 0;
+    while (i < n - 2) {
+        if (array_get_u8(buf, i) as i64 == b0) {
+            if (array_get_u8(buf, i + 1) as i64 == b1) {
+                if (array_get_u8(buf, i + 2) as i64 == b2) {
+                    return 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// search for a 2-byte sequence (b0 b1) in the buffer. returns 1 if found.
+fn cg_find_bytes2(buf: i64, b0: i64, b1: i64) -> i64 {
+    let n: i64 = array_length(buf);
+    if (n < 2) { return 0; }
+    let mut i: i64 = 0;
+    while (i < n - 1) {
+        if (array_get_u8(buf, i) as i64 == b0) {
+            if (array_get_u8(buf, i + 1) as i64 == b1) {
+                return 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// search for a 1-byte value in the buffer. returns 1 if found.
+fn cg_find_bytes1(buf: i64, b0: i64) -> i64 {
+    let n: i64 = array_length(buf);
+    let mut i: i64 = 0;
+    while (i < n) {
+        if (array_get_u8(buf, i) as i64 == b0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// count the number of function prologues (55 48 89 E5) in the buffer.
+fn cg_count_prologues(buf: i64) -> i64 {
+    let n: i64 = array_length(buf);
+    if (n < 4) { return 0; }
+    let mut count: i64 = 0;
+    let mut i: i64 = 0;
+    while (i < n - 3) {
+        if (array_get_u8(buf, i) as i64 == 0x55) {
+            if (array_get_u8(buf, i + 1) as i64 == 0x48) {
+                if (array_get_u8(buf, i + 2) as i64 == 0x89) {
+                    if (array_get_u8(buf, i + 3) as i64 == 0xE5) {
+                        count = count + 1;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+// count the number of call rax (FF D0) instructions in the buffer.
+fn cg_count_calls(buf: i64) -> i64 {
+    let n: i64 = array_length(buf);
+    if (n < 2) { return 0; }
+    let mut count: i64 = 0;
+    let mut i: i64 = 0;
+    while (i < n - 1) {
+        if (array_get_u8(buf, i) as i64 == 0xFF) {
+            if (array_get_u8(buf, i + 1) as i64 == 0xD0) {
+                count = count + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+// ===========================================================================
+// main — run every test in order; bail on the first nonzero return.
+// ===========================================================================
+fn main() -> i64 {
+    let mut r: i64 = 0;
+
+    r = test_canonical();       if (r != 0) { return r; }
+    r = test_int_literal();     if (r != 0) { return r; }
+    r = test_let_local();       if (r != 0) { return r; }
+    r = test_params();          if (r != 0) { return r; }
+    r = test_if();              if (r != 0) { return r; }
+    r = test_while();           if (r != 0) { return r; }
+    r = test_call();            if (r != 0) { return r; }
+    r = test_mul();             if (r != 0) { return r; }
+    r = test_bitwise();         if (r != 0) { return r; }
+    r = test_comparison();      if (r != 0) { return r; }
+    r = test_epilogue();        if (r != 0) { return r; }
+    r = test_unary_neg();       if (r != 0) { return r; }
+    r = test_shift();           if (r != 0) { return r; }
+    r = test_multi_fn();        if (r != 0) { return r; }
+    r = test_for_loop();        if (r != 0) { return r; }
+    r = test_assignment();      if (r != 0) { return r; }
+    r = test_logical_and();     if (r != 0) { return r; }
+    r = test_bitnot();          if (r != 0) { return r; }
+    r = test_div();             if (r != 0) { return r; }
+    r = test_nested_calls();    if (r != 0) { return r; }
+    r = test_sema_error();      if (r != 0) { return r; }
+
+    // every check passed
+    return 0;
+}

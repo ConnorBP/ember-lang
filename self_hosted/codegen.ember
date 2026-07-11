@@ -1,0 +1,1324 @@
+// self_hosted/codegen.ember — the ember code generator, written IN ember.
+//
+// Self-hosting Stage 4 (the final stage): prove ember can generate its own
+// machine code. This is a port of the CORE x64 emission logic of
+// src/codegen.cpp (the C++ reference tree-walking code generator) + the
+// byte-level emitter in src/x64_emitter.hpp to ember source. It consumes the
+// type-checked AST built by Stage 2's parser (parse.ember) + checked by
+// Stage 3's sema (sema.ember) and emits x86-64 machine code bytes into an
+// array<u8>.
+//
+// === v1 subset ===
+//
+// Stage 4 v1 codegens a SUBSET of ember, matching the task scope:
+//   - fn with i64 params + i64/void return
+//   - let with i64 (auto or typed)
+//   - if / while with bool conditions
+//   - return with a value
+//   - binary ops on i64: + - * & | ^ << >>
+//   - comparison ops: == != < <= > >= -> bool (0/1 in rax)
+//   - logical && || -> bool (short-circuit)
+//   - unary: - (neg), ! (logical not), ~ (bitwise not)
+//   - calls to i64->i64 fns (up to 4 args in Win64 registers rcx/rdx/r8/r9)
+//   - int literals -> i64, bool literals -> bool
+//   - identifiers: locals + params (loaded from [rbp+offset])
+//
+// The output is an array<u8> of x64 bytes. The codegen does NOT execute them
+// (that requires JIT memory natives not yet exposed to ember scripts); it
+// produces the bytes + the test verifies them.
+//
+// === x64 calling convention (Win64) ===
+//
+//   - Integer args: rcx, rdx, r8, r9 (first 4), then stack
+//   - Return value: rax
+//   - Callee-saved: rbx, rbp, rsi, rdi, r12-r15
+//   - Shadow space: 32 bytes minimum per call
+//   - Stack alignment: 16-byte before `call`
+//
+// === Frame layout ===
+//
+//   push rbp                  ; 0x55
+//   mov rbp, rsp              ; 48 89 E5
+//   sub rsp, frame_size       ; 48 81 EC <imm32>
+//   ... params spilled to [rbp-8], [rbp-16], ...
+//   ... locals at [rbp-(n*8)], growing downward ...
+//   mov rsp, rbp              ; 48 89 EC
+//   pop rbp                   ; 0x5D
+//   ret                       ; 0xC3
+//
+// Each local + param gets an 8-byte slot (everything is i64 in v1). The frame
+// size is pre-computed from a count of params + locals, rounded up to 16.
+//
+// === x64 emitter ===
+//
+// A port of X64Emitter (src/x64_emitter.hpp): a byte buffer (array<u8>) +
+// methods that emit bytes. Register encoding numbers (0-15) + REX/ModRM
+// helpers match the C++ reference. Labels are rel32 fixups backpatched by
+// cg_resolve_fixups() after all labels are bound — identical to the C++.
+//
+// === Symbol tables ===
+//
+// ember has no map<string, T> builtin, so every table is a flat i64 array
+// (the array extension, elem_size 8) with a fixed stride. Names are stored as
+// TOKEN INDICES (into the lexer's token array) — the same trick parse.ember
+// and sema.ember use — and compared on demand via tok_name. This is O(n) per
+// lookup but n is small.
+//
+//   cg_locals : stride 2  [ name_tok, rbp_offset ]   (the current fn's locals)
+//   cg_labels : stride 2  [ label_id, code_offset ]  (bound label positions)
+//   cg_fixups : stride 2  [ code_offset, label_id ]  (pending rel32 patches)
+//
+// Error handling: a global cg_err flag + message, like sema's s_err.
+// codegen(source) returns 0 on success or 1 on error.
+
+import "sema.ember";
+
+// -----------------------------------------------------------------------------
+// register encoding numbers (0-15), shared by GP registers. Matches x64_emitter.hpp's Reg enum.
+// -----------------------------------------------------------------------------
+global RAX : i64 = 0;
+global RCX : i64 = 1;
+global RDX : i64 = 2;
+global RBX : i64 = 3;
+global RSP : i64 = 4;
+global RBP : i64 = 5;
+global RSI : i64 = 6;
+global RDI : i64 = 7;
+global R8  : i64 = 8;
+global R9  : i64 = 9;
+global R10 : i64 = 10;
+global R11 : i64 = 11;
+global R12 : i64 = 12;
+global R13 : i64 = 13;
+global R14 : i64 = 14;
+global R15 : i64 = 15;
+
+// condition codes for jcc (low nibble of 0F 8x). Matches x64_emitter.hpp's Cond enum.
+global COND_E  : i64 = 0x4;   // equal (ZF=1)
+global COND_NE : i64 = 0x5;   // not equal (ZF=0)
+global COND_L  : i64 = 0xC;   // less (signed)
+global COND_GE : i64 = 0xD;   // greater or equal (signed)
+global COND_LE : i64 = 0xE;   // less or equal (signed)
+global COND_G  : i64 = 0xF;   // greater (signed)
+global COND_B  : i64 = 0x2;   // below (unsigned, CF=1)
+global COND_AE : i64 = 0x3;   // above or equal (unsigned, CF=0)
+global COND_BE : i64 = 0x6;   // below or equal (unsigned)
+global COND_A  : i64 = 0x7;   // above (unsigned)
+
+// -----------------------------------------------------------------------------
+// emitter state. Reset per codegen() call.
+// -----------------------------------------------------------------------------
+global cg_code     : i64 = 0;   // the output byte array (array<u8>, elem_size 1)
+global cg_next_label : i64 = 0; // next label id
+global cg_labels   : i64 = 0;   // bound labels: stride 2 [ label_id, code_offset ]
+global cg_fixups   : i64 = 0;   // pending rel32 fixups: stride 2 [ code_offset, label_id ]
+
+// frame layout for the current function
+global cg_locals     : i64 = 0;   // local var table: stride 2 [ name_tok, rbp_offset ]
+global cg_local_len  : i64 = 0;   // logical length of cg_locals (for scope pop)
+global cg_scope_marks: i64 = 0;   // scope push marks: stride 1 [ mark ]
+global cg_scope_mark_len : i64 = 0;
+global cg_next_off   : i64 = 0;   // next local offset (grows downward, negative)
+global cg_frame_size : i64 = 0;   // the current fn's frame size
+
+// error state
+global cg_err     : i64 = 0;
+global cg_errmsg  : string = "";
+
+// =============================================================================
+// x64 emitter — byte-level emission (port of X64Emitter in x64_emitter.hpp).
+// =============================================================================
+
+// emit a single byte
+fn cg_byte(b: i64) -> i64 {
+    array_push_u8(cg_code, b);
+    return 0;
+}
+
+// emit a little-endian imm32 (4 bytes)
+fn cg_imm32(v: i64) -> i64 {
+    // emit 4 bytes little-endian. use bitwise ops to extract each byte.
+    // (ember i64 is 64-bit; we emit the low 32 bits.)
+    cg_byte(v & 0xFF);
+    cg_byte((v >> 8) & 0xFF);
+    cg_byte((v >> 16) & 0xFF);
+    cg_byte((v >> 24) & 0xFF);
+    return 0;
+}
+
+// emit a little-endian imm64 (8 bytes)
+fn cg_imm64(v: i64) -> i64 {
+    cg_byte(v & 0xFF);
+    cg_byte((v >> 8) & 0xFF);
+    cg_byte((v >> 16) & 0xFF);
+    cg_byte((v >> 24) & 0xFF);
+    cg_byte((v >> 32) & 0xFF);
+    cg_byte((v >> 40) & 0xFF);
+    cg_byte((v >> 48) & 0xFF);
+    cg_byte((v >> 56) & 0xFF);
+    return 0;
+}
+
+// REX prefix: 0100 W R X B. W=1 for 64-bit operand size.
+fn cg_rex(w: i64, r: i64, x: i64, b: i64) -> i64 {
+    let mut v: i64 = 0x40;
+    if (w != 0) { v = v | 8; }
+    if (r != 0) { v = v | 4; }
+    if (x != 0) { v = v | 2; }
+    if (b != 0) { v = v | 1; }
+    return v;
+}
+
+// is a register extended (encoding >= 8)?
+fn cg_is_extended(r: i64) -> i64 {
+    if (r >= 8) { return 1; }
+    return 0;
+}
+
+// ModRM byte: mod(2) reg(3) rm(3).
+fn cg_modrm(mod_: i64, reg: i64, rm: i64) -> i64 {
+    return ((mod_ & 3) << 6) | ((reg & 7) << 3) | (rm & 7);
+}
+
+// --- instructions ---
+
+// push r64 -> 50+rd (or 41 50+rd for r8-r15)
+fn cg_push(r: i64) -> i64 {
+    if (cg_is_extended(r) != 0) { cg_byte(0x41); }
+    cg_byte(0x50 + (r & 7));
+    return 0;
+}
+
+// pop r64 -> 58+rd (or 41 58+rd for r8-r15)
+fn cg_pop(r: i64) -> i64 {
+    if (cg_is_extended(r) != 0) { cg_byte(0x41); }
+    cg_byte(0x58 + (r & 7));
+    return 0;
+}
+
+// mov r64, r64 -> REX.W 89 /r (mod=11, reg=src, rm=dst)
+fn cg_mov_reg_reg(dst: i64, src: i64) -> i64 {
+    cg_byte(cg_rex(1, cg_is_extended(src), 0, cg_is_extended(dst)));
+    cg_byte(0x89);
+    cg_byte(cg_modrm(3, src, dst));
+    return 0;
+}
+
+// mov r64, imm64 -> REX.W B8+rd io
+fn cg_mov_reg_imm64(dst: i64, imm: i64) -> i64 {
+    cg_byte(cg_rex(1, 0, 0, cg_is_extended(dst)));
+    cg_byte(0xB8 + (dst & 7));
+    cg_imm64(imm);
+    return 0;
+}
+
+// add r64, r64 -> REX.W 01 /r (mod=11, reg=src, rm=dst)
+fn cg_add_reg_reg(dst: i64, src: i64) -> i64 {
+    cg_byte(cg_rex(1, cg_is_extended(src), 0, cg_is_extended(dst)));
+    cg_byte(0x01);
+    cg_byte(cg_modrm(3, src, dst));
+    return 0;
+}
+
+// sub r64, r64 -> REX.W 29 /r (mod=11, reg=src, rm=dst)
+fn cg_sub_reg_reg(dst: i64, src: i64) -> i64 {
+    cg_byte(cg_rex(1, cg_is_extended(src), 0, cg_is_extended(dst)));
+    cg_byte(0x29);
+    cg_byte(cg_modrm(3, src, dst));
+    return 0;
+}
+
+// sub r64, imm32 -> REX.W 81 /5 id
+fn cg_sub_reg_imm32(r: i64, imm: i64) -> i64 {
+    cg_byte(cg_rex(1, 0, 0, cg_is_extended(r)));
+    cg_byte(0x81);
+    cg_byte(cg_modrm(3, 5, r));
+    cg_imm32(imm);
+    return 0;
+}
+
+// add r64, imm32 -> REX.W 81 /0 id
+fn cg_add_reg_imm32(r: i64, imm: i64) -> i64 {
+    cg_byte(cg_rex(1, 0, 0, cg_is_extended(r)));
+    cg_byte(0x81);
+    cg_byte(cg_modrm(3, 0, r));
+    cg_imm32(imm);
+    return 0;
+}
+
+// imul r64, r64 -> REX.W 0F AF /r (dst = dst * src)
+fn cg_imul_reg_reg(dst: i64, src: i64) -> i64 {
+    cg_byte(cg_rex(1, cg_is_extended(dst), 0, cg_is_extended(src)));
+    cg_byte(0x0F);
+    cg_byte(0xAF);
+    cg_byte(cg_modrm(3, dst, src));
+    return 0;
+}
+
+// xor r64, r64 -> REX.W 31 /r (mod=11, reg=src, rm=dst)
+fn cg_xor_reg_reg(dst: i64, src: i64) -> i64 {
+    cg_byte(cg_rex(1, cg_is_extended(src), 0, cg_is_extended(dst)));
+    cg_byte(0x31);
+    cg_byte(cg_modrm(3, src, dst));
+    return 0;
+}
+
+// and r64, r64 -> REX.W 21 /r
+fn cg_and_reg_reg(dst: i64, src: i64) -> i64 {
+    cg_byte(cg_rex(1, cg_is_extended(src), 0, cg_is_extended(dst)));
+    cg_byte(0x21);
+    cg_byte(cg_modrm(3, src, dst));
+    return 0;
+}
+
+// or r64, r64 -> REX.W 09 /r
+fn cg_or_reg_reg(dst: i64, src: i64) -> i64 {
+    cg_byte(cg_rex(1, cg_is_extended(src), 0, cg_is_extended(dst)));
+    cg_byte(0x09);
+    cg_byte(cg_modrm(3, src, dst));
+    return 0;
+}
+
+// not r64 -> REX.W F7 /2 (bitwise NOT, one's complement)
+fn cg_not_reg(r: i64) -> i64 {
+    cg_byte(cg_rex(1, 0, 0, cg_is_extended(r)));
+    cg_byte(0xF7);
+    cg_byte(cg_modrm(3, 2, r));
+    return 0;
+}
+
+// neg r64 -> REX.W F7 /3 (two's complement negate)
+fn cg_neg_reg(r: i64) -> i64 {
+    cg_byte(cg_rex(1, 0, 0, cg_is_extended(r)));
+    cg_byte(0xF7);
+    cg_byte(cg_modrm(3, 3, r));
+    return 0;
+}
+
+// shl r64, cl -> REX.W D3 /4 (shift left by cl)
+fn cg_shl_reg_cl(r: i64) -> i64 {
+    cg_byte(cg_rex(1, 0, 0, cg_is_extended(r)));
+    cg_byte(0xD3);
+    cg_byte(cg_modrm(3, 4, r));
+    return 0;
+}
+
+// shr r64, cl -> REX.W D3 /5 (logical shift right by cl)
+fn cg_shr_reg_cl(r: i64) -> i64 {
+    cg_byte(cg_rex(1, 0, 0, cg_is_extended(r)));
+    cg_byte(0xD3);
+    cg_byte(cg_modrm(3, 5, r));
+    return 0;
+}
+
+// sar r64, cl -> REX.W D3 /7 (arithmetic shift right by cl)
+fn cg_sar_reg_cl(r: i64) -> i64 {
+    cg_byte(cg_rex(1, 0, 0, cg_is_extended(r)));
+    cg_byte(0xD3);
+    cg_byte(cg_modrm(3, 7, r));
+    return 0;
+}
+
+// cmp r64, r64 -> REX.W 39 /r (mod=11, reg=rhs, rm=lhs)
+fn cg_cmp_reg_reg(lhs: i64, rhs: i64) -> i64 {
+    cg_byte(cg_rex(1, cg_is_extended(rhs), 0, cg_is_extended(lhs)));
+    cg_byte(0x39);
+    cg_byte(cg_modrm(3, rhs, lhs));
+    return 0;
+}
+
+// cmp r64, imm32 -> REX.W 81 /7 id
+fn cg_cmp_reg_imm32(r: i64, imm: i64) -> i64 {
+    cg_byte(cg_rex(1, 0, 0, cg_is_extended(r)));
+    cg_byte(0x81);
+    cg_byte(cg_modrm(3, 7, r));
+    cg_imm32(imm);
+    return 0;
+}
+
+// test r64, r64 -> REX.W 85 /r (sets flags from AND, without storing)
+fn cg_test_reg_reg(a: i64, b: i64) -> i64 {
+    cg_byte(cg_rex(1, cg_is_extended(b), 0, cg_is_extended(a)));
+    cg_byte(0x85);
+    cg_byte(cg_modrm(3, b, a));
+    return 0;
+}
+
+// setcc al -> 0F 9x C0 (set al from condition cc)
+fn cg_setcc_al(cc: i64) -> i64 {
+    cg_byte(0x0F);
+    cg_byte(0x90 | cc);
+    cg_byte(0xC0);
+    return 0;
+}
+
+// movzx rax, al -> 48 0F B6 C0 (zero-extend al into rax)
+fn cg_movzx_rax_al() -> i64 {
+    cg_byte(0x48);
+    cg_byte(0x0F);
+    cg_byte(0xB6);
+    cg_byte(0xC0);
+    return 0;
+}
+
+// mov r64, [r64 + disp32] (load from memory) -> REX.W 8B /r mod=10
+fn cg_load_reg_mem(dst: i64, base: i64, disp: i64) -> i64 {
+    cg_byte(cg_rex(1, cg_is_extended(dst), 0, cg_is_extended(base)));
+    cg_byte(0x8B);
+    // rsp/r12 (rm=4) need a SIB byte; rbp (rm=5) uses mod=10 (disp32) which
+    // is already what we emit, so no special case for rbp here.
+    if ((base & 7) == 4) {
+        cg_byte(cg_modrm(2, dst, 4));
+        cg_byte(0x24);  // SIB: scale=0, index=none(4), base=rsp(4)
+    } else {
+        cg_byte(cg_modrm(2, dst, base));
+    }
+    cg_imm32(disp);
+    return 0;
+}
+
+// mov [r64 + disp32], r64 (store to memory) -> REX.W 89 /r mod=10
+fn cg_store_reg_mem(base: i64, disp: i64, src: i64) -> i64 {
+    cg_byte(cg_rex(1, cg_is_extended(src), 0, cg_is_extended(base)));
+    cg_byte(0x89);
+    if ((base & 7) == 4) {
+        cg_byte(cg_modrm(2, src, 4));
+        cg_byte(0x24);
+    } else {
+        cg_byte(cg_modrm(2, src, base));
+    }
+    cg_imm32(disp);
+    return 0;
+}
+
+// call r64 (indirect) -> FF /2 with mod=11
+fn cg_call_reg(r: i64) -> i64 {
+    if (cg_is_extended(r) != 0) { cg_byte(cg_rex(0, 0, 0, 1)); }
+    cg_byte(0xFF);
+    cg_byte(cg_modrm(3, 2, r));
+    return 0;
+}
+
+// ret -> C3
+fn cg_ret() -> i64 {
+    cg_byte(0xC3);
+    return 0;
+}
+
+// nop -> 90
+fn cg_nop() -> i64 {
+    cg_byte(0x90);
+    return 0;
+}
+
+// =============================================================================
+// labels + fixups (port of X64Emitter's label/patch system).
+// =============================================================================
+
+// allocate a new label id
+fn cg_alloc_label() -> i64 {
+    let id: i64 = cg_next_label;
+    cg_next_label = cg_next_label + 1;
+    return id;
+}
+
+// bind a label to the current code offset
+fn cg_bind(label_id: i64) -> i64 {
+    let off: i64 = array_length(cg_code);  // current byte count = next offset
+    array_push_i64(cg_labels, label_id);
+    array_push_i64(cg_labels, off);
+    return 0;
+}
+
+// look up a bound label's code offset. returns -1 if not found.
+fn cg_label_offset(label_id: i64) -> i64 {
+    let n: i64 = array_length(cg_labels) / 2;
+    let mut i: i64 = 0;
+    while (i < n) {
+        let id: i64 = array_get_i64(cg_labels, i * 2);
+        if (id == label_id) { return array_get_i64(cg_labels, i * 2 + 1); }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// record a pending rel32 fixup at the current code offset for a label
+fn cg_add_fixup(label_id: i64) -> i64 {
+    let off: i64 = array_length(cg_code);
+    array_push_i64(cg_fixups, off);
+    array_push_i64(cg_fixups, label_id);
+    return 0;
+}
+
+// jmp label -> E9 rel32 (placeholder, backpatched)
+fn cg_jmp(label_id: i64) -> i64 {
+    cg_byte(0xE9);
+    cg_add_fixup(label_id);
+    cg_imm32(0);  // placeholder
+    return 0;
+}
+
+// jcc label -> 0F 8x rel32 (placeholder, backpatched)
+fn cg_jcc(cc: i64, label_id: i64) -> i64 {
+    cg_byte(0x0F);
+    cg_byte(0x80 | cc);
+    cg_add_fixup(label_id);
+    cg_imm32(0);  // placeholder
+    return 0;
+}
+
+// resolve all pending rel32 fixups. Must be called after all labels are bound.
+// Each fixup's rel32 = target_offset - (fixup_offset + 4).
+fn cg_resolve_fixups() -> i64 {
+    let n: i64 = array_length(cg_fixups) / 2;
+    let mut i: i64 = 0;
+    while (i < n) {
+        let fix_off: i64 = array_get_i64(cg_fixups, i * 2);
+        let label_id: i64 = array_get_i64(cg_fixups, i * 2 + 1);
+        let target: i64 = cg_label_offset(label_id);
+        if (target < 0) {
+            if (cg_err == 0) {
+                cg_err = 1;
+                cg_errmsg = string_from_slice("codegen: unbound label in fixup");
+            }
+            i = i + 1;
+            continue;
+        }
+        // rel32 = target - (fix_off + 4)  (the rel32 is relative to the end of the instruction)
+        let rel: i64 = target - (fix_off + 4);
+        // patch the 4 bytes at fix_off (little-endian)
+        array_set_u8(cg_code, fix_off + 0, rel & 0xFF);
+        array_set_u8(cg_code, fix_off + 1, (rel >> 8) & 0xFF);
+        array_set_u8(cg_code, fix_off + 2, (rel >> 16) & 0xFF);
+        array_set_u8(cg_code, fix_off + 3, (rel >> 24) & 0xFF);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// =============================================================================
+// local variable frame layout.
+// =============================================================================
+
+// reset the local table for a new function
+fn cg_locals_init() -> i64 {
+    cg_locals = array_new(8, 0);
+    cg_local_len = 0;
+    cg_scope_marks = array_new(8, 0);
+    cg_scope_mark_len = 0;
+    cg_next_off = 0;
+    return 0;
+}
+
+// push a scope (record the current logical length so pop can truncate)
+fn cg_push_scope() -> i64 {
+    if (array_length(cg_scope_marks) < cg_scope_mark_len + 1) {
+        array_resize(cg_scope_marks, cg_scope_mark_len + 1);
+    }
+    array_set_i64(cg_scope_marks, cg_scope_mark_len, cg_local_len);
+    cg_scope_mark_len = cg_scope_mark_len + 1;
+    return 0;
+}
+
+// pop a scope (truncate the local table back to the mark)
+fn cg_pop_scope() -> i64 {
+    if (cg_scope_mark_len == 0) { return 0; }
+    cg_scope_mark_len = cg_scope_mark_len - 1;
+    let mark: i64 = array_get_i64(cg_scope_marks, cg_scope_mark_len);
+    cg_local_len = mark;
+    return 0;
+}
+
+// allocate a local slot: assign it the next negative offset + record it.
+// returns the offset.
+fn cg_alloc_local(name_tok: i64) -> i64 {
+    cg_next_off = cg_next_off + 8;
+    let off: i64 = -cg_next_off;
+    // grow cg_locals if needed
+    if (array_length(cg_locals) < cg_local_len + 2) {
+        array_resize(cg_locals, cg_local_len + 2);
+    }
+    array_set_i64(cg_locals, cg_local_len, name_tok);
+    array_set_i64(cg_locals, cg_local_len + 1, off);
+    cg_local_len = cg_local_len + 2;
+    return off;
+}
+
+// look up a local by name. returns the rbp offset, or 0 if not found.
+fn cg_lookup_local(name_tok: i64) -> i64 {
+    let n: i64 = cg_local_len / 2;
+    let mut i: i64 = n - 1;  // scan from end (innermost scope wins)
+    while (i >= 0) {
+        let tok: i64 = array_get_i64(cg_locals, i * 2);
+        if (tok == name_tok) { return array_get_i64(cg_locals, i * 2 + 1); }
+        i = i - 1;
+    }
+    return 0;  // 0 = not found (all real offsets are negative)
+}
+
+// =============================================================================
+// codegen state init.
+// =============================================================================
+
+fn cg_init() -> i64 {
+    cg_code = array_new(1, 0);
+    cg_next_label = 0;
+    cg_labels = array_new(8, 0);
+    cg_fixups = array_new(8, 0);
+    cg_err = 0;
+    cg_errmsg = string_from_slice("");
+    return 0;
+}
+
+// =============================================================================
+// frame size pre-computation. Walks the fn body counting locals (let stmts)
+// + params to size the stack frame. All slots are 8 bytes (v1: everything is i64).
+// =============================================================================
+
+fn cg_count_locals_block(b: i64, total: i64) -> i64 {
+    if (b < 0) { return total; }
+    let mut s: i64 = nk_a(b);
+    while (s >= 0) {
+        total = cg_count_locals_stmt(s, total);
+        s = nk_next(s);
+    }
+    return total;
+}
+
+fn cg_count_locals_stmt(s: i64, total: i64) -> i64 {
+    let k: i64 = nk_kind(s);
+    if (k == (NK::LetStmt as i64)) {
+        total = total + 1;
+        return total;
+    }
+    if (k == (NK::IfStmt as i64)) {
+        total = cg_count_locals_block(nk_b(s), total);   // then
+        if (nk_c(s) >= 0) {
+            total = cg_count_locals_block(nk_c(s), total);  // else
+        }
+        return total;
+    }
+    if (k == (NK::WhileStmt as i64)) {
+        total = cg_count_locals_block(nk_b(s), total);   // body
+        return total;
+    }
+    if (k == (NK::BlockStmt as i64)) {
+        total = cg_count_locals_block(s, total);
+        return total;
+    }
+    if (k == (NK::ForStmt as i64)) {
+        total = total + 1;  // the for-init let
+        total = cg_count_locals_block(nk_e(s), total);   // body
+        return total;
+    }
+    return total;
+}
+
+// round up to a multiple of 16
+fn cg_round16(n: i64) -> i64 {
+    return (n + 15) & ~15;
+}
+
+// =============================================================================
+// function prologue + epilogue.
+// =============================================================================
+
+// emit the prologue: push rbp; mov rbp, rsp; sub rsp, frame_size
+fn cg_emit_prologue(frame_size: i64) -> i64 {
+    cg_push(RBP);                    // 0x55
+    cg_mov_reg_reg(RBP, RSP);        // 48 89 E5
+    cg_sub_reg_imm32(RSP, frame_size);  // 48 81 EC <imm32>
+    return 0;
+}
+
+// emit the epilogue: mov rsp, rbp; pop rbp; ret
+fn cg_emit_epilogue() -> i64 {
+    cg_mov_reg_reg(RSP, RBP);        // 48 89 EC
+    cg_pop(RBP);                     // 0x5D
+    cg_ret();                        // 0xC3
+    return 0;
+}
+
+// =============================================================================
+// expression evaluation. Result is in rax (int) for all v1 expressions.
+// (v1: everything is i64 or bool, both held in rax as a 64-bit value.)
+// =============================================================================
+
+fn cg_eval(e: i64) -> i64 {
+    if (e < 0) {
+        if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: missing expression"); }
+        return 0;
+    }
+    let k: i64 = nk_kind(e);
+
+    if (k == (NK::IntLit as i64)) {
+        // mov rax, imm64
+        cg_mov_reg_imm64(RAX, nk_d(e));
+        return 0;
+    }
+    if (k == (NK::BoolLit as i64)) {
+        // mov rax, 0 or 1
+        cg_mov_reg_imm64(RAX, nk_d(e));
+        return 0;
+    }
+    if (k == (NK::Ident as i64)) {
+        // look up the local; load from [rbp + offset]
+        let off: i64 = cg_lookup_local(nk_tok(e));
+        if (off == 0) {
+            if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: unknown local '") + nk_name(e) + string_from_slice("'"); }
+            return 0;
+        }
+        cg_load_reg_mem(RAX, RBP, off);
+        return 0;
+    }
+    if (k == (NK::BinExpr as i64)) {
+        return cg_eval_binexpr(e);
+    }
+    if (k == (NK::UnaryExpr as i64)) {
+        return cg_eval_unaryexpr(e);
+    }
+    if (k == (NK::CallExpr as i64)) {
+        return cg_eval_callexpr(e);
+    }
+    if (k == (NK::AssignExpr as i64)) {
+        return cg_eval_assignexpr(e);
+    }
+
+    // unsupported in v1
+    if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: expression kind unsupported in v1"); }
+    return 0;
+}
+
+// evaluate a binary expression. lhs -> rax, push; rhs -> rax, mov rcx rax;
+// pop rax (lhs); apply op (result in rax).
+fn cg_eval_binexpr(e: i64) -> i64 {
+    let op: i64 = nk_d(e);
+    let lhs: i64 = nk_a(e);
+    let rhs: i64 = nk_b(e);
+
+    // short-circuit logical && / ||
+    if (op == (BinOp::LAnd as i64)) {
+        return cg_eval_logical_and(e);
+    }
+    if (op == (BinOp::LOr as i64)) {
+        return cg_eval_logical_or(e);
+    }
+
+    // eval lhs -> rax; push rax (save lhs across rhs eval)
+    cg_eval(lhs);
+    if (cg_err != 0) { return 0; }
+    cg_push(RAX);
+    // eval rhs -> rax
+    cg_eval(rhs);
+    if (cg_err != 0) { return 0; }
+    // rcx = rhs (rax)
+    cg_mov_reg_reg(RCX, RAX);
+    // rax = lhs (pop)
+    cg_pop(RAX);
+
+    // apply the op (result in rax)
+    let mut is_cmp: i64 = 0;
+    if (op == (BinOp::Eq as i64)) { is_cmp = 1; }
+    if (op == (BinOp::Neq as i64)) { is_cmp = 1; }
+    if (op == (BinOp::Lt as i64)) { is_cmp = 1; }
+    if (op == (BinOp::Le as i64)) { is_cmp = 1; }
+    if (op == (BinOp::Gt as i64)) { is_cmp = 1; }
+    if (op == (BinOp::Ge as i64)) { is_cmp = 1; }
+
+    if (is_cmp != 0) {
+        // cmp rax, rcx; setcc al; movzx rax, al
+        cg_cmp_reg_reg(RAX, RCX);
+        let mut cc: i64 = 0;
+        if (op == (BinOp::Eq as i64))  { cc = COND_E; }
+        if (op == (BinOp::Neq as i64)) { cc = COND_NE; }
+        if (op == (BinOp::Lt as i64))  { cc = COND_L; }
+        if (op == (BinOp::Le as i64))  { cc = COND_LE; }
+        if (op == (BinOp::Gt as i64))  { cc = COND_G; }
+        if (op == (BinOp::Ge as i64))  { cc = COND_GE; }
+        cg_setcc_al(cc);
+        cg_movzx_rax_al();
+        return 0;
+    }
+
+    if (op == (BinOp::Add as i64)) { cg_add_reg_reg(RAX, RCX); return 0; }
+    if (op == (BinOp::Sub as i64)) { cg_sub_reg_reg(RAX, RCX); return 0; }
+    if (op == (BinOp::Mul as i64)) { cg_imul_reg_reg(RAX, RCX); return 0; }
+    if (op == (BinOp::And as i64)) { cg_and_reg_reg(RAX, RCX); return 0; }
+    if (op == (BinOp::Or as i64))  { cg_or_reg_reg(RAX, RCX); return 0; }
+    if (op == (BinOp::Xor as i64)) { cg_xor_reg_reg(RAX, RCX); return 0; }
+    if (op == (BinOp::Shl as i64)) {
+        // rcx already holds the shift count; shl rax, cl
+        cg_shl_reg_cl(RAX);
+        return 0;
+    }
+    if (op == (BinOp::Shr as i64)) {
+        // v1: i64 is signed -> arithmetic shift right (sar)
+        cg_sar_reg_cl(RAX);
+        return 0;
+    }
+    // Div/Mod are more complex (need cqo + idiv); emit a simple sequence.
+    // idiv rcx: rax = rax / rcx, rdx = rax % rcx
+    // cqo (sign-extend rax into rdx:rax) -> 48 99
+    // idiv rcx -> 48 F7 F9
+    if (op == (BinOp::Div as i64)) {
+        // cqo; idiv rcx (rax = rax / rcx)
+        cg_byte(0x48); cg_byte(0x99);
+        cg_byte(0x48); cg_byte(0xF7); cg_byte(0xF9);
+        return 0;
+    }
+    if (op == (BinOp::Mod as i64)) {
+        // cqo; idiv rcx; mov rax, rdx (rax = rax % rcx)
+        cg_byte(0x48); cg_byte(0x99);
+        cg_byte(0x48); cg_byte(0xF7); cg_byte(0xF9);
+        cg_mov_reg_reg(RAX, RDX);
+        return 0;
+    }
+
+    if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: unsupported binary op"); }
+    return 0;
+}
+
+// logical && : short-circuit. lhs false -> result 0; else eval rhs.
+fn cg_eval_logical_and(e: i64) -> i64 {
+    let lhs: i64 = nk_a(e);
+    let rhs: i64 = nk_b(e);
+    let false_l: i64 = cg_alloc_label();
+    let end_l: i64 = cg_alloc_label();
+
+    cg_eval(lhs);
+    if (cg_err != 0) { return 0; }
+    cg_cmp_reg_imm32(RAX, 0);
+    cg_jcc(COND_E, false_l);       // lhs == 0 -> false
+    cg_eval(rhs);
+    if (cg_err != 0) { return 0; }
+    cg_cmp_reg_imm32(RAX, 0);
+    cg_jcc(COND_NE, end_l);        // rhs != 0 -> true (keep rhs value)
+    cg_bind(false_l);
+    cg_mov_reg_imm64(RAX, 0);      // result = 0
+    cg_bind(end_l);
+    // normalize: rax = (rax != 0) ? 1 : 0
+    cg_cmp_reg_imm32(RAX, 0);
+    let done: i64 = cg_alloc_label();
+    cg_mov_reg_imm64(RAX, 0);
+    cg_jcc(COND_E, done);
+    cg_mov_reg_imm64(RAX, 1);
+    cg_bind(done);
+    return 0;
+}
+
+// logical || : short-circuit. lhs true -> result 1; else eval rhs.
+fn cg_eval_logical_or(e: i64) -> i64 {
+    let lhs: i64 = nk_a(e);
+    let rhs: i64 = nk_b(e);
+    let end_l: i64 = cg_alloc_label();
+
+    cg_eval(lhs);
+    if (cg_err != 0) { return 0; }
+    cg_cmp_reg_imm32(RAX, 0);
+    cg_jcc(COND_NE, end_l);        // lhs != 0 -> true (keep lhs value)
+    cg_eval(rhs);
+    if (cg_err != 0) { return 0; }
+    cg_cmp_reg_imm32(RAX, 0);
+    cg_jcc(COND_NE, end_l);        // rhs != 0 -> true
+    cg_mov_reg_imm64(RAX, 0);      // result = 0
+    cg_bind(end_l);
+    // normalize: rax = (rax != 0) ? 1 : 0
+    cg_cmp_reg_imm32(RAX, 0);
+    let done: i64 = cg_alloc_label();
+    cg_mov_reg_imm64(RAX, 0);
+    cg_jcc(COND_E, done);
+    cg_mov_reg_imm64(RAX, 1);
+    cg_bind(done);
+    return 0;
+}
+
+// evaluate a unary expression. operand -> rax; apply the op.
+fn cg_eval_unaryexpr(e: i64) -> i64 {
+    let op: i64 = nk_d(e);
+    let operand: i64 = nk_a(e);
+    cg_eval(operand);
+    if (cg_err != 0) { return 0; }
+
+    if (op == (UnOp::Neg as i64)) {
+        // neg rax
+        cg_neg_reg(RAX);
+        return 0;
+    }
+    if (op == (UnOp::BitNot as i64)) {
+        // not rax
+        cg_not_reg(RAX);
+        return 0;
+    }
+    if (op == (UnOp::Not as i64)) {
+        // logical not: rax = (rax == 0) ? 1 : 0
+        cg_cmp_reg_imm32(RAX, 0);
+        cg_setcc_al(COND_E);       // sete al (1 if rax was 0)
+        cg_movzx_rax_al();
+        return 0;
+    }
+    if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: unsupported unary op"); }
+    return 0;
+}
+
+// evaluate an assignment expression: target = value.
+// v1: target is an Ident (local variable). Eval value -> rax; store to [rbp+off].
+// The result of the assignment expression is the assigned value (in rax).
+fn cg_eval_assignexpr(e: i64) -> i64 {
+    let target: i64 = nk_a(e);
+    let value: i64 = nk_b(e);
+
+    // v1: only Ident targets
+    if (nk_kind(target) != (NK::Ident as i64)) {
+        if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: assignment target must be an identifier in v1"); }
+        return 0;
+    }
+
+    // eval value -> rax
+    cg_eval(value);
+    if (cg_err != 0) { return 0; }
+
+    // store rax to [rbp + off]
+    let off: i64 = cg_lookup_local(nk_tok(target));
+    if (off == 0) {
+        if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: assignment to unknown local '") + nk_name(target) + string_from_slice("'"); }
+        return 0;
+    }
+    cg_store_reg_mem(RBP, off, RAX);
+    return 0;
+}
+
+// evaluate a call expression.
+// v1: up to 4 i64 args in rcx/rdx/r8/r9 (Win64). The call target is a script
+// function; we emit mov rax, <placeholder 0>; call rax — the 8-byte placeholder
+// is the function's entry address (to be filled by the host at JIT time, like
+// the C++ codegen's dispatch-table call). The bytes are valid x64 encoding.
+fn cg_eval_callexpr(e: i64) -> i64 {
+    let name: string = nk_name(e);
+    let fn_row: i64 = find_fn(name);
+    if (fn_row < 0) {
+        if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: call to unknown function '") + name + string_from_slice("'"); }
+        return 0;
+    }
+
+    // count args + collect them (walk the sibling chain via nk_next)
+    let mut args: i64 = array_new(8, 4);  // up to 4 arg node indices
+    let mut argc: i64 = 0;
+    let mut a: i64 = nk_a(e);
+    while (a >= 0) {
+        if (argc < 4) {
+            array_set_i64(args, argc, a);
+        }
+        argc = argc + 1;
+        a = nk_next(a);
+    }
+    if (argc > 4) {
+        if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: v1 supports at most 4 call args"); }
+        return 0;
+    }
+
+    // Win64 calling convention: first 4 int args in rcx, rdx, r8, r9.
+    // We need to eval each arg + place it in the right register. The challenge
+    // is that evaluating arg[i] may clobber a previously-placed register. So:
+    // eval all args into stack temps first, then load them into registers in
+    // order. This is simpler + always correct (the C++ codegen does the same
+    // stash-then-load pattern).
+    //
+    // Stack layout for the call (after sub rsp, call_frame):
+    //   [rsp + 0]      = arg 0 (temp)
+    //   [rsp + 8]      = arg 1 (temp)
+    //   [rsp + 16]     = arg 2 (temp)
+    //   [rsp + 24]     = arg 3 (temp)
+    //   [rsp + 32..63] = shadow space (32 bytes)
+    //
+    // call_frame = round16(argc*8 + 32), minimum 32.
+    let mut call_frame: i64 = argc * 8 + 32;
+    if (call_frame < 32) { call_frame = 32; }
+    call_frame = cg_round16(call_frame);
+
+    // sub rsp, call_frame
+    cg_sub_reg_imm32(RSP, call_frame);
+
+    // eval each arg -> rax; store to [rsp + i*8]
+    let mut i: i64 = 0;
+    while (i < argc) {
+        let arg_node: i64 = array_get_i64(args, i);
+        cg_eval(arg_node);
+        if (cg_err != 0) { return 0; }
+        cg_store_reg_mem(RSP, i * 8, RAX);
+        i = i + 1;
+    }
+
+    // load args into Win64 registers: rcx, rdx, r8, r9
+    if (argc >= 1) { cg_load_reg_mem(RCX, RSP, 0); }
+    if (argc >= 2) { cg_load_reg_mem(RDX, RSP, 8); }
+    if (argc >= 3) { cg_load_reg_mem(R8, RSP, 16); }
+    if (argc >= 4) { cg_load_reg_mem(R9, RSP, 24); }
+
+    // call the target: mov rax, 0 (placeholder for the fn entry address); call rax
+    // The host fills the 8-byte placeholder at JIT time (like the C++ dispatch-table call).
+    cg_mov_reg_imm64(RAX, 0);
+    cg_call_reg(RAX);
+
+    // add rsp, call_frame (restore the stack)
+    cg_add_reg_imm32(RSP, call_frame);
+
+    // result is in rax
+    return 0;
+}
+
+// =============================================================================
+// statement compilation.
+// =============================================================================
+
+fn cg_compile_stmt(s: i64) -> i64 {
+    if (s < 0) { return 0; }
+    let k: i64 = nk_kind(s);
+
+    if (k == (NK::LetStmt as i64)) {
+        // allocate a local slot + eval the initializer -> rax; store to [rbp+off]
+        let name_tok: i64 = nk_tok(s);
+        let init: i64 = nk_b(s);   // initializer expr, or -1
+        let off: i64 = cg_alloc_local(name_tok);
+        if (init >= 0) {
+            cg_eval(init);
+            if (cg_err != 0) { return 0; }
+            cg_store_reg_mem(RBP, off, RAX);
+        }
+        return 0;
+    }
+    if (k == (NK::ExprStmt as i64)) {
+        if (nk_a(s) >= 0) { cg_eval(nk_a(s)); }
+        return 0;
+    }
+    if (k == (NK::ReturnStmt as i64)) {
+        // eval the value -> rax; jmp epilogue
+        let val: i64 = nk_a(s);
+        if (val >= 0) {
+            cg_eval(val);
+            if (cg_err != 0) { return 0; }
+        } else {
+            cg_mov_reg_imm64(RAX, 0);  // void return -> rax = 0
+        }
+        // jmp to the function's epilogue label
+        cg_jmp(cg_epilogue_label);
+        return 0;
+    }
+    if (k == (NK::IfStmt as i64)) {
+        return cg_compile_if(s);
+    }
+    if (k == (NK::WhileStmt as i64)) {
+        return cg_compile_while(s);
+    }
+    if (k == (NK::BlockStmt as i64)) {
+        return cg_compile_block(s);
+    }
+    if (k == (NK::BreakStmt as i64)) {
+        // jmp to the current loop's break label
+        if (cg_loop_depth > 0) {
+            cg_jmp(cg_loop_break);
+        }
+        return 0;
+    }
+    if (k == (NK::ContinueStmt as i64)) {
+        // jmp to the current loop's continue label
+        if (cg_loop_depth > 0) {
+            cg_jmp(cg_loop_continue);
+        }
+        return 0;
+    }
+    if (k == (NK::ForStmt as i64)) {
+        return cg_compile_for(s);
+    }
+
+    // unsupported statement kind in v1
+    if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: statement kind unsupported in v1"); }
+    return 0;
+}
+
+// the current function's epilogue label (set in cg_compile_func)
+global cg_epilogue_label : i64 = 0;
+
+// loop context for break/continue (v1: single-level, no nesting stack)
+global cg_loop_depth   : i64 = 0;
+global cg_loop_break   : i64 = 0;
+global cg_loop_continue: i64 = 0;
+
+// compile a block: push scope, compile each stmt, pop scope.
+fn cg_compile_block(b: i64) -> i64 {
+    if (b < 0) { return 0; }
+    cg_push_scope();
+    let mut s: i64 = nk_a(b);
+    while (s >= 0) {
+        cg_compile_stmt(s);
+        if (cg_err != 0) { cg_pop_scope(); return 0; }
+        s = nk_next(s);
+    }
+    cg_pop_scope();
+    return 0;
+}
+
+// compile an if statement:
+//   eval cond -> rax; cmp rax, 0; je else_l; <then>; jmp end_l; else_l: <else>; end_l:
+fn cg_compile_if(s: i64) -> i64 {
+    let cond: i64 = nk_a(s);
+    let then_b: i64 = nk_b(s);
+    let else_b: i64 = nk_c(s);   // -1 if no else
+
+    cg_eval(cond);
+    if (cg_err != 0) { return 0; }
+    cg_cmp_reg_imm32(RAX, 0);
+
+    let else_l: i64 = cg_alloc_label();
+    let end_l: i64 = cg_alloc_label();
+    cg_jcc(COND_E, else_l);       // cond == 0 -> else
+
+    cg_compile_block(then_b);
+    if (cg_err != 0) { return 0; }
+
+    if (else_b >= 0) {
+        cg_jmp(end_l);
+        cg_bind(else_l);
+        cg_compile_block(else_b);
+        if (cg_err != 0) { return 0; }
+        cg_bind(end_l);
+    } else {
+        cg_bind(else_l);
+    }
+    return 0;
+}
+
+// compile a while statement:
+//   top: eval cond -> rax; cmp rax, 0; je end; <body>; jmp top; end:
+fn cg_compile_while(s: i64) -> i64 {
+    let cond: i64 = nk_a(s);
+    let body: i64 = nk_b(s);
+
+    let top: i64 = cg_alloc_label();
+    let end: i64 = cg_alloc_label();
+
+    cg_bind(top);
+    cg_eval(cond);
+    if (cg_err != 0) { return 0; }
+    cg_cmp_reg_imm32(RAX, 0);
+    cg_jcc(COND_E, end);          // cond == 0 -> exit loop
+
+    // set up break/continue targets
+    let saved_depth: i64 = cg_loop_depth;
+    let saved_break: i64 = cg_loop_break;
+    let saved_cont: i64 = cg_loop_continue;
+    cg_loop_depth = 1;
+    cg_loop_break = end;
+    cg_loop_continue = top;
+
+    cg_compile_block(body);
+
+    // restore loop context
+    cg_loop_depth = saved_depth;
+    cg_loop_break = saved_break;
+    cg_loop_continue = saved_cont;
+    if (cg_err != 0) { return 0; }
+
+    cg_jmp(top);                   // back-edge
+    cg_bind(end);
+    return 0;
+}
+
+// compile a for statement (C-style):
+//   <init>; top: <cond>; je end; <body>; cont: <step>; jmp top; end:
+fn cg_compile_for(s: i64) -> i64 {
+    let init: i64 = nk_a(s);    // LetStmt or -1
+    let cond: i64 = nk_b(s);    // expr or -1
+    let step: i64 = nk_c(s);    // expr or -1
+    let body: i64 = nk_e(s);    // BlockStmt
+
+    cg_push_scope();
+    // init
+    if (init >= 0) {
+        cg_compile_stmt(init);
+        if (cg_err != 0) { cg_pop_scope(); return 0; }
+    }
+
+    let top: i64 = cg_alloc_label();
+    let cont: i64 = cg_alloc_label();
+    let end: i64 = cg_alloc_label();
+
+    cg_bind(top);
+    // cond
+    if (cond >= 0) {
+        cg_eval(cond);
+        if (cg_err != 0) { cg_pop_scope(); return 0; }
+        cg_cmp_reg_imm32(RAX, 0);
+        cg_jcc(COND_E, end);     // cond == 0 -> exit
+    }
+
+    // set up break/continue targets
+    let saved_depth: i64 = cg_loop_depth;
+    let saved_break: i64 = cg_loop_break;
+    let saved_cont: i64 = cg_loop_continue;
+    cg_loop_depth = 1;
+    cg_loop_break = end;
+    cg_loop_continue = cont;
+
+    cg_compile_block(body);
+
+    cg_loop_depth = saved_depth;
+    cg_loop_break = saved_break;
+    cg_loop_continue = saved_cont;
+    if (cg_err != 0) { cg_pop_scope(); return 0; }
+
+    cg_bind(cont);
+    // step
+    if (step >= 0) {
+        cg_eval(step);
+        if (cg_err != 0) { cg_pop_scope(); return 0; }
+    }
+    cg_jmp(top);                   // back-edge
+    cg_bind(end);
+    cg_pop_scope();
+    return 0;
+}
+
+// =============================================================================
+// function compilation.
+// =============================================================================
+
+// compile a single function: prologue, param spill, body, epilogue, fixups.
+fn cg_compile_func(fd: i64) -> i64 {
+    // init the local table for this function
+    cg_locals_init();
+
+    // count params
+    let mut param_count: i64 = 0;
+    let mut p: i64 = nk_a(fd);
+    while (p >= 0) {
+        param_count = param_count + 1;
+        p = nk_next(p);
+    }
+
+    // count locals (let stmts) in the body
+    let body: i64 = nk_c(fd);
+    let local_count: i64 = cg_count_locals_block(body, 0);
+
+    // frame size = (params + locals) * 8, rounded up to 16
+    // +8 for the return address alignment (push rbp makes it 16-aligned)
+    let frame: i64 = cg_round16((param_count + local_count) * 8 + 8);
+    cg_frame_size = frame;
+
+    // epilogue label for this function
+    cg_epilogue_label = cg_alloc_label();
+
+    // prologue
+    cg_emit_prologue(frame);
+
+    // spill params to frame slots (Win64: rcx, rdx, r8, r9 for first 4 int args)
+    // Each param gets an 8-byte slot at [rbp - offset], allocated in order.
+    // We use a temp array to hold the param node indices so we can alloc locals
+    // in order (alloc_local assigns offsets sequentially).
+    let mut arg_regs: i64 = array_new(8, 4);
+    array_set_i64(arg_regs, 0, RCX);
+    array_set_i64(arg_regs, 1, RDX);
+    array_set_i64(arg_regs, 2, R8);
+    array_set_i64(arg_regs, 3, R9);
+
+    let mut pi: i64 = 0;
+    p = nk_a(fd);
+    while (p >= 0) {
+        let off: i64 = cg_alloc_local(nk_tok(p));
+        if (pi < 4) {
+            // mov [rbp + off], arg_reg
+            let reg: i64 = array_get_i64(arg_regs, pi);
+            cg_store_reg_mem(RBP, off, reg);
+        }
+        pi = pi + 1;
+        p = nk_next(p);
+    }
+
+    // body
+    cg_compile_block(body);
+    if (cg_err != 0) { return 0; }
+
+    // bind the epilogue label + emit the epilogue
+    // (every return jumps here; also the implicit fallthrough return)
+    cg_bind(cg_epilogue_label);
+    // implicit void return: rax = 0 (in case the fn falls off the end)
+    cg_mov_reg_imm64(RAX, 0);
+    cg_emit_epilogue();
+
+    // resolve all label fixups
+    cg_resolve_fixups();
+    return 0;
+}
+
+// =============================================================================
+// top-level codegen: find the program node, compile each function.
+// =============================================================================
+
+// find the program node in g_nodes by scanning for NK::Program.
+// (sema() calls parse() internally + doesn't expose the program node index;
+//  the Program node is the one with kind == NK::Program, which is unique.)
+fn cg_find_program() -> i64 {
+    let n: i64 = array_length(g_nodes) / PARSE_STRIDE;
+    let mut i: i64 = 0;
+    while (i < n) {
+        if (nk_kind(i) == (NK::Program as i64)) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// codegen(source): lex + parse + sema + emit x64 bytes for every fn.
+// Returns the array<u8> handle (the code buffer) on success, or 0 on error.
+// cg_failed() / cg_err_msg() expose the error state.
+fn codegen(source: string) -> i64 {
+    // run sema (which parses + type-checks + builds g_fns / g_globals)
+    let r: i64 = sema(source);
+    if (r != 0) {
+        cg_err = 1;
+        if (r == 2) {
+            cg_errmsg = string_from_slice("codegen: parse error: ") + parse_err_msg();
+        } else {
+            cg_errmsg = string_from_slice("codegen: sema error: ") + sema_err_msg();
+        }
+        return 0;
+    }
+
+    // init the emitter
+    cg_init();
+
+    // find the program node
+    let prog: i64 = cg_find_program();
+    if (prog < 0) {
+        cg_err = 1;
+        cg_errmsg = string_from_slice("codegen: no program node found");
+        return 0;
+    }
+
+    // compile each function declaration in the program
+    let mut d: i64 = nk_a(prog);
+    while (d >= 0) {
+        if (nk_kind(d) == (NK::FnDecl as i64)) {
+            cg_compile_func(d);
+            if (cg_err != 0) { return 0; }
+        }
+        d = nk_next(d);
+    }
+
+    return cg_code;  // the array<u8> handle
+}
+
+// whether the codegen flagged an error.
+fn codegen_failed() -> i64 { return cg_err; }
+fn codegen_err_msg() -> string { return cg_errmsg; }
+
+// =============================================================================
+// convenience: get the length of the code buffer (byte count).
+// =============================================================================
+fn codegen_byte_count() -> i64 {
+    return array_length(cg_code);
+}
+
+// read a byte from the code buffer at offset i (for verification).
+fn codegen_byte_at(i: i64) -> i64 {
+    if (i < 0 || i >= array_length(cg_code)) { return -1; }
+    return array_get_u8(cg_code, i) as i64;
+}
