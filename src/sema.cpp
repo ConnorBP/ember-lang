@@ -7,6 +7,7 @@
 #include <set>
 #include <string>
 #include <algorithm>
+#include <cstdio>
 
 namespace ember {
 
@@ -315,7 +316,12 @@ struct Checker {
     // is array_new(esz, ...) or an alias of one). Null otherwise. Used by the
     // ForEachStmt check (the iterable() hook) to type the loop variable and
     // by codegen to select the array_get_* variant. See ForEachStmt in ast.hpp.
-    struct Var { std::string name; const Type* ty; bool is_const; bool local_array_view; const Type* array_elem_ty = nullptr; };
+    struct Var { std::string name; const Type* ty; bool is_const; bool local_array_view; const Type* array_elem_ty = nullptr;
+        // #20 lambda capture: this Var is a by-value capture living in the
+        // lambda's env struct (not a frame slot). env_offset is the byte offset
+        // within env. Sema declares captures this way in the synthetic fn's
+        // scope; codegen loads them from [env_ptr + env_offset].
+        bool is_env_capture = false; int32_t env_offset = 0; };
     std::vector<std::vector<Var>> scopes;
 
     struct GlobalVar { const Type* ty; bool is_const; };
@@ -396,6 +402,7 @@ struct Checker {
     std::unordered_map<std::string, ScriptSig> script_sigs;
     std::unordered_set<std::string> namespace_names;  // Tier 1: namespace names (for Foo::bar resolution)
     std::string current_ns;  // Tier 1: the namespace of the fn currently being checked ("" = top-level)
+    FuncDecl* current_func = nullptr;  // #21: the fn currently being checked (for yield->coroutine marking)
 
     // owning type store (lives on the Program so it outlives sema + codegen;
     // raw `ty` pointers stashed on AST nodes stay valid until codegen finishes).
@@ -1404,6 +1411,33 @@ struct Checker {
     void lower_constexpr_calls_block(Block& b);
     void lower_constexpr_calls_stmt(Stmt& s);
     void try_fold_constexpr_call(ExprPtr& slot);
+
+    // --- #20 lambdas with by-value capture ---
+    // Walk a lambda body to find Idents that resolve to a local in an
+    // ENCLOSING scope (scope index < lambda_scope_start). Those are the
+    // by-value captures. Globals, fn names, and the lambda's own params/
+    // locals are NOT captures. Dedups by name; preserves first-encounter
+    // order (which becomes the env field order).
+    void collect_captures_expr(const Expr& e, size_t lambda_scope_start,
+                               std::vector<std::string>& out);
+    void collect_captures_block(const Block& b, size_t lambda_scope_start,
+                               std::vector<std::string>& out);
+    void collect_captures_stmt(const Stmt& s, size_t lambda_scope_start,
+                               std::vector<std::string>& out);
+    // Type-check a LambdaExpr: determine captures, build the env, prepend the
+    // hidden __env param to the synthetic fn, check the body, set the type.
+    const Type* check_lambda(LambdaExpr& le);
+    // Check a synthetic lambda fn's body (called from check_func when the fn
+    // is a lambda). Binds __env + the captures (as env-capture vars) + the
+    // declared params, then checks the body.
+    void check_lambda_func(FuncDecl& f);
+    // #20 pre-pass: upgrade `fn(Args)->Ret` param types to is_lambda where a
+    // call site passes a lambda to that param. Walks all fn bodies for
+    // CallExpr args that are LambdaExprs.
+    void upgrade_lambda_param_types();
+    void upgrade_lambda_params_block(Block& b, std::unordered_set<std::string>& lam_locals);
+    void upgrade_lambda_params_stmt(Stmt& s, std::unordered_set<std::string>& lam_locals);
+    void upgrade_lambda_params_expr(Expr& e, const std::unordered_set<std::string>& lam_locals);
 };
 
 const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct_ret_call) {
@@ -1494,6 +1528,9 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
     // The handle IS the slot index, baked as an i64 literal — a COMPILE-TIME
     // reification, not a runtime value. We stash the slot on the AST node for
     // codegen; the first-class-ness lives at the CALL site (handle(args)), not here.
+    if (auto* le = dynamic_cast<LambdaExpr*>(&e)) {
+        return check_lambda(*le);
+    }
     if (auto* h = dynamic_cast<FnHandleExpr*>(&e)) {
         // v1.0 Tier 2 cross-module handle `&mod::fn` (docs/MODULES.md + plan_FUNCTION_REFS.md):
         // resolve against the host-provided ModuleExportTable, stamp the
@@ -1794,6 +1831,46 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
             // This closes the parse-time ambiguity (the parser can't know if `h`
             // is a fn name or a fn-typed var; sema resolves it here).
             const Var* v = lookup_local_var(c->name);
+            // #20 lambda call: `f(args)` where f is a lambda-typed local. A
+            // lambda value is {slot, env_ptr}; the call prepends env_ptr as the
+            // hidden first arg + dispatches via the slot. Checked here (before
+            // the fn-handle path) because a lambda type is is_lambda, NOT
+            // is_fn_handle — the two are distinct value shapes.
+            if (v && v->ty && v->ty->is_lambda) {
+                auto hid = std::make_unique<Ident>();
+                hid->loc = c->loc; hid->name = c->name; hid->ty = v->ty;
+                c->lambda_target = std::move(hid);
+                c->is_lambda_call = true;
+                // arity + arg type check against the lambda's recorded sig
+                // (the declared params, NOT the hidden env param).
+                size_t nargs = c->args.size() + (c->receiver ? 1 : 0);
+                if (nargs != v->ty->recorded_params.size()) {
+                    err("lambda call has " + std::to_string(nargs) +
+                        " arg(s) but the lambda takes " +
+                        std::to_string(v->ty->recorded_params.size()),
+                        c->loc.line, c->loc.col);
+                    e.ty = intern(type_void()); return e.ty;
+                }
+                size_t i = 0;
+                if (c->receiver) {
+                    const Type* want = v->ty->recorded_params[0].get();
+                    const Type* got = check_value(c->receiver, want);
+                    if (!types_compatible(want, got))
+                        err("lambda receiver type mismatch (expected " + want->to_string() +
+                            ", got " + got->to_string() + ")", c->receiver->loc.line, c->receiver->loc.col);
+                    ++i;
+                }
+                for (auto& a : c->args) {
+                    const Type* want = v->ty->recorded_params[i++].get();
+                    const Type* got = check_value(a, want);
+                    if (!types_compatible(want, got))
+                        err("lambda argument type mismatch (expected " + want->to_string() +
+                            ", got " + got->to_string() + ")", a->loc.line, a->loc.col);
+                }
+                e.ty = intern(*v->ty->recorded_ret);
+                c->name.clear();
+                return e.ty;
+            }
             if (v && v->ty && v->ty->is_fn_handle) {
                 auto hid = std::make_unique<Ident>();
                 hid->loc = c->loc; hid->name = c->name; hid->ty = v->ty;
@@ -2623,6 +2700,24 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
         // this always passed nullptr, which is why `let x: string = "lit";`
         // couldn't work even in principle - the literal never saw what type
         // was wanted.
+        // #20: `let g: fn(Args)->Ret = <lambda>` — upgrade the declared fn-
+        // handle type to is_lambda (16 bytes) so the 16-byte lambda value
+        // {slot, env_ptr} fits + g(...) dispatches as a lambda call. The
+        // upgrade is on ls->ty (the shared_ptr), permanent for this binding.
+        if (!ls->is_auto && ls->ty && ls->ty->is_fn_handle && ls->ty->has_recorded_sig &&
+            ls->init && dynamic_cast<LambdaExpr*>(ls->init.get())) {
+            auto* le = dynamic_cast<LambdaExpr*>(ls->init.get());
+            if (le->ret && ls->ty->recorded_ret && ls->ty->recorded_ret->same(*le->ret) &&
+                ls->ty->recorded_params.size() == le->params.size()) {
+                bool sig_match = true;
+                for (size_t j = 0; j < le->params.size(); ++j)
+                    if (!ls->ty->recorded_params[j]->same(*le->params[j].ty)) { sig_match = false; break; }
+                if (sig_match) {
+                    ls->ty->is_fn_handle = false;
+                    ls->ty->is_lambda = true;
+                }
+            }
+        }
         const Type* expected_ty = ls->is_auto ? nullptr : intern(*ls->ty);
         const Expr* saved_aggregate_cast_init = aggregate_cast_init;
         aggregate_cast_init = ls->init.get();
@@ -2963,6 +3058,30 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
         returns = true;
         return;
     }
+    // #21 coroutine yield: `yield expr;` marks the enclosing fn as a
+    // coroutine. The yield value's type must match the coroutine's yield
+    // type (the first yield establishes it; subsequent yields must match).
+    // A void yield (`yield;`) is allowed only if the coroutine's yield type
+    // is void. yield does NOT terminate the fn (unlike return) — execution
+    // suspends + resumes on next().
+    if (auto* ys = dynamic_cast<YieldStmt*>(&s)) {
+        if (!current_func) {
+            err("yield outside a function", ys->loc.line, ys->loc.col);
+            return;
+        }
+        current_func->is_coroutine = true;
+        const Type* yt = ys->value ? check_expr(*ys->value) : &type_void();
+        if (!current_func->coroutine_yield_type) {
+            current_func->coroutine_yield_type = std::make_shared<Type>(*yt);
+        } else {
+            const Type* want = current_func->coroutine_yield_type.get();
+            if (!want->same(*yt))
+                err("yield type mismatch (got " + yt->to_string() +
+                    ", coroutine yields " + want->to_string() + ")",
+                    ys->loc.line, ys->loc.col);
+        }
+        return;
+    }
 }
 
 void Checker::check_block(Block& b, const Type* ret_ty, bool& returns) {
@@ -2999,8 +3118,17 @@ void Checker::check_block(Block& b, const Type* ret_ty, bool& returns) {
 
 void Checker::check_func(FuncDecl& f) {
     current_ns = f.ns;  // Tier 1: track the current namespace for bare-call resolution
+    current_func = &f;  // #21: track for yield->coroutine marking
     scopes.clear();
     push_scope();
+    // #20: a synthetic lambda fn has a hidden __env param (params[0]) + the
+    // captures are env-capture vars (not frame locals). check_lambda_func sets
+    // those up; the declared params (params[1..]) are bound there.
+    if (f.is_lambda) {
+        check_lambda_func(f);
+        pop_scope();
+        return;
+    }
     // Struct-by-value params/returns are supported (shipped; see
     // docs/spec/TYPE_SYSTEM.md §2 struct layout + docs/spec/CODEGEN_SPEC.md
     // for the Win64 word-based param convention and hidden-pointer return
@@ -3018,6 +3146,467 @@ void Checker::check_func(FuncDecl& f) {
         err("function '" + f.name + "' not all paths return a value", f.loc.line, f.loc.col);
     }
     pop_scope();
+}
+
+// ============================================================================
+// #20 lambdas with by-value capture
+// ============================================================================
+
+// Walk an expression tree to find Idents that resolve to a local in an
+// ENCLOSING scope (scope index < lambda_scope_start). Those are the captures.
+// Globals, fn names, + the lambda's own params/locals (scope index >= start)
+// are NOT captures. Dedups by name; preserves first-encounter order (the env
+// field order).
+void Checker::collect_captures_expr(const Expr& e, size_t lambda_scope_start,
+                                    std::vector<std::string>& out) {
+    if (auto* id = dynamic_cast<const Ident*>(&e)) {
+        // Is this name a local in an ENCLOSING scope (below the lambda's own)?
+        for (size_t i = 0; i < lambda_scope_start && i < scopes.size(); ++i) {
+            for (const auto& v : scopes[i]) {
+                if (v.name == id->name) {
+                    // dedup
+                    if (std::find(out.begin(), out.end(), id->name) == out.end())
+                        out.push_back(id->name);
+                    return;
+                }
+            }
+        }
+        return;
+    }
+    if (auto* b = dynamic_cast<const BinExpr*>(&e)) {
+        collect_captures_expr(*b->lhs, lambda_scope_start, out);
+        collect_captures_expr(*b->rhs, lambda_scope_start, out);
+        return;
+    }
+    if (auto* u = dynamic_cast<const UnaryExpr*>(&e)) {
+        collect_captures_expr(*u->operand, lambda_scope_start, out);
+        return;
+    }
+    if (auto* c = dynamic_cast<const CastExpr*>(&e)) {
+        collect_captures_expr(*c->operand, lambda_scope_start, out);
+        return;
+    }
+    if (auto* t = dynamic_cast<const TernaryExpr*>(&e)) {
+        collect_captures_expr(*t->cond, lambda_scope_start, out);
+        collect_captures_expr(*t->then_e, lambda_scope_start, out);
+        collect_captures_expr(*t->else_e, lambda_scope_start, out);
+        return;
+    }
+    if (auto* a = dynamic_cast<const AssignExpr*>(&e)) {
+        if (a->target) collect_captures_expr(*a->target, lambda_scope_start, out);
+        if (a->value) collect_captures_expr(*a->value, lambda_scope_start, out);
+        return;
+    }
+    if (auto* c = dynamic_cast<const CallExpr*>(&e)) {
+        if (c->receiver) collect_captures_expr(*c->receiver, lambda_scope_start, out);
+        if (c->indirect_target) collect_captures_expr(*c->indirect_target, lambda_scope_start, out);
+        if (c->lambda_target) collect_captures_expr(*c->lambda_target, lambda_scope_start, out);
+        for (auto& arg : c->args) collect_captures_expr(*arg, lambda_scope_start, out);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const IndexExpr*>(&e)) {
+        collect_captures_expr(*ix->base, lambda_scope_start, out);
+        collect_captures_expr(*ix->index, lambda_scope_start, out);
+        return;
+    }
+    if (auto* fl = dynamic_cast<const FieldExpr*>(&e)) {
+        collect_captures_expr(*fl->base, lambda_scope_start, out);
+        return;
+    }
+    if (auto* v = dynamic_cast<const ViewExpr*>(&e)) {
+        collect_captures_expr(*v->base, lambda_scope_start, out);
+        return;
+    }
+    // IntLit/FloatLit/BoolLit/StringLit/StructLit/ArrayLit/EnumAccessExpr/
+    // FnHandleExpr/LambdaExpr: no unbound Idents to capture (a nested lambda
+    // collects its OWN captures against its own scope start; a FnHandleExpr's
+    // operand is a fn name, not a local). StructLit/ArrayLit recurse via their
+    // field/element exprs:
+    if (auto* sl = dynamic_cast<const StructLit*>(&e)) {
+        for (auto& kv : sl->fields) collect_captures_expr(*kv.second, lambda_scope_start, out);
+        return;
+    }
+    if (auto* al = dynamic_cast<const ArrayLit*>(&e)) {
+        for (auto& el : al->elements) collect_captures_expr(*el, lambda_scope_start, out);
+        return;
+    }
+    // A nested LambdaExpr: its own body is checked separately (it becomes its
+    // own synthetic fn). Its captures are against ITS scope start, not ours.
+    // But a nested lambda referencing THIS scope's vars is itself a capture of
+    // THIS lambda only if the nested lambda is used... the nested lambda's
+    // captures are resolved when IT is checked. We do NOT recurse into a nested
+    // LambdaExpr's body here (it has no body field anymore — the body lives on
+    // its synthetic FuncDecl; collect would need to walk that, but the nested
+    // lambda's captures are handled by its own check_lambda). So: nothing.
+}
+
+void Checker::collect_captures_stmt(const Stmt& s, size_t lambda_scope_start,
+                                    std::vector<std::string>& out) {
+    if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
+    if (auto* ls = dynamic_cast<const LetStmt*>(&s)) {
+        if (ls->init) collect_captures_expr(*ls->init, lambda_scope_start, out);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ExprStmt*>(&s)) {
+        collect_captures_expr(*es->expr, lambda_scope_start, out);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) {
+        if (rs->value) collect_captures_expr(*rs->value, lambda_scope_start, out);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) {
+        collect_captures_expr(*ds->expr, lambda_scope_start, out);
+        return;
+    }
+    if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
+        collect_captures_expr(*is->cond, lambda_scope_start, out);
+        collect_captures_block(is->then_b, lambda_scope_start, out);
+        if (is->has_else) collect_captures_block(is->else_b, lambda_scope_start, out);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) {
+        collect_captures_expr(*ws->cond, lambda_scope_start, out);
+        collect_captures_block(ws->body, lambda_scope_start, out);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) {
+        collect_captures_block(ds->body, lambda_scope_start, out);
+        collect_captures_expr(*ds->cond, lambda_scope_start, out);
+        return;
+    }
+    if (auto* fe = dynamic_cast<const ForEachStmt*>(&s)) {
+        collect_captures_expr(*fe->iter, lambda_scope_start, out);
+        collect_captures_block(fe->body, lambda_scope_start, out);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
+        if (fs->init) collect_captures_stmt(*fs->init, lambda_scope_start, out);
+        if (fs->cond) collect_captures_expr(*fs->cond, lambda_scope_start, out);
+        if (fs->step) collect_captures_expr(*fs->step, lambda_scope_start, out);
+        collect_captures_block(fs->body, lambda_scope_start, out);
+        return;
+    }
+    if (auto* bs = dynamic_cast<const BlockStmt*>(&s)) {
+        collect_captures_block(bs->block, lambda_scope_start, out);
+        return;
+    }
+    if (auto* sw = dynamic_cast<const SwitchStmt*>(&s)) {
+        collect_captures_expr(*sw->subject, lambda_scope_start, out);
+        for (auto& c : sw->cases) collect_captures_block(c.body, lambda_scope_start, out);
+        return;
+    }
+    if (auto* ms = dynamic_cast<const MatchStmt*>(&s)) {
+        collect_captures_expr(*ms->subject, lambda_scope_start, out);
+        for (auto& arm : ms->arms) {
+            if (arm.guard) collect_captures_expr(*arm.guard, lambda_scope_start, out);
+            collect_captures_block(arm.body, lambda_scope_start, out);
+        }
+        return;
+    }
+    if (auto* tc = dynamic_cast<const TryCatchStmt*>(&s)) {
+        collect_captures_block(tc->try_body, lambda_scope_start, out);
+        collect_captures_block(tc->catch_body, lambda_scope_start, out);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) {
+        if (th->value) collect_captures_expr(*th->value, lambda_scope_start, out);
+        return;
+    }
+    // YieldStmt (#21): recurse into the yielded value (may capture).
+    if (auto* ys = dynamic_cast<const YieldStmt*>(&s)) {
+        if (ys->value) collect_captures_expr(*ys->value, lambda_scope_start, out);
+        return;
+    }
+}
+
+void Checker::collect_captures_block(const Block& b, size_t lambda_scope_start,
+                                     std::vector<std::string>& out) {
+    for (auto& s : b.stmts) collect_captures_stmt(*s, lambda_scope_start, out);
+}
+
+// Type-check a LambdaExpr at its creation site. Determines captures, builds
+// the env, prepends the hidden __env param to the synthetic fn, registers
+// the fn's signature, + sets the LambdaExpr's type to a 16-byte lambda type.
+// The synthetic fn's BODY is checked lazily in check_func (when the fn loop
+// reaches it) — NOT here (the body may reference the captures, which are
+// bound in check_lambda_func).
+const Type* Checker::check_lambda(LambdaExpr& le) {
+    // find the synthetic FuncDecl
+    FuncDecl* lf = nullptr;
+    for (auto& fn : prog->funcs) {
+        if (fn.name == le.synthetic_fn_name) { lf = &fn; break; }
+    }
+    if (!lf) {
+        err("internal: lambda synthetic fn '" + le.synthetic_fn_name + "' not found",
+            le.loc.line, le.loc.col);
+        le.ty = intern(type_void()); return le.ty;
+    }
+    // stamp the slot (for codegen's dispatch + the lambda value's slot field)
+    auto sit = script_slots->find(lf->name);
+    if (sit != script_slots->end()) le.slot = sit->second;
+    lf->slot = le.slot;
+    // Determine captures: walk the synthetic fn's body for Idents resolving to
+    // an ENCLOSING scope (below the lambda's own scope, which doesn't exist yet
+    // — we use the current scope stack depth as the boundary). The lambda's own
+    // params/locals will live in a scope pushed during check_lambda_func; any
+    // local at scope index < scopes.size() now is an enclosing-scope capture.
+    size_t lambda_scope_start = scopes.size();
+    std::vector<std::string> caps;
+    collect_captures_block(lf->body, lambda_scope_start, caps);
+    // Build the env layout: each capture is 8 bytes (v1: scalars only — i64/
+    // f64/etc.). Capture types come from the enclosing scope's var types.
+    // (A non-scalar capture — slice/struct/array — is rejected for v1; by-ref
+    // capture via GC is the follow-up.)
+    std::vector<std::shared_ptr<Type>> cap_types;
+    std::vector<int32_t> cap_offsets;
+    int32_t env_off = 0;
+    for (const auto& name : caps) {
+        const Type* vt = lookup_var(name);
+        if (!vt) {
+            // shouldn't happen (collect only picks up resolved enclosing locals)
+            err("lambda capture '" + name + "' has no type", le.loc.line, le.loc.col);
+            continue;
+        }
+        // v1: captures must be scalars (fit in 8 bytes, no GC needed). Reject
+        // slices/structs/arrays (by-value copy of those is a follow-up).
+        if (vt->is_slice || vt->array_len > 0 ||
+            (!vt->struct_name.empty() && is_registered_struct(vt))) {
+            err("lambda capture '" + name + "' has type " + vt->to_string() +
+                "; v1 lambdas capture only scalar values (slice/struct/array " +
+                "capture is a follow-up)", le.loc.line, le.loc.col);
+            // still record it so the body resolves (use the type as-is)
+        }
+        cap_types.push_back(std::make_shared<Type>(*vt));
+        cap_offsets.push_back(env_off);
+        env_off += 8;  // every capture occupies one 8-byte slot (v1 scalars)
+    }
+    int32_t env_size = env_off;
+    fprintf(stderr, "[check_lambda] %s: %zu captures:", le.synthetic_fn_name.c_str(), caps.size());
+    for (auto& cc : caps) fprintf(stderr, " %s", cc.c_str()); fprintf(stderr, "\n");
+    // Record capture metadata on BOTH the LambdaExpr (creation-site codegen)
+    // and the synthetic FuncDecl (body codegen loads captures from env).
+    le.captures = caps;
+    le.capture_types = cap_types;
+    le.capture_offsets = cap_offsets;
+    le.env_size = env_size;
+    lf->lambda_captures = caps;
+    lf->lambda_capture_types = cap_types;
+    lf->lambda_capture_offsets = cap_offsets;
+    lf->env_size = env_size;
+    // Prepend the hidden __env i64 param to the synthetic fn (params[0]).
+    // The body's captures are NOT params — they're env-capture vars bound in
+    // check_lambda_func. The declared params shift to params[1..].
+    Param env_param;
+    env_param.name = "__env";
+    env_param.ty = std::make_shared<Type>(type_i64());
+    env_param.loc = lf->loc;
+    std::vector<Param> new_params;
+    new_params.push_back(std::move(env_param));
+    for (auto& p : lf->params) new_params.push_back(std::move(p));
+    lf->params = std::move(new_params);
+    // Register the synthetic fn's signature (so calls to it via the slot +
+    // script_sigs resolve). The recorded sig uses the DECLARED params (sans
+    // __env) — but script_sigs indexes ALL params (including __env) for the
+    // call-site word-count. We register the full param list (with __env); the
+    // lambda-call path accounts for the hidden env arg.
+    ScriptSig ss;
+    ss.ret = intern(*lf->ret);
+    for (auto& p : lf->params) ss.params.push_back(intern(*p.ty));
+    script_sigs[lf->name] = ss;
+    // Build the lambda value type: 16 bytes {slot, env_ptr}, recorded sig =
+    // the declared params (sans env) + ret.
+    Type lt;
+    lt.is_lambda = true;
+    lt.has_recorded_sig = true;
+    lt.prim = Prim::I64;  // placeholder prim (byte_size uses is_lambda=16)
+    for (auto& p : le.params) lt.recorded_params.push_back(p.ty);
+    lt.recorded_ret = le.ret;
+    const Type* ty = intern(lt);
+    le.ty = ty;
+    return ty;
+}
+
+// Check a synthetic lambda fn's body. Binds the hidden __env param + the
+// captures (as env-capture vars) + the declared params, then checks the body.
+void Checker::check_lambda_func(FuncDecl& f) {
+    current_func = &f;  // #21: track for yield->coroutine marking
+    // params[0] = __env (i64 pointer to the env struct). Bind it as a normal
+    // local so codegen spills it to a frame slot (the env-capture loads read
+    // __env's frame slot to get env_ptr).
+    declare(f.params[0].name, intern(*f.params[0].ty), false, false, f.params[0].loc);
+    // Bind the captures as env-capture vars (is_env_capture=true + offset).
+    // These resolve capture Idents in the body to env loads (not frame slots).
+    for (size_t i = 0; i < f.lambda_captures.size(); ++i) {
+        Var v;
+        v.name = f.lambda_captures[i];
+        v.ty = intern(*f.lambda_capture_types[i]);
+        v.is_const = true;            // captures are by-value copies (immutable)
+        v.local_array_view = false;
+        v.is_env_capture = true;
+        v.env_offset = f.lambda_capture_offsets[i];
+        scopes.back().push_back(std::move(v));
+    }
+    // Bind the declared params (params[1..]) normally.
+    for (size_t i = 1; i < f.params.size(); ++i) {
+        declare(f.params[i].name, intern(*f.params[i].ty), false, false, f.params[i].loc);
+    }
+    const Type* ret_ty = intern(*f.ret);
+    bool returns = false;
+    check_block(f.body, ret_ty, returns);
+    if (!ret_ty->is_void() && !returns) {
+        err("lambda not all paths return a value", f.loc.line, f.loc.col);
+    }
+}
+
+// #20 pre-pass: upgrade `fn(Args)->Ret` param types to is_lambda where a call
+// site passes a lambda to that param. For each CallExpr to a same-module
+// script fn, for each arg that is a LambdaExpr, if the callee's param at that
+// position (offset by the receiver) is a fn-handle type WITH a recorded sig
+// matching the lambda's sig, mutate that param's `ty` in place to is_lambda.
+// This makes the param 16 bytes + dispatch as a lambda call in the callee's
+// body. (The mutation is on the FuncDecl's shared_ptr<Type>, safe + permanent.)
+void Checker::upgrade_lambda_param_types() {
+    for (auto& fn : prog->funcs) {
+        if (fn.is_lambda) continue;  // synthetic lambda fns have no lambda-arg calls to upgrade
+        std::unordered_set<std::string> lam_locals;  // this fn's `let X = <lambda>` names
+        upgrade_lambda_params_block(fn.body, lam_locals);
+    }
+}
+void Checker::upgrade_lambda_params_block(Block& b, std::unordered_set<std::string>& lam_locals) {
+    for (auto& s : b.stmts) upgrade_lambda_params_stmt(*s, lam_locals);
+}
+void Checker::upgrade_lambda_params_stmt(Stmt& s, std::unordered_set<std::string>& lam_locals) {
+    if (auto* ls = dynamic_cast<LetStmt*>(&s)) {
+        if (ls->init) upgrade_lambda_params_expr(*ls->init, lam_locals);
+        // track `let X = <LambdaExpr>` so a later `callee(..., X, ...)` upgrades
+        // the callee's param (the lambda value flows through X).
+        if (ls->init && dynamic_cast<LambdaExpr*>(ls->init.get()))
+            lam_locals.insert(ls->name);
+        return;
+    }
+    if (auto* es = dynamic_cast<ExprStmt*>(&s)) { upgrade_lambda_params_expr(*es->expr, lam_locals); return; }
+    if (auto* rs = dynamic_cast<ReturnStmt*>(&s)) { if (rs->value) upgrade_lambda_params_expr(*rs->value, lam_locals); return; }
+    if (auto* ds = dynamic_cast<DeferStmt*>(&s)) { upgrade_lambda_params_expr(*ds->expr, lam_locals); return; }
+    if (auto* is = dynamic_cast<IfStmt*>(&s)) {
+        upgrade_lambda_params_expr(*is->cond, lam_locals);
+        upgrade_lambda_params_block(is->then_b, lam_locals);
+        if (is->has_else) upgrade_lambda_params_block(is->else_b, lam_locals);
+        return;
+    }
+    if (auto* ws = dynamic_cast<WhileStmt*>(&s)) { upgrade_lambda_params_expr(*ws->cond, lam_locals); upgrade_lambda_params_block(ws->body, lam_locals); return; }
+    if (auto* ds = dynamic_cast<DoWhileStmt*>(&s)) { upgrade_lambda_params_block(ds->body, lam_locals); upgrade_lambda_params_expr(*ds->cond, lam_locals); return; }
+    if (auto* fe = dynamic_cast<ForEachStmt*>(&s)) { upgrade_lambda_params_expr(*fe->iter, lam_locals); upgrade_lambda_params_block(fe->body, lam_locals); return; }
+    if (auto* fs = dynamic_cast<ForStmt*>(&s)) {
+        if (fs->init) upgrade_lambda_params_stmt(*fs->init, lam_locals);
+        if (fs->cond) upgrade_lambda_params_expr(*fs->cond, lam_locals);
+        if (fs->step) upgrade_lambda_params_expr(*fs->step, lam_locals);
+        upgrade_lambda_params_block(fs->body, lam_locals);
+        return;
+    }
+    if (auto* bs = dynamic_cast<BlockStmt*>(&s)) { upgrade_lambda_params_block(bs->block, lam_locals); return; }
+    if (auto* sw = dynamic_cast<SwitchStmt*>(&s)) {
+        upgrade_lambda_params_expr(*sw->subject, lam_locals);
+        for (auto& c : sw->cases) upgrade_lambda_params_block(c.body, lam_locals);
+        return;
+    }
+    if (auto* ms = dynamic_cast<MatchStmt*>(&s)) {
+        upgrade_lambda_params_expr(*ms->subject, lam_locals);
+        for (auto& arm : ms->arms) {
+            if (arm.guard) upgrade_lambda_params_expr(*arm.guard, lam_locals);
+            upgrade_lambda_params_block(arm.body, lam_locals);
+        }
+        return;
+    }
+    if (auto* tc = dynamic_cast<TryCatchStmt*>(&s)) { upgrade_lambda_params_block(tc->try_body, lam_locals); upgrade_lambda_params_block(tc->catch_body, lam_locals); return; }
+    if (auto* th = dynamic_cast<ThrowStmt*>(&s)) { if (th->value) upgrade_lambda_params_expr(*th->value, lam_locals); return; }
+    if (auto* ys = dynamic_cast<YieldStmt*>(&s)) { if (ys->value) upgrade_lambda_params_expr(*ys->value, lam_locals); return; }
+}
+void Checker::upgrade_lambda_params_expr(Expr& e, const std::unordered_set<std::string>& lam_locals) {
+    if (auto* c = dynamic_cast<CallExpr*>(&e)) {
+        if (c->receiver) upgrade_lambda_params_expr(*c->receiver, lam_locals);
+        if (c->indirect_target) upgrade_lambda_params_expr(*c->indirect_target, lam_locals);
+        if (c->lambda_target) upgrade_lambda_params_expr(*c->lambda_target, lam_locals);
+        for (auto& a : c->args) upgrade_lambda_params_expr(*a, lam_locals);
+        // Only same-module script calls (a named callee in script_slots, no
+        // module_alias, not native/indirect/lambda-call) can have their param
+        // types upgraded. Skip native/cross-module/indirect calls.
+        if (!c->name.empty() && c->module_alias.empty() && !c->is_native &&
+            !c->is_indirect && !c->is_lambda_call) {
+            auto sit = script_slots->find(c->name);
+            if (sit != script_slots->end()) {
+                // find the callee FuncDecl
+                FuncDecl* callee = nullptr;
+                for (auto& fn : prog->funcs) if (fn.name == c->name) { callee = &fn; break; }
+                if (callee) {
+                    size_t off = c->receiver ? 1 : 0;
+                    for (size_t i = 0; i < c->args.size(); ++i) {
+                        // An arg is a lambda flow if it is directly a LambdaExpr
+                        // OR an Ident naming a `let X = <lambda>` local.
+                        LambdaExpr* le = dynamic_cast<LambdaExpr*>(c->args[i].get());
+                        if (!le) {
+                            if (auto* id = dynamic_cast<Ident*>(c->args[i].get())) {
+                                if (lam_locals.count(id->name)) {
+                                    // find the let's lambda to get its sig
+                                    // (walk this fn's body for the let — but we
+                                    // don't have it here; instead, look up the
+                                    // lambda's synthetic fn by reconstructing
+                                    // the name is not feasible. So: skip sig
+                                    // check for an Ident arg; upgrade iff the
+                                    // param is ANY `fn(Args)->Ret` with the
+                                    // right ARITY — the actual sig match is
+                                    // enforced at the call site by check_expr.)
+                                    size_t pidx = off + i;
+                                    if (pidx < callee->params.size()) {
+                                        Type& pt = *callee->params[pidx].ty;
+                                        if (pt.is_fn_handle && pt.has_recorded_sig) {
+                                            pt.is_fn_handle = false;
+                                            pt.is_lambda = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (le) {
+                            size_t pidx = off + i;
+                            if (pidx < callee->params.size()) {
+                                Type& pt = *callee->params[pidx].ty;
+                                // upgrade a `fn(Args)->Ret` fn-handle param to
+                                // is_lambda iff the recorded sig matches the
+                                // lambda's declared sig.
+                                if (pt.is_fn_handle && pt.has_recorded_sig &&
+                                    pt.recorded_params.size() == le->params.size()) {
+                                    bool sig_match = true;
+                                    for (size_t j = 0; j < le->params.size(); ++j) {
+                                        if (!pt.recorded_params[j]->same(*le->params[j].ty)) { sig_match = false; break; }
+                                    }
+                                    if (sig_match && le->ret && pt.recorded_ret &&
+                                        pt.recorded_ret->same(*le->ret)) {
+                                        pt.is_fn_handle = false;
+                                        pt.is_lambda = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if (auto* b = dynamic_cast<BinExpr*>(&e)) { upgrade_lambda_params_expr(*b->lhs, lam_locals); upgrade_lambda_params_expr(*b->rhs, lam_locals); return; }
+    if (auto* u = dynamic_cast<UnaryExpr*>(&e)) { upgrade_lambda_params_expr(*u->operand, lam_locals); return; }
+    if (auto* c = dynamic_cast<CastExpr*>(&e)) { upgrade_lambda_params_expr(*c->operand, lam_locals); return; }
+    if (auto* t = dynamic_cast<TernaryExpr*>(&e)) { upgrade_lambda_params_expr(*t->cond, lam_locals); upgrade_lambda_params_expr(*t->then_e, lam_locals); upgrade_lambda_params_expr(*t->else_e, lam_locals); return; }
+    if (auto* a = dynamic_cast<AssignExpr*>(&e)) { if (a->target) upgrade_lambda_params_expr(*a->target, lam_locals); if (a->value) upgrade_lambda_params_expr(*a->value, lam_locals); return; }
+    if (auto* ix = dynamic_cast<IndexExpr*>(&e)) { upgrade_lambda_params_expr(*ix->base, lam_locals); upgrade_lambda_params_expr(*ix->index, lam_locals); return; }
+    if (auto* fl = dynamic_cast<FieldExpr*>(&e)) { upgrade_lambda_params_expr(*fl->base, lam_locals); return; }
+    if (auto* sl = dynamic_cast<StructLit*>(&e)) { for (auto& kv : sl->fields) upgrade_lambda_params_expr(*kv.second, lam_locals); return; }
+    if (auto* al = dynamic_cast<ArrayLit*>(&e)) { for (auto& el : al->elements) upgrade_lambda_params_expr(*el, lam_locals); return; }
+    // a nested LambdaExpr is checked on its own; its body's lambda-arg calls
+    // are upgraded when THIS walk reaches the nested lambda's synthetic fn's
+    // body (the outer loop visits all prog->funcs including nested synthetic
+    // fns). So do NOT recurse into the LambdaExpr here.
 }
 
 // ============================================================================
@@ -3739,6 +4328,18 @@ SemaResult sema(Program& prog,
     // (return relay(s) where relay borrows its arg; g = relay(s) where relay
     // retains). See compute_borrow_retain() + is_local_array_view()'s CallExpr
     // case for how the sets are consumed.
+    // #20 lambda param-type upgrade pre-pass: walk all fn bodies for CallExpr
+    // args that are LambdaExprs. If the callee is a script fn whose param at
+    // that position is a `fn(Args)->Ret` fn-handle type with a matching
+    // recorded sig, upgrade that param type to is_lambda (16 bytes) so the
+    // 16-byte lambda value {slot, env_ptr} fits + the body's call through that
+    // param dispatches as a lambda call. Runs BEFORE body checking so the
+    // upgraded param type is visible when the callee's body is checked. (v1
+    // limitation: if a param receives a lambda in one call + a bare &fn handle
+    // in another, the upgrade makes the &fn call a type error — acceptable for
+    // v1; mixing the two callable shapes at one param is a follow-up.)
+    c.upgrade_lambda_param_types();
+
     c.compute_borrow_retain();
 
     // Global initializers obey the same nominal assignment barrier as locals.
@@ -3760,9 +4361,18 @@ SemaResult sema(Program& prog,
                   got->to_string() + ")", g.loc.line, g.loc.col);
     }
 
-    // check each function
+    // check each function. #20: synthetic lambda fns (__lambda_N) are
+    // checked LAST — their captures + env layout are determined by
+    // check_lambda, which runs during the ENCLOSING fn's check (the fn whose
+    // body holds the LambdaExpr). Checking lambda fns after all their
+    // enclosing fns ensures lf->lambda_captures is populated before
+    // check_lambda_func binds them.
+    for (auto& f : prog.funcs) fprintf(stderr, "[sema-order] %s is_lambda=%d\n", f.name.c_str(), (int)f.is_lambda);
     for (auto& f : prog.funcs) {
-        c.check_func(f);
+        if (!f.is_lambda) c.check_func(f);
+    }
+    for (auto& f : prog.funcs) {
+        if (f.is_lambda) c.check_func(f);
     }
 
     // Tier 1 static_assert: check top-level assertions (in-body ones are

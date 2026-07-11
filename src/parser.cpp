@@ -12,6 +12,7 @@ struct P {
     Program prog;
     std::vector<std::string> errs;
     std::vector<ParseErrorEntry> err_entries;  // same errors as `errs`, individually positioned
+    int lambda_counter = 0;  // #20: unique suffix for synthetic __lambda_N fns
 
     const Token& peek() const { return toks[i]; }
     const Token& peek(int off) const { return toks[std::min(size_t(i + off), toks.size() - 1)]; }
@@ -866,6 +867,54 @@ struct P {
             std::string field = expect(Tk::Ident, "field name").text; expect(Tk::RParen,"')'");
             auto e=std::make_unique<OffsetofExpr>(); e->loc=loc(t); e->ty=std::move(ty); e->field=std::move(field); return e;
         }
+        case Tk::Kw_fn: {
+            // #20 lambda expression: `fn(params) -> ret { body }` in an
+            // expression position. A `fn` here is unambiguously a lambda (a
+            // fn DECLARATION only appears at top level / in a namespace, never
+            // in parse_primary). Build a synthetic FuncDecl `__lambda_N` for
+            // the body, add it to prog.funcs (so the host's slot-assignment +
+            // compile loop picks it up), and keep a LambdaExpr referencing it.
+            // The body is MOVED into the synthetic fn (the lambda owns it from
+            // here); the LambdaExpr keeps a COPY only for sema's capture scan
+            // (sema reads captures off the LambdaExpr, then checks the
+            // synthetic fn's body directly).
+            uint32_t l = t.line, c = t.col;
+            adv();  // 'fn'
+            expect(Tk::LParen, "'(' after 'fn'");
+            std::vector<Param> params;
+            if (!at(Tk::RParen)) {
+                do { params.push_back(parse_param()); } while (accept(Tk::Comma));
+            }
+            expect(Tk::RParen, "')'");
+            std::shared_ptr<Type> ret;
+            if (accept(Tk::Arrow)) {
+                ret = parse_type();
+            } else {
+                ret = std::make_shared<Type>(type_void());
+            }
+            Block body = parse_block();
+            std::string name = "__lambda_" + std::to_string(lambda_counter++);
+            // synthetic FuncDecl: is_lambda=true, no env param yet (sema
+            // prepends __env once captures are known). is_exported=false so it
+            // is NOT published to other modules (a lambda is module-private).
+            FuncDecl lf;
+            lf.name = name;
+            lf.params = params;        // copy: LambdaExpr also keeps the declared params
+            lf.ret = ret;
+            lf.body = std::move(body); // body owned by the synthetic fn
+            lf.loc = {l, c};
+            lf.is_exported = false;
+            lf.is_lambda = true;
+            prog.funcs.push_back(std::move(lf));
+            auto le = std::make_unique<LambdaExpr>();
+            le->loc = {l, c};
+            le->params = params;       // declared params (sans env)
+            le->ret = ret;
+            le->synthetic_fn_name = name;
+            // The body lives on the synthetic FuncDecl (prog.funcs.back());
+            // sema walks it there for the capture scan + body check.
+            return le;
+        }
         default:
             throw ParseError(std::string("unexpected token '")+tok_spelling(t.kind)+"'", t.line, t.col);
         }
@@ -1068,6 +1117,18 @@ struct P {
             auto s = std::make_unique<ThrowStmt>();
             s->loc = loc(t);
             s->value = parse_expr();
+            expect(Tk::Semicolon, "';'");
+            return s;
+        }
+        case Tk::Kw_yield: {
+            // #21 coroutine yield: `yield expr;` or `yield;` (void yield).
+            // Sema marks the enclosing fn as a coroutine when it sees this.
+            adv();
+            auto s = std::make_unique<YieldStmt>();
+            s->loc = loc(t);
+            if (!at(Tk::Semicolon)) {
+                s->value = parse_expr();
+            }
             expect(Tk::Semicolon, "';'");
             return s;
         }

@@ -16,6 +16,7 @@
 #include "peephole.hpp"   // PeepholeGuardedRegions, make_stage1_pipeline, PeepholeCtx
 #include "x64_emitter.hpp"
 #include "thin_ir.hpp"
+#include "regalloc.hpp"   // RegAllocResult (Stage 3 regalloc map)
 #include "ast.hpp"
 
 #include <cassert>
@@ -110,11 +111,19 @@ struct EmitCtx {
     X64Emitter e;
     const ThinFunction& thf;
     const CodeGenCtx& ctx;
+    const RegAllocResult* ra;  // Stage 3: the regalloc map (thf.ra), or &thf.ra
 
     // VReg -> storage info. A VReg may be frame-backed (frame_off != 0) and/or
     // currently live in rax (rax_vreg) / xmm0 (xmm0_vreg). The emit prefers the
     // frame slot for materialization (robust across clobbers); falls back to the
     // register if the VReg is the most-recently-produced value still there.
+    //
+    // Stage 3 (regalloc): when thf.ra.enabled, a VReg in ra.map with in_reg=true
+    // lives in its assigned pool register (rbx/rsi/rdi/r12/r13/r15). load_int_vreg
+    // does `mov rax, R` for such a VReg; record_dst does `mov R, rax`. A VReg with
+    // in_reg=false uses its existing frame slot (the fallback path). The regalloc
+    // map is authoritative when enabled; the vregs[] frame_off tracking below is
+    // the fallback for non-candidate / non-regalloc VRegs.
     struct VRegInfo {
         int32_t frame_off = 0;   // 0 = not frame-backed
         const Type* type = nullptr;
@@ -122,6 +131,11 @@ struct EmitCtx {
     std::unordered_map<VReg, VRegInfo> vregs;
     VReg rax_vreg = 0;    // which VReg's int value is currently in rax (0 = unknown)
     VReg xmm0_vreg = 0;   // which VReg's float value is currently in xmm0
+    // Stage 3: which VReg is currently in each pool register (0 = unknown).
+    // Indexed by the reg_id (Reg enum value). Only pool registers used by the
+    // regalloc are tracked. Used to detect when a VReg is already in its
+    // register (skip the mov R, rax after a def that left it there).
+    std::unordered_map<int32_t, VReg> reg_holds;
 
     // block labels (indexed by block id)
     std::vector<Label> block_labels;
@@ -135,7 +149,7 @@ struct EmitCtx {
 
     std::string non_serializable_reason;
 
-    EmitCtx(const ThinFunction& f, const CodeGenCtx& c) : thf(f), ctx(c) {}
+    EmitCtx(const ThinFunction& f, const CodeGenCtx& c) : thf(f), ctx(c), ra(&f.ra) {}
 
     // ─── type / width helpers ───
     const StructLayoutTable* structs() const { return ctx.structs; }
@@ -151,6 +165,33 @@ struct EmitCtx {
     const Type* vreg_type(VReg v) const {
         auto it = vregs.find(v);
         return it != vregs.end() ? it->second.type : nullptr;
+    }
+
+    // ─── Stage 3: regalloc helpers ───
+    // The regalloc map (thf.ra) is authoritative when ra->enabled. These helpers
+    // query it. When regalloc is off (ra == nullptr or !ra->enabled), every query
+    // returns the "not in reg / use frame" answer, so the emit falls back to the
+    // existing all-frame-slot path — byte-identical to the pre-Stage-3 emit.
+    const RegAllocResult::Assign* ra_get(VReg v) const {
+        if (!ra || !ra->enabled) return nullptr;
+        auto it = ra->map.find(v);
+        return it != ra->map.end() ? &it->second : nullptr;
+    }
+    bool ra_in_reg(VReg v) const {
+        const auto* a = ra_get(v);
+        return a && a->in_reg;
+    }
+    Reg ra_reg(VReg v) const {
+        const auto* a = ra_get(v);
+        return (a && a->in_reg) ? Reg(a->reg_id) : Reg::rax;
+    }
+    // The frame_off to use for a spilled (in_reg=false) VReg. When regalloc is
+    // on, this is the regalloc's frame_off (which is the VReg's existing slot).
+    // When regalloc is off, the caller uses the instruction's meta.frame_off
+    // (the existing behavior).
+    int32_t ra_frame_off(VReg v) const {
+        const auto* a = ra_get(v);
+        return (a && !a->in_reg) ? a->frame_off : 0;
     }
 
     // ─── normalize rax to a type's int width (mirrors CG::normalize_rax) ───
@@ -311,15 +352,31 @@ struct EmitCtx {
     }
 
     // ─── VReg materialization ───
-    // Load a scalar int VReg's value into rax. If the VReg is frame-backed,
-    // load from its frame slot (with normalize). If it's the current rax_vreg,
-    // it's already in rax. Otherwise assume rax (best-effort for register-flow
-    // lowering where the VReg was just produced and no frame slot was assigned).
+    // Load a scalar int VReg's value into rax. Priority:
+    //   1. regalloc: if v is assigned to a pool register R, `mov rax, R` (with
+    //      normalize). This is the Stage-3 fast path — no memory access.
+    //   2. frame-backed: load from the VReg's frame slot (with normalize).
+    //   3. rax_vreg: already in rax (the most-recently-produced value).
+    //   4. best-effort trust rax (register-flow lowering with a lost track).
     void load_int_vreg(VReg v) {
+        // Stage 3: regalloc register-resident path
+        if (ra_in_reg(v)) {
+            e.mov_reg_reg(Reg::rax, ra_reg(v));
+            normalize_rax(vreg_type(v));
+            rax_vreg = v;
+            return;
+        }
         auto it = vregs.find(v);
-        if (it != vregs.end() && it->second.frame_off != 0) {
-            load_rbp_to_rax(e, it->second.frame_off);
-            normalize_rax(it->second.type);
+        // Stage 3: when regalloc is on, a spilled VReg uses its regalloc frame_off
+        int32_t off = 0;
+        if (ra && ra->enabled) {
+            int32_t ra_off = ra_frame_off(v);
+            if (ra_off != 0) off = ra_off;
+        }
+        if (off == 0 && it != vregs.end()) off = it->second.frame_off;
+        if (off != 0) {
+            load_rbp_to_rax(e, off);
+            normalize_rax(it != vregs.end() ? it->second.type : vreg_type(v));
             rax_vreg = v;
         } else if (v != 0 && v == rax_vreg) {
             // already in rax
@@ -401,14 +458,61 @@ struct EmitCtx {
         else rax_vreg = dst;
     }
 
+    // ─── Stage 3: pin an int result to its regalloc home ───
+    // After producing an int result in rax, this either pins it to its assigned
+    // pool register (`mov R, rax`) or spills it to its frame slot (normalize +
+    // `store_rax_to_rbp`). Replaces the per-instr pattern:
+    //     if (meta.frame_off != 0 && dst != 0) { normalize; store; vregs[dst].frame_off = off; }
+    // for int/bool dsts. The normalize happens ONLY in the frame path (matching
+    // the original code where normalize is inside the frame_off block). When
+    // regalloc is off, this is byte-identical to the pattern above. When the
+    // VReg is register-resident, no normalize is emitted here — the use-site
+    // `load_int_vreg` normalizes when it does `mov rax, R`.
+    void pin_int_dst(VReg dst, const ThinMeta& meta, const Type* ty) {
+        if (dst == 0) return;
+        if (ra_in_reg(dst)) {
+            Reg r = ra_reg(dst);
+            e.mov_reg_reg(r, Reg::rax);  // mov R, rax
+            reg_holds[int32_t(r)] = dst;
+            rax_vreg = dst;  // rax still holds the value (mov doesn't clobber)
+            return;
+        }
+        // frame-slot path (regalloc spilled, or regalloc off)
+        int32_t off = meta.frame_off;
+        if (ra && ra->enabled) { int32_t ro = ra_frame_off(dst); if (ro != 0) off = ro; }
+        if (off != 0) {
+            normalize_rax(ty);
+            store_rax_to_rbp(e, off);
+            vregs[dst].frame_off = off;
+        }
+    }
+
     // ─── prologue / epilogue ───
     void emit_prologue() {
         e.push(Reg::rbp);
         e.mov_reg_reg(Reg::rbp, Reg::rsp);
         e.sub_reg_imm32(Reg::rsp, thf.frame.frame_size);
         e.store_reg_mem(Reg::rbp, thf.frame.rbx_save_offset, Reg::rbx);
+        // Stage 3: save additional callee-saved registers used by the regalloc.
+        // rbx is already saved above; skip it. The save offsets are in
+        // thf.ra.save_offsets (parallel to thf.ra.used_reg_ids).
+        if (ra && ra->enabled) {
+            for (size_t i = 0; i < ra->used_reg_ids.size(); ++i) {
+                Reg r = Reg(ra->used_reg_ids[i]);
+                if (r == Reg::rbx) continue;  // already saved
+                e.store_reg_mem(Reg::rbp, ra->save_offsets[i], r);
+            }
+        }
     }
     void emit_epilogue() {
+        // Stage 3: restore callee-saved registers used by the regalloc (rbx below).
+        if (ra && ra->enabled) {
+            for (size_t i = 0; i < ra->used_reg_ids.size(); ++i) {
+                Reg r = Reg(ra->used_reg_ids[i]);
+                if (r == Reg::rbx) continue;  // restored below
+                e.load_reg_mem(r, Reg::rbp, ra->save_offsets[i]);
+            }
+        }
         e.load_reg_mem(Reg::rbx, Reg::rbp, thf.frame.rbx_save_offset);
         e.mov_reg_reg(Reg::rsp, Reg::rbp);
         e.pop(Reg::rbp);
@@ -842,11 +946,7 @@ struct EmitCtx {
         case ThinOp::ConstInt:
             e.mov_reg_imm64(Reg::rax, in.imm.i);
             record_dst_rax(in.dst, in.meta.type);
-            if (in.meta.frame_off != 0) {
-                normalize_rax(in.meta.type);
-                store_rax_to_rbp(e, in.meta.frame_off);
-                if (in.dst != 0) { vregs[in.dst].frame_off = in.meta.frame_off; }
-            }
+            pin_int_dst(in.dst, in.meta, in.meta.type);
             break;
         case ThinOp::ConstFloat: {
             if (in.meta.is_f32) {
@@ -869,10 +969,7 @@ struct EmitCtx {
         case ThinOp::ConstBool:
             e.mov_reg_imm64(Reg::rax, in.imm.i ? 1 : 0);
             record_dst_rax(in.dst, in.meta.type);
-            if (in.meta.frame_off != 0) {
-                store_rax_to_rbp(e, in.meta.frame_off);
-                if (in.dst != 0) vregs[in.dst].frame_off = in.meta.frame_off;
-            }
+            pin_int_dst(in.dst, in.meta, in.meta.type);
             break;
         case ThinOp::ConstStringRef: {
             // slice ABI: rax=ptr (rodata base + addend), rdx=len
@@ -972,10 +1069,7 @@ struct EmitCtx {
                 load_int_vreg(in.src1);
                 normalize_rax(ty);
                 record_dst_rax(in.dst, ty);
-                if (in.meta.frame_off != 0 && in.dst != 0) {
-                    store_rax_to_rbp(e, in.meta.frame_off);
-                    vregs[in.dst].frame_off = in.meta.frame_off;
-                }
+                pin_int_dst(in.dst, in.meta, ty);
             }
             break;
         }
@@ -1179,10 +1273,7 @@ struct EmitCtx {
             e.byte(0x48); e.byte(0xF7); e.byte(0xD8);
             normalize_rax(in.meta.type);
             record_dst_rax(in.dst, in.meta.type);
-            if (in.meta.frame_off != 0 && in.dst != 0) {
-                store_rax_to_rbp(e, in.meta.frame_off);
-                vregs[in.dst].frame_off = in.meta.frame_off;
-            }
+            pin_int_dst(in.dst, in.meta, in.meta.type);
             break;
         }
         case ThinOp::Not: {
@@ -1192,10 +1283,7 @@ struct EmitCtx {
             e.byte(0x0F); e.byte(0x94); e.byte(0xC0); // sete al
             e.byte(0x48); e.byte(0x0F); e.byte(0xB6); e.byte(0xC0); // movzx rax,al
             record_dst_rax(in.dst, in.meta.type);
-            if (in.meta.frame_off != 0 && in.dst != 0) {
-                store_rax_to_rbp(e, in.meta.frame_off);
-                vregs[in.dst].frame_off = in.meta.frame_off;
-            }
+            pin_int_dst(in.dst, in.meta, in.meta.type);
             break;
         }
         case ThinOp::BitNot: {
@@ -1204,10 +1292,7 @@ struct EmitCtx {
             e.byte(0x48); e.byte(0xF7); e.byte(0xD0);
             normalize_rax(in.meta.type);
             record_dst_rax(in.dst, in.meta.type);
-            if (in.meta.frame_off != 0 && in.dst != 0) {
-                store_rax_to_rbp(e, in.meta.frame_off);
-                vregs[in.dst].frame_off = in.meta.frame_off;
-            }
+            pin_int_dst(in.dst, in.meta, in.meta.type);
             break;
         }
 
@@ -1510,10 +1595,7 @@ struct EmitCtx {
         }
         normalize_rax(ty);
         record_dst_rax(in.dst, ty);
-        if (in.meta.frame_off != 0 && in.dst != 0) {
-            store_rax_to_rbp(e, in.meta.frame_off);
-            vregs[in.dst].frame_off = in.meta.frame_off;
-        }
+        pin_int_dst(in.dst, in.meta, ty);
     }
 
     // ─── integer div/mod (emit_integer_divmod with src materialization) ───
@@ -1534,10 +1616,7 @@ struct EmitCtx {
         emit_integer_divmod(want_mod, is_unsigned);
         normalize_rax(in.meta.type);
         record_dst_rax(in.dst, in.meta.type);
-        if (in.meta.frame_off != 0 && in.dst != 0) {
-            store_rax_to_rbp(e, in.meta.frame_off);
-            vregs[in.dst].frame_off = in.meta.frame_off;
-        }
+        pin_int_dst(in.dst, in.meta, in.meta.type);
     }
 
     // ─── float binary op (sub rsp,8 / movsd + SSE op, matching the tree-walker) ───
@@ -1670,10 +1749,7 @@ struct EmitCtx {
         // result is bool (no normalize needed; setcc+movzx yields 0/1)
         record_dst_rax(in.dst, in.meta.type ? in.meta.type : &type_bool());
         if (in.dst != 0 && in.meta.type) vregs[in.dst].type = in.meta.type;
-        if (in.meta.frame_off != 0 && in.dst != 0) {
-            store_rax_to_rbp(e, in.meta.frame_off);
-            vregs[in.dst].frame_off = in.meta.frame_off;
-        }
+        pin_int_dst(in.dst, in.meta, in.meta.type ? in.meta.type : &type_bool());
     }
 
     // ─── short-circuit logical (LAnd / LOr) ───
@@ -1697,10 +1773,7 @@ struct EmitCtx {
         e.mov_reg_imm64(Reg::rax, 1); e.bind(done);
         record_dst_rax(in.dst, in.meta.type ? in.meta.type : &type_bool());
         if (in.dst != 0 && in.meta.type) vregs[in.dst].type = in.meta.type;
-        if (in.meta.frame_off != 0 && in.dst != 0) {
-            store_rax_to_rbp(e, in.meta.frame_off);
-            vregs[in.dst].frame_off = in.meta.frame_off;
-        }
+        pin_int_dst(in.dst, in.meta, in.meta.type ? in.meta.type : &type_bool());
     }
 
     // ─── cast (int<->int width, int<->float, f32<->f64) ───
@@ -1715,20 +1788,14 @@ struct EmitCtx {
             // same-type: just move
             load_int_vreg(in.src1);
             record_dst_rax(in.dst, to);
-            if (in.meta.frame_off != 0 && in.dst != 0) {
-                store_rax_to_rbp(e, in.meta.frame_off);
-                vregs[in.dst].frame_off = in.meta.frame_off;
-            }
+            pin_int_dst(in.dst, in.meta, to);
             return;
         }
         if (plain_from_int && plain_to_int) {
             load_int_vreg(in.src1);
             normalize_rax(to);
             record_dst_rax(in.dst, to);
-            if (in.meta.frame_off != 0 && in.dst != 0) {
-                store_rax_to_rbp(e, in.meta.frame_off);
-                vregs[in.dst].frame_off = in.meta.frame_off;
-            }
+            pin_int_dst(in.dst, in.meta, to);
             return;
         }
         if (from && to && from->is_float() && to->is_float()) {
@@ -1760,10 +1827,7 @@ struct EmitCtx {
             e.byte(from->prim == Prim::F64 ? 0xF2 : 0xF3); e.byte(0x48); e.byte(0x0F); e.byte(0x2C); e.byte(0xC0); // cvttsd2si/cvtss2si
             normalize_rax(to);
             record_dst_rax(in.dst, to);
-            if (in.meta.frame_off != 0 && in.dst != 0) {
-                store_rax_to_rbp(e, in.meta.frame_off);
-                vregs[in.dst].frame_off = in.meta.frame_off;
-            }
+            pin_int_dst(in.dst, in.meta, to);
             return;
         }
         // unknown cast: trap (mirrors the tree-walker's assert)
@@ -1843,18 +1907,24 @@ struct EmitCtx {
             // normalize narrow integer returns at the call boundary
             if (in.ret_type && in.ret_type->is_int()) normalize_rax(in.ret_type);
             record_dst_rax(in.dst, in.ret_type);
-            if (in.meta.frame_off != 0) {
-                if (in.ret_type && in.ret_type->is_float()) {
+            if (in.ret_type && in.ret_type->is_float()) {
+                // float result: frame-slot path (regalloc v1: floats not register candidates)
+                if (in.meta.frame_off != 0) {
                     store_xmm0_to_rbp(e, in.meta.frame_off, in.ret_type);
-                } else if (in.ret_type && in.ret_type->is_slice) {
+                    vregs[in.dst].frame_off = in.meta.frame_off;
+                }
+            } else if (in.ret_type && in.ret_type->is_slice) {
+                // slice result: frame-slot path (regalloc v1: slices not register candidates)
+                if (in.meta.frame_off != 0) {
                     e.store_reg_mem(Reg::rbp, in.meta.frame_off, Reg::rax);
                     e.store_reg_mem(Reg::rbp, in.meta.frame_off + 8, Reg::rdx);
                     vregs[in.dst + 1].frame_off = in.meta.frame_off + 8;
                     vregs[in.dst + 1].type = in.ret_type;
-                } else {
-                    store_rax_to_rbp(e, in.meta.frame_off);
+                    vregs[in.dst].frame_off = in.meta.frame_off;
                 }
-                vregs[in.dst].frame_off = in.meta.frame_off;
+            } else {
+                // int/bool result: pin to regalloc home (register or frame slot)
+                pin_int_dst(in.dst, in.meta, in.ret_type);
             }
         }
     }

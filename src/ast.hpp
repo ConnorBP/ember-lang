@@ -56,6 +56,16 @@ struct Type {
     // hatch — so a cross-module handle can still be passed to a `fn`-typed
     // parameter and called (the runtime guard routes on bit 63, not the type).
     bool is_cross_module_handle = false;
+    // Lambdas with by-value capture (#20): a lambda value is a 16-byte pair
+    // {fn_slot:i64, env_ptr:i64} — the same two-word ABI as a slice {ptr,len}.
+    // recorded_params/recorded_ret carry the lambda's DECLARED signature
+    // (the user-visible params, NOT the hidden env param); has_recorded_sig is
+    // always true for a lambda type. is_lambda makes the type 16 bytes
+    // (byte_size/align/words_for_type treat it like a slice) so the existing
+    // slice store/load/call-arg machinery handles the pair with zero new
+    // storage code. A lambda-typed local is called via a dedicated call path
+    // (sema sets is_lambda_call) that passes env_ptr as the hidden first arg.
+    bool is_lambda = false;
 
     bool is_int() const;            // any i*/u*
     bool is_uint() const;          // any u*
@@ -205,7 +215,17 @@ struct CallExpr : Expr { std::string name; std::vector<ExprPtr> args;
                          // `call [dispatch_base + handle*8]`. Mutually exclusive with
                          // is_native / script_slot / module_alias being set (sema asserts).
                          ExprPtr indirect_target;
-                         bool is_indirect = false; };
+                         bool is_indirect = false;
+                         // Lambda call (#20): `f(args)` where f is a lambda-typed
+                         // local. Sema sets is_lambda_call + moves the lambda Ident
+                         // into lambda_target. Codegen loads the 16-byte value
+                         // {slot, env_ptr}, prepends env_ptr as the hidden first
+                         // arg (the synthetic fn's __env param), validates the slot
+                         // via the existing call-target guard, and dispatches
+                         // through the dispatch table. Mutually exclusive with
+                         // is_native / script_slot / module_alias / is_indirect.
+                         ExprPtr lambda_target;
+                         bool is_lambda_call = false; };
 struct IndexExpr: Expr { ExprPtr base, index;
                          // compile-time bounds folding (sema.cpp's IndexExpr
                          // check): set when `index` folded to a compile-time
@@ -243,6 +263,7 @@ struct ArrayLit : Expr { std::vector<ExprPtr> elements; };
 // at sema.cpp's SwitchStmt requires an IntLit by the time check_expr
 // returns, so the rewrite happens in sema, not as a codegen pre-pass).
 struct EnumAccessExpr : Expr { std::string enum_name; std::string variant; };
+// LambdaExpr is defined below (after Param) — it carries declared params.
 
 // statements
 struct Stmt : Node {};
@@ -322,6 +343,11 @@ struct MatchStmt : Stmt { ExprPtr subject; std::vector<MatchArm> arms; };
 // host-level caller to handle it, exactly like a runtime_error).
 struct TryCatchStmt : Stmt { Block try_body; std::string catch_name; Block catch_body; };
 struct ThrowStmt    : Stmt { ExprPtr value; };
+// Coroutines / yield (#21): `yield expr;` suspends the coroutine and emits
+// `expr` as the next() value. Sema marks a fn containing yield as a coroutine
+// (FuncDecl::is_coroutine). The yield value's type must match the coroutine's
+// yield type (FuncDecl::coroutine_yield_type). value is null for a void yield.
+struct YieldStmt : Stmt { ExprPtr value; };
 struct StaticAssertStmt : Stmt { ExprPtr cond; std::string msg; };
 
 // Tier 1 namespace: `namespace Name { fn... global... struct... enum... }`.
@@ -354,6 +380,27 @@ struct Param { std::string name; std::shared_ptr<Type> ty; DefaultValue default_
 struct Annotation { std::string name; std::vector<std::string> args; };
 struct FieldDecl { std::string name; std::shared_ptr<Type> ty; };
 
+// Lambda expression `fn(params) -> ret { body }` (#20, by-value capture).
+// The parser creates a synthetic FuncDecl `__lambda_N` for the body (added to
+// prog.funcs so it gets a dispatch slot + is compiled), and the LambdaExpr
+// references it by name. Sema determines the captures (outer-scope vars
+// referenced in the body), builds the env layout, prepends a hidden `__env`
+// i64 param to the synthetic fn, and stamps the slot. Codegen materializes the
+// env (a frame temp holding the captured values) at the creation site and
+// emits the 16-byte value {slot, env_ptr}. captures/capture_types/
+// capture_offsets/env_size are filled by sema; codegen of the synthetic fn
+// reads them to load captures from [env_ptr + offset].
+struct LambdaExpr : Expr {
+    std::vector<Param> params;          // declared params (NOT the hidden env param)
+    std::shared_ptr<Type> ret;          // declared return type
+    std::string synthetic_fn_name;      // the `__lambda_N` fn in prog.funcs (owns the body)
+    int slot = -1;                      // sema: dispatch slot of the synthetic fn
+    std::vector<std::string> captures;              // capture names in env order (sema)
+    std::vector<std::shared_ptr<Type>> capture_types;// capture types (sema)
+    std::vector<int32_t> capture_offsets;            // byte offsets within env (sema)
+    int32_t env_size = 0;                             // total env bytes (sema)
+};
+
 struct FuncDecl {
     std::string name;
     std::vector<Param> params;
@@ -384,6 +431,25 @@ struct FuncDecl {
     // CAN be const-evaluated, not one that MUST be. If any arg is not
     // constant, the call is left as a normal runtime call (no error).
     bool is_constexpr = false;
+    // Lambdas with by-value capture (#20): this fn is a lambda body (a
+    // synthetic `__lambda_N` created by the parser). params[0] is the hidden
+    // `__env` i64 pointer (prepended by sema); params[1..] are the declared
+    // params. The capture metadata lets codegen load captures from
+    // [env_ptr + offset] when compiling this fn's body. Set by sema when it
+    // processes the corresponding LambdaExpr.
+    bool is_lambda = false;
+    std::vector<std::string> lambda_captures;              // capture names in env order
+    std::vector<std::shared_ptr<Type>> lambda_capture_types;// capture types
+    std::vector<int32_t> lambda_capture_offsets;           // byte offsets within env
+    int32_t env_size = 0;                                  // total env bytes
+    // Coroutines / yield (#21): a fn containing `yield` is a coroutine. A
+    // coroutine is called via a special path that returns a coroutine handle;
+    // next() resumes it. is_coroutine is set by sema when it detects a yield.
+    // coroutine_yield_type is the type yielded by `yield expr;` (the value
+    // next() returns). The fn's ret type is the final-return type (what a
+    // plain `return` produces; a finished coroutine yields no more values).
+    bool is_coroutine = false;
+    std::shared_ptr<Type> coroutine_yield_type;
 };
 
 struct StructDecl {

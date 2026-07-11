@@ -17,6 +17,7 @@ enum class Tk : uint16_t {
     Kw_if, Kw_else, Kw_while, Kw_do, Kw_for, Kw_switch, Kw_case, Kw_default,
     Kw_break, Kw_continue, Kw_return, Kw_as, Kw_auto, Kw_in,
     Kw_try, Kw_catch, Kw_throw,
+    Kw_yield,
     Kw_true, Kw_false,
     Kw_sizeof, Kw_offsetof,
     Kw_link, Kw_enum, Kw_match, Kw_static_assert, Kw_namespace,

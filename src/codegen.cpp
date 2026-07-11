@@ -5,6 +5,7 @@
 #include "peephole.hpp"  // Stage 1: post-emit peephole pipeline (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4.5)
 #include "thin_lower.hpp"  // Stage A c2: AST -> ThinFunction lowering (the IR-backend path)
 #include "thin_emit.hpp"   // Stage A c3: ThinFunction -> x86-64 emit (the IR-backend path)
+#include "regalloc.hpp"    // Stage 3: linear-scan register allocation (post-pass, pre-emit)
 #include "ember_pass.hpp"  // Stage C: EmberPassManager (run IR optimization passes)
 #include <cassert>
 #include <cstring>
@@ -129,6 +130,14 @@ struct CG {
     int max_args = 0;
     std::vector<uint8_t> rodata;
     std::string non_serializable_reason;
+    // #20 lambda capture map (set when compiling a synthetic lambda fn):
+    // capture name -> (byte offset within env, type). The env_ptr is the
+    // __env param (params[0]), whose frame slot is in `locals["__env"]`.
+    // The Ident eval loads a capture as: load env_ptr from [rbp+__env_off],
+    // then load the value at [env_ptr + offset].
+    bool compiling_lambda = false;
+    std::unordered_map<std::string, std::pair<int32_t, const Type*>> lambda_captures;
+    int32_t lambda_env_off = 0;  // frame slot offset of the __env param
     struct PendingNative {
         CompiledNativeBinding binding;
         void* target = nullptr; // JIT-only; never serialized
@@ -173,6 +182,7 @@ struct CG {
     static int32_t value_bytes(const Type* t, const StructLayoutTable* structs) {
         if (!t) return 8;
         if (t->is_slice) return 16;
+        if (t->is_lambda) return 16;            // {fn_slot, env_ptr} (#20)
         if (t->array_len > 0)
             return int32_t(t->array_len) * value_bytes(t->elem.get(), structs);
         if (!t->struct_name.empty() && structs) {
@@ -190,7 +200,7 @@ struct CG {
     // Local scalar slots remain word-sized; aggregates use their exact,
     // recursively computed Ember extent.
     static int32_t local_width_bytes(const Type* t, const StructLayoutTable* structs) {
-        if (t && (t->is_slice || t->array_len > 0 ||
+        if (t && (t->is_slice || t->is_lambda || t->array_len > 0 ||
                   (!t->struct_name.empty() && structs && structs->count(t->struct_name))))
             return value_bytes(t, structs);
         return 8;
@@ -204,6 +214,7 @@ struct CG {
     // copy the words from, never an arbitrary expression to evaluate).
     static int32_t words_for_type(const Type* t, const StructLayoutTable* structs) {
         if (t && t->is_slice) return 2;
+        if (t && t->is_lambda) return 2;        // {fn_slot, env_ptr} (#20)
         if (t && !t->struct_name.empty() && structs) {
             auto it = structs->find(t->struct_name);
             if (it != structs->end()) return (it->second.size + 7) / 8;
@@ -814,6 +825,14 @@ struct CG {
         if (auto* fx = dynamic_cast<const FieldExpr*>(&ex)) { count_struct_temps_expr(*fx->base, total); return; }
         if (auto* v = dynamic_cast<const ViewExpr*>(&ex)) { count_struct_temps_expr(*v->base, total); return; }
         if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) count_struct_temps_expr(*kv.second, total); return; }
+        // #20: a LambdaExpr allocs a __envtmp$N frame temp of env_size bytes
+        // (rounded up to 8). Count it so the frame is sized to hold the env.
+        if (auto* le = dynamic_cast<const LambdaExpr*>(&ex)) {
+            if (le->env_size > 0) total += int32_t((le->env_size + 7) & ~7);
+            return;
+        }
+        // a nested lambda's body is a separate fn (not in this fn's frame);
+        // FnHandleExpr/EnumAccessExpr/IntLit/etc: no temps.
     }
 
     // Chunk c2: pre-count the total frame bytes needed for array-literal
@@ -1172,7 +1191,7 @@ struct CG {
             return;
         }
         eval(value);
-        if (t && t->is_slice) {
+        if (t && (t->is_slice || t->is_lambda)) {
             e.store_reg_mem(dst, off, Reg::rax);
             e.store_reg_mem(dst, off + 8, Reg::rdx);
         } else if (t && t->prim == Prim::F64) e.movsd_mem_xmm(dst, off, Xmm::xmm0);
@@ -1798,6 +1817,67 @@ void CG::eval(const Expr& ex) {
         e.mov_reg_imm64(Reg::rax, lit->v);
         return;
     }
+    // #20 lambda expression: materialize the env (a frame temp holding the
+    // captured values copied from the enclosing scope) + emit the 16-byte
+    // lambda value {slot, env_ptr} as rax=slot, rdx=env_ptr (the slice ABI).
+    if (auto* le = dynamic_cast<const LambdaExpr*>(&ex)) {
+        // Materialize the env: a compiler-hidden frame temp of env_size bytes.
+        // Each capture (a scalar, 8 bytes) is copied from its enclosing-scope
+        // local into env[capture_offsets[i]]. The env_ptr is the temp's address.
+        // (v1: stack-allocated env — the lambda must not outlive this frame.)
+        int32_t env_off = 0;
+        if (le->env_size > 0) {
+            // alloc a frame temp sized to env_size (rounded up to a local slot)
+            std::string name = "__envtmp$" + std::to_string(temp_counter++);
+            // use a fixed-array-of-u8 backing type to reserve env_size bytes
+            auto bt = std::make_shared<Type>(make_prim(Prim::U8));
+            Type t; t.prim = Prim::U8; t.array_len = uint32_t((le->env_size + 7) & ~7); t.elem = bt;
+            arr_temp_types.push_back(std::make_shared<Type>(std::move(t)));
+            env_off = alloc_local(name, arr_temp_types.back().get());
+            // copy each capture from its enclosing-scope local into the env
+            for (size_t i = 0; i < le->captures.size(); ++i) {
+                int32_t dst = env_off + le->capture_offsets[i];
+                // the capture is an Ident in the enclosing scope; load it into
+                // rax (int) or xmm0 (float) + store to env. v1: scalars only.
+                const std::string& cname = le->captures[i];
+                const Type* ct = le->capture_types[i].get();
+                auto cit = locals.find(cname);
+                if (cit == locals.end()) {
+                    // capture is a global (shouldn't happen for v1 — globals
+                    // aren't captured) or unresolvable; zero-fill the slot.
+                    e.mov_reg_imm64(Reg::rax, 0);
+                    e.store_rax_elem(Reg::rbp, dst, 8);
+                    continue;
+                }
+                if (ct && ct->is_float()) {
+                    if (ct->prim == Prim::F64) e.movsd_xmm_mem(Xmm::xmm0, Reg::rbp, cit->second);
+                    else e.movss_xmm_mem(Xmm::xmm0, Reg::rbp, cit->second);
+                    // store xmm0 to env slot (as an 8-byte slot — f64 fills it;
+                    // f32 zero-extends via movsd of a zeroed reg is overkill,
+                    // just store the low 4 bytes + zero the upper 4)
+                    if (ct->prim == Prim::F64) e.movsd_mem_xmm(Reg::rbp, dst, Xmm::xmm0);
+                    else { e.movss_mem_xmm(Reg::rbp, dst, Xmm::xmm0); }
+                } else {
+                    e.load_reg_mem(Reg::rax, Reg::rbp, cit->second);
+                    normalize_rax(ct);
+                    e.store_rax_elem(Reg::rbp, dst, 8);
+                }
+            }
+        }
+        // rax = slot (the synthetic fn's dispatch slot)
+        e.mov_reg_imm64(Reg::rax, int64_t(le->slot));
+        // rdx = env_ptr = lea [rbp + env_off] (0 if no env)
+        if (le->env_size > 0) {
+            // lea rdx, [rbp + env_off]  (env_off is negative)
+            e.mov_reg_reg(Reg::rdx, Reg::rbp);
+            e.add_reg_imm32(Reg::rdx, env_off);
+        } else {
+            e.mov_reg_imm64(Reg::rdx, 0);
+        }
+        if (non_serializable_reason.empty())
+            non_serializable_reason = "lambda env is a stack-frame-local allocation";
+        return;
+    }
     if (auto* lit = dynamic_cast<const FloatLit*>(&ex)) {
         if (ex.ty && ex.ty->prim == Prim::F64) {
             uint64_t bits; std::memcpy(&bits, &lit->v, 8);
@@ -1815,6 +1895,28 @@ void CG::eval(const Expr& ex) {
         return;
     }
     if (auto* id = dynamic_cast<const Ident*>(&ex)) {
+        // #20 lambda capture: if compiling a lambda fn + this name is a
+        // capture, load env_ptr from the __env param's frame slot, then load
+        // the value at [env_ptr + offset]. v1: captures are scalars (int or
+        // float), 8 bytes each.
+        if (compiling_lambda) {
+            auto cit = lambda_captures.find(id->name);
+            if (cit != lambda_captures.end()) {
+                int32_t env_off = cit->second.first;
+                const Type* ct = cit->second.second;
+                // load env_ptr from [rbp + lambda_env_off] into rax
+                e.load_reg_mem(Reg::rax, Reg::rbp, lambda_env_off);
+                // load the value at [rax + env_off]
+                if (ct && ct->is_float()) {
+                    if (ct->prim == Prim::F64) e.movsd_xmm_mem(Xmm::xmm0, Reg::rax, env_off);
+                    else e.movss_xmm_mem(Xmm::xmm0, Reg::rax, env_off);
+                } else {
+                    e.load_reg_mem(Reg::rax, Reg::rax, env_off);
+                    normalize_rax(ct);
+                }
+                return;
+            }
+        }
         // Item E ("hot local pinning") fast path: if this name is the
         // currently-active pin, read straight from its register instead of
         // reloading from [rbp+off] - strictly cheaper, and always safe
@@ -1832,9 +1934,10 @@ void CG::eval(const Expr& ex) {
         auto it = locals.find(id->name);
         if (it != locals.end()) {
             const Type* t = local_types[id->name];
-            if (t->is_slice) {
-                // slice ABI: rax=ptr ([off]), rdx=len ([off+8]) - the two-
-                // register convention CallExpr/LetStmt/AssignExpr all share.
+            if (t->is_slice || t->is_lambda) {
+                // slice/lambda ABI: rax=word0 ([off]), rdx=word1 ([off+8]) -
+                // the two-register convention CallExpr/LetStmt/AssignExpr share.
+                // For a slice: {ptr, len}. For a lambda (#20): {slot, env_ptr}.
                 e.load_reg_mem(Reg::rax, Reg::rbp, it->second);
                 e.load_reg_mem(Reg::rdx, Reg::rbp, it->second + 8);
             } else if (t->prim == Prim::F64) { e.movsd_xmm_mem(Xmm::xmm0, Reg::rbp, it->second); }
@@ -2388,7 +2491,7 @@ void CG::eval(const Expr& ex) {
             auto it = locals.find(id->name);
             if (it != locals.end()) {
                 const Type* t = local_types[id->name];
-                if (t->is_slice) {
+                if (t->is_slice || t->is_lambda) {
                     e.store_reg_mem(Reg::rbp, it->second, Reg::rax);
                     e.store_reg_mem(Reg::rbp, it->second + 8, Reg::rdx);
                 } else if (t->is_float()) store_xmm0_to_rbp(*this, it->second, t);
@@ -2567,6 +2670,114 @@ void CG::eval(const Expr& ex) {
         // sema turns that into a compile error instead (see CallExpr::elided
         // in ast.hpp and the assert_eq_* folding in sema.cpp's CallExpr case).
         if (c->elided) return;
+        // #20 lambda call: `f(args)` where f is a lambda-typed value {slot,
+        // env_ptr}. Load the 16-byte value, prepend env_ptr as the hidden
+        // first arg (the synthetic fn's __env param), then stash the user
+        // args, validate the slot via the call-target guard, + dispatch via
+        // `call [dispatch_base + slot*8]`. (No receiver for a lambda call —
+        // sema only sets is_lambda_call for a bare-name lambda local.)
+        if (c->is_lambda_call) {
+            // eval the lambda target -> rax=slot, rdx=env_ptr (the slice ABI).
+            eval(*c->lambda_target);
+            // We need the slot (rax) + env_ptr (rdx) to survive the arg stash
+            // + depth check. Stash both into the arg-temp region FIRST:
+            //   [rsp+0]        = env_ptr (arg word 0, the __env param)
+            //   [rsp+8..]      = user args (arg words 1..n)
+            //   [rsp+8+n*8]    = slot (scratch, past the arg slots)
+            //   [rsp+16+n*8..] = shadow space
+            int nuser = int(c->args.size());
+            int32_t slot_scratch_off = 8 + nuser * 8;       // past env + user args
+            int32_t outgoing = std::max(0, (nuser + 1) - 4) * 8;  // env+nuser words, 4 in regs
+            int32_t total = round16(slot_scratch_off + 8 + 32 + outgoing);
+            e.sub_reg_imm32(Reg::rsp, total);
+            // stash env_ptr at [rsp+0], slot at [rsp+slot_scratch_off]
+            e.store_reg_mem(Reg::rsp, 0, Reg::rdx);                 // env_ptr -> arg word 0
+            e.store_reg_mem(Reg::rsp, slot_scratch_off, Reg::rax);  // slot -> scratch
+            // stash each user arg to its word slot [rsp+8 + i*8]
+            for (int i = 0; i < nuser; ++i) {
+                eval(*c->args[size_t(i)]);
+                const Type* at = c->args[size_t(i)]->ty;
+                int32_t off = 8 + i * 8;
+                if (at && at->is_slice) {
+                    // a slice arg is 2 words (ptr, len)
+                    e.store_reg_mem(Reg::rsp, off, Reg::rax);
+                    e.store_reg_mem(Reg::rsp, off + 8, Reg::rdx);
+                } else if (at && at->is_lambda) {
+                    e.store_reg_mem(Reg::rsp, off, Reg::rax);
+                    e.store_reg_mem(Reg::rsp, off + 8, Reg::rdx);
+                } else if (at && at->is_float()) {
+                    if (at->prim == Prim::F64) e.movsd_mem_xmm(Reg::rsp, off, Xmm::xmm0);
+                    else e.movss_mem_xmm(Reg::rsp, off, Xmm::xmm0);
+                } else {
+                    e.store_reg_mem(Reg::rsp, off, Reg::rax);
+                }
+            }
+            // total words = env(1) + user words (a slice/lambda user arg = 2)
+            int total_words = 1;  // env_ptr
+            for (int i = 0; i < nuser; ++i) {
+                const Type* at = c->args[size_t(i)]->ty;
+                total_words += (at && (at->is_slice || at->is_lambda)) ? 2 : 1;
+            }
+            // Build a flat word list mapping (which stash offset each word loads).
+            // word_stash_off[w] = stash offset for word w; word_is_float[w], word_is_f64[w]
+            std::vector<int32_t> word_stash_off;
+            std::vector<bool> w_is_float, w_is_f64;
+            word_stash_off.push_back(0); w_is_float.push_back(false); w_is_f64.push_back(false);  // env_ptr
+            for (int i = 0; i < nuser; ++i) {
+                const Type* at = c->args[size_t(i)]->ty;
+                int32_t base = 8 + i * 8;
+                if (at && (at->is_slice || at->is_lambda)) {
+                    word_stash_off.push_back(base);     w_is_float.push_back(false); w_is_f64.push_back(false);
+                    word_stash_off.push_back(base + 8); w_is_float.push_back(false); w_is_f64.push_back(false);
+                } else if (at && at->is_float()) {
+                    word_stash_off.push_back(base); w_is_float.push_back(true); w_is_f64.push_back(at->prim == Prim::F64);
+                } else {
+                    word_stash_off.push_back(base); w_is_float.push_back(false); w_is_f64.push_back(false);
+                }
+            }
+            int nwords = int(word_stash_off.size());
+            (void)total_words;
+            // reload the slot into rax, run the provenance guard BEFORE placing
+            // args in registers (the guard clobbers rcx + r11; args are stashed
+            // on the stack + reloaded into regs AFTER the guard, like the normal
+            // indirect-call path).
+            emit_depth_check();
+            e.load_reg_mem(Reg::rax, Reg::rsp, slot_scratch_off);  // reload slot
+            emit_call_target_guard();
+            // place words 0..3 into registers. word 0 = env_ptr (always int).
+            static const Reg int_regs[4] = {Reg::rcx, Reg::rdx, Reg::r8, Reg::r9};
+            static const Xmm flt_regs[4] = {Xmm::xmm0, Xmm::xmm1, Xmm::xmm2, Xmm::xmm3};
+            for (int w = 0; w < nwords && w < 4; ++w) {
+                if (w_is_float[size_t(w)]) {
+                    if (w_is_f64[size_t(w)]) e.movsd_xmm_mem(flt_regs[w], Reg::rsp, word_stash_off[size_t(w)]);
+                    else e.movss_xmm_mem(flt_regs[w], Reg::rsp, word_stash_off[size_t(w)]);
+                } else {
+                    e.load_reg_mem(int_regs[w], Reg::rsp, word_stash_off[size_t(w)]);
+                }
+            }
+            // words 4+ -> outgoing stack args
+            for (int w = 4; w < nwords; ++w) {
+                int32_t dst = slot_scratch_off + 8 + 32 + (w - 4) * 8;
+                if (w_is_float[size_t(w)]) {
+                    if (w_is_f64[size_t(w)]) { e.movsd_xmm_mem(Xmm::xmm4, Reg::rsp, word_stash_off[size_t(w)]); e.movsd_mem_xmm(Reg::rsp, dst, Xmm::xmm4); }
+                    else { e.movss_xmm_mem(Xmm::xmm4, Reg::rsp, word_stash_off[size_t(w)]); e.movss_mem_xmm(Reg::rsp, dst, Xmm::xmm4); }
+                } else {
+                    e.load_reg_mem(Reg::rax, Reg::rsp, word_stash_off[size_t(w)]);
+                    e.store_reg_mem(Reg::rsp, dst, Reg::rax);
+                }
+            }
+            // r11 = [dispatch_base + slot*8]; call r11 (slot still in rax)
+            e.mov_reg_imm64_external(Reg::r11, AbsFixup::DispatchTableBase);
+            e.lea_reg_mem_sib(Reg::r11, Reg::r11, Reg::rax, 3);  // lea r11, [r11 + rax*8]
+            e.load_reg_mem(Reg::r11, Reg::r11, 0);               // mov r11, [r11] (entry)
+            e.call_reg(Reg::r11);
+            emit_depth_leave();
+            e.add_reg_imm32(Reg::rsp, total);
+            if (ex.ty && ex.ty->is_int()) normalize_rax(ex.ty);
+            if (non_serializable_reason.empty())
+                non_serializable_reason = "lambda call requires process-local allowlist storage";
+            return;
+        }
         // Stash args on the STACK (rsp-relative, sub rsp per call) so nested calls
         // (e.g. ackermann(m-1, ackermann(m, n-1))) get a fresh region each - a
         // fixed rbp-relative arg_temps region would let an inner call clobber the
@@ -3425,7 +3636,7 @@ void CG::exec_stmt(const Stmt& s) {
         int32_t off = alloc_local(ls->name, ls->init->ty);
         eval(*ls->init);
         const Type* t = ls->init->ty;
-        if (t->is_slice) {
+        if (t->is_slice || t->is_lambda) {
             e.store_reg_mem(Reg::rbp, off, Reg::rax);
             e.store_reg_mem(Reg::rbp, off + 8, Reg::rdx);
         } else if (t->is_float()) store_xmm0_to_rbp(*this, off, t);
@@ -3488,6 +3699,8 @@ void CG::exec_stmt(const Stmt& s) {
         bool is_float_ret = f.ret && f.ret->is_float();
         bool is_f64_ret = f.ret && f.ret->prim == Prim::F64;
         bool is_slice_ret = f.ret && f.ret->is_slice;
+        bool is_lambda_ret = f.ret && f.ret->is_lambda;  // #20: 16-byte {slot, env_ptr}
+        bool is_two_word_ret = is_slice_ret || is_lambda_ret;
         if (rs->value) {
             eval(*rs->value);
             // float return -> xmm0 (already there if float eval); int -> rax (already)
@@ -3504,7 +3717,7 @@ void CG::exec_stmt(const Stmt& s) {
                     if(is_f64_ret)e.movsd_mem_xmm(Reg::rsp,0,Xmm::xmm0);else e.movss_mem_xmm(Reg::rsp,0,Xmm::xmm0);
                 } else {
                     e.store_reg_mem(Reg::rsp, 0, Reg::rax);
-                    if (is_slice_ret) e.store_reg_mem(Reg::rsp, 8, Reg::rdx);
+                    if (is_two_word_ret) e.store_reg_mem(Reg::rsp, 8, Reg::rdx);
                 }
             }
         }
@@ -3515,7 +3728,7 @@ void CG::exec_stmt(const Stmt& s) {
                     if(is_f64_ret)e.movsd_xmm_mem(Xmm::xmm0,Reg::rsp,0);else e.movss_xmm_mem(Xmm::xmm0,Reg::rsp,0);
                 } else {
                     e.load_reg_mem(Reg::rax, Reg::rsp, 0);
-                    if (is_slice_ret) e.load_reg_mem(Reg::rdx, Reg::rsp, 8);
+                    if (is_two_word_ret) e.load_reg_mem(Reg::rdx, Reg::rsp, 8);
                 }
                 e.add_reg_imm32(Reg::rsp, 16);
             }
@@ -4313,6 +4526,14 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
                     EmberAnalysisManager am;
                     ctx.pass_manager->run(thf, am);
                 }
+                // Stage 3: linear-scan register allocation after the optimization
+                // passes, before emit. Assigns VRegs to callee-saved registers
+                // (rbx/rsi/rdi/r12/r13/r15) instead of frame slots. Value-
+                // preserving: the emit uses the regalloc map to keep values in
+                // registers; spilled VRegs use their existing frame slots.
+                if (ctx.enable_regalloc) {
+                    run_regalloc(thf);
+                }
                 return emit_x64(thf, ctx);
             }
             // empty body / lowering gave up (non_serializable) -> fall through to tree-walker
@@ -4320,6 +4541,19 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
     }
     // ... existing CG tree-walk continues unchanged (default-off path) ...
     CG cg(ctx, f);
+    // #20: if this is a synthetic lambda fn, set up the capture map so the
+    // Ident eval loads captures from [env_ptr + offset]. The __env param is
+    // params[0]; its frame slot is assigned during the param-spill loop below
+    // (recorded into cg.lambda_env_off).
+    if (f.is_lambda) {
+        cg.compiling_lambda = true;
+        for (size_t i = 0; i < f.lambda_captures.size(); ++i) {
+            cg.lambda_captures[f.lambda_captures[i]] = {
+                f.lambda_capture_offsets[i],
+                f.lambda_capture_types[i].get()
+            };
+        }
+    }
     // prescan: find max_args, makes_calls
     cg.prescan_block(f.body);
 
@@ -4510,6 +4744,7 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
         int wcount = CG::words_for_type(pt, ctx.structs);
         bool is_struct = pt && !pt->struct_name.empty() && ctx.structs && ctx.structs->count(pt->struct_name) != 0;
         int32_t off = cg.alloc_local(f.params[i].name, pt);
+        if (f.is_lambda && i == 0) cg.lambda_env_off = off;  // #20: record __env's frame slot
         if (is_struct) {
             // A struct param's byte size is frequently NOT a multiple of 8
             // (e.g. Mixed: i64+f32+u8+bool = 14 bytes, wcount=2 words). The

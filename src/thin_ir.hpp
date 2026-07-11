@@ -95,6 +95,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ember {
@@ -275,6 +276,52 @@ struct ThinFramePlan {
     std::vector<std::string> native_fixup_names;
 };
 
+// Stage 3: the result of linear-scan register allocation over the
+// ThinFunction. Produced by run_regalloc() (src/regalloc.cpp) AFTER the
+// optimization passes and BEFORE emit_x64. The emit reads this map to decide
+// where each VReg lives: a VReg assigned to a register stays in that register
+// (mov reg, rax after each def; mov rax, reg before each use) instead of being
+// spilled to / reloaded from a frame slot. A VReg assigned to a frame slot
+// uses the existing LoadFrame/StoreFrame path (the slot is the VReg's existing
+// meta.frame_off from the lowering's spill-slot pass, so NO new spill slots
+// are allocated by the regalloc).
+//
+// Register pool (Win64 callee-saved, NOT used as scratch by emit_x64):
+//   rbx, rsi, rdi, r12, r13, r15  (r14 is the context reg; avoided)
+// These survive calls (callee-saved ABI) so a VReg in a register is valid
+// across CallNative/CallScript/etc. without caller-side save/restore. The
+// regalloc records which pool registers it used so the emit can save them in
+// the prologue (store to extended frame slots) and restore them in the
+// epilogue. rbx is already saved by the standard prologue (rbx_save_offset);
+// the regalloc does NOT double-save it.
+//
+// ADDITIVE: default-constructed {enabled=false, empty map} — untouched by
+// lower_function / dump / the thin_ir_struct ctest. emit_x64 checks
+// `ra.enabled` and falls back to the all-frame-slot path when false (the
+// existing behavior, byte-identical). The serializer (Stage B) does NOT
+// serialize this — regalloc is a JIT-time pass; a deserialized ThinFunction
+// has ra.enabled=false and re-runs regalloc at load time if the host enables it.
+struct RegAllocResult {
+    bool enabled = false;
+    // VReg -> assignment. Absent = the VReg is NOT a register candidate
+    // (float/slice/struct/non-scalar) and uses its existing frame slot.
+    struct Assign {
+        bool in_reg = false;       // true = lives in a pool register; false = frame slot
+        int32_t reg_id = -1;       // the Reg enum value (when in_reg)
+        int32_t frame_off = 0;     // the spill frame slot (when !in_reg; the VReg's existing meta.frame_off)
+    };
+    std::unordered_map<VReg, Assign> map;
+    // The pool registers actually used (for prologue save / epilogue restore).
+    // Each entry is a Reg enum value. Parallel to save_offsets.
+    std::vector<int32_t> used_reg_ids;
+    // Frame offsets for saving each used register (parallel to used_reg_ids).
+    // These are ABSOLUTE rbp-negative offsets allocated by the regalloc in the
+    // extended frame. rbx is NOT included here (already saved at rbx_save_offset).
+    std::vector<int32_t> save_offsets;
+    // The number of pool registers the allocator is allowed to use (<= pool size).
+    int32_t num_regs = 0;
+};
+
 // One lowered function. blocks[0] is the entry block. rodata holds the
 // function-local string-literal bytes (forwarded to CompiledFn::rodata).
 // abs_fixups is populated by the EMIT (c3), not the lowering (c2) — c3 records
@@ -311,6 +358,11 @@ struct ThinFunction {
     // those). ADDITIVE: default-constructed 0, untouched by lower_function /
     // emit_x64 / dump.
     uint32_t declared_max_vreg = 0;
+    // Stage 3: the linear-scan register allocation result. Populated by
+    // run_regalloc() after the optimization passes; consumed by emit_x64.
+    // ADDITIVE: default-constructed {enabled=false} — emit_x64 checks
+    // ra.enabled and falls back to the all-frame-slot path when false.
+    RegAllocResult ra;
 };
 
 // Debug pretty-printer (src/thin_ir.cpp). Returns a human-readable dump of

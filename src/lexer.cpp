@@ -17,6 +17,7 @@ static const std::unordered_map<std::string, Tk>& keywords() {
         {"break",Tk::Kw_break},{"continue",Tk::Kw_continue},{"return",Tk::Kw_return},
         {"as",Tk::Kw_as},{"auto",Tk::Kw_auto},{"in",Tk::Kw_in},
         {"try",Tk::Kw_try},{"catch",Tk::Kw_catch},{"throw",Tk::Kw_throw},
+        {"yield",Tk::Kw_yield},
         {"true",Tk::Kw_true},{"false",Tk::Kw_false},
         {"sizeof",Tk::Kw_sizeof},{"offsetof",Tk::Kw_offsetof},
         {"link",Tk::Kw_link},
@@ -68,6 +69,7 @@ const char* tok_spelling(Tk k) {
     case Tk::Kw_try: return "try";
     case Tk::Kw_catch: return "catch";
     case Tk::Kw_throw: return "throw";
+    case Tk::Kw_yield: return "yield";
     default: return "kw";
     }
 }

@@ -86,6 +86,12 @@ add_library(ember STATIC
     # dependency. Both em_writer.cpp and em_loader.cpp now #include it.
     src/thin_ir.cpp
     src/em_type_codec.cpp
+    # Stage 3: linear-scan register allocation over the ThinFunction. Runs
+    # after the optimization passes, before emit_x64. Self-contained: touches
+    # Type only via public data members + the Prim enum (same rule as
+    # thin_ir.cpp / thin_ir_ser.cpp), so it stays in the core lib with no
+    # ember_frontend dependency.
+    src/regalloc.cpp
     # Stage B c1b: the ThinFunction serializer/deserializer (thin_ir_ser.{hpp,cpp}).
     # Turns a ThinFunction into an opaque byte blob (the ir_blob a v5 .em
     # per-function record carries) and back. Self-contained: touches Type only
@@ -902,6 +908,19 @@ if(WIN32)
 endif()
 add_test(NAME ir_passes COMMAND ir_passes_test)
 
+# regalloc_test - Stage 3: the linear-scan register allocation value-preservation
+# + register-assignment gate. Compiles register-heavy workloads (recursion,
+# loops, register pressure) WITH and WITHOUT run_regalloc, asserts identical
+# i64 returns, and verifies the regalloc actually assigned VRegs to callee-saved
+# registers. Links ember + ember_frontend (lower_function/emit_x64/run_regalloc).
+add_executable(regalloc_test examples/regalloc_test.cpp)
+target_link_libraries(regalloc_test PRIVATE
+    ember ember_frontend ember_import)
+if(WIN32)
+    target_link_libraries(regalloc_test PRIVATE kernel32)
+endif()
+add_test(NAME regalloc COMMAND regalloc_test)
+
 # aggregate_global_test - pins aggregate globals (chunk c3): struct globals
 # `global cfg : Config = Config{...};`, fixed-array globals `global arr : i64[3]
 # = [10,20,30];`, slice globals `global s : i64[] = [1,2,3];`. Compiles tiny
@@ -935,4 +954,5 @@ set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_a
     v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
     array_lit aggregate_global em_signed codegen_opt thin_ir_struct thin_ir
     thin_ir_ser em_v5_ir em_v5_mixed ember_pass ir_passes ext_map ext_bounds
+    regalloc
     PROPERTIES TIMEOUT 30)

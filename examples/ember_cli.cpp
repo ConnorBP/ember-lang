@@ -520,6 +520,7 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
         }
         ctx.pass_manager = &pass_pm;
         ctx.enable_ir_backend = true;
+        ctx.enable_regalloc = true;  // Stage 3: linear-scan regalloc with --passes
     }
 
     // ---- compile + finalize each function ----

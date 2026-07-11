@@ -181,6 +181,16 @@ struct CodeGenCtx {
     bool enable_peephole = false;
     bool enable_local_regalloc = false;
 
+    // --- Stage 3: linear-scan register allocation over the ThinFunction ---
+    // When true AND enable_ir_backend is true, compile_func runs run_regalloc()
+    // AFTER the optimization passes and BEFORE emit_x64. The regalloc assigns
+    // scalar int/bool VRegs to Win64 callee-saved registers (rbx/rsi/rdi/r12/
+    // r13/r15) instead of frame slots, with linear-scan spilling when all pool
+    // registers are in use. Value-preserving: the emit uses the regalloc map;
+    // spilled VRegs use their existing frame slots. Default false = the IR path
+    // spills every VReg to a frame slot (the Stage A/C behavior, unchanged).
+    bool enable_regalloc = false;
+
     // --- Stage A: thin three-address IR backend (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4.3 Stage 2) ---
     // A compile-time AST -> ThinFunction -> x86 path, alternative to the
     // tree-walker. Default false -> compile_func runs the existing CG tree-walk
