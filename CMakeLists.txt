@@ -715,8 +715,19 @@ if(WIN32)
 endif()
 add_test(NAME aggregate_global COMMAND aggregate_global_test)
 
+# em_v5_mixed_test - D8: v5 mixed-mode (.em with IR + raw-x86 functions in one
+# module). Builds a 2-function v5 module: `add` (is_ir=1, IR blob) + `double`
+# (is_ir=0, raw-x86). Writes v5, loads, calls BOTH, asserts value-equivalence.
+# Covers the mixed is_ir format (audit finding D8).
+add_executable(em_v5_mixed_test examples/em_v5_mixed_test.cpp)
+target_link_libraries(em_v5_mixed_test PRIVATE ember ember_frontend)
+if(WIN32)
+    target_link_libraries(em_v5_mixed_test PRIVATE kernel32)
+endif()
+add_test(NAME em_v5_mixed COMMAND em_v5_mixed_test)
+
 set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
     v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
     array_lit aggregate_global em_signed codegen_opt thin_ir_struct thin_ir
-    thin_ir_ser em_v5_ir ember_pass ir_passes ext_map ext_bounds
+    thin_ir_ser em_v5_ir em_v5_mixed ember_pass ir_passes ext_map ext_bounds
     PROPERTIES TIMEOUT 30)

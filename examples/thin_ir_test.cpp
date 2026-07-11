@@ -636,6 +636,108 @@ int main() {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Part 4: D9 — for-each / match IR-backend fallback to tree-walker.
+    // When enable_ir_backend=true, lower_function marks functions using
+    // ForEachStmt or MatchStmt as non_serializable (blocks cleared), so
+    // compile_func falls through to the tree-walker. This test asserts the
+    // fallback EXECUTES CORRECTLY (right result) and does not crash or
+    // miscompile. Also probes lower_function directly to confirm the
+    // non_serializable flag is set (the fallback trigger).
+    // -----------------------------------------------------------------
+    std::printf("\nPart 4: D9 for-each/match IR-backend fallback\n");
+    {
+        // for-each: sum a slice. Tree-walker result = 150.
+        const char* src =
+            "fn main() -> i64 {\n"
+            "    let a: i64[5] = [10, 20, 30, 40, 50];\n"
+            "    let s: i64[] = a[..];\n"
+            "    let mut sum: i64 = 0;\n"
+            "    for (x in s) { sum = sum + x; }\n"
+            "    return sum;\n"
+            "}\n";
+        auto m = compile(src, /*ir_on=*/true, false, false);
+        ck(m != nullptr, "[D9.1] for-each compile with ir_on=true succeeded");
+        if (m) {
+            int64_t r = call0_i64(*m, "main");
+            ck(r == 150, "[D9.2] for-each fallback result == 150 (tree-walker correct)");
+        }
+        // Probe lower_function directly: the ThinFunction must be non_serializable.
+        {
+            auto lr = tokenize(src, "<d9fe>");
+            if (lr.ok) {
+                auto pr = parse(std::move(lr.toks));
+                if (pr.ok) {
+                    Program prog = std::move(pr.program);
+                    int si = 0; std::unordered_map<std::string,int> slots;
+                    for (auto& fn : prog.funcs) { slots[fn.name]=si++; fn.slot=si-1; }
+                    NativeTable nt; build_natives(nt);
+                    auto layouts = build_struct_layouts(prog);
+                    prog.string_xor_key = 0xA5;
+                    auto sr = sema(prog, nt.natives, slots, 0, &nt.overloads, &layouts);
+                    if (sr.ok) {
+                        const FuncDecl* mf = nullptr;
+                        for (auto& fn : prog.funcs) if (fn.name=="main") { mf=&fn; break; }
+                        if (mf) {
+                            CodeGenCtx ctx; ctx.natives=&nt.natives; ctx.script_slots=&slots;
+                            ctx.structs=&layouts; ctx.enable_ir_backend=true;
+                            ThinFunction thf = lower_function(*mf, ctx);
+                            ck(thf.blocks.empty(), "[D9.3] for-each lower_function blocks empty (fallback triggered)");
+                            ck(thf.non_serializable, "[D9.4] for-each lower_function non_serializable flag set");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    {
+        // match: dispatch on an integer. Tree-walker result = 20.
+        const char* src =
+            "fn main() -> i64 {\n"
+            "    let x: i64 = 2;\n"
+            "    match (x) {\n"
+            "        1 => { return 10; },\n"
+            "        2 => { return 20; },\n"
+            "        3 => { return 30; },\n"
+            "        _ => { return 99; }\n"
+            "    }\n"
+            "    return 0;\n"
+            "}\n";
+        auto m = compile(src, /*ir_on=*/true, false, false);
+        ck(m != nullptr, "[D9.5] match compile with ir_on=true succeeded");
+        if (m) {
+            int64_t r = call0_i64(*m, "main");
+            ck(r == 20, "[D9.6] match fallback result == 20 (tree-walker correct)");
+        }
+        // Probe lower_function directly: the match function must be non_serializable.
+        {
+            auto lr = tokenize(src, "<d9mt>");
+            if (lr.ok) {
+                auto pr = parse(std::move(lr.toks));
+                if (pr.ok) {
+                    Program prog = std::move(pr.program);
+                    int si = 0; std::unordered_map<std::string,int> slots;
+                    for (auto& fn : prog.funcs) { slots[fn.name]=si++; fn.slot=si-1; }
+                    NativeTable nt; build_natives(nt);
+                    auto layouts = build_struct_layouts(prog);
+                    prog.string_xor_key = 0xA5;
+                    auto sr = sema(prog, nt.natives, slots, 0, &nt.overloads, &layouts);
+                    if (sr.ok) {
+                        const FuncDecl* mf = nullptr;
+                        for (auto& fn : prog.funcs) if (fn.name=="main") { mf=&fn; break; }
+                        if (mf) {
+                            CodeGenCtx ctx; ctx.natives=&nt.natives; ctx.script_slots=&slots;
+                            ctx.structs=&layouts; ctx.enable_ir_backend=true;
+                            ThinFunction thf = lower_function(*mf, ctx);
+                            ck(thf.blocks.empty(), "[D9.7] match lower_function blocks empty (fallback triggered)");
+                            ck(thf.non_serializable, "[D9.8] match lower_function non_serializable flag set");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     std::printf("\nthin_ir_test: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }
