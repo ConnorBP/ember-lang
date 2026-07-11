@@ -866,3 +866,81 @@ the measured wins, with the documented slice_bounds regression).
 The design (§4 architecture, §5 pass interface, §6 representation, §7 migration)
 is unchanged; the sections below are the design as written pre-ship, with §4.2/§4.5/§4.7
 updated to mark Stage 1 SHIPPED and record the measured numbers.
+
+**Stage A SHIPPED (2026-07-10).** The thin three-address IR compile-time backend
+— the IL-.em Stage A, the landed Stage-2 stepping stone of §4.3/§4.6 (option (c))
+— shipped behind a flag (`CodeGenCtx::enable_ir_backend`, default off →
+byte-identical to the pre-Stage-A tree-walker; the 27/27 ctest gate — incl. the
+new `thin_ir` + `thin_ir_struct` targets — + 268/0/0 lang gate hold unchanged
+with the flag off; the CLI never sets it, so the default codegen path is the
+unchanged tree-walker). What shipped:
+- `src/thin_ir.{hpp,cpp}` — the IR data structures (`ThinFunction`/
+  `ThinBlock`/`ThinInstr` + the stable `ThinOp` uint16_t enum, the
+  serialization-ready contract Stage B consumes; see the SERIALIZATION BOUNDARY
+  note in `thin_ir.hpp`) + the debug pretty-printer.
+- `src/thin_lower.{hpp,cpp}` — the AST→`ThinFunction` lowering
+  (`lower_function`); a mechanical, value-equivalent mirror of what
+  `CG::eval`/`exec_block`/`compile_func` would emit.
+- `src/thin_emit.{hpp,cpp}` — the `ThinFunction`→x64 emit (`emit_x64`);
+  reproduces the tree-walker's byte sequences keyed off `ThinOp`.
+- `examples/thin_ir_test.cpp` — the correctness gate (modeled on Stage 1's
+  `codegen_opt_test`); `thin_ir_struct` (ctest) pins the IR struct invariants.
+
+**Contract (dual-path; the gate pins both):**
+- **default off = byte-identical tree-walker.** `compile_func` falls through to
+  the existing `CG` tree-walk unchanged; the ctest + lang gates hold (the flag
+  is inert when off — `thin_ir_test` Part 1 pins byte-identity across two
+  off-compiles and against a fresh tree-walker baseline).
+- **on = value-equivalent (NOT byte-identical).** `compile_func` calls
+  `lower_function` then `emit_x64`; the IR path may emit push/pop where the
+  tree-walker used r10, etc. — only the JIT'd *execution* is value-equivalent
+  (`thin_ir_test` Part 2 compiles a corpus both ways and asserts identical i64
+  returns).
+- **composes with `enable_peephole`.** The IR path runs the same post-emit
+  peephole as the tree-walker (Stage 1's `peephole.{hpp,cpp}` operate on the
+  emitted `vector<uint8_t>`, IR-path or tree-walker alike).
+- **obf functions fall back to the tree-walker.** The lowering marks
+  `@obf`/`@obf_keyed`/mba/opaque functions `non_serializable` (the obf
+  transforms are emitter-level with no `ThinOp` representation); the dispatch
+  skips the thin path for them (see `thin_lower.hpp`'s fallback note).
+
+**Honest coverage (the gate records what WORKS and flags what doesn't):**
+
+PASSING the value-equivalence gate (pinned in `thin_ir_test` Part 2, regression
+protection): scalar integer arithmetic + overflow wrap, comparisons (all six
+predicates), short-circuit `&&`/`||`, control flow (if/while/for/do-while/
+switch, break/continue), recursion (fib), script-to-script calls, native calls
+(i64(i64,i64) + math `sqrt`), cast (int width + int↔float), ternary; corpus
+`runtime_audit_semantics` + `runtime_division_forms` (the division forms —
+signed/unsigned Div/Mod + the `INT64_MIN/-1` overflow guard).
+
+KNOWN GAPS (documented as SKIP in `thin_ir_test`, Stage B/C work — NOT silently
+passing, NOT failing the whole gate): slices (index + bounds — the
+element-load is not frame-backed, stale `rax` across a sum), structs
+(by-value arg/return/field/reassign — the hidden word-0 ptr / `CopyBytes` /
+`FieldAddr` ABI has emit-path bugs), strings (native `string_from_slice` +
+inline-XOR decrypt emit bugs), defer-cleanup block emission (segfaults the IR
+path), fixed-array indexed store (`a[expr] = v`). These node classes are
+covered by the lang suite on the default-off (tree-walker) path; the IR path's
+handling of them is the Stage B/C work.
+
+**Foundation framing.** Stage A is the thin-IR *substrate* — correct lowering +
+emit, no optimization (LAZY MODE per `thin_lower.hpp`: no regalloc, no peephole,
+no CSE/DCE/const-prop; those are Stage C IR passes over the `ThinFunction`
+AFTER the lowering produces it). It is the foundation for:
+- **Stage B — `.em` IR serialization (the security property).** The `ThinOp`
+  enum is a stable uint16_t serialization boundary (`thin_ir.hpp`'s
+  SERIALIZATION BOUNDARY note); Stage B serializes the IR verbatim so a `.em`
+  module carries IR (not raw x86), closing the raw-x86 code-injection surface
+  the signed-`.em` work (F2) addresses at the signature layer.
+- **Stage C — IR optimization passes.** CSE/DCE/const-prop/peephole/LICM become
+  `ThinPass`es over the `ThinFunction` (matching on `ThinOp`, not bytes — far
+  less brittle than Stage 1's byte-peephole, per §4.3); the Stage-1 peephole
+  table carries over as IR-pattern rewrites. The Stage-3 upgrade to full
+  SSA-lite (rename + slot-back + liveness + linear-scan) is additive on this
+  instruction set, not a rewrite (§4.3/§4.6).
+
+The design sections (§4 architecture, §5 pass interface, §6 representation, §7
+migration) are unchanged; §4.3/§4.6/§4.7 are the design as written pre-ship (the
+hybrid thin-IR option this Stage-A shipment implements), now with a shipped
+status entry above.

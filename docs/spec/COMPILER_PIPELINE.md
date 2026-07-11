@@ -375,6 +375,24 @@ succeeded)
 > matters. The SSA-lite IR below is the **target design** the tree-walker
 > lowers toward conceptually; the formal IR + regalloc refactor is the
 > v0.5 milestone. The spec text is preserved unchanged.
+>
+> **Implementation note (Stage A, 2026-07-10):** a thin three-address IR — a
+> deliberate subset of this SSA-lite design (three-address `dst = op src1 src2`
+> form, basic blocks, but NO SSA renaming, NO phi, and reassigned locals stay
+> slot-backed via `LoadFrame`/`StoreFrame` exactly as the "would-be-phi" note
+> below describes) — is now implemented behind `CodeGenCtx::enable_ir_backend`
+> as the Stage-2 stepping stone. `src/thin_ir.{hpp,cpp}` ship the
+> `ThinFunction`/`ThinBlock`/`ThinInstr` + the stable `ThinOp` enum;
+> `src/thin_lower.{hpp,cpp}` ship the AST→`ThinFunction` lowering
+> (`lower_function`); `src/thin_emit.{hpp,cpp}` ship the `ThinFunction`→x64 emit
+> (`emit_x64`). Default off → the tree-walker above runs unchanged
+> (byte-identical); on → value-equivalent (not byte-identical). It is the
+> foundation for the formal SSA-lite + linear-scan refactor (§8 below): the
+> `ThinOp` instruction set is a subset of the `IrInstr::Op` vocabulary, so the
+> Stage-3 upgrade (SSA rename + slot-back + liveness + linear-scan) is
+> additive, not a rewrite. See `CODEGEN_OPTIMIZATION_DESIGN.md` §4.3/§4.6 (the
+> hybrid thin-IR option + the `ThinFunction` representation) and §8 (Stage A
+> status), and `src/thin_ir.hpp` (the serialization-ready contract).
 
 Already characterized at a high level in CODEGEN_SPEC.md Section 5. Concrete
 shape:

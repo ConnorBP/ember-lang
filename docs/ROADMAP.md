@@ -412,10 +412,27 @@ here so the decision and its evidence have a tracked home.
     5-9x call/loop/slice/string slowdowns are spill-bound): CONFIRMED; Stage 1
     ships the working subset (the loop/call wins; the slice regression motivates
     Stage 2).
-  - **Stage 2** — a thin three-address IR replacing the tree-walker's `eval`
-    with `lower_expr` + emit, with the Stage 1 peephole table carried over as IR
-    passes. Gated on Stage 1's brittleness or cross-block evidence. Gate: Stage 1
-    insufficient on a cross-block-hot workload.
+  - **Stage 2** — **Stage A SHIPPED (2026-07-10)** as the landed Stage-2
+    stepping stone: the thin three-address IR compile-time backend
+    (`AST → ThinFunction → x64` via `lower_function` + `emit_x64`), behind
+    `CodeGenCtx::enable_ir_backend` (default off → byte-identical tree-walker;
+    on → value-equivalent, NOT byte-identical). Value-equivalent for scalar
+    integer arithmetic + control flow (if/while/for/do-while/switch,
+    break/continue) + recursion + division forms, gated by `thin_ir_test` +
+    `thin_ir_struct` (ctest 27/27, lang 268/0/0; the CLI never sets the flag, so
+    the default path is the unchanged tree-walker). Composes with
+    `enable_peephole`; obf functions fall back to the tree-walker. KNOWN GAPS
+    (documented as SKIP in `thin_ir_test`, Stage B/C work): slices (index +
+    bounds), structs (by-value arg/return/field/reassign), strings (native +
+    inline-XOR decrypt), defer-cleanup emission, fixed-array indexed store.
+    `src/thin_ir.{hpp,cpp}` (the IR + stable `ThinOp` serialization boundary) +
+    `src/thin_lower.{hpp,cpp}` + `src/thin_emit.{hpp,cpp}`. This is the
+    foundation for Stage B (`.em` IR serialization — the security property) and
+    Stage C (IR optimization passes over the `ThinFunction`). The FULL Stage 2
+    (carrying the Stage 1 peephole/regalloc over as `ThinPass`es + cross-block
+    CSE/LICM) and Stage 3 (full SSA-lite rename + linear-scan) remain the
+    still-future upgrade path, gated on Stage A's insufficiency or cross-block
+    evidence. See `../spec/CODEGEN_OPTIMIZATION_DESIGN.md` §8 (Stage A status).
   - **Stage 3** — full SSA-lite rename + linear-scan regalloc (COMPILER_PIPELINE
     §5's target). Gated on Stage 2's insufficiency. Gate: Stage 2 insufficient
     on a spill-heavy workload (CODEGEN_SPEC §5 acceptance criteria become the
