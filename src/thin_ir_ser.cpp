@@ -8,6 +8,7 @@
 #include <limits>
 #include <sstream>   // put_type bridges emit_type(ostream&) -> bytes
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace ember {
@@ -585,6 +586,7 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err,
         return true;
     };
 
+    std::unordered_set<uint32_t> seen_ids;
     for (uint32_t bi = 0; bi < num_blocks; ++bi) {
         const auto& blk = thf.blocks[bi];
         // C1 fix: block.id must be < num_blocks (emit_x64 uses it as a vector
@@ -593,6 +595,14 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err,
             if (err) *err = "thin_ir_ser: validate: block " + std::to_string(bi) +
                            " id out of range (" + std::to_string(blk.id) + " >= " +
                            std::to_string(num_blocks) + ")";
+            return false;
+        }
+        // Sec-6 fix: reject duplicate block IDs. Two blocks sharing an id cause
+        // block_labels[id] to be bound twice (second wins), so a Jmp/Branch to
+        // that id lands in the wrong block.
+        if (!seen_ids.insert(blk.id).second) {
+            if (err) *err = "thin_ir_ser: validate: duplicate block id " +
+                           std::to_string(blk.id) + " (block " + std::to_string(bi) + ")";
             return false;
         }
         // Every block has a terminator.
