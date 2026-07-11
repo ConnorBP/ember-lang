@@ -4,6 +4,7 @@
 #include <climits>
 #include <cstring>
 #include <unordered_set>
+#include <set>
 #include <string>
 
 namespace ember {
@@ -347,11 +348,49 @@ struct Checker {
     bool is_typed_enum(const std::string& n) const { return typed_enum_backing.count(n) != 0; }
 
     // script function signatures: name -> (ret type, param types)
+    //
+    // borrowed_params / retained_params (slice-escape safety Stage 2, C5):
+    // a per-fn escape analysis computed in a pre-pass BEFORE any function
+    // body is checked (so a call to fn F in fn G's body — checked before F's
+    // body — sees F's sets). Only SLICE params are tracked (a non-slice param
+    // is passed by value and copied; only a slice (ptr+len into a frame) can
+    // dangle). Indexing matches call-site arg indexing: param i <-> c->args[i]
+    // for a direct named script call.
+    //
+    //   borrowed_params  — the slice params whose value flows into the fn's
+    //     RETURN value (the fn `return s;` / `return s[..];` / `return relay(s);`
+    //     where relay borrows its arg). For these the CALL RESULT is itself a
+    //     stack-backed slice: is_local_array_view() recognizes such a CallExpr
+    //     and tags the result localview, so the caller's OWN escape guards (C1
+    //     return / C2a global-store / C2b field-store) catch the escape at the
+    //     actual escape point. This is what lets the legitimate synchronous
+    //     pattern `return_slice_defer(return_values[..])` (fn returns its slice
+    //     arg, caller reads r[0]/r[1] within the caller's own frame) still work:
+    //     the call result is tagged localview, but the synchronous reads are not
+    //     escape sites, so no guard fires.
+    //
+    //   retained_params   — the slice params the fn STORES to a GLOBAL inside
+    //     its body (`g = s;` / `g = relay(s);` where relay retains). The escape
+    //     is INSIDE the fn, invisible to the caller's own guards (the param is
+    //     not localview from the fn's perspective — it's declared
+    //     local_array_view=false in check_func). So the reject happens at the
+    //     CALL SITE: passing a stack-backed slice to a retaining param is a
+    //     compile error, because the callee would store the dangling ptr into a
+    //     global that outlives the caller's frame.
+    //
+    // A param can be in BOTH sets (the fn returns it AND stores it to a global):
+    // the retained reject at the call site takes precedence (the fn does escape
+    // it, regardless of what the caller does with the result). return_slice_defer
+    // is borrowed-only (it returns `values`, never stores it) so it is NOT
+    // rejected at the call site. See demo/SLICE_ESCAPE_SAFETY_INVESTIGATION.md
+    // §6.3 and the ROADMAP's slice-escape Stage 2 entry.
     struct ScriptSig {
         const Type* ret;
         std::vector<const Type*> params;
         std::vector<const DefaultValue*> defaults; // parallel to params; Kind::None = required
         size_t required_count = 0;                 // count of leading non-defaulted params
+        std::set<size_t> borrowed_params;  // C5: slice params flowing into the return value
+        std::set<size_t> retained_params;  // C5: slice params stored to a global inside the fn
     };
     std::unordered_map<std::string, ScriptSig> script_sigs;
 
@@ -844,22 +883,31 @@ struct Checker {
     // (AssignExpr else-if branch) — these close C1/C2a/C2b for both the
     // local_array_view class and the StringLit class.
     //
-    // STAGE 2 (deferred): C3 (a stack-backed slice passed to a NATIVE that may
-    // retain the ptr) and C5 (a stack-backed slice passed to a script fn /
-    // fn-handle / cross-module call that may retain it) are NOT guarded at the
-    // call-arg sites. A blanket reject there was rejected because it breaks
-    // the legitimate synchronous pattern `return_slice_defer(return_values[..])`
-    // (a fn that takes a slice and returns it for the caller to read within the
-    // caller's own frame — see tests/lang/runtime_language_features.ember).
-    // Closing C3/C5 needs a real borrow/escape analysis: propagate the
-    // localview bit through a call's RETURN value (so the caller's binding of
-    // the result is itself a stack-backed slice), then reject only at the
-    // ACTUAL escape point (return/store of that propagated result), and add a
-    // `borrows`/`retains` annotation to NativeSig so C3 can distinguish
-    // copying natives (string_from_slice) from retaining ones. See
-    // demo/SLICE_ESCAPE_SAFETY_INVESTIGATION.md §6.3/§8 and the stage-2 roadmap
-    // entry. Until then C3/C5 are open at the call site (no shipped native
-    // retains, and a retaining script fn is the residual live hole).
+    // STAGE 2 (this pass): C3 + C5 are closed with a borrow/escape analysis
+    // instead of a blanket call-site reject:
+    //   - C3 (native retain): NativeSig gains a `retains` bool. A stack-backed
+    //     slice passed to a `retains=true` native is rejected at the call site
+    //     (the native stores the ptr past the call -> it dangles). A copying
+    //     native (retains=false, the default; string_from_slice copies) is
+    //     allowed. No shipped native retains, so C3 is "accidentally safe";
+    //     the field + guard are the annotation surface for a future retaining
+    //     native.
+    //   - C5 (script fn / fn-handle / cross-module): for a direct named script
+    //     call, a pre-pass computes per-fn `borrowed_params` (slice params that
+    //     flow into the return) and `retained_params` (slice params stored to a
+    //     global inside the fn). A RETAINED param rejects at the call site (the
+    //     escape is inside the fn, invisible to the caller's guards). A BORROWED
+    //     param does NOT reject at the call site — instead is_local_array_view()
+    //     (below) recognizes the CallExpr as itself a stack-backed slice, so the
+    //     call RESULT is tagged localview and the caller's OWN C1/C2a/C2b
+    //     guards catch the escape at the actual escape point (return / global-
+    //     store). This is what keeps return_slice_defer working: the result is
+    //     tagged localview, but synchronous reads (r[0], r[1]) are not escape
+    //     sites. Indirect (fn-handle) and cross-module calls can't see the
+    //     callee body, so a stack-backed slice arg is conservatively rejected
+    //     at the call site (sound; no existing test passes a slice to either).
+    // See demo/SLICE_ESCAPE_SAFETY_INVESTIGATION.md §6.3/§8 and the ROADMAP's
+    // slice-escape Stage 2 entry.
     bool is_local_array_view(const Expr& e) const {
         if (dynamic_cast<const ViewExpr*>(&e)) return true;
         // A StringLit that resolved to slice<u8> (NOT promoted to a `string`
@@ -881,7 +929,346 @@ struct Checker {
         }
         if (auto* t = dynamic_cast<const TernaryExpr*>(&e))
             return is_local_array_view(*t->then_e) || is_local_array_view(*t->else_e);
+        // C5 propagation (Stage 2): a direct named script call whose callee
+        // BORROWS one of its slice params into the return value, called with a
+        // stack-backed slice in that arg position, is ITSELF a stack-backed
+        // slice — the returned slice aliases the caller's frame-local backing
+        // store. Tag it so the caller's own C1 (return) / C2a (global-store) /
+        // C2b (field-store) guards fire at the actual escape point, NOT at this
+        // call. This is the key to keeping the synchronous pattern
+        // `let r = return_slice_defer(s); r[0];` valid: r is tagged localview,
+        // but r[0] is a read (not an escape), so no guard fires. A NATIVE call
+        // is never localview here — a native's return value is host-owned (a
+        // handle or a host slice), never an alias of the caller's frame. Only
+        // direct named script calls (not indirect / cross-module — those can't
+        // be proven to borrow) propagate.
+        if (auto* c = dynamic_cast<const CallExpr*>(&e)) {
+            if (!c->is_native && !c->is_indirect && c->module_alias.empty() && !c->name.empty()) {
+                auto ssi = script_sigs.find(c->name);
+                if (ssi != script_sigs.end()) {
+                    for (size_t i = 0; i < c->args.size() && i < ssi->second.params.size(); ++i) {
+                        if (ssi->second.borrowed_params.count(i) &&
+                            is_local_array_view(*c->args[i]))
+                            return true;
+                    }
+                }
+            }
+        }
         return false;
+    }
+
+    // --- slice-escape Stage 2 pre-pass: per-fn borrow/retain analysis ---
+    // Does expression `e` reference the slice param named `paramName` (directly
+    // as an Ident, via a ViewExpr over the param, via a CastExpr, via a
+    // Ternary branch, or transitively via a call to a script fn that BORROWS
+    // the arg position `e` is in)? The transitive case is what makes
+    // `return relay(s)` (where relay returns its arg) count as borrowing s.
+    // Only SLICE params are of interest (a non-slice param is copied by value;
+    // only a slice ptr+len can dangle), but this predicate is purely syntactic
+    // — the caller filters by slice-ness when populating the param sets.
+    // `const` so it is usable from is_local_array_view's recursion path too.
+    bool expr_refs_slice_param(const Expr& e, const std::string& paramName) const {
+        if (auto* id = dynamic_cast<const Ident*>(&e))
+            return id->name == paramName;
+        if (auto* v = dynamic_cast<const ViewExpr*>(&e))
+            return expr_refs_slice_param(*v->base, paramName);
+        if (auto* t = dynamic_cast<const TernaryExpr*>(&e))
+            return expr_refs_slice_param(*t->then_e, paramName) ||
+                   expr_refs_slice_param(*t->else_e, paramName);
+        if (auto* cast = dynamic_cast<const CastExpr*>(&e))
+            return expr_refs_slice_param(*cast->operand, paramName);
+        if (auto* c = dynamic_cast<const CallExpr*>(&e)) {
+            // Transitive borrow: a direct named script call to a fn that
+            // borrows arg j, where arg j refs paramName. Native / indirect /
+            // cross-module calls don't carry borrowed_params, so they never
+            // propagate (conservative — they don't help prove a borrow). The
+            // fixed-point in compute_borrow_retain() converges this.
+            if (!c->is_native && !c->is_indirect && c->module_alias.empty() && !c->name.empty()) {
+                auto ssi = script_sigs.find(c->name);
+                if (ssi != script_sigs.end()) {
+                    for (size_t j = 0; j < c->args.size() && j < ssi->second.params.size(); ++j) {
+                        if (ssi->second.borrowed_params.count(j) &&
+                            expr_refs_slice_param(*c->args[j], paramName))
+                            return true;
+                    }
+                }
+            }
+            return false;
+        }
+        return false;
+    }
+
+    // Is assignment target `target` rooted at a GLOBAL (a bare global Ident,
+    // or a FieldExpr / IndexExpr chain whose root base is a global)? Mirrors
+    // the C2b root-chase in check_expr's AssignExpr guard. A local-rooted
+    // target is only unsafe if the local itself escapes (the harder struct-
+    // escape analysis, a follow-on); the v1 cut tracks only global-rooted
+    // stores as retained, matching Stage 1's C2b scope.
+    bool assign_target_is_global_rooted(const Expr& target) const {
+        const Expr* root = &target;
+        while (true) {
+            if (auto* fe = dynamic_cast<const FieldExpr*>(root)) { root = fe->base.get(); continue; }
+            if (auto* ix = dynamic_cast<const IndexExpr*>(root)) { root = ix->base.get(); continue; }
+            break;
+        }
+        if (auto* rid = dynamic_cast<const Ident*>(root)) {
+            if (globals.count(rid->name)) return true;
+        }
+        return false;
+    }
+
+    // Scan a fn body for the C5 escape shapes the pre-pass needs:
+    //   - return_values: every `return <expr>` value (a borrow source — does
+    //     the value flow a slice param into the return?).
+    //   - global_stores: every (target,value) where target is global-rooted
+    //     (a retain source — does the value flow a slice param into a global?).
+    //   - script_calls: every direct-named script CallExpr in the body (a
+    //     transitive borrow/retain source — does a call to a borrowing/retaining
+    //     fn with an arg that refs a slice param propagate the borrow/retain?).
+    // Recurses through every block-bearing statement (if/while/for/do-while/
+    // for-each/switch/match/block/defer). Used by compute_borrow_retain() per fn.
+    struct BorrowScan {
+        std::vector<const Expr*> return_values;
+        std::vector<std::pair<const Expr*, const Expr*>> global_stores;
+        std::vector<const CallExpr*> script_calls;
+    };
+    void scan_body_for_escapes(const Block& b, BorrowScan& out) const {
+        for (const auto& s : b.stmts) {
+            if (auto* rs = dynamic_cast<const ReturnStmt*>(s.get())) {
+                if (rs->value) out.return_values.push_back(rs->value.get());
+                continue;
+            }
+            if (auto* es = dynamic_cast<const ExprStmt*>(s.get())) {
+                scan_expr_for_escapes(*es->expr, out);
+                continue;
+            }
+            if (auto* ls = dynamic_cast<const LetStmt*>(s.get())) {
+                if (ls->init) scan_expr_for_escapes(*ls->init, out);
+                continue;
+            }
+            if (auto* ds = dynamic_cast<const DeferStmt*>(s.get())) {
+                // A defer may carry an AssignExpr (defer g = s;) that stores to
+                // a global at block exit — that is a retain too. Or a CallExpr
+                // whose callee retains. Scan it like any other expr.
+                if (ds->expr) scan_expr_for_escapes(*ds->expr, out);
+                continue;
+            }
+            if (auto* is = dynamic_cast<const IfStmt*>(s.get())) {
+                if (is->cond) scan_expr_for_escapes(*is->cond, out);
+                scan_body_for_escapes(is->then_b, out);
+                if (is->has_else) scan_body_for_escapes(is->else_b, out);
+                continue;
+            }
+            if (auto* ws = dynamic_cast<const WhileStmt*>(s.get())) {
+                if (ws->cond) scan_expr_for_escapes(*ws->cond, out);
+                scan_body_for_escapes(ws->body, out);
+                continue;
+            }
+            if (auto* fs = dynamic_cast<const ForStmt*>(s.get())) {
+                if (fs->init && fs->init->init) scan_expr_for_escapes(*fs->init->init, out);
+                if (fs->cond) scan_expr_for_escapes(*fs->cond, out);
+                if (fs->step) scan_expr_for_escapes(*fs->step, out);
+                scan_body_for_escapes(fs->body, out);
+                continue;
+            }
+            if (auto* dw = dynamic_cast<const DoWhileStmt*>(s.get())) {
+                scan_body_for_escapes(dw->body, out);
+                if (dw->cond) scan_expr_for_escapes(*dw->cond, out);
+                continue;
+            }
+            if (auto* fe = dynamic_cast<const ForEachStmt*>(s.get())) {
+                if (fe->iter) scan_expr_for_escapes(*fe->iter, out);
+                scan_body_for_escapes(fe->body, out);
+                continue;
+            }
+            if (auto* bs = dynamic_cast<const BlockStmt*>(s.get())) {
+                scan_body_for_escapes(bs->block, out);
+                continue;
+            }
+            if (auto* sw = dynamic_cast<const SwitchStmt*>(s.get())) {
+                if (sw->subject) scan_expr_for_escapes(*sw->subject, out);
+                for (const auto& c : sw->cases) scan_body_for_escapes(c.body, out);
+                continue;
+            }
+            if (auto* ms = dynamic_cast<const MatchStmt*>(s.get())) {
+                if (ms->subject) scan_expr_for_escapes(*ms->subject, out);
+                for (const auto& arm : ms->arms) scan_body_for_escapes(arm.body, out);
+                continue;
+            }
+            // BreakStmt / ContinueStmt / StaticAssertStmt: no escape shapes.
+        }
+    }
+    // Scan a single expression tree for nested AssignExprs (global-rooted ->
+    // retain), direct-named script CallExprs (transitive borrow/retain
+    // sources), and recurse through compound expressions. AssignExprs are
+    // statement-level in practice but the recursion is defensive.
+    void scan_expr_for_escapes(const Expr& e, BorrowScan& out) const {
+        if (auto* a = dynamic_cast<const AssignExpr*>(&e)) {
+            if (assign_target_is_global_rooted(*a->target))
+                out.global_stores.push_back({a->target.get(), a->value.get()});
+            // still recurse into value for nested assigns (rare)
+            scan_expr_for_escapes(*a->value, out);
+            return;
+        }
+        if (auto* b = dynamic_cast<const BinExpr*>(&e)) {
+            scan_expr_for_escapes(*b->lhs, out);
+            scan_expr_for_escapes(*b->rhs, out);
+            return;
+        }
+        if (auto* u = dynamic_cast<const UnaryExpr*>(&e)) {
+            scan_expr_for_escapes(*u->operand, out);
+            return;
+        }
+        if (auto* c = dynamic_cast<const CallExpr*>(&e)) {
+            // A direct named script call is a transitive borrow/retain source:
+            // if the callee borrows/retains arg j and arg j refs one of THIS
+            // fn's slice params, this fn borrows/retains that param. Collect
+            // the call; compute_borrow_retain() checks it against the callee's
+            // sets (which the fixed-point converges). Native / indirect /
+            // cross-module calls carry no borrowed/retained sets, so they are
+            // not collected (they don't help prove a borrow/retain here).
+            if (!c->is_native && !c->is_indirect && c->module_alias.empty() && !c->name.empty())
+                out.script_calls.push_back(c);
+            if (c->receiver) scan_expr_for_escapes(*c->receiver, out);
+            for (const auto& a : c->args) scan_expr_for_escapes(*a, out);
+            if (c->indirect_target) scan_expr_for_escapes(*c->indirect_target, out);
+            return;
+        }
+        if (auto* ix = dynamic_cast<const IndexExpr*>(&e)) {
+            scan_expr_for_escapes(*ix->base, out);
+            scan_expr_for_escapes(*ix->index, out);
+            return;
+        }
+        if (auto* fe = dynamic_cast<const FieldExpr*>(&e)) {
+            scan_expr_for_escapes(*fe->base, out);
+            return;
+        }
+        if (auto* v = dynamic_cast<const ViewExpr*>(&e)) {
+            scan_expr_for_escapes(*v->base, out);
+            return;
+        }
+        if (auto* t = dynamic_cast<const TernaryExpr*>(&e)) {
+            if (t->cond) scan_expr_for_escapes(*t->cond, out);
+            scan_expr_for_escapes(*t->then_e, out);
+            scan_expr_for_escapes(*t->else_e, out);
+            return;
+        }
+        if (auto* cast = dynamic_cast<const CastExpr*>(&e)) {
+            scan_expr_for_escapes(*cast->operand, out);
+            return;
+        }
+        // IntLit/FloatLit/BoolLit/StringLit/Ident/SizeofExpr/OffsetofExpr/
+        // StructLit/ArrayLit/EnumAccessExpr/FnHandleExpr: no nested escape
+        // shapes to scan.
+    }
+
+    // Compute per-fn borrowed_params / retained_params for every script fn, via
+    // a fixed-point. Each pass, per fn, scans the body for the three escape
+    // sources and grows the sets:
+    //   - BORROWED (return flows a slice param into the return value): a return
+    //     value refs a slice param — directly (`return s`), via a view
+    //     (`return s[..]`), or transitively (`return relay(s)` where relay
+    //     borrows; expr_refs_slice_param handles the transitive CallExpr case).
+    //   - RETAINED (a slice param stored to a global): a global-rooted
+    //     assignment value refs a slice param (directly or via a retaining call
+    //     in the value position).
+    //   - TRANSITIVE (a call to a borrowing/retaining fn): for each direct
+    //     named script call in the body, if the callee borrows/retains arg j
+    //     and arg j refs one of THIS fn's slice params, this fn borrows/retains
+    //     that param. This is what makes `wrapper(s) { store_to_global(s); }`
+    //     retain param 0 (store_to_global retains; wrapper calls it with s).
+    // The fixed-point repeats until no set grows (bounded by num_fns * num_slice
+    // _params; converges in 1-2 passes in practice). Runs BEFORE any function
+    // body is checked (in the script_sigs registration loop) so a forward call
+    // from G to F (G checked first) already sees F's sets.
+    void compute_borrow_retain() {
+        bool changed = true;
+        int guard = 0;
+        while (changed && guard < 1024) {
+            changed = false;
+            ++guard;
+            for (auto& f : prog->funcs) {
+                auto ssi = script_sigs.find(f.name);
+                if (ssi == script_sigs.end()) continue;
+                // collect this fn's slice-param names (index -> name; empty for
+                // non-slice params, which can't dangle and aren't tracked).
+                std::vector<std::string> slice_param_names;
+                for (size_t i = 0; i < f.params.size(); ++i) {
+                    if (f.params[i].ty && f.params[i].ty->is_slice)
+                        slice_param_names.push_back(f.params[i].name);
+                    else
+                        slice_param_names.emplace_back();
+                }
+                BorrowScan scan;
+                scan_body_for_escapes(f.body, scan);
+                // BORROWED: a slice param whose value flows into a return value.
+                for (const Expr* rv : scan.return_values) {
+                    for (size_t i = 0; i < slice_param_names.size(); ++i) {
+                        if (slice_param_names[i].empty()) continue;
+                        if (expr_refs_slice_param(*rv, slice_param_names[i])) {
+                            if (ssi->second.borrowed_params.insert(i).second)
+                                changed = true;
+                        }
+                    }
+                }
+                // RETAINED: a slice param stored to a global (directly, or via a
+                // retaining call in the value position) inside the fn.
+                for (auto& gs : scan.global_stores) {
+                    for (size_t i = 0; i < slice_param_names.size(); ++i) {
+                        if (slice_param_names[i].empty()) continue;
+                        if (expr_refs_slice_param(*gs.second, slice_param_names[i])) {
+                            if (ssi->second.retained_params.insert(i).second)
+                                changed = true;
+                        }
+                    }
+                }
+                // TRANSITIVE borrow + retain: a call to a borrowing/retaining fn
+                // with an arg that refs one of this fn's slice params.
+                for (const CallExpr* c : scan.script_calls) {
+                    auto callee_it = script_sigs.find(c->name);
+                    if (callee_it == script_sigs.end()) continue;
+                    const auto& callee = callee_it->second;
+                    for (size_t j = 0; j < c->args.size() && j < callee.params.size(); ++j) {
+                        const Expr& arg = *c->args[j];
+                        for (size_t i = 0; i < slice_param_names.size(); ++i) {
+                            if (slice_param_names[i].empty()) continue;
+                            if (!expr_refs_slice_param(arg, slice_param_names[i])) continue;
+                            if (callee.borrowed_params.count(j)) {
+                                if (ssi->second.borrowed_params.insert(i).second)
+                                    changed = true;
+                            }
+                            if (callee.retained_params.count(j)) {
+                                if (ssi->second.retained_params.insert(i).second)
+                                    changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // C5 conservative reject for a call path whose callee body is NOT visible
+    // to sema (an indirect / fn-handle call, or a cross-module call). For a
+    // direct named script call we can compute borrowed_params/retained_params
+    // and reject precisely (retain) or propagate (borrow). For these two paths
+    // we can't see the callee, so we can't prove it doesn't retain the ptr —
+    // conservatively reject any stack-backed slice arg. Sound: the worst case
+    // is a false positive on a synchronous-reading callee, but no existing
+    // test passes a stack-backed slice to an indirect or cross-module call
+    // (fn-handle tests use i64; import tests pass no slices), so this closes
+    // C5's last two paths without breaking the suite. The synchronous
+    // return_slice_defer pattern is a DIRECT named call, so it is unaffected.
+    void reject_local_view_slice_arg_opaque_callee(const CallExpr& c, const Expr& arg,
+                                                    const std::string& callee_label,
+                                                    size_t arg_one_based) {
+        if (arg.ty && arg.ty->is_slice && is_local_array_view(arg))
+            err(std::string("cannot pass a slice derived from a stack local to ") +
+                callee_label + " (arg " + std::to_string(arg_one_based) +
+                "); the callee's body is not visible at this call site, so it "
+                "may retain the pointer past the frame. Materialize it to a "
+                "`string` handle or a rodata/global-backed slice first.",
+                arg.loc.line, arg.loc.col);
     }
 
     static bool is_lvalue(const Expr& e) {
@@ -1139,6 +1526,9 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                     if (!types_compatible(want, got))
                         err("function handle receiver type mismatch (expected " + want->to_string() +
                             ", got " + got->to_string() + ")", c->receiver->loc.line, c->receiver->loc.col);
+                    // C5 (indirect / fn-handle call): callee body not visible.
+                    reject_local_view_slice_arg_opaque_callee(*c, *c->receiver,
+                        "a function handle call", 0);
                     ++i;
                 }
                 for (auto& a : c->args) {
@@ -1147,6 +1537,9 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                     if (!types_compatible(want, got))
                         err("function handle argument type mismatch (expected " + want->to_string() +
                             ", got " + got->to_string() + ")", a->loc.line, a->loc.col);
+                    // C5 (indirect / fn-handle call): callee body not visible.
+                    reject_local_view_slice_arg_opaque_callee(*c, *a,
+                        "a function handle call", i);
                 }
                 e.ty = intern(*tt->recorded_ret);
             } else {
@@ -1211,7 +1604,14 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                                 // type-checked at compile time). Skip arity/return checks;
                                 // still type-check each arg standalone (no expected hint) so
                                 // malformed args surface. Default ret to i64.
-                                for (auto& a : c->args) check_expr(*a);
+                                for (auto& a : c->args) {
+                                    check_expr(*a);
+                                    // C5 (cross-module, unknown sig): callee body not
+                                    // visible — conservatively reject a stack-backed slice.
+                                    reject_local_view_slice_arg_opaque_callee(*c, *a,
+                                        "cross-module call '" + c->module_alias + "::" + c->name + "'",
+                                        size_t(&a - &c->args[0]) + 1);
+                                }
                                 e.ty = intern(type_i64());
                                 return e.ty;
                             }
@@ -1230,6 +1630,11 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                                     err("cross-module arg " + std::to_string(i) + " type mismatch (expected " +
                                         exp.params[i].to_string() + ", got " + got->to_string() + ")",
                                         c->loc.line, c->loc.col);
+                                // C5 (cross-module, JIT export): callee body not visible
+                                // — conservatively reject a stack-backed slice.
+                                reject_local_view_slice_arg_opaque_callee(*c, *c->args[i],
+                                    "cross-module call '" + c->module_alias + "::" + c->name + "'",
+                                    i + 1);
                             }
                             e.ty = intern(exp.ret);
                             return e.ty;
@@ -1296,6 +1701,9 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                         if (!types_compatible(want, got))
                             err("function handle receiver type mismatch (expected " + want->to_string() +
                                 ", got " + got->to_string() + ")", c->receiver->loc.line, c->receiver->loc.col);
+                        // C5 (indirect / fn-handle call): callee body not visible.
+                        reject_local_view_slice_arg_opaque_callee(*c, *c->receiver,
+                            "a function handle call", 0);
                         ++i;
                     }
                     for (auto& a : c->args) {
@@ -1304,6 +1712,9 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                         if (!types_compatible(want, got))
                             err("function handle argument type mismatch (expected " + want->to_string() +
                                 ", got " + got->to_string() + ")", a->loc.line, a->loc.col);
+                        // C5 (indirect / fn-handle call): callee body not visible.
+                        reject_local_view_slice_arg_opaque_callee(*c, *a,
+                            "a function handle call", i);
                     }
                     e.ty = intern(*tt->recorded_ret);
                 } else {
@@ -1344,6 +1755,18 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                             c->receiver->loc.line, c->receiver->loc.col);
                     check_struct_arg_shape(*c->receiver, want);
                     reject_large_native_aggregate(want, c->receiver->loc);
+                    // C3 (slice-escape safety Stage 2): a `retains=true` native
+                    // may store a slice ptr past the call. A stack-backed slice
+                    // (ViewExpr over a fixed array, or an encrypted StringLit
+                    // temp) receiver would dangle once the backing frame dies.
+                    if (nit->second.retains && got && got->is_slice &&
+                        is_local_array_view(*c->receiver))
+                        err("cannot pass a slice derived from a stack local to native '" +
+                            c->name + "' (receiver); the native retains the pointer "
+                            "past the call, so it would outlive the frame. "
+                            "Materialize it to a `string` handle or a rodata/global-"
+                            "backed slice first.",
+                            c->receiver->loc.line, c->receiver->loc.col);
                     off = 1;
                 }
                 for (size_t i = 0; i < c->args.size(); ++i) {
@@ -1355,6 +1778,24 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                             c->args[i]->loc.line, c->args[i]->loc.col);
                     check_struct_arg_shape(*c->args[i], want);
                     reject_large_native_aggregate(want, c->args[i]->loc);
+                    // C3 (slice-escape safety Stage 2): a `retains=true` native
+                    // may store a slice ptr past the call (the annotation surface
+                    // for a future retaining native). A stack-backed slice arg
+                    // would dangle once the backing frame dies — reject at the
+                    // call site. A copying native (retains=false, the default —
+                    // string_from_slice copies the bytes into a host-owned
+                    // std::string during the call) is allowed: the bytes are
+                    // copied out before the frame dies. No shipped native
+                    // retains, so this guard fires only for an explicitly
+                    // retains-tagged native.
+                    if (nit->second.retains && got && got->is_slice &&
+                        is_local_array_view(*c->args[i]))
+                        err("cannot pass a slice derived from a stack local to native '" +
+                            c->name + "' (arg " + std::to_string(i+1) + "); the native "
+                            "retains the pointer past the call, so it would outlive "
+                            "the frame. Materialize it to a `string` handle or a "
+                            "rodata/global-backed slice first.",
+                            c->args[i]->loc.line, c->args[i]->loc.col);
                 }
                 // Compile-time assertion folding (efficiency ask, part 2):
                 // when BOTH arguments to an assert_eq_* call are compile-time
@@ -1461,6 +1902,27 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                                 "': expected " + want->to_string() + ", got " + got->to_string(),
                                 c->args[i]->loc.line, c->args[i]->loc.col);
                         check_struct_arg_shape(*c->args[i], want);
+                        // C5 retain guard (slice-escape safety Stage 2): this
+                        // param is in the callee's retained_params set — the
+                        // callee stores it (or a value derived from it) to a
+                        // GLOBAL inside its body, so the slice ptr escapes the
+                        // frame via the callee's global store (invisible to the
+                        // caller's own C1/C2 guards, since the param is not
+                        // localview from the callee's perspective). Reject a
+                        // stack-backed slice arg at the call site. A BORROWED
+                        // param (returned, not stored) is NOT rejected here —
+                        // instead is_local_array_view() tags the call result
+                        // localview and the caller's own escape guards catch
+                        // the escape at the actual escape point (this is what
+                        // keeps return_slice_defer working).
+                        if (ssi->second.retained_params.count(i) && got && got->is_slice &&
+                            is_local_array_view(*c->args[i]))
+                            err("cannot pass a slice derived from a stack local to '" +
+                                c->name + "' (arg " + std::to_string(i+1) + "); the callee "
+                                "retains the pointer (stores it to a global), so it would "
+                                "outlive the frame. Materialize it to a `string` handle or "
+                                "a rodata/global-backed slice first.",
+                                c->args[i]->loc.line, c->args[i]->loc.col);
                     }
                 }
                 params = nullptr;
@@ -3037,6 +3499,16 @@ SemaResult sema(Program& prog,
         }
         c.script_sigs[f.name] = ss;
     }
+
+    // Slice-escape safety Stage 2 (C5): compute per-fn borrowed_params /
+    // retained_params BEFORE any function body is checked. A forward call
+    // from G to F (G checked first in the check_func loop below) must already
+    // see F's sets, so this runs here, after script_sigs are registered and
+    // before the check_func loop. The fixed-point converges transitivity
+    // (return relay(s) where relay borrows its arg; g = relay(s) where relay
+    // retains). See compute_borrow_retain() + is_local_array_view()'s CallExpr
+    // case for how the sets are consumed.
+    c.compute_borrow_retain();
 
     // Global initializers obey the same nominal assignment barrier as locals.
     // Check them after signatures are registered so any initializer call has

@@ -1,0 +1,14 @@
+// sema_invalid_local_slice_native_retain_alias.ember — C3 reject via a
+// localview ALIAS (slice-escape safety Stage 2). The stack-backed slice is
+// first aliased into a local (`let s = a[..]` — the AssignExpr/LetStmt
+// propagation tags s with local_array_view=true), then the ALIAS is passed
+// to a retains=true native. Sema's is_local_array_view() follows the Ident
+// to the local_array_view flag, so the guard still fires. This proves the
+// existing alias-propagation bit (Stage 1) composes with the new C3 guard.
+fn bad() -> i64 {
+    let a: u8[3];
+    a[0] = 1; a[1] = 2; a[2] = 3;
+    let s: u8[] = a[..];
+    let h: i64 = test_retain_slice(s);
+    return h;
+}

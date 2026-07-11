@@ -115,14 +115,20 @@ class BindingBuilder {
 public:
     // Register a native function: name, return type, param types, fn ptr.
     // permission defaults 0; pass PERM_FFI for FFI-gated natives.
+    // retains defaults false (the native copies/consumes slice bytes and drops
+    // the ptr during the call — the only shipped slice-taking native,
+    // string_from_slice, copies). Pass retains=true ONLY for a native that
+    // stores a slice ptr past the call (semA then rejects stack-backed slice
+    // args to it, slice-escape safety C3). See NativeSig::retains.
     BindingBuilder& add(const char* name, Type ret, std::vector<Type> params,
-                        void* fn, uint32_t permission = 0) {
+                        void* fn, uint32_t permission = 0, bool retains = false) {
         NativeSig s;
         s.name = name;
         s.fn_ptr = fn;
         s.ret = std::move(ret);
         s.params = std::move(params);
         s.permission = permission;
+        s.retains = retains;
         natives_[name] = std::move(s);
         return *this;
     }

@@ -33,12 +33,27 @@ using ModuleExportTable = std::unordered_map<std::string, std::vector<ModuleExpo
 
 // A registered native function signature (host-side; mirrors NativeFn
 // from docs/spec/BINDING_API.md but sema only needs the type info + fn ptr).
+//
+// `retains` (slice-escape safety Stage 2, C3): does this native RETAIN a slice
+// pointer it receives past the call (store it in a host-side data structure
+// that outlives the call), or does it COPY/consume the bytes and drop the ptr?
+// Default false = copying/consuming (the only shipped slice-taking native,
+// string_from_slice, copies the bytes into a host-owned std::string and
+// returns a handle — it does NOT retain the ptr). Sema rejects a stack-backed
+// slice (a ViewExpr over a fixed array, or an encrypted StringLit temp) passed
+// to a `retains=true` native, because the backing frame dies before the
+// retained use and the ptr would dangle. A copying native (retains=false) is
+// allowed — the bytes are copied out during the call, before the frame dies.
+// No shipped native retains a slice ptr today, so C3 is "accidentally safe";
+// this field is the annotation surface a future retaining native sets to true
+// to get the guard. See demo/SLICE_ESCAPE_SAFETY_INVESTIGATION.md §5.4/§6.3.
 struct NativeSig {
     std::string name;
     void* fn_ptr = nullptr;
     Type ret;
     std::vector<Type> params;
     uint32_t permission = 0;
+    bool retains = false;  // C3: may this native retain a slice ptr past the call?
 };
 
 // Operator-overload registry: (type_name, operator) -> native fn ptr + sig.

@@ -88,6 +88,26 @@ int main(int argc, char** argv) {
     ember::ext_array::register_natives(natives);
     ember::ext_math::register_natives(natives);
 
+    // Slice-escape safety Stage 2 (C3) test surface: a RETAINING native. No
+    // shipped native retains a slice ptr (string_from_slice copies), so C3 is
+    // "accidentally safe" in production. To exercise the C3 guard's reject
+    // path (a stack-backed slice passed to a retains=true native -> sema
+    // error), register a test-only retaining native here. It takes a u8[]
+    // slice and is flagged retains=true; sema then rejects a stack-backed
+    // slice arg to it (sema_invalid_local_slice_native_retain.ember). The fn
+    // ptr is never called (sema_check runs sema only, no execution), so a
+    // stub null ptr is fine — only the signature + retains flag matter.
+    {
+        ember::NativeSig s;
+        s.name = "test_retain_slice";
+        s.fn_ptr = nullptr;
+        s.ret = ember::type_i64();
+        s.params.push_back(ember::make_slice(std::make_shared<ember::Type>(ember::make_prim(ember::Prim::U8))));
+        s.permission = 0;
+        s.retains = true;
+        natives["test_retain_slice"] = std::move(s);
+    }
+
     ember::OpOverloadTable overloads;
     ember::ext_vec::register_overloads(overloads);
     ember::ext_quat::register_overloads(overloads);

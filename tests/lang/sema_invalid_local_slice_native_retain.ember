@@ -1,0 +1,16 @@
+// sema_invalid_local_slice_native_retain.ember — C3 reject (slice-escape
+// safety Stage 2). A stack-backed slice (a ViewExpr over a fixed array) is
+// passed to a NATIVE flagged `retains=true` (test_retain_slice, a test-only
+// retaining native registered by sema_check; no shipped native retains —
+// string_from_slice copies). The native may store the slice ptr past the
+// call, so the backing frame would die before the retained use and the ptr
+// would dangle. Sema must reject this at the call site.
+//
+// (string_from_slice, by contrast, is retains=false — see
+// sema_valid_local_slice_native_copy.ember for the allowed copying case.)
+fn bad() -> i64 {
+    let a: u8[3];
+    a[0] = 1; a[1] = 2; a[2] = 3;
+    let h: i64 = test_retain_slice(a[..]);
+    return h;
+}
