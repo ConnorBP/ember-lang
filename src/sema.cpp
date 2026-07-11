@@ -491,7 +491,25 @@ struct Checker {
                want->is_uint() == got->is_uint() && int_width(got) < int_width(want);
     }
     static bool types_compatible(const Type* want, const Type* got) {
-        return want && got && want->same(*got);
+        if (!want || !got) return false;
+        if (want->same(*got)) return true;
+        // #20 lambda compatibility: a lambda type (is_lambda) is compatible
+        // with a fn-handle type (is_fn_handle) if both carry matching recorded
+        // sigs. This bridges the two representations without making them
+        // globally `same` (which would break fn-handle equality elsewhere).
+        if ((want->is_lambda || want->is_fn_handle) && (got->is_lambda || got->is_fn_handle)) {
+            if (want->has_recorded_sig && got->has_recorded_sig) {
+                if (want->recorded_params.size() != got->recorded_params.size()) return false;
+                for (size_t i = 0; i < want->recorded_params.size(); ++i)
+                    if (!want->recorded_params[i]->same(*got->recorded_params[i])) return false;
+                if (want->recorded_ret && got->recorded_ret)
+                    return want->recorded_ret->same(*got->recorded_ret);
+                return !want->recorded_ret && !got->recorded_ret;
+            }
+            // one or both bare (no recorded sig): compatible (bare fn accepts any).
+            return true;
+        }
+        return false;
     }
 
     // The single implicit-conversion gate for value-flow contexts.  Legal
