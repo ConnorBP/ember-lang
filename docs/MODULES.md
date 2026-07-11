@@ -1,12 +1,21 @@
 # ember - modules / live `import` (Tier 6 design sketch)
 
-**Status: DESIGN ONLY.** This is a future-work design sketch for
-`ROADMAP.md` Tier 6 ("Modules / `import`"). Nothing here is in the v1
-grammar, nothing here is implemented, nothing here changes the v1
-pipeline. It exists so the deferral is a tracked decision with the
-load-bearing design points written down, not a forgotten gap - the
-same reason every other `ROADMAP.md` entry has a re-entry trigger and
-a dependency rather than a one-line "later."
+**Status: design sketch, now substantially shipped.** This doc began as a
+future-work design sketch for `ROADMAP.md` Tier 6 ("Modules / `import`"). The
+core of that design — the per-process `ModuleRegistry` (`src/module_registry.{hpp,cpp}`),
+the cross-module call IR (the `CallCrossModule` `ThinOp` + AST
+`cross_module_id`/`cross_module_slot` + `codegen.cpp`'s `emit_cross_module_call`),
+the `link "file.em" as alias;` grammar (`src/parser.cpp`), and the linker
+(`src/module_linker.hpp` + `em_loader.cpp`'s `link_em_file`) — **shipped**
+(`BUNDLING_AND_EM_MODULES.md` Part 3 item 3). So the module registry, the
+cross-module call, and the `link` directive are NOT future work; they are the
+implemented live-module surface, and this doc is the design reference for that
+surface. What remains genuinely future is the re-entry-trigger-gated work this
+doc frames as not-yet-needed: whole-module reload, late `relink_imports`, and
+the removed-function trap stub (see §6 + `HOT_RELOAD.md`). The deferral is a
+tracked decision with the load-bearing design points written down, not a
+forgotten gap - the same reason every other `ROADMAP.md` entry has a re-entry
+trigger and a dependency rather than a one-line "later."
 
 The split this doc rests on is already decided in
 `BUNDLING_AND_EM_MODULES.md` Section 1.1: `include` (parse-time bundle, one

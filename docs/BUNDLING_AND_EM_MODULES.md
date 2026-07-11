@@ -33,7 +33,7 @@ The two modes are not two flavors of one mechanism. They are two
 | Cross-unit call | ordinary `CallScript` through the single shared dispatch table (same as any intra-file call today) | new cross-module indirection: module registry → foreign `DispatchTable` → slot |
 | New runtime machinery | **none**  -  merged `Program` flows through the existing pipeline | module registry, cross-module call IR shape, linker stage |
 | Dedup | parse-time include-graph walk, set of canonicalized paths | not needed (separate units, separately compiled) |
-| Matches existing | exactly the current single-file compile, just fed a merged AST | `ROADMAP.md` Tier 6 "Modules / `import`" deferral |
+| Matches existing | exactly the current single-file compile, just fed a merged AST | `ROADMAP.md` Tier 6 "Modules / `import`" (the live `link` surface shipped since — see §1.5 + `MODULES.md`) |
 
 This split is the YAGNI-correct reading of the request. "Bundle"
 means "compile a set of source files as one module" - the dedup is a
@@ -48,7 +48,9 @@ splitting*, which `include` provides. True runtime module separation
 larger subsystem with no demonstrated need yet.
 
 **Decision:** ship `include` (bundle) now. Spec `import` (live) in
-`MODULES.md` as future work, do not implement it. The two
+`MODULES.md` (originally as future work; the live `link` directive +
+`ModuleRegistry` + cross-module call subsequently **shipped** — see §1.5
+below + `MODULES.md`). The two
 keywords are named to make the semantics obvious and to match the
 user's own phrasing ("one of them forcing non bundle so it imports it
 live"): `include` is the C `#include` analog (merged before
@@ -158,10 +160,10 @@ merged `Program`, but reload remains per-function:
 - **Whole-module reload:** deferred. A future implementation would need to
   re-resolve the root and apply a transactional batch; v1 does not claim this.
 
-### 1.5 `import` (live) - design sketch only, not implemented
+### 1.5 `import` (live) - design, now shipped
 
-For completeness, the Tier 6 design lives in a new `MODULES.md`
-(not written in this pass - it's future work). The load-bearing
+For completeness, the Tier 6 design lives in `MODULES.md`
+(written since this section was first sketched). The load-bearing
 design point, recorded here so it isn't lost:
 
 - A **module registry**: per-process map `module_id → DispatchTable*`.
@@ -181,9 +183,16 @@ design point, recorded here so it isn't lost:
   caller - same property intra-module reload already has, lifted one
   indirection up).
 
-This does **not** ship now. The re-entry trigger is a real runtime
-mod-loading use case (one mod loads another's pre-compiled `.em` at
-runtime), which bundling does not cover and which does not exist yet.
+This **shipped** as the live `link` directive + `ModuleRegistry` +
+cross-module call path (`src/module_registry.{hpp,cpp}` +
+`src/module_linker.hpp` + `em_loader.cpp`'s `link_em_file` + the
+`link "file.em" as alias;` grammar + `CallCrossModule` / `emit_cross_module_call`).
+See `MODULES.md` (the design reference) + Part 3 item 3. What remains
+genuinely future is the re-entry-trigger-gated work (`MODULES.md` §6:
+whole-module reload, late `relink_imports`, the removed-function trap stub).
+The re-entry trigger for *those* is a real runtime mod-loading use case
+(one mod loads another's pre-compiled `.em` at runtime) beyond what the
+shipped `link` surface covers.
 
 ---
 

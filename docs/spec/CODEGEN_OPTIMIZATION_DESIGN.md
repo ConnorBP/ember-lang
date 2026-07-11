@@ -978,25 +978,36 @@ PreservedAnalyses, AnalysisManager, PassInstrumentation, pipeline parsing) and
 designed in `docs/spec/PASS_SYSTEM_DESIGN.md` (the mixture architecture:
 extension-style discovery + LLVM-style pass interface).
 
-**Stage C SHIPPED (2026-07-11, Steps 1-5; Steps 4-5 partial).** The composable
-pass system + the first four IR optimization passes (+ the `SubstitutionPass`
+**Stage C SHIPPED (2026-07-11, Steps 1-5 + four additional passes).** The composable
+pass system + **eight** IR optimization passes (+ the `SubstitutionPass`
 obfuscation pass):
 - `src/ember_pass.{hpp,cpp}` + `src/ember_pass_registry.hpp` +
   `src/ember_pass_pipeline.hpp` — the infrastructure (type-erased pass manager,
   CRTP mix-in, PreservedAnalyses, registry, pipeline string parser,
   instrumentation callbacks). `examples/ember_pass_test.cpp` (ctest `ember_pass`).
-- `extensions/opt/ext_opt.{hpp,cpp}` (ember_ext_opt) — `ConstPropPass`,
-  `DeadCodeElimPass`, `CSEPass`, `LICMPass`, registered by name via
-  `register_passes`. `examples/ir_passes_test.cpp` (ctest `ir_passes`) verifies
-  value-preservation + instr-count-reduction (LICM is value-preserving; it
-  hoists, it does not remove instrs).
+- `extensions/opt/ext_opt.{hpp,cpp}` (ember_ext_opt) — the eight IR optimization
+  passes, registered by name via `register_passes`: `ConstPropPass` (`"constprop"`),
+  `DeadCodeElimPass` (`"dce"`), `CSEPass` (`"cse"`), `LICMPass` (`"licm"`),
+  `StoreToLoadForwardPass` (`"forward"`), `CopyPropPass` (`"copyprop"`),
+  `InstCombinePass` (`"instcombine"`), `DeadStoreElimPass` (`"dse"`).
+  `examples/ir_passes_test.cpp` (ctest `ir_passes`) verifies value-preservation +
+  instr-count-reduction (LICM/forward/copyprop/instcombine are value-preserving;
+  LICM hoists and forward/copyprop rewrite rather than remove instrs, so they
+  are checked for value-preservation rather than instr-count-reduction).
 - Pass manager wired into `CodeGenCtx` (compile_func runs passes between
   lower_function and emit_x64). CLI `--passes constprop,cse,dce`. Bench
   `EMBER_IR_PASS` env var. Code-size reductions verified: constprop_fold
   406→318B, dce 382→326B, cse 418→404B.
-Steps 4-5 partially shipped (2026-07-11): `LICMPass` (Step 4) and
-`SubstitutionPass` (Step 5, `extensions/obf/ext_obf.cpp`, `is_required = true`)
-shipped. `EmberAnalysisManager` (§6) and the remaining obfuscation passes
+Steps 1-5 fully shipped (2026-07-11): the infrastructure (Step 1), the first
+three opt passes constprop/dce/cse (Step 2), the `CodeGenCtx` wiring + CLI +
+bench (Step 3), `LICMPass` (Step 4), and `SubstitutionPass` (Step 5,
+`extensions/obf/ext_obf.cpp`, `is_required = true`). Four additional IR
+optimization passes shipped beyond the original Step plan: `forward`,
+`copyprop`, `instcombine`, `dse` (the store-to-load forwarding pipeline that
+closes the IR backend's 1.2-1.9× tree-walker gap + intra-block copy
+propagation + identity-fold inst combining + dead-store elimination). See
+`extensions/opt/ext_opt.hpp` for the per-pass one-line descriptions.
+`EmberAnalysisManager` (§6) and the remaining obfuscation passes
 (`FlatteningPass`, `MBAPass`, bogus control flow) remain FUTURE.
 
 The design sections (§4 architecture, §5 pass interface, §6 representation, §7
