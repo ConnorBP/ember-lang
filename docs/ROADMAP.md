@@ -53,15 +53,17 @@ stable v1 binding API, delivered as part of a v1.0 release so mods are
 actually writable (`planning/GAP_ANALYSIS.md` Section 3):
 
 - **`array`** ✓ limited v1 API — opaque i64 buffer handle with new/length/
-  resize, typed u8/f32/i64 get/set, and `array_push_u8`. Generic push,
-  pop/remove/clear are deferred.
+  resize, typed u8/f32/i64 get/set, push_u8/f32/i64, pop_u8/f32/i64, clear,
+  remove. ✓ full v1 API shipped (push/pop/clear/remove added 2026-07-11).
 - **`map<K,V>`** — deferred; no map extension exists.
 - **`string`** ✓ limited v1 API — opaque nominal handle with construction,
-  from-slice/scalar conversion, length/character access, identity, concat and
-  equality. find/substr/general format natives are deferred. F-strings lower
+  from-slice/scalar conversion, length/character access, identity, concat,
+  equality, find, substr. ✓ find/substr shipped 2026-07-11; general format
+  natives still deferred. F-strings lower
   through `__fstring_to_string` to `string_from_*`/identity; no `__fmt` exists.
-- **`math`** ✓ limited v1 API — f32 `sqrt`/`sin`/`cos`/`tan`; broader f32/f64
-  math is deferred.
+- **`math`** ✓ limited v1 API — f32 `sqrt`/`sin`/`cos`/`tan`; f64 `sqrt_f64`/
+  `sin_f64`/`cos_f64`/`tan_f64`/`floor_f64`/`ceil_f64`/`abs_f64`/`pow_f64` +
+  `abs_i64` shipped 2026-07-11; broader math still deferred.
 - **`vec2/vec3/vec4`, `quat`, `mat4`** ✓ opaque nominal handles with
   constructors/accessors and registered overloads. `sync` ✓ provides atomics,
   swap buffers, and SPSC/MPSC/MPMC queues; `lifecycle` ✓ provides dynamic
