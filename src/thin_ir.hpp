@@ -303,6 +303,14 @@ struct ThinFunction {
     // / emit_x64 / dump — the thin_ir_struct ctest builds a ThinFunction by
     // hand and stays green unchanged.
     std::vector<std::shared_ptr<Type>> owned_types;
+    // Stage B: the max VReg+1 declared in the ir_blob header. The deserializer
+    // stores it here so validate_thin_function can check every VReg reference
+    // against the DECLARED bound (not a recomputed one — recomputing from the
+    // function's own VRegs is tautological). 0 for JIT-lowered ThinFunctions
+    // (the lowering doesn't declare a bound; the validator recomputes for
+    // those). ADDITIVE: default-constructed 0, untouched by lower_function /
+    // emit_x64 / dump.
+    uint32_t declared_max_vreg = 0;
 };
 
 // Debug pretty-printer (src/thin_ir.cpp). Returns a human-readable dump of

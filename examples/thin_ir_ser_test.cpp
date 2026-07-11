@@ -434,6 +434,23 @@ static bool validation_edge_cases() {
         if (validate_thin_function(bad, &verr)) return false;
         if (verr.find("rbx_save_offset") == std::string::npos) return false;
     }
+    // P1: VReg exceeds the declared max_vreg. Set declared_max_vreg to a small
+    // value (e.g. 4) and add an instr with a VReg reference (dst=10) that
+    // exceeds it. The recomputed max_vreg would be 11 (tautological), but the
+    // declared bound (4) catches it.
+    {
+        auto bad = base;
+        bad.declared_max_vreg = 4;  // only VRegs 1..3 are valid
+        ThinInstr extra;
+        extra.op = ThinOp::ConstInt;
+        extra.dst = 10;  // 10 >= 4 — exceeds declared bound
+        extra.imm.i = 0;
+        extra.meta.width = 8;
+        bad.blocks[0].instrs.push_back(extra);
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("VReg out of range") == std::string::npos) return false;
+    }
     // Positive: the base function validates clean (sanity check).
     {
         std::string verr;
@@ -476,7 +493,7 @@ int main() {
 
     // Part 4: validation edge cases (the audit-found checks).
     std::printf("Part 4: validation edge cases (C1/C2/P2/P3/P4/P7)\n");
-    check(validation_edge_cases(), "all validation edge cases rejected (bad block.id, empty native_name, rodata OOB, slot OOB, mod_id OOB, bad cmp, bad frame_size, bad rbx_save_offset)");
+    check(validation_edge_cases(), "all validation edge cases rejected (bad block.id, empty native_name, rodata OOB, slot OOB, mod_id OOB, bad cmp, bad frame_size, bad rbx_save_offset, VReg exceeds declared bound)");
 
     std::printf("\n%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

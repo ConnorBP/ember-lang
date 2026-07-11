@@ -372,6 +372,7 @@ bool deserialize_thin_function(const uint8_t*& cur, const uint8_t* end,
         if (err) *err = "thin_ir_ser: limit: max_vreg exceeds IR_MAX_VREGS";
         return false;
     }
+    out.declared_max_vreg = max_vreg;  // stored for validate_thin_function
     uint16_t num_blocks = 0;
     if (!read_u16(cur, end, num_blocks)) {
         if (err) *err = "thin_ir_ser: truncated header (num_blocks)";
@@ -565,8 +566,16 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err,
         return false;
     }
 
-    // Compute max_vreg from the function (same as the serializer).
-    uint32_t max_vreg = compute_max_vreg(thf);
+    // P1 fix: use the DECLARED max_vreg from the blob header (stored in
+    // thf.declared_max_vreg by the deserializer) rather than recomputing it.
+    // Recomputing from the function's own VRefs is tautological (every VReg is
+    // < recomputed_max by construction). The declared bound is an independent
+    // ceiling the attacker cannot inflate — if a VReg reference exceeds it,
+    // the blob is malformed. For JIT-lowered functions (declared_max_vreg==0),
+    // fall back to the recomputed value.
+    uint32_t max_vreg = thf.declared_max_vreg != 0
+                        ? thf.declared_max_vreg
+                        : compute_max_vreg(thf);
 
     auto check_vreg = [&](uint32_t v, const char* field) -> bool {
         if (v != 0 && v >= max_vreg) {
