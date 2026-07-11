@@ -3413,13 +3413,27 @@ void CG::exec_stmt(const Stmt& s) {
         // Load element at [ptr + index*esz].
         e.load_reg_mem(Reg::rax, Reg::rbp, ptr_off);   // rax = ptr
         e.load_reg_mem(Reg::rcx, Reg::rbp, idx_off);   // rcx = index
-        uint8_t scale = 0;
-        if (esz == 1) scale = 0; else if (esz == 2) scale = 1;
-        else if (esz == 4) scale = 2; else scale = 3;
-        e.lea_reg_mem_sib(Reg::rax, Reg::rax, Reg::rcx, scale);  // rax = ptr + index*esz
-        e.load_elem_to_rax(Reg::rax, 0, esz, false);  // rax = element
+        // Compute element address: rax = ptr + index * esz.
+        // For power-of-2 sizes (1,2,4,8), use SIB scaling (lea with scale).
+        // For non-power-of-2 sizes (e.g. 12 for a 3-float struct), use imul.
+        if (esz == 1 || esz == 2 || esz == 4 || esz == 8) {
+            uint8_t scale = 0;
+            if (esz == 2) scale = 1; else if (esz == 4) scale = 2; else if (esz == 8) scale = 3;
+            e.lea_reg_mem_sib(Reg::rax, Reg::rax, Reg::rcx, scale);
+        } else {
+            // Non-power-of-2: imul rcx, esz; add rax, rcx
+            e.mov_reg_imm64(Reg::r11, int64_t(esz));
+            e.imul_reg_reg(Reg::rcx, Reg::r11);  // rcx = index * esz
+            e.add_reg_reg(Reg::rax, Reg::rcx);   // rax = ptr + index*esz
+        }
+        // Load the element. For sizes > 8 (structs), load only the first
+        // 8 bytes (the for-each var is a scalar slot; struct for-each is a
+        // future enhancement). For sizes ≤ 8, load_elem_to_rax handles the
+        // width correctly.
+        int load_width = (esz <= 8) ? esz : 8;
+        e.load_elem_to_rax(Reg::rax, 0, load_width, false);
         // Store to var's slot.
-        e.store_rax_elem(Reg::rbp, var_off, esz);
+        e.store_rax_elem(Reg::rbp, var_off, load_width);
         loops.push_back({latch, end, false, cleanup_scopes.size()});
         exec_block(fe->body);
         loops.pop_back();
