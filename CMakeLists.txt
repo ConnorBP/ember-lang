@@ -91,6 +91,7 @@ add_library(ember STATIC
     # per-function record carries) and back. Self-contained: touches Type only
     # via em_type_codec (emit_type/parse_type) + ThinFunction public members.
     src/thin_ir_ser.cpp
+    src/gc.cpp              # GC: tracing mark-sweep core (foundational infra for lambdas/coroutines)
 )
 target_include_directories(ember PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ember PUBLIC ember_ed25519)  # F2 .em content authentication
@@ -243,6 +244,15 @@ if(WIN32)
     target_link_libraries(ext_map_test PRIVATE kernel32)
 endif()
 add_test(NAME ext_map COMMAND ext_map_test)
+
+# gc_test - pins the tracing mark-sweep GC core: alloc+collect, root scanning,
+# reachable survives, unreachable collected, ref-graph tracing, cycles.
+add_executable(gc_test examples/gc_test.cpp)
+target_link_libraries(gc_test PRIVATE ember)
+if(WIN32)
+    target_link_libraries(gc_test PRIVATE kernel32)
+endif()
+add_test(NAME gc_core COMMAND gc_test)
 
 # ext_bounds_test: runtime bounds-checking coverage for the array<T> and string
 # host-store extensions (D4+D5 from docs/audit/AUDIT_2026-07-11_DOCS_TESTS.md).
