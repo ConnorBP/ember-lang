@@ -224,6 +224,24 @@ if(WIN32)
 endif()
 add_test(NAME ext_map COMMAND ext_map_test)
 
+# ext_bounds_test: runtime bounds-checking coverage for the array<T> and string
+# host-store extensions (D4+D5 from docs/audit/AUDIT_2026-07-11_DOCS_TESTS.md).
+# D4: array_get_u8/array_set_u8/array_get_i64/array_set_i64 index bounds
+# (negative index, OOB index, index==size boundary, index==size-1 last valid);
+# an OOB/negative index is a no-op on set and returns 0 on get. D5:
+# string_char_at (negative / >=length -> 0) and string_substr (negative start
+# or start>=length -> empty; negative len -> to end; len past end -> clamped).
+# Calls the registered native fn_ptrs directly (the ext_map_test shape — the
+# indexing natives are pure host-side ops over opaque i64 handles, no JIT
+# round-trip needed). Links ember_ext_array + ember_ext_string directly (no
+# prism/prism_script_host) — proving the extensions are reusable outside prism.
+add_executable(ext_bounds_test examples/ext_bounds_test.cpp)
+target_link_libraries(ext_bounds_test PRIVATE ember ember_frontend ember_ext_array ember_ext_string)
+if(WIN32)
+    target_link_libraries(ext_bounds_test PRIVATE kernel32)
+endif()
+add_test(NAME ext_bounds COMMAND ext_bounds_test)
+
 # Extension registration smoke test (RESTRUCTURE_PLAN.md Section 6): validates the
 # relocated non-cheat extensions (vec/quat/mat/string/array/math/sync/lifecycle) register
 # their NativeSig + OpOverloadTable entries via the extension entry points.
@@ -700,5 +718,5 @@ add_test(NAME aggregate_global COMMAND aggregate_global_test)
 set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
     v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
     array_lit aggregate_global em_signed codegen_opt thin_ir_struct thin_ir
-    thin_ir_ser em_v5_ir ember_pass ir_passes ext_map
+    thin_ir_ser em_v5_ir ember_pass ir_passes ext_map ext_bounds
     PROPERTIES TIMEOUT 30)
