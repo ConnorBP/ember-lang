@@ -324,6 +324,17 @@ struct Checker {
         bool is_env_capture = false; int32_t env_offset = 0; };
     std::vector<std::vector<Var>> scopes;
 
+    // #20 nested-lambda capture: a snapshot of the ENCLOSING scope chain at
+    // the moment a LambdaExpr is created (saved in check_lambda, keyed by the
+    // synthetic fn name). check_lambda_func restores it before pushing the
+    // lambda's own scope, so that a NESTED lambda's collect_captures (which
+    // runs during the enclosing lambda's body check) can see not only the
+    // enclosing lambda's params/captures but ALSO the scopes above it (e.g.
+    // main's locals). Without this, check_func's scopes.clear() wipes the
+    // outer scopes before the nested lambda is checked, so a capture from a
+    // grandparent scope (like main's `base`) is missed.
+    std::unordered_map<std::string, std::vector<std::vector<Var>>> lambda_scope_snapshots;
+
     struct GlobalVar { const Type* ty; bool is_const; };
     std::unordered_map<std::string, GlobalVar> globals;
     int loop_depth = 0;
@@ -3253,14 +3264,28 @@ void Checker::collect_captures_expr(const Expr& e, size_t lambda_scope_start,
         for (auto& el : al->elements) collect_captures_expr(*el, lambda_scope_start, out);
         return;
     }
-    // A nested LambdaExpr: its own body is checked separately (it becomes its
-    // own synthetic fn). Its captures are against ITS scope start, not ours.
-    // But a nested lambda referencing THIS scope's vars is itself a capture of
-    // THIS lambda only if the nested lambda is used... the nested lambda's
-    // captures are resolved when IT is checked. We do NOT recurse into a nested
-    // LambdaExpr's body here (it has no body field anymore — the body lives on
-    // its synthetic FuncDecl; collect would need to walk that, but the nested
-    // lambda's captures are handled by its own check_lambda). So: nothing.
+    // A nested LambdaExpr: its own body is its own synthetic fn (checked
+    // separately, with its own captures). But for TRANSITIVE capture, a var
+    // that the nested lambda references from an ENCLOSING scope of THIS lambda
+    // (e.g. main's `base`, which is above this lambda) must ALSO be captured
+    // by THIS lambda — otherwise the nested lambda's env (built in this
+    // lambda's frame) could not reach it (this lambda's frame cannot access a
+    // grandparent frame; the only bridge is this lambda's own env). So we DO
+    // recurse into the nested lambda's synthetic-fn body here, collecting any
+    // Idents it references that resolve to a scope below THIS lambda's start.
+    // Idents resolving to the nested lambda's OWN params/locals (or to THIS
+    // lambda's params — which are in a scope that doesn't exist yet at collect
+    // time) are simply not found below `lambda_scope_start`, so they are not
+    // wrongly added to THIS lambda's captures; they become the nested lambda's
+    // own captures when IT is checked.
+    if (auto* nle = dynamic_cast<const LambdaExpr*>(&e)) {
+        FuncDecl* nlf = nullptr;
+        for (auto& fn : prog->funcs) {
+            if (fn.name == nle->synthetic_fn_name) { nlf = &fn; break; }
+        }
+        if (nlf) collect_captures_block(nlf->body, lambda_scope_start, out);
+        return;
+    }
 }
 
 void Checker::collect_captures_stmt(const Stmt& s, size_t lambda_scope_start,
@@ -3375,6 +3400,18 @@ const Type* Checker::check_lambda(LambdaExpr& le) {
     // params/locals will live in a scope pushed during check_lambda_func; any
     // local at scope index < scopes.size() now is an enclosing-scope capture.
     size_t lambda_scope_start = scopes.size();
+    // #20 nested-lambda capture: snapshot the enclosing scope chain so
+    // check_lambda_func can restore it before checking this lambda's body.
+    // A nested lambda's collect_captures runs during the enclosing lambda's
+    // body check; without restoring this chain, check_func's scopes.clear()
+    // would have wiped the grandparent scopes (e.g. main's locals), so a
+    // capture resolving to a grandparent var would be missed. Save the
+    // enclosing scopes [0..lambda_scope_start) (the lambda's own scope is
+    // pushed fresh in check_lambda_func on top of this restored chain).
+    std::vector<std::vector<Var>> snap;
+    for (size_t i = 0; i < lambda_scope_start && i < scopes.size(); ++i)
+        snap.push_back(scopes[i]);
+    lambda_scope_snapshots[lf->name] = std::move(snap);
     std::vector<std::string> caps;
     collect_captures_block(lf->body, lambda_scope_start, caps);
     // Build the env layout: each capture is 8 bytes (v1: scalars only — i64/
@@ -3418,14 +3455,21 @@ const Type* Checker::check_lambda(LambdaExpr& le) {
     // Prepend the hidden __env i64 param to the synthetic fn (params[0]).
     // The body's captures are NOT params — they're env-capture vars bound in
     // check_lambda_func. The declared params shift to params[1..].
-    Param env_param;
-    env_param.name = "__env";
-    env_param.ty = std::make_shared<Type>(type_i64());
-    env_param.loc = lf->loc;
-    std::vector<Param> new_params;
-    new_params.push_back(std::move(env_param));
-    for (auto& p : lf->params) new_params.push_back(std::move(p));
-    lf->params = std::move(new_params);
+    // Guard: if __env is already params[0] (check_lambda re-ran for this fn —
+    // e.g. a LambdaExpr re-evaluated during a re-check), don't prepend again
+    // (a double __env would corrupt the param layout + sig word count).
+    const bool already_has_env =
+        !lf->params.empty() && lf->params[0].name == "__env";
+    if (!already_has_env) {
+        Param env_param;
+        env_param.name = "__env";
+        env_param.ty = std::make_shared<Type>(type_i64());
+        env_param.loc = lf->loc;
+        std::vector<Param> new_params;
+        new_params.push_back(std::move(env_param));
+        for (auto& p : lf->params) new_params.push_back(std::move(p));
+        lf->params = std::move(new_params);
+    }
     // Register the synthetic fn's signature (so calls to it via the slot +
     // script_sigs resolve). The recorded sig uses the DECLARED params (sans
     // __env) — but script_sigs indexes ALL params (including __env) for the
@@ -3452,6 +3496,21 @@ const Type* Checker::check_lambda(LambdaExpr& le) {
 // captures (as env-capture vars) + the declared params, then checks the body.
 void Checker::check_lambda_func(FuncDecl& f) {
     current_func = &f;  // #21: track for yield->coroutine marking
+    // #20 nested-lambda capture: restore the enclosing scope chain saved in
+    // check_lambda, then push THIS lambda's own scope on top. check_func did
+    // scopes.clear()+push_scope() before calling us, leaving a single empty
+    // scope; we replace it with the restored chain + a fresh top scope so that
+    // a NESTED lambda (checked during this body's check) can collect captures
+    // from the grandparent scopes too (e.g. main's locals), and so THIS body's
+    // own Idents resolve against the enclosing chain. If no snapshot exists
+    // (a lambda fn reached without its LambdaExpr being checked — shouldn't
+    // happen for a referenced lambda), fall back to the single empty scope
+    // check_func already pushed.
+    auto snit = lambda_scope_snapshots.find(f.name);
+    if (snit != lambda_scope_snapshots.end()) {
+        scopes = snit->second;  // restore enclosing chain
+        push_scope();           // fresh top scope for this lambda's params/captures/locals
+    }
     // params[0] = __env (i64 pointer to the env struct). Bind it as a normal
     // local so codegen spills it to a frame slot (the env-capture loads read
     // __env's frame slot to get env_ptr).
@@ -3489,7 +3548,14 @@ void Checker::check_lambda_func(FuncDecl& f) {
 // body. (The mutation is on the FuncDecl's shared_ptr<Type>, safe + permanent.)
 void Checker::upgrade_lambda_param_types() {
     for (auto& fn : prog->funcs) {
-        if (fn.is_lambda) continue;  // synthetic lambda fns have no lambda-arg calls to upgrade
+        // #20 nested lambdas: a lambda fn's body CAN pass a lambda-typed value
+        // to another fn (e.g. `apply(inner, 30)` inside an outer lambda's body),
+        // so we MUST walk lambda fn bodies here too — otherwise the callee's
+        // fn-handle param is never upgraded to is_lambda, the lambda value
+        // {slot, env_ptr} is passed as a single word, and the callee reads a
+        // garbage env_ptr. (Previously skipped with "synthetic lambda fns have
+        // no lambda-arg calls to upgrade", which only held for non-nested
+        // lambdas.)
         std::unordered_set<std::string> lam_locals;  // this fn's `let X = <lambda>` names
         upgrade_lambda_params_block(fn.body, lam_locals);
     }
@@ -4383,16 +4449,42 @@ SemaResult sema(Program& prog,
     }
 
     // check each function. #20: synthetic lambda fns (__lambda_N) are
-    // checked LAST — their captures + env layout are determined by
-    // check_lambda, which runs during the ENCLOSING fn's check (the fn whose
-    // body holds the LambdaExpr). Checking lambda fns after all their
-    // enclosing fns ensures lf->lambda_captures is populated before
+    // checked AFTER all non-lambda fns — their captures + env layout are
+    // determined by check_lambda, which runs during the ENCLOSING fn's check
+    // (the fn whose body holds the LambdaExpr). Checking lambda fns after all
+    // their enclosing fns ensures lf->lambda_captures is populated before
     // check_lambda_func binds them.
     for (auto& f : prog.funcs) {
         if (!f.is_lambda) c.check_func(f);
     }
-    for (auto& f : prog.funcs) {
-        if (f.is_lambda) c.check_func(f);
+    // Nested lambdas: a lambda fn's captures are set by check_lambda, which
+    // runs during the body-check of its ENCLOSING fn. For a top-level lambda
+    // the enclosing fn is a non-lambda (checked above). For a NESTED lambda
+    // the enclosing fn is itself a lambda fn — so the enclosing lambda must
+    // be checked first (its check_lambda_func walks its body, which calls
+    // check_lambda on the nested lambda, populating the nested lambda's
+    // captures + scope snapshot). Process lambda fns in dependency order with
+    // a fixpoint: a lambda is ready to check once check_lambda has prepended
+    // its hidden __env param (params[0].name == "__env"); skip any not yet
+    // ready and repeat until no progress. Any lambda still unready at the end
+    // (e.g. an unreferenced lambda literal whose enclosing fn was never
+    // checked) is checked anyway to surface body errors.
+    std::vector<bool> done(prog.funcs.size(), false);
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        for (size_t i = 0; i < prog.funcs.size(); ++i) {
+            if (done[i] || !prog.funcs[i].is_lambda) continue;
+            const bool ready = !prog.funcs[i].params.empty() &&
+                               prog.funcs[i].params[0].name == "__env";
+            if (!ready) continue;
+            c.check_func(prog.funcs[i]);
+            done[i] = true;
+            progress = true;
+        }
+    }
+    for (size_t i = 0; i < prog.funcs.size(); ++i) {
+        if (prog.funcs[i].is_lambda && !done[i]) c.check_func(prog.funcs[i]);
     }
 
     // Tier 1 static_assert: check top-level assertions (in-body ones are

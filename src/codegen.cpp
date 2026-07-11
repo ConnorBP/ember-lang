@@ -1868,6 +1868,37 @@ void CG::eval(const Expr& ex) {
                 const Type* ct = le->capture_types[i].get();
                 auto cit = locals.find(cname);
                 if (cit == locals.end()) {
+                    // #20 nested-lambda transitive capture: if this fn is itself
+                    // a lambda + cname is one of ITS captures, the value lives
+                    // in THIS lambda's env (not a frame slot). Load it from
+                    // [env_ptr + offset] (env_ptr = [rbp + lambda_env_off]) and
+                    // copy it into the nested lambda's env. This is how a nested
+                    // lambda reaches a grandparent-scope var: the enclosing
+                    // lambda captured it, and the nested lambda re-captures it
+                    // from the enclosing lambda's env (the enclosing frame
+                    // cannot access the grandparent frame directly).
+                    auto lcit = compiling_lambda ? lambda_captures.find(cname)
+                                                 : lambda_captures.end();
+                    if (lcit != lambda_captures.end()) {
+                        int32_t cap_env_off = lcit->second.first;
+                        // load env_ptr from [rbp + lambda_env_off] into rax
+                        e.load_reg_mem(Reg::rax, Reg::rbp, lambda_env_off);
+                        if (ct && ct->is_float()) {
+                            if (ct->prim == Prim::F64)
+                                e.movsd_xmm_mem(Xmm::xmm0, Reg::rax, cap_env_off);
+                            else
+                                e.movss_xmm_mem(Xmm::xmm0, Reg::rax, cap_env_off);
+                            if (ct->prim == Prim::F64)
+                                e.movsd_mem_xmm(Reg::rbp, dst, Xmm::xmm0);
+                            else
+                                e.movss_mem_xmm(Reg::rbp, dst, Xmm::xmm0);
+                        } else {
+                            e.load_reg_mem(Reg::rax, Reg::rax, cap_env_off);
+                            normalize_rax(ct);
+                            e.store_rax_elem(Reg::rbp, dst, 8);
+                        }
+                        continue;
+                    }
                     // capture is a global (shouldn't happen for v1 — globals
                     // aren't captured) or unresolvable; zero-fill the slot.
                     e.mov_reg_imm64(Reg::rax, 0);
@@ -4861,7 +4892,12 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
                 }
                 byte_pos += word_bytes;
             }
-        } else if (pt->is_slice) {
+        } else if (pt->is_slice || pt->is_lambda) {
+            // a slice ({ptr, len}) and a lambda ({slot, env_ptr}) are each 2
+            // consecutive integer words — spill both to the param's frame slot
+            // (word 0 -> off, word 1 -> off+8). Missing the lambda's env_ptr
+            // word here left the callee reading a garbage env_ptr when it
+            // later called the lambda-typed param (off-by-1 / wrong capture).
             spill_word(param_word, off, nullptr);
             spill_word(param_word + 1, off + 8, nullptr);
         } else if (pt->is_float()) {
