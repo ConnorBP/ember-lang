@@ -811,6 +811,94 @@ int main() {
         ck(total_instrs(tf) < orig, "D9.4: dse reduced total instr count");
     }
 
+    // -----------------------------------------------------------------
+    // D10 (regression): DSE must NOT remove a StoreFrame that feeds a
+    // CopyBytes reader. Two StoreFrames to slot -8 with a CopyBytes that
+    // READS -8 (its source range) between them: the first store feeds the
+    // copy, so it is NOT dead. Before the fix DSE only killed on LoadFrame,
+    // so it removed the first store and the CopyBytes read an uninitialized
+    // slot (a value-preservation bug, confirmed by a hand-built IR repro).
+    // -----------------------------------------------------------------
+    std::printf("\n--- D10: DSE keeps a store that feeds a CopyBytes reader ---\n");
+    {
+        ThinFunction tf; tf.name = "dse_copybytes_reader";
+        const VReg v0=1, v1=2, v2=3;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr{ ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        auto st = [&](VReg s, int32_t off)->ThinInstr{ ThinInstr x; x.op=ThinOp::StoreFrame; x.src1=s; x.meta.frame_off=off; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v0, 5));
+        b0.instrs.push_back(st(v0, -8));                 // first store to -8 (=5)
+        // CopyBytes: read 8 bytes from src -8, write to dst -16. Reads slot -8.
+        { ThinInstr x; x.op=ThinOp::CopyBytes; x.dst=0; x.src1=0;
+          x.meta.frame_off=-16; x.meta.field_off=-8; x.meta.len=8; b0.instrs.push_back(std::move(x)); }
+        b0.instrs.push_back(ci(v1, 9));
+        b0.instrs.push_back(st(v1, -8));                 // second store to -8 (=9, overwrites)
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v2; x.meta.frame_off=-16; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        b0.term.kind=TermKind::Return; b0.term.ret=v2;
+        tf.blocks.push_back(std::move(b0));
+
+        size_t stores_before=0; for(auto&b:tf.blocks)for(auto&in:b.instrs)if(in.op==ThinOp::StoreFrame)++stores_before;
+        ck(stores_before == 2, "D10.0: two stores before dse");
+
+        EmberAnalysisManager am; auto pc=reg.create("dse"); pc->run(tf,am);
+        size_t stores_after=0; for(auto&b:tf.blocks)for(auto&in:b.instrs)if(in.op==ThinOp::StoreFrame)++stores_after;
+        char msg[128]; std::snprintf(msg,sizeof msg,"D10.1: dse keeps both stores (CopyBytes is a reader) (before=%zu after=%zu)",stores_before,stores_after);
+        ck(stores_after == 2, msg);
+        // The first store (off=-8, src=v0/5) must specifically survive.
+        bool first_store_survives = false;
+        for (const auto& blk : tf.blocks)
+            for (const auto& in : blk.instrs)
+                if (in.op == ThinOp::StoreFrame && in.meta.frame_off == -8 && in.src1 == v0)
+                    first_store_survives = true;
+        ck(first_store_survives, "D10.2: the first StoreFrame(-8,v0=5) survives (feeds the CopyBytes)");
+    }
+
+    // -----------------------------------------------------------------
+    // D11 (regression): StoreToLoadForward must NOT forward a LoadFrame
+    // past an intervening CopyBytes that WRITES the slot. StoreFrame to -8,
+    // then CopyBytes whose dest range covers -8 (overwrites it), then
+    // LoadFrame of -8: the load must read what the CopyBytes wrote, NOT the
+    // stale StoreFrame value. Before the fix, forward rewrote the LoadFrame
+    // to a Move of the stale StoreFrame src (confirmed by IR dump),
+    // delivering the wrong value.
+    // -----------------------------------------------------------------
+    std::printf("\n--- D11: forward does not cross a CopyBytes writer ---\n");
+    {
+        ThinFunction tf; tf.name = "forward_copybytes_writer";
+        const VReg v0=1, v77=2, vload=3;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr{ ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        auto st = [&](VReg s, int32_t off)->ThinInstr{ ThinInstr x; x.op=ThinOp::StoreFrame; x.src1=s; x.meta.frame_off=off; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v0, 5));
+        b0.instrs.push_back(st(v0, -8));                 // slot -8 = 5
+        b0.instrs.push_back(ci(v77, 77));
+        b0.instrs.push_back(st(v77, -16));               // slot -16 = 77 (copy source)
+        // CopyBytes: write 8 bytes from src -16 to dst -8 (OVERWRITES slot -8).
+        { ThinInstr x; x.op=ThinOp::CopyBytes; x.dst=0; x.src1=0;
+          x.meta.frame_off=-8; x.meta.field_off=-16; x.meta.len=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=vload; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        b0.term.kind=TermKind::Return; b0.term.ret=vload;
+        tf.blocks.push_back(std::move(b0));
+
+        EmberAnalysisManager am; auto pc=reg.create("forward"); pc->run(tf,am);
+        // The LoadFrame dst=vload off=-8 must NOT have been rewritten to a Move
+        // (the CopyBytes overwrote -8, so the load must read the slot, not the
+        // stale StoreFrame src v0).
+        bool load_preserved = false;
+        for (const auto& blk : tf.blocks)
+            for (const auto& in : blk.instrs)
+                if (in.op == ThinOp::LoadFrame && in.dst == vload && in.meta.frame_off == -8)
+                    load_preserved = true;
+        ck(load_preserved, "D11.1: LoadFrame(-8) preserved (not forwarded past the CopyBytes writer)");
+        // And there must be no Move dst=vload src=v0 (the stale forward).
+        bool stale_move = false;
+        for (const auto& blk : tf.blocks)
+            for (const auto& in : blk.instrs)
+                if (in.op == ThinOp::Move && in.dst == vload && in.src1 == v0)
+                    stale_move = true;
+        ck(!stale_move, "D11.2: no stale Move vload=v0 (forward correctly killed by CopyBytes write)");
+    }
+
     std::printf("\n%s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }

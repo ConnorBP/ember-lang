@@ -63,7 +63,11 @@ bool is_foldable_int_binop(ThinOp op) {
 // Fold a binary int op on two constant operands. Returns true + sets *result.
 // Only handles the safe, well-defined cases. Does NOT fold Div/Mod (division
 // by zero / INT64_MIN/-1 UB). Respects meta.width (truncates to width bytes,
-// two's-complement) and meta.is_unsigned (for Shr).
+// two's-complement) and meta.is_unsigned (for Shr). Shift amounts are masked
+// to 0..63 to match x64 shl/shr semantics (the CPU masks CL to 0..63) and
+// try_eval_const_i64's `r & 63` — without the mask, `a << b` for b >= 64 is
+// C++ undefined behavior and would let ConstProp fold a `7 << 64` to an
+// arbitrary value instead of the `7 << 0 = 7` the tree-walker produces.
 bool fold_int_binop(ThinOp op, int64_t a, int64_t b, int32_t width,
                     bool is_unsigned, int64_t* result) {
     int64_t r = 0;
@@ -74,11 +78,17 @@ bool fold_int_binop(ThinOp op, int64_t a, int64_t b, int32_t width,
     case ThinOp::And: r = a & b; break;
     case ThinOp::Or:  r = a | b; break;
     case ThinOp::Xor: r = a ^ b; break;
-    case ThinOp::Shl: r = a << b; break;
-    case ThinOp::Shr:
-        if (is_unsigned) r = int64_t(uint64_t(a) >> b);
-        else             r = a >> b;
+    case ThinOp::Shl: r = static_cast<int64_t>(uint64_t(a) << (uint64_t(b) & 63u)); break;
+    case ThinOp::Shr: {
+        int sh = int(uint64_t(b) & 63u);
+        if (is_unsigned) r = int64_t(uint64_t(a) >> sh);
+        else {
+            uint64_t ur = uint64_t(a) >> sh;
+            if (sh != 0 && a < 0) ur |= ~((1ULL << (64 - sh)) - 1);
+            r = static_cast<int64_t>(ur);
+        }
         break;
+    }
     default:
         return false;
     }
@@ -151,6 +161,70 @@ std::unordered_set<int32_t> compute_read_slots(const ThinFunction& f) {
         }
     }
     return read;
+}
+
+// Does `in` READ frame offset `off`? Used by DSE's intra-block dead-store
+// scan to kill a pending dead store when a reader appears between two
+// StoreFrames to the same slot. Mirrors compute_read_slots's conservative
+// reader set: LoadFrame reads meta.frame_off; CopyBytes reads its SOURCE
+// range [meta.field_off, meta.field_off + meta.len) AND (conservatively)
+// meta.frame_off (the dest, when frame-relative — treating the dest as a
+// read is a false positive that only keeps a dead store alive, never
+// removes a needed one); FieldAddr reads meta.frame_off (the struct base).
+// StoreFrame to a DIFFERENT offset does NOT read `off` (frame slots don't
+// overlap in v1 — each local gets its own non-overlapping region, per the
+// StoreToLoadForward comment), so a store to another slot is not a reader.
+//
+// The CopyBytes case is the one DSE previously MISSED (it only killed on
+// LoadFrame), which let DSE remove a StoreFrame that fed a subsequent
+// CopyBytes source — a value-preservation bug (hand-built IR repro: two
+// StoreFrames to slot X with a CopyBytes reading X between them; DSE
+// removed the first store, so the copy read an uninitialized slot).
+bool instr_reads_off(const ThinInstr& in, int32_t off) {
+    if (in.op == ThinOp::LoadFrame)
+        return in.meta.frame_off == off;
+    if (in.op == ThinOp::FieldAddr)
+        return in.meta.frame_off == off;
+    if (in.op == ThinOp::CopyBytes) {
+        // conservative: dest (meta.frame_off, when frame-relative) counts as a read
+               if (in.meta.frame_off == off) return true;
+        // source range [field_off, field_off + len): any StoreFrame whose slot
+        // lies in this range feeds the copy.
+        if (in.meta.len > 0 && off >= in.meta.field_off &&
+            off < in.meta.field_off + in.meta.len)
+            return true;
+        return false;
+    }
+    return false;
+}
+
+// Does `in` WRITE frame offset `off` (other than via StoreFrame, which the
+// callers handle directly)? Used by StoreToLoadForward to kill a pending
+// store-to-load forward when an intervening instruction writes the slot
+// (so a later LoadFrame must re-read the slot, not forward the stale
+// StoreFrame's value). CopyBytes writes its DEST range
+// [meta.frame_off, meta.frame_off + meta.len) when the dest is
+// frame-relative (in.dst == 0 and not global-backed). StoreFrame is handled
+// by the caller's own tracking. Other instrs don't write frame slots.
+//
+// The CopyBytes case is the one StoreToLoadForward previously MISSED: a
+// StoreFrame to X, then a CopyBytes whose dest range covers X, then a
+// LoadFrame of X — the forward wrongly delivered the StoreFrame's value
+// instead of the bytes the CopyBytes wrote (hand-built IR repro confirmed
+// the LoadFrame was rewritten to a Move of the stale StoreFrame src).
+bool instr_writes_off(const ThinInstr& in, int32_t off) {
+    if (in.op == ThinOp::CopyBytes) {
+        // Dest is frame-relative when in.dst == 0 (no dest vreg) and the dest
+        // side is not global-backed. copy_frame_frame / copy_global_frame set
+        // meta.frame_off = dst_off; copy_frame_vptr / copy_global_vptr set
+        // in.dst to a vreg (dest is [vreg+0], not a frame slot). For a
+        // frame-relative dest, the written range is [frame_off, frame_off+len).
+        if (in.dst == 0 && in.meta.len > 0 &&
+            off >= in.meta.frame_off && off < in.meta.frame_off + in.meta.len)
+            return true;
+        return false;
+    }
+    return false;
 }
 
 } // namespace
@@ -681,17 +755,32 @@ EmberPreserved StoreToLoadForwardPass::run(ThinFunction& f, EmberAnalysisManager
             // Any other instruction that writes to a VReg could invalidate a
             // store if the VReg was the store's source. But since we're only
             // tracking frame_off → src VReg, and the src VReg is the value AT
-            // THE TIME of the store, a subsequent redefinition of that VReg
-            // doesn't change what was stored. The store happened with the old
-            // value. So we don't need to kill on VReg redefinition — the frame
-            // slot holds the value that was stored, regardless of what happens
-            // to the VReg later. This is correct because we're forwarding the
+            // THE TIME of the store (VRegs are SSA — each VReg is written
+            // exactly once by thin_lower's monotonic new_vreg, so the src VReg
+            // is never redefined), a subsequent redefinition cannot happen.
+            // So we don't need to kill on VReg redefinition — the frame slot
+            // holds the value that was stored, regardless of what happens to
+            // the VReg later. This is correct because we're forwarding the
             // VALUE that was stored, not the VReg itself.
             //
-            // HOWEVER: if the instruction is a StoreFrame to a DIFFERENT slot
-            // that happens to alias (overlapping frame offsets for structs >8
-            // bytes), we'd need to kill. For v1, frame slots don't overlap
-            // (each local gets its own non-overlapping region), so this is safe.
+            // HOWEVER: an instruction that WRITES the frame slot directly
+            // (CopyBytes whose dest range covers the slot) overwrites the
+            // stored value, so a later LoadFrame must re-read the slot (not
+            // forward the now-stale StoreFrame src). Kill any pending forward
+            // whose slot lies in the writer's dest range. (StoreFrame to a
+            // DIFFERENT slot doesn't alias — v1 frame slots don't overlap,
+            // each local gets its own non-overlapping region.) This closes the
+            // CopyBytes-dest gap: StoreFrame@X; CopyBytes(dst covers X);
+            // LoadFrame@X previously forwarded the stale StoreFrame value
+            // instead of the bytes the CopyBytes wrote.
+            if (!last_store_src.empty()) {
+                for (auto it = last_store_src.begin(); it != last_store_src.end(); ) {
+                    if (instr_writes_off(in, it->first))
+                        it = last_store_src.erase(it);
+                    else
+                        ++it;
+                }
+            }
         }
     }
     return changed ? EmberPreserved::none() : EmberPreserved::all();
@@ -931,8 +1020,9 @@ EmberPreserved DeadStoreElimPass::run(ThinFunction& f, EmberAnalysisManager&) {
         while (block_changed) {
             block_changed = false;
             // Map: frame_off → index of the last StoreFrame to that off (in the
-            // current instr vector). A LoadFrame of the same off kills the
-            // pending store (it was read, so it's not dead).
+            // current instr vector). A reader of the same off (LoadFrame,
+            // CopyBytes source range, or FieldAddr base — see instr_reads_off)
+            // kills the pending store (it was read, so it's not dead).
             std::unordered_map<int32_t, size_t> last_store_idx;
             auto& instrs = blk.instrs;
             for (size_t i = 0; i < instrs.size(); ++i) {
@@ -942,7 +1032,7 @@ EmberPreserved DeadStoreElimPass::run(ThinFunction& f, EmberAnalysisManager&) {
                     auto it = last_store_idx.find(off);
                     if (it != last_store_idx.end()) {
                         // A prior StoreFrame to this off with no intervening
-                        // LoadFrame → the prior store is dead. Remove it.
+                        // reader → the prior store is dead. Remove it.
                         size_t dead_idx = it->second;
                         instrs.erase(instrs.begin() + ptrdiff_t(dead_idx));
                         // We erased an earlier instr; the current index i has
@@ -952,12 +1042,21 @@ EmberPreserved DeadStoreElimPass::run(ThinFunction& f, EmberAnalysisManager&) {
                         break;
                     }
                     last_store_idx[off] = i;
-                } else if (in.op == ThinOp::LoadFrame) {
-                    // A load reads the slot → the last store is not dead.
-                    last_store_idx.erase(in.meta.frame_off);
+                } else {
+                    // Any reader of a tracked off kills that pending store
+                    // (the slot was read between the two stores, so the first
+                    // store is NOT dead). This covers LoadFrame, CopyBytes's
+                    // source range, and FieldAddr's base — the same reader set
+                    // compute_read_slots uses (DCE/ConstProp already honor it;
+                    // DSE previously honored ONLY LoadFrame, missing CopyBytes/
+                    // FieldAddr, which removed a store that fed a CopyBytes).
+                    for (auto it = last_store_idx.begin(); it != last_store_idx.end(); ) {
+                        if (instr_reads_off(in, it->first))
+                            it = last_store_idx.erase(it);
+                        else
+                            ++it;
+                    }
                 }
-                // Any other instr does not affect store-liveness for our
-                // purposes (we only track StoreFrame/LoadFrame per off).
             }
         }
     }

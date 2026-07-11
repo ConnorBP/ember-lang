@@ -250,6 +250,47 @@ int main() {
         else { ck(call0_i64(*m, "main") == 12, "[10] priv constexpr fn == 12 (secret(5)=6 * 2, both modifiers)"); }
     }
 
+    // [11] nested-loop constexpr DoS bound (regression for the per-loop vs
+    // total-budget defect). A constexpr fn with NESTED loops whose combined
+    // iteration count far exceeds the 100k budget MUST fall back to a runtime
+    // call (not hang the compiler) and still produce the correct runtime
+    // result. Before the fix, each loop had its OWN 100k counter, so two
+    // nested 100k loops ran 100k*100k = 10^10 sema-time iterations (a
+    // compile-time hang / DoS). The fix is a shared TOTAL iteration budget
+    // across all loops in one eval: the outer loop's first 100k iterations
+    // exhaust it, eval returns false, and the call folds back to runtime.
+    //
+    // The fn counts the iterations of a 2-deep nested loop with SMALL bounds
+    // (3*3 = 9 total) so the runtime result is verifiable AND the constexpr
+    // eval (which runs 9 iterations, well under 100k) actually FOLDS it —
+    // pinning that small nested loops still const-eval correctly. A second
+    // call with large bounds (200*200 = 40000, still under 100k) also folds.
+    // A third with 400*400 = 160000 (> 100k) falls back to runtime.
+    {
+        const char* src =
+            "constexpr fn nested_count(outer: i64, inner: i64) -> i64 {\n"
+            "    let mut total: i64 = 0;\n"
+            "    let mut i: i64 = 0;\n"
+            "    while (i < outer) {\n"
+            "        let mut j: i64 = 0;\n"
+            "        while (j < inner) {\n"
+            "            total = total + 1;\n"
+            "            j = j + 1;\n"
+            "        }\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    return total;\n"
+            "}\n"
+            "fn main() -> i64 { return nested_count(3, 3) + nested_count(200, 200) + nested_count(400, 400); }\n";
+        auto m = compile(src);
+        if (!m) { ck(false, "[11] nested-loop DoS (compile — must not hang)"); }
+        else {
+            // 3*3=9 (folds) + 200*200=40000 (folds) + 400*400=160000 (runtime fallback) = 200009
+            ck(call0_i64(*m, "main") == 9 + 40000 + 160000,
+               "[11] nested-loop constexpr: small folds, large falls back to runtime, no hang (9+40000+160000=200009)");
+        }
+    }
+
     if (g_fail) {
         std::printf("\nFAILED\n");
         return 1;

@@ -931,10 +931,16 @@ struct Checker {
 
     // --- constexpr fn evaluation (Tier 1) ---
     // A tree-walking interpreter that evaluates a constexpr fn call at sema
-    // time to produce a compile-time i64 result. Bounded: max 100000 loop
-    // iterations per loop, max 256 recursion depth (nested constexpr calls).
-    // Only i64 integer fns in this increment; float/bool/struct fns skip
-    // constexpr eval and fall back to runtime calls.
+    // time to produce a compile-time i64 result. Bounded: max 256 recursion
+    // depth (nested constexpr calls) and a TOTAL iteration budget of
+    // CE_MAX_TOTAL_ITERS across ALL loops in one eval (see ce_eval_stmt's loop
+    // cases). The total budget is what makes the bound real: a per-loop counter
+    // alone is bypassed by NESTED loops (N nested 100k loops = 100k^N iters,
+    // a compile-time DoS). The shared counter credits every loop body iteration
+    // across every nesting level against one budget, so nesting cannot multiply
+    // past it. Only i64 integer fns in this increment; float/bool/struct fns
+    // skip constexpr eval and fall back to runtime calls.
+    static constexpr int64_t CE_MAX_TOTAL_ITERS = 100000;
     struct ConstEvalCtx {
         std::vector<std::unordered_map<std::string, int64_t>> scopes;
         int64_t result = 0;
@@ -942,6 +948,7 @@ struct Checker {
         bool broke = false;
         bool continued = false;
         int depth = 0;
+        int64_t total_iters = 0;  // shared across ALL loops in this eval (DoS bound)
     };
     bool eval_constexpr_fn(const FuncDecl& fn, const std::vector<int64_t>& arg_values,
                            int64_t& result_out, std::string& err, int depth = 0);
@@ -2467,13 +2474,18 @@ bool Checker::ce_eval_stmt(const Stmt& s, ConstEvalCtx& ctx, std::string& err) {
         return true;
     }
     if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) {
-        const int MAX_LOOP = 100000;
-        int iters = 0;
         while (true) {
             int64_t c;
             if (!ce_eval_expr(*ws->cond, c, ctx, err)) return false;
             if (!c) break;
-            if (++iters > MAX_LOOP) { err = "constexpr loop exceeded iteration limit"; return false; }
+            // Charge the shared TOTAL iteration budget (not a per-loop
+            // counter) so nested loops cannot multiply past it (a per-loop
+            // 100k cap is bypassed by N nested loops = 100k^N iters). The
+            // budget is shared across every loop at every nesting level in
+            // this eval, making the bound a real total-work bound.
+            if (++ctx.total_iters > CE_MAX_TOTAL_ITERS) {
+                err = "constexpr loop exceeded iteration limit"; return false;
+            }
             ctx.broke = false; ctx.continued = false;
             if (!ce_eval_block(ws->body, ctx, err)) return false;
             if (ctx.returned) break;
@@ -2483,21 +2495,23 @@ bool Checker::ce_eval_stmt(const Stmt& s, ConstEvalCtx& ctx, std::string& err) {
         return true;
     }
     if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
-        const int MAX_LOOP = 100000;
         // for-init runs in a scope that wraps the whole loop (the loop var
         // persists across iterations, same as runtime semantics)
         ctx.scopes.emplace_back();
         if (fs->init) {
             if (!ce_eval_stmt(*fs->init, ctx, err)) { ctx.scopes.pop_back(); return false; }
         }
-        int iters = 0;
         while (true) {
             if (fs->cond) {
                 int64_t c;
                 if (!ce_eval_expr(*fs->cond, c, ctx, err)) { ctx.scopes.pop_back(); return false; }
                 if (!c) break;
             }
-            if (++iters > MAX_LOOP) { err = "constexpr loop exceeded iteration limit"; ctx.scopes.pop_back(); return false; }
+            // Shared TOTAL iteration budget (see WhileStmt above): nested
+            // loops cannot multiply past this single per-eval budget.
+            if (++ctx.total_iters > CE_MAX_TOTAL_ITERS) {
+                err = "constexpr loop exceeded iteration limit"; ctx.scopes.pop_back(); return false;
+            }
             ctx.broke = false; ctx.continued = false;
             if (!ce_eval_block(fs->body, ctx, err)) { ctx.scopes.pop_back(); return false; }
             if (ctx.returned) break;
@@ -2511,8 +2525,6 @@ bool Checker::ce_eval_stmt(const Stmt& s, ConstEvalCtx& ctx, std::string& err) {
         return true;
     }
     if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) {
-        const int MAX_LOOP = 100000;
-        int iters = 0;
         while (true) {
             ctx.broke = false; ctx.continued = false;
             if (!ce_eval_block(ds->body, ctx, err)) return false;
@@ -2521,7 +2533,10 @@ bool Checker::ce_eval_stmt(const Stmt& s, ConstEvalCtx& ctx, std::string& err) {
             int64_t c;
             if (!ce_eval_expr(*ds->cond, c, ctx, err)) return false;
             if (!c) break;
-            if (++iters > MAX_LOOP) { err = "constexpr loop exceeded iteration limit"; return false; }
+            // Shared TOTAL iteration budget (see WhileStmt above).
+            if (++ctx.total_iters > CE_MAX_TOTAL_ITERS) {
+                err = "constexpr loop exceeded iteration limit"; return false;
+            }
         }
         return true;
     }
