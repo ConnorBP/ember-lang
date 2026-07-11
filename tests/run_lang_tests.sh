@@ -114,7 +114,12 @@ for spec in "runtime_audit_semantics.ember:77" "runtime_cast_regressions.ember:4
             "sema_valid_basics.ember:6" "sema_valid_defer_local_ref.ember:94" \
             "sema_valid_priv_fn_intra_module.ember:42" \
             "valid_constexpr.ember:49" "valid_constexpr_recursive.ember:55" \
-            "valid_constexpr_in_expr.ember:177" "valid_constexpr_runtime_fallback.ember:20"; do
+            "valid_constexpr_in_expr.ember:177" "valid_constexpr_runtime_fallback.ember:20" \
+            "valid_static_assert.ember:42" "valid_static_assert_constexpr.ember:49" \
+            "valid_for_each_array.ember:60" "valid_for_each_array_u8.ember:60" \
+            "valid_for_each_array_empty.ember:0" "valid_for_each_array_break.ember:60" \
+            "valid_for_each_array_continue.ember:90" "valid_for_each_array_single.ember:42" \
+            "valid_for_each_array_f32.ember:1"; do
     f=${spec%%:*}; exp=${spec##*:}; out=$("$CLI" run "tests/lang/$f" 2>&1); rc=$?
     if [ $rc -eq "$exp" ]; then printf "PASS  %s (explicit expected rc=%d)\n" "$f" "$rc"; pass=$((pass+1))
     else printf "FAIL  %s (rc=%d, expected %d)\n%s\n" "$f" "$rc" "$exp" "$out"; fail=$((fail+1)); fi

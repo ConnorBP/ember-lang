@@ -271,6 +271,9 @@ struct ThinLowerer {
 
     void prescan_block(const Block& b) { for (auto& s : b.stmts) prescan_stmt(*s); }
     void prescan_stmt(const Stmt& s) {
+        // static_assert is fully resolved at sema and produces NO runtime code;
+        // every statement walker skips it (mirrors the elided assert_eq_* path).
+        if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) prescan_expr(*ls->init); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { prescan_expr(*es->expr); return; }
         if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) { if (rs->value) prescan_expr(*rs->value); return; }
@@ -311,6 +314,7 @@ struct ThinLowerer {
 
     void count_struct_temps_block(const Block& b, int32_t& total) { for (auto& s : b.stmts) count_struct_temps_stmt(*s, total); }
     void count_struct_temps_stmt(const Stmt& s, int32_t& total) {
+        if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_struct_temps_expr(*ls->init, total); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_struct_temps_expr(*es->expr, total); return; }
         if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) {
@@ -366,6 +370,7 @@ struct ThinLowerer {
 
     void count_arr_temps_block(const Block& b, int32_t& total) { for (auto& s : b.stmts) count_arr_temps_stmt(*s, total); }
     void count_arr_temps_stmt(const Stmt& s, int32_t& total) {
+        if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_arr_temps_expr(*ls->init, total); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_arr_temps_expr(*es->expr, total); return; }
         if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) { if (rs->value) count_arr_temps_expr(*rs->value, total); return; }
@@ -415,6 +420,7 @@ struct ThinLowerer {
 
     void count_str_temps_block(const Block& b, int32_t& total) { for (auto& s : b.stmts) count_str_temps_stmt(*s, total); }
     void count_str_temps_stmt(const Stmt& s, int32_t& total) {
+        if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_str_temps_expr(*ls->init, total); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_str_temps_expr(*es->expr, total); return; }
         if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) { if (rs->value) count_str_temps_expr(*rs->value, total); return; }
@@ -468,6 +474,7 @@ struct ThinLowerer {
     // other count_*_temps walkers cover).
     void count_logical_temps_block(const Block& b, int32_t& total) { for (auto& s : b.stmts) count_logical_temps_stmt(*s, total); }
     void count_logical_temps_stmt(const Stmt& s, int32_t& total) {
+        if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_logical_temps_expr(*ls->init, total); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_logical_temps_expr(*es->expr, total); return; }
         if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) { if (rs->value) count_logical_temps_expr(*rs->value, total); return; }
@@ -533,6 +540,7 @@ struct ThinLowerer {
         for (auto& s : b.stmts) count_pin_refs_stmt(*s, counts);
     }
     void count_pin_refs_stmt(const Stmt& s, std::unordered_map<std::string,int>& counts) {
+        if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_pin_refs_expr(*ls->init, counts); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_pin_refs_expr(*es->expr, counts); return; }
         if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) { if (rs->value) count_pin_refs_expr(*rs->value, counts); return; }
@@ -666,6 +674,8 @@ struct ThinLowerer {
         return 1;
     }
     int64_t stmt_cost(const Stmt& s) {
+        // static_assert produces no code, so it costs zero.
+        if (dynamic_cast<const StaticAssertStmt*>(&s)) return 0;
         if (auto* bs = dynamic_cast<const BlockStmt*>(&s))  return block_cost(bs->block);
         if (auto* is = dynamic_cast<const IfStmt*>(&s))
             return cost_add(cost_add(1, is->cond ? expr_cost(*is->cond) : 0),
@@ -2360,6 +2370,11 @@ void ThinLowerer::lower_block(const Block& b) {
 
 void ThinLowerer::lower_stmt(const Stmt& s) {
     const Loc loc = s.loc;
+
+    // static_assert produces NO codegen (sema resolved it fully: true ->
+    // elided, false / non-const -> compile error that never reaches here).
+    // Skip it before any dispatch so the IR lowering emits nothing for it.
+    if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
 
     if (auto* ls = dynamic_cast<const LetStmt*>(&s)) {
         if (!ls->init) {

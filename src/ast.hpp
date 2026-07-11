@@ -216,7 +216,19 @@ struct ForStmt  : Stmt { std::unique_ptr<LetStmt> init; ExprPtr cond; ExprPtr st
 struct DoWhileStmt:Stmt { Block body; ExprPtr cond; };
 // Tier 1: for-each over a slice T[]. `iter` must be a slice; `var` gets the
 // element type. Desugared by codegen to a while loop with indexing.
-struct ForEachStmt: Stmt { std::string var; ExprPtr iter; Block body; };
+//
+// iterable() hook (Tier 1): for-each generalizes beyond slices to any
+// registered iterable. Two iterable kinds are recognized today:
+//   1. a slice T[]           -> tree-walker ptr+len indexing (the shipped path)
+//   2. an array<T> handle    -> an opaque i64 from the array extension, lowered
+//                               to array_length(h) + array_get_*(h, i) natives
+// `array_elem_ty` is set by sema ONLY for the array-handle case (case 2): it
+// is the inferred element type (u8/f32/i64) used to select the array_get_*
+// variant in codegen. It is null for the slice case, where the element type
+// comes from iter->ty->elem. Future iterables (map, host collections)
+// register through the same hook surface (see sema.cpp's ForEachStmt check +
+// the array_elem_ty inference); only the array case is implemented now.
+struct ForEachStmt: Stmt { std::string var; ExprPtr iter; Block body; const Type* array_elem_ty = nullptr; };
 struct ReturnStmt:Stmt { ExprPtr value; };          // nullptr = void return
 struct BreakStmt: Stmt {};
 struct ContinueStmt:Stmt {};
@@ -233,6 +245,17 @@ struct SwitchStmt: Stmt { ExprPtr subject; std::vector<SwitchCase> cases; };
 // bool literals, `_` (wildcard/default). No struct destructure in v1.
 struct MatchArm { ExprPtr pattern; bool is_wildcard = false; Block body; };
 struct MatchStmt : Stmt { ExprPtr subject; std::vector<MatchArm> arms; };
+// Tier 1: static_assert(cond, "msg") — a compile-time assertion. Sema folds
+// `cond` (constexpr calls + enum variants are already IntLits by the time the
+// statement check runs, so the same try_eval_const_bool that powers assert_eq
+// folding applies) and resolves it NOW: true -> elided (codegen emits nothing,
+// the statement is a pure compile-time check); false -> a sema compile error
+// carrying `msg`; not-foldable -> a sema compile error ("condition must be a
+// compile-time constant"). Valid both inside a function body (parsed by
+// parse_stmt, checked in check_stmt) and at top level (parsed in parse_program,
+// stored on Program::static_asserts, checked in a dedicated sema pass). Produces
+// NO runtime code in either position.
+struct StaticAssertStmt : Stmt { ExprPtr cond; std::string msg; };
 
 // declarations
 // A literal default value for a parameter (v1: literals only - arbitrary
@@ -338,6 +361,7 @@ struct Program {
     std::vector<FuncDecl> funcs;
     std::vector<LinkDecl> links;   // v0.5 live-module link declarations (docs/MODULES.md §6)
     std::vector<EnumDecl> enums;   // Tier 1 script-side enums (docs/planning/plan_ENUMS.md)
+    std::vector<StaticAssertStmt> static_asserts;  // Tier 1 top-level static_assert (in-body ones live inside their fn's Block)
     // type store: owns synthesized Types created by sema (slices, adapted
     // literal types) so the raw `ty` pointers stashed on AST nodes survive
     // until codegen finishes (sema's local Checker would otherwise free them).

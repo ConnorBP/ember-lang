@@ -251,6 +251,46 @@ bool try_eval_const_bool(const Expr& e, bool& out) {
         if (!try_eval_const_bool(*u->operand, v)) return false;
         out = !v; return true;
     }
+    // Comparison operators over compile-time integer constants: fold both
+    // sides via try_eval_const_i64 and compare. This is what lets a
+    // static_assert condition like `1 + 1 == 2` or `square(7) == 49` (after
+    // the constexpr-call pre-pass rewrites square(7) to an IntLit) resolve to
+    // a compile-time bool. Safe to add to the shared folder: the only
+    // pre-existing caller is assert_eq_bool's constant-operand folding, where
+    // this STRICTLY widens what folds (a constant comparison arg now elides
+    // instead of leaving a runtime call) — matching assert_eq's existing
+    // "a passing constant assertion costs nothing once elided" philosophy.
+    // A non-foldable side (Ident, runtime call, etc.) returns false and the
+    // expression stays a genuine runtime value, exactly as before.
+    if (auto* b = dynamic_cast<const BinExpr*>(&e)) {
+        switch (b->op) {
+        case BinExpr::Op::Eq: case BinExpr::Op::Neq:
+        case BinExpr::Op::Lt: case BinExpr::Op::Le:
+        case BinExpr::Op::Gt: case BinExpr::Op::Ge: {
+            int64_t l, r;
+            if (!try_eval_const_i64(*b->lhs, l)) return false;
+            if (!try_eval_const_i64(*b->rhs, r)) return false;
+            switch (b->op) {
+            case BinExpr::Op::Eq: out = (l == r); break;
+            case BinExpr::Op::Neq: out = (l != r); break;
+            case BinExpr::Op::Lt: out = (l <  r); break;
+            case BinExpr::Op::Le: out = (l <= r); break;
+            case BinExpr::Op::Gt: out = (l >  r); break;
+            case BinExpr::Op::Ge: out = (l >= r); break;
+            default: return false; // unreachable (switch above gates these)
+            }
+            return true;
+        }
+        case BinExpr::Op::LAnd: case BinExpr::Op::LOr: {
+            bool l, r;
+            if (!try_eval_const_bool(*b->lhs, l)) return false;
+            if (!try_eval_const_bool(*b->rhs, r)) return false;
+            out = (b->op == BinExpr::Op::LAnd) ? (l && r) : (l || r);
+            return true;
+        }
+        default: break; // arithmetic/bitwise ops are not bool-producing here
+        }
+    }
     return false;
 }
 
@@ -268,7 +308,12 @@ struct Checker {
     const ModuleExportTable* module_exports = nullptr;  // v0.5 cross-module exports (mod::fn resolution)
 
     // scope stack for locals/params
-    struct Var { std::string name; const Type* ty; bool is_const; bool local_array_view; };
+    // array_elem_ty: the inferred element type (u8/f32/i64) when this Var holds
+    // an array<T> handle from the array extension (set when the let-initializer
+    // is array_new(esz, ...) or an alias of one). Null otherwise. Used by the
+    // ForEachStmt check (the iterable() hook) to type the loop variable and
+    // by codegen to select the array_get_* variant. See ForEachStmt in ast.hpp.
+    struct Var { std::string name; const Type* ty; bool is_const; bool local_array_view; const Type* array_elem_ty = nullptr; };
     std::vector<std::vector<Var>> scopes;
 
     struct GlobalVar { const Type* ty; bool is_const; };
@@ -632,7 +677,8 @@ struct Checker {
     void push_scope() { scopes.emplace_back(); }
     void pop_scope()  { scopes.pop_back(); }
     void declare(const std::string& n, const Type* t, bool is_const,
-                 bool local_array_view = false, Loc loc = {0, 0}) {
+                 bool local_array_view = false, Loc loc = {0, 0},
+                 const Type* array_elem_ty = nullptr) {
         if (scopes.empty()) return;
         for (const auto& v : scopes.back()) {
             if (v.name == n) {
@@ -640,7 +686,50 @@ struct Checker {
                 return;
             }
         }
-        scopes.back().push_back({n, t, is_const, local_array_view});
+        scopes.back().push_back({n, t, is_const, local_array_view, array_elem_ty});
+    }
+
+    // iterable() hook (Tier 1, array case): infer the element type of an
+    // array<T> handle from its creation expression. `array_new(elem_size, n)`
+    // is the only way a handle is minted in script, and elem_size statically
+    // determines the typed get/set family (1 -> u8, 4 -> f32, 8 -> i64). Used
+    // both at the `let a = array_new(...)` declaration (to tag the Var) and at
+    // the ForEachStmt iterable (for an inline `for (x in array_new(...))`).
+    // Returns nullptr when the expression is not a (possibly cast-wrapped)
+    // array_new call with a compile-time-constant elem_size.
+    const Type* infer_array_elem_ty_from_call(const CallExpr* c) {
+        if (!c || !c->is_native || c->native_binding_name != "array_new") return nullptr;
+        if (c->args.size() < 1) return nullptr;
+        int64_t esz = 0;
+        if (!try_eval_const_i64(*c->args[0], esz)) return nullptr;
+        if (esz == 1) return intern(make_prim(Prim::U8));
+        if (esz == 4) return &type_f32();
+        if (esz == 8) return &type_i64();
+        return nullptr;  // unsupported elem size for typed for-each
+    }
+    // Unwrap a (possibly CastExpr-wrapped) initializer to find an array_new
+    // call; returns the inferred element type or nullptr.
+    const Type* infer_array_elem_ty_from_init(const Expr* init) {
+        if (!init) return nullptr;
+        if (auto* c = dynamic_cast<const CallExpr*>(init)) return infer_array_elem_ty_from_call(c);
+        if (auto* cast = dynamic_cast<const CastExpr*>(init)) return infer_array_elem_ty_from_init(cast->operand.get());
+        return nullptr;
+    }
+    // Infer the element type for a for-each iterable expression: an inline
+    // array_new call, or a variable that was declared from one (tracked via
+    // the Var::array_elem_ty tag, including aliases through a bare Ident
+    // assignment). Returns nullptr if the iterable is not a provable array
+    // handle (the caller then rejects it as a non-iterable).
+    const Type* infer_iterable_array_elem_ty(const Expr& iter) {
+        if (auto* c = dynamic_cast<const CallExpr*>(&iter)) {
+            if (const Type* t = infer_array_elem_ty_from_call(c)) return t;
+        }
+        if (auto* id = dynamic_cast<const Ident*>(&iter)) {
+            if (const Var* v = lookup_local_var(id->name)) {
+                if (v->array_elem_ty) return v->array_elem_ty;
+            }
+        }
+        return nullptr;
     }
 
     // NOTE (slice-escape safety, stage 1 vs stage 2): this function tracks
@@ -731,6 +820,11 @@ struct Checker {
     void check_block(Block& b, const Type* ret_ty, bool& returns);
     void check_stmt(Stmt& s, const Type* ret_ty, bool& returns);
     void check_func(FuncDecl& f);
+    // Tier 1 static_assert: fold cond + resolve (true -> elided, false ->
+    // compile error with msg, non-const -> compile error). Shared by the
+    // in-body check_stmt path and the top-level prog.static_asserts pass so
+    // both positions apply the identical compile-time verdict.
+    void check_static_assert(StaticAssertStmt& sa);
 
     // --- constexpr fn evaluation (Tier 1) ---
     // A tree-walking interpreter that evaluates a constexpr fn call at sema
@@ -1688,6 +1782,42 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
     e.ty = intern(type_void()); return e.ty;
 }
 
+// Tier 1 static_assert(cond, "msg") — compile-time assertion (shared by the
+// in-body check_stmt path and the top-level prog.static_asserts pass).
+//
+// By the time this runs, the constexpr-call pre-pass has already rewritten any
+// constexpr fn calls in `cond` to IntLits and the enum-access pre-pass has
+// already rewritten any EnumAccessExpr to IntLits, so `cond` is a tree of
+// literals / BinExpr / UnaryExpr that try_eval_const_bool can fold (the
+// comparison-operator folding added to try_eval_const_bool handles
+// `1 + 1 == 2` and `square(7) == 49` shapes). The verdict:
+//   - folds to true  -> elided (codegen emits nothing; a passing compile-time
+//                       check costs zero, mirroring assert_eq_*'s elided path)
+//   - folds to false -> sema compile error carrying `msg`
+//   - doesn't fold   -> sema compile error ("condition must be a compile-time
+//                       constant") — a runtime value is not a static assertion
+// The cond is still type-checked first (it must be bool) so a type error
+// surfaces with its own diagnostic instead of being masked as "non-const".
+void Checker::check_static_assert(StaticAssertStmt& sa) {
+    const Type* ct = check_expr(*sa.cond);
+    if (!ct->is_bool()) {
+        err("static_assert condition must be bool (got " + ct->to_string() + ")",
+            sa.cond->loc.line, sa.cond->loc.col);
+        return;
+    }
+    bool result = false;
+    if (try_eval_const_bool(*sa.cond, result)) {
+        if (!result) {
+            err("static_assert failed: " + sa.msg, sa.loc.line, sa.loc.col);
+        }
+        // true -> elided: nothing to record, codegen skips StaticAssertStmt
+        // entirely (it produces no code in either statement walker).
+    } else {
+        err("static_assert condition must be a compile-time constant",
+            sa.cond->loc.line, sa.cond->loc.col);
+    }
+}
+
 void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
     if (auto* ls = dynamic_cast<LetStmt*>(&s)) {
         // `auto` is deprecated: it's a redundant spelling of `let x = expr;`
@@ -1747,7 +1877,22 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
         }
         if (contains_void(decl_ty))
             err("local '" + ls->name + "' cannot have void type", ls->loc.line, ls->loc.col);
-        declare(ls->name, decl_ty, ls->is_const, is_local_array_view(*ls->init), ls->loc);
+        // iterable() hook (Tier 1, array case): if this local is initialized
+        // from array_new(esz, ...) — or aliased from a var that was — tag it
+        // with the inferred element type so a later `for (x in this_var)` can
+        // type its loop variable and pick the array_get_* variant. A bare
+        // `let b = a;` where `a` is an array handle propagates the tag.
+        const Type* arr_elem = infer_array_elem_ty_from_init(ls->init.get());
+        if (!arr_elem) {
+            if (auto* id = dynamic_cast<const Ident*>(ls->init.get())) {
+                if (const Var* v = lookup_local_var(id->name)) arr_elem = v->array_elem_ty;
+            }
+        }
+        declare(ls->name, decl_ty, ls->is_const, is_local_array_view(*ls->init), ls->loc, arr_elem);
+        return;
+    }
+    if (auto* sa = dynamic_cast<StaticAssertStmt*>(&s)) {
+        check_static_assert(*sa);
         return;
     }
     if (auto* es = dynamic_cast<ExprStmt*>(&s)) { check_expr(*es->expr); return; }
@@ -1851,13 +1996,36 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
         return;
     }
     if (auto* fe = dynamic_cast<ForEachStmt*>(&s)) {
-        // for (x in iter): iter must be a slice T[]; x gets the element type.
+        // for (x in iter): the iterable() hook (Tier 1). Two iterable kinds:
+        //   1. a slice T[]              -> x gets the slice's element type
+        //   2. an array<T> handle (i64) -> x gets the inferred element type
+        //      (u8/f32/i64 from the array_new elem_size), and codegen lowers
+        //      this to array_length(h) + array_get_*(h, i). The handle must be
+        //      PROVABLY from the array extension (an inline array_new call or a
+        //      var tagged at its `let`); a bare i64 that isn't a known array
+        //      handle is rejected so a typo like `for (x in 42)` stays an error.
         const Type* iter_ty = check_expr(*fe->iter);
-        if (!iter_ty->is_slice)
-            err("for-each iterable must be a slice (got " + iter_ty->to_string() + ")",
+        const Type* elem_ty = nullptr;
+        if (iter_ty && iter_ty->is_slice) {
+            elem_ty = iter_ty->elem.get();
+            if (!elem_ty) elem_ty = &type_i64();  // fallback
+        } else if (iter_ty && iter_ty->prim == Prim::I64 && !iter_ty->is_fn_handle && iter_ty->struct_name.empty()) {
+            // array<T> handle path: infer the element type, else reject.
+            elem_ty = infer_iterable_array_elem_ty(*fe->iter);
+            if (!elem_ty) {
+                err("for-each iterable must be a slice or array handle (got "
+                    + iter_ty->to_string() + "); if this is an array handle, declare it from array_new so its element type is known",
+                    fe->iter->loc.line, fe->iter->loc.col);
+                elem_ty = &type_i64();  // continue checking the body with a fallback
+            } else {
+                fe->array_elem_ty = elem_ty;  // codegen reads this for the array branch
+            }
+        } else {
+            err("for-each iterable must be a slice or array handle (got "
+                + (iter_ty ? iter_ty->to_string() : std::string("?")) + ")",
                 fe->iter->loc.line, fe->iter->loc.col);
-        const Type* elem_ty = iter_ty->elem.get();
-        if (!elem_ty) elem_ty = &type_i64();  // fallback
+            elem_ty = &type_i64();  // fallback so the body still type-checks
+        }
         ++loop_depth;
         push_scope();
         declare(fe->var, elem_ty, false, false, fe->loc);
@@ -2368,6 +2536,10 @@ void Checker::lower_constexpr_calls_stmt(Stmt& s) {
         if (ls->init) lower_constexpr_calls_expr(ls->init);
         return;
     }
+    if (auto* sa = dynamic_cast<StaticAssertStmt*>(&s)) {
+        if (sa->cond) lower_constexpr_calls_expr(sa->cond);
+        return;
+    }
     if (auto* es = dynamic_cast<ExprStmt*>(&s)) { lower_constexpr_calls_expr(es->expr); return; }
     if (auto* rs = dynamic_cast<ReturnStmt*>(&s)) {
         if (rs->value) lower_constexpr_calls_expr(rs->value);
@@ -2439,6 +2611,10 @@ void Checker::lower_constexpr_calls_block(Block& b) {
 void Checker::lower_enum_access_stmt(Stmt& s) {
     if (auto* ls = dynamic_cast<LetStmt*>(&s)) {
         if (ls->init) lower_enum_access_expr(ls->init);
+        return;
+    }
+    if (auto* sa = dynamic_cast<StaticAssertStmt*>(&s)) {
+        if (sa->cond) lower_enum_access_expr(sa->cond);
         return;
     }
     if (auto* es = dynamic_cast<ExprStmt*>(&s)) { lower_enum_access_expr(es->expr); return; }
@@ -2579,6 +2755,9 @@ SemaResult sema(Program& prog,
     for (auto& g : prog.globals) {
         if (g.init) c.lower_enum_access_expr(g.init);
     }
+    for (auto& sa : prog.static_asserts) {
+        if (sa.cond) c.lower_enum_access_expr(sa.cond);
+    }
     for (auto& f : prog.funcs) {
         c.lower_enum_access_block(f.body);
     }
@@ -2591,6 +2770,9 @@ SemaResult sema(Program& prog,
     // CallExpr is left as-is — the fn is still callable at runtime.
     for (auto& g : prog.globals) {
         if (g.init) c.lower_constexpr_calls_expr(g.init);
+    }
+    for (auto& sa : prog.static_asserts) {
+        if (sa.cond) c.lower_constexpr_calls_expr(sa.cond);
     }
     for (auto& f : prog.funcs) {
         c.lower_constexpr_calls_block(f.body);
@@ -2648,6 +2830,16 @@ SemaResult sema(Program& prog,
     // check each function
     for (auto& f : prog.funcs) {
         c.check_func(f);
+    }
+
+    // Tier 1 static_assert: check top-level assertions (in-body ones are
+    // checked inside check_stmt). Runs after function bodies so all script
+    // signatures + globals are registered (a top-level static_assert cond may
+    // reference a global or call a fn — the constexpr-call pre-pass already
+    // folded constexpr calls to IntLits, but a non-constexpr fn call or a
+    // global reference still needs check_expr's name resolution to succeed).
+    for (auto& sa : prog.static_asserts) {
+        c.check_static_assert(sa);
     }
 
     SemaResult r;

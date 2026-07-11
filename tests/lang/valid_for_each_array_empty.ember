@@ -1,0 +1,16 @@
+// valid_for_each_array_empty — for-each over an empty array handle.
+//
+// An array of length 0: array_length returns 0, so the desugared while loop
+// (i < 0) never runs its body. Verifies the bounds check (idx >= len -> exit)
+// fires immediately and execution continues past the loop. The handle is a
+// valid (1-based) array_new result even with count 0.
+//
+// expect: 0
+fn main() -> i64 {
+    let a: i64 = array_new(8, 0);
+    let mut sum: i64 = 0;
+    for (x in a) {
+        sum = sum + x;
+    }
+    return sum;
+}

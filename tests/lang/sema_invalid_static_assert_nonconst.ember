@@ -1,0 +1,17 @@
+// static_assert with a NON-constant condition — the condition must be a
+// compile-time constant. A reference to a (non-const) global is a RUNTIME
+// value: try_eval_const_i64 does not fold Idents, so `g == 5` does not fold
+// to a compile-time bool and static_assert must reject it with the
+// "condition must be a compile-time constant" diagnostic (NOT the "failed"
+// diagnostic — the value is simply not knowable at compile time).
+//
+// Classified sema_invalid_*.ember -> must PARSE ok, must SEMA ERROR. The
+// runner asserts sema_check exits nonzero on this file.
+
+global g : i64 = 5;
+
+static_assert(g == 5, "g is five (but g is a runtime value, not a constant)");
+
+fn main() -> i64 {
+    return g;
+}

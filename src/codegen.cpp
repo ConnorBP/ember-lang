@@ -572,6 +572,12 @@ struct CG {
         for (auto& s : b.stmts) prescan_stmt(*s);
     }
     void prescan_stmt(const Stmt& s) {
+        // static_assert is fully resolved at sema (true -> elided, false /
+        // non-const -> compile error) and produces NO runtime code; every
+        // statement walker skips it. Mirrors how an elided assert_eq_* call
+        // (c->elided) emits nothing — but as a dedicated Stmt node rather
+        // than a flag on a CallExpr.
+        if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) prescan_expr(*ls->init); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { prescan_expr(*es->expr); return; }
         if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) { if (rs->value) prescan_expr(*rs->value); return; }
@@ -632,6 +638,7 @@ struct CG {
         for (auto& s : b.stmts) count_struct_temps_stmt(*s, total);
     }
     void count_struct_temps_stmt(const Stmt& s, int32_t& total) {
+        if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_struct_temps_expr(*ls->init, total); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_struct_temps_expr(*es->expr, total); return; }
         if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) {
@@ -715,6 +722,7 @@ struct CG {
         for (auto& s : b.stmts) count_arr_temps_stmt(*s, total);
     }
     void count_arr_temps_stmt(const Stmt& s, int32_t& total) {
+        if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_arr_temps_expr(*ls->init, total); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_arr_temps_expr(*es->expr, total); return; }
         if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) { if (rs->value) count_arr_temps_expr(*rs->value, total); return; }
@@ -782,6 +790,7 @@ struct CG {
         for (auto& s : b.stmts) count_str_temps_stmt(*s, total);
     }
     void count_str_temps_stmt(const Stmt& s, int32_t& total) {
+        if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_str_temps_expr(*ls->init, total); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_str_temps_expr(*es->expr, total); return; }
         if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) { if (rs->value) count_str_temps_expr(*rs->value, total); return; }
@@ -839,6 +848,7 @@ struct CG {
         for (auto& s : b.stmts) count_pin_refs_stmt(*s, counts);
     }
     void count_pin_refs_stmt(const Stmt& s, std::unordered_map<std::string,int>& counts) {
+        if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_pin_refs_expr(*ls->init, counts); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_pin_refs_expr(*es->expr, counts); return; }
         if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) { if (rs->value) count_pin_refs_expr(*rs->value, counts); return; }
@@ -3094,6 +3104,10 @@ void CG::exec_block(const Block& b) {
 }
 
 void CG::exec_stmt(const Stmt& s) {
+    // static_assert produces NO codegen (sema resolved it: true -> elided,
+    // false / non-const -> compile error that never reaches here). Skip it
+    // before any dispatch so the tree-walker emits nothing for it.
+    if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
     if (auto* ls = dynamic_cast<const LetStmt*>(&s)) {
         if (!ls->init) {
             // no initializer (parser only allows this for explicitly-typed
@@ -3377,7 +3391,86 @@ void CG::exec_stmt(const Stmt& s) {
         return;
     }
     if (auto* fe = dynamic_cast<const ForEachStmt*>(&s)) {
-        // for (x in iter) { body } — desugars to a while loop over the slice.
+        // for (x in iter) { body } — desugars to a while loop.
+        //
+        // iterable() hook (Tier 1): two iterable kinds share this shape.
+        //   - slice T[]           -> ptr+len indexing (the shipped path below)
+        //   - array<T> handle     -> array_length(h) + array_get_*(h, i) natives
+        // Sema sets fe->array_elem_ty only for the array-handle case; when it
+        // is set we take the array branch, otherwise the slice branch runs
+        // unchanged (existing slice for-each tests are byte-for-byte identical).
+        if (fe->array_elem_ty) {
+            // ---- array-handle for-each ----
+            // len = array_length(h);  i = 0;
+            // while (i < len) { x = array_get_*(h, i); body; i = i + 1; }
+            const Type* elem_ty = fe->array_elem_ty;
+            const char* get_name =
+                (elem_ty->prim == Prim::U8)  ? "array_get_u8"  :
+                (elem_ty->prim == Prim::F32) ? "array_get_f32" :
+                /* I64 default */              "array_get_i64";
+            const NativeSig* len_sig = native_named("array_length");
+            const NativeSig* get_sig = native_named(get_name);
+            // The array extension registers array_new/array_length/array_get_*
+            // together, so if sema tagged this handle (array_new resolved),
+            // these are present. Guard anyway so a misconfigured host traps
+            // instead of dereferencing a null fn ptr.
+            if (!len_sig || !get_sig || !len_sig->fn_ptr || !get_sig->fn_ptr) {
+                emit_trap(int(TrapReason::IllegalInstruction),
+                          "internal: for-each array native missing (array extension not registered?)");
+                return;
+            }
+            static const Type i64_ty = make_prim(Prim::I64);
+            int fe_id = fe_counter++;
+            std::string h_name   = "__fe_h$"   + std::to_string(fe_id);
+            std::string len_name = "__fe_len$" + std::to_string(fe_id);
+            std::string idx_name = "__fe_idx$" + std::to_string(fe_id);
+            int32_t h_off   = alloc_local(h_name, &i64_ty);
+            int32_t len_off = alloc_local(len_name, &i64_ty);
+            int32_t idx_off = alloc_local(idx_name, &i64_ty);
+            int32_t var_off = alloc_local(fe->var, elem_ty);
+            // Evaluate the iterable -> rax = the i64 array handle; stash it.
+            eval(*fe->iter);
+            e.store_reg_mem(Reg::rbp, h_off, Reg::rax);
+            // len = array_length(h).  Win64: rcx = handle, 32-byte shadow,
+            // result in rax. rsp is 16-aligned in the body; sub 32 keeps it so.
+            e.sub_reg_imm32(Reg::rsp, 32);
+            e.load_reg_mem(Reg::rcx, Reg::rbp, h_off);
+            emit_counted_named_native(len_sig->fn_ptr, "array_length", "for-each array_length");
+            e.add_reg_imm32(Reg::rsp, 32);
+            e.store_reg_mem(Reg::rbp, len_off, Reg::rax);
+            // i = 0.
+            e.mov_reg_imm64(Reg::rax, 0);
+            e.store_reg_mem(Reg::rbp, idx_off, Reg::rax);
+            Label top = e.alloc_label(), latch = e.alloc_label(), end = e.alloc_label();
+            e.bind(top);
+            e.load_reg_mem(Reg::rax, Reg::rbp, idx_off);
+            e.load_reg_mem(Reg::rdx, Reg::rbp, len_off);
+            e.cmp_reg_reg(Reg::rax, Reg::rdx);
+            e.jcc(Cond::ge, end);
+            // x = array_get_*(h, i).  rcx = handle, rdx = index, 32-byte shadow.
+            // result: rax (u8/i64) or xmm0 (f32).
+            e.sub_reg_imm32(Reg::rsp, 32);
+            e.load_reg_mem(Reg::rcx, Reg::rbp, h_off);
+            e.load_reg_mem(Reg::rdx, Reg::rbp, idx_off);
+            emit_counted_named_native(get_sig->fn_ptr, get_name, "for-each array_get");
+            e.add_reg_imm32(Reg::rsp, 32);
+            // Store the element into the loop variable's slot. store_slot
+            // handles int (normalize_rax + 8-byte mov; scalar slots are 8
+            // bytes per local_width_bytes) and f32 (movss_mem_xmm from xmm0).
+            store_slot(var_off, elem_ty);
+            loops.push_back({latch, end, false, cleanup_scopes.size()});
+            exec_block(fe->body);
+            loops.pop_back();
+            e.bind(latch);
+            e.load_reg_mem(Reg::rax, Reg::rbp, idx_off);
+            e.add_reg_imm32(Reg::rax, 1);
+            e.store_reg_mem(Reg::rbp, idx_off, Reg::rax);
+            emit_budget_check(block_cost(fe->body), "budget exceeded at for-each back-edge");
+            e.jmp(top);
+            e.bind(end);
+            return;
+        }
+        // ---- slice for-each (unchanged) ----
         // The iter is a slice {ptr, len}; x gets the element at each index.
         const Type* iter_ty = fe->iter->ty;
         const Type* elem_ty = iter_ty && iter_ty->elem ? iter_ty->elem.get() : nullptr;
@@ -3663,6 +3756,9 @@ int64_t CG::expr_cost(const Expr& ex) {
     return 1;  // unknown leaf expression
 }
 int64_t CG::stmt_cost(const Stmt& s) {
+    // static_assert produces no code, so it costs zero (a passing
+    // compile-time check adds nothing to the instruction budget).
+    if (dynamic_cast<const StaticAssertStmt*>(&s)) return 0;
     if (auto* bs = dynamic_cast<const BlockStmt*>(&s))  return block_cost(bs->block);
     if (auto* is = dynamic_cast<const IfStmt*>(&s))
         return cost_add(cost_add(1, is->cond ? expr_cost(*is->cond) : 0),

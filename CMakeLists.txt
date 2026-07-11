@@ -190,6 +190,18 @@ add_executable(ext_runtime_test examples/ext_runtime_test.cpp)
 target_link_libraries(ext_runtime_test PRIVATE ember ember_frontend ember_ext_math)
 add_test(NAME ext_runtime COMMAND ext_runtime_test)
 
+# for_each_array_test: pins the iterable() hook's array<T> case (Tier 1) -
+# `for (x in array_handle)` lowered to array_length(h) + array_get_*(h, i).
+# Each probe compiles a tiny .ember through the full pipeline with the array
+# extension natives registered and reads the i64 return DIRECTLY via a C
+# reinterpret of the JIT entry (a non-circular direct-value probe, including a
+# >8-bit full-i64 storage pin that ember_cli's 8-bit exit code can't observe).
+# Links ember_ext_array directly (no prism_script_host) to prove the array
+# extension + the for-each lowering are reusable outside any specific host.
+add_executable(for_each_array_test examples/for_each_array_test.cpp)
+target_link_libraries(for_each_array_test PRIVATE ember ember_frontend ember_ext_array)
+add_test(NAME for_each_array COMMAND for_each_array_test)
+
 # ext_sync_test: cross-thread sync primitives (atomics, swap buffer, SPSC/MPSC/MPMC
 # queues) per docs/plan_SYNC_QUEUES.md. Tier-1 single-thread functional coverage
 # (each primitive through the full lex->parse->sema->codegen->JIT->call path) +
@@ -596,6 +608,21 @@ if(WIN32)
     target_link_libraries(constexpr_test PRIVATE kernel32)
 endif()
 add_test(NAME constexpr COMMAND constexpr_test)
+
+# static_assert_test - Tier 1 compile-time assertion (static_assert(cond, msg)).
+# A passing assertion (cond folds to true at sema time) is ELIDED (no codegen);
+# a failing one (folds to false) is a sema compile error carrying msg; a
+# non-constant condition is a sema compile error. Covers top-level + in-body
+# positions, constexpr-fn conditions (the cross-feature fold), logical
+# operators (&&/||/!) over compile-time comparisons, and non-bool / non-const
+# rejections. Pure language features (no natives), so links only the core
+# libs — matching constexpr_test's shape.
+add_executable(static_assert_test examples/static_assert_test.cpp)
+target_link_libraries(static_assert_test PRIVATE ember ember_frontend ember_import)
+if(WIN32)
+    target_link_libraries(static_assert_test PRIVATE kernel32)
+endif()
+add_test(NAME static_assert COMMAND static_assert_test)
 
 # codegen_opt_test - pins the Stage 1 codegen-optimization peephole + local
 # regalloc rewrites' VALUE EQUIVALENCE (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4.7).

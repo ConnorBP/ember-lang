@@ -141,12 +141,19 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
   builder (the variants live entirely in the script). Typed enums (`enum E : i32`)
   and `enum`-from-expr remain a later refinement.
 - **`for-each`** ✓ shipped 2026-07-11 (Tier 1) — `for (x in slice)` over a
-  slice T[]. The iterable must be a slice; x gets the element type. The
+  slice T[], **and** `for (x in array_handle)` over an array<T> handle (the
+  iterable() hook, array case, shipped 2026-07-11). For a slice, the
   tree-walker evaluates the slice → {ptr, len} and emits a while loop with
-  element indexing at [ptr + index*elem_size]. The IR backend marks functions
-  using for-each as non_serializable (falls back to the tree-walker). The
-  `iterable()` TypeBuilder hook for general collection iteration is still
-  deferred (the current for-each is slice-specific).
+  element indexing at [ptr + index*elem_size]. For an array<T> handle (an
+  opaque i64 from `array_new`), sema infers the element type (u8/f32/i64)
+  from the `array_new` elem_size and tags the handle; codegen lowers the
+  for-each to `len = array_length(h); while i < len { x = array_get_*(h, i);
+  ... }`, dispatching to the typed get native for the inferred element type.
+  A bare i64 that isn't provably an array handle is rejected (so `for (x in
+  42)` stays an error). The IR backend marks functions using for-each as
+  non_serializable (falls back to the tree-walker). The general `iterable()`
+  hook surface is documented below (only the array case is implemented now;
+  map and host collections are the follow-on).
 - **`match` (pattern)** ✓ shipped 2026-07-11 (Tier 1, v1 form) —
   `match (expr) { pattern => body, _ => default }`. Patterns: integer/bool
   literals + `_` wildcard. Each arm is a separate branch (no fallthrough, no
@@ -166,10 +173,18 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
   constexpr). A later refinement of the shipped `enum`: typed enums make an
   enum name a real type (`let x: Color = ...` works); enum-from-expr lets a
   variant value be computed from a constexpr expression. Dep: constexpr.
-- **`iterable()` TypeBuilder hook** - **TODO.** General collection iteration
-  for `for (x in collection)` beyond slices. The shipped for-each is slice-
-  specific; this generalizes it to any type that registers an `iterable()`
-  hook (arrays, maps, host collections). Dep: the TypeBuilder hook surface.
+- **`iterable()` hook** — **PARTIAL (array case shipped 2026-07-11).**
+  General collection iteration for `for (x in collection)` beyond slices. The
+  shipped for-each now covers two iterable kinds: slices T[] (ptr+len
+  indexing) and array<T> handles (array_length + array_get_*). The hook
+  surface is documented in `src/ast.hpp` (`ForEachStmt::array_elem_ty`),
+  `src/sema.cpp` (the ForEachStmt check + the `infer_*_array_elem_ty`
+  helpers), and `src/codegen.cpp` (the ForEachStmt array branch). Future
+  iterables (map, host collections) register through the same surface: sema
+  recognizes the iterable type and determines its element type, then codegen
+  lowers the loop to that type's length + element-access primitives. Only the
+  array case is implemented now; the rest is deferred. Dep: per-type length/
+  element-access primitives (a map would need map_size + map_iter, etc.).
 - **Struct destructure + guards in match** - **TODO.** A later refinement of
   the shipped `match`: let a pattern destructure a struct (`Point{ x, y } =>`)
   and carry a guard (`Point{ x, y } if x > 0 =>`). Dep: parser + sema work.

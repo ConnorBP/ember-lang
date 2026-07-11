@@ -11,7 +11,7 @@ static const std::unordered_map<std::string, Tk>& keywords() {
         {"fn",Tk::Kw_fn},{"struct",Tk::Kw_struct},{"global",Tk::Kw_global},
         {"let",Tk::Kw_let},{"mut",Tk::Kw_mut},
         {"const",Tk::Kw_const},{"constexpr",Tk::Kw_constexpr},{"defer",Tk::Kw_defer},
-        {"priv",Tk::Kw_priv},
+        {"priv",Tk::Kw_priv},{"static_assert",Tk::Kw_static_assert},
         {"if",Tk::Kw_if},{"else",Tk::Kw_else},{"while",Tk::Kw_while},{"do",Tk::Kw_do},
         {"for",Tk::Kw_for},{"switch",Tk::Kw_switch},{"case",Tk::Kw_case},{"default",Tk::Kw_default},
         {"break",Tk::Kw_break},{"continue",Tk::Kw_continue},{"return",Tk::Kw_return},
@@ -62,6 +62,7 @@ const char* tok_spelling(Tk k) {
     case Tk::Kw_enum: return "enum";
     case Tk::Kw_match: return "match";
     case Tk::Kw_priv: return "priv";
+    case Tk::Kw_static_assert: return "static_assert";
     default: return "kw";
     }
 }

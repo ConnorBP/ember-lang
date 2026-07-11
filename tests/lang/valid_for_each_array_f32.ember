@@ -1,0 +1,20 @@
+// valid_for_each_array_f32 — for-each over an f32 array handle.
+//
+// iterable() hook, array case with elem_size=4 -> the loop variable x is f32
+// (inferred from array_new(4, n)). codegen dispatches to array_get_f32, whose
+// result arrives in xmm0 and is stored to the loop variable's slot with
+// movss. Verifies the float return path of the array for-each.
+//
+// expect: 1 (pass) — sum == 60.0
+fn main() -> i64 {
+    let a: i64 = array_new(4, 3);
+    array_set_f32(a, 0, 10.0);
+    array_set_f32(a, 1, 20.0);
+    array_set_f32(a, 2, 30.0);
+    let mut sum: f32 = 0.0;
+    for (x in a) {
+        sum = sum + x;
+    }
+    if (sum == 60.0) { return 1; }
+    return 0;
+}

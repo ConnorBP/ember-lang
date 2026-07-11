@@ -268,6 +268,41 @@ struct P {
         return e;
     }
 
+    // Tier 1 static_assert (docs/planning/plan_STATIC_ASSERT.md):
+    //   static_assert ( expr , string_lit ) ;
+    // `expr` is a full expression (sema folds it + checks it's a compile-time
+    // bool constant via try_eval_const_bool, the same folder that powers
+    // assert_eq_bool); `string_lit` is the message, carried verbatim. The
+    // parser stays dumb about foldability — it just records the two pieces.
+    // Used both inside a function body (parse_stmt wraps the result in a
+    // StmtPtr) and at top level (parse_program pushes it to
+    // prog.static_asserts). Produces NO runtime code in either position;
+    // sema resolves it fully (true -> elided, false -> compile error with
+    // msg, non-const -> compile error).
+    StaticAssertStmt parse_static_assert() {
+        const Token& t = peek();
+        expect(Tk::Kw_static_assert, "'static_assert'");
+        expect(Tk::LParen, "'('");
+        StaticAssertStmt sa;
+        sa.loc = loc(t);
+        sa.cond = parse_expr();
+        expect(Tk::Comma, "','");
+        // The message is a string literal (raw or cooked). StringLit.text
+        // holds the decoded literal body; a non-string token here is a parse
+        // error so a malformed static_assert can never reach sema with a
+        // missing/non-string message.
+        const Token& msg = peek();
+        if (msg.kind != Tk::StringLit && msg.kind != Tk::RawStringLit) {
+            throw ParseError("static_assert message must be a string literal",
+                             msg.line, msg.col);
+        }
+        sa.msg = msg.text;
+        adv();
+        expect(Tk::RParen, "')'");
+        expect(Tk::Semicolon, "';'");
+        return sa;
+    }
+
     // --- expressions (precedence climbing) ---
     ExprPtr parse_expr() { return parse_assign(); }
 
@@ -758,6 +793,10 @@ struct P {
         case Tk::Kw_let: case Tk::Kw_auto: case Tk::Kw_const:
             return parse_let_stmt(t);
         case Tk::Kw_defer: { adv(); auto s=std::make_unique<DeferStmt>(); s->loc=loc(t); s->expr=parse_expr(); expect(Tk::Semicolon,"';'"); return s; }
+        case Tk::Kw_static_assert: {
+            auto sa = std::make_unique<StaticAssertStmt>(parse_static_assert());
+            return sa;
+        }
         case Tk::Kw_if: { adv(); auto s=std::make_unique<IfStmt>(); s->loc=loc(t); expect(Tk::LParen,"'('"); s->cond=parse_expr(); expect(Tk::RParen,"')'"); s->then_b=parse_block(); if (accept(Tk::Kw_else)) { s->has_else=true; if (at(Tk::Kw_if)) { auto sub=parse_stmt(); // else if
             // wrap single stmt in block
             IfStmt* is = dynamic_cast<IfStmt*>(sub.get());
@@ -950,10 +989,13 @@ struct P {
                 } else if (at(Tk::Kw_enum)) {
                     if (!anns.empty()) throw ParseError("annotations on enums not supported v1", peek().line, peek().col);
                     prog.enums.push_back(std::move(*parse_enum()));
+                } else if (at(Tk::Kw_static_assert)) {
+                    if (!anns.empty()) throw ParseError("annotations on static_assert not supported v1", peek().line, peek().col);
+                    prog.static_asserts.push_back(parse_static_assert());
                 } else if (at(Tk::Semicolon)) {
                     adv(); // empty top-level stmt
                 } else {
-                    throw ParseError("expected fn/struct/global at top level", peek().line, peek().col);
+                    throw ParseError("expected fn/struct/global/static_assert at top level", peek().line, peek().col);
                 }
             } catch (const ParseError& e) {
                 errs.push_back(std::string(e.what()) + " @ line " + std::to_string(e.line));
