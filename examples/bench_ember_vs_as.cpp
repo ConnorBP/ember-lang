@@ -96,11 +96,6 @@ static int64_t ember_call_void(EmberModule& m, const std::string& fn) {
     using F = int64_t(*)();
     return reinterpret_cast<F>(e)();
 }
-static int64_t ember_call_i64(EmberModule& m, const std::string& fn, int64_t arg) {
-    void* e = m.table->get(m.slots[fn]);
-    using F = int64_t(*)(int64_t);
-    return reinterpret_cast<F>(e)(arg);
-}
 
 // ---- AngelScript: compile a script string, return the context ----
 struct AsModule {
@@ -132,13 +127,6 @@ static AsModule as_compile(const std::string& script, const std::string& entry_d
 }
 static int64_t as_exec(AsModule& m) {
     m.ctx->Prepare(m.func);
-    m.ctx->Execute();
-    asQWORD r = m.ctx->GetReturnQWord();
-    return int64_t(r);
-}
-static int64_t as_exec_i64(AsModule& m, int64_t arg) {
-    m.ctx->Prepare(m.func);
-    m.ctx->SetArgQWord(0, asQWORD(arg));
     m.ctx->Execute();
     asQWORD r = m.ctx->GetReturnQWord();
     return int64_t(r);

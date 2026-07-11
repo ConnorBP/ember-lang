@@ -70,7 +70,9 @@ int main() {
     auto layouts = build_struct_layouts(pr.program); pr.program.string_xor_key=0;
     auto sr = sema(pr.program, natives, slots, 0, nullptr, &layouts);
     if(!sr.ok){ std::printf("FAIL: sema (%zu):\n",sr.errors.size());
-        for(auto&e:sr.errors) std::printf("  line %u: %s\n",e.line,e.msg.c_str()); return 1; }
+        for(auto&e:sr.errors) std::printf("  line %u: %s\n",e.line,e.msg.c_str());
+        return 1;
+    }
 
     ember::GlobalsBlock gb; std::vector<uint8_t> gbs(0); gb.base=int64_t(gbs.data());
     ember::g_globals_for_codegen = &gb;

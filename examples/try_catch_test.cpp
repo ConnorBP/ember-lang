@@ -90,7 +90,9 @@ static bool compile_tc(const std::string& src, TCModule& m) {
     auto layouts=build_struct_layouts(pr.program); pr.program.string_xor_key=0;
     auto sr=sema(pr.program,m.natives,m.slots,0,&ov,&layouts);
     if(!sr.ok){ std::printf("FAIL: sema (%zu errors):\n",sr.errors.size());
-        for(auto&e:sr.errors) std::printf("  line %u: %s\n",e.line,e.msg.c_str()); return false; }
+        for(auto&e:sr.errors) std::printf("  line %u: %s\n",e.line,e.msg.c_str());
+        return false;
+    }
 
     ember::GlobalsBlock gb; std::vector<uint8_t> gbs(pr.program.globals.size()*8, 0);
     gb.base=int64_t(gbs.data());

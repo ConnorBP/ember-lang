@@ -720,7 +720,6 @@ int main() {
         b0.term.kind = TermKind::Return; b0.term.ret = v3;
         tf.blocks.push_back(std::move(b0));
 
-        size_t orig = total_instrs(tf);
         size_t orig_binops = 0;
         for (const auto& blk : tf.blocks)
             for (const auto& in : blk.instrs)

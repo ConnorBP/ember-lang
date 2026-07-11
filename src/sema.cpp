@@ -3827,10 +3827,18 @@ bool Checker::ce_eval_expr(const Expr& e, int64_t& out, ConstEvalCtx& ctx, std::
         int64_t rhs;
         if (!ce_eval_expr(*a->value, rhs, ctx, err)) return false;
         if (a->compound) {
-            int64_t cur;
+            // A compound-assign (x += rhs) requires x to already exist in an
+            // enclosing scope. If it isn't found, cur would be read
+            // uninitialized below — detect that and fail the eval instead.
+            bool found = false;
+            int64_t cur = 0;
             for (int i = int(ctx.scopes.size()) - 1; i >= 0; --i) {
                 auto it = ctx.scopes[size_t(i)].find(id->name);
-                if (it != ctx.scopes[size_t(i)].end()) { cur = it->second; break; }
+                if (it != ctx.scopes[size_t(i)].end()) { cur = it->second; found = true; break; }
+            }
+            if (!found) {
+                err = "constexpr: compound-assign to unknown variable '" + id->name + "'";
+                return false;
             }
             // replicate BinExpr arithmetic for the compound op
             int64_t tmp = 0;

@@ -77,6 +77,7 @@ int main() {
         ck(h.stats().live_objects == 1, "[4c] live_objects==1");
         ck(h.stats().freed_objects == 1, "[4d] freed_objects==1");
         void* obj3 = h.alloc(8, refmap_none());
+        (void)obj3;  // unrooted: allocated only to be collected on the next sweep
         h.collect();
         ck(h.stats().live_objects == 1, "[4e] still 1 after second collect");
         ck(h.stats().freed_objects == 2, "[4f] freed_objects==2");

@@ -60,13 +60,6 @@
 // x86 via EmLoadPolicy.
 static const ember::EmLoadPolicy RAW_X86_POLICY{0u, true};
 
-// Win64 i64(i64) call: the compiled functions take one i64 arg (rcx) and
-// return i64 (rax), matching double_it(x: i64) -> i64 and caller(x: i64) -> i64.
-static int64_t call_i64_i64(void* entry, int64_t a) {
-    using F = int64_t(*)(int64_t);
-    return reinterpret_cast<F>(entry)(a);
-}
-
 // =====================================================================
 // CALLEE (Module B): fn double_it(x: i64) -> i64 { return x * 2; }
 // Built via the REAL parser→sema→codegen pipeline (no hand-assembly). Returns
