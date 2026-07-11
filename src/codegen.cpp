@@ -59,6 +59,7 @@ struct CG {
     // rest of this file already assumes).
     int32_t rbx_save_offset = 0;
     int32_t next_local_off = 0;          // grows downward (negative offsets)
+    int fe_counter = 0;                  // unique suffix for for-each internals
     std::unordered_map<std::string, int32_t> locals;  // name -> offset from rbp
     std::unordered_map<std::string, const Type*> local_types;
     // Compiler-hidden temp frame slots for struct-by-value general-expression
@@ -3179,10 +3180,16 @@ void CG::exec_stmt(const Stmt& s) {
         if (esz <= 0) esz = 8;
         // Static i64 type for the ptr/len/index slots.
         static const Type i64_ty = make_prim(Prim::I64);
+        // Unique names for the for-each internals (a nested for-each would
+        // overwrite the outer's locals map entries if they shared names).
+        int fe_id = fe_counter++;
+        std::string ptr_name = "__fe_ptr$" + std::to_string(fe_id);
+        std::string len_name = "__fe_len$" + std::to_string(fe_id);
+        std::string idx_name = "__fe_idx$" + std::to_string(fe_id);
         // Alloc frame slots for: ptr, len, index, var.
-        int32_t ptr_off = alloc_local("__fe_ptr", &i64_ty);
-        int32_t len_off = alloc_local("__fe_len", &i64_ty);
-        int32_t idx_off = alloc_local("__fe_idx", &i64_ty);
+        int32_t ptr_off = alloc_local(ptr_name, &i64_ty);
+        int32_t len_off = alloc_local(len_name, &i64_ty);
+        int32_t idx_off = alloc_local(idx_name, &i64_ty);
         int32_t var_off = alloc_local(fe->var, elem_ty ? elem_ty : &i64_ty);
         // Evaluate the iterable → rax=ptr, rdx=len (the slice ABI).
         eval(*fe->iter);
