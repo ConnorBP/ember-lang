@@ -23,6 +23,31 @@ case, the shipped safety boundary, and explicitly deferred mechanisms.
   not itself corrupt memory). Ember cannot and does not verify native
   function *bodies* - same trust boundary as AngelScript/the surveyed native-JIT language
   bindings.
+- **`.em` bundles are a DISTINCT, STRONGER attack surface than script source (F2,
+  docs/spec/SPEC_AUDIT_2026-07-10.md F2).** A `.em` module is raw x86-64 native
+  code (em_file.hpp `EmFunctionRecord::code`; codegen.cpp finalize `out.bytes =
+  cg.e.code`; em_loader.cpp `alloc_executable_rw` + `seal_executable`) that gets
+  mapped executable and called with the host's privileges — it is NOT text the
+  parser/sema/codegen pipeline validates. v1/v2/v3 `.em` carry a build/abi
+  IDENTITY hash (FNV1a of compiler/ABI string literals) + a TYPE signature (sema
+  arg-checking), NOT content authentication: a malicious `.em` from the same
+  compiler/ABI with valid identity+type-sigs still injected arbitrary x86. **v4
+  closes this (implemented 2026-07-10):** a v4 `.em` is the v3 layout + an additive
+  Ed25519 signature block; the loader verifies the signature over the content
+  (header → name directory) BEFORE `alloc_executable_rw` and rejects on mismatch
+  (no exec page published — a tampered `.em` is rejected, not executed). The
+  crypto is a vendored Ed25519 (`thirdparty/ed25519/`, public domain); the signing
+  key stays OFF the host. **Host trust decision (secure-boot-style opt-in):** a
+  host supplies an `EmVerifyPolicy` keyring to `load_em_file`/`link_em_file`. A
+  non-empty keyring = SIGNED-ONLY (v1/v2/v3 unsigned modules rejected; v4 loads
+  only if its signature verifies against a trusted key). An empty/null keyring =
+  DEV MODE (unsigned v1/v2/v3 accepted — the development convenience; a v4 module
+  rejected with a clear error, since a v4 module IS signed and running it unverified
+  is worse than honest unsigned dev code). The CLI `--verify-em-key <path>` flag
+  opts in. A host that loads `.em` from an untrusted source WITHOUT a keyring is
+  loading a code-injection vector; a host that loads only signed `.em` with a
+  trusted keyring gets cryptographic content authentication. This is the standard
+  "signed native artifact" model (analogous to signed DLLs / signed firmware).
 
 ## 2. Execution entry point & non-local abort mechanism
 

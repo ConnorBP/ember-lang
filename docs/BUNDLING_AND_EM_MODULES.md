@@ -449,25 +449,66 @@ core payoff.
 
 - Source compilation is assembled from the public lexer/parser/sema/codegen
   APIs (there is no shipped `ember_compile` facade).
-### 2.5.1 Format v2 portability and v1 compatibility
+### 2.5.1 Format v2 portability and v1 compatibility — and v4 content authentication (F2)
 
-The writer emits version 2. The loader explicitly accepts versions 1 and 2.
-Version 1 retains its historical ABI-trusted `unknown_sig` behavior. Version 2
-rejects compiler/build or target-ABI identity mismatches before executable
-allocation, stores canonical `Type`-based export signatures, and resolves each
-native immediate by symbolic name and signature through a host-supplied
-`unordered_map<string, NativeSig>` allowlist. Function string bytes live in the
-function rodata payload and use an explicit code-plus-rodata relocation; no
+The writer emits version 4 (signed) via `write_em_file_signed`, or version 3
+(unsigned) via `write_em_file`. The loader explicitly accepts versions 1, 2, 3,
+and 4. Version 1 retains its historical ABI-trusted `unknown_sig` behavior.
+Version 2 rejects compiler/build or target-ABI identity mismatches before
+executable allocation, stores canonical `Type`-based export signatures, and
+resolves each native immediate by symbolic name and signature through a
+host-supplied `unordered_map<string, NativeSig>` allowlist. Version 3 (F1,
+docs/spec/SPEC_AUDIT_2026-07-10.md F1) keeps the v2 per-function record layout
+byte-identical and repurposes the name directory as the module's EXPORT TABLE
+(only `pub fn`/bare-`fn` entries). Function string bytes live in the function
+rodata payload and use an explicit code-plus-rodata relocation; no
 `Program::rodata_store` pointer is serialized. Generated trap-stub/context/detail
-and function-reference allowlist state has no portable binding yet, so the v2
+and function-reference allowlist state has no portable binding yet, so the
 writer rejects those exact functions with a feature-specific error rather than
 baking a process pointer.
 
-- `load_em_file(path, LoadedModule&, error, registry, native_allowlist)` is the
-  implemented host loader; `link_em_file` additionally registers the loaded
-  dispatch table. v1 remains ABI/process trusted and exposes unknown export
-  signatures. v2 verifies stable build/target identities before executable
-  allocation and uses explicit symbolic native and function-rodata bindings.
+**Version 4 — signed raw-x86 `.em` (F2, docs/spec/SPEC_AUDIT_2026-07-10.md F2).**
+v1/v2/v3 carry a build/abi IDENTITY hash (FNV1a of compiler/ABI string literals)
++ a TYPE signature (sema arg-checking) — NOT content authentication. A malicious
+`.em` from the same compiler/ABI with valid identity+type-sigs still injected
+arbitrary x86 (the raw-x86 code-injection risk the audit names). v4 closes that
+gap: the v3 layout byte-identical + an additive Ed25519 signature block (104
+bytes: `sig_magic` "EMSG" | `payload_len` | `pubkey_id`[32] | `signature`[64]).
+The signed payload is the v3 content bytes (header → name directory); the
+loader cross-checks `payload_len` == end of name dir, then **verifies the Ed25519
+signature over the content BEFORE `alloc_executable_rw`** and rejects on mismatch
+(no exec page published — a tampered `.em` is rejected, not executed). The crypto
+is a vendored orlp/ed25519 (public domain, `thirdparty/ed25519/`); standard
+PureEd25519 (RFC 8032; the scheme's internal hash is SHA-512 — the audit's "over
+SHA-256" is read as "cryptographic content authentication via Ed25519 over the
+.em content", not a separate SHA-256 prehash). The build_id/abi_hash stay the
+COMPATIBILITY check; the v4 signature is the CONTENT authentication the identity
+hash is NOT.
+
+**Key management — secure-boot-style opt-in (the honest minimal v1).** The signing
+key stays OFF the host (the build tool that emits `.em` signs it); the host gets
+only verification public keys. `load_em_file` takes an `EmVerifyPolicy{ vector<array<uint8_t,32>> trusted_keys; }`:
+- **empty keyring (or null) = DEV MODE** — the loader accepts unsigned v1/v2/v3
+  modules (the development convenience the audit names) and rejects a v4 module
+  with a clear error ("v4 module requires a verification key; host provided none"
+  — a v4 module IS signed, so running it unverified is worse than honest
+  unsigned dev code). The existing .em round-trip tests + demos use this path.
+- **non-empty keyring = SIGNED-ONLY** — the loader rejects unsigned v1/v2/v3
+  modules ("host mandates signed modules") and accepts a v4 module ONLY if its
+  signature verifies against one of the trusted keys. A v4 module whose
+  `pubkey_id` is not in the keyring is rejected with "signed by an untrusted key"
+  (so a host can tell "wrong keychain" from "tampered content").
+The CLI `--verify-em-key <path>` flag (repeatable) reads a 32-byte pubkey file
+and opts into signed-only mode for both `--load-em` and `link` directives.
+Mirrors secure-boot: keys present == signed-only; keys absent == unsigned dev OK.
+
+- `load_em_file(path, LoadedModule&, error, registry, native_allowlist, verify)`
+  is the implemented host loader (the `verify` policy is additive, default null =
+  dev mode); `link_em_file` additionally registers the loaded dispatch table and
+  threads the same `verify` policy. v1 remains ABI/process trusted and exposes
+  unknown export signatures. v2/v3 verify stable build/target identities before
+  executable allocation and use explicit symbolic native and function-rodata
+  bindings. v4 verifies the Ed25519 signature before `alloc_executable_rw`.
 - **Reloading code originally loaded from `.em`:** `.em` carries no source.
   The host may compile a source replacement and use the existing
   single-function machinery only if it also retains the corresponding Program,
@@ -485,10 +526,17 @@ baking a process pointer.
 
 ### 2.7 Versioning and forward-compat
 
-- The writer emits version 2. The loader accepts exactly v1 and v2 and
-  rejects other versions outright (no guessing). Bumping the
+- The writer emits version 4 (signed, via `write_em_file_signed`) or version 3
+  (unsigned, via `write_em_file`). The loader accepts exactly v1, v2, v3, and
+  v4 and rejects other versions outright (no guessing). Bumping the
   version on any format change is mandatory - a `.em` is a
   de-facto ABI, and silent misreads are worse than loud rejects.
+- v4 (F2, docs/spec/SPEC_AUDIT_2026-07-10.md F2) is v3 layout + an additive
+  Ed25519 signature block after the name directory; v1/v2/v3 have no signature
+  block (their "trailing bytes == 0" check is unchanged). The signature block
+  is self-describing (a `sig_magic` "EMSG" sentinel + a `payload_len` the loader
+  cross-checks against the name-directory end), so a v3 reader that ignored
+  trailing bytes would still reject a v4 file as corrupt rather than misread it.
 - The `flags` field reserves bit 0 for "embeds source" (future
   reload-from-`.em`) and leaves the rest zero. Unused bits are not
   repurposed without a version bump.
