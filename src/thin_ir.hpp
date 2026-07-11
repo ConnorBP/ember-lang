@@ -93,6 +93,7 @@
 #include "x64_emitter.hpp"  // AbsFixup::Kind (reloc base kind carried in meta)
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -294,6 +295,14 @@ struct ThinFunction {
                                      // reason and the driver skips the thin
                                      // path for this fn.
     std::string non_serializable_reason;
+    // Stage B: type objects reconstructed by deserialize_thin_function live
+    // here so ret_type / arg_types / meta.type / frame.params[].ty const Type*
+    // pointers remain valid for the ThinFunction's lifetime. Empty for JIT-
+    // lowered ThinFunctions (their Type* point into the compile-time type
+    // store). ADDITIVE: default-constructed empty, untouched by lower_function
+    // / emit_x64 / dump — the thin_ir_struct ctest builds a ThinFunction by
+    // hand and stays green unchanged.
+    std::vector<std::shared_ptr<Type>> owned_types;
 };
 
 // Debug pretty-printer (src/thin_ir.cpp). Returns a human-readable dump of

@@ -34,6 +34,7 @@
 // OFF the host; the host loader gets only the verification public key.
 
 #include "em_writer.hpp"
+#include "em_type_codec.hpp"  // shared .em canonical-type codec (emit_type/emit_signature/validate_canonical_type/validate_signature)
 
 #include <algorithm>
 #include <array>
@@ -104,29 +105,10 @@ bool name_fits_u16(const std::string& s, std::string* err, const char* ctx) {
     return true;
 }
 
-void emit_type(std::ostream& ofs, const Type& t) {
-    uint8_t prim = static_cast<uint8_t>(t.prim);
-    uint8_t flags = uint8_t((t.is_slice ? 1 : 0) | (t.array_len ? 2 : 0) |
-                            (!t.struct_name.empty() ? 4 : 0) | (t.is_fn_handle ? 8 : 0) |
-                            (t.has_recorded_sig ? 16 : 0));
-    ofs.write(reinterpret_cast<const char*>(&prim), 1);
-    ofs.write(reinterpret_cast<const char*>(&flags), 1);
-    emit_u32_le(ofs, t.array_len);
-    emit_u16_le(ofs, static_cast<uint16_t>(t.struct_name.size()));
-    emit_string(ofs, t.struct_name);
-    if ((t.is_slice || t.array_len) && t.elem) emit_type(ofs, *t.elem);
-    if (t.is_fn_handle && t.has_recorded_sig) {
-        emit_u32_le(ofs, static_cast<uint32_t>(t.recorded_params.size()));
-        for (const auto& p : t.recorded_params) emit_type(ofs, p ? *p : Type{});
-        emit_type(ofs, t.recorded_ret ? *t.recorded_ret : Type{});
-    }
-}
-
-void emit_signature(std::ostream& ofs, const EmSignature& sig) {
-    emit_type(ofs, sig.ret);
-    emit_u32_le(ofs, static_cast<uint32_t>(sig.params.size()));
-    for (const Type& p : sig.params) emit_type(ofs, p);
-}
+// emit_type / emit_signature / validate_canonical_type / validate_signature
+// live in em_type_codec.{hpp,cpp} (the shared .em canonical-type codec) and
+// are called unqualified below; they resolve to ember::emit_type etc. via
+// ordinary unqualified lookup because we are inside namespace ember.
 
 bool count_fits_u32(size_t n, std::string* err, const char* ctx) {
     if (n > 0xFFFFFFFFu) {
@@ -134,43 +116,6 @@ bool count_fits_u32(size_t n, std::string* err, const char* ctx) {
                          " (n=" + std::to_string(n) + ")";
         return false;
     }
-    return true;
-}
-
-// Mirror of the loader's parse_type shape validation. A hand-built Type whose
-// prim/flags-equivalent fields are internally inconsistent must be rejected at
-// write time, not serialized for the loader to catch. This is the write-side
-// half of the M-H14-1 canonical-type consistency gate; the loader enforces the
-// same invariants against the on-disk flags/len fields before any allocation.
-bool validate_canonical_type(const Type& t, std::string* err, unsigned depth = 0) {
-    if (depth > 16) { if (err) *err = "em_writer: type nesting too deep"; return false; }
-    // The writer derives flag bits from exactly these fields; a Type that does
-    // not match the derivation would serialize a flag the loader would reject.
-    const bool is_struct = !t.struct_name.empty();
-    const bool is_array  = t.array_len != 0;
-    // A slice/array is characterized by its element; its own prim must be Void.
-    // A struct name does NOT constrain prim: a script struct has Prim::Void
-    // while a host handle (`bind_handle`) is Prim::I64 with a struct-name tag.
-    if ((t.is_slice || is_array) && t.prim != Prim::Void) { if (err) *err = "em_writer: inconsistent canonical type: slice/array must have Prim::Void"; return false; }
-    if (t.is_slice && is_array) { if (err) *err = "em_writer: inconsistent canonical type: type is both slice and array"; return false; }
-    if (t.is_slice && !t.elem) { if (err) *err = "em_writer: inconsistent canonical type: slice requires an element type"; return false; }
-    if (is_array && !t.elem) { if (err) *err = "em_writer: inconsistent canonical type: fixed array requires an element type"; return false; }
-    if (t.is_fn_handle && t.prim != Prim::I64) { if (err) *err = "em_writer: inconsistent canonical type: function handle requires Prim::I64"; return false; }
-    if (t.has_recorded_sig && !t.is_fn_handle) { if (err) *err = "em_writer: inconsistent canonical type: recorded signature requires function handle"; return false; }
-    if (t.elem && !validate_canonical_type(*t.elem, err, depth + 1)) return false;
-    if (t.is_fn_handle && t.has_recorded_sig) {
-        if (t.recorded_params.size() > 1024) { if (err) *err = "em_writer: inconsistent canonical type: function type parameter count"; return false; }
-        for (const auto& p : t.recorded_params)
-            if (!p || !validate_canonical_type(*p, err, depth + 1)) { if (err) *err = "em_writer: inconsistent canonical type: recorded parameter missing"; return false; }
-        if (!t.recorded_ret || !validate_canonical_type(*t.recorded_ret, err, depth + 1)) { if (err) *err = "em_writer: inconsistent canonical type: recorded return type missing"; return false; }
-    }
-    return true;
-}
-
-bool validate_signature(const EmSignature& sig, std::string* err) {
-    if (sig.params.size() > 1024) { if (err) *err = "em_writer: signature parameter count"; return false; }
-    if (!validate_canonical_type(sig.ret, err)) return false;
-    for (const Type& p : sig.params) if (!validate_canonical_type(p, err)) return false;
     return true;
 }
 

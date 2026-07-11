@@ -11,7 +11,10 @@
 //
 //   Header (40 bytes):
 //     magic           : u32 = 0x454D424C  ("EMBL")
-//     version         : u32 = 4 (loader also accepts historical v1, v2, v3)
+//     version         : u32 = 4 (default writer version; loader also accepts
+//                       historical v1, v2, v3, and v5 once the Stage-B
+//                       writer/loader land — see the v5 per-function record
+//                       below)
 //     flags           : u32 = 0           (bit 0 reserved: embeds source)
 //     function_count  : u32
 //     global_size     : u32
@@ -33,6 +36,34 @@
 //       v2 reloc { offset: u32, kind: u8, addend: u32 }
 //     canonical export signature (v2)
 //     symbolic native binding records (v2)
+//
+//   v5 per-function record (header version=5; ADDITIVE redesign of the per-fn
+//   body ONLY — the 40-byte header, globals block, and name directory are
+//   UNCHANGED from v3/v4. A v5 module may MIX IR and raw-x86 functions per-fn
+//   ("mixed mode"): IR-serializable fns ship IR; non-serializable fns —
+//   aggregate/string/struct/defer gaps, flagged by ThinFunction::non_serializable
+//   — ship raw x86. This is the on-disk contract the v5 writer and v5 loader
+//   independently implement):
+//     name_len        : u16
+//     name            : bytes[name_len]   (UTF-8, no NUL)
+//     slot_index      : u32
+//     is_ir           : u8   (1 = IR function; 0 = raw-x86 fallback)
+//     signature       : canonical export signature (SAME encoding as v2+:
+//                       emit_type(ret) + u32 param_count + emit_type per param)
+//     if is_ir == 1:  // IR function — carries IR, NOT machine code
+//       ir_blob_len   : u32
+//       ir_blob       : bytes[ir_blob_len]  (OPAQUE to the .em container =
+//                       serialize_thin_function output, src/thin_ir_ser.hpp;
+//                       parsed ONLY by the IR deserializer, never by the .em
+//                       loader). NO code/rodata/relocs/native_bindings fields
+//                       follow.
+//     if is_ir == 0:  // raw-x86 fallback (byte-identical to the v4 per-fn
+//                     // body AFTER the is_ir byte; the signature was hoisted
+//                     // above the branch in v5):
+//       code_size     : u32, rodata_size : u32, code : bytes, rodata : bytes,
+//       reloc_count   : u32, relocs[reloc_count] { offset:u32, kind:u8,
+//                       addend:u32 },
+//       native_binding_count : u32, native_bindings (SAME as v2+)
 //
 //   Globals block:    bytes[global_size]
 //
@@ -78,6 +109,29 @@
 // v3, and v4. v1/v2/v3 carry NO signature (the v3 "trailing bytes == 0" check
 // still holds); v4 carries exactly one signature block.
 //
+// v5 (Stage B, IL-.em: docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4.3) keeps the
+// 40-byte header byte-identical with version=5 (reserved[0..1]=EM_BUILD_ID,
+// reserved[2]=EM_TARGET_ABI_HASH, same as v2+) and keeps the globals block +
+// name directory (export table) exactly as v3/v4. It redesigns ONLY the per-
+// function record: an `is_ir` byte selects between an IR blob (the output of
+// serialize_thin_function, src/thin_ir_ser.hpp — OPAQUE to the .em container)
+// and a raw-x86 fallback (the v4 per-fn body). v5 is UNSIGNED for Stage B (NO
+// signature block) — the v3 "trailing bytes == 0" rule still holds. A v5-
+// signed variant (v5 + the additive Ed25519 block) is explicitly FUTURE work;
+// do not implement it in Stage B.
+//
+// v5 SECURITY MODEL: a v5 .em carries IR, NOT machine code. The loader
+// deserializes + validates the IR (structural well-formedness + a type-check
+// against the host native table) and re-lowers it to x86 via emit_x64
+// (src/thin_emit.hpp) BEFORE alloc_executable_rw — so a tampered or malformed
+// v5 .em is REJECTED at IR validation with NO executable page allocated (the
+// raw-x86 fallback path is the v4 path, which still verifies its v4 signature
+// first when a keyring is present). v5 is OFF-BY-DEFAULT and INERT until the
+// Stage-B writer/loader land: EM_VERSION stays 4 (the default writer version),
+// and no v5 code path exists in em_writer.cpp / em_loader.cpp yet. The
+// constants + the ir_blob field + this layout spec are the contract those
+// parallel chunks implement against.
+//
 // KEY MANAGEMENT (F2): the signing key stays OFF the host (the build tool that
 // emits `.em` signs it). The loader takes a set of TRUSTED verification public
 // keys (a keyring). Non-empty keyring -> SIGNED-ONLY (v1/v2/v3 unsigned modules
@@ -105,6 +159,12 @@ namespace ember {
 // 'E','M','B','L' = 0x4C,0x42,0x4D,0x45 -> 0x454D424C.
 constexpr uint32_t EM_MAGIC    = 0x454D424Cu;
 constexpr uint32_t EM_VERSION  = 4u;       // v4: v3 layout + Ed25519 signature block (F2 content authentication)
+constexpr uint32_t EM_VERSION_V5 = 5u;     // v5 (Stage B, IL-.em): per-function IR blob (is_ir byte + ir_blob) OR
+                                            // raw-x86 fallback; carries IR NOT machine code (see the v5 per-function
+                                            // record + SECURITY MODEL below). UNSIGNED for Stage B; a v5-signed variant
+                                            // (v5 + Ed25519 block) is FUTURE work. INERT until the Stage-B writer/
+                                            // loader land — EM_VERSION stays 4 (the default writer version); no v5
+                                            // code path exists in em_writer.cpp / em_loader.cpp yet.
 constexpr uint32_t EM_VERSION_V3 = 3u;     // historical v3: name directory IS the export table (F1 pub/priv visibility)
 constexpr uint32_t EM_VERSION_V2 = 2u;     // historical v2: canonical signatures, native bindings, rodata relocs
 constexpr uint32_t EM_VERSION_V1 = 1u;     // historical v1: ABI-trusted, unknown signatures
@@ -258,6 +318,17 @@ struct EmFunctionRecord {
     // Set by codegen for features whose process state has no sound v2 binding
     // (currently trap stub/context/detail and function-reference allowlists).
     std::string non_serializable_reason;
+    // v5: when non-empty, this function is an IR function — `ir_blob` is the
+    // output of `serialize_thin_function` (src/thin_ir_ser.hpp) and the v4
+    // `code`/`rodata`/`relocs`/`native_bindings` fields are UNUSED (empty).
+    // When empty, the function is a raw-x86 fallback (serialized exactly as
+    // v4). A v5 module may MIX the two per-function (mixed mode): IR-
+    // serializable fns ship IR; non-serializable fns (aggregate/string/struct/
+    // defer gaps, flagged by ThinFunction::non_serializable) ship raw x86. On
+    // disk the v5 `is_ir` byte is derived as `!ir_blob.empty()`. ADDITIVE:
+    // default-constructed empty, untouched by the v1-v4 writer/loader paths
+    // (they never read or write it; a v4 record has no is_ir byte).
+    std::vector<uint8_t>  ir_blob;
 };
 
 // A whole `.em` module in memory. `functions` is in no required order; the

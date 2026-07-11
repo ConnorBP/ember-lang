@@ -76,7 +76,17 @@ add_library(ember STATIC
     # must not depend on ember_frontend: the link direction is one-way). Same
     # self-contained pattern em_writer.cpp / em_loader.cpp already follow. The
     # struct test links only `ember` and so reaches dump() directly.
+    #
+    # Stage B c1a: the shared .em canonical-type codec (em_type_codec.{hpp,cpp})
+    # deduplicates the Type/EmSignature on-disk encoding that em_writer.cpp
+    # (emit_type/emit_signature/validate_canonical_type/validate_signature) and
+    # em_loader.cpp (parse_type/canonical_type_same/parse_signature) previously
+    # carried as private anon-namespace copies. Same self-contained pattern: it
+    # touches Type ONLY through public data members + the Prim enum and never
+    # calls a Type method, so it stays in the core lib with no ember_frontend
+    # dependency. Both em_writer.cpp and em_loader.cpp now #include it.
     src/thin_ir.cpp
+    src/em_type_codec.cpp
 )
 target_include_directories(ember PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ember PUBLIC ember_ed25519)  # F2 .em content authentication

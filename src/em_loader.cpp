@@ -6,6 +6,7 @@
 // operation, not validation of an untrusted or portable code container.
 
 #include "em_loader.hpp"
+#include "em_type_codec.hpp"  // shared .em canonical-type codec (parse_type/canonical_type_same/parse_signature)
 
 #include <algorithm>
 #include <array>
@@ -172,64 +173,25 @@ bool parse_name(Reader& rd, std::string& out, const char* field,
     return true;
 }
 
-// Validate the on-disk canonical-type shape BEFORE assigning any field or
-// allocating an element. A hand-built Type whose prim/flags/array_len/name are
-// internally inconsistent must be rejected here, not published as an exec
-// page. The writer derives every flag bit from the Type's fields; the loader
-// does not consume bits 1 (array) or 2 (struct) for its own Type construction,
-// but it enforces that they agree with array_len/name_len so a malformed v2
-// artifact cannot smuggle an inconsistent Type past the signature check.
-bool parse_type(Reader& rd, Type& t, unsigned depth, std::string* err) {
-    if (depth > 16) { set_error(err, "em_loader: limit: type nesting too deep"); return false; }
-    uint8_t prim=0, flags=0; uint32_t array_len=0; uint16_t name_len=0;
-    if(!rd.u8(prim)||!rd.u8(flags)||!rd.u32(array_len)||!rd.u16(name_len)) { set_error(err,"em_loader: format: truncated canonical type"); return false; }
-    if(prim>static_cast<uint8_t>(Prim::F64)||(flags&~uint8_t(31))||name_len>MAX_NAME_SIZE) { set_error(err,"em_loader: format: invalid canonical type"); return false; }
-    const uint8_t* name=nullptr; if(!rd.take(name_len,name)) { set_error(err,"em_loader: format: truncated type name"); return false; }
-
-    const bool is_slice  = (flags & 1) != 0;
-    const bool is_array  = (flags & 2) != 0;
-    const bool is_struct = (flags & 4) != 0;
-    const bool is_fn     = (flags & 8) != 0;
-    const bool has_sig   = (flags & 16) != 0;
-
-    // (a) struct flag iff name nonempty.
-    if (is_struct != (name_len > 0)) { set_error(err,"em_loader: format: inconsistent canonical type: struct flag does not match name"); return false; }
-    // (e) array flag iff nonzero length; slice (bit 0) and array (bit 1) are
-    // mutually exclusive — a slice carries array_len==0, an array carries
-    // is_slice==false and array_len>0.
-    if (is_array != (array_len != 0)) { set_error(err,"em_loader: format: inconsistent canonical type: array flag does not match array_len"); return false; }
-    if (is_slice && array_len) { set_error(err,"em_loader: format: type is both slice and array"); return false; }
-    // (b) a function handle is an i64 slot; is_fn_handle requires prim==I64.
-    if (is_fn && prim != static_cast<uint8_t>(Prim::I64)) { set_error(err,"em_loader: format: inconsistent canonical type: function handle requires Prim::I64"); return false; }
-    // (c)+(d) a recorded signature is only valid on a function handle.
-    if (has_sig && !is_fn) { set_error(err,"em_loader: format: inconsistent canonical type: recorded signature requires function handle"); return false; }
-    // (g) a slice/array is characterized by its element, not its own prim;
-    // its prim must be Void (the value is `elem[]` / `elem[N]`). A struct
-    // name does NOT constrain prim: a script struct has Prim::Void while a
-    // host handle (`bind_handle`) is Prim::I64 with a struct-name tag, so
-    // both are valid.
-    if ((is_slice || array_len) && prim != static_cast<uint8_t>(Prim::Void)) { set_error(err,"em_loader: format: inconsistent canonical type: slice/array must have Prim::Void"); return false; }
-
-    t.prim=static_cast<Prim>(prim); t.is_slice=is_slice; t.array_len=array_len;
-    t.struct_name.assign(reinterpret_cast<const char*>(name),name_len); t.is_fn_handle=is_fn; t.has_recorded_sig=has_sig;
-    if(t.is_slice||t.array_len) { t.elem=std::make_shared<Type>(); if(!parse_type(rd,*t.elem,depth+1,err))return false; }
-    if(t.is_fn_handle&&t.has_recorded_sig) { uint32_t n=0; if(!rd.u32(n)||n>1024){set_error(err,"em_loader: limit: function type parameter count");return false;} for(uint32_t i=0;i<n;++i){auto p=std::make_shared<Type>();if(!parse_type(rd,*p,depth+1,err))return false;t.recorded_params.push_back(std::move(p));}t.recorded_ret=std::make_shared<Type>();if(!parse_type(rd,*t.recorded_ret,depth+1,err))return false; }
-    return true;
-}
-
-bool canonical_type_same(const Type& a,const Type& b) {
-    if(a.prim!=b.prim||a.struct_name!=b.struct_name||a.is_slice!=b.is_slice||a.array_len!=b.array_len||a.is_fn_handle!=b.is_fn_handle||a.has_recorded_sig!=b.has_recorded_sig)return false;
-    if(bool(a.elem)!=bool(b.elem)||(a.elem&&!canonical_type_same(*a.elem,*b.elem)))return false;
-    if(a.recorded_params.size()!=b.recorded_params.size()||bool(a.recorded_ret)!=bool(b.recorded_ret))return false;
-    for(size_t i=0;i<a.recorded_params.size();++i)if(bool(a.recorded_params[i])!=bool(b.recorded_params[i])||(a.recorded_params[i]&&!canonical_type_same(*a.recorded_params[i],*b.recorded_params[i])))return false;
-    return !a.recorded_ret||canonical_type_same(*a.recorded_ret,*b.recorded_ret);
-}
-
+// parse_type / canonical_type_same / parse_signature live in em_type_codec
+// (the shared .em canonical-type codec) and operate on a raw (cur, end) cursor
+// pair. The loader keeps a Reader-based adapter here so its call sites in
+// parse_file stay unchanged; the adapter bridges Reader <-> cursor and then
+// delegates to ember::parse_signature. canonical_type_same is a pure
+// Type-vs-Type comparison with no cursor, so parse_file calls it directly
+// (unqualified lookup resolves to ember::canonical_type_same).
 bool parse_signature(Reader& rd, EmSignature& sig, std::string* err) {
-    if(!parse_type(rd,sig.ret,0,err))return false;
-    uint32_t n=0;
-    if(!rd.u32(n)||n>1024){set_error(err,"em_loader: limit: signature parameter count");return false;}
-    sig.params.resize(n); for(Type& t:sig.params)if(!parse_type(rd,t,0,err))return false; return true;
+    const uint8_t* cur = rd.bytes.data() + rd.pos;
+    const uint8_t* end = rd.bytes.data() + rd.bytes.size();
+    if (!::ember::parse_signature(cur, end, sig, err)) {
+        // Advance pos to wherever the cursor stopped so a follow-on diagnostic
+        // or a caller inspecting position sees a best-effort offset. The parse
+        // has already failed; the exact pos does not affect the reject path.
+        rd.pos = static_cast<uint64_t>(cur - rd.bytes.data());
+        return false;
+    }
+    rd.pos = static_cast<uint64_t>(cur - rd.bytes.data());
+    return true;
 }
 
 bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
