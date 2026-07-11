@@ -1,0 +1,6 @@
+import "sema.ember";
+fn main() -> i64 {
+    let a: i64 = array_new(8, 0);
+    array_push_i64(a, -1);
+    return array_get_i64(a, 0);
+}

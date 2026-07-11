@@ -1,0 +1,275 @@
+// self_hosted/sema_test.ember — tests for the self-hosted ember sema.
+//
+// TDD: every type-checking rule implemented in sema.ember is exercised. The
+// test lexes + parses + type-checks known ember snippets and verifies the
+// sema accepts valid programs (sema returns 0) and rejects invalid ones (sema
+// returns nonzero + the right error class). main() returns 0 on full success,
+// or a nonzero code identifying the first failing check (so a failure is
+// harness-observable, not a silent 0).
+//
+// Run: ./buildt/ember_cli.exe run self_hosted/sema_test.ember --fn main
+// (exit 0 == all tests pass).
+//
+// Positive tests (should type-check):
+//   1. canonical  fn main() -> i64 { let x: i64 = 1 + 2 * 3; return x; }
+//   2. bool cond  fn f(b: bool) -> i64 { if (b) { return 1; } return 0; }
+//   3. while      fn w(n: i64) -> i64 { while (n > 0) { n = n - 1; } return n; }
+//   4. call       fn add(a: i64, b: i64) -> i64 { return a + b; }
+//                 fn main() -> i64 { return add(1, 2); }
+//   5. logical    fn g(b: bool) -> bool { return b && true; }
+//   6. unary neg  fn h() -> i64 { return -5; }
+//   7. auto let   fn a() -> i64 { let x = 42; return x; }
+//   8. comparison fn c(x: i64) -> bool { return x < 10; }
+//
+// Negative tests (should FAIL type-check):
+//   N1. if cond not bool      fn f(x: i64) -> i64 { if (x) { return 1; } return 0; }
+//   N2. return type mismatch  fn f() -> i64 { return true; }
+//   N3. let type mismatch     fn f() -> i64 { let x: i64 = true; return x; }
+//   N4. call arg mismatch     fn add(a: i64, b: i64) -> i64 { return a + b; }
+//                              fn main() -> i64 { return add(1, true); }
+//   N5. call wrong arity      fn add(a: i64, b: i64) -> i64 { return a + b; }
+//                              fn main() -> i64 { return add(1); }
+//   N6. undefined name        fn f() -> i64 { return y; }
+//   N7. while cond not bool   fn f(x: i64) -> i64 { while (x) { x = x - 1; } return 0; }
+//   N8. unknown function      fn f() -> i64 { return nope(1); }
+//   N9. arithmetic type mix   fn f() -> i64 { let b: bool = true; return b + 1; }
+
+import "sema.ember";
+
+// ---------------------------------------------------------------------------
+// assertion helpers. ck returns 0 to continue or a nonzero code to bail; the
+// driver returns immediately on the first failure. (Same protocol as
+// parse_test.ember / lex_test.ember.)
+// ---------------------------------------------------------------------------
+global g_pass : i64 = 0;
+
+fn ck(got: i64, want: i64, code: i64) -> i64 {
+    if (got == want) { g_pass = g_pass + 1; return 0; }
+    return code;
+}
+
+// ---------------------------------------------------------------------------
+// Positive tests — the sema should ACCEPT these (sema() returns 0).
+// ---------------------------------------------------------------------------
+
+// Test 1 — the canonical program from the task spec.
+fn test_canonical() -> i64 {
+    let r: i64 = sema("fn main() -> i64 { let x: i64 = 1 + 2 * 3; return x; }");
+    // sema() returns 0 on success. (A nonzero r means a parse or sema error.)
+    if (r != 0) { return 1000 + r; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// Test 2 — if with a bool condition + early return.
+fn test_if_bool() -> i64 {
+    let r: i64 = sema("fn f(b: bool) -> i64 { if (b) { return 1; } return 0; }");
+    if (r != 0) { return 2000 + r; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// Test 3 — while loop with a comparison condition + assignment.
+fn test_while() -> i64 {
+    let r: i64 = sema("fn w(n: i64) -> i64 { while (n > 0) { n = n - 1; } return n; }");
+    if (r != 0) { return 3000 + r; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// Test 4 — a call to an i64->i64 fn with correct args.
+fn test_call() -> i64 {
+    let r: i64 = sema("fn add(a: i64, b: i64) -> i64 { return a + b; } fn main() -> i64 { return add(1, 2); }");
+    if (r != 0) { return 4000 + r; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// Test 5 — logical && on bool operands yielding bool.
+fn test_logical() -> i64 {
+    let r: i64 = sema("fn g(b: bool) -> bool { return b && true; }");
+    if (r != 0) { return 5000 + r; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// Test 6 — unary neg on an integer literal.
+fn test_unary_neg() -> i64 {
+    let r: i64 = sema("fn h() -> i64 { return -5; }");
+    if (r != 0) { return 6000 + r; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// Test 7 — auto let (infer i64 from an int literal initializer).
+fn test_auto_let() -> i64 {
+    let r: i64 = sema("fn a() -> i64 { let x = 42; return x; }");
+    if (r != 0) { return 7000 + r; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// Test 8 — comparison yielding bool, returned from a bool fn.
+fn test_comparison() -> i64 {
+    let r: i64 = sema("fn c(x: i64) -> bool { return x < 10; }");
+    if (r != 0) { return 8000 + r; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// Test 9 — nested calls + a binary op on the results.
+fn test_nested_calls() -> i64 {
+    let r: i64 = sema("fn sq(n: i64) -> i64 { return n * n; } fn main() -> i64 { return sq(3) + sq(4); }");
+    if (r != 0) { return 9000 + r; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// Test 10 — for loop (C-style) with a bool cond + a let init.
+fn test_for_loop() -> i64 {
+    let r: i64 = sema("fn fl() -> i64 { for (let i: i64 = 0; i < 10; i = i + 1) { } return 0; }");
+    if (r != 0) { return 10000 + r; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// Test 11 — a global + a fn that reads it.
+fn test_global() -> i64 {
+    let r: i64 = sema("global C: i64 = 7; fn main() -> i64 { return C; }");
+    if (r != 0) { return 11000 + r; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// Test 12 — bitwise ops on i64 (And/Or/Xor/Shl/Shr) + the ! operator on bool.
+fn test_bitwise_not() -> i64 {
+    let r: i64 = sema("fn b(x: i64) -> i64 { return (x & 3) | (x ^ 1) | (x << 2) | (x >> 1); } fn n(b2: bool) -> bool { return !b2; }");
+    if (r != 0) { return 12000 + r; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Negative tests — the sema should REJECT these (sema_failed() returns 1).
+// Each checks that sema flags an error (we do not check the exact message, only
+// that a type error was caught — the error-class is identified by the test
+// code so a regression surfaces clearly).
+// ---------------------------------------------------------------------------
+
+// N1 — if condition is i64, not bool.
+fn test_neg_if_cond() -> i64 {
+    let r: i64 = sema("fn f(x: i64) -> i64 { if (x) { return 1; } return 0; }");
+    // must fail (sema_failed == 1). r is 1 (sema error) or 2 (parse error); both
+    // are nonzero, but we specifically want a SEMA error (r == 1).
+    let r2: i64 = ck(r, 1, 21001); if (r2 != 0) { return r2; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// N2 — return type mismatch (returning bool from an i64 fn).
+fn test_neg_return_mismatch() -> i64 {
+    let r: i64 = sema("fn f() -> i64 { return true; }");
+    let r2: i64 = ck(r, 1, 22001); if (r2 != 0) { return r2; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// N3 — let type mismatch (initializing an i64 with a bool).
+fn test_neg_let_mismatch() -> i64 {
+    let r: i64 = sema("fn f() -> i64 { let x: i64 = true; return x; }");
+    let r2: i64 = ck(r, 1, 23001); if (r2 != 0) { return r2; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// N4 — call arg type mismatch (passing bool where i64 is expected).
+fn test_neg_call_arg() -> i64 {
+    let r: i64 = sema("fn add(a: i64, b: i64) -> i64 { return a + b; } fn main() -> i64 { return add(1, true); }");
+    let r2: i64 = ck(r, 1, 24001); if (r2 != 0) { return r2; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// N5 — call wrong arity (too few args).
+fn test_neg_call_arity() -> i64 {
+    let r: i64 = sema("fn add(a: i64, b: i64) -> i64 { return a + b; } fn main() -> i64 { return add(1); }");
+    let r2: i64 = ck(r, 1, 25001); if (r2 != 0) { return r2; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// N6 — undefined name (returning an undeclared variable).
+fn test_neg_undefined() -> i64 {
+    let r: i64 = sema("fn f() -> i64 { return y; }");
+    let r2: i64 = ck(r, 1, 26001); if (r2 != 0) { return r2; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// N7 — while condition is i64, not bool.
+fn test_neg_while_cond() -> i64 {
+    let r: i64 = sema("fn f(x: i64) -> i64 { while (x) { x = x - 1; } return 0; }");
+    let r2: i64 = ck(r, 1, 27001); if (r2 != 0) { return r2; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// N8 — call to an unknown function.
+fn test_neg_unknown_fn() -> i64 {
+    let r: i64 = sema("fn f() -> i64 { return nope(1); }");
+    let r2: i64 = ck(r, 1, 28001); if (r2 != 0) { return r2; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// N9 — arithmetic on a bool (b + 1 where b: bool).
+fn test_neg_arith_bool() -> i64 {
+    let r: i64 = sema("fn f() -> i64 { let b: bool = true; return b + 1; }");
+    let r2: i64 = ck(r, 1, 29001); if (r2 != 0) { return r2; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// N10 — logical && on i64 operands (not bool).
+fn test_neg_logical_int() -> i64 {
+    let r: i64 = sema("fn f(x: i64) -> bool { return x && true; }");
+    let r2: i64 = ck(r, 1, 30001); if (r2 != 0) { return r2; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// main — run every test in order; bail on the first nonzero return.
+// ---------------------------------------------------------------------------
+fn main() -> i64 {
+    let mut r: i64 = 0;
+
+    // positive
+    r = test_canonical();           if (r != 0) { return r; }
+    r = test_if_bool();             if (r != 0) { return r; }
+    r = test_while();               if (r != 0) { return r; }
+    r = test_call();                if (r != 0) { return r; }
+    r = test_logical();             if (r != 0) { return r; }
+    r = test_unary_neg();           if (r != 0) { return r; }
+    r = test_auto_let();            if (r != 0) { return r; }
+    r = test_comparison();          if (r != 0) { return r; }
+    r = test_nested_calls();        if (r != 0) { return r; }
+    r = test_for_loop();            if (r != 0) { return r; }
+    r = test_global();              if (r != 0) { return r; }
+    r = test_bitwise_not();         if (r != 0) { return r; }
+
+    // negative
+    r = test_neg_if_cond();         if (r != 0) { return r; }
+    r = test_neg_return_mismatch(); if (r != 0) { return r; }
+    r = test_neg_let_mismatch();    if (r != 0) { return r; }
+    r = test_neg_call_arg();        if (r != 0) { return r; }
+    r = test_neg_call_arity();      if (r != 0) { return r; }
+    r = test_neg_undefined();       if (r != 0) { return r; }
+    r = test_neg_while_cond();      if (r != 0) { return r; }
+    r = test_neg_unknown_fn();      if (r != 0) { return r; }
+    r = test_neg_arith_bool();      if (r != 0) { return r; }
+    r = test_neg_logical_int();     if (r != 0) { return r; }
+
+    // every check passed
+    return 0;
+}

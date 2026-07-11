@@ -1,0 +1,1140 @@
+// self_hosted/sema.ember — the ember semantic analyzer (type checker),
+// written IN ember.
+//
+// Self-hosting Stage 3: prove ember can type-check itself. This is a port of
+// the CORE passes of src/sema.cpp (the C++ reference multi-pass type checker)
+// to ember source. It consumes the AST built by Stage 2's parser (parse.ember)
+// and type-checks it: resolves types, checks expressions / statements /
+// declarations, and manages scopes.
+//
+// === v1 subset ===
+//
+// Stage 3 v1 type-checks a SUBSET of ember, matching the task scope:
+//   - fn declarations with i64 / bool / void params + returns
+//   - let with a declared type (check init matches); auto (infer from init)
+//   - if / while with bool conditions
+//   - return with a value matching the fn return type
+//   - binary ops: arithmetic (+ - * / %) + bitwise (& | ^ << >>) -> i64,
+//     comparison (== != < <= > >=) -> bool, logical (&& ||) -> bool
+//   - unary: - (i64), ! (bool), ~ (i64)
+//   - calls: check arg count + each arg type against the fn signature
+//   - int literals -> i64, bool literals -> bool
+//   - identifiers: look up in the local scope, then globals
+//
+// Struct / enum / field-access / indexing / slice type-checking are left for a
+// follow-on stage (the parser builds those nodes; this sema walks the subset
+// above and reports an "unsupported in v1 sema" error for the rest, so a
+// type-check of the canonical test program succeeds end-to-end).
+//
+// === Type representation ===
+//
+// A "type" in this sema is an i64 index into the parser's AST node array
+// (g_nodes), pointing at a Type node. The parser's Type node already encodes
+// everything sema needs:
+//   d (prim)      — Prim enum value (I64=5, Bool=1, Void=0, ...)
+//   tok           — struct-name token index (or -1 for primitives)
+//   a (elem)      — element type for array/slice types
+//   e (array_len) — fixed-array length
+//   f (is_slice)  — 1 for slice types
+// So `type_eq` is a structural comparison of two Type nodes. Canonical
+// primitive types (i64, bool, void) are created once at init and reused, so
+// i64-ness is a single node-index comparison in the common case.
+//
+// === Symbol tables ===
+//
+// ember has no map<string, Type> builtin, so every table is a flat i64 array
+// (the array extension, elem_size 8) with a fixed stride. Names are stored as
+// TOKEN INDICES (into the lexer's token array, g_toks) — the same trick the
+// parser uses for AST node names — and compared on demand via tok_text, so a
+// lookup is a linear scan comparing tok_text(g_toks, entry_tok). This is O(n)
+// per lookup but n is small (a handful of fns / globals / locals), fine for a
+// v1 sema.
+//
+//   g_fns    : stride 4  [ name_tok, ret_type, first_param, param_count ]
+//   g_structs: stride 2  [ name_tok, first_field ]
+//   g_globals: stride 2  [ name_tok, type ]
+//   g_scope  : stride 2  [ name_tok, type ]   (the local-variable scope stack)
+//   g_marks  : stride 1  [ mark_index ]        (scope-push marks into g_scope)
+//
+// === Error handling ===
+//
+// The C++ sema collects a vector of SemaError; ember has no exceptions, so this
+// sema uses a global error flag (s_err) + first-error message/position, like
+// the parser's p_err. check_* fns set the flag on a type error and return a
+// fallback type (void) so checking continues and downstream nodes still get a
+// type. sema() returns 0 on success or 1 if s_err was set; sema_failed() /
+// sema_err_* expose the state for the test.
+
+import "parse.ember";
+
+// -----------------------------------------------------------------------------
+// canonical primitive types. Created once at init so every i64/bool/void in the
+// program shares one Type node index (making type_eq a single-index compare in
+// the common case). These are appended to the parser's g_nodes array, so they
+// live for the lifetime of the AST.
+// -----------------------------------------------------------------------------
+global TY_I64  : i64 = 0;
+global TY_BOOL : i64 = 0;
+global TY_VOID : i64 = 0;
+
+// -----------------------------------------------------------------------------
+// symbol tables (flat i64 arrays).
+// -----------------------------------------------------------------------------
+global g_fns     : i64 = 0;   // array, stride FN_STRIDE
+global g_structs : i64 = 0;   // array, stride STRUCT_STRIDE
+global g_globals : i64 = 0;   // array, stride GLOBAL_STRIDE
+global g_scope   : i64 = 0;   // array, stride SCOPE_STRIDE (local vars)
+global g_marks   : i64 = 0;   // array, stride 1 (scope-push marks)
+
+global FN_STRIDE     : i64 = 4;
+global STRUCT_STRIDE : i64 = 2;
+global GLOBAL_STRIDE : i64 = 2;
+global SCOPE_STRIDE  : i64 = 2;
+
+// the token array handle (copied from the parser's g_toks at sema() entry, so
+// name lookups can call tok_text without re-threading it through every call).
+global s_toks : i64 = 0;
+
+// -----------------------------------------------------------------------------
+// error state. s_err = 1 once a type error is flagged; the first error's
+// message + position are recorded (later errors are suppressed so the test
+// sees the root cause, matching the parser's err() first-error policy).
+// -----------------------------------------------------------------------------
+global s_err     : i64 = 0;
+global s_errline : i64 = 0;
+global s_errcol  : i64 = 0;
+global s_errmsg  : string = "";
+
+// the current function's return type (for return-stmt checking). -1 = not in a fn.
+global s_cur_ret : i64 = 0;
+
+// -----------------------------------------------------------------------------
+// init — allocate the symbol tables + canonical types. Called once at sema()
+// entry (and safe to call repeatedly: it resets every table). The canonical
+// primitive Type nodes are appended to g_nodes so type_eq can compare by index.
+// -----------------------------------------------------------------------------
+fn s_init() -> i64 {
+    s_toks = parse_tokens();
+    g_fns = array_new(8, 0);
+    g_structs = array_new(8, 0);
+    g_globals = array_new(8, 0);
+    g_scope = array_new(8, 0);
+    g_marks = array_new(8, 0);
+    s_err = 0;
+    s_errline = 0;
+    s_errcol = 0;
+    s_errmsg = string_from_slice("");
+    s_cur_ret = -1;
+
+    // canonical primitive types: three Type nodes appended to g_nodes.
+    TY_I64 = alloc_node(NK::Type as i64);
+    set_d(TY_I64, Prim::I64 as i64);
+
+    TY_BOOL = alloc_node(NK::Type as i64);
+    set_d(TY_BOOL, Prim::Bool as i64);
+
+    TY_VOID = alloc_node(NK::Type as i64);
+    set_d(TY_VOID, Prim::Void as i64);
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// error reporting. serr(msg, line, col) flags the first error and returns the
+// void type (so callers can `return serr(...)` and keep checking with a
+// fallback). The line/col come from the relevant token's position.
+// -----------------------------------------------------------------------------
+fn serr(msg: string, line: i64, col: i64) -> i64 {
+    if (s_err == 0) {
+        s_err = 1;
+        s_errline = line;
+        s_errcol = col;
+        s_errmsg = msg;
+    }
+    return TY_VOID;
+}
+
+// a node's position (line/col) from its `tok` token, for error messages. Falls
+// back to (0,0) for synthetic nodes (tok < 0).
+fn node_line(i: i64) -> i64 {
+    let t: i64 = nk_tok(i);
+    if (t < 0) { return 0; }
+    return tok_line(s_toks, t);
+}
+fn node_col(i: i64) -> i64 {
+    let t: i64 = nk_tok(i);
+    if (t < 0) { return 0; }
+    return tok_col(s_toks, t);
+}
+
+// retrieve a name from a token index (the symbol-table key).
+fn tok_name(t: i64) -> string {
+    if (t < 0) { return string_from_slice(""); }
+    return tok_text(s_toks, t);
+}
+
+// -----------------------------------------------------------------------------
+// type accessors + equality. A type is a Type-node index.
+// -----------------------------------------------------------------------------
+
+// the Prim value of a type node (the `d` slot).
+fn ty_prim(t: i64) -> i64 { return nk_d(t); }
+
+// the struct-name token index of a type node (the `tok` slot, -1 for prims).
+fn ty_struct_tok(t: i64) -> i64 { return nk_tok(t); }
+
+// the struct name as a string ("" for primitives).
+fn ty_struct_name(t: i64) -> string { return tok_name(nk_tok(t)); }
+
+// is_slice flag (the `f` slot).
+fn ty_is_slice(t: i64) -> i64 { return nk_f(t); }
+
+// array_len (the `e` slot).
+fn ty_array_len(t: i64) -> i64 { return nk_e(t); }
+
+// element type (the `a` slot) for array/slice types.
+fn ty_elem(t: i64) -> i64 { return nk_a(t); }
+
+// is this type the integer type i64? (v1 subset: only i64 is a "plain integer")
+fn ty_is_i64(t: i64) -> i64 {
+    if (t < 0) { return 0; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 0; }
+    if (nk_d(t) != (Prim::I64 as i64)) { return 0; }
+    if (nk_tok(t) >= 0) { return 0; }   // a named/handle type, not plain i64
+    if (nk_f(t) != 0) { return 0; }     // a slice, not a scalar
+    return 1;
+}
+
+// is this type a plain integer (any int width)? v1's binary-op check accepts
+// any integer primitive (i8/i16/i32/i64/u8/u16/u32/u64) for arithmetic; the
+// canonical test uses i64 but the rule generalizes.
+fn ty_is_int(t: i64) -> i64 {
+    if (t < 0) { return 0; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 0; }
+    let p: i64 = nk_d(t);
+    if (nk_tok(t) >= 0) { return 0; }
+    if (nk_f(t) != 0) { return 0; }
+    // Prim I8..U64 = 2..9
+    if (p >= 2 && p <= 9) { return 1; }
+    return 0;
+}
+
+// is this type bool?
+fn ty_is_bool(t: i64) -> i64 {
+    if (t < 0) { return 0; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 0; }
+    if (nk_d(t) != (Prim::Bool as i64)) { return 0; }
+    if (nk_tok(t) >= 0) { return 0; }
+    return 1;
+}
+
+// is this type void?
+fn ty_is_void(t: i64) -> i64 {
+    if (t < 0) { return 0; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 0; }
+    if (nk_d(t) != (Prim::Void as i64)) { return 0; }
+    if (nk_tok(t) >= 0) { return 0; }
+    return 1;
+}
+
+// is this a numeric type (int or float)? floats are Prim F32=10 / F64=11.
+fn ty_is_float(t: i64) -> i64 {
+    if (t < 0) { return 0; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 0; }
+    let p: i64 = nk_d(t);
+    if (nk_tok(t) >= 0) { return 0; }
+    if (nk_f(t) != 0) { return 0; }
+    if (p == 10 || p == 11) { return 1; }
+    return 0;
+}
+
+// Structural type equality: two Type nodes are the same type iff their prim,
+// struct name, slice flag, array len, and element type all match. Canonical
+// primitives share one node index so the common case is a single `t1 == t2`.
+fn type_eq(t1: i64, t2: i64) -> i64 {
+    if (t1 == t2) { return 1; }
+    if (t1 < 0 || t2 < 0) { return 0; }
+    if (nk_kind(t1) != (NK::Type as i64)) { return 0; }
+    if (nk_kind(t2) != (NK::Type as i64)) { return 0; }
+    if (nk_d(t1) != nk_d(t2)) { return 0; }
+    // struct name: compare by text (two different tokens with the same text)
+    if (tok_name(nk_tok(t1)) != tok_name(nk_tok(t2))) { return 0; }
+    if (nk_f(t1) != nk_f(t2)) { return 0; }
+    if (nk_e(t1) != nk_e(t2)) { return 0; }
+    // element type for array/slice — recurse
+    let e1: i64 = nk_a(t1);
+    let e2: i64 = nk_a(t2);
+    if (e1 < 0 && e2 < 0) { return 1; }
+    if (e1 < 0 || e2 < 0) { return 0; }
+    return type_eq(e1, e2);
+}
+
+// types_compatible: true iff `want` and `got` are the same type. v1 subset has
+// NO implicit conversions (the C++ sema widens ints / adapts literals; v1
+// keeps it strict so the test is a clean same-type check). One ergonomic
+// exception: an IntLit (untyped literal) is checked at the let/init site, not
+// here, so a `let x: i64 = 1` works (1 is an IntLit that resolves to i64).
+fn types_compatible(want: i64, got: i64) -> i64 {
+    return type_eq(want, got);
+}
+
+// a human-readable type name for error messages ("i64", "bool", "void", or the
+// struct name). v1 keeps it short; the canonical subset only needs the prims.
+fn ty_name(t: i64) -> string {
+    if (t < 0) { return string_from_slice("?"); }
+    if (nk_kind(t) != (NK::Type as i64)) { return string_from_slice("?"); }
+    let p: i64 = nk_d(t);
+    if (nk_tok(t) >= 0) { return tok_name(nk_tok(t)); }
+    if (p == (Prim::I64 as i64)) { return string_from_slice("i64"); }
+    if (p == (Prim::Bool as i64)) { return string_from_slice("bool"); }
+    if (p == (Prim::Void as i64)) { return string_from_slice("void"); }
+    if (p == (Prim::I32 as i64)) { return string_from_slice("i32"); }
+    if (p == (Prim::F32 as i64)) { return string_from_slice("f32"); }
+    if (p == (Prim::F64 as i64)) { return string_from_slice("f64"); }
+    return string_from_slice("?");
+}
+
+// -----------------------------------------------------------------------------
+// type resolution. resolve_type(t) verifies a Type node is well-formed: a
+// primitive prim, or a named struct that was declared. Returns the canonical
+// type (for i64/bool/void, the shared TY_* node; otherwise the node itself),
+// or TY_VOID + an error if the named struct is unknown.
+//
+// For the v1 subset, the only named types the test uses are primitives; struct
+// types are resolved by looking up g_structs. An unknown name is a type error.
+// -----------------------------------------------------------------------------
+fn resolve_type(t: i64) -> i64 {
+    if (t < 0) { return serr(string_from_slice("missing type"), 0, 0); }
+    if (nk_kind(t) != (NK::Type as i64)) {
+        return serr(string_from_slice("expected a type"), node_line(t), node_col(t));
+    }
+    let p: i64 = nk_d(t);
+    // named struct/handle type: tok set, prim=Void (the parser's named-type
+    // marker). Look it up in the struct table.
+    if (nk_tok(t) >= 0) {
+        let nm: string = tok_name(nk_tok(t));
+        if (find_struct(nm) >= 0) { return t; }
+        // not a declared struct — v1 reports an error (no opaque host handles
+        // in the subset). The C++ sema accepts opaque handles; v1 keeps it
+        // strict so an unknown name is always caught.
+        return serr(string_from_slice("unknown type '") + nm + string_from_slice("'"),
+                    node_line(t), node_col(t));
+    }
+    // canonicalize the common primitives to the shared nodes
+    if (p == (Prim::I64 as i64)) { return TY_I64; }
+    if (p == (Prim::Bool as i64)) { return TY_BOOL; }
+    if (p == (Prim::Void as i64)) { return TY_VOID; }
+    // other prims (i8/i16/i32/u*/f32/f64): valid, return as-is
+    return t;
+}
+
+// -----------------------------------------------------------------------------
+// struct table. find_struct(name) returns the struct's entry index in
+// g_structs (row = index / STRUCT_STRIDE), or -1 if not declared.
+// -----------------------------------------------------------------------------
+fn find_struct(name: string) -> i64 {
+    let n: i64 = array_length(g_structs) / STRUCT_STRIDE;
+    let mut i: i64 = 0;
+    while (i < n) {
+        let tok: i64 = array_get_i64(g_structs, i * STRUCT_STRIDE + 0);
+        if (tok_name(tok) == name) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// register a struct decl: append (name_tok, first_field) to g_structs.
+fn register_struct(sd: i64) -> i64 {
+    let nm_tok: i64 = nk_tok(sd);
+    let nm: string = tok_name(nm_tok);
+    if (find_struct(nm) >= 0) {
+        return serr(string_from_slice("duplicate struct declaration '") + nm + string_from_slice("'"),
+                    node_line(sd), node_col(sd));
+    }
+    array_push_i64(g_structs, nm_tok);
+    array_push_i64(g_structs, nk_a(sd));   // first field (or -1)
+    return 0;
+}
+
+// look up a struct field's type by name. Returns the field's Type node, or -1
+// if the struct / field is not found. Fields are linked via nk_next from the
+// struct's first-field slot.
+fn struct_field_type(struct_row: i64, field_name: string) -> i64 {
+    let first: i64 = array_get_i64(g_structs, struct_row * STRUCT_STRIDE + 1);
+    let mut f: i64 = first;
+    while (f >= 0) {
+        if (tok_name(nk_tok(f)) == field_name) {
+            return resolve_type(nk_a(f));
+        }
+        f = nk_next(f);
+    }
+    return -1;
+}
+
+// -----------------------------------------------------------------------------
+// function table. find_fn(name) returns the fn's entry row, or -1.
+//   row layout (FN_STRIDE = 4): [ name_tok, ret_type, first_param, param_count ]
+// first_param is the first Param node (linked via nk_next); param_count is the
+// total.
+// -----------------------------------------------------------------------------
+fn find_fn(name: string) -> i64 {
+    let n: i64 = array_length(g_fns) / FN_STRIDE;
+    let mut i: i64 = 0;
+    while (i < n) {
+        let tok: i64 = array_get_i64(g_fns, i * FN_STRIDE + 0);
+        if (tok_name(tok) == name) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// fn_param_type(fn_row, i) -> the i-th param's resolved type (0-based).
+fn fn_param_type(fn_row: i64, i: i64) -> i64 {
+    let first: i64 = array_get_i64(g_fns, fn_row * FN_STRIDE + 2);
+    let mut p: i64 = first;
+    let mut k: i64 = 0;
+    while (p >= 0) {
+        if (k == i) { return resolve_type(nk_a(p)); }
+        p = nk_next(p);
+        k = k + 1;
+    }
+    return TY_VOID;
+}
+
+// fn_ret_type(fn_row) -> the fn's resolved return type.
+fn fn_ret_type(fn_row: i64) -> i64 {
+    let rt: i64 = array_get_i64(g_fns, fn_row * FN_STRIDE + 1);
+    return resolve_type(rt);
+}
+
+// fn_param_count(fn_row) -> the recorded param count.
+fn fn_param_count(fn_row: i64) -> i64 {
+    return array_get_i64(g_fns, fn_row * FN_STRIDE + 3);
+}
+
+// register a fn decl: resolve + record its signature. The body is checked
+// separately in check_func_body (after ALL signatures are registered, so a
+// forward call from fn A to fn B — A checked first — sees B's sig).
+fn register_fn(fd: i64) -> i64 {
+    let nm_tok: i64 = nk_tok(fd);
+    let nm: string = tok_name(nm_tok);
+    if (find_fn(nm) >= 0) {
+        return serr(string_from_slice("duplicate function declaration '") + nm + string_from_slice("'"),
+                    node_line(fd), node_col(fd));
+    }
+    // count params + resolve the return type
+    let mut count: i64 = 0;
+    let mut p: i64 = nk_a(fd);
+    while (p >= 0) {
+        count = count + 1;
+        p = nk_next(p);
+    }
+    let rt: i64 = resolve_type(nk_b(fd));
+    array_push_i64(g_fns, nm_tok);
+    array_push_i64(g_fns, nk_b(fd));     // raw ret type node (resolved on read)
+    array_push_i64(g_fns, nk_a(fd));     // first param
+    array_push_i64(g_fns, count);
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// global table. find_global(name) -> row, or -1.
+//   row layout (GLOBAL_STRIDE = 2): [ name_tok, type ]
+// -----------------------------------------------------------------------------
+fn find_global(name: string) -> i64 {
+    let n: i64 = array_length(g_globals) / GLOBAL_STRIDE;
+    let mut i: i64 = 0;
+    while (i < n) {
+        let tok: i64 = array_get_i64(g_globals, i * GLOBAL_STRIDE + 0);
+        if (tok_name(tok) == name) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn global_type(row: i64) -> i64 {
+    return resolve_type(array_get_i64(g_globals, row * GLOBAL_STRIDE + 1));
+}
+
+fn register_global(gd: i64) -> i64 {
+    let nm_tok: i64 = nk_tok(gd);
+    let nm: string = tok_name(nm_tok);
+    if (find_global(nm) >= 0) {
+        return serr(string_from_slice("duplicate global declaration '") + nm + string_from_slice("'"),
+                    node_line(gd), node_col(gd));
+    }
+    array_push_i64(g_globals, nm_tok);
+    array_push_i64(g_globals, nk_a(gd));   // type node (resolved on read)
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// scope management (local variables). The scope is a flat array of
+// (name_tok, type) pairs; g_marks records the array length at each push_scope
+// so pop_scope can truncate back to it. declare() adds to the current (top)
+// scope; lookup_local() scans the whole stack (innermost-last wins because we
+// scan from the end).
+// -----------------------------------------------------------------------------
+fn push_scope() -> i64 {
+    array_push_i64(g_marks, array_length(g_scope) / SCOPE_STRIDE);
+    return 0;
+}
+
+fn pop_scope() -> i64 {
+    let n: i64 = array_length(g_marks);
+    if (n == 0) { return 0; }
+    let mark: i64 = array_get_i64(g_marks, n - 1);
+    // truncate g_scope back to `mark` entries. ember's array extension has no
+    // truncate, so we rewrite the slot count via repeated... no: we instead
+    // keep a separate "logical length" s_scope_len and only read up to it.
+    // See s_scope_len below. (We still pop the mark.)
+    array_set_i64(g_marks, n - 1, 0);   // clear (not a real pop; g_marks grows
+    // unbounded across many push/pop, but a fn body has a bounded number of
+    // scopes, so this is fine for v1.)
+    s_scope_len = mark * SCOPE_STRIDE;
+    return 0;
+}
+
+// the logical length of g_scope (so pop_scope can "truncate" without a real
+// array-truncate op). Reads/writes use this as the bound.
+global s_scope_len : i64 = 0;
+
+// declare a local in the current (top) scope. Reports a redeclaration error if
+// the same name is already in the TOP scope (shadowing an enclosing scope is
+// allowed, matching the C++ sema's per-scope dedup).
+fn declare(name_tok: i64, t: i64) -> i64 {
+    let nm: string = tok_name(name_tok);
+    // dedup against the current top scope: scan from the last mark to the end.
+    let nmarks: i64 = array_length(g_marks);
+    let mut top_mark: i64 = 0;
+    if (nmarks > 0) {
+        top_mark = array_get_i64(g_marks, nmarks - 1) * SCOPE_STRIDE;
+    }
+    let mut i: i64 = top_mark;
+    while (i < s_scope_len) {
+        if (tok_name(array_get_i64(g_scope, i)) == nm) {
+            return serr(string_from_slice("redeclaration of '") + nm + string_from_slice("' in the same scope"),
+                        node_line_tok(name_tok), node_col_tok(name_tok));
+        }
+        i = i + SCOPE_STRIDE;
+    }
+    // append (name_tok, type) at s_scope_len
+    array_set_i64(g_scope, s_scope_len, name_tok);
+    array_set_i64(g_scope, s_scope_len + 1, t);
+    s_scope_len = s_scope_len + SCOPE_STRIDE;
+    return 0;
+}
+
+// position helpers that take a raw token index (for declare's error).
+fn node_line_tok(t: i64) -> i64 {
+    if (t < 0) { return 0; }
+    return tok_line(s_toks, t);
+}
+fn node_col_tok(t: i64) -> i64 {
+    if (t < 0) { return 0; }
+    return tok_col(s_toks, t);
+}
+
+// lookup a local by name. Returns its type, or -1 if not found. Scans from the
+// END of the scope stack so the innermost binding wins.
+fn lookup_local(name: string) -> i64 {
+    let mut i: i64 = s_scope_len - SCOPE_STRIDE;
+    while (i >= 0) {
+        if (tok_name(array_get_i64(g_scope, i)) == name) {
+            return array_get_i64(g_scope, i + 1);
+        }
+        i = i - SCOPE_STRIDE;
+    }
+    return -1;
+}
+
+// lookup a variable: locals first, then globals. Returns its type or -1.
+fn lookup_var(name: string) -> i64 {
+    let lt: i64 = lookup_local(name);
+    if (lt >= 0) { return lt; }
+    let g: i64 = find_global(name);
+    if (g >= 0) { return global_type(g); }
+    return -1;
+}
+
+// -----------------------------------------------------------------------------
+// expression type-check. check_expr(e) -> the expression's resolved type (a
+// Type node index), or TY_VOID on error (with s_err set). Mirrors the C++
+// Checker::check_expr's dispatch on node kind.
+//
+// v1 subset handles: IntLit, BoolLit, Ident, BinExpr, UnaryExpr, CallExpr.
+// Other expression kinds report an "unsupported in v1 sema" error so the test
+// sees a clean message if it exercises one.
+// -----------------------------------------------------------------------------
+fn check_expr(e: i64) -> i64 {
+    if (e < 0) { return serr(string_from_slice("missing expression"), 0, 0); }
+    let k: i64 = nk_kind(e);
+
+    if (k == (NK::IntLit as i64)) {
+        // an integer literal is i64 in the v1 subset (the C++ sema adapts it
+        // to a surrounding expected type; v1 keeps literals i64 and checks
+        // compatibility at the let/init site, where i64 == i64 trivially).
+        return TY_I64;
+    }
+    if (k == (NK::BoolLit as i64)) {
+        return TY_BOOL;
+    }
+    if (k == (NK::Ident as i64)) {
+        let nm: string = nk_name(e);
+        let t: i64 = lookup_var(nm);
+        if (t < 0) {
+            return serr(string_from_slice("undefined name '") + nm + string_from_slice("'"),
+                        node_line(e), node_col(e));
+        }
+        return t;
+    }
+    if (k == (NK::BinExpr as i64)) {
+        return check_binexpr(e);
+    }
+    if (k == (NK::UnaryExpr as i64)) {
+        return check_unaryexpr(e);
+    }
+    if (k == (NK::CallExpr as i64)) {
+        return check_callexpr(e);
+    }
+    if (k == (NK::FieldExpr as i64)) {
+        return check_fieldexpr(e);
+    }
+    if (k == (NK::IndexExpr as i64)) {
+        return check_indexexpr(e);
+    }
+
+    // unsupported in the v1 subset — report once and return void
+    return serr(string_from_slice("expression kind unsupported in v1 sema"),
+                node_line(e), node_col(e));
+}
+
+// check a binary expression. Arithmetic/bitwise require integer operands and
+// yield the operand type (i64 in the subset); comparison requires same-type
+// operands and yields bool; logical requires bool operands and yields bool.
+fn check_binexpr(e: i64) -> i64 {
+    let op: i64 = nk_d(e);
+    let lt: i64 = check_expr(nk_a(e));
+    let rt: i64 = check_expr(nk_b(e));
+
+    // logical && || : bool operands -> bool
+    if (op == (BinOp::LAnd as i64) || op == (BinOp::LOr as i64)) {
+        if (ty_is_bool(lt) == 0 || ty_is_bool(rt) == 0) {
+            return serr(string_from_slice("logical operator requires bool operands"),
+                        node_line(e), node_col(e));
+        }
+        return TY_BOOL;
+    }
+
+    // comparison == != < <= > >= : same-type operands -> bool
+    let mut is_cmp: i64 = 0;
+    if (op == (BinOp::Eq as i64)) { is_cmp = 1; }
+    if (op == (BinOp::Neq as i64)) { is_cmp = 1; }
+    if (op == (BinOp::Lt as i64)) { is_cmp = 1; }
+    if (op == (BinOp::Le as i64)) { is_cmp = 1; }
+    if (op == (BinOp::Gt as i64)) { is_cmp = 1; }
+    if (op == (BinOp::Ge as i64)) { is_cmp = 1; }
+    if (is_cmp == 1) {
+        if (type_eq(lt, rt) == 0) {
+            return serr(string_from_slice("comparison requires same-type operands (got ")
+                        + ty_name(lt) + string_from_slice(" and ") + ty_name(rt) + string_from_slice(")"),
+                        node_line(e), node_col(e));
+        }
+        return TY_BOOL;
+    }
+
+    // shift << >> : integer operands -> lhs type
+    if (op == (BinOp::Shl as i64) || op == (BinOp::Shr as i64)) {
+        if (ty_is_int(lt) == 0 || ty_is_int(rt) == 0) {
+            return serr(string_from_slice("shift requires integer operands"),
+                        node_line(e), node_col(e));
+        }
+        return lt;
+    }
+
+    // bitwise & | ^ : integer operands -> operand type
+    let mut is_bitwise: i64 = 0;
+    if (op == (BinOp::And as i64)) { is_bitwise = 1; }
+    if (op == (BinOp::Or as i64)) { is_bitwise = 1; }
+    if (op == (BinOp::Xor as i64)) { is_bitwise = 1; }
+    if (is_bitwise == 1) {
+        if (ty_is_int(lt) == 0 || ty_is_int(rt) == 0) {
+            return serr(string_from_slice("bitwise operator requires integer operands"),
+                        node_line(e), node_col(e));
+        }
+        if (type_eq(lt, rt) == 0) {
+            return serr(string_from_slice("operator requires same-type operands"),
+                        node_line(e), node_col(e));
+        }
+        return lt;
+    }
+
+    // arithmetic + - * / % : numeric operands -> operand type
+    if (ty_is_int(lt) == 0 && ty_is_float(lt) == 0) {
+        return serr(string_from_slice("operator requires numeric operands (got ") + ty_name(lt) + string_from_slice(")"),
+                    node_line(e), node_col(e));
+    }
+    if (ty_is_int(rt) == 0 && ty_is_float(rt) == 0) {
+        return serr(string_from_slice("operator requires numeric operands (got ") + ty_name(rt) + string_from_slice(")"),
+                    node_line(e), node_col(e));
+    }
+    if (type_eq(lt, rt) == 0) {
+        return serr(string_from_slice("operator requires same-type operands (got ")
+                    + ty_name(lt) + string_from_slice(" and ") + ty_name(rt) + string_from_slice(")"),
+                    node_line(e), node_col(e));
+    }
+    return lt;
+}
+
+// check a unary expression. - and ~ require an integer -> operand type;
+// ! requires bool -> bool.
+fn check_unaryexpr(e: i64) -> i64 {
+    let op: i64 = nk_d(e);
+    let ot: i64 = check_expr(nk_a(e));
+    if (op == (UnOp::Not as i64)) {
+        if (ty_is_bool(ot) == 0) {
+            return serr(string_from_slice("'!' requires bool"),
+                        node_line(e), node_col(e));
+        }
+        return TY_BOOL;
+    }
+    if (op == (UnOp::Neg as i64)) {
+        if (ty_is_int(ot) == 0 && ty_is_float(ot) == 0) {
+            return serr(string_from_slice("unary '-' requires numeric"),
+                        node_line(e), node_col(e));
+        }
+        return ot;
+    }
+    // BitNot
+    if (ty_is_int(ot) == 0) {
+        return serr(string_from_slice("'~' requires integer"),
+                    node_line(e), node_col(e));
+    }
+    return ot;
+}
+
+// check a call expression. Look up the fn, check the arg count + each arg's
+// type against the fn's param types, and return the fn's return type. v1
+// handles direct named calls only (no fn-handle / indirect / cross-module).
+fn check_callexpr(e: i64) -> i64 {
+    let nm: string = nk_name(e);
+    let row: i64 = find_fn(nm);
+    if (row < 0) {
+        // not a declared fn. v1 has no natives / fn-handles in the subset, so
+        // an unknown name is a type error.
+        return serr(string_from_slice("unknown function '") + nm + string_from_slice("'"),
+                    node_line(e), node_col(e));
+    }
+    // count args (linked via nk_next from the call's `a` slot)
+    let mut nargs: i64 = 0;
+    let mut a: i64 = nk_a(e);
+    while (a >= 0) {
+        nargs = nargs + 1;
+        a = nk_next(a);
+    }
+    let nparams: i64 = fn_param_count(row);
+    if (nargs != nparams) {
+        return serr(string_from_slice("function '") + nm + string_from_slice("' expects ")
+                    + int_to_str(nparams) + string_from_slice(" args, got ") + int_to_str(nargs),
+                    node_line(e), node_col(e));
+    }
+    // check each arg's type against the corresponding param type
+    let mut ai: i64 = nk_a(e);
+    let mut i: i64 = 0;
+    while (ai >= 0) {
+        let got: i64 = check_expr(ai);
+        let want: i64 = fn_param_type(row, i);
+        if (types_compatible(want, got) == 0) {
+            return serr(string_from_slice("arg ") + int_to_str(i + 1) + string_from_slice(" of '") + nm
+                        + string_from_slice("': expected ") + ty_name(want) + string_from_slice(", got ")
+                        + ty_name(got),
+                        node_line(ai), node_col(ai));
+        }
+        ai = nk_next(ai);
+        i = i + 1;
+    }
+    return fn_ret_type(row);
+}
+
+// check a field access base.field. base must be a struct type; the field must
+// exist; the result is the field's type.
+fn check_fieldexpr(e: i64) -> i64 {
+    let base: i64 = nk_a(e);
+    let bt: i64 = check_expr(base);
+    if (bt < 0) { return TY_VOID; }
+    let sname: string = ty_struct_name(bt);
+    if (string_length(sname) == 0) {
+        return serr(string_from_slice("field access requires a struct type (got ") + ty_name(bt) + string_from_slice(")"),
+                    node_line(e), node_col(e));
+    }
+    let row: i64 = find_struct(sname);
+    if (row < 0) {
+        return serr(string_from_slice("unknown struct type '") + sname + string_from_slice("'"),
+                    node_line(e), node_col(e));
+    }
+    let fname: string = nk_name(e);
+    let ft: i64 = struct_field_type(row, fname);
+    if (ft < 0) {
+        return serr(string_from_slice("struct '") + sname + string_from_slice("' has no field '") + fname + string_from_slice("'"),
+                    node_line(e), node_col(e));
+    }
+    return ft;
+}
+
+// check an index base[idx]. base must be an array/slice; idx must be an
+// integer; the result is the element type. (v1: no bounds folding.)
+fn check_indexexpr(e: i64) -> i64 {
+    let base: i64 = nk_a(e);
+    let bt: i64 = check_expr(base);
+    let it: i64 = check_expr(nk_b(e));
+    if (ty_is_int(it) == 0) {
+        return serr(string_from_slice("array index must be an integer"),
+                    node_line(nk_b(e)), node_col(nk_b(e)));
+    }
+    if (bt < 0) { return TY_VOID; }
+    if (ty_is_slice(bt) == 0 && ty_array_len(bt) <= 0) {
+        return serr(string_from_slice("indexing requires an array or slice type (got ") + ty_name(bt) + string_from_slice(")"),
+                    node_line(e), node_col(e));
+    }
+    let elem: i64 = ty_elem(bt);
+    if (elem < 0) { return TY_I64; }   // fallback
+    return resolve_type(elem);
+}
+
+// -----------------------------------------------------------------------------
+// statement type-check. check_stmt(s) walks a statement node, threading the
+// current function's return type (s_cur_ret) for return-stmt checking.
+// Mirrors the C++ Checker::check_stmt.
+// -----------------------------------------------------------------------------
+
+// check a block: push a scope, check each statement (linked via nk_next from
+// the block's `a` slot), pop the scope.
+fn check_block(b: i64) -> i64 {
+    if (b < 0) { return 0; }
+    push_scope();
+    let mut s: i64 = nk_a(b);
+    while (s >= 0) {
+        check_stmt(s);
+        if (s_err != 0) { pop_scope(); return 0; }
+        s = nk_next(s);
+    }
+    pop_scope();
+    return 0;
+}
+
+fn check_stmt(s: i64) -> i64 {
+    if (s < 0) { return 0; }
+    let k: i64 = nk_kind(s);
+
+    if (k == (NK::LetStmt as i64)) {
+        return check_let(s);
+    }
+    if (k == (NK::IfStmt as i64)) {
+        let cond: i64 = nk_a(s);
+        let ct: i64 = check_expr(cond);
+        if (ty_is_bool(ct) == 0) {
+            serr(string_from_slice("if condition must be bool"), node_line(cond), node_col(cond));
+            return 0;
+        }
+        check_block(nk_b(s));        // then
+        if (s_err != 0) { return 0; }
+        if (nk_c(s) >= 0) {
+            check_block(nk_c(s));    // else
+        }
+        return 0;
+    }
+    if (k == (NK::WhileStmt as i64)) {
+        let cond: i64 = nk_a(s);
+        let ct: i64 = check_expr(cond);
+        if (ty_is_bool(ct) == 0) {
+            serr(string_from_slice("while condition must be bool"), node_line(cond), node_col(cond));
+            return 0;
+        }
+        check_block(nk_b(s));
+        return 0;
+    }
+    if (k == (NK::ReturnStmt as i64)) {
+        return check_return(s);
+    }
+    if (k == (NK::ExprStmt as i64)) {
+        if (nk_a(s) >= 0) { check_expr(nk_a(s)); }
+        return 0;
+    }
+    if (k == (NK::BlockStmt as i64)) {
+        check_block(s);
+        return 0;
+    }
+    if (k == (NK::BreakStmt as i64) || k == (NK::ContinueStmt as i64)) {
+        return 0;   // v1: no loop-depth tracking (the canonical test doesn't use these)
+    }
+    if (k == (NK::ForStmt as i64)) {
+        return check_for(s);
+    }
+
+    // unsupported statement kind in v1 (do-while, switch, match, defer, etc.)
+    serr(string_from_slice("statement kind unsupported in v1 sema"), node_line(s), node_col(s));
+    return 0;
+}
+
+// check a let statement. If it has a declared type, check the initializer's
+// type matches it (and declare the var at the declared type). If auto (no
+// declared type), infer the var's type from the initializer.
+fn check_let(s: i64) -> i64 {
+    let nm_tok: i64 = nk_tok(s);
+    let nm: string = tok_name(nm_tok);
+    let ty_node: i64 = nk_a(s);     // declared type node, or -1 for auto
+    let init: i64 = nk_b(s);        // initializer expr, or -1
+
+    let mut decl_ty: i64 = 0;
+    if (ty_node >= 0) {
+        decl_ty = resolve_type(ty_node);
+        if (s_err != 0) { return 0; }
+        if (ty_is_void(decl_ty) == 1) {
+            serr(string_from_slice("local '") + nm + string_from_slice("' cannot have void type"),
+                 node_line(s), node_col(s));
+            return 0;
+        }
+    }
+
+    if (init < 0) {
+        // no initializer: declare at the stated type (must have one)
+        if (ty_node < 0) {
+            serr(string_from_slice("let with no initializer needs a type"), node_line(s), node_col(s));
+            return 0;
+        }
+        declare(nm_tok, decl_ty);
+        return 0;
+    }
+
+    let init_ty: i64 = check_expr(init);
+    if (s_err != 0) { return 0; }
+
+    if (ty_node >= 0) {
+        // typed let: init must match the declared type
+        if (types_compatible(decl_ty, init_ty) == 0) {
+            serr(string_from_slice("let type mismatch (") + ty_name(decl_ty) + string_from_slice(" = ")
+                 + ty_name(init_ty) + string_from_slice(")"),
+                 node_line(s), node_col(s));
+            return 0;
+        }
+        declare(nm_tok, decl_ty);
+    } else {
+        // auto: infer the type from the initializer
+        if (ty_is_void(init_ty) == 1) {
+            serr(string_from_slice("cannot infer type from a void initializer"), node_line(s), node_col(s));
+            return 0;
+        }
+        declare(nm_tok, init_ty);
+    }
+    return 0;
+}
+
+// check a return statement. If it has a value, its type must match the current
+// fn's return type; if not, the fn must return void.
+fn check_return(s: i64) -> i64 {
+    let val: i64 = nk_a(s);
+    if (val >= 0) {
+        let vt: i64 = check_expr(val);
+        if (s_err != 0) { return 0; }
+        if (s_cur_ret < 0) {
+            serr(string_from_slice("return outside a function"), node_line(s), node_col(s));
+            return 0;
+        }
+        if (types_compatible(s_cur_ret, vt) == 0) {
+            serr(string_from_slice("return type mismatch (got ") + ty_name(vt) + string_from_slice(", fn returns ")
+                 + ty_name(s_cur_ret) + string_from_slice(")"),
+                 node_line(s), node_col(s));
+            return 0;
+        }
+    } else {
+        // bare return; fn must return void
+        if (s_cur_ret >= 0 && ty_is_void(s_cur_ret) == 0) {
+            serr(string_from_slice("non-void function must return a value"), node_line(s), node_col(s));
+            return 0;
+        }
+    }
+    return 0;
+}
+
+// check a C-style for (init; cond; step) body. init is a let or expr stmt;
+// cond must be bool; step is an expr. v1 does not track loop depth.
+fn check_for(s: i64) -> i64 {
+    push_scope();
+    if (nk_a(s) >= 0) { check_stmt(nk_a(s)); }    // init
+    if (s_err != 0) { pop_scope(); return 0; }
+    if (nk_b(s) >= 0) {
+        let ct: i64 = check_expr(nk_b(s));        // cond
+        if (ty_is_bool(ct) == 0) {
+            serr(string_from_slice("for cond must be bool"), node_line(nk_b(s)), node_col(nk_b(s)));
+            pop_scope();
+            return 0;
+        }
+    }
+    if (nk_c(s) >= 0) { check_expr(nk_c(s)); }    // step
+    if (s_err != 0) { pop_scope(); return 0; }
+    check_block(nk_e(s));                          // body
+    pop_scope();
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// declaration checking + function-body checking.
+// -----------------------------------------------------------------------------
+
+// check a function body: push a scope, declare the params, set s_cur_ret to
+// the resolved return type, check the body block, then restore s_cur_ret. The
+// "all paths return" check is deferred (v1 keeps it simple; the canonical test
+// has an explicit return).
+fn check_func_body(fd: i64) -> i64 {
+    let nm: string = nk_name(fd);
+    push_scope();
+    // declare params
+    let mut p: i64 = nk_a(fd);
+    while (p >= 0) {
+        let pt: i64 = resolve_type(nk_a(p));
+        if (s_err != 0) { pop_scope(); return 0; }
+        if (ty_is_void(pt) == 1) {
+            serr(string_from_slice("parameter '") + tok_name(nk_tok(p)) + string_from_slice("' cannot have void type"),
+                 node_line(p), node_col(p));
+            pop_scope();
+            return 0;
+        }
+        declare(nk_tok(p), pt);
+        p = nk_next(p);
+    }
+    let saved_ret: i64 = s_cur_ret;
+    s_cur_ret = resolve_type(nk_b(fd));
+    if (s_err != 0) { s_cur_ret = saved_ret; pop_scope(); return 0; }
+    check_block(nk_c(fd));
+    s_cur_ret = saved_ret;
+    pop_scope();
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// the top-level sema pass. Walks the program's top-level decls in TWO passes:
+//   pass 1 — register every signature (structs, fns, globals) so a forward
+//             reference from any fn body sees every other decl's signature.
+//   pass 2 — check each fn body + each global's initializer type.
+// Returns 0 on success, 1 if s_err was set.
+// -----------------------------------------------------------------------------
+fn check_program(prog: i64) -> i64 {
+    if (prog < 0) { return serr(string_from_slice("no program to check"), 0, 0); }
+    if (nk_kind(prog) != (NK::Program as i64)) {
+        return serr(string_from_slice("expected a program node"), 0, 0);
+    }
+
+    // pass 1: register declarations
+    let mut d: i64 = nk_a(prog);
+    while (d >= 0) {
+        let k: i64 = nk_kind(d);
+        if (k == (NK::StructDecl as i64)) {
+            register_struct(d);
+        } else if (k == (NK::FnDecl as i64)) {
+            register_fn(d);
+        } else if (k == (NK::GlobalDecl as i64)) {
+            register_global(d);
+        }
+        // other top-level kinds (enum, link, namespace, static_assert) are
+        // accepted-but-ignored in v1 (the canonical test has none).
+        if (s_err != 0) { return 1; }
+        d = nk_next(d);
+    }
+
+    // pass 2: check bodies + global initializers
+    d = nk_a(prog);
+    while (d >= 0) {
+        let k: i64 = nk_kind(d);
+        if (k == (NK::FnDecl as i64)) {
+            check_func_body(d);
+            if (s_err != 0) { return 1; }
+        } else if (k == (NK::GlobalDecl as i64)) {
+            // check the initializer's type against the declared global type
+            let gty: i64 = resolve_type(nk_a(d));
+            if (s_err != 0) { return 1; }
+            let init: i64 = nk_b(d);
+            if (init >= 0) {
+                let ity: i64 = check_expr(init);
+                if (s_err != 0) { return 1; }
+                if (types_compatible(gty, ity) == 0) {
+                    serr(string_from_slice("global type mismatch (") + ty_name(gty) + string_from_slice(" = ")
+                         + ty_name(ity) + string_from_slice(")"),
+                         node_line(d), node_col(d));
+                    return 1;
+                }
+            }
+        }
+        d = nk_next(d);
+    }
+    if (s_err != 0) { return 1; }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// the entry point. Parse `source` (via the parser), then type-check the AST.
+// Returns 0 on success (the program type-checks), 1 on a type error, or 2 if
+// parsing failed (so the test can distinguish a parse failure from a sema
+// failure). The error position + message are available via sema_err_*.
+// -----------------------------------------------------------------------------
+fn sema(source: string) -> i64 {
+    let prog: i64 = parse(source);
+    if (parse_failed() != 0) {
+        s_err = 1;
+        s_errline = parse_err_line();
+        s_errcol = parse_err_col();
+        s_errmsg = string_from_slice("parse error: ") + parse_err_msg();
+        return 2;
+    }
+    s_init();
+    return check_program(prog);
+}
+
+// whether the sema flagged an error (set by serr() / a parse failure).
+fn sema_failed() -> i64 { return s_err; }
+fn sema_err_line() -> i64 { return s_errline; }
+fn sema_err_col() -> i64 { return s_errcol; }
+fn sema_err_msg() -> string { return s_errmsg; }
+
+// -----------------------------------------------------------------------------
+// helpers used in error messages. int_to_str renders a small i64 to a string
+// (arg counts, etc.). ember has no native int->str in the v1 subset, so this
+// is a tiny hand-rolled converter (handles 0 + non-negative values; negative
+// values get a leading '-').
+// -----------------------------------------------------------------------------
+fn int_to_str(v: i64) -> string {
+    if (v == 0) { return string_from_slice("0"); }
+    let mut neg: i64 = 0;
+    let mut n: i64 = v;
+    if (n < 0) { neg = 1; n = -n; }
+    // collect digits into a temporary (reverse order), then build the string
+    let mut digits: i64 = 0;
+    let mut buf: i64 = array_new(8, 20);
+    let mut pos: i64 = 0;
+    while (n > 0) {
+        let d: i64 = n % 10;
+        array_set_i64(buf, pos, d + 48);   // '0' = 48
+        pos = pos + 1;
+        n = n / 10;
+    }
+    // build the result: optional '-' + digits in reverse
+    let rlen: i64 = pos + neg;
+    let mut r: string = string_from_slice("");
+    if (neg == 1) { r = string_from_slice("-"); }
+    let mut j: i64 = pos - 1;
+    while (j >= 0) {
+        let ch: i64 = array_get_i64(buf, j);
+        r = r + char_to_str(ch);
+        j = j - 1;
+    }
+    return r;
+}
+
+// render a single ASCII byte (0..255) to a one-character string. ember has no
+// direct int->char->string, so build via string_char_at on a base string of
+// all printable ASCII. (Used only by int_to_str for digit chars 48..57.)
+fn char_to_str(ch: i64) -> string {
+    // a 0..9 digit -> ch is 48..57. Build the digit string by indexing a
+    // constant "0123456789" with ch - 48.
+    let digits: string = string_from_slice("0123456789");
+    let idx: i64 = ch - 48;
+    return string_substr(digits, idx, idx + 1);
+}

@@ -1,0 +1,3 @@
+import "parse.ember";
+
+fn main() -> i64 { return 0; }

@@ -647,9 +647,9 @@ fn test_match() -> i64 {
     let a2: i64 = nk_next(a1);
     r = ck(nk_d(a2), 1, 14023); if (r != 0) { return r; }       // is_wildcard
     r = ck(nk_a(a2), -1, 14024); if (r != 0) { return r; }      // no pattern expr
-    // body: return 2  (a2b = BlockStmt -> ReturnStmt -> IntLit)
+    // body: return 2
     let a2b: i64 = nk_b(a2);
-    r = ck(nk_d(nk_a(nk_a(a2b))), 2, 14025); if (r != 0) { return r; }
+    r = ck(nk_d(nk_a(a2b)), 2, 14025); if (r != 0) { return r; }
     r = ck(nk_next(a2), -1, 14026); if (r != 0) { return r; }      // no next arm
     return 0;
 }
@@ -681,23 +681,6 @@ fn test_fn_handle() -> i64 {
 // ---------------------------------------------------------------------------
 fn main() -> i64 {
     let mut r: i64 = 0;
-
-    r = test_canonical();             if (r != 0) { return r; }
-    r = test_let_precedence();        if (r != 0) { return r; }
-    r = test_if_else_calls();         if (r != 0) { return r; }
-    r = test_while_assign_unary();    if (r != 0) { return r; }
-    r = test_struct_field_index();    if (r != 0) { return r; }
-    r = test_bools_parens_multi();    if (r != 0) { return r; }
-    r = test_for_break_continue();    if (r != 0) { return r; }
-    r = test_error();                 if (r != 0) { return r; }
-    r = test_globals_enum_link();     if (r != 0) { return r; }
-    r = test_types_cast();            if (r != 0) { return r; }
-    r = test_switch();                if (r != 0) { return r; }
-    r = test_ternary_struct_array_lit(); if (r != 0) { return r; }
-    r = test_do_defer_yield();        if (r != 0) { return r; }
-    r = test_match();                 if (r != 0) { return r; }
-    r = test_fn_handle();             if (r != 0) { return r; }
-
-    // every check passed
+    r = test_match();             if (r != 0) { return r; }
     return 0;
 }

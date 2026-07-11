@@ -885,6 +885,12 @@ fn parse_unary() -> i64 {
         let h: i64 = alloc_node(NK::FnHandleExpr as i64);
         if (p_err != 0) { return -1; }
         set_a(h, operand);
+        // tok = the fn-name token (per the node layout: `tok=fn-name tok`).
+        // For `&id` the operand is the Ident holding the name, so mirror its
+        // tok; this lets nk_name(fh) resolve to "id" (matching the
+        // cross-module branch, which sets tok to fn_tok). For a non-Ident
+        // operand nk_tok returns -1 and nk_name yields "" (same as before).
+        if (nk_kind(operand) == (NK::Ident as i64)) { set_tok(h, nk_tok(operand)); }
         return h;
     }
     if (k == (Tok::Inc as i64) || k == (Tok::Dec as i64)) {

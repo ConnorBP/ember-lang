@@ -1,0 +1,26 @@
+import "parse.ember";
+
+// Diagnose what nk_name(fn1) returns in a separate function.
+// Encode: 0 if equal to "main".
+// Else return 1000000 + len*1000 + char0*100 + char1*10 + char2
+fn t1() -> i64 {
+    let prog: i64 = parse("fn main() -> i64 { return 42; }");
+    if (parse_failed() != 0) { return 900000; }
+    let fn1: i64 = nk_a(prog);
+    let s1: string = nk_name(fn1);
+    let s2: string = string_from_slice("main");
+    if (s1 == s2) { return 0; }
+    let n: i64 = string_length(s1);
+    let c0: i64 = string_char_at(s1, 0);
+    let c1: i64 = string_char_at(s1, 1);
+    let c2: i64 = string_char_at(s1, 2);
+    let c3: i64 = string_char_at(s1, 3);
+    let c4: i64 = string_char_at(s1, 4);
+    // encode: 1000000 + n*100000 + c0*1000 + c1*100 + c2*10 + c3
+    // but to keep < 2^31 and readable: 100000 + n*10000 + c0*100 + c1
+    return 100000 + n * 10000 + c0 * 100 + c1 + c2 + c3 + c4;
+}
+
+fn main() -> i64 {
+    return t1();
+}
