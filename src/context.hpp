@@ -28,6 +28,20 @@
 // table's HotReloadDomain::ExecutionGuard. Nested script calls share that guard.
 // This keeps contexts independent of domains and avoids a global registry.
 //
+// IN-CONTEXT THREADS (v1 Tier 4, `thread` addon): the residual case where a
+// compute-heavy mod needs parallelism WITHIN ONE script context — two ember-
+// calling OS threads sharing ONE context_t. The single checkpoint/budget/depth
+// are not concurrently-safe, so context_t carries a coarse `call_mutex`. Every
+// ember_call into this context (the host's outer call AND each spawned thread's
+// call) locks it, serializing the script-side execution while the host + sibling
+// threads run concurrently off-context. A spawned thread additionally saves +
+// restores the per-call fields (budget/depth/catch/checkpoint) around its own
+// call so the caller's in-progress state survives the interleaving (a thread_join
+// releases the mutex while it waits, letting the spawned call run to completion).
+// This is the coarse-grained-but-correct option; per-thread persistent copies of
+// the fields remain a future refinement. The multi-context model above is
+// unchanged and `call_mutex` is uncontended there (one context per thread).
+//
 // LAYOUT: the JIT-read fields (budget_remaining, call_depth, max_call_depth)
 // are in a POD PREFIX at the top, so [ctx_reg + offsetof(field)] is POD-safe
 // and stable across compilers (offsetof on the non-POD trailing std::string
@@ -36,6 +50,7 @@
 #pragma once
 #include <cstdint>
 #include <csetjmp>
+#include <mutex>
 #include <string>
 
 namespace ember {
@@ -102,6 +117,13 @@ struct context_t {
     // 8 × int64_t = 64 bytes per entry: [rbx, rbp, r12, r13, r14, r15, rsp, rip]
     int64_t catch_bufs[MAX_CATCH_DEPTH][8]{};
     int32_t catch_saved_call_depths[MAX_CATCH_DEPTH]{};
+
+    // ---- IN-CONTEXT THREADS: coarse serialization mutex (Tier 4 `thread` addon).
+    //      NOT read by JIT'd [ctx_reg+off] code; host + spawned-thread calls lock
+    //      it around every ember_call into this context. Uncontended under the
+    //      multi-context model (one context_t per thread). Placed LAST so it does
+    //      not perturb the POD-prefix offsets the codegen bakes above. ----
+    std::mutex call_mutex{};
 
     void reset_for_call() {
         // Required after longjmp recovery: balanced leave instructions on the

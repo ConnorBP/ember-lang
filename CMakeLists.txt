@@ -159,6 +159,7 @@ ember_add_extension(array    extensions/array/ext_array.cpp)
 ember_add_extension(math     extensions/math/ext_math.cpp)
 ember_add_extension(map      extensions/map/ext_map.cpp)
 ember_add_extension(sync     extensions/sync/ext_sync.cpp)
+ember_add_extension(thread   extensions/thread/ext_thread.cpp)   # Tier 4: in-context threads (thread_spawn/join + call_mutex serialization)
 ember_add_extension(lifecycle extensions/lifecycle/ext_lifecycle.cpp)
 ember_add_extension(opt extensions/opt/ext_opt.cpp)         # Stage C: IR optimization passes
 ember_add_extension(obf extensions/obf/ext_obf.cpp)           # Stage C Step 5: IR obfuscation passes
@@ -320,6 +321,23 @@ if(WIN32)
 endif()
 add_test(NAME thread_safety COMMAND thread_safety_test)
 set_tests_properties(thread_safety PROPERTIES TIMEOUT 30)
+
+# in_context_threads_test: Tier 4 in-context threads (the `thread` addon +
+# aint* atomics). Two ember-calling OS threads on ONE context_t, serialized by
+# context_t::call_mutex. Links ember_ext_thread (thread_spawn/join) +
+# ember_ext_sync (aint* atomics for shared state). Mirrors thread_safety's
+# B1 harness + the lock-around-main-call contract.
+add_executable(in_context_threads_test examples/in_context_threads_test.cpp)
+target_link_libraries(in_context_threads_test PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_vec ember_ext_quat ember_ext_mat
+    ember_ext_string ember_ext_array ember_ext_math
+    ember_ext_sync ember_ext_thread)
+if(WIN32)
+    target_link_libraries(in_context_threads_test PRIVATE kernel32)
+endif()
+add_test(NAME in_context_threads COMMAND in_context_threads_test)
+set_tests_properties(in_context_threads PROPERTIES TIMEOUT 60)
 
 # Win64 ABI regressions: switch volatile scratch, raw B1 thunk r14
 # preservation, and an aligned-SSE trap stub called from both stack parities.
