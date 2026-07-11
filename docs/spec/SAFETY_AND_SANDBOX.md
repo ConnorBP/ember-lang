@@ -256,7 +256,7 @@ Native-triggerable runtime errors (a native binding decides mid-call
 that something is wrong - e.g. an engine API rejecting invalid game
 state) use the same non-local-unwind machinery (Section 2) via two
 host-callable functions (mirrors the surveyed native-JIT language's `runtime_error`/
-`runtime_exception`, ../RESEARCH_NOTES.md/DESIGN.md Section 8):
+`runtime_exception`, ../RESEARCH_NOTES.md "Prior native-JIT scripting language"):
 - `runtime_error(context_t*, const char* msg)` - records the message,
   triggers the same checkpoint-unwind as Section 3/Section 4/Section 5's traps. Intended
   for "this is definitely a bug, abort this call" situations

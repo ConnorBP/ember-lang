@@ -72,3 +72,33 @@ Folded through `try_eval_const_f32` (no `try_eval_const_f64` exists).
 - `docs/audit/PERFORMANCE_AUDIT_2026-07-11.md` (375 lines)
 - `docs/audit/AUDIT_2026-07-11_DOCS_TESTS.md` (237 lines)
 - `docs/audit/AUDIT_2026-07-11_ARCH_DESIGN.md` (303 lines)
+
+---
+
+**Update 2026-07-11 (post-audit fix pass):** the six correctness findings
+C1-C6 above are no longer open — all were fixed after this synthesis was
+written, and the tree is green (ctest 34/34, lang suite clean) at the fix
+head. This note is appended, not retrofitted; the finding text above is the
+historical record as of the audit revision.
+
+- **C1** (`arr[i].field` on struct arrays) — fixed; pinned by
+  `examples/field_of_index_test.cpp` (ctest `field_of_index`, commit `381a616`).
+- **C2** (for-each over non-power-of-2 element sizes) — fixed; `src/codegen.cpp`
+  for-each now uses an `imul`-based element address for esz ∉ {1,2,4,8}
+  (commit `ab49898`).
+- **C3** (`g[..]` view of a global fixed array) — fixed; `src/codegen.cpp`
+  global array/slice/struct base resolution (commit `3b7c8df`).
+- **C4** (thin-IR int compare with a >32-bit literal) — fixed; `src/thin_emit.cpp`
+  `emit_cmp` falls back to `mov imm64` + `cmp_reg_reg` when the immediate
+  doesn't fit `int32` (commit `4d4036e`).
+- **C5** (u64 literals ≥ 2^63 rejected by sema) — fixed; `src/sema.cpp`
+  `adapt_int_lit`'s `U64` arm now accepts any 64-bit bit pattern
+  unconditionally (no `>= 0` guard).
+- **C6** (f64 global initializers lose precision) — fixed; `src/sema.cpp`
+  `try_eval_const_f64` bakes the exact double bytes into the globals block
+  (commit `3b7c8df`).
+
+The two larger doc/test items below (map extension test coverage; for-each
+and match absent from the canonical grammar/codegen specs) remain open and
+are tracked for a separate follow-up — they are beyond a conservative
+doc-fix pass.

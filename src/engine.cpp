@@ -165,7 +165,9 @@ bool finalize(CompiledFn& fn) {
         void* page = alloc_executable_rw(image);
         if (!page) return false;
         uint8_t* bytes=static_cast<uint8_t*>(page);
-        for(const auto& af:fn.abs_fixups) if(af.kind==AbsFixup::FunctionRodataBase) {
+        // Bounds-check symmetric with pass 1 above: a malformed fixup with
+        // code_offset+8 > image.size() must not write past the allocated page.
+        for(const auto& af:fn.abs_fixups) if(af.kind==AbsFixup::FunctionRodataBase && uint64_t(af.code_offset)+8 <= image.size()) {
             uint64_t v=reinterpret_cast<uintptr_t>(bytes+fn.bytes.size()+af.addend);
             for(int i=0;i<8;++i)bytes[af.code_offset+i]=uint8_t(v>>(8*i));
         }

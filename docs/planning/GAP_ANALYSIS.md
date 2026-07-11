@@ -16,7 +16,7 @@ oversight.
 | Fairly safe | ✓ v1 | `../spec/SAFETY_AND_SANDBOX.md` (budgets, bounds, depth, `PERM_FFI`, non-local unwind) |
 | Extremely fast (JIT, not bytecode) | ✓ v1 | `../spec/CODEGEN_SPEC.md` (baseline JIT, no interpreter); honest caveat in Section 3 below re: "MUCH faster than AngelScript" |
 | Expose scripting API bindings like AngelScript | ✓ v1 floor | `BindingBuilder` + `NativeSig`; fluent type/engine builders deferred (`../spec/BINDING_API.md`) |
-| For game engine + game modding | ⚠ partial | core JIT+bindings plus limited array/string addons; map and richer collection/string APIs deferred — see Section 3 |
+| For game engine + game modding | ⚠ partial | core JIT+bindings plus limited array/string/map addons; richer collection/string APIs still deferred — see Section 3 |
 | "AngelScript but MUCH faster" | ✓ expected | baseline JIT vs AS's bytecode interpreter (../RESEARCH_NOTES.md)  -  see Section 3 caveat |
 | "(sort of like a native-JIT scripting language)" | ✓ scoping | the surveyed native-JIT language's *embedding API* mirrored; its *language breadth* deliberately scoped down  -  `../ROADMAP.md` |
 | Hot reload | ✓ v1 (single fn) / v2 (whole-module workflow) | `../HOT_RELOAD.md` |
@@ -77,23 +77,29 @@ Section 3 below + `../ROADMAP.md`.
 
 ## 3. Standard addon reality and deferred data structures
 
-The eight shipped host-side extensions are `vec`, `quat`, `mat`, `string`,
-`array`, `math`, `sync`, and `lifecycle`. Their actual script APIs are:
+The nine shipped host-side extensions are `vec`, `quat`, `mat`, `string`,
+`array`, `map`, `math`, `sync`, and `lifecycle`. Their actual script APIs are:
 
 - vec2/vec3/vec4 constructors and component get/set; vec add/sub/mul/equality;
   quat construction/access plus add/sub/mul/equality; mat4 construction,
   identity, get/set, multiplication, and equality;
 - string construction, `string_from_slice`, length/character access,
-  scalar-to-string conversions, identity, and concatenation/equality overloads;
-- array creation, length, resize, typed u8/f32/i64 get/set, and `array_push_u8`;
-- math `sqrt`/`sin`/`cos`/`tan` for f32;
+  scalar-to-string conversions, identity, concatenation/equality overloads,
+  and find/substr (find/substr shipped 2026-07-11);
+- array creation, length, resize, typed u8/f32/i64 get/set, push/pop_u8/f32/i64,
+  clear, and remove (full v1 API shipped 2026-07-11);
+- math `sqrt`/`sin`/`cos`/`tan` (f32) + `sqrt_f64`/`sin_f64`/`cos_f64`/`tan_f64`/
+  `floor_f64`/`ceil_f64`/`abs_f64`/`pow_f64` (f64) + `abs_i64` (abs_i64 shipped
+  2026-07-11);
 - sync `atomic_*`, `swapbuf_*`, `spsc_*`, `mpsc_*`, and `mpmc_*` APIs;
 - lifecycle `register_routine`/`unregister_routine`.
+- map `map_new`/`map_set`/`map_get`/`map_contains`/`map_length`/`map_remove`/
+  `map_clear` (shipped 2026-07-11; K and V are i64, see `../ROADMAP.md` Tier 0).
 
-There is no map extension. General array pop/remove/clear and generic push,
-string find/substr/format APIs, and a broader math surface are deferred. These
-are addon gaps, not hidden language builtins. The host owns addon storage and
-scripts carry nominal opaque handles.
+A `map` extension now ships (2026-07-11). General array push beyond the
+u8/f32/i64 typed set, string `format` APIs, and a broader math surface are
+still deferred. These are addon gaps, not hidden language builtins. The host
+owns addon storage and scripts carry nominal opaque handles.
 
 The `.em` bundling format shipped in v0.1 (`em_file`/`em_writer`/`em_loader`,
 `../spec/CODEGEN_SPEC.md` Section 15 test 7). v0.5 then shipped live cross-module
