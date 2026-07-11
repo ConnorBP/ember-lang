@@ -1566,7 +1566,14 @@ struct EmitCtx {
             load_int_vreg(in.src1);
             if (in.src2 == 0) {
                 // immediate
-                e.cmp_reg_imm32(Reg::rax, int32_t(in.imm.i));
+                int64_t imm = in.imm.i;
+                if (imm >= INT32_MIN && imm <= INT32_MAX) {
+                    e.cmp_reg_imm32(Reg::rax, int32_t(imm));
+                } else {
+                    // imm doesn't fit in int32: materialize into rcx, compare reg-reg
+                    e.mov_reg_imm64(Reg::rcx, imm);
+                    e.cmp_reg_reg(Reg::rax, Reg::rcx);  // cmp lhs(rax), rhs(rcx)
+                }
             } else {
                 e.push(Reg::rax);
                 load_int_vreg(in.src2);
