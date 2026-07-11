@@ -7,6 +7,7 @@
 
 #include "em_loader.hpp"
 #include "em_type_codec.hpp"  // shared .em canonical-type codec (parse_type/canonical_type_same/parse_signature)
+#include "binding_builder.hpp"  // PERM_FFI constant (Finding B: load-side permission gate)
 #include "thin_ir_ser.hpp"  // Stage B: deserialize_thin_function / validate_thin_function
 #include "thin_emit.hpp"    // Stage B: emit_x64 (re-emit deserialized IR -> x64)
 #include "codegen.hpp"      // Stage B: CodeGenCtx (the load-time re-emit context)
@@ -207,6 +208,7 @@ bool parse_signature(Reader& rd, EmSignature& sig, std::string* err) {
 bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
                 ModuleRegistry* registry,
                 const std::unordered_map<std::string, NativeSig>* natives,
+                uint32_t module_permissions,
                 std::string* err) {
     Reader rd{file};
     uint32_t magic = 0, version = 0, flags = 0, function_count = 0;
@@ -424,6 +426,13 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
                 auto it=natives->find(b.name);if(it==natives->end()||!it->second.fn_ptr){set_error(err,"em_loader: binding: missing native \""+b.name+"\"");return false;}
                 if(!canonical_type_same(it->second.ret,b.signature.ret)||it->second.params.size()!=b.signature.params.size()){set_error(err,"em_loader: binding: signature mismatch for native \""+b.name+"\"");return false;}
                 for(size_t pi=0;pi<b.signature.params.size();++pi)if(!canonical_type_same(it->second.params[pi],b.signature.params[pi])){set_error(err,"em_loader: binding: signature mismatch for native \""+b.name+"\"");return false;}
+                // Finding B (EM_FORMAT_RED_TEAM 2026-07-11): PERM_FFI load-side
+                // enforcement. A hand-crafted .em bypasses sema's compile-time
+                // PERM_FFI gate, so the loader must check NativeSig::permission
+                // here. A native flagged PERM_FFI is rejected if the loading
+                // module's permissions lack the FFI bit. This mirrors sema's
+                // compile-time check (sema.cpp:1954) at the load boundary.
+                if((it->second.permission&PERM_FFI)&&!(module_permissions&PERM_FFI)){set_error(err,"em_loader: binding: native \""+b.name+"\" requires PERM_FFI permission (module lacks it)");return false;}
             }
         }
         mod.functions.push_back(std::move(f));
@@ -550,9 +559,32 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
 bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
                         std::string* err, ModuleRegistry* registry,
                         const std::unordered_map<std::string, NativeSig>* natives,
-                        const EmVerifyPolicy* verify) {
+                        const EmVerifyPolicy* verify,
+                        const EmLoadPolicy* load_policy) {
+    // EmLoadPolicy: null == the SECURE DEFAULT (module_permissions = 0,
+    // allow_raw_x86 = false). Resolve the effective values once so every
+    // check below uses the same policy.
+    const uint32_t module_permissions = load_policy ? load_policy->module_permissions : 0u;
+    const bool allow_raw_x86 = load_policy ? load_policy->allow_raw_x86 : false;
+
     ParsedModule parsed;
-    if (!parse_file(file, parsed, registry, natives, err)) return false;
+    if (!parse_file(file, parsed, registry, natives, module_permissions, err)) return false;
+
+    // FIX 3 (EM_FORMAT_RED_TEAM 2026-07-11): reject raw-x86 formats (v1-v4)
+    // by default. v1-v4 store raw x86 machine code — an arbitrary-code-
+    // execution surface by construction (the loader maps the bytes executable
+    // with no validation). Only v5 (IR, re-emitted through emit_x64 + the
+    // structural validator) is accepted by default. A host that needs to load
+    // existing v1-v4 artifacts passes EmLoadPolicy{allow_raw_x86=true} for
+    // back-compat. This check runs BEFORE the signature/dev-mode policy so a
+    // raw-x86 module is rejected regardless of its signature status.
+    if (parsed.version != EM_VERSION_V5 && !allow_raw_x86) {
+        set_error(err, "em_loader: format: raw x86 format v" +
+                       std::to_string(parsed.version) +
+                       " rejected by default (only v5 IR accepted); " +
+                       "pass EmLoadPolicy{allow_raw_x86=true} for back-compat");
+        return false;
+    }
 
     // F2 (docs/spec/SPEC_AUDIT_2026-07-10.md F2): verify the .em CONTENT
     // authentication BEFORE any executable page is allocated. This is the
@@ -663,6 +695,10 @@ bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
             // meta.native_name in the host table and set native_fn. An IR
             // module referencing a native the host didn't register is
             // REJECTED — the core v5 security gate (no exec page allocated).
+            // Finding B (EM_FORMAT_RED_TEAM 2026-07-11): also enforce
+            // PERM_FFI at rebind — a native flagged PERM_FFI is rejected if
+            // the loading module's permissions lack the FFI bit. This mirrors
+            // the v2-v4 check in parse_file and sema's compile-time gate.
             if (natives) {
                 for (auto& blk : thf.blocks) {
                     for (auto& in : blk.instrs) {
@@ -672,6 +708,12 @@ bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
                                 set_error(err, "em_loader: v5 IR: unknown native \"" +
                                                in.meta.native_name + "\" in \"" +
                                                pf.name + "\"");
+                                return false;
+                            }
+                            if ((it->second.permission & PERM_FFI) && !(module_permissions & PERM_FFI)) {
+                                set_error(err, "em_loader: v5 IR: native \"" +
+                                               in.meta.native_name + "\" in \"" +
+                                               pf.name + "\" requires PERM_FFI permission (module lacks it)");
                                 return false;
                             }
                             in.native_fn = it->second.fn_ptr;
@@ -806,7 +848,8 @@ bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
 bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
                        ModuleRegistry* registry,
                        const std::unordered_map<std::string, NativeSig>* natives,
-                       const EmVerifyPolicy* verify) {
+                       const EmVerifyPolicy* verify,
+                       const EmLoadPolicy* load_policy) {
     if (!path) {
         set_error(err, "em_loader: argument: null path");
         return false;
@@ -842,7 +885,7 @@ bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
         set_error(err, "em_loader: io: short file read");
         return false;
     }
-    return load_em_bytes_impl(file, out, err, registry, natives, verify);
+    return load_em_bytes_impl(file, out, err, registry, natives, verify, load_policy);
 }
 
 LoadedModule::~LoadedModule() {
@@ -890,11 +933,12 @@ void* LoadedModule::entry() const {
 bool load_em_file(const char* path, LoadedModule& out, std::string* err,
                   ModuleRegistry* registry,
                   const std::unordered_map<std::string, NativeSig>* native_bindings,
-                  const EmVerifyPolicy* verify) {
+                  const EmVerifyPolicy* verify,
+                  const EmLoadPolicy* load_policy) {
     // Complete public no-throw boundary: malformed input and allocation/library
     // failures are always reported as false plus a categorized error.
     try {
-        return load_em_file_impl(path, out, err, registry, native_bindings, verify);
+        return load_em_file_impl(path, out, err, registry, native_bindings, verify, load_policy);
     } catch (const std::bad_alloc&) {
         set_error(err, "em_loader: allocation: std::bad_alloc");
     } catch (const std::length_error&) {
@@ -911,7 +955,8 @@ bool load_em_bytes(const uint8_t* data, size_t len, LoadedModule& out,
                    std::string* err,
                    ModuleRegistry* registry,
                    const std::unordered_map<std::string, NativeSig>* native_bindings,
-                   const EmVerifyPolicy* verify) {
+                   const EmVerifyPolicy* verify,
+                   const EmLoadPolicy* load_policy) {
     // Complete public no-throw boundary: malformed input and allocation/library
     // failures are always reported as false plus a categorized error.
     try {
@@ -928,7 +973,7 @@ bool load_em_bytes(const uint8_t* data, size_t len, LoadedModule& out,
             return false;
         }
         std::vector<uint8_t> file(data, data + len);
-        return load_em_bytes_impl(file, out, err, registry, native_bindings, verify);
+        return load_em_bytes_impl(file, out, err, registry, native_bindings, verify, load_policy);
     } catch (const std::bad_alloc&) {
         set_error(err, "em_loader: allocation: std::bad_alloc");
     } catch (const std::length_error&) {

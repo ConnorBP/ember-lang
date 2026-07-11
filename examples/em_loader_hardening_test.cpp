@@ -14,6 +14,11 @@
 
 using namespace ember;
 
+// FIX 3 (EM_FORMAT_RED_TEAM 2026-07-11): the loader now rejects v1-v4 (raw
+// x86) by default. This test constructs v1 modules, so it opts in to raw x86
+// via EmLoadPolicy.
+static const EmLoadPolicy RAW_X86_POLICY{0u, true};
+
 static void u16(std::vector<uint8_t>& b, uint16_t v) {
     b.push_back(uint8_t(v)); b.push_back(uint8_t(v >> 8));
 }
@@ -56,7 +61,7 @@ static void expect_reject(const char* tag, const std::vector<uint8_t>& bytes) {
     bool ok = false;
     bool threw = false;
     const auto started = std::chrono::steady_clock::now();
-    try { ok = load_em_file(path.string().c_str(), out, &err); }
+    try { ok = load_em_file(path.string().c_str(), out, &err, nullptr, nullptr, nullptr, &RAW_X86_POLICY); }
     catch (...) { threw = true; }
     const auto elapsed = std::chrono::steady_clock::now() - started;
     std::filesystem::remove(path);
@@ -110,7 +115,7 @@ int main() {
         const auto path = temp_path("globals");
         { std::ofstream os(path, std::ios::binary); os.write(reinterpret_cast<const char*>(b.data()), b.size()); }
         LoadedModule out; std::string err;
-        bool ok = load_em_file(path.string().c_str(), out, &err);
+        bool ok = load_em_file(path.string().c_str(), out, &err, nullptr, nullptr, nullptr, &RAW_X86_POLICY);
         std::filesystem::remove(path);
         if (!ok || out.globals != std::vector<uint8_t>({7, 8, 9}) || !out.entry()) {
             std::printf("FAIL globals: ok=%d err=%s\n", int(ok), err.c_str());

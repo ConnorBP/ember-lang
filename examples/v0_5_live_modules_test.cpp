@@ -40,6 +40,11 @@
 
 using namespace ember;
 
+// FIX 3 (EM_FORMAT_RED_TEAM 2026-07-11): the loader now rejects v1-v4 (raw
+// x86) by default. This test uses write_em_file (v3), so it opts in to raw
+// x86 via EmLoadPolicy.
+static const EmLoadPolicy RAW_X86_POLICY{0u, true};
+
 static int g_fail = 0;
 static void check(bool cond, const char* msg) {
     std::printf("[%s] %s\n", cond ? "PASS" : "FAIL", msg);
@@ -83,7 +88,7 @@ static RunResult run_script(const std::string& src, ModuleRegistry& registry,
         if (ld.is_file) {
             keep_alive->emplace_back();
             std::string lerr;
-            bool ok = link_em_file(registry, ld.target.c_str(), ld.alias, keep_alive->back(), &lerr, &natives);
+            bool ok = link_em_file(registry, ld.target.c_str(), ld.alias, keep_alive->back(), &lerr, &natives, nullptr, &RAW_X86_POLICY);
             if (!ok) { rr.trapped=true; return rr; }
             uint32_t id = registry.find_by_name(ld.alias);
             add_exports(local_exports, ld.alias, build_em_exports(keep_alive->back(), id));

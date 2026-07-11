@@ -31,6 +31,13 @@
 #include <unordered_map>
 #include <vector>
 
+// FIX 3 (EM_FORMAT_RED_TEAM 2026-07-11): the loader now rejects v1-v4 (raw
+// x86) by default. This test uses write_em_bytes (v3), so it opts in to raw
+// x86 via EmLoadPolicy for the valid-load path. The error-path tests (null
+// data, short buffer, bad magic) fail before the version check, so they
+// don't need the flag.
+static const ember::EmLoadPolicy RAW_X86_POLICY{0u, true};
+
 static int64_t call_i64_i64(void* entry, int64_t a) {
     using F = int64_t(*)(int64_t);
     return reinterpret_cast<F>(entry)(a);
@@ -142,7 +149,7 @@ int main() {
     // ---- load from the byte buffer (load_em_bytes) ----
     LoadedModule lm;
     std::string lerr;
-    if (!load_em_bytes(em_bytes.data(), em_bytes.size(), lm, &lerr, nullptr, &natives)) {
+    if (!load_em_bytes(em_bytes.data(), em_bytes.size(), lm, &lerr, nullptr, &natives, nullptr, &RAW_X86_POLICY)) {
         std::printf("FAIL: load_em_bytes: %s\n", lerr.c_str());
         for (auto& fn : fns) if (fn.exec) free_executable(fn.exec);
         return 1;

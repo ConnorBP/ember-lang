@@ -279,7 +279,11 @@ static bool compile_to_em_module(const std::string& file,
             }
             linked_ems.emplace_back();
             std::string lerr;
-            if (!link_em_file(registry, path.c_str(), ld.alias, linked_ems.back(), &lerr, &natives)) {
+            // FIX 3 + Finding B: the bundler is a build tool processing trusted
+            // source, so it opts in to raw x86 (v3 artifacts) and grants
+            // PERM_FFI (the linked modules may use ext_io natives).
+            ember::EmLoadPolicy em_policy{ember::PERM_FFI, true};
+            if (!link_em_file(registry, path.c_str(), ld.alias, linked_ems.back(), &lerr, &natives, nullptr, &em_policy)) {
                 err_out = "ember_bundle: link '" + ld.target + "' failed: " + lerr;
                 return false;
             }

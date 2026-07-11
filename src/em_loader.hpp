@@ -97,6 +97,39 @@ struct EmVerifyPolicy {
     bool signed_only() const { return !trusted_keys.empty(); }
 };
 
+// EmLoadPolicy — the load-side SAFETY policy a host passes to load_em_file /
+// load_em_bytes. This is the red-team-audit (docs/audit/EM_FORMAT_RED_TEAM
+// 2026-07-11) fix surface: two load-side gates that were previously
+// compile-side-only or absent entirely.
+//
+//   - module_permissions: the permission bits (PERM_FFI etc.) granted to the
+//     LOADING module. Finding B: the loader's native binding resolution now
+//     checks NativeSig::permission against this — a native flagged PERM_FFI is
+//     rejected at bind time if the loading module lacks the FFI bit. This
+//     closes the hand-crafted-.em bypass of sema's compile-time PERM_FFI gate.
+//     Default 0 (no permissions) is the secure default: a host that passes no
+//     policy gets no FFI natives bound, matching the compile-side default.
+//
+//   - allow_raw_x86: if false (the default), the loader REFUSES v1-v4 (raw
+//     x86) modules — they are an arbitrary-code-execution surface by
+//     construction (the loader maps the bytes executable with no validation).
+//     Only v5 (IR, re-emitted through emit_x64 + the structural validator) is
+//     accepted. If true, v1-v4 are accepted subject to the existing
+//     EmVerifyPolicy (dev mode: unsigned v1/v2/v3 accepted, v4 rejected;
+//     signed-only: v4 accepted if signed). This flag is the back-compat /
+//     dev-test opt-in; production hosts that load untrusted .em should leave
+//     it false.
+//
+// `null` policy (the default arg) == the SECURE DEFAULT: module_permissions =
+// 0, allow_raw_x86 = false. A host that loads v1-v4 artifacts (existing tests,
+// the CLI's --load-em back-compat path, the standalone-exe stub) passes a
+// non-null policy with allow_raw_x86 = true. See docs/audit/
+// EM_FORMAT_RED_TEAM_2026-07-11.md Finding B + the raw-x86 recommendation.
+struct EmLoadPolicy {
+    uint32_t module_permissions = 0;  // PERM_FFI etc. granted to the loading module
+    bool allow_raw_x86 = false;       // if true, accept v1-v4 (raw x86); default false (v5 IR only)
+};
+
 // A loaded `.em` module: owns the dispatch table, the globals block, and the
 // per-function exec pages. The runtime (ember_call, hot reload) treats this
 // identically to a JIT-compiled module.
@@ -187,6 +220,14 @@ struct LoadedModule {
 // default so every existing caller keeps working unchanged against unsigned
 // v1/v2/v3 modules.
 //
+// `load_policy` is optional (additive, default nullptr == SECURE DEFAULT):
+// the load-side safety policy. See `EmLoadPolicy`. The secure default
+// (null) grants module_permissions = 0 and allow_raw_x86 = false — only v5
+// (IR) modules are accepted, and PERM_FFI-gated natives are rejected at bind
+// time. A host that loads v1-v4 artifacts (back-compat / dev tests) passes a
+// non-null policy with allow_raw_x86 = true; a host that trusts the loading
+// module with FFI passes module_permissions = PERM_FFI.
+//
 // No-throw boundary: malformed files, I/O failures, allocation failures,
 // signature-verification failures, and standard-library exceptions all surface
 // as `false` plus a categorized `*err` message. Disk-controlled counts/sizes
@@ -194,7 +235,8 @@ struct LoadedModule {
 bool load_em_file(const char* path, LoadedModule& out, std::string* err,
                   ModuleRegistry* registry = nullptr,
                   const std::unordered_map<std::string, NativeSig>* native_bindings = nullptr,
-                  const EmVerifyPolicy* verify = nullptr);
+                  const EmVerifyPolicy* verify = nullptr,
+                  const EmLoadPolicy* load_policy = nullptr);
 
 // Load a `.em` from an in-memory byte buffer (the standalone-exe stub's path —
 // the `.em` is appended to the stub's own exe, read into memory, loaded here).
@@ -214,6 +256,7 @@ bool load_em_bytes(const uint8_t* data, size_t len, LoadedModule& out,
                    std::string* err,
                    ModuleRegistry* registry = nullptr,
                    const std::unordered_map<std::string, NativeSig>* native_bindings = nullptr,
-                   const EmVerifyPolicy* verify = nullptr);
+                   const EmVerifyPolicy* verify = nullptr,
+                   const EmLoadPolicy* load_policy = nullptr);
 
 } // namespace ember

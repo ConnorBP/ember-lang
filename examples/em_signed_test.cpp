@@ -70,6 +70,13 @@
 #include <unordered_map>
 #include <vector>
 
+// FIX 3 (EM_FORMAT_RED_TEAM 2026-07-11): the loader now rejects v1-v4 (raw
+// x86) by default. This test uses write_em_file_signed (v4) + write_em_file
+// (v3), so it opts in to raw x86 via EmLoadPolicy. The raw-x86 gate runs
+// before the signature/dev-mode policy, so all v4/v3 loads need the flag to
+// reach the signature/verify checks they actually test.
+static const ember::EmLoadPolicy RAW_X86_POLICY{0u, true};
+
 // Win64 i64(i64) call: double_it(x: i64) -> i64 takes one i64 (rcx) -> rax.
 static int64_t call_i64_i64(void* entry, int64_t a) {
     using F = int64_t(*)(int64_t);
@@ -180,7 +187,7 @@ int main() {
     // ---- (A) SIGNED v4 .em verifies + runs (happy path) ----
     {
         LoadedModule lm; std::string lerr;
-        bool ok = load_em_file(signed_path.string().c_str(), lm, &lerr, nullptr, &natives, &signed_only_policy);
+        bool ok = load_em_file(signed_path.string().c_str(), lm, &lerr, nullptr, &natives, &signed_only_policy, &RAW_X86_POLICY);
         bool ran_ok = ok && lm.pages.size() == 1 && lm.format_version == EM_VERSION;
         if (ran_ok) {
             void* e = lm.entry_by_name("double_it");
@@ -205,7 +212,7 @@ int main() {
             os.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
         }
         LoadedModule lm; std::string lerr;
-        bool ok = load_em_file(tampered.string().c_str(), lm, &lerr, nullptr, &natives, &signed_only_policy);
+        bool ok = load_em_file(tampered.string().c_str(), lm, &lerr, nullptr, &natives, &signed_only_policy, &RAW_X86_POLICY);
         bool rejected = !ok && lm.pages.empty();
         bool clear_error = lerr.find("verification FAILED") != std::string::npos ||
                            lerr.find("Ed25519 verification") != std::string::npos;
@@ -228,7 +235,7 @@ int main() {
             os.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
         }
         LoadedModule lm; std::string lerr;
-        bool ok = load_em_file(corupt.string().c_str(), lm, &lerr, nullptr, &natives, &signed_only_policy);
+        bool ok = load_em_file(corupt.string().c_str(), lm, &lerr, nullptr, &natives, &signed_only_policy, &RAW_X86_POLICY);
         bool rejected = !ok && lm.pages.empty();
         bool sig_error = lerr.find("verification FAILED") != std::string::npos ||
                          lerr.find("Ed25519 verification") != std::string::npos;
@@ -243,7 +250,7 @@ int main() {
     // (D1) dev mode (no keyring) rejects a v4 module.
     {
         LoadedModule lm; std::string lerr;
-        bool ok = load_em_file(signed_path.string().c_str(), lm, &lerr, nullptr, &natives, nullptr);
+        bool ok = load_em_file(signed_path.string().c_str(), lm, &lerr, nullptr, &natives, nullptr, &RAW_X86_POLICY);
         bool rejected = !ok && lm.pages.empty();
         bool clear = lerr.find("requires a verification key") != std::string::npos;
         bool case_d1 = rejected && clear;
@@ -260,7 +267,7 @@ int main() {
             failures++;
         } else {
             LoadedModule lm; std::string lerr;
-            bool ok = load_em_file(unsigned_path.string().c_str(), lm, &lerr, nullptr, &natives, &signed_only_policy);
+            bool ok = load_em_file(unsigned_path.string().c_str(), lm, &lerr, nullptr, &natives, &signed_only_policy, &RAW_X86_POLICY);
             bool rejected = !ok && lm.pages.empty();
             bool clear = lerr.find("mandates signed modules") != std::string::npos;
             bool case_d2 = rejected && clear;
@@ -269,7 +276,7 @@ int main() {
             if (!case_d2) failures++;
             // (E) backward compat: the SAME unsigned v3 module loads fine in DEV mode.
             LoadedModule lm2; std::string lerr2;
-            bool ok2 = load_em_file(unsigned_path.string().c_str(), lm2, &lerr2, nullptr, &natives, nullptr);
+            bool ok2 = load_em_file(unsigned_path.string().c_str(), lm2, &lerr2, nullptr, &natives, nullptr, &RAW_X86_POLICY);
             bool ran_ok = ok2 && lm2.pages.size() == 1 && lm2.format_version == EM_VERSION_V3;
             if (ran_ok) {
                 void* e = lm2.entry_by_name("double_it");

@@ -48,6 +48,11 @@
 #include <unordered_map>
 #include <vector>
 
+// FIX 3 (EM_FORMAT_RED_TEAM 2026-07-11): the loader now rejects v1-v4 (raw
+// x86) by default. This test uses write_em_file (v3) + an explicit v1 module,
+// so it opts in to raw x86 via EmLoadPolicy.
+static const ember::EmLoadPolicy RAW_X86_POLICY{0u, true};
+
 // Win64 i64(i64) call: the compiled functions take one i64 arg (rcx) and
 // return i64 (rax), matching double_it(x: i64) -> i64.
 static int64_t call_i64_i64(void* entry, int64_t a) {
@@ -218,7 +223,7 @@ int main() {
     // ---- load it back ----
     LoadedModule lm;
     std::string lerr;
-    if (!load_em_file(tmp.string().c_str(), lm, &lerr, nullptr, &natives)) {
+    if (!load_em_file(tmp.string().c_str(), lm, &lerr, nullptr, &natives, nullptr, &RAW_X86_POLICY)) {
         std::printf("FAIL: load_em_file: %s\n", lerr.c_str());
         for (auto& fn : fns) if (fn.exec) free_executable(fn.exec);
         return 1;
@@ -258,7 +263,7 @@ int main() {
     auto bad = tmp; bad += ".bad";
     { std::ifstream is(tmp, std::ios::binary); std::vector<char> bytes((std::istreambuf_iterator<char>(is)), {}); bytes[28] ^= 1; std::ofstream os(bad, std::ios::binary); os.write(bytes.data(), bytes.size()); }
     LoadedModule bad_mod; std::string bad_err;
-    bool identity_rejected = !load_em_file(bad.string().c_str(), bad_mod, &bad_err, nullptr, &natives) && bad_mod.pages.empty() && bad_err.find("compatibility") != std::string::npos;
+    bool identity_rejected = !load_em_file(bad.string().c_str(), bad_mod, &bad_err, nullptr, &natives, nullptr, &RAW_X86_POLICY) && bad_mod.pages.empty() && bad_err.find("compatibility") != std::string::npos;
     std::filesystem::remove(bad);
     std::printf("[4b] mutated build/ABI identity rejected: %s\n", passfail(identity_rejected));
     if (!identity_rejected) failures++;
@@ -272,10 +277,10 @@ int main() {
     bind_mod.functions.push_back(bind_fn);bind_mod.entry_slot=0;bind_mod.name_table={{"bound",0}};
     std::string bind_werr;bool bind_written=write_em_file(bind_mod,bind_path.string().c_str(),&bind_werr);
     LoadedModule missing_mod;std::string missing_err;std::unordered_map<std::string,NativeSig> empty_allowlist;
-    bool missing_rejected=bind_written&&!load_em_file(bind_path.string().c_str(),missing_mod,&missing_err,nullptr,&empty_allowlist)&&missing_mod.pages.empty()&&missing_err.find("missing native")!=std::string::npos;
+    bool missing_rejected=bind_written&&!load_em_file(bind_path.string().c_str(),missing_mod,&missing_err,nullptr,&empty_allowlist,nullptr,&RAW_X86_POLICY)&&missing_mod.pages.empty()&&missing_err.find("missing native")!=std::string::npos;
     NativeSig wrong;wrong.name="host_bound";wrong.fn_ptr=reinterpret_cast<void*>(uintptr_t(1));wrong.ret=make_prim(Prim::F32);wrong.params={make_prim(Prim::I64)};
     std::unordered_map<std::string,NativeSig> wrong_allowlist{{wrong.name,wrong}};LoadedModule wrong_mod;std::string wrong_err;
-    bool incompatible_rejected=bind_written&&!load_em_file(bind_path.string().c_str(),wrong_mod,&wrong_err,nullptr,&wrong_allowlist)&&wrong_mod.pages.empty()&&wrong_err.find("signature mismatch")!=std::string::npos;
+    bool incompatible_rejected=bind_written&&!load_em_file(bind_path.string().c_str(),wrong_mod,&wrong_err,nullptr,&wrong_allowlist,nullptr,&RAW_X86_POLICY)&&wrong_mod.pages.empty()&&wrong_err.find("signature mismatch")!=std::string::npos;
     std::filesystem::remove(bind_path);bool binding_rejection_ok=missing_rejected&&incompatible_rejected;
     std::printf("[4c] missing/incompatible native bindings rejected: %s\n",passfail(binding_rejection_ok));if(!binding_rejection_ok)failures++;
 
@@ -306,7 +311,7 @@ int main() {
         allow.params=allow_params;
         std::unordered_map<std::string,NativeSig> allow_list{{allow.name,allow}};
         LoadedModule amod; std::string aerr;
-        bool rejected = dw && !load_em_file(dim_path.string().c_str(),amod,&aerr,nullptr,&allow_list)
+        bool rejected = dw && !load_em_file(dim_path.string().c_str(),amod,&aerr,nullptr,&allow_list,nullptr,&RAW_X86_POLICY)
                             && amod.pages.empty()
                             && aerr.find("signature mismatch")!=std::string::npos;
         std::printf("[4e-%s] %s\n", tag, passfail(rejected));
@@ -357,7 +362,7 @@ int main() {
       u32(EM_MAGIC);u32(EM_VERSION_V1);u32(0);u32(1);u32(0);u32(0);u32(0);u32(0);u32(0);u32(0);
       u16(1);b.push_back('f');u32(0);u32(1);u32(0);b.push_back(0xc3);u32(0);u32(1);u16(1);b.push_back('f');u32(0);
       std::ofstream os(v1,std::ios::binary);os.write(reinterpret_cast<const char*>(b.data()),b.size()); }
-    LoadedModule v1_mod; std::string v1_err; bool v1_ok=load_em_file(v1.string().c_str(),v1_mod,&v1_err);
+    LoadedModule v1_mod; std::string v1_err; bool v1_ok=load_em_file(v1.string().c_str(),v1_mod,&v1_err,nullptr,nullptr,nullptr,&RAW_X86_POLICY);
     auto v1_exports=build_em_exports(v1_mod,8); bool v1_contract=v1_ok&&v1_mod.format_version==EM_VERSION_V1&&v1_exports.size()==1&&v1_exports[0].unknown_sig;
     std::filesystem::remove(v1); std::printf("[4d] v1 unknown-signature compatibility: %s\n",passfail(v1_contract)); if(!v1_contract)failures++;
 

@@ -409,7 +409,8 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
             }
             linked_ems.emplace_back();
             std::string lerr;
-            if (!link_em_file(registry, path.c_str(), ld.alias, linked_ems.back(), &lerr, &natives)) {
+            EmLoadPolicy em_policy{opts.ffi_mode ? PERM_FFI : 0u, true};
+            if (!link_em_file(registry, path.c_str(), ld.alias, linked_ems.back(), &lerr, &natives, nullptr, &em_policy)) {
                 std::fprintf(stderr, "ember: link '%s' failed: %s\n", ld.target.c_str(), lerr.c_str());
                 do_cleanup(); return {2};
             }
@@ -964,7 +965,8 @@ static std::unique_ptr<CompiledScript> compile_script(
             }
             cs->linked_ems.emplace_back();
             std::string lerr;
-            if (!link_em_file(*cs->registry, path.c_str(), ld.alias, cs->linked_ems.back(), &lerr, &natives)) {
+            EmLoadPolicy em_policy{0u, true};
+            if (!link_em_file(*cs->registry, path.c_str(), ld.alias, cs->linked_ems.back(), &lerr, &natives, nullptr, &em_policy)) {
                 err = "link '" + ld.target + "' failed: " + lerr; return nullptr;
             }
             uint32_t id = cs->registry->find_by_name(ld.alias);
@@ -1141,7 +1143,8 @@ static int run_pipe_command(const std::string& config_path) {
         if (ext == ".em") {
             em_mods.emplace_back();
             std::string lerr;
-            if (!load_em_file(m.path.c_str(), em_mods.back(), &lerr, nullptr, &natives)) {
+            EmLoadPolicy em_policy{0u, true};
+            if (!load_em_file(m.path.c_str(), em_mods.back(), &lerr, nullptr, &natives, nullptr, &em_policy)) {
                 std::fprintf(stderr, "ember pipe: module '%s' (.em load) failed: %s\n", m.alias.c_str(), lerr.c_str());
                 return 2;
             }
@@ -1505,7 +1508,8 @@ int main(int argc, char** argv) {
         std::unordered_map<std::string, NativeSig> load_natives;
         register_standard_bindings(load_natives);
         LoadedModule loaded; std::string lerr;
-        if(!load_em_file(load_em_path.c_str(),loaded,&lerr,nullptr,&load_natives)){std::fprintf(stderr,"ember: load failed: %s\n",lerr.c_str());return 2;}
+        EmLoadPolicy em_policy{ffi_mode ? PERM_FFI : 0u, true};
+        if(!load_em_file(load_em_path.c_str(),loaded,&lerr,nullptr,&load_natives,nullptr,&em_policy)){std::fprintf(stderr,"ember: load failed: %s\n",lerr.c_str());return 2;}
         void* entry=loaded.entry_by_name(fn_name.c_str()); if(!entry)entry=loaded.entry();
         if(!entry){std::fprintf(stderr,"ember: loaded entry '%s' not found\n",fn_name.c_str());return 2;}
         uint32_t selected_slot=loaded.entry_slot;

@@ -48,6 +48,11 @@
 #include <unordered_map>
 #include <vector>
 
+// FIX 3 (EM_FORMAT_RED_TEAM 2026-07-11): the loader now rejects v1-v4 (raw
+// x86) by default. This test uses write_em_file (v3), so it opts in to raw
+// x86 via EmLoadPolicy.
+static const ember::EmLoadPolicy RAW_X86_POLICY{0u, true};
+
 using namespace ember;
 
 struct M {
@@ -299,7 +304,7 @@ int main() {
         }
         LoadedModule lm; std::string lerr;
         std::unordered_map<std::string, NativeSig> empty_natives;
-        if (!load_em_file(tmp.string().c_str(), lm, &lerr, nullptr, &empty_natives)) {
+        if (!load_em_file(tmp.string().c_str(), lm, &lerr, nullptr, &empty_natives, nullptr, &RAW_X86_POLICY)) {
             std::printf("FAIL: load_em_file: %s\n", lerr.c_str()); g_fail = 1;
             std::filesystem::remove(tmp); return;
         }

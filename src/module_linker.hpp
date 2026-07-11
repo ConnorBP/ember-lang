@@ -116,8 +116,9 @@ inline uint32_t register_jit_module_with_handles(ModuleRegistry& reg, const std:
 inline bool link_em_file(ModuleRegistry& reg, const char* path, const std::string& name,
                         LoadedModule& out, std::string* err = nullptr,
                         const std::unordered_map<std::string, NativeSig>* natives = nullptr,
-                        const EmVerifyPolicy* verify = nullptr) {
-    if (!load_em_file(path, out, err, &reg, natives, verify)) return false;
+                        const EmVerifyPolicy* verify = nullptr,
+                        const EmLoadPolicy* load_policy = nullptr) {
+    if (!load_em_file(path, out, err, &reg, natives, verify, load_policy)) return false;
     uint32_t id = reg.register_module(name, out.dispatch.data(), err);
     if (id == UINT32_MAX) return false;
     return true;

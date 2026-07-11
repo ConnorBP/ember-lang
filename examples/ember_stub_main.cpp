@@ -178,10 +178,15 @@ int main(int argc, char** argv) {
     register_standard_bindings(natives);
 
     // 4. Load the .em from memory.
+    // The stub is a trusted host running its own bundled .em (appended at
+    // build time, not loaded from an untrusted source), so it grants PERM_FFI
+    // and opts in to raw x86 (the bundler emits v3). FIX 3 + Finding B
+    // (EM_FORMAT_RED_TEAM 2026-07-11).
     ember::LoadedModule mod;
     std::string lerr;
+    ember::EmLoadPolicy em_policy{ember::PERM_FFI, true};
     if (!ember::load_em_bytes(em_bytes.data(), em_bytes.size(), mod, &lerr,
-                              nullptr, &natives)) {
+                              nullptr, &natives, nullptr, &em_policy)) {
         std::fprintf(stderr, "ember_stub: load failed: %s\n", lerr.c_str());
         return 2;
     }

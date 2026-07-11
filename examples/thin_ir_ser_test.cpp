@@ -502,6 +502,61 @@ static bool validation_edge_cases() {
         if (validate_thin_function(bad, &verr)) return false;
         if (verr.find("frame_off") == std::string::npos) return false;
     }
+    // Finding A (EM_FORMAT_RED_TEAM 2026-07-11): frame_size == 0 must NOT
+    // bypass the frame_off bounds check. The prior validator gated the
+    // frame_off check on `frame_size > 0`, so frame_size == 0 skipped it
+    // entirely — a producing op with frame_off = +8 overwrote the return
+    // address (the prologue always does `push rbp; mov rbp, rsp` regardless
+    // of frame_size, so [rbp+8] = return addr). The fix: ALWAYS check
+    // frame_off regardless of frame_size. When frame_size == 0, any non-zero
+    // frame_off is rejected.
+    //
+    // Case A1: frame_size=0, frame_off=+8 (the return-address overwrite
+    // primitive from the audit's PoC). MUST be rejected.
+    {
+        auto bad = base;
+        bad.frame.frame_size = 0;  // zero frame — the bypass condition
+        ThinInstr ci;
+        ci.op = ThinOp::ConstInt;
+        ci.dst = 4;
+        ci.imm.i = 0x4141414142424242LL;  // the attacker's return addr
+        ci.meta.frame_off = 8;  // +8 = return address slot ([rbp+8])
+        ci.meta.width = 8;
+        bad.blocks[0].instrs.push_back(ci);
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("frame_off") == std::string::npos) return false;
+    }
+    // Case A2: frame_size=0, frame_off=-8 (negative, but frame_size is 0 so
+    // there's no frame to write to — below rsp, unallocated stack). MUST be
+    // rejected. This pins that the fix rejects ANY non-zero frame_off when
+    // frame_size == 0, not just positive ones.
+    {
+        auto bad = base;
+        bad.frame.frame_size = 0;
+        ThinInstr sf;
+        sf.op = ThinOp::StoreFrame;
+        sf.src1 = 1;
+        sf.meta.frame_off = -8;  // negative, but frame_size=0 so still invalid
+        sf.meta.width = 8;
+        bad.blocks[0].instrs.push_back(sf);
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("frame_off") == std::string::npos) return false;
+    }
+    // Case A3 (contrast / negative control): frame_size=0 with NO non-zero
+    // frame_off instrs must still validate clean (a leaf function with no
+    // frame slots is legitimate — frame_size=0 alone is not malformed, only
+    // frame_size=0 + a non-zero frame_off is).
+    {
+        auto good = base;
+        good.frame.frame_size = 0;
+        // base has ConstInt(1) + Add, neither uses frame_off (both are 0).
+        // The param at off=-16 is a frame-plan offset, not an instr frame_off,
+        // so it doesn't trigger the instr-level check. This should validate.
+        std::string verr;
+        if (!validate_thin_function(good, &verr)) return false;
+    }
     // Positive: the base function validates clean (sanity check).
     {
         std::string verr;

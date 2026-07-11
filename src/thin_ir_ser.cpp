@@ -646,16 +646,27 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err,
                 if (err) *err = "thin_ir_ser: validate: negative len for BoundsCheck";
                 return false;
             }
-            // Item 12a fix (extended): frame_off must be within the function's
-            // frame for ANY instr that uses it as an rbp-relative displacement.
-            // The original check only covered 7 specific ops, but emit_x64
-            // writes to [rbp + frame_off] for ~20 producing ops (ConstInt, Add,
-            // etc. via record_dst/store_rax_to_rbp). An attacker-controlled
+            // Item 12a fix (extended) + Finding A fix (EM_FORMAT_RED_TEAM
+            // 2026-07-11): frame_off must be within the function's frame for
+            // ANY instr that uses it as an rbp-relative displacement. The
+            // original check only covered 7 specific ops, but emit_x64 writes
+            // to [rbp + frame_off] for ~20 producing ops (ConstInt, Add, etc.
+            // via record_dst/store_rax_to_rbp). An attacker-controlled
             // frame_off on ANY of those can write outside the stack frame
             // (stack smash / return-address overwrite). frame_off must be
             // negative (stack grows down) and >= -frame_size. frame_off == 0
             // means "not frame-backed" and is safe to skip.
-            if (in.meta.frame_off != 0 && thf.frame.frame_size > 0) {
+            //
+            // FINDING A: the prior version gated this check on
+            // `frame_size > 0`, so a hand-crafted IR with frame_size == 0
+            // skipped the check entirely — a producing op with frame_off = +8
+            // overwrote the return address (the prologue always does
+            // `push rbp; mov rbp, rsp` regardless of frame_size, so
+            // [rbp+0] = saved rbp, [rbp+8] = return addr). The fix: ALWAYS
+            // check frame_off regardless of frame_size. When frame_size == 0,
+            // -frame_size == 0, so any non-zero frame_off (positive or
+            // negative) fails the range check and is rejected.
+            if (in.meta.frame_off != 0) {
                 if (in.meta.frame_off >= 0 || in.meta.frame_off < -thf.frame.frame_size) {
                     if (err) *err = "thin_ir_ser: validate: frame_off out of frame bounds";
                     return false;

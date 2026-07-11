@@ -55,6 +55,11 @@
 #include <unordered_map>
 #include <vector>
 
+// FIX 3 (EM_FORMAT_RED_TEAM 2026-07-11): the loader now rejects v1-v4 (raw
+// x86) by default. This test uses write_em_file (v3), so it opts in to raw
+// x86 via EmLoadPolicy.
+static const ember::EmLoadPolicy RAW_X86_POLICY{0u, true};
+
 // Win64 i64(i64) call: the compiled functions take one i64 arg (rcx) and
 // return i64 (rax), matching double_it(x: i64) -> i64 and caller(x: i64) -> i64.
 static int64_t call_i64_i64(void* entry, int64_t a) {
@@ -476,7 +481,7 @@ int main() {
             std::string lerr_B;
             std::unordered_map<std::string,NativeSig> no_natives;
             bool loaded_B_ok = load_em_file(path_B.string().c_str(), loaded_B, &lerr_B,
-                                            /*registry=*/nullptr, &no_natives);
+                                            /*registry=*/nullptr, &no_natives, nullptr, &RAW_X86_POLICY);
             std::printf("[B7] %s: load_em_file module B (no registry needed)\n", passfail(loaded_B_ok));
             if (!loaded_B_ok) { std::printf("    load_em_file(B) error: %s\n", lerr_B.c_str()); failures++; }
             else if (loaded_B.entry() == nullptr) { std::printf("    [B7] FAIL: loaded B entry null\n"); failures++; }
@@ -486,7 +491,7 @@ int main() {
             LoadedModule loaded_A;
             std::string lerr_A;
             bool loaded_A_ok = load_em_file(path_A.string().c_str(), loaded_A, &lerr_A,
-                                            /*registry=*/&fresh_registry, &no_natives);
+                                            /*registry=*/&fresh_registry, &no_natives, nullptr, &RAW_X86_POLICY);
             std::printf("[B8] %s: load_em_file module A (kind-2 reloc -> fresh registry base)\n", passfail(loaded_A_ok));
             if (!loaded_A_ok) { std::printf("    load_em_file(A) error: %s\n", lerr_A.c_str()); failures++; }
 

@@ -880,6 +880,19 @@ if(WIN32)
 endif()
 add_test(NAME thin_ir_ser COMMAND thin_ir_ser_test)
 
+# em_redteam_audit_test - regression tests for the .em format red-team audit
+# (docs/audit/EM_FORMAT_RED_TEAM_2026-07-11.md). Tests FIX 2 (PERM_FFI
+# load-side enforcement, both v3 raw-x86 + v5 IR paths) and FIX 3 (raw-x86
+# v1-v4 rejected by default, v5 accepted). FIX 1 (frame_size=0) is tested in
+# thin_ir_ser_test.cpp. Links ember + ember_frontend (loader + writer + v5
+# IR re-emit path + lowering).
+add_executable(em_redteam_audit_test examples/em_redteam_audit_test.cpp)
+target_link_libraries(em_redteam_audit_test PRIVATE ember ember_frontend)
+if(WIN32)
+    target_link_libraries(em_redteam_audit_test PRIVATE kernel32)
+endif()
+add_test(NAME em_redteam_audit COMMAND em_redteam_audit_test)
+
 # em_v5_ir_test - Stage B c3 (IL-.em): the v5 IR .em end-to-end integration
 # test. Compiles a function via the IR path (lower_function), serializes to a
 # v5 .em (write_em_file_v5), loads it (load_em_file deserializes + validates +
@@ -972,6 +985,6 @@ add_test(NAME em_v5_mixed COMMAND em_v5_mixed_test)
 set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
     v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
     array_lit aggregate_global em_signed codegen_opt thin_ir_struct thin_ir
-    thin_ir_ser em_v5_ir em_v5_mixed ember_pass ir_passes ext_map ext_bounds
+    thin_ir_ser em_redteam_audit em_v5_ir em_v5_mixed ember_pass ir_passes ext_map ext_bounds
     regalloc
     PROPERTIES TIMEOUT 30)
