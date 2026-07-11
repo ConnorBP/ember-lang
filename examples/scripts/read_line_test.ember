@@ -1,0 +1,13 @@
+// read_line_test.ember - read_line() from stdin.
+//   Run with:  echo "hello from stdin" | ember run read_line_test.ember --ffi
+// expect stdout:
+//   you typed: hello from stdin
+// expect exit: 0
+
+fn main() -> i64 {
+    print(string_from_slice("you typed: "));
+    let line: string = read_line();
+    print(line);
+    println(string_from_slice(""));
+    return 0;
+}

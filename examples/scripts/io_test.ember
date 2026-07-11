@@ -1,0 +1,97 @@
+// io_test.ember - the I/O extension native-call path through the JIT.
+//   Exercises console output (print/println/print_i64/print_f64), a file
+//   write+read round-trip (file_write_bytes/file_read_bytes/file_exists),
+//   and the path string ops (path_basename/path_dirname/path_exists).
+//
+//   Run with:  ember run io_test.ember --ffi
+//   (--ffi grants PERM_FFI so the I/O natives are callable; without it sema
+//    rejects every I/O call site at compile time -- security by default.)
+//
+// expect stdout:
+//   hello world
+//   42 3.14
+//   wrote: 1
+//   exists: 1
+//   read bytes: 9
+//   contents: 116 101 115 116 32 100 97 116 97
+//   basename: baz.txt
+//   dirname: /foo/bar
+//   path_exists(file): 1
+//   path_exists(nope): 0
+// expect exit: 0
+
+fn main() -> i64 {
+    // --- console output ---
+    print(string_from_slice("hello "));
+    println(string_from_slice("world"));
+    print_i64(42);
+    print(string_from_slice(" "));
+    print_f64(3.14);
+    println(string_from_slice(""));
+
+    // --- file I/O round-trip ---
+    // Build "test data" as an array<u8> (9 bytes: 't','e','s','t',' ','d','a','t','a').
+    let path: string = string_from_slice("io_test_data.txt");
+    let data: i64 = array_new(1, 9);
+    array_set_u8(data, 0, 116);  // 't'
+    array_set_u8(data, 1, 101);  // 'e'
+    array_set_u8(data, 2, 115);  // 's'
+    array_set_u8(data, 3, 116);  // 't'
+    array_set_u8(data, 4, 32);   // ' '
+    array_set_u8(data, 5, 100);  // 'd'
+    array_set_u8(data, 6, 97);   // 'a'
+    array_set_u8(data, 7, 116);  // 't'
+    array_set_u8(data, 8, 97);   // 'a'
+
+    let wrote: i64 = file_write_bytes(path, data);
+    print(string_from_slice("wrote: "));
+    print_i64(wrote);
+    println(string_from_slice(""));
+
+    let exists: i64 = file_exists(path);
+    print(string_from_slice("exists: "));
+    print_i64(exists);
+    println(string_from_slice(""));
+
+    let buf: i64 = file_read_bytes(path);
+    let n: i64 = array_length(buf);
+    print(string_from_slice("read bytes: "));
+    print_i64(n);
+    println(string_from_slice(""));
+
+    // Print the file contents as byte values (ember has no print_char native).
+    print(string_from_slice("contents: "));
+    let mut i: i64 = 0;
+    while (i < n) {
+        let ch: i64 = array_get_u8(buf, i) as i64;
+        if (i > 0) { print(string_from_slice(" ")); }
+        print_i64(ch);
+        i = i + 1;
+    }
+    println(string_from_slice(""));
+
+    // --- path string ops (pure manipulation, no FS access) ---
+    let p: string = string_from_slice("/foo/bar/baz.txt");
+    let base: string = path_basename(p);
+    print(string_from_slice("basename: "));
+    print(base);
+    println(string_from_slice(""));
+
+    let dir: string = path_dirname(p);
+    print(string_from_slice("dirname: "));
+    print(dir);
+    println(string_from_slice(""));
+
+    // --- path_exists (portable stat) ---
+    let pe_file: i64 = path_exists(path);
+    print(string_from_slice("path_exists(file): "));
+    print_i64(pe_file);
+    println(string_from_slice(""));
+
+    let pe_nope: i64 = path_exists(string_from_slice("this_does_not_exist_xyz"));
+    print(string_from_slice("path_exists(nope): "));
+    print_i64(pe_nope);
+    println(string_from_slice(""));
+
+    return 0;
+}

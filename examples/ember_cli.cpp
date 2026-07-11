@@ -65,6 +65,7 @@
 #include "ext_lifecycle.hpp"
 #include "ext_opt.hpp"        // Stage C: register_passes (IR optimization passes)
 #include "ext_obf.hpp"         // Stage C Step 5: register_passes (IR obfuscation passes)
+#include "ext_io.hpp"          // OS I/O (console + file + path), core subset
 #include "../src/ember_pass.hpp"       // Stage C: EmberPassManager
 #include "../src/ember_pass_registry.hpp" // Stage C: EmberPassRegistry
 #include "../src/ember_pass_pipeline.hpp" // Stage C: build_pipeline_from_string
@@ -134,6 +135,7 @@ static void register_standard_bindings(
     ext_array::register_natives(natives); ext_math::register_natives(natives);
     ext_map::register_natives(natives);
     ember::ext_sync::register_natives(natives); ember::ext_lifecycle::register_natives(natives);
+    ember::ext_io::register_natives(natives);
     OpOverloadTable overloads;
     ext_vec::register_overloads(overloads); ext_quat::register_overloads(overloads);
     ext_mat::register_overloads(overloads); ext_string::register_overloads(overloads);
@@ -171,7 +173,8 @@ static void usage(FILE* out) {
         "  --tick              run @on_tick and dynamic routines on a tick thread\n"
         "  --tick-count N      stop automatically after N ticks (default: keypress)\n"
         "  --tick-interval MS  tick interval in milliseconds (default: 16)\n"
-        "  --passes SPEC      run IR optimization passes (e.g. constprop,cse,dce,licm,subst)\n");
+        "  --passes SPEC      run IR optimization passes (e.g. constprop,cse,dce,licm,subst)\n"
+        "  --ffi              grant FFI permission: enable I/O natives (print, file, path)\n");
 }
 
 // Compute the TYPED globals-block layout (chunk c3): per-global (offset, size)
@@ -256,6 +259,7 @@ int main(int argc, char** argv) {
     bool bench_mode = false;    // Family A: `ember bench` — microbenchmark the entry fn
     int bench_iters = 20;       // --iters N (measured iterations)
     int bench_warmup = 5;       // --warmup N (untimed warmup iterations)
+    bool ffi_mode = false;      // --ffi: grant PERM_FFI to sema so I/O natives (print/file/path) are callable
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--fn") {
@@ -287,6 +291,13 @@ int main(int argc, char** argv) {
         } else if (a == "--warmup") {
             if (++i >= argc) { std::fprintf(stderr, "ember: --warmup needs N\n"); return 2; }
             bench_warmup = std::atoi(argv[i]); if (bench_warmup < 0) bench_warmup = 0;
+        } else if (a == "--ffi" || a == "--allow-io") {
+            // Grant PERM_FFI to sema so the ext_io natives (print/println/
+            // file_read_bytes/path_*/...) registered in register_standard_bindings
+            // are callable. Without --ffi, sema is called with 0 and every I/O
+            // call site is rejected at compile time (security by default -- the
+            // ext_io natives are registered but not callable).
+            ffi_mode = true;
         } else if (a == "-h" || a == "--help") {
             usage(stdout); return 0;
         } else if (a.size() > 0 && a[0] == '-') {
@@ -425,7 +436,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    auto sr = sema(pr.program, natives, slots, 0, &overloads, &struct_layouts, &module_exports);
+    auto sr = sema(pr.program, natives, slots, ffi_mode ? PERM_FFI : 0u, &overloads, &struct_layouts, &module_exports);
     if (!sr.ok) {
         std::fprintf(stderr, "ember: sema errors (%zu):\n", sr.errors.size());
         for (auto& e : sr.errors) std::fprintf(stderr, "  line %u: %s\n", e.line, e.msg.c_str());
@@ -853,6 +864,7 @@ run_tick:
     ext_string::reset(); ext_array::reset();
     ember::ext_sync::reset();
     ember::ext_lifecycle::reset();
+    ember::ext_io::reset();
     // ext_math is stateless (no reset()).
 
     return exit_code;

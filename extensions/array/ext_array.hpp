@@ -35,4 +35,15 @@ void reset();
 // an array<u8> handle and need its raw bytes.
 bool get_bytes(int64_t handle, uint8_t** out_data, int64_t* out_len);
 
+// Allocate a new array<u8> (elem_size=1) handle owning a copy of [data, data+len).
+// Returns a 1-based opaque handle (0 on allocation failure or bad len). Exposed
+// so host-side natives that PRODUCE a byte buffer (e.g. ext_io::file_read_bytes)
+// can mint an ember array<u8> handle the consumer resolves via get_bytes() --
+// the same round-trip read-side/get_bytes already relies on for reading. This
+// is the array-side analogue of ext_string::alloc. If data is null and len is
+// 0, a valid empty array handle is returned (a 0-byte file reads as an empty
+// array, not a failure). The handle is owned by this extension's host store
+// and freed on reset().
+int64_t alloc_bytes(const uint8_t* data, int64_t len);
+
 } // namespace ember::ext_array
