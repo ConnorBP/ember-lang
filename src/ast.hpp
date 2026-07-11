@@ -273,6 +273,16 @@ struct FuncDecl {
     // native `engine.define` surface is unaffected (pub/priv is a script-module
     // bundling concern, not a native-binding concern).
     bool is_exported = true;
+    // constexpr fn (Tier 1 feature): a fn declared `constexpr` CAN be
+    // const-evaluated at sema time when called with all-constant arguments.
+    // The call site is then rewritten IN PLACE to an IntLit carrying the
+    // folded result (mirroring lower_enum_access_expr's EnumAccessExpr ->
+    // IntLit rewrite), so downstream consumers (case labels, global inits,
+    // codegen const-fold) see the literal directly. A constexpr fn may ALSO
+    // be called at runtime with non-constant args — it is a normal fn that
+    // CAN be const-evaluated, not one that MUST be. If any arg is not
+    // constant, the call is left as a normal runtime call (no error).
+    bool is_constexpr = false;
 };
 
 struct StructDecl {

@@ -900,14 +900,33 @@ struct P {
                 // default (backward compat - existing cross-module tests/demos use
                 // bare `fn` and call across modules). `priv` is only meaningful on
                 // a function declaration; it is consumed here, not on let/global.
-                bool is_priv = accept(Tk::Kw_priv);
+                //
+                // constexpr modifier: `constexpr fn` declares a fn that CAN be
+                // const-evaluated at sema time when called with all-constant
+                // args (the call is rewritten to an IntLit, mirroring
+                // lower_enum_access_expr). `priv` and `constexpr` may appear in
+                // either order before `fn` (`priv constexpr fn` /
+                // `constexpr priv fn`). Both are only valid on a fn decl.
+                bool is_priv = false;
+                bool is_constexpr = false;
+                // accept the two modifiers in any order, at most once each
+                for (int mod_pass = 0; mod_pass < 2; ++mod_pass) {
+                    if (at(Tk::Kw_priv) && !is_priv) { is_priv = accept(Tk::Kw_priv); }
+                    else if (at(Tk::Kw_constexpr) && !is_constexpr) { is_constexpr = accept(Tk::Kw_constexpr); }
+                    else break;
+                }
                 if (is_priv && !at(Tk::Kw_fn)) {
                     throw ParseError("'priv' modifier is only valid on a function declaration ('priv fn')",
+                                     peek().line, peek().col);
+                }
+                if (is_constexpr && !at(Tk::Kw_fn)) {
+                    throw ParseError("'constexpr' modifier is only valid on a function declaration ('constexpr fn')",
                                      peek().line, peek().col);
                 }
                 if (at(Tk::Kw_fn)) {
                     prog.funcs.push_back(std::move(*parse_func(std::move(anns))));
                     prog.funcs.back().is_exported = !is_priv;
+                    prog.funcs.back().is_constexpr = is_constexpr;
                 } else if (at(Tk::Kw_struct)) {
                     if (!anns.empty()) throw ParseError("annotations on structs not supported v1", peek().line, peek().col);
                     prog.structs.push_back(std::move(*parse_struct()));

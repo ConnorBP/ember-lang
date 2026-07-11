@@ -1,0 +1,16 @@
+// constexpr fn call used inside a larger expression + a global initializer.
+// The folded value (square(6) = 36) is visible to downstream consumers:
+//   - global init: global g : i64 = square(6) + 100;  -> 136
+//   - larger expr: square(5) + square(4)              -> 25 + 16 = 41
+//
+// sema_valid: must parse OK and sema OK.
+constexpr fn square(n: i64) -> i64 {
+    return n * n;
+}
+
+global g : i64 = square(6) + 100;
+
+fn main() -> i64 {
+    let x: i64 = square(5) + square(4);
+    return x + g;
+}

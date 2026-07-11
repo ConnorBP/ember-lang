@@ -583,6 +583,20 @@ if(WIN32)
 endif()
 add_test(NAME field_of_index COMMAND field_of_index_test)
 
+# constexpr_test - Tier 1 constexpr fn evaluation. A `constexpr fn` called
+# with all-constant args is const-evaluated at sema time; the call site is
+# rewritten to an IntLit before codegen. Covers basic fold, recursion (fib),
+# constexpr in expressions / global inits, while/for loops + mutation inside
+# constexpr fns, runtime fallback (non-const arg), nested constexpr calls,
+# compound assignment, and `priv constexpr fn`. Pure language features (no
+# natives), so links only the core libs — matching field_of_index_test's shape.
+add_executable(constexpr_test examples/constexpr_test.cpp)
+target_link_libraries(constexpr_test PRIVATE ember ember_frontend ember_import)
+if(WIN32)
+    target_link_libraries(constexpr_test PRIVATE kernel32)
+endif()
+add_test(NAME constexpr COMMAND constexpr_test)
+
 # codegen_opt_test - pins the Stage 1 codegen-optimization peephole + local
 # regalloc rewrites' VALUE EQUIVALENCE (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4.7).
 # For each rewrite, compiles the SAME source with the Stage-1 flags OFF and ON,

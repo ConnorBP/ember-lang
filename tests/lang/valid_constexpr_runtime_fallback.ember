@@ -1,0 +1,17 @@
+// constexpr fn called with a NON-constant (runtime) argument. This must still
+// WORK — a constexpr fn CAN be called at runtime. The call falls back to a
+// normal runtime call (no error). The const-eval pre-pass skips it because
+// the arg is a runtime value (not foldable to an i64 constant).
+//
+// sema_valid: must parse OK and sema OK. The result is computed at runtime.
+constexpr fn double_it(n: i64) -> i64 {
+    return n * 2;
+}
+
+fn main() -> i64 {
+    let mut x: i64 = 0;
+    // x is a runtime value (not a compile-time constant), so double_it(x)
+    // is NOT const-evaluated — it's a normal runtime call.
+    x = double_it(x + 10);
+    return x;
+}

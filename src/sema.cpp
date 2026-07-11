@@ -731,6 +731,35 @@ struct Checker {
     void check_block(Block& b, const Type* ret_ty, bool& returns);
     void check_stmt(Stmt& s, const Type* ret_ty, bool& returns);
     void check_func(FuncDecl& f);
+
+    // --- constexpr fn evaluation (Tier 1) ---
+    // A tree-walking interpreter that evaluates a constexpr fn call at sema
+    // time to produce a compile-time i64 result. Bounded: max 100000 loop
+    // iterations per loop, max 256 recursion depth (nested constexpr calls).
+    // Only i64 integer fns in this increment; float/bool/struct fns skip
+    // constexpr eval and fall back to runtime calls.
+    struct ConstEvalCtx {
+        std::vector<std::unordered_map<std::string, int64_t>> scopes;
+        int64_t result = 0;
+        bool returned = false;
+        bool broke = false;
+        bool continued = false;
+        int depth = 0;
+    };
+    bool eval_constexpr_fn(const FuncDecl& fn, const std::vector<int64_t>& arg_values,
+                           int64_t& result_out, std::string& err, int depth = 0);
+    bool ce_eval_expr(const Expr& e, int64_t& out, ConstEvalCtx& ctx, std::string& err);
+    bool ce_eval_block(const Block& b, ConstEvalCtx& ctx, std::string& err);
+    bool ce_eval_stmt(const Stmt& s, ConstEvalCtx& ctx, std::string& err);
+
+    // Pre-pass: fold constexpr calls into IntLits BEFORE check_expr runs
+    // (mirrors lower_enum_access_expr's pattern - walks ExprPtr& slots so
+    // nodes can be replaced in place). Runs bottom-up so nested constexpr
+    // calls fold inner-first.
+    void lower_constexpr_calls_expr(ExprPtr& slot);
+    void lower_constexpr_calls_block(Block& b);
+    void lower_constexpr_calls_stmt(Stmt& s);
+    void try_fold_constexpr_call(ExprPtr& slot);
 };
 
 const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct_ret_call) {
@@ -1939,6 +1968,465 @@ void Checker::check_func(FuncDecl& f) {
     pop_scope();
 }
 
+// ============================================================================
+// constexpr fn evaluation (Tier 1) — compile-time interpreter
+// ============================================================================
+// A bounded tree-walking interpreter that evaluates a constexpr fn call at
+// sema time. Produces a compile-time i64 result that replaces the call site
+// (an IntLit), so downstream consumers (case labels, global inits, codegen
+// const-fold) see the literal directly. Only i64 integer fns are supported
+// in this increment; float/bool/struct fns skip constexpr eval.
+//
+// Bounds: max 100000 loop iterations per loop, max 256 recursion depth.
+// Exceeding either returns false (the call falls back to a runtime call —
+// no error, the fn is still callable at runtime). A zero divisor in Div/Mod
+// also returns false (the runtime trap must handle it, same as
+// try_eval_const_i64's rationale).
+// ============================================================================
+
+bool Checker::ce_eval_expr(const Expr& e, int64_t& out, ConstEvalCtx& ctx, std::string& err) {
+    if (auto* lit = dynamic_cast<const IntLit*>(&e)) {
+        out = lit->v; return true;
+    }
+    if (auto* lit = dynamic_cast<const BoolLit*>(&e)) {
+        out = lit->v ? 1 : 0; return true;
+    }
+    if (auto* u = dynamic_cast<const UnaryExpr*>(&e)) {
+        int64_t v;
+        if (!ce_eval_expr(*u->operand, v, ctx, err)) return false;
+        switch (u->op) {
+        case UnaryExpr::Op::Neg:    out = bit_cast_i64(uint64_t(0) - uint64_t(v)); return true;
+        case UnaryExpr::Op::BitNot: out = ~v; return true;
+        case UnaryExpr::Op::Not:    out = v ? 0 : 1; return true;
+        }
+        return false;
+    }
+    if (auto* b = dynamic_cast<const BinExpr*>(&e)) {
+        // short-circuit logical ops
+        if (b->op == BinExpr::Op::LAnd) {
+            int64_t l;
+            if (!ce_eval_expr(*b->lhs, l, ctx, err)) return false;
+            if (!l) { out = 0; return true; }
+            int64_t r;
+            if (!ce_eval_expr(*b->rhs, r, ctx, err)) return false;
+            out = r ? 1 : 0; return true;
+        }
+        if (b->op == BinExpr::Op::LOr) {
+            int64_t l;
+            if (!ce_eval_expr(*b->lhs, l, ctx, err)) return false;
+            if (l) { out = 1; return true; }
+            int64_t r;
+            if (!ce_eval_expr(*b->rhs, r, ctx, err)) return false;
+            out = r ? 1 : 0; return true;
+        }
+        int64_t l, r;
+        if (!ce_eval_expr(*b->lhs, l, ctx, err)) return false;
+        if (!ce_eval_expr(*b->rhs, r, ctx, err)) return false;
+        switch (b->op) {
+        case BinExpr::Op::Add: out = bit_cast_i64(uint64_t(l) + uint64_t(r)); return true;
+        case BinExpr::Op::Sub: out = bit_cast_i64(uint64_t(l) - uint64_t(r)); return true;
+        case BinExpr::Op::Mul: out = bit_cast_i64(uint64_t(l) * uint64_t(r)); return true;
+        case BinExpr::Op::And: out = l & r; return true;
+        case BinExpr::Op::Or:  out = l | r; return true;
+        case BinExpr::Op::Xor: out = l ^ r; return true;
+        case BinExpr::Op::Shl: out = bit_cast_i64(uint64_t(l) << (r & 63)); return true;
+        case BinExpr::Op::Shr: {
+            int sh = int(r & 63);
+            uint64_t ur = uint64_t(l) >> sh;
+            if (sh != 0 && l < 0) ur |= ~((1ULL << (64 - sh)) - 1);
+            out = bit_cast_i64(ur); return true;
+        }
+        case BinExpr::Op::Div:
+            if (r == 0) { err = "constexpr division by zero"; return false; }
+            out = l / r; return true;
+        case BinExpr::Op::Mod:
+            if (r == 0) { err = "constexpr modulo by zero"; return false; }
+            out = l % r; return true;
+        case BinExpr::Op::Eq: out = (l == r) ? 1 : 0; return true;
+        case BinExpr::Op::Neq: out = (l != r) ? 1 : 0; return true;
+        case BinExpr::Op::Lt: out = (l < r) ? 1 : 0; return true;
+        case BinExpr::Op::Le: out = (l <= r) ? 1 : 0; return true;
+        case BinExpr::Op::Gt: out = (l > r) ? 1 : 0; return true;
+        case BinExpr::Op::Ge: out = (l >= r) ? 1 : 0; return true;
+        default: return false;
+        }
+    }
+    if (auto* id = dynamic_cast<const Ident*>(&e)) {
+        for (int i = int(ctx.scopes.size()) - 1; i >= 0; --i) {
+            auto it = ctx.scopes[size_t(i)].find(id->name);
+            if (it != ctx.scopes[size_t(i)].end()) { out = it->second; return true; }
+        }
+        err = "constexpr: unknown variable '" + id->name + "'";
+        return false;
+    }
+    if (auto* c = dynamic_cast<const CallExpr*>(&e)) {
+        // Only direct calls to constexpr script fns with all-constant args.
+        // Indirect / native / cross-module / method calls are not foldable.
+        if (c->is_indirect || c->receiver || !c->module_alias.empty()) return false;
+        const FuncDecl* fn = nullptr;
+        for (auto& f : prog->funcs) {
+            if (f.name == c->name) { fn = &f; break; }
+        }
+        if (!fn || !fn->is_constexpr) return false;
+        // i64 integer fns only in this increment
+        if (!fn->ret || !fn->ret->is_int()) return false;
+        for (auto& p : fn->params)
+            if (!p.ty || !p.ty->is_int()) return false;
+        if (c->args.size() != fn->params.size()) return false;
+        std::vector<int64_t> arg_vals;
+        arg_vals.reserve(c->args.size());
+        for (auto& a : c->args) {
+            int64_t v;
+            if (!ce_eval_expr(*a, v, ctx, err)) return false;
+            arg_vals.push_back(v);
+        }
+        return eval_constexpr_fn(*fn, arg_vals, out, err, ctx.depth + 1);
+    }
+    if (auto* t = dynamic_cast<const TernaryExpr*>(&e)) {
+        int64_t c;
+        if (!ce_eval_expr(*t->cond, c, ctx, err)) return false;
+        return ce_eval_expr(c ? *t->then_e : *t->else_e, out, ctx, err);
+    }
+    if (auto* c = dynamic_cast<const CastExpr*>(&e)) {
+        // int-to-int casts: evaluate the operand (i64 holds all integer widths)
+        if (!c->to || !c->to->is_int()) return false;
+        return ce_eval_expr(*c->operand, out, ctx, err);
+    }
+    if (auto* a = dynamic_cast<const AssignExpr*>(&e)) {
+        // Only Ident targets are supported in the i64 interpreter.
+        auto* id = dynamic_cast<Ident*>(a->target.get());
+        if (!id) return false;
+        int64_t rhs;
+        if (!ce_eval_expr(*a->value, rhs, ctx, err)) return false;
+        if (a->compound) {
+            int64_t cur;
+            for (int i = int(ctx.scopes.size()) - 1; i >= 0; --i) {
+                auto it = ctx.scopes[size_t(i)].find(id->name);
+                if (it != ctx.scopes[size_t(i)].end()) { cur = it->second; break; }
+            }
+            // replicate BinExpr arithmetic for the compound op
+            int64_t tmp = 0;
+            switch (*a->compound) {
+            case BinExpr::Op::Add: tmp = bit_cast_i64(uint64_t(cur) + uint64_t(rhs)); break;
+            case BinExpr::Op::Sub: tmp = bit_cast_i64(uint64_t(cur) - uint64_t(rhs)); break;
+            case BinExpr::Op::Mul: tmp = bit_cast_i64(uint64_t(cur) * uint64_t(rhs)); break;
+            case BinExpr::Op::Div:
+                if (rhs == 0) { err = "constexpr division by zero"; return false; }
+                tmp = cur / rhs; break;
+            case BinExpr::Op::Mod:
+                if (rhs == 0) { err = "constexpr modulo by zero"; return false; }
+                tmp = cur % rhs; break;
+            case BinExpr::Op::And: tmp = cur & rhs; break;
+            case BinExpr::Op::Or:  tmp = cur | rhs; break;
+            case BinExpr::Op::Xor: tmp = cur ^ rhs; break;
+            case BinExpr::Op::Shl: tmp = bit_cast_i64(uint64_t(cur) << (rhs & 63)); break;
+            case BinExpr::Op::Shr: {
+                int sh = int(rhs & 63);
+                uint64_t ur = uint64_t(cur) >> sh;
+                if (sh != 0 && cur < 0) ur |= ~((1ULL << (64 - sh)) - 1);
+                tmp = bit_cast_i64(ur); break;
+            }
+            default: return false;
+            }
+            rhs = tmp;
+        }
+        for (int i = int(ctx.scopes.size()) - 1; i >= 0; --i) {
+            auto it = ctx.scopes[size_t(i)].find(id->name);
+            if (it != ctx.scopes[size_t(i)].end()) { it->second = rhs; out = rhs; return true; }
+        }
+        err = "constexpr: assignment to unknown variable '" + id->name + "'";
+        return false;
+    }
+    // FloatLit, StringLit, FnHandleExpr, SizeofExpr, OffsetofExpr,
+    // StructLit, ArrayLit, EnumAccessExpr (already lowered), FieldExpr,
+    // IndexExpr, ViewExpr: not supported in the i64 constexpr interpreter.
+    return false;
+}
+
+bool Checker::ce_eval_block(const Block& b, ConstEvalCtx& ctx, std::string& err) {
+    ctx.scopes.emplace_back();
+    for (auto& s : b.stmts) {
+        if (!ce_eval_stmt(*s, ctx, err)) return false;
+        if (ctx.returned || ctx.broke || ctx.continued) break;
+    }
+    ctx.scopes.pop_back();
+    return true;
+}
+
+bool Checker::ce_eval_stmt(const Stmt& s, ConstEvalCtx& ctx, std::string& err) {
+    if (auto* es = dynamic_cast<const ExprStmt*>(&s)) {
+        int64_t v;
+        return ce_eval_expr(*es->expr, v, ctx, err);
+    }
+    if (auto* ls = dynamic_cast<const LetStmt*>(&s)) {
+        int64_t v = 0;
+        if (ls->init) {
+            if (!ce_eval_expr(*ls->init, v, ctx, err)) return false;
+        }
+        if (ctx.scopes.empty()) ctx.scopes.emplace_back();
+        ctx.scopes.back()[ls->name] = v;
+        return true;
+    }
+    if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
+        int64_t c;
+        if (!ce_eval_expr(*is->cond, c, ctx, err)) return false;
+        if (c) return ce_eval_block(is->then_b, ctx, err);
+        if (is->has_else) return ce_eval_block(is->else_b, ctx, err);
+        return true;
+    }
+    if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) {
+        const int MAX_LOOP = 100000;
+        int iters = 0;
+        while (true) {
+            int64_t c;
+            if (!ce_eval_expr(*ws->cond, c, ctx, err)) return false;
+            if (!c) break;
+            if (++iters > MAX_LOOP) { err = "constexpr loop exceeded iteration limit"; return false; }
+            ctx.broke = false; ctx.continued = false;
+            if (!ce_eval_block(ws->body, ctx, err)) return false;
+            if (ctx.returned) break;
+            if (ctx.broke) { ctx.broke = false; break; }
+            // continued or fell through: keep looping
+        }
+        return true;
+    }
+    if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
+        const int MAX_LOOP = 100000;
+        // for-init runs in a scope that wraps the whole loop (the loop var
+        // persists across iterations, same as runtime semantics)
+        ctx.scopes.emplace_back();
+        if (fs->init) {
+            if (!ce_eval_stmt(*fs->init, ctx, err)) { ctx.scopes.pop_back(); return false; }
+        }
+        int iters = 0;
+        while (true) {
+            if (fs->cond) {
+                int64_t c;
+                if (!ce_eval_expr(*fs->cond, c, ctx, err)) { ctx.scopes.pop_back(); return false; }
+                if (!c) break;
+            }
+            if (++iters > MAX_LOOP) { err = "constexpr loop exceeded iteration limit"; ctx.scopes.pop_back(); return false; }
+            ctx.broke = false; ctx.continued = false;
+            if (!ce_eval_block(fs->body, ctx, err)) { ctx.scopes.pop_back(); return false; }
+            if (ctx.returned) break;
+            if (ctx.broke) { ctx.broke = false; break; }
+            if (fs->step) {
+                int64_t v;
+                if (!ce_eval_expr(*fs->step, v, ctx, err)) { ctx.scopes.pop_back(); return false; }
+            }
+        }
+        ctx.scopes.pop_back();
+        return true;
+    }
+    if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) {
+        const int MAX_LOOP = 100000;
+        int iters = 0;
+        while (true) {
+            ctx.broke = false; ctx.continued = false;
+            if (!ce_eval_block(ds->body, ctx, err)) return false;
+            if (ctx.returned) break;
+            if (ctx.broke) { ctx.broke = false; break; }
+            int64_t c;
+            if (!ce_eval_expr(*ds->cond, c, ctx, err)) return false;
+            if (!c) break;
+            if (++iters > MAX_LOOP) { err = "constexpr loop exceeded iteration limit"; return false; }
+        }
+        return true;
+    }
+    if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) {
+        if (rs->value) {
+            if (!ce_eval_expr(*rs->value, ctx.result, ctx, err)) return false;
+        } else {
+            ctx.result = 0;
+        }
+        ctx.returned = true;
+        return true;
+    }
+    if (dynamic_cast<const BreakStmt*>(&s)) {
+        ctx.broke = true;
+        return true;
+    }
+    if (dynamic_cast<const ContinueStmt*>(&s)) {
+        ctx.continued = true;
+        return true;
+    }
+    if (auto* bs = dynamic_cast<const BlockStmt*>(&s)) {
+        return ce_eval_block(bs->block, ctx, err);
+    }
+    // SwitchStmt, MatchStmt, ForEachStmt, DeferStmt: not supported in the
+    // i64 constexpr interpreter — return false so the call falls back to
+    // runtime (sema still type-checks the body normally).
+    return false;
+}
+
+bool Checker::eval_constexpr_fn(const FuncDecl& fn, const std::vector<int64_t>& arg_values,
+                                int64_t& result_out, std::string& err, int depth) {
+    if (depth > 256) { err = "constexpr recursion depth exceeded"; return false; }
+    ConstEvalCtx ctx;
+    ctx.depth = depth;
+    ctx.scopes.emplace_back();
+    // bind params
+    for (size_t i = 0; i < fn.params.size() && i < arg_values.size(); ++i)
+        ctx.scopes.back()[fn.params[i].name] = arg_values[i];
+    // walk body
+    for (auto& s : fn.body.stmts) {
+        if (!ce_eval_stmt(*s, ctx, err)) return false;
+        if (ctx.returned) break;
+    }
+    result_out = ctx.result;
+    return true;
+}
+
+// ============================================================================
+// constexpr call folding pre-pass (mirrors lower_enum_access_expr)
+// ============================================================================
+// Walks every ExprPtr slot bottom-up; when a CallExpr to a constexpr fn with
+// all-constant i64 args is found, evaluates it and replaces the CallExpr with
+// an IntLit carrying the result. Runs AFTER enum lowering (so EnumAccessExpr
+// nodes are already IntLits) and BEFORE check_expr (so check_expr / case
+// labels / global inits / codegen all see the folded literal). If the eval
+// fails (non-const arg, too-deep recursion, unsupported node), the CallExpr
+// is left as-is — the fn is still callable at runtime.
+// ============================================================================
+
+void Checker::try_fold_constexpr_call(ExprPtr& slot) {
+    auto* c = dynamic_cast<CallExpr*>(slot.get());
+    if (!c) return;
+    // skip indirect / cross-module / method calls
+    if (c->is_indirect || c->receiver || !c->module_alias.empty()) return;
+    const FuncDecl* fn = nullptr;
+    for (auto& f : prog->funcs) {
+        if (f.name == c->name) { fn = &f; break; }
+    }
+    if (!fn || !fn->is_constexpr) return;
+    // i64 integer fns only in this increment
+    if (!fn->ret || !fn->ret->is_int()) return;
+    for (auto& p : fn->params)
+        if (!p.ty || !p.ty->is_int()) return;
+    if (c->args.size() != fn->params.size()) return;
+    // all args must fold to i64 constants
+    std::vector<int64_t> arg_vals;
+    arg_vals.reserve(c->args.size());
+    for (auto& a : c->args) {
+        int64_t v;
+        if (!try_eval_const_i64(*a, v)) return; // not foldable — leave as runtime call
+        arg_vals.push_back(v);
+    }
+    // evaluate
+    int64_t result;
+    std::string eval_err;
+    if (!eval_constexpr_fn(*fn, arg_vals, result, eval_err, 0)) return; // eval failed — runtime call
+    // replace the CallExpr with an IntLit carrying the folded result
+    auto lit = std::make_unique<IntLit>();
+    lit->loc = c->loc;
+    lit->v = result;
+    lit->ty = intern(*fn->ret); // adopt the fn's return type
+    slot = std::move(lit);
+}
+
+void Checker::lower_constexpr_calls_expr(ExprPtr& slot) {
+    if (!slot) return;
+    // recurse into children first (bottom-up: inner constexpr calls fold
+    // before outer ones, so square(square(7)) folds inner→49 then outer→2401)
+    if (auto* b = dynamic_cast<BinExpr*>(slot.get())) {
+        lower_constexpr_calls_expr(b->lhs);
+        lower_constexpr_calls_expr(b->rhs);
+    } else if (auto* u = dynamic_cast<UnaryExpr*>(slot.get())) {
+        lower_constexpr_calls_expr(u->operand);
+    } else if (auto* c = dynamic_cast<CastExpr*>(slot.get())) {
+        lower_constexpr_calls_expr(c->operand);
+    } else if (auto* c = dynamic_cast<CallExpr*>(slot.get())) {
+        if (c->receiver) lower_constexpr_calls_expr(c->receiver);
+        for (auto& a : c->args) lower_constexpr_calls_expr(a);
+    } else if (auto* ix = dynamic_cast<IndexExpr*>(slot.get())) {
+        lower_constexpr_calls_expr(ix->base);
+        lower_constexpr_calls_expr(ix->index);
+    } else if (auto* fl = dynamic_cast<FieldExpr*>(slot.get())) {
+        lower_constexpr_calls_expr(fl->base);
+    } else if (auto* v = dynamic_cast<ViewExpr*>(slot.get())) {
+        lower_constexpr_calls_expr(v->base);
+    } else if (auto* a = dynamic_cast<AssignExpr*>(slot.get())) {
+        lower_constexpr_calls_expr(a->target);
+        lower_constexpr_calls_expr(a->value);
+    } else if (auto* t = dynamic_cast<TernaryExpr*>(slot.get())) {
+        lower_constexpr_calls_expr(t->cond);
+        lower_constexpr_calls_expr(t->then_e);
+        lower_constexpr_calls_expr(t->else_e);
+    } else if (auto* sl = dynamic_cast<StructLit*>(slot.get())) {
+        for (auto& kv : sl->fields) lower_constexpr_calls_expr(kv.second);
+    } else if (auto* al = dynamic_cast<ArrayLit*>(slot.get())) {
+        for (auto& el : al->elements) lower_constexpr_calls_expr(el);
+    } else if (auto* fn = dynamic_cast<FnHandleExpr*>(slot.get())) {
+        lower_constexpr_calls_expr(fn->operand);
+    }
+    // AFTER children are folded, check if THIS node is a foldable constexpr call
+    try_fold_constexpr_call(slot);
+}
+
+void Checker::lower_constexpr_calls_stmt(Stmt& s) {
+    if (auto* ls = dynamic_cast<LetStmt*>(&s)) {
+        if (ls->init) lower_constexpr_calls_expr(ls->init);
+        return;
+    }
+    if (auto* es = dynamic_cast<ExprStmt*>(&s)) { lower_constexpr_calls_expr(es->expr); return; }
+    if (auto* rs = dynamic_cast<ReturnStmt*>(&s)) {
+        if (rs->value) lower_constexpr_calls_expr(rs->value);
+        return;
+    }
+    if (auto* is = dynamic_cast<IfStmt*>(&s)) {
+        lower_constexpr_calls_expr(is->cond);
+        lower_constexpr_calls_block(is->then_b);
+        if (is->has_else) lower_constexpr_calls_block(is->else_b);
+        return;
+    }
+    if (auto* ws = dynamic_cast<WhileStmt*>(&s)) {
+        lower_constexpr_calls_expr(ws->cond);
+        lower_constexpr_calls_block(ws->body);
+        return;
+    }
+    if (dynamic_cast<BreakStmt*>(&s)) return;
+    if (dynamic_cast<ContinueStmt*>(&s)) return;
+    if (auto* bs = dynamic_cast<BlockStmt*>(&s)) { lower_constexpr_calls_block(bs->block); return; }
+    if (auto* ds = dynamic_cast<DeferStmt*>(&s)) { lower_constexpr_calls_expr(ds->expr); return; }
+    if (auto* fs = dynamic_cast<ForStmt*>(&s)) {
+        if (fs->init) lower_constexpr_calls_stmt(*fs->init);
+        if (fs->cond) lower_constexpr_calls_expr(fs->cond);
+        if (fs->step) lower_constexpr_calls_expr(fs->step);
+        lower_constexpr_calls_block(fs->body);
+        return;
+    }
+    if (auto* ds = dynamic_cast<DoWhileStmt*>(&s)) {
+        lower_constexpr_calls_block(ds->body);
+        if (ds->cond) lower_constexpr_calls_expr(ds->cond);
+        return;
+    }
+    if (auto* fe = dynamic_cast<ForEachStmt*>(&s)) {
+        lower_constexpr_calls_expr(fe->iter);
+        lower_constexpr_calls_block(fe->body);
+        return;
+    }
+    if (auto* sw = dynamic_cast<SwitchStmt*>(&s)) {
+        lower_constexpr_calls_expr(sw->subject);
+        for (auto& c : sw->cases) {
+            if (!c.is_default) lower_constexpr_calls_expr(c.value);
+            lower_constexpr_calls_block(c.body);
+        }
+        return;
+    }
+    if (auto* ms = dynamic_cast<MatchStmt*>(&s)) {
+        lower_constexpr_calls_expr(ms->subject);
+        for (auto& arm : ms->arms) {
+            if (!arm.is_wildcard) lower_constexpr_calls_expr(arm.pattern);
+            lower_constexpr_calls_block(arm.body);
+        }
+        return;
+    }
+}
+
+void Checker::lower_constexpr_calls_block(Block& b) {
+    for (auto& s : b.stmts) lower_constexpr_calls_stmt(*s);
+}
+
 // Pass 1.7 (docs/planning/plan_ENUMS.md Section 5): rewrite every EnumAccessExpr to an
 // IntLit before check_expr runs, walking the statement tree in parallel
 // with check_stmt/check_block's own traversal. After this pass there are no
@@ -2093,6 +2581,19 @@ SemaResult sema(Program& prog,
     }
     for (auto& f : prog.funcs) {
         c.lower_enum_access_block(f.body);
+    }
+    // constexpr call folding pre-pass (Tier 1): after enum lowering (so enum
+    // variants are already IntLits) and BEFORE any check_expr runs (so global
+    // initializers, case labels, and codegen all see the folded literal).
+    // Walks every ExprPtr slot bottom-up; a CallExpr to a constexpr fn with
+    // all-constant i64 args is evaluated and replaced with an IntLit. If the
+    // eval fails (non-const arg, too-deep recursion, unsupported node), the
+    // CallExpr is left as-is — the fn is still callable at runtime.
+    for (auto& g : prog.globals) {
+        if (g.init) c.lower_constexpr_calls_expr(g.init);
+    }
+    for (auto& f : prog.funcs) {
+        c.lower_constexpr_calls_block(f.body);
     }
     // register script function signatures (pass 2 of docs/spec/COMPILER_PIPELINE.md Section 4:
     // all signatures resolved before any body is checked, so forward calls work)
