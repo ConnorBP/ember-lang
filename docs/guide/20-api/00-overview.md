@@ -1,0 +1,43 @@
+# API Reference Overview
+
+This section documents the standard extension native functions that every Ember host can expose to a running script. Native functions are the only way a script observes or affects anything outside its own values: printing, asserting, string handling, math, and arrays.
+
+A host application may register additional, host-specific natives on top of these (drawing, process memory, UI widgets, and so on). Those are documented by the host, not in this guide. This page covers only the standard extension surface that ships with Ember itself.
+
+## How This Section Is Organized
+
+Each functional category has its own page. A script rarely needs the whole surface at once, so grouping by purpose keeps each page short enough to scan while writing a script.
+
+- [I/O and Debug](10-io-debug.md): `print_i64`, `print_f32`, and `print_str`, for getting values out of a running script
+- [Assertions](20-assertions.md): `assert_eq_*`, lightweight in-script self-checks
+- [Strings](30-strings.md): `string_*`, `str_compare`, `str_length`, plus the string `+` and `==` overloads
+- [Math and Vectors](40-math-vectors.md): `vec2`/`vec3`/`vec4`/`quat`/`mat4` handle types and scalar math helpers
+- [Arrays](50-arrays.md): `array_*` handle functions for the `array of T` handle type
+
+## Naming Conventions
+
+Every native function name is snake_case, matching Ember's own identifier convention for functions and variables. A few consistent patterns show up across categories:
+
+- **`get_` / `set_` prefixes** mark a paired accessor and mutator for the same underlying value. If you see a `get_something`, check the same page for a matching `set_something` before assuming the value is read-only.
+- **`assert_eq_` prefix** marks the self-check family described on the Assertions page. Every one of these compares two values of a fixed type and traps the script on mismatch rather than returning a bool.
+- Everything else follows a plain `noun_verb` or `category_action` shape, such as `string_from_slice`, `array_push`, or `vec3_new`.
+
+```ember
+// assert_eq_ self-check and plain snake_case in one script
+let total: i64 = 0;
+for (let i: i64 = 1; i <= 5; i += 1) {
+    total += i;
+}
+assert_eq_i64(total, 15);
+print_i64(total);
+```
+
+## Parameter Types Shown Are Ember-Side Types
+
+Every signature in this section is written in Ember's own type syntax, the same syntax you would use in a `fn` declaration. These are the types the function expects when called from a script, not the C++ types on the host side. A parameter documented as `s: i64` for a string function means "pass a string handle here," since `string` is itself an opaque `i64` handle from Ember's point of view. A parameter documented as `s: u8[]` means a byte slice, and a bare string literal converts to either automatically depending on which the function expects.
+
+> **NOTE:** Several native functions internally call a compiler-generated string-decrypt helper (its name is double-underscore prefixed) as part of string-obfuscation output. This helper is not documented on any page in this section because scripts never call it directly. It is inserted automatically by the compiler wherever an `obf` or `obf_keyed` annotation applies to a string literal, and it has no callable form in Ember source.
+
+## Reading a Signature
+
+Each entry in the category pages follows the same shape: the function name, its parameter list with Ember types, its return type (or no arrow if it returns nothing), and a short description of behavior and any gotchas (stub status, trap conditions, side effects). Where a function is also reachable through method-call sugar, such as `s.string_length()` desugaring to `string_length(s)`, the entry notes it.
