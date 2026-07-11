@@ -67,7 +67,6 @@ add_library(ember STATIC
     src/jit_memory.cpp
     src/engine.cpp
     src/em_writer.cpp
-    src/em_loader.cpp
     src/module_registry.cpp
     # Stage A c1 (IL-.em): the thin three-address IR data structures' debug
     # pretty-printer. Lives in the CORE lib (not ember_frontend) because it
@@ -106,6 +105,14 @@ add_library(ember_frontend STATIC
     src/thin_lower.cpp
     src/peephole.cpp
     src/thin_emit.cpp
+    # Stage B c2: em_loader.cpp moved here from the core `ember` lib because the
+    # v5 IR re-emit path (deserialize_thin_function + emit_x64) needs frontend
+    # symbols (emit_x64 from thin_emit.cpp, CodeGenCtx from codegen.hpp). The
+    # core lib must not depend on ember_frontend (one-way link direction), so
+    # the loader — which now drives the IR re-emit — lives in the frontend.
+    # em_loader.hpp stays in src/ (available to both libs); only the .cpp moved.
+    # em_writer.cpp stays in the core lib (it has no frontend dependencies).
+    src/em_loader.cpp
 )
 target_include_directories(ember_frontend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ember_frontend PUBLIC ember)
@@ -155,7 +162,7 @@ target_link_libraries(import_roundtrip_test PRIVATE ember ember_frontend)
 add_test(NAME import_roundtrip COMMAND import_roundtrip_test)
 
 add_executable(em_loader_hardening_test examples/em_loader_hardening_test.cpp)
-target_link_libraries(em_loader_hardening_test PRIVATE ember)
+target_link_libraries(em_loader_hardening_test PRIVATE ember ember_frontend)
 add_test(NAME em_loader_hardening COMMAND em_loader_hardening_test)
 
 # ext_runtime_test: runtime coverage for the relocated extensions (RESTRUCTURE_PLAN.md Section 6).

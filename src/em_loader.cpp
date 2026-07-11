@@ -7,6 +7,10 @@
 
 #include "em_loader.hpp"
 #include "em_type_codec.hpp"  // shared .em canonical-type codec (parse_type/canonical_type_same/parse_signature)
+#include "thin_ir_ser.hpp"  // Stage B: deserialize_thin_function / validate_thin_function
+#include "thin_emit.hpp"    // Stage B: emit_x64 (re-emit deserialized IR -> x64)
+#include "codegen.hpp"      // Stage B: CodeGenCtx (the load-time re-emit context)
+#include "dispatch_table.hpp" // Stage B: DispatchTable (for the load-time dispatch base)
 
 #include <algorithm>
 #include <array>
@@ -103,6 +107,12 @@ struct ParsedFn {
     std::vector<uint8_t> rodata;
     std::vector<EmReloc> relocs;
     std::vector<EmNativeBinding> native_bindings;
+    // v5 (Stage B): when non-empty, this function is an IR function — the
+    // ir_blob is the output of serialize_thin_function (opaque to parse_file;
+    // deserialized + validated + re-emitted in load_em_file_impl). When empty,
+    // the function is a raw-x86 fallback (code/rodata/relocs/native_bindings
+    // are populated as in v3/v4).
+    std::vector<uint8_t> ir_blob;
 };
 
 struct ParsedModule {
@@ -215,7 +225,8 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
         return false;
     }
     if (version != EM_VERSION_V1 && version != EM_VERSION_V2 &&
-        version != EM_VERSION_V3 && version != EM_VERSION) {
+        version != EM_VERSION_V3 && version != EM_VERSION &&
+        version != EM_VERSION_V5) {
         set_error(err, "em_loader: format: unsupported version " + std::to_string(version)); return false;
     }
     mod.version = version;
@@ -257,8 +268,8 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
         if (!parse_name(rd, f.name, "function name", err)) return false;
 
         uint32_t code_size = 0, rodata_size = 0;
-        if (!rd.u32(f.slot_index) || !rd.u32(code_size) || !rd.u32(rodata_size)) {
-            set_error(err, "em_loader: format: truncated function metadata");
+        if (!rd.u32(f.slot_index)) {
+            set_error(err, "em_loader: format: truncated function metadata (slot_index)");
             return false;
         }
         if (f.slot_index >= MAX_SLOTS) {
@@ -272,6 +283,54 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
         }
         slot_seen[f.slot_index] = 1;
         max_slot = std::max(max_slot, f.slot_index);
+
+        // v5 per-function record: is_ir byte + hoisted signature, then either
+        // the IR blob (is_ir=1) or the v4 raw-x86 body (is_ir=0).
+        if (version == EM_VERSION_V5) {
+            uint8_t is_ir = 0;
+            if (!rd.u8(is_ir)) {
+                set_error(err, "em_loader: format: truncated v5 is_ir byte");
+                return false;
+            }
+            if (is_ir != 0 && is_ir != 1) {
+                set_error(err, "em_loader: format: invalid v5 is_ir byte (must be 0 or 1)");
+                return false;
+            }
+            if (!parse_signature(rd, f.signature, err)) return false;
+            if (is_ir) {
+                // IR function: read the opaque ir_blob. parse_file does NOT
+                // interpret it — deserialization + validation + re-emit happen
+                // in load_em_file_impl BEFORE alloc_executable_rw.
+                uint32_t ir_blob_len = 0;
+                if (!rd.u32(ir_blob_len)) {
+                    set_error(err, "em_loader: format: truncated v5 ir_blob_len");
+                    return false;
+                }
+                if (ir_blob_len > MAX_FILE_SIZE) {
+                    set_error(err, "em_loader: limit: v5 ir_blob_len exceeds file limit");
+                    return false;
+                }
+                if (ir_blob_len > rd.remaining()) {
+                    set_error(err, "em_loader: format: v5 ir_blob cannot fit in file");
+                    return false;
+                }
+                const uint8_t* blob = nullptr;
+                if (!rd.take(ir_blob_len, blob)) {
+                    set_error(err, "em_loader: format: truncated v5 ir_blob");
+                    return false;
+                }
+                f.ir_blob.assign(blob, blob + ir_blob_len);
+                mod.functions.push_back(std::move(f));
+                continue;  // NO code/rodata/relocs/native_bindings follow.
+            }
+            // is_ir == 0: fall through to the raw-x86 body (code_size +
+            // rodata_size follow, same as v3/v4 after the hoisted signature).
+        }
+
+        if (!rd.u32(code_size) || !rd.u32(rodata_size)) {
+            set_error(err, "em_loader: format: truncated function metadata (code/rodata size)");
+            return false;
+        }
 
         if (code_size == 0 || code_size > MAX_CODE_PER_FN) {
             set_error(err, "em_loader: limit: invalid/excessive code_size in \"" + f.name + "\"");
@@ -343,9 +402,12 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
         }
         // v2+ records carry a canonical export signature + symbolic native
         // bindings (v3 keeps the v2 per-function layout byte-identical; only
-        // the name directory's contents differ - F1 visibility).
+        // the name directory's contents differ - F1 visibility). v5 hoisted
+        // the signature above the is_ir branch, so it is NOT re-read here.
         if(version >= EM_VERSION_V2) {
-            if(!parse_signature(rd,f.signature,err))return false;
+            if (version != EM_VERSION_V5) {
+                if(!parse_signature(rd,f.signature,err))return false;
+            }
             uint32_t binding_count=0;if(!rd.u32(binding_count)){set_error(err,"em_loader: format: truncated native binding count");return false;}
             if(binding_count>MAX_RELOCS_PER_FN){set_error(err,"em_loader: limit: native binding count");return false;}
             f.native_bindings.resize(binding_count);
@@ -579,6 +641,118 @@ bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
     }
     staged.pages.reserve(parsed.functions.size());
     std::vector<void*> entries(parsed.functions.size(), nullptr);
+
+    // v5 (Stage B): for IR functions (ir_blob non-empty), deserialize +
+    // validate + re-emit to x64 HERE, BEFORE any alloc_executable_rw. This is
+    // the v5 SECURITY MODEL: a tampered/malformed v5 .em is REJECTED at IR
+    // validation with NO executable page allocated. The re-emitted code/rodata/
+    // relocs/native_bindings replace the ParsedFn's empty fields so the
+    // existing exec-page loop below handles them uniformly.
+    if (parsed.version == EM_VERSION_V5) {
+        // Build the load-time CodeGenCtx for re-emit. The dispatch + globals
+        // bases are the staged backing stores (stable — never resize after
+        // an address is patched). natives is the host table. script_slots is
+        // built from the parsed functions. structs is empty (the passing IR
+        // cases — scalar/control-flow/calls — don't need struct layouts; the
+        // known-gap cases ship raw-x86 fallback via is_ir=0).
+        std::unordered_map<std::string, int> slot_map;
+        for (const auto& pf : parsed.functions)
+            slot_map[pf.name] = int(pf.slot_index);
+        StructLayoutTable empty_structs;
+        CodeGenCtx ictx;
+        ictx.dispatch_base = reinterpret_cast<int64_t>(staged.dispatch.data());
+        ictx.globals_base  = reinterpret_cast<int64_t>(staged.globals.data());
+        ictx.natives = natives;
+        ictx.script_slots = &slot_map;
+        ictx.structs = &empty_structs;
+        ictx.enable_ir_backend = true;  // emit_x64 is the IR-path emitter
+
+        for (auto& pf : parsed.functions) {
+            if (pf.ir_blob.empty()) continue;  // raw-x86 fallback — skip
+            ThinFunction thf;
+            const uint8_t* cur = pf.ir_blob.data();
+            const uint8_t* end = pf.ir_blob.data() + pf.ir_blob.size();
+            std::string derr;
+            if (!deserialize_thin_function(cur, end, pf.name,
+                                           int32_t(pf.slot_index), thf, &derr)) {
+                set_error(err, "em_loader: v5 IR: deserialization failed for \"" +
+                               pf.name + "\": " + derr);
+                return false;
+            }
+            // Native rebind: for every CallNative instr, look up
+            // meta.native_name in the host table and set native_fn. An IR
+            // module referencing a native the host didn't register is
+            // REJECTED — the core v5 security gate (no exec page allocated).
+            if (natives) {
+                for (auto& blk : thf.blocks) {
+                    for (auto& in : blk.instrs) {
+                        if (in.op == ThinOp::CallNative && !in.meta.native_name.empty()) {
+                            auto it = natives->find(in.meta.native_name);
+                            if (it == natives->end() || !it->second.fn_ptr) {
+                                set_error(err, "em_loader: v5 IR: unknown native \"" +
+                                               in.meta.native_name + "\" in \"" +
+                                               pf.name + "\"");
+                                return false;
+                            }
+                            in.native_fn = it->second.fn_ptr;
+                        }
+                    }
+                }
+            } else if (!pf.ir_blob.empty()) {
+                // An IR function with CallNative instrs but no host native
+                // table — check whether any CallNative exists.
+                bool has_native_call = false;
+                for (const auto& blk : thf.blocks)
+                    for (const auto& in : blk.instrs)
+                        if (in.op == ThinOp::CallNative && !in.meta.native_name.empty())
+                            { has_native_call = true; break; }
+                if (has_native_call) {
+                    set_error(err, "em_loader: v5 IR: function \"" + pf.name +
+                                   "\" calls a native but host provided no native table");
+                    return false;
+                }
+            }
+            // Semantic validation (VReg bounds, block-target bounds, etc.).
+            std::string verr;
+            if (!validate_thin_function(thf, &verr)) {
+                set_error(err, "em_loader: v5 IR: validation failed for \"" +
+                               pf.name + "\": " + verr);
+                return false;
+            }
+            // Re-emit the deserialized IR to x64.
+            CompiledFn cf = emit_x64(thf, ictx);
+            if (cf.bytes.empty()) {
+                set_error(err, "em_loader: v5 IR: re-emit produced empty code for \"" +
+                               pf.name + "\"");
+                return false;
+            }
+            // Replace the ParsedFn's fields with the re-emitted code so the
+            // existing exec-page loop handles it uniformly.
+            pf.code = std::move(cf.bytes);
+            pf.rodata = std::move(cf.rodata);
+            pf.relocs.clear();
+            pf.relocs.reserve(cf.abs_fixups.size());
+            for (const auto& af : cf.abs_fixups) {
+                EmReloc r;
+                r.offset = af.code_offset;
+                r.kind = static_cast<uint8_t>(af.kind);
+                r.addend = af.addend;
+                pf.relocs.push_back(r);
+            }
+            pf.native_bindings.clear();
+            pf.native_bindings.reserve(cf.native_fixups.size());
+            for (const auto& nf : cf.native_fixups) {
+                EmNativeBinding b;
+                b.offset = nf.code_offset;
+                b.name = nf.name;
+                b.signature.ret = nf.ret;
+                b.signature.params = nf.params;
+                pf.native_bindings.push_back(std::move(b));
+            }
+            pf.ir_blob.clear();  // consumed — no longer needed
+            pf.ir_blob.shrink_to_fit();
+        }
+    }
 
     for (size_t i = 0; i < parsed.functions.size(); ++i) {
         const ParsedFn& f = parsed.functions[i];

@@ -56,4 +56,12 @@ bool write_em_file_signed(const EmModule& mod, const char* path,
                           const std::array<uint8_t,64>& priv,
                           std::string* err);
 
+// v5 (Stage B, IL-.em): write an UNSIGNED v5 module. A v5 module carries IR
+// (not raw x86) for IR-serializable functions (EmFunctionRecord::ir_blob
+// non-empty -> is_ir=1) and raw-x86 fallback for non-serializable functions
+// (ir_blob empty -> is_ir=0). UNSIGNED for Stage B (the v3 "trailing bytes ==
+// 0" rule holds; a v5-signed variant is FUTURE work). See em_file.hpp for the
+// v5 per-function record layout + the security model.
+bool write_em_file_v5(const EmModule& mod, const char* path, std::string* err);
+
 } // namespace ember

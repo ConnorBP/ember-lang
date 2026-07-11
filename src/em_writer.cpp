@@ -55,6 +55,10 @@ namespace {
 // Write the low byte first; each shift picks the next byte up. `ofs` is the
 // stream we append to; bytes go in order so the on-disk order is LE.
 
+void emit_u8(std::ostream& ofs, uint8_t v) {
+    ofs.write(reinterpret_cast<const char*>(&v), 1);
+}
+
 void emit_u16_le(std::ostream& ofs, uint16_t v) {
     uint8_t b[2] = {
         static_cast<uint8_t>(v & 0xFFu),
@@ -123,14 +127,19 @@ bool count_fits_u32(size_t n, std::string* err, const char* ctx) {
 
 // ---- shared pre-flight: bounds-check every disk-controlled count/size so we
 // never write a truncated header or a corrupt record. Pure validation — no I/O.
-bool preflight_em_module(const EmModule& mod, std::string* err, uint64_t& rodata_total_out) {
+bool preflight_em_module(const EmModule& mod, std::string* err, uint64_t& rodata_total_out,
+                         uint32_t version = EM_VERSION_V3) {
     if (!count_fits_u32(mod.functions.size(), err, "function_count")) return false;
     if (!count_fits_u32(mod.globals.size(),  err, "global_size"))      return false;
     if (!count_fits_u32(mod.name_table.size(), err, "name_table_count")) return false;
 
     uint64_t rodata_total_acc = 0;
     for (const auto& f : mod.functions) {
-        if (!f.non_serializable_reason.empty()) {
+        const bool is_ir_fn = (version == EM_VERSION_V5) && !f.ir_blob.empty();
+        // IR functions ship IR (portable by construction — the IR has no
+        // process-local ptrs). Raw-x86 fallback functions (ir_blob empty) must
+        // have portable raw-x86 (non_serializable_reason empty), same as v3/v4.
+        if (!is_ir_fn && !f.non_serializable_reason.empty()) {
             if (err) *err = "em_writer: function \"" + f.name + "\" is not portable: " + f.non_serializable_reason;
             return false;
         }
@@ -181,6 +190,24 @@ bool emit_em_content(std::ostream& ofs, const EmModule& mod, uint32_t version,
         emit_u16_le(ofs, static_cast<uint16_t>(f.name.size()));
         emit_string(ofs, f.name);
         emit_u32_le(ofs, f.slot_index);
+
+        if (version == EM_VERSION_V5) {
+            // v5 per-function record: is_ir byte + signature (hoisted above
+            // the branch), then either the IR blob or the v4 raw-x86 body.
+            const bool is_ir = !f.ir_blob.empty();
+            emit_u8(ofs, is_ir ? 1u : 0u);
+            emit_signature(ofs, f.signature);
+            if (is_ir) {
+                // IR function — carries IR, NOT machine code. The blob is
+                // opaque to the .em container (serialize_thin_function output).
+                emit_u32_le(ofs, static_cast<uint32_t>(f.ir_blob.size()));
+                emit_bytes(ofs, f.ir_blob);
+                continue;  // NO code/rodata/relocs/native_bindings follow.
+            }
+            // is_ir == 0: fall through to the raw-x86 body (byte-identical to
+            // the v4 body after the is_ir byte + hoisted signature).
+        }
+
         emit_u32_le(ofs, static_cast<uint32_t>(f.code.size()));
         emit_u32_le(ofs, static_cast<uint32_t>(f.rodata.size()));
         std::vector<uint8_t> portable_code = f.code;
@@ -199,7 +226,12 @@ bool emit_em_content(std::ostream& ofs, const EmModule& mod, uint32_t version,
             ofs.write(reinterpret_cast<const char*>(&kb), 1);
             emit_u32_le(ofs, r.addend);
         }
-        emit_signature(ofs, f.signature);
+        // v2+ records carry a canonical export signature after the relocs.
+        // v5 hoisted the signature above the is_ir branch, so it is NOT
+        // re-emitted here for v5.
+        if (version != EM_VERSION_V5) {
+            emit_signature(ofs, f.signature);
+        }
         emit_u32_le(ofs, static_cast<uint32_t>(f.native_bindings.size()));
         for (const auto& b : f.native_bindings) {
             emit_u32_le(ofs, b.offset);
@@ -227,6 +259,23 @@ bool write_em_file(const EmModule& mod, const char* path, std::string* err) {
     std::ofstream ofs(path, std::ios::binary | std::ios::out | std::ios::trunc);
     if (!ofs) { if (err) *err = std::string("em_writer: could not open output file: ") + path; return false; }
     if (!emit_em_content(ofs, mod, EM_VERSION_V3, rodata_total, err)) { ofs.close(); return false; }
+    ofs.flush();
+    if (!ofs) { if (err) *err = "em_writer: I/O error during write/flush"; return false; }
+    return true;
+}
+
+// v5 (Stage B, IL-.em): write an UNSIGNED v5 module. A v5 module carries IR
+// (not raw x86) for IR-serializable functions (ir_blob non-empty -> is_ir=1)
+// and raw-x86 fallback for non-serializable functions (ir_blob empty ->
+// is_ir=0, byte-identical v4 body after the is_ir byte + hoisted signature).
+// UNSIGNED for Stage B (the v3 "trailing bytes == 0" rule holds; a v5-signed
+// variant is FUTURE work). See em_file.hpp for the v5 format + security model.
+bool write_em_file_v5(const EmModule& mod, const char* path, std::string* err) {
+    uint64_t rodata_total = 0;
+    if (!preflight_em_module(mod, err, rodata_total, EM_VERSION_V5)) return false;
+    std::ofstream ofs(path, std::ios::binary | std::ios::out | std::ios::trunc);
+    if (!ofs) { if (err) *err = std::string("em_writer: could not open output file: ") + path; return false; }
+    if (!emit_em_content(ofs, mod, EM_VERSION_V5, rodata_total, err)) { ofs.close(); return false; }
     ofs.flush();
     if (!ofs) { if (err) *err = "em_writer: I/O error during write/flush"; return false; }
     return true;
