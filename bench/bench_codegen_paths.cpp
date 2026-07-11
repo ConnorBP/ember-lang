@@ -62,6 +62,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <cmath>
+#include <random>
 
 using namespace ember;
 
@@ -312,7 +313,77 @@ static Stats time_baseline(BaselineFn fn, int64_t N, int iters, int warmup) {
     return s;
 }
 
-// ---- the 6 prototype paths (one per category; see design doc §6) ----
+// ---- paired/interleaved comparison (kills shared-mode noise) ----
+// Alternates ember/baseline per iteration, collects per-pair ratios.
+// Returns the median of the paired ratios + a bootstrap 95% CI.
+struct PairedStats {
+    double median_ratio;     // median of per-pair (ember_ns / baseline_ns)
+    double ci_lo, ci_hi;     // bootstrap 95% CI on the median ratio
+    double mean_ratio;       // mean of per-pair ratios
+    int n_pairs;             // number of valid pairs (baseline_ns > 0)
+};
+
+static PairedStats time_paired(BenchModule& m, context_t& ectx, void* entry,
+                               BaselineFn bfn, int64_t N,
+                               int iters, int warmup) {
+    PairedStats ps{}; ps.median_ratio = 0; ps.ci_lo = 0; ps.ci_hi = 0;
+    ps.mean_ratio = 0; ps.n_pairs = 0;
+    // warmup both
+    for (int w = 0; w < warmup; ++w) {
+        ectx.reset_for_call(); ectx.budget_remaining = INT64_MAX;
+        ectx.has_checkpoint = true;
+        if (__builtin_setjmp(ectx.checkpoint)) return ps;  // trap
+        (void)ember_call_void(entry, &ectx);
+        ectx.has_checkpoint = false;
+        g_baseline_N = N; (void)bfn(g_baseline_N);
+    }
+    // interleaved timed iters
+    std::vector<double> ratios; ratios.reserve(size_t(iters));
+    for (int it = 0; it < iters; ++it) {
+        // ember
+        ectx.reset_for_call(); ectx.budget_remaining = INT64_MAX;
+        ectx.has_checkpoint = true;
+        if (__builtin_setjmp(ectx.checkpoint)) return ps;
+        auto te0 = std::chrono::steady_clock::now();
+        (void)ember_call_void(entry, &ectx);
+        auto te1 = std::chrono::steady_clock::now();
+        ectx.has_checkpoint = false;
+        double ens = double(std::chrono::duration_cast<std::chrono::nanoseconds>(te1 - te0).count());
+        // baseline (immediately after — shared system state)
+        auto tb0 = std::chrono::steady_clock::now();
+        g_baseline_N = N; (void)bfn(g_baseline_N);
+        auto tb1 = std::chrono::steady_clock::now();
+        double bns = double(std::chrono::duration_cast<std::chrono::nanoseconds>(tb1 - tb0).count());
+        if (bns > 0) ratios.push_back(ens / bns);
+    }
+    if (ratios.empty()) return ps;
+    ps.n_pairs = int(ratios.size());
+    // median + mean of ratios
+    std::vector<double> sorted = ratios;
+    std::sort(sorted.begin(), sorted.end());
+    ps.median_ratio = sorted[sorted.size() / 2];
+    ps.mean_ratio = 0; for (double r : ratios) ps.mean_ratio += r;
+    ps.mean_ratio /= double(ratios.size());
+    // bootstrap 95% CI on the median (B=1000 resamples)
+    // Simple bootstrap: resample with replacement, compute median of each
+    // resample, take the 2.5th and 97.5th percentiles of the medians.
+    std::vector<double> boot_medians;
+    boot_medians.reserve(1000);
+    std::mt19937 rng(12345);  // fixed seed for reproducibility
+    for (int b = 0; b < 1000; ++b) {
+        std::vector<double> resample;
+        resample.reserve(ratios.size());
+        std::uniform_int_distribution<int> dist(0, int(ratios.size()) - 1);
+        for (size_t i = 0; i < ratios.size(); ++i)
+            resample.push_back(ratios[size_t(dist(rng))]);
+        std::sort(resample.begin(), resample.end());
+        boot_medians.push_back(resample[resample.size() / 2]);
+    }
+    std::sort(boot_medians.begin(), boot_medians.end());
+    ps.ci_lo = boot_medians[size_t(double(boot_medians.size()) * 0.025)];
+    ps.ci_hi = boot_medians[size_t(double(boot_medians.size()) * 0.975)];
+    return ps;
+}
 // Each ember `main` does a fixed amount of work exercising the named path;
 // the matching extern "C" fn in baseline_paths.cpp does the SAME work (taking
 // inner_n as its N param). The `%N` token in ember_src is substituted with
@@ -476,6 +547,18 @@ int main(int argc, char** argv) {
             std::printf("  safety=%-3s  ember median=%9.1f ns  g++-O2 median=%9.1f ns  ratio=%6.2f  [%s]\n",
                         mode, es.median, bs.median, es.median / bs.median,
                         verdict(es.median / bs.median));
+            // Paired/interleaved comparison + bootstrap 95% CI (kills shared-
+            // mode noise — the separate-loop ratio above can drift if system
+            // state changes between the ember and baseline timing windows).
+            if (!es.trapped) {
+                context_t pctx; pctx.max_call_depth = 8192; pctx.budget_remaining = INT64_MAX;
+                PairedStats ps = time_paired(*m, pctx, m->table.get(m->slots["main"]),
+                                             bfn, p.inner_n, std::min(p.iters, 200), std::min(p.warmup, 10));
+                if (ps.n_pairs > 0) {
+                    std::printf("  [paired] safety=%-3s  paired median ratio=%5.2f  CI=[%.2f, %.2f]  (n=%d)\n",
+                                mode, ps.median_ratio, ps.ci_lo, ps.ci_hi, ps.n_pairs);
+                }
+            }
         }
     }
     FreeLibrary(hBaseline);
