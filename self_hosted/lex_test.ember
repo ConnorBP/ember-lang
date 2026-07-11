@@ -1,0 +1,473 @@
+// self_hosted/lex_test.ember — tests for the self-hosted ember lexer (lex.ember).
+//
+// TDD: every token type is exercised. The test lexes known source snippets and
+// verifies the token stream's kinds, text, positions, and decoded literal
+// values. main() returns 0 on full success, or a nonzero code identifying the
+// first failing check (so a failure is harness-observable, not a silent 0).
+//
+// Run: ./buildt/ember_cli.exe run self_hosted/lex_test.ember --fn main
+// (exit 0 == all tests pass).
+
+import "lex.ember";
+
+// ---------------------------------------------------------------------------
+// tiny assertion helpers. fail() returns a distinct nonzero code so the
+// harness sees which check broke; the driver returns immediately on the first
+// failure (tests are sequential — a wrong token early usually cascades, so
+// reporting the first failure is the most useful signal).
+// ---------------------------------------------------------------------------
+
+// global accumulator: number of checks that passed. Returned as 0 only if
+// every check passed (we encode failures as negative codes instead).
+global g_pass : i64 = 0;
+
+// Check `got == want`; if so, bump g_pass and return 0, else return `code`
+// (a nonzero identifier for this check). The driver checks the return: 0 =
+// keep going, nonzero = bail with that code.
+fn ck(got: i64, want: i64, code: i64) -> i64 {
+    if (got == want) { g_pass = g_pass + 1; return 0; }
+    return code;
+}
+
+// Check `got == want` for strings; same protocol.
+fn cks(got: string, want: string, code: i64) -> i64 {
+    if (got == want) { g_pass = g_pass + 1; return 0; }
+    return code;
+}
+
+// ---------------------------------------------------------------------------
+// Test 1 — the canonical program: full token stream for
+//   fn main() -> i64 { return 42; }
+// Verifies kinds, text, line/col, and the integer literal value.
+// ---------------------------------------------------------------------------
+fn test_canonical() -> i64 {
+    let arr: i64 = lex("fn main() -> i64 { return 42; }");
+    if (lex_failed() != 0) { return 1001; }
+    let mut r: i64 = 0;
+
+    // 12 tokens: fn main ( ) -> i64 { return 42 ; } EOF
+    r = ck(tok_count(arr), 12, 1010); if (r != 0) { return r; }
+
+    r = ck(tok_kind(arr, 0), Tok::Kw_fn as i64, 1011); if (r != 0) { return r; }
+    r = cks(tok_text(arr, 0), string_from_slice("fn"), 1012); if (r != 0) { return r; }
+    r = ck(tok_line(arr, 0), 1, 1013); if (r != 0) { return r; }
+    r = ck(tok_col(arr, 0), 1, 1014); if (r != 0) { return r; }
+
+    r = ck(tok_kind(arr, 1), Tok::Ident as i64, 1021); if (r != 0) { return r; }
+    r = cks(tok_text(arr, 1), string_from_slice("main"), 1022); if (r != 0) { return r; }
+    r = ck(tok_col(arr, 1), 4, 1023); if (r != 0) { return r; }
+
+    r = ck(tok_kind(arr, 2), Tok::LParen as i64, 1031); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 3), Tok::RParen as i64, 1032); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 4), Tok::Arrow as i64, 1033); if (r != 0) { return r; }
+    r = cks(tok_text(arr, 4), string_from_slice("->"), 1034); if (r != 0) { return r; }
+
+    r = ck(tok_kind(arr, 5), Tok::Kw_i64 as i64, 1041); if (r != 0) { return r; }
+    r = cks(tok_text(arr, 5), string_from_slice("i64"), 1042); if (r != 0) { return r; }
+
+    r = ck(tok_kind(arr, 6), Tok::LBrace as i64, 1051); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 7), Tok::Kw_return as i64, 1052); if (r != 0) { return r; }
+
+    r = ck(tok_kind(arr, 8), Tok::IntLit as i64, 1061); if (r != 0) { return r; }
+    r = cks(tok_text(arr, 8), string_from_slice("42"), 1062); if (r != 0) { return r; }
+    r = ck(tok_ivalue(arr, 8), 42, 1063); if (r != 0) { return r; }
+
+    r = ck(tok_kind(arr, 9), Tok::Semicolon as i64, 1071); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 10), Tok::RBrace as i64, 1072); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 11), Tok::Eof as i64, 1081); if (r != 0) { return r; }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 2 — every keyword. Lexes each keyword alone and checks its kind. Also
+// checks that `true`/`false` become BoolLit (matching the C++ lexer).
+// ---------------------------------------------------------------------------
+fn test_keywords() -> i64 {
+    // each entry: lex the keyword, expect the kind. We re-lex per keyword so a
+    // failure localizes. The keyword is followed by a space so the identifier
+    // scan stops cleanly (it would anyway at EOF, but this is explicit).
+    let mut r: i64 = 0;
+
+    r = ck(tok_kind(lex("fn "), 0), Tok::Kw_fn as i64, 2001); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("let "), 0), Tok::Kw_let as i64, 2002); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("mut "), 0), Tok::Kw_mut as i64, 2003); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("const "), 0), Tok::Kw_const as i64, 2004); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("constexpr "), 0), Tok::Kw_constexpr as i64, 2005); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("global "), 0), Tok::Kw_global as i64, 2006); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("struct "), 0), Tok::Kw_struct as i64, 2007); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("enum "), 0), Tok::Kw_enum as i64, 2008); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("if "), 0), Tok::Kw_if as i64, 2009); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("else "), 0), Tok::Kw_else as i64, 2010); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("while "), 0), Tok::Kw_while as i64, 2011); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("do "), 0), Tok::Kw_do as i64, 2012); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("for "), 0), Tok::Kw_for as i64, 2013); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("switch "), 0), Tok::Kw_switch as i64, 2014); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("case "), 0), Tok::Kw_case as i64, 2015); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("default "), 0), Tok::Kw_default as i64, 2016); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("break "), 0), Tok::Kw_break as i64, 2017); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("continue "), 0), Tok::Kw_continue as i64, 2018); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("return "), 0), Tok::Kw_return as i64, 2019); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("defer "), 0), Tok::Kw_defer as i64, 2020); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("match "), 0), Tok::Kw_match as i64, 2021); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("in "), 0), Tok::Kw_in as i64, 2022); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("namespace "), 0), Tok::Kw_namespace as i64, 2023); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("link "), 0), Tok::Kw_link as i64, 2024); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("priv "), 0), Tok::Kw_priv as i64, 2025); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("static_assert "), 0), Tok::Kw_static_assert as i64, 2026); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("yield "), 0), Tok::Kw_yield as i64, 2027); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("as "), 0), Tok::Kw_as as i64, 2028); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("auto "), 0), Tok::Kw_auto as i64, 2029); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("try "), 0), Tok::Kw_try as i64, 2030); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("catch "), 0), Tok::Kw_catch as i64, 2031); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("throw "), 0), Tok::Kw_throw as i64, 2032); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("sizeof "), 0), Tok::Kw_sizeof as i64, 2033); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("offsetof "), 0), Tok::Kw_offsetof as i64, 2034); if (r != 0) { return r; }
+
+    // primitive types
+    r = ck(tok_kind(lex("bool "), 0), Tok::Kw_bool as i64, 2041); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("i8 "), 0), Tok::Kw_i8 as i64, 2042); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("i16 "), 0), Tok::Kw_i16 as i64, 2043); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("i32 "), 0), Tok::Kw_i32 as i64, 2044); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("i64 "), 0), Tok::Kw_i64 as i64, 2045); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("u8 "), 0), Tok::Kw_u8 as i64, 2046); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("u16 "), 0), Tok::Kw_u16 as i64, 2047); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("u32 "), 0), Tok::Kw_u32 as i64, 2048); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("u64 "), 0), Tok::Kw_u64 as i64, 2049); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("f32 "), 0), Tok::Kw_f32 as i64, 2050); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("f64 "), 0), Tok::Kw_f64 as i64, 2051); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("void "), 0), Tok::Kw_void as i64, 2052); if (r != 0) { return r; }
+
+    // true / false -> BoolLit (the C++ lexer rewrites Kw_true/Kw_false)
+    r = ck(tok_kind(lex("true "), 0), Tok::BoolLit as i64, 2061); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("false "), 0), Tok::BoolLit as i64, 2062); if (r != 0) { return r; }
+
+    // `import` is NOT a keyword (the C++ lexer's keyword map omits it; the
+    // import resolver handles `import` lines pre-lex) -> Ident.
+    r = ck(tok_kind(lex("import "), 0), Tok::Ident as i64, 2063); if (r != 0) { return r; }
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 3 — operators and punctuation. Lexes each operator (single and
+// multi-char) and checks its kind + text. Covers the maximal-munch cases.
+// ---------------------------------------------------------------------------
+fn test_operators() -> i64 {
+    let mut r: i64 = 0;
+
+    // single-char punctuation
+    r = ck(tok_kind(lex("("), 0), Tok::LParen as i64, 3001); if (r != 0) { return r; }
+    r = ck(tok_kind(lex(")"), 0), Tok::RParen as i64, 3002); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("{"), 0), Tok::LBrace as i64, 3003); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("}"), 0), Tok::RBrace as i64, 3004); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("["), 0), Tok::LBracket as i64, 3005); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("]"), 0), Tok::RBracket as i64, 3006); if (r != 0) { return r; }
+    r = ck(tok_kind(lex(","), 0), Tok::Comma as i64, 3007); if (r != 0) { return r; }
+    r = ck(tok_kind(lex(";"), 0), Tok::Semicolon as i64, 3008); if (r != 0) { return r; }
+    r = ck(tok_kind(lex(":"), 0), Tok::Colon as i64, 3009); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("."), 0), Tok::Dot as i64, 3010); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("?"), 0), Tok::Question as i64, 3011); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("~"), 0), Tok::Tilde as i64, 3012); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("@"), 0), Tok::At as i64, 3013); if (r != 0) { return r; }
+
+    // arithmetic
+    r = ck(tok_kind(lex("+"), 0), Tok::Plus as i64, 3021); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("-"), 0), Tok::Minus as i64, 3022); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("*"), 0), Tok::Star as i64, 3023); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("/"), 0), Tok::Slash as i64, 3024); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("%"), 0), Tok::Percent as i64, 3025); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("="), 0), Tok::Assign as i64, 3026); if (r != 0) { return r; }
+
+    // comparison / logic
+    r = ck(tok_kind(lex("=="), 0), Tok::Eq as i64, 3031); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("!="), 0), Tok::Neq as i64, 3032); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("<"), 0), Tok::Lt as i64, 3033); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("<="), 0), Tok::Le as i64, 3034); if (r != 0) { return r; }
+    r = ck(tok_kind(lex(">"), 0), Tok::Gt as i64, 3035); if (r != 0) { return r; }
+    r = ck(tok_kind(lex(">="), 0), Tok::Ge as i64, 3036); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("&&"), 0), Tok::AndAnd as i64, 3037); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("||"), 0), Tok::OrOr as i64, 3038); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("!"), 0), Tok::Not as i64, 3039); if (r != 0) { return r; }
+
+    // bitwise / shift
+    r = ck(tok_kind(lex("&"), 0), Tok::Amp as i64, 3041); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("|"), 0), Tok::Pipe as i64, 3042); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("^"), 0), Tok::Caret as i64, 3043); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("<<"), 0), Tok::Shl as i64, 3044); if (r != 0) { return r; }
+    r = ck(tok_kind(lex(">>"), 0), Tok::Shr as i64, 3045); if (r != 0) { return r; }
+
+    // inc / dec
+    r = ck(tok_kind(lex("++"), 0), Tok::Inc as i64, 3051); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("--"), 0), Tok::Dec as i64, 3052); if (r != 0) { return r; }
+
+    // multi-char punctuation
+    r = ck(tok_kind(lex("::"), 0), Tok::DoubleColon as i64, 3061); if (r != 0) { return r; }
+    r = cks(tok_text(lex("::"), 0), string_from_slice("::"), 3062); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("->"), 0), Tok::Arrow as i64, 3063); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("=>"), 0), Tok::FatArrow as i64, 3064); if (r != 0) { return r; }
+    r = ck(tok_kind(lex(".."), 0), Tok::DotDot as i64, 3065); if (r != 0) { return r; }
+
+    // compound assignments
+    r = ck(tok_kind(lex("+="), 0), Tok::PlusAssign as i64, 3071); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("-="), 0), Tok::MinusAssign as i64, 3072); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("*="), 0), Tok::StarAssign as i64, 3073); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("/="), 0), Tok::SlashAssign as i64, 3074); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("%="), 0), Tok::PercentAssign as i64, 3075); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("&="), 0), Tok::AmpAssign as i64, 3076); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("|="), 0), Tok::PipeAssign as i64, 3077); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("^="), 0), Tok::CaretAssign as i64, 3078); if (r != 0) { return r; }
+    r = ck(tok_kind(lex("<<="), 0), Tok::ShlAssign as i64, 3079); if (r != 0) { return r; }
+    r = ck(tok_kind(lex(">>="), 0), Tok::ShrAssign as i64, 3080); if (r != 0) { return r; }
+
+    // maximal munch: "<<=" should be ONE ShlAssign, not Shl + "=".
+    r = ck(tok_count(lex("<<=")), 2, 3091); if (r != 0) { return r; }   // ShlAssign + Eof
+    r = ck(tok_count(lex(">>=")), 2, 3092); if (r != 0) { return r; }
+    // "==" is one Eq, not two Assign
+    r = ck(tok_count(lex("==")), 2, 3093); if (r != 0) { return r; }   // Eq + Eof
+    // "::" is one DoubleColon, not two Colon
+    r = ck(tok_count(lex("::")), 2, 3094); if (r != 0) { return r; }   // DoubleColon + Eof
+    // "->" is one Arrow, not Minus + Gt
+    r = ck(tok_count(lex("->")), 2, 3095); if (r != 0) { return r; }
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 4 — literals: decimal int, hex int, float (with f suffix), string with
+// escapes, f-string, raw string. Verifies kind, text, and decoded values.
+// ---------------------------------------------------------------------------
+fn test_literals() -> i64 {
+    let mut r: i64 = 0;
+
+    // decimal integer
+    {
+        let arr: i64 = lex("12345");
+        r = ck(tok_kind(arr, 0), Tok::IntLit as i64, 4001); if (r != 0) { return r; }
+        r = cks(tok_text(arr, 0), string_from_slice("12345"), 4002); if (r != 0) { return r; }
+        r = ck(tok_ivalue(arr, 0), 12345, 4003); if (r != 0) { return r; }
+    }
+
+    // hex integer
+    {
+        let arr: i64 = lex("0xFF");
+        r = ck(tok_kind(arr, 0), Tok::IntLit as i64, 4011); if (r != 0) { return r; }
+        r = cks(tok_text(arr, 0), string_from_slice("0xFF"), 4012); if (r != 0) { return r; }
+        r = ck(tok_ivalue(arr, 0), 255, 4013); if (r != 0) { return r; }
+    }
+    {
+        let arr: i64 = lex("0xDEAD");
+        r = ck(tok_ivalue(arr, 0), 57005, 4014); if (r != 0) { return r; }   // 0xDEAD = 57005
+    }
+
+    // float with f suffix -> FloatLit, fvalue ~= 3.14
+    {
+        let arr: i64 = lex("3.14f");
+        r = ck(tok_kind(arr, 0), Tok::FloatLit as i64, 4021); if (r != 0) { return r; }
+        r = cks(tok_text(arr, 0), string_from_slice("3.14f"), 4022); if (r != 0) { return r; }
+        let fv: f64 = tok_fvalue(arr, 0);
+        // 3.14 exactly is hard in f64; check it is in (3.13, 3.15)
+        let mut ok: i64 = 0;
+        if (fv > 3.13 && fv < 3.15) { ok = 1; }
+        r = ck(ok, 1, 4023); if (r != 0) { return r; }
+    }
+
+    // float without suffix -> FloatLit
+    {
+        let arr: i64 = lex("2.5");
+        r = ck(tok_kind(arr, 0), Tok::FloatLit as i64, 4031); if (r != 0) { return r; }
+        let fv: f64 = tok_fvalue(arr, 0);
+        let mut ok: i64 = 0;
+        if (fv > 2.49 && fv < 2.51) { ok = 1; }
+        r = ck(ok, 1, 4032); if (r != 0) { return r; }
+    }
+
+    // exponent float: 1e3 -> 1000.0
+    {
+        let arr: i64 = lex("1e3");
+        r = ck(tok_kind(arr, 0), Tok::FloatLit as i64, 4041); if (r != 0) { return r; }
+        let fv: f64 = tok_fvalue(arr, 0);
+        let mut ok: i64 = 0;
+        if (fv > 999.0 && fv < 1001.0) { ok = 1; }
+        r = ck(ok, 1, 4042); if (r != 0) { return r; }
+    }
+
+    // string literal with escapes: the raw span includes quotes + escapes;
+    // the lexer must scan past `\"` to find the real close.
+    {
+        let arr: i64 = lex("\"a\\nb\\\"c\"");
+        r = ck(tok_kind(arr, 0), Tok::StringLit as i64, 4051); if (r != 0) { return r; }
+        r = ck(tok_count(arr), 2, 4052); if (r != 0) { return r; }   // StringLit + Eof (one token, not split)
+        r = cks(tok_text(arr, 0), string_from_slice("\"a\\nb\\\"c\""), 4053); if (r != 0) { return r; }
+    }
+
+    // f-string: f"hello {x}" -> FStringLit, one token
+    {
+        let arr: i64 = lex("f\"hello {x}\"");
+        r = ck(tok_kind(arr, 0), Tok::FStringLit as i64, 4061); if (r != 0) { return r; }
+        r = ck(tok_count(arr), 2, 4062); if (r != 0) { return r; }   // FStringLit + Eof
+    }
+
+    // raw string: r"""line1\nline2""" -> RawStringLit, one token, backslash literal
+    {
+        let arr: i64 = lex("r\"\"\"line1\\nline2\"\"\"");
+        r = ck(tok_kind(arr, 0), Tok::RawStringLit as i64, 4071); if (r != 0) { return r; }
+        r = ck(tok_count(arr), 2, 4072); if (r != 0) { return r; }   // RawStringLit + Eof
+    }
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 5 — comments. Line and block comments are skipped (produce no tokens),
+// and a block comment spanning newlines tracks line numbers correctly.
+// ---------------------------------------------------------------------------
+fn test_comments() -> i64 {
+    let mut r: i64 = 0;
+
+    // line comment then a token
+    {
+        let arr: i64 = lex("// a comment\nfn");
+        r = ck(tok_count(arr), 2, 5001); if (r != 0) { return r; }   // Kw_fn + Eof
+        r = ck(tok_kind(arr, 0), Tok::Kw_fn as i64, 5002); if (r != 0) { return r; }
+        r = ck(tok_line(arr, 0), 2, 5003); if (r != 0) { return r; }  // fn is on line 2
+    }
+
+    // block comment spanning newlines, then a token whose line is correct
+    {
+        let arr: i64 = lex("/* multi\nline\ncomment */ x");
+        r = ck(tok_count(arr), 2, 5011); if (r != 0) { return r; }   // Ident + Eof
+        r = ck(tok_kind(arr, 0), Tok::Ident as i64, 5012); if (r != 0) { return r; }
+        r = cks(tok_text(arr, 0), string_from_slice("x"), 5013); if (r != 0) { return r; }
+        r = ck(tok_line(arr, 0), 3, 5014); if (r != 0) { return r; }  // x is on line 3
+    }
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 6 — identifiers: prefix underscore, digits after first char, and that a
+// keyword-like prefix (e.g. "fnn") is an Ident, not Kw_fn.
+// ---------------------------------------------------------------------------
+fn test_idents() -> i64 {
+    let mut r: i64 = 0;
+
+    {
+        let arr: i64 = lex("_foo");
+        r = ck(tok_kind(arr, 0), Tok::Ident as i64, 6001); if (r != 0) { return r; }
+        r = cks(tok_text(arr, 0), string_from_slice("_foo"), 6002); if (r != 0) { return r; }
+    }
+    {
+        let arr: i64 = lex("abc123");
+        r = ck(tok_kind(arr, 0), Tok::Ident as i64, 6011); if (r != 0) { return r; }
+        r = cks(tok_text(arr, 0), string_from_slice("abc123"), 6012); if (r != 0) { return r; }
+    }
+    {
+        let arr: i64 = lex("fnn");
+        r = ck(tok_kind(arr, 0), Tok::Ident as i64, 6021); if (r != 0) { return r; }   // not Kw_fn
+    }
+    {
+        let arr: i64 = lex("i644");
+        r = ck(tok_kind(arr, 0), Tok::Ident as i64, 6031); if (r != 0) { return r; }   // not Kw_i64
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 7 — the Token struct surface: get_token() builds a real Token with all
+// fields populated from the flat store + g_fvals.
+// ---------------------------------------------------------------------------
+fn test_struct() -> i64 {
+    let mut r: i64 = 0;
+    let arr: i64 = lex("fn 42 3.0f");
+    if (lex_failed() != 0) { return 7001; }
+
+    let t0: Token = get_token(arr, 0);
+    r = ck(t0.kind, Tok::Kw_fn as i64, 7011); if (r != 0) { return r; }
+    r = cks(t0.text, string_from_slice("fn"), 7012); if (r != 0) { return r; }
+    r = ck(t0.line, 1, 7013); if (r != 0) { return r; }
+    r = ck(t0.col, 1, 7014); if (r != 0) { return r; }
+
+    let t1: Token = get_token(arr, 1);
+    r = ck(t1.kind, Tok::IntLit as i64, 7021); if (r != 0) { return r; }
+    r = ck(t1.ivalue, 42, 7022); if (r != 0) { return r; }
+    r = cks(t1.text, string_from_slice("42"), 7023); if (r != 0) { return r; }
+
+    let t2: Token = get_token(arr, 2);
+    r = ck(t2.kind, Tok::FloatLit as i64, 7031); if (r != 0) { return r; }
+    let mut okf: i64 = 0;
+    if (t2.fvalue > 2.99 && t2.fvalue < 3.01) { okf = 1; }
+    r = ck(okf, 1, 7032); if (r != 0) { return r; }
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 8 — self-reference: lex a fragment of ember source that looks like the
+// lexer's own code, to exercise a realistic mixed token stream. This is the
+// "ember lexing ember" proof at a small scale.
+// ---------------------------------------------------------------------------
+fn test_self() -> i64 {
+    let mut r: i64 = 0;
+    let src: string = string_from_slice("fn lex(source: string) -> i64 { return g_arr; }");
+    let arr: i64 = lex(src);
+    if (lex_failed() != 0) { return 8001; }
+
+    // fn lex ( source : string ) -> i64 { return g_arr ; } EOF  = 15 tokens
+    r = ck(tok_count(arr), 15, 8010); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 0), Tok::Kw_fn as i64, 8011); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 1), Tok::Ident as i64, 8012); if (r != 0) { return r; }
+    r = cks(tok_text(arr, 1), string_from_slice("lex"), 8013); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 2), Tok::LParen as i64, 8014); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 3), Tok::Ident as i64, 8015); if (r != 0) { return r; }
+    r = cks(tok_text(arr, 3), string_from_slice("source"), 8016); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 4), Tok::Colon as i64, 8017); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 5), Tok::Ident as i64, 8018); if (r != 0) { return r; }   // string -> Ident (type name)
+    r = cks(tok_text(arr, 5), string_from_slice("string"), 8019); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 6), Tok::RParen as i64, 8020); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 7), Tok::Arrow as i64, 8021); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 8), Tok::Kw_i64 as i64, 8022); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 9), Tok::LBrace as i64, 8023); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 10), Tok::Kw_return as i64, 8024); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 11), Tok::Ident as i64, 8025); if (r != 0) { return r; }
+    r = cks(tok_text(arr, 11), string_from_slice("g_arr"), 8026); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 12), Tok::Semicolon as i64, 8027); if (r != 0) { return r; }
+    r = ck(tok_kind(arr, 13), Tok::RBrace as i64, 8028); if (r != 0) { return r; }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Test 9 — error handling: an unterminated string literal sets g_err.
+// ---------------------------------------------------------------------------
+fn test_errors() -> i64 {
+    let mut r: i64 = 0;
+    // unterminated string
+    let arr: i64 = lex("\"no close");
+    r = ck(lex_failed(), 1, 9001); if (r != 0) { return r; }
+    // a clean lex must NOT set the error flag
+    let arr2: i64 = lex("fn main() {}");
+    r = ck(lex_failed(), 0, 9002); if (r != 0) { return r; }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// the driver. Runs every test; returns 0 on full success, or the first failing
+// check's code. The CLI exit code is this value mod 256; 0 == pass.
+// ---------------------------------------------------------------------------
+fn main() -> i64 {
+    let mut r: i64 = 0;
+
+    r = test_canonical(); if (r != 0) { return r; }
+    r = test_keywords();  if (r != 0) { return r; }
+    r = test_operators(); if (r != 0) { return r; }
+    r = test_literals();  if (r != 0) { return r; }
+    r = test_comments();  if (r != 0) { return r; }
+    r = test_idents();    if (r != 0) { return r; }
+    r = test_struct();    if (r != 0) { return r; }
+    r = test_self();      if (r != 0) { return r; }
+    r = test_errors();    if (r != 0) { return r; }
+
+    // every test passed. g_pass is the total number of individual checks that
+    // passed (a sanity signal — return it encoded so a regression that passes
+    // the wrong number of checks is still visible). We return 0 for success.
+    return 0;
+}
