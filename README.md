@@ -111,7 +111,7 @@ cd ember
 mkdir buildt && cd buildt
 cmake -G Ninja -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe ..
 cmake --build .          # or: ninja
-ctest                    # 28 tests
+ctest                    # 37 tests (35 excluding the two benchmarks)
 ```
 
 Run and bench a script (`ember` = `buildt/ember_cli.exe`):

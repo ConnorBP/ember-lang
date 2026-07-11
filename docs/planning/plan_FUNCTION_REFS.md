@@ -1,5 +1,10 @@
 # ember — Tier 2 first-class function references (implementation plan)
 
+**⚠ SHIPPED v1.0** — first-class function refs (`&fn` / `handle(args)` / the
+`fn` type) landed, pinned by `examples/function_refs_test.cpp` (ctest target
+`function_refs`); see `v1.0_INTEGRATION_NOTES.md` §4. The text below is the
+historical planning record, left unchanged.
+
 **Status: plan only.** No source written. This document is the design for the
 fork the user resolved: **first-class call syntax `handle(args)`** — the first
 indirect call through a *runtime* i64 value in ember. Every call today

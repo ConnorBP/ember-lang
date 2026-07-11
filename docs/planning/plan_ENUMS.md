@@ -1,5 +1,10 @@
 # Implementation Plan — Tier 1: Script-Side `enum`
 
+> **⚠ SHIPPED v1.0** — script-side `enum` landed, pinned by
+> `tests/lang/{valid_enums,sema_valid_enums,sema_invalid_enum_unknown_enum,
+> sema_invalid_enum_unknown_variant}.ember`; see `v1.0_INTEGRATION_NOTES.md` §2.
+> The text below is the historical planning record, left unchanged.
+>
 > Research / planning document. **No source is written here.** Every claim
 > below is anchored to a firsthand read of the current tree; the seam each
 > decision hangs on is quoted with a file:line so the implementer can verify

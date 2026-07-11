@@ -1,5 +1,9 @@
 # Plan — OS IO extensions: file, console, process, path, directory
 
+> **⚠ SHIPPED v1.0** — the `io` extension landed in `extensions/io/` (see
+> `extensions/README.md` and `v1.0_INTEGRATION_NOTES.md`). The text below is
+> the historical planning record, left unchanged.
+>
 > **Status: research / planning only.** This document reads the code
 > firsthand (the extension pattern in `extensions/array/ext_array.cpp`,
 > the binding API in `src/binding_builder.hpp`, the permission gate in

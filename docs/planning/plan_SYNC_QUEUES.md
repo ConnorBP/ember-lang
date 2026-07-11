@@ -1,5 +1,11 @@
 # Plan — sync-extensions addon: atomics, swap buffer, SPSC/MPSC/MPMC queues
 
+> **⚠ SHIPPED v1.0** — the `sync` extension (atomics, swap buffer,
+> SPSC/MPSC/MPMC queues) landed in `extensions/sync/`, pinned by
+> `examples/ext_sync_test.cpp` (ctest target `ext_sync`); see
+> `v1.0_INTEGRATION_NOTES.md` §3. The text below is the historical planning
+> record, left unchanged.
+>
 > **Status: research / planning only.** This document reads the code
 > firsthand and lays out the design. No source is changed. The user is
 > making a scoping decision from this — be concrete and honest about

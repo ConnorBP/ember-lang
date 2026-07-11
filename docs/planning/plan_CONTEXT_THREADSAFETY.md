@@ -1,5 +1,10 @@
 # Plan — making the ember `context_t` safe for concurrent host-thread calls
 
+> **⚠ SHIPPED v1.0** — context thread-safety (Option D + B1) landed, pinned by
+> `examples/thread_safety_test.cpp` (ctest target `thread_safety`); see
+> `v1.0_INTEGRATION_NOTES.md` §1. The text below is the historical planning
+> record, left unchanged.
+>
 > **Status: research / planning only.** This document reads the code
 > firsthand and lays out design options. No source is changed. The user is
 > making a scoping decision from this — be concrete and honest about which
