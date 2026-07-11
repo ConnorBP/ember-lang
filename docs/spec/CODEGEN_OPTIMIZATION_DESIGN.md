@@ -940,6 +940,42 @@ AFTER the lowering produces it). It is the foundation for:
   SSA-lite (rename + slot-back + liveness + linear-scan) is additive on this
   instruction set, not a rewrite (§4.3/§4.6).
 
+**Stage B SHIPPED (2026-07-10).** The `.em` IR serialization — the security
+property. A v5 `.em` module carries IR (not raw x86); the loader deserializes +
+validates + re-emits via `emit_x64` BEFORE `alloc_executable_rw`, so a
+tampered/malformed v5 `.em` is rejected with NO executable page allocated.
+What shipped:
+- `src/em_type_codec.{hpp,cpp}` (c1a) — the shared canonical-type codec
+  (the Type/EmSignature on-disk encoding, extracted from the duplicated
+  writer/loader implementations; the IR serializer reuses it for `const Type*`
+  → stable type ID).
+- `src/thin_ir_ser.{hpp,cpp}` (c1b) — the IR serializer/deserializer
+  (`serialize_thin_function` / `deserialize_thin_function` / `validate_thin_function`).
+  `ThinOp` (uint16) serializes verbatim; `const Type*` via `em_type_codec`;
+  `native_fn` dropped (rebound by `meta.native_name`); safety-by-construction
+  (ir_magic, bounded counts, uint64 cursor arithmetic, max_vreg up front).
+- v5 writer + loader paths (c2) — `em_writer.cpp` `write_em_file_v5` + the v5
+  `emit_em_content` per-function record (`is_ir` byte + hoisted signature +
+  ir_blob or v4 body); `em_loader.cpp` v5 `parse_file` (opaque ir_blob read) +
+  `load_em_file_impl` (deserialize + native-rebind + validate + `emit_x64` re-
+  emit BEFORE `alloc_executable_rw`). `em_loader.cpp` moved to `ember_frontend`
+  (the re-emit needs `emit_x64` / `CodeGenCtx`).
+- `examples/thin_ir_ser_test.cpp` + `examples/em_v5_ir_test.cpp` (c3) — the
+  gates: IR round-trip (serialize/deserialize/validate/re-emit/execute,
+  fib(10)==55) + malformed rejection (bad magic, truncated, empty, unknown
+  native → no exec page).
+
+Mixed mode: a v5 module may MIX IR (`is_ir=1`) and raw-x86 (`is_ir=0`)
+functions per-function. v5 is UNSIGNED for Stage B (a v5-signed variant is
+FUTURE work). See `docs/audit/AUDIT_2026-07-10_STAGE_B.md` for the full
+shipment audit + the v5 security model.
+
+**Stage C foundation.** The composable pass architecture for Stage C (IR
+optimization passes over `ThinFunction`) is researched in
+`docs/LLVM_PASS_SYSTEM_RESEARCH.md` (LLVM 18.1.8 pass-manager patterns
+distilled for ember: concept-based polymorphism, CRTP mix-in,
+PreservedAnalyses, AnalysisManager, PassInstrumentation, pipeline parsing).
+
 The design sections (§4 architecture, §5 pass interface, §6 representation, §7
 migration) are unchanged; §4.3/§4.6/§4.7 are the design as written pre-ship (the
 hybrid thin-IR option this Stage-A shipment implements), now with a shipped
