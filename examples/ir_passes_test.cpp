@@ -27,7 +27,8 @@
 #include "../src/thin_emit.hpp"       // emit_x64
 #include "../src/ember_pass.hpp"      // EmberPassManager, EmberAnalysisManager
 #include "../src/ember_pass_registry.hpp" // EmberPassRegistry
-#include "../extensions/opt/ext_opt.hpp"  // register_passes
+#include "../extensions/opt/ext_opt.hpp"  // register_passes (opt)
+#include "../extensions/obf/ext_obf.hpp"   // register_passes (obf)
 
 #include <cstdio>
 #include <memory>
@@ -157,14 +158,16 @@ static int64_t call0_i64(M& m, const std::string& fn) {
 int main() {
     std::printf("=== ir_passes_test: Stage C IR optimization passes ===\n");
 
-    // (1) Registry: register_passes provides all three passes by name.
+    // (1) Registry: register_passes provides all passes by name.
     std::printf("(1) Registry\n");
     EmberPassRegistry reg;
     ext_opt::register_passes(reg);
+    ext_obf::register_passes(reg);
     ck(reg.has("constprop"), "registry has \"constprop\"");
     ck(reg.has("dce"), "registry has \"dce\"");
     ck(reg.has("cse"), "registry has \"cse\"");
     ck(reg.has("licm"), "registry has \"licm\"");
+    ck(reg.has("subst"), "registry has \"subst\" (obf)");
 
     // The four workloads.
     struct Workload { const char* name; const char* src; };
@@ -230,9 +233,9 @@ int main() {
         }
     }
 
-    // (3) All three passes on licm_invariant (no target pass — just no-crash +
+    // (3) All passes on licm_invariant (no target pass — just no-crash +
     // value-preserving, already covered by (a) for each pass).
-    std::printf("\n--- licm_invariant (no target pass; all three value-preserving) ---\n");
+    std::printf("\n--- licm_invariant (no target pass; all value-preserving) ---\n");
     {
         auto mb = compile_with(SRC_LICM_INVARIANT, nullptr);
         int64_t rb = mb ? call0_i64(*mb, "main") : -1;
@@ -245,6 +248,40 @@ int main() {
             std::snprintf(msg, sizeof(msg), "%s value-preserving on licm_invariant (b=%lld p=%lld)",
                           pt.name, (long long)rb, (long long)rp);
             ck(rb == rp, msg);
+        }
+    }
+
+    // (4) SubstitutionPass (obfuscation): value-preserving + instr count INCREASES.
+    std::printf("\n--- subst (obfuscation: MBA substitution) ---\n");
+    {
+        // Value-preserving on all 4 workloads.
+        for (int wi = 0; wi < NW; ++wi) {
+            const auto& wl = workloads[wi];
+            auto mb = compile_with(wl.src, nullptr);
+            if (!mb) { ck(false, "subst baseline compile failed"); continue; }
+            int64_t rb = call0_i64(*mb, "main");
+            EmberPassManager pm;
+            pm.add_pass_concept(reg.create("subst"));
+            auto mp = compile_with(wl.src, &pm);
+            if (!mp) { ck(false, "subst pass compile failed"); continue; }
+            int64_t rp = call0_i64(*mp, "main");
+            char msg[128];
+            std::snprintf(msg, sizeof(msg), "subst value-preserving on %s (b=%lld p=%lld)",
+                          wl.name, (long long)rb, (long long)rp);
+            ck(rb == rp, msg);
+        }
+        // Instr count INCREASES on a workload with Add (cse_redundant has i*7 + a+a).
+        size_t before = 0, after = 0;
+        EmberPassManager pm;
+        pm.add_pass_concept(reg.create("subst"));
+        auto mt = compile_with(SRC_CSE_REDUNDANT, &pm, &after, &before);
+        if (mt) {
+            char msg[128];
+            std::snprintf(msg, sizeof(msg), "subst INCREASES instr count on cse_redundant (before=%zu after=%zu)",
+                          before, after);
+            ck(after > before, msg);
+        } else {
+            ck(false, "subst target compile failed");
         }
     }
 

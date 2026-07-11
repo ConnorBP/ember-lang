@@ -63,6 +63,7 @@
 #include "ext_sync.hpp"
 #include "ext_lifecycle.hpp"
 #include "ext_opt.hpp"        // Stage C: register_passes (IR optimization passes)
+#include "ext_obf.hpp"         // Stage C Step 5: register_passes (IR obfuscation passes)
 #include "../src/ember_pass.hpp"       // Stage C: EmberPassManager
 #include "../src/ember_pass_registry.hpp" // Stage C: EmberPassRegistry
 #include "../src/ember_pass_pipeline.hpp" // Stage C: build_pipeline_from_string
@@ -541,6 +542,7 @@ int main(int argc, char** argv) {
     // --passes is given (the passes operate on the ThinFunction IR).
     EmberPassRegistry pass_reg;
     ext_opt::register_passes(pass_reg);
+    ext_obf::register_passes(pass_reg);
     EmberPassManager pass_pm;
     if (!passes_spec.empty()) {
         std::string pass_err;
