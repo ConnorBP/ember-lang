@@ -200,7 +200,9 @@ fn ty_is_i64(t: i64) -> i64 {
     if (nk_kind(t) != (NK::Type as i64)) { return 0; }
     if (nk_d(t) != (Prim::I64 as i64)) { return 0; }
     if (nk_tok(t) >= 0) { return 0; }   // a named/handle type, not plain i64
-    if (nk_f(t) != 0) { return 0; }     // a slice, not a scalar
+    if (nk_f(t) == 1) { return 0; }     // a slice, not a scalar (f=1 marks a slice; the
+                                        // parser's alloc_node defaults f to -1, so a
+                                        // plain scalar has f=-1, not 0)
     return 1;
 }
 
@@ -212,7 +214,7 @@ fn ty_is_int(t: i64) -> i64 {
     if (nk_kind(t) != (NK::Type as i64)) { return 0; }
     let p: i64 = nk_d(t);
     if (nk_tok(t) >= 0) { return 0; }
-    if (nk_f(t) != 0) { return 0; }
+    if (nk_f(t) == 1) { return 0; }   // f=1 marks a slice; scalars default to f=-1
     // Prim I8..U64 = 2..9
     if (p >= 2 && p <= 9) { return 1; }
     return 0;
@@ -242,7 +244,7 @@ fn ty_is_float(t: i64) -> i64 {
     if (nk_kind(t) != (NK::Type as i64)) { return 0; }
     let p: i64 = nk_d(t);
     if (nk_tok(t) >= 0) { return 0; }
-    if (nk_f(t) != 0) { return 0; }
+    if (nk_f(t) == 1) { return 0; }   // f=1 marks a slice; scalars default to f=-1
     if (p == 10 || p == 11) { return 1; }
     return 0;
 }
@@ -517,7 +519,16 @@ fn declare(name_tok: i64, t: i64) -> i64 {
         }
         i = i + SCOPE_STRIDE;
     }
-    // append (name_tok, type) at s_scope_len
+    // append (name_tok, type) at s_scope_len. array_set_i64 does NOT grow the
+    // array (it silently drops writes past the end), so grow g_scope first when
+    // the logical length has reached the physical length. After a pop_scope the
+    // physical array is still big enough (we only lower s_scope_len, never
+    // shrink), so this resize only fires on the first declare past the high-
+    // water mark — and it overwrites any stale slot, so re-pushed scopes see
+    // fresh data (not leftover entries from a popped scope).
+    if (array_length(g_scope) < s_scope_len + SCOPE_STRIDE) {
+        array_resize(g_scope, s_scope_len + SCOPE_STRIDE);
+    }
     array_set_i64(g_scope, s_scope_len, name_tok);
     array_set_i64(g_scope, s_scope_len + 1, t);
     s_scope_len = s_scope_len + SCOPE_STRIDE;
@@ -602,6 +613,9 @@ fn check_expr(e: i64) -> i64 {
     if (k == (NK::IndexExpr as i64)) {
         return check_indexexpr(e);
     }
+    if (k == (NK::AssignExpr as i64)) {
+        return check_assignexpr(e);
+    }
 
     // unsupported in the v1 subset — report once and return void
     return serr(string_from_slice("expression kind unsupported in v1 sema"),
@@ -615,6 +629,15 @@ fn check_binexpr(e: i64) -> i64 {
     let op: i64 = nk_d(e);
     let lt: i64 = check_expr(nk_a(e));
     let rt: i64 = check_expr(nk_b(e));
+    return check_binop_result(op, lt, rt, e);
+}
+
+// Validate a binary op's operand types and return its result type (or TY_VOID
+// + s_err on a type error). Shared by check_binexpr (a BinExpr) and the
+// compound-assign path of check_assignexpr (which only needs the validity
+// check; the stored type is the target's). `e` is the originating node for
+// error positions (the BinExpr or AssignExpr).
+fn check_binop_result(op: i64, lt: i64, rt: i64, e: i64) -> i64 {
 
     // logical && || : bool operands -> bool
     if (op == (BinOp::LAnd as i64) || op == (BinOp::LOr as i64)) {
@@ -798,6 +821,69 @@ fn check_indexexpr(e: i64) -> i64 {
     let elem: i64 = ty_elem(bt);
     if (elem < 0) { return TY_I64; }   // fallback
     return resolve_type(elem);
+}
+
+// check an assignment target = value (incl. compound += and postfix ++/--).
+// The target must be an lvalue (Ident / FieldExpr / IndexExpr in v1); the
+// value's type must be compatible with the target's type. For a compound op
+// the operand types must satisfy the binary-op rule for that op. Returns the
+// target's type (the C++ sema likewise types an assignment at its lhs).
+//
+// Node layout (parse.ember): a=target, b=value, d=compound op (or -1 for plain
+// '='), e=postfix flag (1 for postfix ++/--, where the value is implicit 1).
+fn check_assignexpr(e: i64) -> i64 {
+    let target: i64 = nk_a(e);
+    let value: i64 = nk_b(e);
+    let cop: i64 = nk_d(e);
+    let postfix: i64 = nk_e(e);
+
+    // the target must be an lvalue. v1 recognizes Ident, FieldExpr, IndexExpr
+    // as assignable (matching the C++ is_lvalue). Anything else (a literal, a
+    // call, a binary expr) is not.
+    let tk: i64 = nk_kind(target);
+    let mut is_lval: i64 = 0;
+    if (tk == (NK::Ident as i64)) { is_lval = 1; }
+    if (tk == (NK::FieldExpr as i64)) { is_lval = 1; }
+    if (tk == (NK::IndexExpr as i64)) { is_lval = 1; }
+    if (is_lval == 0) {
+        return serr(string_from_slice("assignment target is not an lvalue"),
+                    node_line(e), node_col(e));
+    }
+
+    let lt: i64 = check_expr(target);
+    if (s_err != 0) { return TY_VOID; }
+
+    // postfix ++ / -- : the value is an implicit 1; the target must be a
+    // numeric integer (only integers support inc/dec in v1). No explicit
+    // value node is present (b == -1).
+    if (postfix == 1) {
+        if (ty_is_int(lt) == 0) {
+            return serr(string_from_slice("'++'/'--' requires an integer target"),
+                        node_line(e), node_col(e));
+        }
+        return lt;
+    }
+
+    // compound op (+=, -=, ...): the stored value is `target op value`, so the
+    // op's binary rule must hold for (lt, rt) and yield lt. Reuse the same
+    // operand-type checks as check_binexpr via the shared helper.
+    if (cop >= 0) {
+        let rt: i64 = check_expr(value);
+        if (s_err != 0) { return TY_VOID; }
+        let _r: i64 = check_binop_result(cop, lt, rt, e);
+        if (s_err != 0) { return TY_VOID; }
+        return lt;
+    }
+
+    // plain '=' : the value's type must be compatible with the target's.
+    let rt: i64 = check_expr(value);
+    if (s_err != 0) { return TY_VOID; }
+    if (types_compatible(lt, rt) == 0) {
+        return serr(string_from_slice("assignment type mismatch (") + ty_name(lt) + string_from_slice(" = ")
+                    + ty_name(rt) + string_from_slice(")"),
+                    node_line(e), node_col(e));
+    }
+    return lt;
 }
 
 // -----------------------------------------------------------------------------
