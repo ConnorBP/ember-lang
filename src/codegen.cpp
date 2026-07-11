@@ -2467,25 +2467,78 @@ void CG::eval(const Expr& ex) {
         for (auto& op : ops) if (op.words==1 && !op.is_struct && op.ty && op.ty->is_float()) {
             word_is_float[size_t(op.slot0)]=true; word_is_f64[size_t(op.slot0)]=op.ty->prim==Prim::F64;
         }
-        // place words 0..3 into regs
+        // place words 0..3 into regs — with Win64 hidden-pointer ABI for
+        // >8-byte struct args to NATIVE calls. The Win64 ABI passes a >8-byte
+        // struct by hidden pointer (caller allocates, passes ptr in the arg
+        // register). The current codegen stashes the struct bytes at [rsp+slot*8];
+        // for native calls with >8-byte struct args, we load a POINTER to the
+        // stash location into the register instead of the struct's words, and
+        // shift subsequent args to account for the struct collapsing to 1 slot.
         static const Reg int_regs[4] = {Reg::rcx, Reg::rdx, Reg::r8, Reg::r9};
         static const Xmm flt_regs[4] = {Xmm::xmm0, Xmm::xmm1, Xmm::xmm2, Xmm::xmm3};
-        for (int w = 0; w < n && w < 4; ++w) {
-            int32_t off = w * 8;
-            if (word_is_float[size_t(w)]) {
-                if(word_is_f64[size_t(w)])e.movsd_xmm_mem(flt_regs[w],Reg::rsp,off);else e.movss_xmm_mem(flt_regs[w], Reg::rsp, off);
+        // Build the physical slot mapping for native calls with >8-byte structs.
+        // For non-native calls (script-to-script), ember's private ABI passes
+        // words directly (no hidden pointer), so the mapping is identity.
+        struct PhysSlot { int logical_word; bool is_struct_ptr; int32_t struct_byte_off; };
+        std::vector<PhysSlot> phys_slots;
+        if (c->is_native) {
+            int phys_pos = 0;
+            for (auto& op : ops) {
+                int32_t struct_size = 0;
+                if (op.is_struct && op.ty && ctx.structs) {
+                    auto it = ctx.structs->find(op.ty->struct_name);
+                    if (it != ctx.structs->end()) struct_size = it->second.size;
+                }
+                if (struct_size > 8) {
+                    // >8-byte struct: collapses to 1 physical slot (pointer).
+                    phys_slots.push_back({phys_pos, true, op.slot0 * 8});
+                    phys_pos++;
+                    // Skip the remaining words of this struct (they're inside
+                    // the struct, not separate arg slots).
+                } else {
+                    for (int w = 0; w < op.words; ++w) {
+                        phys_slots.push_back({phys_pos, false, 0});
+                        phys_pos++;
+                    }
+                }
+            }
+        } else {
+            // Non-native: identity mapping (each word is one physical slot).
+            for (int w = 0; w < n; ++w)
+                phys_slots.push_back({w, false, 0});
+        }
+        int n_phys = int(phys_slots.size());
+        // Load physical slots 0..3 into registers.
+        for (int p = 0; p < n_phys && p < 4; ++p) {
+            const auto& ps = phys_slots[size_t(p)];
+            if (ps.is_struct_ptr) {
+                // Load a pointer to the struct's stash location into the register.
+                // lea reg, [rsp+disp] via mov+add (no simple lea_reg_mem in the emitter).
+                e.mov_reg_reg(int_regs[p], Reg::rsp);
+                e.add_reg_imm32(int_regs[p], ps.struct_byte_off);
             } else {
-                e.load_reg_mem(int_regs[w], Reg::rsp, off);
+                int w = ps.logical_word;
+                int32_t off = w * 8;
+                if (word_is_float[size_t(w)]) {
+                    if(word_is_f64[size_t(w)])e.movsd_xmm_mem(flt_regs[p],Reg::rsp,off);else e.movss_xmm_mem(flt_regs[p], Reg::rsp, off);
+                } else {
+                    e.load_reg_mem(int_regs[p], Reg::rsp, off);
+                }
             }
         }
-        // words 4+ -> [rsp + stash_size + handle_word + 32 + (w-4)*8] (caller's
-        // outgoing stack args). The handle_word shift (advisor §2) keeps shadow
-        // space + outgoing clear of the stashed handle word.
-        for (int w = 4; w < n; ++w) {
-            int32_t src = w * 8;
-            int32_t dst = stash_size + handle_word + 32 + (w - 4) * 8;
-            e.load_reg_mem(Reg::rax, Reg::rsp, src);
-            e.store_reg_mem(Reg::rsp, dst, Reg::rax);
+        // Physical slots 4+ -> outgoing stack args.
+        for (int p = 4; p < n_phys; ++p) {
+            const auto& ps = phys_slots[size_t(p)];
+            int32_t dst = stash_size + handle_word + 32 + (p - 4) * 8;
+            if (ps.is_struct_ptr) {
+                e.mov_reg_reg(Reg::rax, Reg::rsp);
+                e.add_reg_imm32(Reg::rax, ps.struct_byte_off);
+                e.store_reg_mem(Reg::rsp, dst, Reg::rax);
+            } else {
+                int32_t src = ps.logical_word * 8;
+                e.load_reg_mem(Reg::rax, Reg::rsp, src);
+                e.store_reg_mem(Reg::rsp, dst, Reg::rax);
+            }
         }
         if (c->is_native) {
             // mov rax, native target; call rax, with combined depth accounting
