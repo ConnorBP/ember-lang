@@ -40,10 +40,11 @@ wiring to the B1 model (the `--tick` thread-safety bug, fixed), and a demo
 script (`examples/scripts/dynamic_registration.ember`). See
 `planning/v1.0_INTEGRATION_NOTES.md` §5.
 
-The current tree configures 20 CTest tests when the AngelScript SDK is present
-and 19 when it is absent (only the benchmark is conditional). The four
-`plan_*.md` files in `docs/` are historical design records; shipped contracts
-in the main docs take precedence where those plans describe earlier states.
+The current tree configures 22 CTest targets by default (incl.
+`bench_codegen_paths`; +`bench_ember_vs_as` when the AngelScript SDK is
+present, for 23 total with the SDK). The four `plan_*.md` files in `docs/` are
+historical design records; shipped contracts in the main docs take precedence
+where those plans describe earlier states.
 
 ## Tier 0 - standard addon set (ships with v1.0, host C++ side)
 

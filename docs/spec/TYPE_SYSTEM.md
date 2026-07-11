@@ -257,6 +257,17 @@ memory-indirection concept in the whole language.
 
 ## 9. `auto` - the one type-inference rule
 
+> **Deprecation note (2026-07-10, commit `d852160`):** `auto` is
+> **deprecated** (soft - emits a non-fatal sema warning; the program still
+> compiles and runs). It is a redundant spelling of `let x = expr;`
+> inference (both share the same `is_auto` inference path). The canonical
+> forms are `let x = expr;` (inference) and `let x: T = expr;` (explicit).
+> `auto` is slated for removal after a grace period - migrate any
+> `auto x = e;` to `let x = e;`. See `COMPILER_PIPELINE.md` §2 (which records
+> the deprecation in the grammar note) and `../ROADMAP.md` "Slated for
+> removal (deprecated)". The inference rule below is preserved for reference
+> and because `let`-inference shares it.
+
 `auto` is allowed **only** as a local-variable declaration's type,
 and only when the declaration has an initializer: `auto x = expr;`
 infers `x`'s type as exactly the type of `expr` (no widening, no

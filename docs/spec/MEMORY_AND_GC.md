@@ -71,11 +71,27 @@ into the current frame. This is safe **only** because:
   from a local-array-view value inside a function body is a compile
   error, same rationale).
 - Passing such a slice as an argument to a call made *from* the
-  current frame is fine (callee's frame is nested strictly inside the
-  caller's - the local array is still alive for the callee's entire
-  execution) - the provenance tag only blocks the two escape routes
-  (return, global-store) that could outlive the frame, not ordinary
-  downward parameter passing.
+  current frame is fine **for a callee that does not retain the ptr past
+  the frame** (callee's frame is nested strictly inside the caller's - the
+  local array is still alive for the callee's entire synchronous
+  execution). The provenance tag blocks the **three Stage-1 escape routes**
+  - C1 (return), C2a (global-store), and C2b (global-rooted `FieldExpr`/
+  `IndexExpr` store) - for both the `ViewExpr`-over-fixed-array class and
+  the `StringLit`-derived-`slice<u8>` class (Stage 1, commit `8062195`, see
+  `../ROADMAP.md` "Slice-of-stack-local escape safety — STAGE 1 DONE,
+  STAGE 2 DEFERRED"). **C3** (a stack-backed slice passed to a native that
+  may retain the ptr) and **C5** (a stack-backed slice passed to a script
+  fn / fn-handle / cross-module call that may retain it) are an **open
+  hole** that is **not yet guarded** at the call-arg sites (Stage 2
+  deferred): a retaining callee dangles the ptr. Closing C3/C5 needs a real
+  borrow/escape analysis (propagate the localview bit through a call's
+  return value, reject only at the actual escape point, and add a
+  `borrows`/`retains` annotation to `NativeSig` so C3 can distinguish
+  copying natives like `string_from_slice` from retaining ones). No
+  shipped native retains a slice ptr today, so C3 is "accidentally safe";
+  C5 (a retaining script fn) is the residual live hole. See
+  `../../demo/SLICE_ESCAPE_SAFETY_INVESTIGATION.md` for the 5-category
+  escape matrix.
 - This is **not** general borrow-checking (TYPE_SYSTEM.md Section 4 already
   disclaims that) - it's one narrow, syntactically-decidable check
   covering the one case ember itself can introduce a dangling slice
@@ -85,9 +101,18 @@ into the current frame. This is safe **only** because:
 
 ## 4. Module-global storage
 
-- v1 global storage supports scalar/handle globals only: one eight-byte slot
-  per declaration. Sema rejects slice, fixed-array, and by-value struct globals;
-  a typed aggregate global layout remains deferred.
+- v1 global storage supports scalar/handle/struct/fixed-array/slice globals.
+  Aggregate globals (struct / fixed-array / slice) shipped 2026-07-10
+  (commit `9e90cf8`): the globals block is now a **typed block** with a
+  per-global `offset` and `size`, 8-byte alignment per slot. A scalar global
+  occupies 8 bytes at its offset; a **slice** global occupies 16 bytes
+  (the `{ptr, len}` pair); a **struct** global occupies its tightly-packed
+  Ember size; a **fixed-array** global occupies `N * sizeof(T)`. Global
+  load/store addresses the slot at `[globals_base + offset]` (the typed
+  per-global offset), not the old flat `[globals_base + i*8]` index form.
+  See `TYPE_SYSTEM.md` §12.2 for the type-system / layout contract and
+  `CODEGEN_SPEC.md` §16.4 for the codegen (typed global table, load/store
+  addressing, `.em` round-trip with slice relative-ptr relocation).
 - Access from JIT'd code: each global's frame offset within this block
   is a compile-time constant, so a global read/write compiles to
   `mov reg, [globals_base_imm64 + offset]` - `globals_base` is an
@@ -99,13 +124,17 @@ into the current frame. This is safe **only** because:
 - **Reload and globals**: the shipped single-function reload changes only one
   dispatch slot/page and cannot change declarations, so global slots remain
   untouched. Whole-module declaration/layout migration is deferred.
-- **Global initializer**: evaluated once at `ember_compile` time (for
-  compile-time-constant initializers - the only kind allowed in v1,
-  matching `auto`'s restriction to no-solver-needed cases, TYPE_SYSTEM.md
-  Section 9) - no "run script code at module-load time" concept needed for
-  this, keeps global init trivial (a memcpy of constant bytes into
-  the block at compile time, not a JIT'd "init function" that has to
-  be invoked).
+- **Global initializer**: folded at **load time** by the host's
+  `eval_global_initializers` (the const-initializer-folding rule,
+  `TYPE_SYSTEM.md` §12.2): a struct initializer folds field-by-field, a
+  fixed-array initializer element-by-element, a slice initializer
+  materializes its backing store and folds `{ptr, len}`. A field/element
+  initializer that is not a literal or constexpr-foldable expression folds
+  to **zero** for that field/element; the rest fold normally (the same
+  const-fold restriction v1 scalar globals already enforced, extended to
+  aggregate fields/elements). No "run arbitrary script code at module-load
+  time" concept is needed - this is the host folding const initializers into
+  the typed block, not a JIT'd "init function" that has to be invoked.
 
 ## 5. Arena allocator (reserved design, not built until needed)
 
@@ -164,9 +193,33 @@ the literal" concern as Section 3 - but since the literal's rodata lives in
 the *same* code page as the function using it, and returning that
 slice value from the function is fine (it's not escaping the code
 page, just the frame - the underlying bytes live exactly as long as
-the code that returns them), literal-derived slices are **not**
-subject to Section 3's dangling-check; only locally-computed `arr[..]`
-views of stack data are.
+the code that returns them), a literal-derived slice is **not** subject
+to Section 3's dangling-check on the unencrypted path; only
+locally-computed `arr[..]` views of stack data are.
+
+There are now **two** string-literal lowering paths (the 2026-07-10
+inline-stack-XOR string-encryption lowering, commit `e98dc87`; see
+`../ROADMAP.md` "Runtime string encryption — DONE"):
+- **Unencrypted path (`Program::string_xor_key == 0`):** the literal's
+  bytes are function-local rodata as described above - a raw rodata
+  pointer, lifetime = the code page. A `slice<u8>` derived from it is
+  exempt from Section 3's dangling-check (the bytes outlive any
+  frame).
+- **Encrypted path (`Program::string_xor_key != 0`, the CLI default is
+  `0xA5`, ON by default):** the encrypted bytes still live in rodata,
+  but the *plaintext* the slice points at is a **transient stack temp**
+  - the encrypted literal is decrypted inline into a compiler-hidden
+  temp frame slot at each use site (codegen's StringLit eval case /
+  `alloc_str_temp` / `count_str_temps_block`), and the plaintext lives
+  only on the caller's stack frame for the expression's lifetime and
+  is reclaimed at frame teardown. A `slice<u8>` derived from such an
+  encrypted literal IS subject to Section 3's dangling-check: the
+  Stage-1 slice-escape fix (commit `8062195`) covers it via
+  `is_local_array_view` returning true for a `StringLit` whose
+  resolved type is `slice<u8>`, so C1 (return), C2a (global-store), and
+  C2b (global-rooted field/element store) are all guarded. See
+  `../../demo/STRING_ENCRYPTION_ANALYSIS.md` for the original analysis
+  + the probe that demonstrated the old heap-residency leak.
 
 ## 7. Array representations recap (cross-reference, no new rules)
 

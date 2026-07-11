@@ -325,11 +325,26 @@ succeeded)
      each function body's check.
    - Slice-escape provenance check (MEMORY_AND_GC.md Section 3) runs as part
      of type-checking `return` statements and global-assignment
-     statements specifically (the two escape routes) - implemented as
-     a small backward walk from the returned/assigned expression
-     through the chain of `Expr` nodes that produced it, stopping at
-     (and flagging) a `ViewExpr` whose base is a local, or passing
-     cleanly if the value came from a call or a global/param instead.
+     statements specifically - the **Stage-1 escape routes**: C1 (return),
+     C2a (global `Ident`-store), and C2b (global-rooted `FieldExpr`/
+     `IndexExpr`-store), for both the `ViewExpr`-over-fixed-array class and
+     the `StringLit`-derived-`slice<u8>` class (commit `8062195`). It is
+     implemented as a small backward walk from the returned/assigned
+     expression through the chain of `Expr` nodes that produced it,
+     stopping at (and flagging) a `ViewExpr` whose base is a local (or a
+     `StringLit` whose resolved type is `slice<u8>`), or passing cleanly
+     if the value came from a call or a global/param instead.
+     **Stage 2 (deferred, see `../ROADMAP.md` "Slice-of-stack-local escape
+     safety — STAGE 1 DONE, STAGE 2 DEFERRED"): C3 (a stack-backed slice
+     passed to a native that may retain the ptr) and C5 (a stack-backed
+     slice passed to a script fn / fn-handle / cross-module call that may
+     retain it) are NOT yet guarded** at the call-arg sites - a retaining
+     callee dangles the ptr. Closing them needs a real borrow/escape
+     analysis (propagate the localview bit through a call's return value,
+     reject only at the actual escape point, and add a `borrows`/`retains`
+     annotation to `NativeSig` so C3 can distinguish copying natives from
+     retaining ones). See `../../demo/SLICE_ESCAPE_SAFETY_INVESTIGATION.md`
+     for the 5-category escape matrix.
    - Index-expression unsigned-type check (TYPE_SYSTEM.md Section 7).
    - Annotation argument grammar check (TYPE_SYSTEM.md Section 10 - literals
      only, no identifiers/expressions).
