@@ -201,6 +201,22 @@ add_executable(ext_lifecycle_test examples/ext_lifecycle_test.cpp)
 target_link_libraries(ext_lifecycle_test PRIVATE ember ember_frontend ember_ext_lifecycle)
 add_test(NAME ext_lifecycle COMMAND ext_lifecycle_test)
 
+# ext_map_test: runtime coverage for the map<K,V> host-store extension (D1).
+# The map extension ships 7 natives (map_new, map_set, map_get, map_contains,
+# map_length, map_remove, map_clear) but had zero ctest coverage. This test
+# calls the registered native fn_ptrs directly (the ext_lifecycle_test T4/T5
+# shape — the map natives are pure host-side ops over opaque i64 handles, no
+# JIT round-trip needed) and asserts the host-store contract: 1-indexed
+# handles, set/get/contains/length/remove/clear semantics, missing-key
+# behavior, invalid-handle safety, and reset(). Links ember_ext_map directly
+# (no prism/prism_script_host) — proving the extension is reusable outside prism.
+add_executable(ext_map_test examples/ext_map_test.cpp)
+target_link_libraries(ext_map_test PRIVATE ember ember_frontend ember_ext_map)
+if(WIN32)
+    target_link_libraries(ext_map_test PRIVATE kernel32)
+endif()
+add_test(NAME ext_map COMMAND ext_map_test)
+
 # Extension registration smoke test (RESTRUCTURE_PLAN.md Section 6): validates the
 # relocated non-cheat extensions (vec/quat/mat/string/array/math/sync/lifecycle) register
 # their NativeSig + OpOverloadTable entries via the extension entry points.
@@ -676,5 +692,5 @@ add_test(NAME aggregate_global COMMAND aggregate_global_test)
 set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
     v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
     array_lit aggregate_global em_signed codegen_opt thin_ir_struct thin_ir
-    thin_ir_ser em_v5_ir ember_pass ir_passes
+    thin_ir_ser em_v5_ir ember_pass ir_passes ext_map
     PROPERTIES TIMEOUT 30)
