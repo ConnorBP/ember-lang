@@ -58,15 +58,41 @@ struct P {
         case Tk::Kw_u8: prim(Prim::U8); break;  case Tk::Kw_u16: prim(Prim::U16); break;
         case Tk::Kw_u32: prim(Prim::U32); break; case Tk::Kw_u64: prim(Prim::U64); break;
         case Tk::Kw_f32: prim(Prim::F32); break; case Tk::Kw_f64: prim(Prim::F64); break;
-        case Tk::Kw_fn:
+        case Tk::Kw_fn: {
             // v1.0 Tier 2 (docs/planning/plan_FUNCTION_REFS.md §2): a bare `fn` is the
-            // function-handle type (i64 with is_fn_handle=true). A parameterized
-            // `fn(i64)->i64` form is v2+; Tier 2's bare `fn` accepts any fn (the
-            // call-target guard validates the handle at the call site, §5).
+            // function-handle type (i64 with is_fn_handle=true). A bare `fn`
+            // accepts any fn (the call-target guard validates the handle at the
+            // call site, §5) — the unsound backward-compat fallback.
+            //
+            // Parameterized `fn(Args) -> Ret` (closes the bare-fn signature
+            // hole): a fn type WITH a recorded signature type-checks the args
+            // at every call site through it (sema's indirect-call path checks
+            // against recorded_params/recorded_ret when has_recorded_sig). Two
+            // `fn(i64)->i64` types are equal; `fn(i64)->i64` != `fn(i64,i64)->i64`
+            // (Type::same compares recorded sigs). A bare `fn` stays same-as a
+            // specific fn (the one subtyping direction — a bare-`fn` param
+            // accepts a specific &fn), so existing `let h: fn = &id` still works.
+            //
             // Unambiguous: parse_type is only called in type positions (param/
             // ret/let annotations, as/sizeof operands), never where a `fn`
             // declaration could start (that path consumes Kw_fn at parse_top).
-            t->prim = Prim::I64; t->is_fn_handle = true; adv(); break;
+            t->prim = Prim::I64; t->is_fn_handle = true; adv();
+            // optional `(Type, Type, ...) -> Type` signature after `fn`.
+            // A bare `fn` (no following '(') stays the unsound fallback.
+            if (at(Tk::LParen)) {
+                adv();  // '('
+                t->has_recorded_sig = true;
+                if (!at(Tk::RParen)) {
+                    do {
+                        t->recorded_params.push_back(parse_type());
+                    } while (accept(Tk::Comma));
+                }
+                expect(Tk::RParen, "')'");
+                expect(Tk::Arrow, "'->' in function type");
+                t->recorded_ret = parse_type();
+            }
+            break;
+        }
         case Tk::Ident:
             // named struct type (resolved in sema) — prim=Void is the neutral
             // "named type" marker. Sema resolves it: prim=Void stays for

@@ -82,7 +82,20 @@ std::string Type::to_string() const {
     if (array_len) return (elem?elem->to_string():std::string("?")) + "[" + std::to_string(array_len) + "]";
     if (!enum_name.empty()) return enum_name;   // typed enum type (enum E : T)
     if (!struct_name.empty()) return struct_name;
-    if (is_fn_handle) return "fn";   // v1.0 Tier 2: display alias for i64-with-fn-handle-tag
+    if (is_fn_handle) {
+        // v1.0 Tier 2: a fn handle displays as `fn` (bare) or `fn(A, B)->R`
+        // (parameterized, when has_recorded_sig). The parameterized form is
+        // the type-system-sound spelling; bare `fn` is the unsound fallback.
+        if (!has_recorded_sig) return "fn";
+        std::string s = "fn(";
+        for (size_t i = 0; i < recorded_params.size(); ++i) {
+            if (i) s += ", ";
+            s += recorded_params[i] ? recorded_params[i]->to_string() : std::string("?");
+        }
+        s += ") -> ";
+        s += recorded_ret ? recorded_ret->to_string() : std::string("?");
+        return s;
+    }
     switch (prim) {
     case Prim::Bool: return "bool";
     case Prim::I8: return "i8"; case Prim::I16: return "i16"; case Prim::I32: return "i32"; case Prim::I64: return "i64";

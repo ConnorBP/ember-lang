@@ -1,0 +1,76 @@
+// valid_fn_types — parameterized function types `fn(Args)->Ret` (Tier 2).
+// Closes the bare-fn signature hole: a fn-typed parameter WITH a signature
+// type-checks its args at the call site. A bare `fn` (no signature) stays the
+// unsound backward-compat fallback (runtime guard still validates the handle).
+//
+// main returns 250 — the sum of every sub-check's contribution:
+//   apply_id        42   (call through a typed fn param fn(i64)->i64)
+//   apply_add       50   (two-arg typed fn param fn(i64,i64)->i64)
+//   bare_compat      7   (bare `fn` param still works, no type check)
+//   higher_order    88   (fn returning fn: fn(i64)->fn(i64)->i64)
+//   fn_as_arg       63   (fn(fn(i64)->i64)->i64 — fn as argument)
+//    = 250
+//
+// Plus compile-time-only coverage (no runtime contribution, but must sema OK):
+//   fn()->void param, fn type in a struct field, fn type equality.
+
+// --- 1. basic typed fn param: fn(i64)->i64 ---
+fn id(x: i64) -> i64 { return x; }
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 { return f(x); }
+
+// --- 2. two-arg typed fn param: fn(i64,i64)->i64 ---
+fn add(a: i64, b: i64) -> i64 { return a + b; }
+fn apply2(f: fn(i64, i64) -> i64, a: i64, b: i64) -> i64 { return f(a, b); }
+
+// --- 3. bare fn param (backward compat — unsound fallback, still works) ---
+fn apply_bare(f: fn, x: i64) -> i64 { return f(x); }
+
+// --- 4. fn()->void — a typed fn param taking no args, returning void ---
+fn say() -> void { return; }
+fn run_void(f: fn() -> void) -> void { f(); return; }
+
+// --- 5. higher-order: fn(i64)->fn(i64)->i64 ---
+// pick_id ignores its arg and yields the identity handle. The return type
+// fn(i64)->i64 records the signature so the caller type-checks the result.
+fn pick_id(seed: i64) -> fn(i64) -> i64 { return &id; }
+
+// --- 6. fn as an argument: fn(fn(i64)->i64)->i64 ---
+fn apply_to_seven(g: fn(i64) -> i64) -> i64 { return g(7); }
+fn call_fn_arg(h: fn(fn(i64) -> i64) -> i64, g: fn(i64) -> i64) -> i64 {
+    return h(g);
+}
+
+// --- 7. fn type in a struct field ---
+struct Callback { cb: fn(i64) -> i64; }
+fn via_struct(box: Callback, x: i64) -> i64 {
+    // extract the fn-typed field, then call through the handle (the field is
+    // a value of type fn(i64)->i64, not a method-name call target).
+    let f = box.cb;
+    return f(x);
+}
+
+fn main() -> i64 {
+    let r1 = apply(&id, 42);              // 42
+
+    let r2 = apply2(&add, 20, 30);        // 50
+
+    let r3 = apply_bare(&id, 7);          // 7
+
+    // higher-order: pick_id yields &id; call it with 88.
+    let h = pick_id(0);
+    let r4 = h(88);                       // 88
+
+    // fn as arg: call_fn_arg(&apply_to_seven, &id) = apply_to_seven(&id) = id(7) = 7.
+    // Add 56 so this check contributes 63.
+    let r5 = call_fn_arg(&apply_to_seven, &id) + 56;   // 7 + 56 = 63
+
+    // fn()->void param — call it; no runtime contribution but exercises the
+    // zero-arg/void-return signature path end-to-end.
+    run_void(&say);
+
+    // fn type in a struct field — build the struct literal + call through it.
+    let box = Callback { cb: &id };
+    let r6 = via_struct(box, 0);          // 0 (keeps the total at 250)
+
+    return r1 + r2 + r3 + r4 + r5 + r6;   // 42 + 50 + 7 + 88 + 63 + 0 = 250
+}

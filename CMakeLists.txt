@@ -325,6 +325,24 @@ if(WIN32)
 endif()
 add_test(NAME function_refs COMMAND function_refs_test)
 
+# v1.0 Tier 2 parameterized function types: `fn(Args)->Ret` as a type, closing
+# the bare-fn signature hole. A fn-typed param/variable WITH a signature
+# type-checks its args at the call site; a bare `fn` stays the unsound
+# backward-compat fallback (runtime guard still validates the handle). Proves
+# Type::same equality (fn(i64)->i64 == fn(i64)->i64, != fn(i64,i64)->i64),
+# sema accept/reject of matching/mismatched &fn handles, arg type-checking
+# through a typed fn param, and runtime dispatch through typed fn params
+# (higher-order, fn-as-arg, struct-field fn). Same harness as function_refs.
+add_executable(fn_types_test examples/fn_types_test.cpp)
+target_link_libraries(fn_types_test PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_vec ember_ext_quat ember_ext_mat
+    ember_ext_string ember_ext_array ember_ext_math)
+if(WIN32)
+    target_link_libraries(fn_types_test PRIVATE kernel32)
+endif()
+add_test(NAME fn_types COMMAND fn_types_test)
+
 # v0.5 live-modules stress matrix: bidirectional script<->.em cross-module
 # linking through the real grammar (link directive + mod::fn calls). Covers
 # the user's ask: scripts and .em bundles both able to use either form,

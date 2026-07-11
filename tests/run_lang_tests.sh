@@ -64,7 +64,7 @@ done
 for f in tests/lang/sema_valid_*.ember tests/lang/runtime_audit_semantics.ember \
          tests/lang/runtime_cast_regressions.ember tests/lang/runtime_division_forms.ember tests/lang/runtime_integer_boundaries.ember \
          tests/lang/runtime_language_features.ember tests/lang/import_test.ember \
-         tests/lang/valid_structs_slices.ember \
+         tests/lang/valid_structs_slices.ember tests/lang/valid_fn_types.ember \
          tests/lang/runtime_struct_reassign_single.ember tests/lang/runtime_struct_reassign_loop.ember \
          tests/lang/runtime_struct_reassign_multi.ember; do
     run "$SEMA" "$f" ok
@@ -122,7 +122,8 @@ for spec in "runtime_audit_semantics.ember:77" "runtime_cast_regressions.ember:4
             "valid_for_each_array_f32.ember:1" \
             "valid_typed_enum.ember:0" "valid_typed_enum_match.ember:20" \
             "valid_enum_from_constexpr.ember:42" \
-            "valid_type_stress.ember:123"; do
+            "valid_type_stress.ember:123" \
+            "valid_fn_types.ember:250"; do
     f=${spec%%:*}; exp=${spec##*:}; out=$("$CLI" run "tests/lang/$f" 2>&1); rc=$?
     if [ $rc -eq "$exp" ]; then printf "PASS  %s (explicit expected rc=%d)\n" "$f" "$rc"; pass=$((pass+1))
     else printf "FAIL  %s (rc=%d, expected %d)\n%s\n" "$f" "$rc" "$exp" "$out"; fail=$((fail+1)); fi
