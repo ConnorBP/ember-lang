@@ -321,6 +321,127 @@ static bool malformed_rejection() {
     return true;
 }
 
+// ─── Part 4: validation edge cases (the audit-found checks) ───
+//
+// Each case builds a hand-constructed ThinFunction that is structurally
+// deserializable (it never goes through the blob) but fails a specific
+// validate_thin_function check. This pins each audit fix.
+
+static bool validation_edge_cases() {
+    auto base = build_hand_thinfn();  // a valid 1-block fn: ConstInt(1), Add, Return
+
+    // C1: block.id out of range (>= num_blocks). emit_x64 uses blk.id as a
+    // vector index — an OOB id is a heap OOB.
+    {
+        auto bad = base;
+        bad.blocks[0].id = 5;  // only 1 block (id must be 0)
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        // blocks[0].id != 0 is caught by the entry-block check first.
+        if (verr.find("id") == std::string::npos) return false;
+    }
+    // C1 variant: 2 blocks, second block has id=99 (>= 2).
+    {
+        auto bad = base;
+        bad.blocks[0].term.kind = TermKind::Jmp;
+        bad.blocks[0].term.target = 1;
+        ThinBlock blk1;
+        blk1.id = 99;  // should be 1
+        blk1.term.kind = TermKind::Return;
+        blk1.term.ret = 3;
+        bad.blocks.push_back(blk1);
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("id out of range") == std::string::npos) return false;
+    }
+    // C2: CallNative with empty native_name.
+    {
+        auto bad = base;
+        ThinInstr call;
+        call.op = ThinOp::CallNative;
+        call.dst = 4;
+        call.meta.native_name = "";  // empty — must be rejected
+        call.ret_type = nullptr;
+        bad.blocks[0].instrs.push_back(call);
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("empty native_name") == std::string::npos) return false;
+    }
+    // P2: StringDecrypt with rodata OOB (addend + len > rodata.size()).
+    {
+        auto bad = base;
+        bad.rodata.resize(4);  // 4 bytes of rodata
+        ThinInstr sd;
+        sd.op = ThinOp::StringDecrypt;
+        sd.meta.addend = 2;
+        sd.meta.len = 10;  // 2 + 10 = 12 > 4
+        bad.blocks[0].instrs.push_back(sd);
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("rodata") == std::string::npos) return false;
+    }
+    // P3: CallScript slot >= dispatch_size.
+    {
+        auto bad = base;
+        ThinInstr cs;
+        cs.op = ThinOp::CallScript;
+        cs.dst = 4;
+        cs.meta.slot = 99;  // dispatch_size will be 1
+        bad.blocks[0].instrs.push_back(cs);
+        std::string verr;
+        if (validate_thin_function(bad, &verr, 1, 0)) return false;  // dispatch_size=1
+        if (verr.find("slot out of range") == std::string::npos) return false;
+    }
+    // P3: CallCrossModule mod_id >= registry_size.
+    {
+        auto bad = base;
+        ThinInstr cm;
+        cm.op = ThinOp::CallCrossModule;
+        cm.dst = 4;
+        cm.meta.mod_id = 99;  // registry_size will be 1
+        bad.blocks[0].instrs.push_back(cm);
+        std::string verr;
+        if (validate_thin_function(bad, &verr, 0, 1)) return false;  // registry_size=1
+        if (verr.find("mod_id out of range") == std::string::npos) return false;
+    }
+    // P4: Cmp predicate out of range (> 5).
+    {
+        auto bad = base;
+        ThinInstr cmp;
+        cmp.op = ThinOp::Cmp;
+        cmp.dst = 4;
+        cmp.src1 = 1;
+        cmp.src2 = 2;
+        cmp.meta.cmp = 99;  // must be 0..5
+        bad.blocks[0].instrs.push_back(cmp);
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("predicate") == std::string::npos) return false;
+    }
+    // P7: frame_size out of range (> 1MB).
+    {
+        auto bad = base;
+        bad.frame.frame_size = (1 << 21);  // 2MB > 1MB limit
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("frame_size") == std::string::npos) return false;
+    }
+    // P7: rbx_save_offset out of range (>= 0, should be negative).
+    {
+        auto bad = base;
+        bad.frame.rbx_save_offset = 8;  // positive — should be negative
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("rbx_save_offset") == std::string::npos) return false;
+    }
+    // Positive: the base function validates clean (sanity check).
+    {
+        std::string verr;
+        if (!validate_thin_function(base, &verr)) return false;
+    }
+    return true;
+}
+
 int main() {
     std::printf("=== thin_ir_ser_test: Stage B c1b IR serializer ===\n");
 
@@ -352,6 +473,10 @@ int main() {
     // Part 3: malformed rejection.
     std::printf("Part 3: malformed-blob rejection\n");
     check(malformed_rejection(), "all malformed blobs rejected (bad magic, truncated, bad ThinOp, bad target, no terminator, empty)");
+
+    // Part 4: validation edge cases (the audit-found checks).
+    std::printf("Part 4: validation edge cases (C1/C2/P2/P3/P4/P7)\n");
+    check(validation_edge_cases(), "all validation edge cases rejected (bad block.id, empty native_name, rodata OOB, slot OOB, mod_id OOB, bad cmp, bad frame_size, bad rbx_save_offset)");
 
     std::printf("\n%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

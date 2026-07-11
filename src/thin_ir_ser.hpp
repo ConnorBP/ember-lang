@@ -159,22 +159,34 @@ bool deserialize_thin_function(const uint8_t*& cur, const uint8_t* end,
 // Semantic validation of a deserialized ThinFunction, performed by the loader
 // AFTER deserialize_thin_function succeeds and BEFORE emit_x64 (so no
 // executable page is allocated for a malformed/invalid IR function). Checks:
-//   - VReg bounds: every dst/src1/src2/args[i]/term.cond/term.ret is 0 or
-//     < max_vreg (computed from the function's VReg usage).
-//   - Block-target bounds: every term.target/false_target < num_blocks.
+//   - Block id bounds: every block.id < num_blocks (emit_x64 uses blk.id as a
+//     vector index — an out-of-range id is a heap OOB).
 //   - Block 0 is entry (blocks[0].id == 0).
 //   - Every block has a terminator (term.kind != None).
+//   - Block-target bounds: every term.target/false_target < num_blocks.
 //   - Terminator shape consistency (Jmp/Branch/Return/Trap fields).
-//   - Rodata bounds: every ConstStringRef addend+len <= rodata.size().
-//   - ThinOp ordinal in range (re-checked; the deserializer already checks).
+//   - VReg bounds: every dst/src1/src2/args[i]/term.cond/term.ret is 0 or
+//     < max_vreg (computed from the function's VReg usage).
+//   - Rodata bounds: every ConstStringRef AND StringDecrypt addend+len <=
+//     rodata.size().
+//   - CallScript slot < dispatch_size (if dispatch_size > 0).
+//   - CallCrossModule mod_id < registry_size (if registry_size > 0).
+//   - Cmp predicate in [0,5] (Eq..Ge).
+//   - CallNative has a non-empty native_name (the rebind gate relies on this).
+//   - Frame plan sanity: frame_size in [0, 1MB], rbx_save_offset negative.
 //
-// `max_vreg` is an out-parameter: the loader passes it to emit_x64 callers
-// if needed; it's the highest VReg+1 seen across the function.
+// `dispatch_size` and `registry_size` are the host's dispatch table size and
+// module registry size (0 = unknown / no check; the loader passes the real
+// values so CallScript/CallCrossModule slots can be range-checked).
 //
 // NOTE: native-name rebinding (looking up meta.native_name in the host table
 // and setting native_fn) is a SEPARATE step the loader performs between
 // deserialize and validate, because it needs the host natives table and
-// produces a reject on unknown names (the core v5 security gate).
-bool validate_thin_function(const ThinFunction& thf, std::string* err);
+// produces a reject on unknown names (the core v5 security gate). The
+// validator's CallNative non-empty-name check is the structural half of that
+// gate (a CallNative with no name is malformed and rejected here).
+bool validate_thin_function(const ThinFunction& thf, std::string* err,
+                            uint32_t dispatch_size = 0,
+                            uint32_t registry_size = 0);
 
 } // namespace ember

@@ -319,6 +319,12 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
                     set_error(err, "em_loader: format: truncated v5 ir_blob");
                     return false;
                 }
+                // P6 fix: is_ir=1 with ir_blob_len=0 is malformed (an IR
+                // function must carry a non-empty blob).
+                if (ir_blob_len == 0) {
+                    set_error(err, "em_loader: format: v5 is_ir=1 with empty ir_blob");
+                    return false;
+                }
                 f.ir_blob.assign(blob, blob + ir_blob_len);
                 mod.functions.push_back(std::move(f));
                 continue;  // NO code/rodata/relocs/native_bindings follow.
@@ -679,6 +685,10 @@ bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
                                pf.name + "\": " + derr);
                 return false;
             }
+            // Efficiency: the blob is consumed by deserialize; clear it now to
+            // free memory before the re-emit (the blob is never read again).
+            pf.ir_blob.clear();
+            pf.ir_blob.shrink_to_fit();
             // Native rebind: for every CallNative instr, look up
             // meta.native_name in the host table and set native_fn. An IR
             // module referencing a native the host didn't register is
@@ -712,9 +722,14 @@ bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
                     return false;
                 }
             }
-            // Semantic validation (VReg bounds, block-target bounds, etc.).
+            // Semantic validation (block id bounds, VReg bounds, block-target
+            // bounds, rodata bounds, CallScript/CallCrossModule slot range,
+            // Cmp predicate range, CallNative non-empty name, frame plan sanity).
+            // Pass dispatch_size and registry_size so CallScript/CallCrossModule
+            // slots can be range-checked against the host's tables.
             std::string verr;
-            if (!validate_thin_function(thf, &verr)) {
+            if (!validate_thin_function(thf, &verr, uint32_t(staged.dispatch.size()),
+                                        registry ? registry->count() : 0u)) {
                 set_error(err, "em_loader: v5 IR: validation failed for \"" +
                                pf.name + "\": " + verr);
                 return false;
@@ -749,7 +764,7 @@ bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
                 b.signature.params = nf.params;
                 pf.native_bindings.push_back(std::move(b));
             }
-            pf.ir_blob.clear();  // consumed — no longer needed
+            pf.ir_blob.clear();  // already cleared after deserialize (efficiency)
             pf.ir_blob.shrink_to_fit();
         }
     }

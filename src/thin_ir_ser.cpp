@@ -542,7 +542,9 @@ bool deserialize_thin_function(const uint8_t*& cur, const uint8_t* end,
 
 // ─── semantic validation ───
 
-bool validate_thin_function(const ThinFunction& thf, std::string* err) {
+bool validate_thin_function(const ThinFunction& thf, std::string* err,
+                            uint32_t dispatch_size,
+                            uint32_t registry_size) {
     const uint32_t num_blocks = static_cast<uint32_t>(thf.blocks.size());
     if (num_blocks == 0) {
         if (err) *err = "thin_ir_ser: validate: zero blocks";
@@ -551,6 +553,15 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err) {
     // Block 0 is entry.
     if (thf.blocks[0].id != 0) {
         if (err) *err = "thin_ir_ser: validate: entry block id != 0";
+        return false;
+    }
+    // Frame plan sanity (P7): frame_size in a reasonable range, rbx_save negative.
+    if (thf.frame.frame_size < 0 || thf.frame.frame_size > int32_t(1u << 20)) {
+        if (err) *err = "thin_ir_ser: validate: frame_size out of range";
+        return false;
+    }
+    if (thf.frame.rbx_save_offset >= 0 || thf.frame.rbx_save_offset < -(1 << 20)) {
+        if (err) *err = "thin_ir_ser: validate: rbx_save_offset out of range";
         return false;
     }
 
@@ -567,6 +578,14 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err) {
 
     for (uint32_t bi = 0; bi < num_blocks; ++bi) {
         const auto& blk = thf.blocks[bi];
+        // C1 fix: block.id must be < num_blocks (emit_x64 uses it as a vector
+        // index into block_labels). An out-of-range id is a heap OOB.
+        if (blk.id >= num_blocks) {
+            if (err) *err = "thin_ir_ser: validate: block " + std::to_string(bi) +
+                           " id out of range (" + std::to_string(blk.id) + " >= " +
+                           std::to_string(num_blocks) + ")";
+            return false;
+        }
         // Every block has a terminator.
         if (blk.term.kind == TermKind::None) {
             if (err) *err = "thin_ir_ser: validate: block " + std::to_string(bi) + " has no terminator";
@@ -578,13 +597,37 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err) {
             if (!check_vreg(in.src2, "instr src2")) return false;
             for (uint32_t a : in.args)
                 if (!check_vreg(a, "instr args")) return false;
-            // ConstStringRef rodata bounds.
-            if (in.op == ThinOp::ConstStringRef) {
+            // C2 fix: CallNative must have a non-empty native_name (the rebind
+            // gate relies on this; an empty name bypasses the rebind and
+            // produces a null call target).
+            if (in.op == ThinOp::CallNative && in.meta.native_name.empty()) {
+                if (err) *err = "thin_ir_ser: validate: CallNative with empty native_name";
+                return false;
+            }
+            // P2 fix: ConstStringRef AND StringDecrypt rodata bounds.
+            if (in.op == ThinOp::ConstStringRef || in.op == ThinOp::StringDecrypt) {
                 uint64_t end_off = uint64_t(in.meta.addend) + uint64_t(in.meta.len);
                 if (end_off > thf.rodata.size()) {
-                    if (err) *err = "thin_ir_ser: validate: ConstStringRef rodata out of bounds";
+                    if (err) *err = "thin_ir_ser: validate: rodata reference out of bounds";
                     return false;
                 }
+            }
+            // P3 fix: CallScript slot < dispatch_size.
+            if (in.op == ThinOp::CallScript && dispatch_size > 0 &&
+                uint32_t(in.meta.slot) >= dispatch_size) {
+                if (err) *err = "thin_ir_ser: validate: CallScript slot out of range";
+                return false;
+            }
+            // P3 fix: CallCrossModule mod_id < registry_size.
+            if (in.op == ThinOp::CallCrossModule && registry_size > 0 &&
+                uint32_t(in.meta.mod_id) >= registry_size) {
+                if (err) *err = "thin_ir_ser: validate: CallCrossModule mod_id out of range";
+                return false;
+            }
+            // P4 fix: Cmp predicate in [0,5] (Eq..Ge).
+            if (in.op == ThinOp::Cmp && in.meta.cmp > 5) {
+                if (err) *err = "thin_ir_ser: validate: Cmp predicate out of range";
+                return false;
             }
         }
         // Block-target bounds (Jmp/Branch).
