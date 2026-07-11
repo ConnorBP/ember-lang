@@ -412,7 +412,8 @@ int main(int argc, char** argv) {
     auto paths = make_paths();
 
     // ---- results storage (path × safety × engine) ----
-    struct Cell { const char* path; const char* safety; const char* engine; Stats st; };
+    struct Cell { const char* path; const char* safety; const char* engine; Stats st;
+                  double compile_ns = 0; size_t code_bytes = 0; size_t ir_instrs = 0; };
     std::vector<Cell> cells;
 
     bool any_compile_fail = false;
@@ -456,7 +457,7 @@ int main(int argc, char** argv) {
             Stats es = time_ember(*m, ectx, p.iters, p.warmup);
             if (es.trapped) {
                 std::fprintf(stderr, "  ember TRAP (safety=%s): %s\n", mode, ectx.last_error.c_str());
-                cells.push_back({p.name, mode, "ember", es});
+                cells.push_back({p.name, mode, "ember", es, m->compile_ns, m->code_bytes, m->ir_instr_count});
                 continue;
             }
             // correctness check (ember vs g++ -O2 reference) — only for paths
@@ -468,9 +469,7 @@ int main(int argc, char** argv) {
                              mode, (long long)es.result, (long long)ref);
                 // record the mismatch but keep timing (the mismatch itself is data)
             }
-            cells.push_back({p.name, mode, "ember", es});
-
-            // time the baseline with the same iters/warmup (pass inner_n)
+            cells.push_back({p.name, mode, "ember", es, m->compile_ns, m->code_bytes, m->ir_instr_count});
             Stats bs = time_baseline(bfn, p.inner_n, p.iters, p.warmup);
             cells.push_back({p.name, mode, "gcc_O2", bs});
 
@@ -487,7 +486,7 @@ int main(int argc, char** argv) {
     FILE* f = std::fopen("results_codegen_paths.csv", "w");
     if (!f) std::fprintf(stderr, "WARN: could not open results_codegen_paths.csv for write\n");
     if (f) {
-        std::fprintf(f, "path,safety,engine,iters,warmup,min_ns,median_ns,mean_ns,p99_ns,stddev_ns,cv_pct,result,note\n");
+        std::fprintf(f, "path,safety,engine,iters,warmup,min_ns,median_ns,mean_ns,p99_ns,stddev_ns,cv_pct,result,compile_ns,code_bytes,ir_instrs,note\n");
         // notes map per path (one note per path; safety/engine share it)
         std::unordered_map<std::string, const char*> notes;
         for (auto& p : paths) notes[p.name] = p.note;
@@ -497,10 +496,10 @@ int main(int argc, char** argv) {
             // (the harness used p.iters/p.warmup for both). Find the path.
             int iters = 0, warmup = 0;
             for (auto& p : paths) if (strcmp(p.name, c.path) == 0) { iters = p.iters; warmup = p.warmup; break; }
-            std::fprintf(f, "%s,%s,%s,%d,%d,%.1f,%.1f,%.1f,%.1f,%.1f,%.2f,%lld,%s\n",
+            std::fprintf(f, "%s,%s,%s,%d,%d,%.1f,%.1f,%.1f,%.1f,%.1f,%.2f,%lld,%.0f,%zu,%zu,%s\n",
                 c.path, c.safety, c.engine, iters, warmup,
                 c.st.min, c.st.median, c.st.mean, c.st.p99, c.st.stddev, c.st.cv,
-                (long long)c.st.result, note);
+                (long long)c.st.result, c.compile_ns, c.code_bytes, c.ir_instrs, note);
         }
         std::fclose(f);
         std::printf("\nwrote results_codegen_paths.csv\n");
