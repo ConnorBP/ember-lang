@@ -1,0 +1,2009 @@
+// self_hosted/parse.ember — the ember parser, written IN ember.
+//
+// Self-hosting Stage 2: prove ember can parse itself. This is a port of
+// src/parser.cpp (the C++ reference recursive-descent parser) to ember
+// source. It consumes the token stream from Stage 1's lexer (lex.ember) and
+// builds an AST in a flat node pool.
+//
+// === AST storage design ===
+//
+// Like the lexer's flat token store, the AST is a growable `array`-extension
+// buffer of i64s with a fixed stride per node. ember's type system cannot
+// store strings in the array extension (array_push_i64 is i64-only), so node
+// names are stored as TOKEN INDICES: a node's `tok` field is an index into the
+// lexer's token array, and the name is retrieved on demand via
+// `tok_text(g_toks, tok)`. This reuses the lexer's existing text-decoding
+// infrastructure and avoids a separate string pool. For synthetic nodes with
+// no source token (e.g. a program root), `tok` is -1.
+//
+//   flat stride (8 i64s per node): [ kind, tok, a, b, c, d, e, f ]
+//     kind  — NK enum value (which production)
+//     tok   — token index for the node's name/text, or -1
+//     a..f  — general-purpose child/field slots (node indices, flags, op
+//             codes, primitive enum values, etc.). -1 = "no value" for a
+//             child slot.
+//
+// Lists (block statements, params, args, fields, enum variants, struct-lit
+// field inits, array-lit elements) are first-child + next-sibling linked via
+// the `c` slot (next). This is the classic compact tree representation: a
+// Block node's `a` = first stmt; each stmt's `c` = next stmt (or -1).
+//
+// === Operator encodings ===
+//
+// Binary ops (BinExpr `d` slot) and compound-assign ops (AssignExpr `d` slot)
+// use the BinOp enum below (matching the C++ BinExpr::Op order). Unary ops
+// (UnaryExpr `d` slot) use the UnOp enum.
+//
+// === Error handling ===
+//
+// The C++ parser throws ParseError; ember has no exceptions, so this parser
+// uses a global error flag (p_err). On a structural mismatch, `err(msg)` sets
+// the flag + records the current token's position; every parse_* fn checks
+// p_err / a -1 return and bails. parse() returns the program node index on
+// success or -1 on failure; parse_failed() / parse_error_* expose the state.
+
+import "lex.ember";
+
+// -----------------------------------------------------------------------------
+// AST node kinds. i64 constants (Tier 1 enum), usable in switch + comparisons.
+// Grouped by category; values are dense within a group but groups are spaced
+// so new kinds can be inserted without renumbering.
+// -----------------------------------------------------------------------------
+
+// types
+enum NK {
+    Type         = 1,   // d=prim (Prim), tok=struct-name tok (or -1), a=elem type, e=array_len, f=is_slice
+    // declarations
+    FnDecl       = 10,  // tok=name, a=first Param, b=ret Type, c=body BlockStmt, d=flags
+    Param        = 11,  // tok=name, a=type, next=next Param
+    StructDecl   = 12,  // tok=name, a=first Field
+    Field        = 13,  // tok=name, a=type, next=next Field
+    EnumDecl     = 14,  // tok=name, a=first Variant
+    Variant      = 15,  // tok=name, a=value expr (or -1), next=next Variant
+    GlobalDecl   = 16,  // tok=name, a=type, b=init expr, d=is_const
+    LinkDecl     = 17,  // tok=target, a=alias tok (or -1)
+    StaticAssertDecl = 18, // a=cond expr, tok=msg tok
+    NamespaceDecl = 19, // tok=name, a=first member decl
+    // statements
+    LetStmt      = 20,  // tok=name, a=type (or -1), b=init expr (or -1), d=flags
+    IfStmt       = 21,  // a=cond, b=then BlockStmt, c=else BlockStmt (or -1)
+    WhileStmt    = 22,  // a=cond, b=body BlockStmt
+    ForStmt      = 23,  // a=init (LetStmt or -1), b=cond (or -1), c=step (or -1), e=body BlockStmt
+    ForEachStmt  = 24,  // tok=var name, a=iter expr, b=body BlockStmt
+    DoWhileStmt  = 25,  // a=body BlockStmt, b=cond expr
+    ReturnStmt   = 26,  // a=value expr (or -1)
+    BreakStmt    = 27,
+    ContinueStmt = 28,
+    DeferStmt    = 29,  // a=expr
+    ExprStmt     = 30,  // a=expr
+    BlockStmt    = 31,  // a=first stmt (linked via next)
+    SwitchStmt   = 32,  // a=subject expr, b=first Case
+    Case         = 33,  // a=value expr (or -1 for default), b=first body stmt, next=next Case, d=is_default
+    MatchStmt    = 34,  // a=subject expr, b=first MatchArm
+    MatchArm     = 35,  // a=pattern expr (or -1 for wildcard), b=body BlockStmt, next=next MatchArm, d=is_wildcard
+    YieldStmt    = 36,  // a=value expr (or -1)
+    ThrowStmt    = 37,  // a=value expr
+    TryCatchStmt = 38,  // a=try BlockStmt, b=catch BlockStmt, tok=catch-name tok
+    StaticAssertStmt = 39, // a=cond expr, tok=msg tok
+    // expressions
+    IntLit       = 50,  // d=ivalue
+    BoolLit      = 51,  // d=bvalue (0 or 1)
+    FloatLit     = 52,  // tok=token idx (fvalue decoded on demand from token)
+    StringLit    = 53,  // tok=token idx (text from token)
+    Ident        = 54,  // tok=token idx (name from token)
+    BinExpr      = 55,  // d=op (BinOp), a=lhs, b=rhs
+    UnaryExpr    = 56,  // d=op (UnOp), a=operand
+    AssignExpr   = 57,  // a=target, b=value, d=compound op (or -1), e=postfix flag
+    CallExpr     = 58,  // tok=name tok (or -1 for indirect), a=first arg, next=next arg, b=receiver (or -1), e=indirect target (or -1)
+    FieldExpr    = 59,  // a=base, tok=field tok
+    IndexExpr    = 60,  // a=base, b=index
+    CastExpr     = 61,  // a=operand, b=to Type
+    TernaryExpr  = 62,  // a=cond, b=then_e, c=else_e
+    StructLit    = 63,  // tok=type-name tok, a=first FieldInit
+    FieldInit    = 64,  // tok=field-name tok, a=value expr, next=next FieldInit
+    ArrayLit     = 65,  // a=first element (linked via next)
+    ViewExpr     = 66,  // a=base
+    FnHandleExpr = 67,  // a=operand (or -1 for cross-module), tok=fn-name tok, e=module-alias tok (or -1)
+    LambdaExpr   = 68,  // a=first Param, b=ret Type, c=body BlockStmt
+    EnumAccess   = 69,  // tok=variant tok, a=enum-name tok (the base Ident's tok)
+    SizeofExpr   = 70,  // a=Type
+    OffsetofExpr = 71,  // a=Type, tok=field tok
+    // root
+    Program      = 90,  // a=first top-level decl (linked via next)
+}
+
+// Binary operator encoding (matches C++ BinExpr::Op order: Add=0..LOr=15).
+enum BinOp {
+    Add  = 0,  Sub  = 1,  Mul  = 2,  Div  = 3,  Mod  = 4,
+    And  = 5,  Or   = 6,  Xor  = 7,  Shl  = 8,  Shr  = 9,
+    Eq   = 10, Neq  = 11, Lt   = 12, Le   = 13, Gt   = 14, Ge   = 15,
+    LAnd = 16, LOr  = 17,
+}
+
+// Unary operator encoding (matches C++ UnaryExpr::Op: Neg=0, Not=1, BitNot=2).
+enum UnOp {
+    Neg    = 0,
+    Not    = 1,
+    BitNot = 2,
+}
+
+// Primitive type encoding (matches C++ Prim order: Void=0..F64=12).
+enum Prim {
+    Void = 0, Bool = 1,
+    I8 = 2, I16 = 3, I32 = 4, I64 = 5,
+    U8 = 6, U16 = 7, U32 = 8, U64 = 9,
+    F32 = 10, F64 = 11,
+}
+
+// --- LetStmt / FnDecl flag bits (stored in the `d` slot) ---
+global LF_MUT  : i64 = 1;    // LetStmt: `mut`
+global LF_CONST: i64 = 2;    // LetStmt: `const`
+global LF_AUTO : i64 = 4;    // LetStmt: `auto` (no declared type)
+global FD_PRIV : i64 = 1;    // FnDecl: `priv`
+global FD_CEXPR: i64 = 2;    // FnDecl: `constexpr`
+
+// -----------------------------------------------------------------------------
+// parser state (scalar globals — same pattern as the lexer's g_src/g_arr/etc.)
+// -----------------------------------------------------------------------------
+
+global g_toks : i64 = 0;     // the token array handle (from lex())
+global g_ti   : i64 = 0;     // current token index (cursor into g_toks)
+global g_tcount: i64 = 0;    // token count (including trailing Eof)
+global g_nodes : i64 = 0;    // the AST node array handle (flat store, elem_size 8)
+global p_err   : i64 = 0;    // 1 once a parse error is flagged
+global p_errline : i64 = 0;
+global p_errcol  : i64 = 0;
+global p_errmsg  : string = "";
+
+// node stride: 9 i64s per node.
+//   [ kind, tok, a, b, c, d, e, f, next ]
+// `next` is the DEDICATED next-sibling link for list nodes (block stmts,
+// params, args, fields, variants, enum variants, struct-lit field inits,
+// array-lit elements, top-level decls). It is NEVER used for node-specific
+// data, so statement types can freely use a..f for their own fields without
+// clobbering the sibling chain. (An earlier 8-slot design overloaded `c` for
+// both next-sibling AND IfStmt's else-branch / ForStmt's step — a conflict
+// that silently broke list traversal.)
+global PARSE_STRIDE : i64 = 9;
+
+// -----------------------------------------------------------------------------
+// node pool — allocate + accessors.
+// -----------------------------------------------------------------------------
+
+// Allocate one node of `kind`, zero all slots, bump the count. Returns the
+// new node's index, or -1 on error.
+fn alloc_node(kind: i64) -> i64 {
+    let idx: i64 = array_length(g_nodes) / PARSE_STRIDE;
+    array_push_i64(g_nodes, kind);
+    array_push_i64(g_nodes, -1);   // tok
+    array_push_i64(g_nodes, -1);   // a
+    array_push_i64(g_nodes, -1);   // b
+    array_push_i64(g_nodes, -1);   // c
+    array_push_i64(g_nodes, 0);    // d
+    array_push_i64(g_nodes, -1);   // e
+    array_push_i64(g_nodes, -1);   // f
+    array_push_i64(g_nodes, -1);   // next (sibling link)
+    return idx;
+}
+
+// typed accessors — each returns the i64 at slot offset within node i.
+fn nk_kind(i: i64) -> i64 { return array_get_i64(g_nodes, i * PARSE_STRIDE + 0); }
+fn nk_tok(i: i64) -> i64 { return array_get_i64(g_nodes, i * PARSE_STRIDE + 1); }
+fn nk_a(i: i64)   -> i64 { return array_get_i64(g_nodes, i * PARSE_STRIDE + 2); }
+fn nk_b(i: i64)   -> i64 { return array_get_i64(g_nodes, i * PARSE_STRIDE + 3); }
+fn nk_c(i: i64)   -> i64 { return array_get_i64(g_nodes, i * PARSE_STRIDE + 4); }
+fn nk_d(i: i64)   -> i64 { return array_get_i64(g_nodes, i * PARSE_STRIDE + 5); }
+fn nk_e(i: i64)   -> i64 { return array_get_i64(g_nodes, i * PARSE_STRIDE + 6); }
+fn nk_f(i: i64)   -> i64 { return array_get_i64(g_nodes, i * PARSE_STRIDE + 7); }
+fn nk_next(i: i64) -> i64 { return array_get_i64(g_nodes, i * PARSE_STRIDE + 8); }
+
+// setters for the general-purpose slots + the dedicated next-sibling link.
+fn set_tok(i: i64, v: i64) -> i64 { array_set_i64(g_nodes, i * PARSE_STRIDE + 1, v); return 0; }
+fn set_a(i: i64, v: i64) -> i64 { array_set_i64(g_nodes, i * PARSE_STRIDE + 2, v); return 0; }
+fn set_b(i: i64, v: i64) -> i64 { array_set_i64(g_nodes, i * PARSE_STRIDE + 3, v); return 0; }
+fn set_c(i: i64, v: i64) -> i64 { array_set_i64(g_nodes, i * PARSE_STRIDE + 4, v); return 0; }
+fn set_d(i: i64, v: i64) -> i64 { array_set_i64(g_nodes, i * PARSE_STRIDE + 5, v); return 0; }
+fn set_e(i: i64, v: i64) -> i64 { array_set_i64(g_nodes, i * PARSE_STRIDE + 6, v); return 0; }
+fn set_f(i: i64, v: i64) -> i64 { array_set_i64(g_nodes, i * PARSE_STRIDE + 7, v); return 0; }
+fn set_next(i: i64, v: i64) -> i64 { array_set_i64(g_nodes, i * PARSE_STRIDE + 8, v); return 0; }
+
+// number of nodes allocated.
+fn node_count() -> i64 {
+    return array_length(g_nodes) / PARSE_STRIDE;
+}
+
+// retrieve a node's name text (from its `tok` index into the token array).
+// Returns "" if tok < 0.
+fn nk_name(i: i64) -> string {
+    let t: i64 = nk_tok(i);
+    if (t < 0) { return string_from_slice(""); }
+    return tok_text(g_toks, t);
+}
+
+// retrieve an arbitrary token's text by token index (convenience for callers
+// that hold a raw token index, e.g. the fn-handle module alias).
+fn tok_text_at(ti: i64) -> string {
+    if (ti < 0) { return string_from_slice(""); }
+    return tok_text(g_toks, ti);
+}
+
+// the decoded body of a string-literal token (quotes stripped). The lexer
+// records StringLit / RawStringLit tokens as the RAW source span (quotes +
+// escapes included — see lex.ember's tok_text doc). This helper strips the
+// surrounding quotes so callers comparing against a decoded literal get the
+// content, not the raw source. For a plain "...": strips the leading + trailing
+// '"'. For a raw r"""...""": strips the leading r""" + trailing """.
+// Non-string tokens return their raw text unchanged.
+fn tok_string_body(ti: i64) -> string {
+    if (ti < 0) { return string_from_slice(""); }
+    let k: i64 = tok_kind(g_toks, ti);
+    let raw: string = tok_text(g_toks, ti);
+    let n: i64 = string_length(raw);
+    if (k == (Tok::StringLit as i64)) {
+        // "..."  — strip first + last char (the quotes)
+        if (n >= 2) { return string_substr(raw, 1, n - 2); }
+        return string_from_slice("");
+    }
+    if (k == (Tok::RawStringLit as i64)) {
+        // r"""..."""  — strip leading 4 (r""") + trailing 3 (""")
+        if (n >= 7) { return string_substr(raw, 4, n - 7); }
+        return string_from_slice("");
+    }
+    // non-string: return the raw text (idents, keywords, etc.)
+    return raw;
+}
+
+// the decoded string body of a node's `tok` (for nodes whose name token is a
+// string literal, e.g. LinkDecl's target, StaticAssert's message, StringLit
+// expr). For non-string tokens this is the same as nk_name.
+fn nk_string_body(i: i64) -> string {
+    let t: i64 = nk_tok(i);
+    return tok_string_body(t);
+}
+
+// -----------------------------------------------------------------------------
+// token cursor — peek / advance / accept / expect, all over g_toks at g_ti.
+// -----------------------------------------------------------------------------
+
+// the current token's kind.
+fn cur_kind() -> i64 {
+    return tok_kind(g_toks, g_ti);
+}
+
+// peek a token kind at offset off (clamped to the trailing Eof).
+fn peek_kind(off: i64) -> i64 {
+    let idx: i64 = g_ti + off;
+    if (idx >= g_tcount) { return Tok::Eof as i64; }
+    if (idx < 0) { return tok_kind(g_toks, 0); }
+    return tok_kind(g_toks, idx);
+}
+
+// is the current token of this kind?
+fn at(kind: i64) -> i64 {
+    if (cur_kind() == kind) { return 1; }
+    return 0;
+}
+
+// advance the cursor; return the index of the token that was consumed. Clamps
+// at the trailing Eof so p_adv() past EOF stays on EOF.
+fn p_adv() -> i64 {
+    let idx: i64 = g_ti;
+    if (g_ti < g_tcount - 1) { g_ti = g_ti + 1; }
+    return idx;
+}
+
+// if the current token is `kind`, consume it and return 1; else return 0.
+fn accept(kind: i64) -> i64 {
+    if (cur_kind() == kind) { p_adv(); return 1; }
+    return 0;
+}
+
+// the current token's text (for error messages + identifier consumption).
+fn cur_text() -> string {
+    return tok_text(g_toks, g_ti);
+}
+
+// the current token's ivalue (for integer literals).
+fn cur_ivalue() -> i64 {
+    return tok_ivalue(g_toks, g_ti);
+}
+
+// -----------------------------------------------------------------------------
+// error reporting. err(msg) flags the error at the current token and returns
+// -1 so callers can `return err(...)` inline. err_after(msg) anchors the error
+// one token back (for "expected X after Y" messages, matching the C++ parser's
+// end-of-last-consumed-token anchoring).
+// -----------------------------------------------------------------------------
+
+fn err(msg: string) -> i64 {
+    if (p_err == 0) {
+        p_err = 1;
+        p_errline = tok_line(g_toks, g_ti);
+        p_errcol = tok_col(g_toks, g_ti);
+        p_errmsg = msg;
+    }
+    return -1;
+}
+
+fn err_at(msg: string, line: i64, col: i64) -> i64 {
+    if (p_err == 0) {
+        p_err = 1;
+        p_errline = line;
+        p_errcol = col;
+        p_errmsg = msg;
+    }
+    return -1;
+}
+
+// expect a token of `kind`; consume + return its index on success, or set an
+// error and return -1. `what` is the human-readable description for the error.
+fn expect(kind: i64, what: string) -> i64 {
+    if (cur_kind() != kind) {
+        return err(what);
+    }
+    return p_adv();
+}
+
+// -----------------------------------------------------------------------------
+// type parsing. Mirrors the C++ parse_type: a primitive / named struct / fn
+// type, then postfix [N] (fixed array) or [] (slice) suffixes.
+//
+//   type := prim | ident | fn ['(' [type {',' type}] ')' '->' type]
+//         { '[' ']' | '[' IntLit ']' }
+// -----------------------------------------------------------------------------
+
+// Map a primitive-type keyword token kind to a Prim value, or -1 if not a prim.
+fn prim_of_kind(kind: i64) -> i64 {
+    if (kind == (Tok::Kw_void as i64)) { return Prim::Void as i64; }
+    if (kind == (Tok::Kw_bool as i64)) { return Prim::Bool as i64; }
+    if (kind == (Tok::Kw_i8 as i64))   { return Prim::I8 as i64; }
+    if (kind == (Tok::Kw_i16 as i64))  { return Prim::I16 as i64; }
+    if (kind == (Tok::Kw_i32 as i64))  { return Prim::I32 as i64; }
+    if (kind == (Tok::Kw_i64 as i64))  { return Prim::I64 as i64; }
+    if (kind == (Tok::Kw_u8 as i64))   { return Prim::U8 as i64; }
+    if (kind == (Tok::Kw_u16 as i64))  { return Prim::U16 as i64; }
+    if (kind == (Tok::Kw_u32 as i64))  { return Prim::U32 as i64; }
+    if (kind == (Tok::Kw_u64 as i64))  { return Prim::U64 as i64; }
+    if (kind == (Tok::Kw_f32 as i64))  { return Prim::F32 as i64; }
+    if (kind == (Tok::Kw_f64 as i64))  { return Prim::F64 as i64; }
+    return -1;
+}
+
+// parse a type, returning a Type node index (or -1 on error).
+fn parse_type() -> i64 {
+    let k: i64 = cur_kind();
+    let p: i64 = prim_of_kind(k);
+    let mut n: i64 = 0;
+
+    if (p >= 0) {
+        // primitive
+        p_adv();
+        n = alloc_node(NK::Type as i64);
+        if (p_err != 0) { return -1; }
+        set_d(n, p);
+        return parse_type_suffix(n);
+    }
+
+    if (k == (Tok::Kw_fn as i64)) {
+        // fn type (function handle). prim=I64, is_fn_handle carried implicitly.
+        p_adv();
+        n = alloc_node(NK::Type as i64);
+        if (p_err != 0) { return -1; }
+        set_d(n, Prim::I64 as i64);
+        // optional '(' params ')' '->' ret signature
+        if (at(Tok::LParen as i64) == 1) {
+            p_adv();
+            // parse param types (stored as a list in `a` via c=next)
+            let mut first: i64 = -1;
+            let mut prev: i64 = -1;
+            if (at(Tok::RParen as i64) == 0) {
+                let mut go: i64 = 1;
+                while (go == 1) {
+                    let pt: i64 = parse_type();
+                    if (p_err != 0) { return -1; }
+                    if (first < 0) { first = pt; }
+                    else { set_next(prev, pt); }
+                    prev = pt;
+                    if (accept(Tok::Comma as i64) == 0) { go = 0; }
+                }
+            }
+            if (first >= 0) { set_a(n, first); }
+            if (expect(Tok::RParen as i64, string_from_slice("expected ')'")) < 0) { return -1; }
+            if (expect(Tok::Arrow as i64, string_from_slice("expected '->' in function type")) < 0) { return -1; }
+            let rt: i64 = parse_type();
+            if (p_err != 0) { return -1; }
+            set_b(n, rt);   // ret type in `b` for fn types
+        }
+        return parse_type_suffix(n);
+    }
+
+    if (k == (Tok::Ident as i64)) {
+        // named struct type
+        let ntok: i64 = p_adv();
+        n = alloc_node(NK::Type as i64);
+        if (p_err != 0) { return -1; }
+        set_d(n, Prim::Void as i64);   // Void prim = named-type marker
+        set_tok(n, ntok);
+        return parse_type_suffix(n);
+    }
+
+    return err(string_from_slice("expected type"));
+}
+
+// postfix [N] / [] suffixes on a base type. Returns `n` (possibly wrapped in a
+// new array/slice Type node).
+fn parse_type_suffix(n: i64) -> i64 {
+    let mut base: i64 = n;
+    let mut go: i64 = 1;
+    while (go == 1) {
+        if (at(Tok::LBracket as i64) == 0) { go = 0; continue; }
+        p_adv();  // '['
+        if (accept(Tok::RBracket as i64) == 1) {
+            // slice T[]
+            let s: i64 = alloc_node(NK::Type as i64);
+            if (p_err != 0) { return -1; }
+            set_f(s, 1);            // is_slice
+            set_a(s, base);         // elem
+            base = s;
+            continue;
+        }
+        // fixed array T[N]
+        let ntok: i64 = expect(Tok::IntLit as i64, string_from_slice("expected integer array size"));
+        if (p_err != 0) { return -1; }
+        let sz: i64 = tok_ivalue(g_toks, ntok);
+        if (sz <= 0) {
+            return err(string_from_slice("array size must be a positive integer"));
+        }
+        if (expect(Tok::RBracket as i64, string_from_slice("expected ']'")) < 0) { return -1; }
+        let arr: i64 = alloc_node(NK::Type as i64);
+        if (p_err != 0) { return -1; }
+        set_e(arr, sz);         // array_len
+        set_a(arr, base);       // elem
+        base = arr;
+    }
+    return base;
+}
+
+// helpers for type nodes (used by the test + future sema).
+fn type_is_slice(t: i64) -> i64 { return nk_f(t); }
+fn type_array_len(t: i64) -> i64 { return nk_e(t); }
+fn type_prim(t: i64) -> i64 { return nk_d(t); }
+fn type_elem(t: i64) -> i64 { return nk_a(t); }
+fn type_ret(t: i64) -> i64 { return nk_b(t); }   // fn type's ret (in b)
+fn type_name(t: i64) -> string { return nk_name(t); }
+
+// -----------------------------------------------------------------------------
+// parameter parsing: NAME ':' type ['=' literal]. Returns a Param node index
+// (or -1 on error). For v1 the default value is recorded as a parsed expr in
+// `b` (the C++ parser restricts it to a literal; we parse an expr and let a
+// later pass restrict — keeps the parser simple).
+// -----------------------------------------------------------------------------
+
+fn parse_param() -> i64 {
+    let ntok: i64 = expect(Tok::Ident as i64, string_from_slice("expected parameter name"));
+    if (p_err != 0) { return -1; }
+    if (expect(Tok::Colon as i64, string_from_slice("expected ':'")) < 0) { return -1; }
+    let ty: i64 = parse_type();
+    if (p_err != 0) { return -1; }
+    let p: i64 = alloc_node(NK::Param as i64);
+    if (p_err != 0) { return -1; }
+    set_tok(p, ntok);
+    set_a(p, ty);
+    if (accept(Tok::Assign as i64) == 1) {
+        let dv: i64 = parse_expr();
+        if (p_err != 0) { return -1; }
+        set_b(p, dv);
+    }
+    return p;
+}
+
+// -----------------------------------------------------------------------------
+// expression parsing — precedence climbing, mirroring the C++ parse_expr chain:
+//   expr    := assign
+//   assign  := ternary [ ('=' | '+=' | ...) assign ]
+//   ternary := or [ '?' expr ':' ternary ]
+//   or      := and { '||' and }
+//   and     := bxor { '&&' bxor }
+//   bxor    := bor { '^' bor }
+//   bor     := band { '|' band }
+//   band    := eq { '&' eq }
+//   eq      := rel { ('==' | '!=') rel }
+//   rel     := shift { ('<' | '<=' | '>' | '>=') shift }
+//   shift   := add { ('<<' | '>>') add }
+//   add     := mul { ('+' | '-') mul }
+//   mul     := cast { ('*' | '/' | '%') cast }
+//   cast    := unary { 'as' type }
+//   unary   := ('-' | '!' | '~' | '&' | '++' | '--') unary | postfix
+//   postfix := primary { '::' ident ['(' args ')'] | '(' args ')' | '[' ... ']' | '.' ident | '++' | '--' }
+//   primary := IntLit | FloatLit | BoolLit | StringLit | ident [struct-lit] | '(' expr ')' | '[' array-lit ']' | ...
+// -----------------------------------------------------------------------------
+
+// map a binary-operator token kind to a BinOp value (or -1 if not a binop).
+fn binop_of(kind: i64) -> i64 {
+    if (kind == (Tok::Plus as i64))    { return BinOp::Add as i64; }
+    if (kind == (Tok::Minus as i64))   { return BinOp::Sub as i64; }
+    if (kind == (Tok::Star as i64))    { return BinOp::Mul as i64; }
+    if (kind == (Tok::Slash as i64))   { return BinOp::Div as i64; }
+    if (kind == (Tok::Percent as i64)) { return BinOp::Mod as i64; }
+    if (kind == (Tok::Amp as i64))     { return BinOp::And as i64; }
+    if (kind == (Tok::Pipe as i64))    { return BinOp::Or as i64; }
+    if (kind == (Tok::Caret as i64))   { return BinOp::Xor as i64; }
+    if (kind == (Tok::Shl as i64))     { return BinOp::Shl as i64; }
+    if (kind == (Tok::Shr as i64))     { return BinOp::Shr as i64; }
+    if (kind == (Tok::Eq as i64))      { return BinOp::Eq as i64; }
+    if (kind == (Tok::Neq as i64))     { return BinOp::Neq as i64; }
+    if (kind == (Tok::Lt as i64))      { return BinOp::Lt as i64; }
+    if (kind == (Tok::Le as i64))      { return BinOp::Le as i64; }
+    if (kind == (Tok::Gt as i64))      { return BinOp::Gt as i64; }
+    if (kind == (Tok::Ge as i64))      { return BinOp::Ge as i64; }
+    if (kind == (Tok::AndAnd as i64))  { return BinOp::LAnd as i64; }
+    if (kind == (Tok::OrOr as i64))    { return BinOp::LOr as i64; }
+    return -1;
+}
+
+// parse a comma-separated arg list into a first-child/next-sibling list.
+// Returns the first arg node index (or -1 if no args). The caller has already
+// NOT consumed the '('; this fn consumes '(' ... ')'.
+fn parse_arg_list() -> i64 {
+    if (expect(Tok::LParen as i64, string_from_slice("expected '('")) < 0) { return -1; }
+    let mut first: i64 = -1;
+    let mut prev: i64 = -1;
+    if (at(Tok::RParen as i64) == 0) {
+        let mut go: i64 = 1;
+        while (go == 1) {
+            let a: i64 = parse_expr();
+            if (p_err != 0) { return -1; }
+            if (first < 0) { first = a; }
+            else { set_next(prev, a); }
+            prev = a;
+            if (accept(Tok::Comma as i64) == 0) { go = 0; }
+        }
+    }
+    if (expect(Tok::RParen as i64, string_from_slice("expected ')'")) < 0) { return -1; }
+    return first;
+}
+
+// parse_primary — literals, idents, parenthesized exprs, array literals, etc.
+fn parse_primary() -> i64 {
+    let k: i64 = cur_kind();
+
+    if (k == (Tok::IntLit as i64)) {
+        let v: i64 = cur_ivalue();
+        p_adv();
+        let n: i64 = alloc_node(NK::IntLit as i64);
+        if (p_err != 0) { return -1; }
+        set_d(n, v);
+        return n;
+    }
+    if (k == (Tok::FloatLit as i64)) {
+        let t: i64 = p_adv();
+        let n: i64 = alloc_node(NK::FloatLit as i64);
+        if (p_err != 0) { return -1; }
+        set_tok(n, t);
+        return n;
+    }
+    if (k == (Tok::BoolLit as i64)) {
+        // true/false — decode from the token text (true=1, false=0)
+        let t: i64 = p_adv();
+        let txt: string = tok_text(g_toks, t);
+        let mut bv: i64 = 0;
+        if (txt == string_from_slice("true")) { bv = 1; }
+        let n: i64 = alloc_node(NK::BoolLit as i64);
+        if (p_err != 0) { return -1; }
+        set_d(n, bv);
+        set_tok(n, t);
+        return n;
+    }
+    if (k == (Tok::StringLit as i64) || k == (Tok::RawStringLit as i64)) {
+        let t: i64 = p_adv();
+        let n: i64 = alloc_node(NK::StringLit as i64);
+        if (p_err != 0) { return -1; }
+        set_tok(n, t);
+        return n;
+    }
+    if (k == (Tok::FStringLit as i64)) {
+        // v1 simplification: record the f-string token; a later pass desugars
+        // it (the C++ parser splits it into literal+interpolation segments).
+        let t: i64 = p_adv();
+        let n: i64 = alloc_node(NK::StringLit as i64);
+        if (p_err != 0) { return -1; }
+        set_tok(n, t);
+        set_d(n, 1);   // flag: this is an f-string, not a plain string
+        return n;
+    }
+    if (k == (Tok::Ident as i64)) {
+        let ntok: i64 = p_adv();
+        // struct literal?  IDENT '{' field: expr, ... '}'
+        if (at(Tok::LBrace as i64) == 1) {
+            p_adv();  // '{'
+            let sl: i64 = alloc_node(NK::StructLit as i64);
+            if (p_err != 0) { return -1; }
+            set_tok(sl, ntok);
+            let mut first: i64 = -1;
+            let mut prev: i64 = -1;
+            if (at(Tok::RBrace as i64) == 0) {
+                let mut go: i64 = 1;
+                while (go == 1) {
+                    let ft: i64 = expect(Tok::Ident as i64, string_from_slice("expected field name"));
+                    if (p_err != 0) { return -1; }
+                    if (expect(Tok::Colon as i64, string_from_slice("expected ':'")) < 0) { return -1; }
+                    let fv: i64 = parse_expr();
+                    if (p_err != 0) { return -1; }
+                    let fi: i64 = alloc_node(NK::FieldInit as i64);
+                    if (p_err != 0) { return -1; }
+                    set_tok(fi, ft);
+                    set_a(fi, fv);
+                    if (first < 0) { first = fi; }
+                    else { set_next(prev, fi); }
+                    prev = fi;
+                    if (accept(Tok::Comma as i64) == 0) { go = 0; }
+                }
+            }
+            if (first >= 0) { set_a(sl, first); }
+            if (expect(Tok::RBrace as i64, string_from_slice("expected '}'")) < 0) { return -1; }
+            return sl;
+        }
+        // plain identifier
+        let n: i64 = alloc_node(NK::Ident as i64);
+        if (p_err != 0) { return -1; }
+        set_tok(n, ntok);
+        return n;
+    }
+    if (k == (Tok::LParen as i64)) {
+        p_adv();  // '('
+        let e: i64 = parse_expr();
+        if (p_err != 0) { return -1; }
+        if (expect(Tok::RParen as i64, string_from_slice("expected ')'")) < 0) { return -1; }
+        return e;
+    }
+    if (k == (Tok::LBracket as i64)) {
+        // array literal [ expr, expr, ... ]
+        p_adv();  // '['
+        let al: i64 = alloc_node(NK::ArrayLit as i64);
+        if (p_err != 0) { return -1; }
+        let mut first: i64 = -1;
+        let mut prev: i64 = -1;
+        if (at(Tok::RBracket as i64) == 0) {
+            let mut go: i64 = 1;
+            while (go == 1) {
+                let e: i64 = parse_expr();
+                if (p_err != 0) { return -1; }
+                if (first < 0) { first = e; }
+                else { set_next(prev, e); }
+                prev = e;
+                if (accept(Tok::Comma as i64) == 0) { go = 0; }
+            }
+        }
+        if (first >= 0) { set_a(al, first); }
+        if (expect(Tok::RBracket as i64, string_from_slice("expected ']'")) < 0) { return -1; }
+        return al;
+    }
+    if (k == (Tok::Kw_sizeof as i64)) {
+        p_adv();
+        if (expect(Tok::LParen as i64, string_from_slice("expected '('")) < 0) { return -1; }
+        let ty: i64 = parse_type();
+        if (p_err != 0) { return -1; }
+        if (expect(Tok::RParen as i64, string_from_slice("expected ')'")) < 0) { return -1; }
+        let n: i64 = alloc_node(NK::SizeofExpr as i64);
+        if (p_err != 0) { return -1; }
+        set_a(n, ty);
+        return n;
+    }
+    if (k == (Tok::Kw_offsetof as i64)) {
+        p_adv();
+        if (expect(Tok::LParen as i64, string_from_slice("expected '('")) < 0) { return -1; }
+        let ty: i64 = parse_type();
+        if (p_err != 0) { return -1; }
+        if (expect(Tok::Comma as i64, string_from_slice("expected ','")) < 0) { return -1; }
+        let ft: i64 = expect(Tok::Ident as i64, string_from_slice("expected field name"));
+        if (p_err != 0) { return -1; }
+        if (expect(Tok::RParen as i64, string_from_slice("expected ')'")) < 0) { return -1; }
+        let n: i64 = alloc_node(NK::OffsetofExpr as i64);
+        if (p_err != 0) { return -1; }
+        set_a(n, ty);
+        set_tok(n, ft);
+        return n;
+    }
+    if (k == (Tok::Kw_fn as i64)) {
+        // lambda: fn(params) -> ret { body }
+        p_adv();  // 'fn'
+        if (expect(Tok::LParen as i64, string_from_slice("expected '(' after 'fn'")) < 0) { return -1; }
+        let mut first_p: i64 = -1;
+        let mut prev_p: i64 = -1;
+        if (at(Tok::RParen as i64) == 0) {
+            let mut go: i64 = 1;
+            while (go == 1) {
+                let p: i64 = parse_param();
+                if (p_err != 0) { return -1; }
+                if (first_p < 0) { first_p = p; }
+                else { set_next(prev_p, p); }
+                prev_p = p;
+                if (accept(Tok::Comma as i64) == 0) { go = 0; }
+            }
+        }
+        if (expect(Tok::RParen as i64, string_from_slice("expected ')'")) < 0) { return -1; }
+        let mut ret: i64 = 0;
+        if (accept(Tok::Arrow as i64) == 1) {
+            ret = parse_type();
+            if (p_err != 0) { return -1; }
+        } else {
+            ret = alloc_node(NK::Type as i64);
+            if (p_err != 0) { return -1; }
+            set_d(ret, Prim::Void as i64);
+        }
+        let body: i64 = parse_block();
+        if (p_err != 0) { return -1; }
+        let le: i64 = alloc_node(NK::LambdaExpr as i64);
+        if (p_err != 0) { return -1; }
+        if (first_p >= 0) { set_a(le, first_p); }
+        set_b(le, ret);
+        set_c(le, body);
+        return le;
+    }
+
+    return err(string_from_slice("unexpected token in expression"));
+}
+
+// parse_postfix — primary followed by :: / ( / [ / . / ++ / --
+fn parse_postfix() -> i64 {
+    let mut e: i64 = parse_primary();
+    if (p_err != 0) { return -1; }
+    let mut go: i64 = 1;
+    while (go == 1) {
+        let k: i64 = cur_kind();
+        if (k == (Tok::DoubleColon as i64)) {
+            // mod::fn(args)  or  Enum::variant
+            // e must be an Ident
+            if (nk_kind(e) != (NK::Ident as i64)) {
+                return err(string_from_slice("expected '::' to follow a name"));
+            }
+            let base_tok: i64 = nk_tok(e);
+            p_adv();  // '::'
+            let name_tok: i64 = expect(Tok::Ident as i64, string_from_slice("expected name after '::'"));
+            if (p_err != 0) { return -1; }
+            if (at(Tok::LParen as i64) == 1) {
+                // cross-module call mod::fn(args)
+                let c: i64 = alloc_node(NK::CallExpr as i64);
+                if (p_err != 0) { return -1; }
+                set_tok(c, name_tok);
+                set_e(c, base_tok);   // module-alias tok in `e`
+                let args: i64 = parse_arg_list();
+                if (p_err != 0) { return -1; }
+                if (args >= 0) { set_a(c, args); }
+                e = c;
+                continue;
+            }
+            // enum variant access E::A
+            let ea: i64 = alloc_node(NK::EnumAccess as i64);
+            if (p_err != 0) { return -1; }
+            set_tok(ea, name_tok);
+            set_a(ea, base_tok);
+            e = ea;
+            continue;
+        }
+        if (k == (Tok::LParen as i64)) {
+            // call e(args)
+            let c: i64 = alloc_node(NK::CallExpr as i64);
+            if (p_err != 0) { return -1; }
+            if (nk_kind(e) == (NK::Ident as i64)) {
+                // free fn call name(args)
+                set_tok(c, nk_tok(e));
+            } else if (nk_kind(e) == (NK::FieldExpr as i64)) {
+                // method call obj.method(args) -> method(obj, args)
+                set_tok(c, nk_tok(e));      // method name
+                set_b(c, nk_a(e));           // receiver = base
+            } else {
+                // indirect call through a runtime handle
+                set_e(c, e);                 // indirect target
+            }
+            let args: i64 = parse_arg_list();
+            if (p_err != 0) { return -1; }
+            if (args >= 0) { set_a(c, args); }
+            e = c;
+            continue;
+        }
+        if (k == (Tok::LBracket as i64)) {
+            p_adv();  // '['
+            if (at(Tok::DotDot as i64) == 1) {
+                p_adv();  // '..'
+                if (expect(Tok::RBracket as i64, string_from_slice("expected ']'")) < 0) { return -1; }
+                let v: i64 = alloc_node(NK::ViewExpr as i64);
+                if (p_err != 0) { return -1; }
+                set_a(v, e);
+                e = v;
+                continue;
+            }
+            let idx: i64 = parse_expr();
+            if (p_err != 0) { return -1; }
+            if (expect(Tok::RBracket as i64, string_from_slice("expected ']'")) < 0) { return -1; }
+            let x: i64 = alloc_node(NK::IndexExpr as i64);
+            if (p_err != 0) { return -1; }
+            set_a(x, e);
+            set_b(x, idx);
+            e = x;
+            continue;
+        }
+        if (k == (Tok::Dot as i64)) {
+            p_adv();
+            let ft: i64 = expect(Tok::Ident as i64, string_from_slice("expected field name"));
+            if (p_err != 0) { return -1; }
+            let fl: i64 = alloc_node(NK::FieldExpr as i64);
+            if (p_err != 0) { return -1; }
+            set_a(fl, e);
+            set_tok(fl, ft);
+            e = fl;
+            continue;
+        }
+        if (k == (Tok::Inc as i64) || k == (Tok::Dec as i64)) {
+            p_adv();
+            let a: i64 = alloc_node(NK::AssignExpr as i64);
+            if (p_err != 0) { return -1; }
+            set_a(a, e);    // target
+            set_e(a, 1);    // postfix flag
+            if (k == (Tok::Inc as i64)) { set_d(a, BinOp::Add as i64); }
+            else { set_d(a, BinOp::Sub as i64); }
+            e = a;
+            continue;
+        }
+        go = 0;
+    }
+    return e;
+}
+
+// parse_unary — prefix - ! ~ & ++ --
+fn parse_unary() -> i64 {
+    let k: i64 = cur_kind();
+    if (k == (Tok::Minus as i64) || k == (Tok::Not as i64) || k == (Tok::Tilde as i64)) {
+        p_adv();
+        let operand: i64 = parse_unary();
+        if (p_err != 0) { return -1; }
+        let u: i64 = alloc_node(NK::UnaryExpr as i64);
+        if (p_err != 0) { return -1; }
+        if (k == (Tok::Minus as i64)) { set_d(u, UnOp::Neg as i64); }
+        else if (k == (Tok::Not as i64)) { set_d(u, UnOp::Not as i64); }
+        else { set_d(u, UnOp::BitNot as i64); }
+        set_a(u, operand);
+        return u;
+    }
+    if (k == (Tok::Amp as i64)) {
+        // &fn  or  &mod::fn  (function handle)
+        p_adv();
+        // &mod::fn (no call parens)
+        if (peek_kind(0) == (Tok::Ident as i64) && peek_kind(1) == (Tok::DoubleColon as i64)
+            && peek_kind(2) == (Tok::Ident as i64) && peek_kind(3) != (Tok::LParen as i64)) {
+            let mod_tok: i64 = p_adv();
+            p_adv();  // '::'
+            let fn_tok: i64 = p_adv();
+            let h: i64 = alloc_node(NK::FnHandleExpr as i64);
+            if (p_err != 0) { return -1; }
+            set_tok(h, fn_tok);
+            set_e(h, mod_tok);
+            return h;
+        }
+        let operand: i64 = parse_unary();
+        if (p_err != 0) { return -1; }
+        let h: i64 = alloc_node(NK::FnHandleExpr as i64);
+        if (p_err != 0) { return -1; }
+        set_a(h, operand);
+        return h;
+    }
+    if (k == (Tok::Inc as i64) || k == (Tok::Dec as i64)) {
+        // prefix ++/-- desugars to assign
+        p_adv();
+        let operand: i64 = parse_unary();
+        if (p_err != 0) { return -1; }
+        let a: i64 = alloc_node(NK::AssignExpr as i64);
+        if (p_err != 0) { return -1; }
+        set_a(a, operand);
+        if (k == (Tok::Inc as i64)) { set_d(a, BinOp::Add as i64); }
+        else { set_d(a, BinOp::Sub as i64); }
+        let one: i64 = alloc_node(NK::IntLit as i64);
+        if (p_err != 0) { return -1; }
+        set_d(one, 1);
+        set_b(a, one);
+        return a;
+    }
+    return parse_postfix();
+}
+
+// parse_cast — unary { 'as' type }
+fn parse_cast() -> i64 {
+    let mut e: i64 = parse_unary();
+    if (p_err != 0) { return -1; }
+    let mut go: i64 = 1;
+    while (go == 1) {
+        if (at(Tok::Kw_as as i64) == 0) { go = 0; continue; }
+        p_adv();
+        let ty: i64 = parse_type();
+        if (p_err != 0) { return -1; }
+        let c: i64 = alloc_node(NK::CastExpr as i64);
+        if (p_err != 0) { return -1; }
+        set_a(c, e);
+        set_b(c, ty);
+        e = c;
+    }
+    return e;
+}
+
+// generic left-assoc binary level: parse `lower`, then while the current token
+// is one of the ops in the predicate, fold into a BinExpr. `pred` is a fn that
+// returns 1 if the token kind is an operator at this level.
+fn p_mul(k: i64) -> i64 {
+    if (k == (Tok::Star as i64)) { return 1; }
+    if (k == (Tok::Slash as i64)) { return 1; }
+    if (k == (Tok::Percent as i64)) { return 1; }
+    return 0;
+}
+fn p_add(k: i64) -> i64 {
+    if (k == (Tok::Plus as i64)) { return 1; }
+    if (k == (Tok::Minus as i64)) { return 1; }
+    return 0;
+}
+fn p_shift(k: i64) -> i64 {
+    if (k == (Tok::Shl as i64)) { return 1; }
+    if (k == (Tok::Shr as i64)) { return 1; }
+    return 0;
+}
+fn p_rel(k: i64) -> i64 {
+    if (k == (Tok::Lt as i64)) { return 1; }
+    if (k == (Tok::Le as i64)) { return 1; }
+    if (k == (Tok::Gt as i64)) { return 1; }
+    if (k == (Tok::Ge as i64)) { return 1; }
+    return 0;
+}
+fn p_eq(k: i64) -> i64 {
+    if (k == (Tok::Eq as i64)) { return 1; }
+    if (k == (Tok::Neq as i64)) { return 1; }
+    return 0;
+}
+fn p_band(k: i64) -> i64 { if (k == (Tok::Amp as i64)) { return 1; } return 0; }
+fn p_bor(k: i64) -> i64  { if (k == (Tok::Pipe as i64)) { return 1; } return 0; }
+fn p_bxor(k: i64) -> i64 { if (k == (Tok::Caret as i64)) { return 1; } return 0; }
+fn p_and(k: i64) -> i64  { if (k == (Tok::AndAnd as i64)) { return 1; } return 0; }
+fn p_or(k: i64) -> i64   { if (k == (Tok::OrOr as i64)) { return 1; } return 0; }
+
+// a binary-level helper that takes the lower-level parser fn name and the
+// predicate fn name. ember has no fn-pointer-as-param in the simple call ABI
+// we use, so each level is spelled out below calling the level under it.
+// (The C++ parser uses a member-fn-pointer template; ember uses explicit
+// per-level fns.)
+
+fn parse_mul() -> i64 {
+    let mut lhs: i64 = parse_cast();
+    if (p_err != 0) { return -1; }
+    let mut go: i64 = 1;
+    while (go == 1) {
+        let k: i64 = cur_kind();
+        if (p_mul(k) == 1) {
+            let op: i64 = binop_of(k);
+            p_adv();
+            let rhs: i64 = parse_cast();
+            if (p_err != 0) { return -1; }
+            let b: i64 = alloc_node(NK::BinExpr as i64);
+            if (p_err != 0) { return -1; }
+            set_d(b, op);
+            set_a(b, lhs);
+            set_b(b, rhs);
+            lhs = b;
+        } else { go = 0; }
+    }
+    return lhs;
+}
+
+fn parse_add() -> i64 {
+    let mut lhs: i64 = parse_mul();
+    if (p_err != 0) { return -1; }
+    let mut go: i64 = 1;
+    while (go == 1) {
+        let k: i64 = cur_kind();
+        if (p_add(k) == 1) {
+            let op: i64 = binop_of(k);
+            p_adv();
+            let rhs: i64 = parse_mul();
+            if (p_err != 0) { return -1; }
+            let b: i64 = alloc_node(NK::BinExpr as i64);
+            if (p_err != 0) { return -1; }
+            set_d(b, op);
+            set_a(b, lhs);
+            set_b(b, rhs);
+            lhs = b;
+        } else { go = 0; }
+    }
+    return lhs;
+}
+
+fn parse_shift() -> i64 {
+    let mut lhs: i64 = parse_add();
+    if (p_err != 0) { return -1; }
+    let mut go: i64 = 1;
+    while (go == 1) {
+        let k: i64 = cur_kind();
+        if (p_shift(k) == 1) {
+            let op: i64 = binop_of(k);
+            p_adv();
+            let rhs: i64 = parse_add();
+            if (p_err != 0) { return -1; }
+            let b: i64 = alloc_node(NK::BinExpr as i64);
+            if (p_err != 0) { return -1; }
+            set_d(b, op);
+            set_a(b, lhs);
+            set_b(b, rhs);
+            lhs = b;
+        } else { go = 0; }
+    }
+    return lhs;
+}
+
+fn parse_rel() -> i64 {
+    let mut lhs: i64 = parse_shift();
+    if (p_err != 0) { return -1; }
+    let mut go: i64 = 1;
+    while (go == 1) {
+        let k: i64 = cur_kind();
+        if (p_rel(k) == 1) {
+            let op: i64 = binop_of(k);
+            p_adv();
+            let rhs: i64 = parse_shift();
+            if (p_err != 0) { return -1; }
+            let b: i64 = alloc_node(NK::BinExpr as i64);
+            if (p_err != 0) { return -1; }
+            set_d(b, op);
+            set_a(b, lhs);
+            set_b(b, rhs);
+            lhs = b;
+        } else { go = 0; }
+    }
+    return lhs;
+}
+
+fn parse_eq() -> i64 {
+    let mut lhs: i64 = parse_rel();
+    if (p_err != 0) { return -1; }
+    let mut go: i64 = 1;
+    while (go == 1) {
+        let k: i64 = cur_kind();
+        if (p_eq(k) == 1) {
+            let op: i64 = binop_of(k);
+            p_adv();
+            let rhs: i64 = parse_rel();
+            if (p_err != 0) { return -1; }
+            let b: i64 = alloc_node(NK::BinExpr as i64);
+            if (p_err != 0) { return -1; }
+            set_d(b, op);
+            set_a(b, lhs);
+            set_b(b, rhs);
+            lhs = b;
+        } else { go = 0; }
+    }
+    return lhs;
+}
+
+fn parse_band() -> i64 {
+    let mut lhs: i64 = parse_eq();
+    if (p_err != 0) { return -1; }
+    let mut go: i64 = 1;
+    while (go == 1) {
+        let k: i64 = cur_kind();
+        if (p_band(k) == 1) {
+            let op: i64 = binop_of(k);
+            p_adv();
+            let rhs: i64 = parse_eq();
+            if (p_err != 0) { return -1; }
+            let b: i64 = alloc_node(NK::BinExpr as i64);
+            if (p_err != 0) { return -1; }
+            set_d(b, op);
+            set_a(b, lhs);
+            set_b(b, rhs);
+            lhs = b;
+        } else { go = 0; }
+    }
+    return lhs;
+}
+
+fn parse_bxor() -> i64 {
+    let mut lhs: i64 = parse_band();
+    if (p_err != 0) { return -1; }
+    let mut go: i64 = 1;
+    while (go == 1) {
+        let k: i64 = cur_kind();
+        if (p_bxor(k) == 1) {
+            let op: i64 = binop_of(k);
+            p_adv();
+            let rhs: i64 = parse_band();
+            if (p_err != 0) { return -1; }
+            let b: i64 = alloc_node(NK::BinExpr as i64);
+            if (p_err != 0) { return -1; }
+            set_d(b, op);
+            set_a(b, lhs);
+            set_b(b, rhs);
+            lhs = b;
+        } else { go = 0; }
+    }
+    return lhs;
+}
+
+fn parse_bor() -> i64 {
+    let mut lhs: i64 = parse_bxor();
+    if (p_err != 0) { return -1; }
+    let mut go: i64 = 1;
+    while (go == 1) {
+        let k: i64 = cur_kind();
+        if (p_bor(k) == 1) {
+            let op: i64 = binop_of(k);
+            p_adv();
+            let rhs: i64 = parse_bxor();
+            if (p_err != 0) { return -1; }
+            let b: i64 = alloc_node(NK::BinExpr as i64);
+            if (p_err != 0) { return -1; }
+            set_d(b, op);
+            set_a(b, lhs);
+            set_b(b, rhs);
+            lhs = b;
+        } else { go = 0; }
+    }
+    return lhs;
+}
+
+fn parse_and() -> i64 {
+    let mut lhs: i64 = parse_bor();
+    if (p_err != 0) { return -1; }
+    let mut go: i64 = 1;
+    while (go == 1) {
+        let k: i64 = cur_kind();
+        if (p_and(k) == 1) {
+            let op: i64 = binop_of(k);
+            p_adv();
+            let rhs: i64 = parse_bor();
+            if (p_err != 0) { return -1; }
+            let b: i64 = alloc_node(NK::BinExpr as i64);
+            if (p_err != 0) { return -1; }
+            set_d(b, op);
+            set_a(b, lhs);
+            set_b(b, rhs);
+            lhs = b;
+        } else { go = 0; }
+    }
+    return lhs;
+}
+
+fn parse_or() -> i64 {
+    let mut lhs: i64 = parse_and();
+    if (p_err != 0) { return -1; }
+    let mut go: i64 = 1;
+    while (go == 1) {
+        let k: i64 = cur_kind();
+        if (p_or(k) == 1) {
+            let op: i64 = binop_of(k);
+            p_adv();
+            let rhs: i64 = parse_and();
+            if (p_err != 0) { return -1; }
+            let b: i64 = alloc_node(NK::BinExpr as i64);
+            if (p_err != 0) { return -1; }
+            set_d(b, op);
+            set_a(b, lhs);
+            set_b(b, rhs);
+            lhs = b;
+        } else { go = 0; }
+    }
+    return lhs;
+}
+
+// parse_ternary — or [ '?' expr ':' ternary ]
+fn parse_ternary() -> i64 {
+    let c: i64 = parse_or();
+    if (p_err != 0) { return -1; }
+    if (accept(Tok::Question as i64) == 0) { return c; }
+    let t: i64 = parse_expr();
+    if (p_err != 0) { return -1; }
+    if (expect(Tok::Colon as i64, string_from_slice("expected ':'")) < 0) { return -1; }
+    let el: i64 = parse_ternary();
+    if (p_err != 0) { return -1; }
+    let r: i64 = alloc_node(NK::TernaryExpr as i64);
+    if (p_err != 0) { return -1; }
+    set_a(r, c);
+    set_b(r, t);
+    set_c(r, el);
+    return r;
+}
+
+// map a compound-assignment token kind to a BinOp value (or -1).
+fn compound_op_of(kind: i64) -> i64 {
+    if (kind == (Tok::PlusAssign as i64))    { return BinOp::Add as i64; }
+    if (kind == (Tok::MinusAssign as i64))   { return BinOp::Sub as i64; }
+    if (kind == (Tok::StarAssign as i64))    { return BinOp::Mul as i64; }
+    if (kind == (Tok::SlashAssign as i64))   { return BinOp::Div as i64; }
+    if (kind == (Tok::PercentAssign as i64)) { return BinOp::Mod as i64; }
+    if (kind == (Tok::AmpAssign as i64))     { return BinOp::And as i64; }
+    if (kind == (Tok::PipeAssign as i64))    { return BinOp::Or as i64; }
+    if (kind == (Tok::CaretAssign as i64))   { return BinOp::Xor as i64; }
+    if (kind == (Tok::ShlAssign as i64))     { return BinOp::Shl as i64; }
+    if (kind == (Tok::ShrAssign as i64))     { return BinOp::Shr as i64; }
+    return -1;
+}
+
+// is this token an assignment operator (=, +=, -=, ...)?
+fn is_assign_op(kind: i64) -> i64 {
+    if (kind == (Tok::Assign as i64)) { return 1; }
+    if (compound_op_of(kind) >= 0) { return 1; }
+    return 0;
+}
+
+// parse_assign — ternary [ ('=' | '+=' | ...) assign ]
+fn parse_assign() -> i64 {
+    let lhs: i64 = parse_ternary();
+    if (p_err != 0) { return -1; }
+    let k: i64 = cur_kind();
+    if (is_assign_op(k) == 0) { return lhs; }
+    let cop: i64 = compound_op_of(k);
+    p_adv();
+    let rhs: i64 = parse_assign();
+    if (p_err != 0) { return -1; }
+    let a: i64 = alloc_node(NK::AssignExpr as i64);
+    if (p_err != 0) { return -1; }
+    set_a(a, lhs);
+    set_b(a, rhs);
+    set_d(a, cop);   // compound op (or -1 for plain '=')
+    return a;
+}
+
+// parse_expr — the entry point (= parse_assign).
+fn parse_expr() -> i64 {
+    return parse_assign();
+}
+
+// -----------------------------------------------------------------------------
+// statement parsing.
+// -----------------------------------------------------------------------------
+
+// parse a block: '{' stmts... '}'. Returns a BlockStmt node whose `a` is the
+// first stmt (linked via c=next). Returns -1 on error.
+fn parse_block() -> i64 {
+    if (expect(Tok::LBrace as i64, string_from_slice("expected '{'")) < 0) { return -1; }
+    let blk: i64 = alloc_node(NK::BlockStmt as i64);
+    if (p_err != 0) { return -1; }
+    let mut first: i64 = -1;
+    let mut prev: i64 = -1;
+    while (at(Tok::RBrace as i64) == 0 && at(Tok::Eof as i64) == 0) {
+        let s: i64 = parse_stmt();
+        if (p_err != 0) { return -1; }
+        if (first < 0) { first = s; }
+        else { set_next(prev, s); }
+        prev = s;
+    }
+    if (first >= 0) { set_a(blk, first); }
+    if (expect(Tok::RBrace as i64, string_from_slice("expected '}'")) < 0) { return -1; }
+    return blk;
+}
+
+// parse a let statement: ('let' | 'auto' | 'const') ['mut'] IDENT [':' type] ['=' expr] ';'
+// `t` is the leading keyword token kind (already peeked, not consumed).
+fn parse_let_stmt(kw_kind: i64) -> i64 {
+    let mut is_auto: i64 = 0;
+    let mut is_const: i64 = 0;
+    if (kw_kind == (Tok::Kw_auto as i64)) { is_auto = 1; }
+    if (kw_kind == (Tok::Kw_const as i64)) { is_const = 1; }
+    p_adv();  // consume the keyword
+    let is_mut: i64 = accept(Tok::Kw_mut as i64);
+    let mut flags: i64 = 0;
+    if (is_mut == 1) { flags = flags | LF_MUT; }
+    if (is_const == 1) { flags = flags | LF_CONST; }
+
+    let ntok: i64 = expect(Tok::Ident as i64, string_from_slice("expected variable name"));
+    if (p_err != 0) { return -1; }
+
+    let mut ty: i64 = -1;
+    if (is_auto == 0) {
+        if (accept(Tok::Colon as i64) == 1) {
+            ty = parse_type();
+            if (p_err != 0) { return -1; }
+        } else {
+            // no ':TYPE' — infer from initializer (is_auto semantics)
+            is_auto = 1;
+        }
+    }
+    let mut init: i64 = -1;
+    if (accept(Tok::Assign as i64) == 1) {
+        init = parse_expr();
+        if (p_err != 0) { return -1; }
+    }
+    if (expect(Tok::Semicolon as i64, string_from_slice("expected ';'")) < 0) { return -1; }
+
+    let s: i64 = alloc_node(NK::LetStmt as i64);
+    if (p_err != 0) { return -1; }
+    set_tok(s, ntok);
+    if (ty >= 0) { set_a(s, ty); }
+    if (init >= 0) { set_b(s, init); }
+    let mut f: i64 = flags;
+    if (is_auto == 1) { f = f | LF_AUTO; }
+    set_d(s, f);
+    return s;
+}
+
+// parse a static_assert (cond, msg): the shared body for both the statement
+// and top-level forms. Returns a node index; the caller wraps it in the right
+// kind (StaticAssertStmt / StaticAssertDecl).
+fn parse_static_assert_body(kind: i64) -> i64 {
+    if (expect(Tok::Kw_static_assert as i64, string_from_slice("expected 'static_assert'")) < 0) { return -1; }
+    if (expect(Tok::LParen as i64, string_from_slice("expected '('")) < 0) { return -1; }
+    let cond: i64 = parse_expr();
+    if (p_err != 0) { return -1; }
+    if (expect(Tok::Comma as i64, string_from_slice("expected ','")) < 0) { return -1; }
+    let mt: i64 = expect(Tok::StringLit as i64, string_from_slice("expected string literal"));
+    if (p_err != 0) { return -1; }
+    if (expect(Tok::RParen as i64, string_from_slice("expected ')'")) < 0) { return -1; }
+    if (expect(Tok::Semicolon as i64, string_from_slice("expected ';'")) < 0) { return -1; }
+    let n: i64 = alloc_node(kind);
+    if (p_err != 0) { return -1; }
+    set_a(n, cond);
+    set_tok(n, mt);
+    return n;
+}
+
+// parse_stmt — dispatch on the leading token.
+fn parse_stmt() -> i64 {
+    let k: i64 = cur_kind();
+
+    if (k == (Tok::Kw_let as i64) || k == (Tok::Kw_auto as i64) || k == (Tok::Kw_const as i64)) {
+        return parse_let_stmt(k);
+    }
+    if (k == (Tok::Kw_defer as i64)) {
+        p_adv();
+        let e: i64 = parse_expr();
+        if (p_err != 0) { return -1; }
+        if (expect(Tok::Semicolon as i64, string_from_slice("expected ';'")) < 0) { return -1; }
+        let s: i64 = alloc_node(NK::DeferStmt as i64);
+        if (p_err != 0) { return -1; }
+        set_a(s, e);
+        return s;
+    }
+    if (k == (Tok::Kw_static_assert as i64)) {
+        return parse_static_assert_body(NK::StaticAssertStmt as i64);
+    }
+    if (k == (Tok::Kw_if as i64)) {
+        p_adv();
+        if (expect(Tok::LParen as i64, string_from_slice("expected '('")) < 0) { return -1; }
+        let cond: i64 = parse_expr();
+        if (p_err != 0) { return -1; }
+        if (expect(Tok::RParen as i64, string_from_slice("expected ')'")) < 0) { return -1; }
+        let then_b: i64 = parse_block();
+        if (p_err != 0) { return -1; }
+        let s: i64 = alloc_node(NK::IfStmt as i64);
+        if (p_err != 0) { return -1; }
+        set_a(s, cond);
+        set_b(s, then_b);
+        if (accept(Tok::Kw_else as i64) == 1) {
+            if (at(Tok::Kw_if as i64) == 1) {
+                // else if — wrap the nested if stmt in a block
+                let sub: i64 = parse_stmt();
+                if (p_err != 0) { return -1; }
+                let eb: i64 = alloc_node(NK::BlockStmt as i64);
+                if (p_err != 0) { return -1; }
+                set_a(eb, sub);
+                set_c(s, eb);
+            } else {
+                let eb: i64 = parse_block();
+                if (p_err != 0) { return -1; }
+                set_c(s, eb);
+            }
+        }
+        return s;
+    }
+    if (k == (Tok::Kw_while as i64)) {
+        p_adv();
+        if (expect(Tok::LParen as i64, string_from_slice("expected '('")) < 0) { return -1; }
+        let cond: i64 = parse_expr();
+        if (p_err != 0) { return -1; }
+        if (expect(Tok::RParen as i64, string_from_slice("expected ')'")) < 0) { return -1; }
+        let body: i64 = parse_block();
+        if (p_err != 0) { return -1; }
+        let s: i64 = alloc_node(NK::WhileStmt as i64);
+        if (p_err != 0) { return -1; }
+        set_a(s, cond);
+        set_b(s, body);
+        return s;
+    }
+    if (k == (Tok::Kw_do as i64)) {
+        p_adv();
+        let body: i64 = parse_block();
+        if (p_err != 0) { return -1; }
+        if (expect(Tok::Kw_while as i64, string_from_slice("expected 'while'")) < 0) { return -1; }
+        if (expect(Tok::LParen as i64, string_from_slice("expected '('")) < 0) { return -1; }
+        let cond: i64 = parse_expr();
+        if (p_err != 0) { return -1; }
+        if (expect(Tok::RParen as i64, string_from_slice("expected ')'")) < 0) { return -1; }
+        if (expect(Tok::Semicolon as i64, string_from_slice("expected ';'")) < 0) { return -1; }
+        let s: i64 = alloc_node(NK::DoWhileStmt as i64);
+        if (p_err != 0) { return -1; }
+        set_a(s, body);
+        set_b(s, cond);
+        return s;
+    }
+    if (k == (Tok::Kw_for as i64)) {
+        p_adv();
+        if (expect(Tok::LParen as i64, string_from_slice("expected '('")) < 0) { return -1; }
+        // for-each?  IDENT 'in' ...
+        if (peek_kind(0) == (Tok::Ident as i64) && peek_kind(1) == (Tok::Kw_in as i64)) {
+            let vtok: i64 = p_adv();
+            p_adv();  // 'in'
+            let iter: i64 = parse_expr();
+            if (p_err != 0) { return -1; }
+            if (expect(Tok::RParen as i64, string_from_slice("expected ')'")) < 0) { return -1; }
+            let body: i64 = parse_block();
+            if (p_err != 0) { return -1; }
+            let s: i64 = alloc_node(NK::ForEachStmt as i64);
+            if (p_err != 0) { return -1; }
+            set_tok(s, vtok);
+            set_a(s, iter);
+            set_b(s, body);
+            return s;
+        }
+        // C-style for ( init ; cond ; step ) body
+        let mut init: i64 = -1;
+        if (at(Tok::Kw_let as i64) == 1 || at(Tok::Kw_auto as i64) == 1 || at(Tok::Kw_const as i64) == 1) {
+            init = parse_let_stmt(cur_kind());
+            if (p_err != 0) { return -1; }
+        } else {
+            if (expect(Tok::Semicolon as i64, string_from_slice("expected ';'")) < 0) { return -1; }
+        }
+        let mut cond: i64 = -1;
+        if (at(Tok::Semicolon as i64) == 0) {
+            cond = parse_expr();
+            if (p_err != 0) { return -1; }
+        }
+        if (expect(Tok::Semicolon as i64, string_from_slice("expected ';'")) < 0) { return -1; }
+        let mut step: i64 = -1;
+        if (at(Tok::RParen as i64) == 0) {
+            step = parse_expr();
+            if (p_err != 0) { return -1; }
+        }
+        if (expect(Tok::RParen as i64, string_from_slice("expected ')'")) < 0) { return -1; }
+        let body: i64 = parse_block();
+        if (p_err != 0) { return -1; }
+        let s: i64 = alloc_node(NK::ForStmt as i64);
+        if (p_err != 0) { return -1; }
+        if (init >= 0) { set_a(s, init); }
+        if (cond >= 0) { set_b(s, cond); }
+        if (step >= 0) { set_c(s, step); }
+        set_e(s, body);
+        return s;
+    }
+    if (k == (Tok::Kw_switch as i64)) {
+        p_adv();
+        if (expect(Tok::LParen as i64, string_from_slice("expected '('")) < 0) { return -1; }
+        let subject: i64 = parse_expr();
+        if (p_err != 0) { return -1; }
+        if (expect(Tok::RParen as i64, string_from_slice("expected ')'")) < 0) { return -1; }
+        if (expect(Tok::LBrace as i64, string_from_slice("expected '{'")) < 0) { return -1; }
+        let s: i64 = alloc_node(NK::SwitchStmt as i64);
+        if (p_err != 0) { return -1; }
+        set_a(s, subject);
+        let mut first_c: i64 = -1;
+        let mut prev_c: i64 = -1;
+        while (at(Tok::RBrace as i64) == 0 && at(Tok::Eof as i64) == 0) {
+            let is_default: i64 = accept(Tok::Kw_default as i64);
+            let mut cval: i64 = -1;
+            if (is_default == 0) {
+                if (expect(Tok::Kw_case as i64, string_from_slice("expected 'case' or 'default'")) < 0) { return -1; }
+                cval = parse_expr();
+                if (p_err != 0) { return -1; }
+            }
+            if (expect(Tok::Colon as i64, string_from_slice("expected ':'")) < 0) { return -1; }
+            let mut first_s: i64 = -1;
+            let mut prev_s: i64 = -1;
+            while (at(Tok::Kw_case as i64) == 0 && at(Tok::Kw_default as i64) == 0
+                   && at(Tok::RBrace as i64) == 0 && at(Tok::Eof as i64) == 0) {
+                let st: i64 = parse_stmt();
+                if (p_err != 0) { return -1; }
+                if (first_s < 0) { first_s = st; }
+                else { set_next(prev_s, st); }
+                prev_s = st;
+            }
+            let cnode: i64 = alloc_node(NK::Case as i64);
+            if (p_err != 0) { return -1; }
+            if (cval >= 0) { set_a(cnode, cval); }
+            if (first_s >= 0) { set_b(cnode, first_s); }
+            if (is_default == 1) { set_d(cnode, 1); }
+            if (first_c < 0) { first_c = cnode; }
+            else { set_next(prev_c, cnode); }
+            prev_c = cnode;
+        }
+        if (first_c >= 0) { set_b(s, first_c); }
+        if (expect(Tok::RBrace as i64, string_from_slice("expected '}'")) < 0) { return -1; }
+        return s;
+    }
+    if (k == (Tok::Kw_match as i64)) {
+        p_adv();
+        if (expect(Tok::LParen as i64, string_from_slice("expected '('")) < 0) { return -1; }
+        let subject: i64 = parse_expr();
+        if (p_err != 0) { return -1; }
+        if (expect(Tok::RParen as i64, string_from_slice("expected ')'")) < 0) { return -1; }
+        if (expect(Tok::LBrace as i64, string_from_slice("expected '{'")) < 0) { return -1; }
+        let s: i64 = alloc_node(NK::MatchStmt as i64);
+        if (p_err != 0) { return -1; }
+        set_a(s, subject);
+        let mut first_a: i64 = -1;
+        let mut prev_a: i64 = -1;
+        while (at(Tok::RBrace as i64) == 0 && at(Tok::Eof as i64) == 0) {
+            let arm: i64 = alloc_node(NK::MatchArm as i64);
+            if (p_err != 0) { return -1; }
+            // wildcard '_' or expr pattern
+            if (at(Tok::Ident as i64) == 1 && cur_text() == string_from_slice("_")) {
+                p_adv();
+                set_d(arm, 1);   // is_wildcard
+            } else {
+                let pat: i64 = parse_expr();
+                if (p_err != 0) { return -1; }
+                set_a(arm, pat);
+            }
+            // optional guard
+            if (accept(Tok::Kw_if as i64) == 1) {
+                let g: i64 = parse_expr();
+                if (p_err != 0) { return -1; }
+                set_e(arm, g);
+            }
+            if (expect(Tok::FatArrow as i64, string_from_slice("expected '=>'")) < 0) { return -1; }
+            if (at(Tok::LBrace as i64) == 1) {
+                let b: i64 = parse_block();
+                if (p_err != 0) { return -1; }
+                set_b(arm, b);
+            } else {
+                let st: i64 = parse_stmt();
+                if (p_err != 0) { return -1; }
+                let b: i64 = alloc_node(NK::BlockStmt as i64);
+                if (p_err != 0) { return -1; }
+                set_a(b, st);
+                set_b(arm, b);
+            }
+            accept(Tok::Comma as i64);
+            if (first_a < 0) { first_a = arm; }
+            else { set_next(prev_a, arm); }
+            prev_a = arm;
+        }
+        if (first_a >= 0) { set_b(s, first_a); }
+        if (expect(Tok::RBrace as i64, string_from_slice("expected '}'")) < 0) { return -1; }
+        return s;
+    }
+    if (k == (Tok::Kw_return as i64)) {
+        p_adv();
+        let mut val: i64 = -1;
+        if (at(Tok::Semicolon as i64) == 0) {
+            val = parse_expr();
+            if (p_err != 0) { return -1; }
+        }
+        if (expect(Tok::Semicolon as i64, string_from_slice("expected ';'")) < 0) { return -1; }
+        let s: i64 = alloc_node(NK::ReturnStmt as i64);
+        if (p_err != 0) { return -1; }
+        if (val >= 0) { set_a(s, val); }
+        return s;
+    }
+    if (k == (Tok::Kw_break as i64)) {
+        p_adv();
+        if (expect(Tok::Semicolon as i64, string_from_slice("expected ';'")) < 0) { return -1; }
+        let s: i64 = alloc_node(NK::BreakStmt as i64);
+        if (p_err != 0) { return -1; }
+        return s;
+    }
+    if (k == (Tok::Kw_continue as i64)) {
+        p_adv();
+        if (expect(Tok::Semicolon as i64, string_from_slice("expected ';'")) < 0) { return -1; }
+        let s: i64 = alloc_node(NK::ContinueStmt as i64);
+        if (p_err != 0) { return -1; }
+        return s;
+    }
+    if (k == (Tok::Kw_yield as i64)) {
+        p_adv();
+        let mut val: i64 = -1;
+        if (at(Tok::Semicolon as i64) == 0) {
+            val = parse_expr();
+            if (p_err != 0) { return -1; }
+        }
+        if (expect(Tok::Semicolon as i64, string_from_slice("expected ';'")) < 0) { return -1; }
+        let s: i64 = alloc_node(NK::YieldStmt as i64);
+        if (p_err != 0) { return -1; }
+        if (val >= 0) { set_a(s, val); }
+        return s;
+    }
+    if (k == (Tok::Kw_throw as i64)) {
+        p_adv();
+        let val: i64 = parse_expr();
+        if (p_err != 0) { return -1; }
+        if (expect(Tok::Semicolon as i64, string_from_slice("expected ';'")) < 0) { return -1; }
+        let s: i64 = alloc_node(NK::ThrowStmt as i64);
+        if (p_err != 0) { return -1; }
+        set_a(s, val);
+        return s;
+    }
+    if (k == (Tok::Kw_try as i64)) {
+        p_adv();
+        let try_b: i64 = parse_block();
+        if (p_err != 0) { return -1; }
+        if (expect(Tok::Kw_catch as i64, string_from_slice("expected 'catch'")) < 0) { return -1; }
+        if (expect(Tok::LParen as i64, string_from_slice("expected '('")) < 0) { return -1; }
+        let cnametok: i64 = expect(Tok::Ident as i64, string_from_slice("expected catch variable name"));
+        if (p_err != 0) { return -1; }
+        if (expect(Tok::RParen as i64, string_from_slice("expected ')'")) < 0) { return -1; }
+        let catch_b: i64 = parse_block();
+        if (p_err != 0) { return -1; }
+        let s: i64 = alloc_node(NK::TryCatchStmt as i64);
+        if (p_err != 0) { return -1; }
+        set_a(s, try_b);
+        set_b(s, catch_b);
+        set_tok(s, cnametok);
+        return s;
+    }
+    if (k == (Tok::LBrace as i64)) {
+        let b: i64 = parse_block();
+        if (p_err != 0) { return -1; }
+        let s: i64 = alloc_node(NK::BlockStmt as i64);
+        if (p_err != 0) { return -1; }
+        set_a(s, b);
+        return s;
+    }
+
+    // expression statement
+    let e: i64 = parse_expr();
+    if (p_err != 0) { return -1; }
+    if (expect(Tok::Semicolon as i64, string_from_slice("expected ';'")) < 0) { return -1; }
+    let s: i64 = alloc_node(NK::ExprStmt as i64);
+    if (p_err != 0) { return -1; }
+    set_a(s, e);
+    return s;
+}
+
+// -----------------------------------------------------------------------------
+// top-level declaration parsing.
+// -----------------------------------------------------------------------------
+
+// parse an annotation: @name [( literal {, literal} )]
+// Returns the annotation's name token index (v1: args not recorded), or -1.
+fn parse_annotation() -> i64 {
+    if (expect(Tok::At as i64, string_from_slice("expected '@'")) < 0) { return -1; }
+    let ntok: i64 = expect(Tok::Ident as i64, string_from_slice("expected annotation name"));
+    if (p_err != 0) { return -1; }
+    if (accept(Tok::LParen as i64) == 1) {
+        if (at(Tok::RParen as i64) == 0) {
+            let mut go: i64 = 1;
+            while (go == 1) {
+                let k: i64 = cur_kind();
+                if (k == (Tok::IntLit as i64) || k == (Tok::FloatLit as i64)
+                    || k == (Tok::StringLit as i64) || k == (Tok::RawStringLit as i64)
+                    || k == (Tok::BoolLit as i64)) {
+                    p_adv();
+                } else {
+                    return err(string_from_slice("expected literal in annotation args"));
+                }
+                if (accept(Tok::Comma as i64) == 0) { go = 0; }
+            }
+        }
+        if (expect(Tok::RParen as i64, string_from_slice("expected ')'")) < 0) { return -1; }
+    }
+    return ntok;
+}
+
+// parse a function declaration: ['priv' | 'constexpr']* 'fn' name '(' params ')' ['->' type] block
+// The modifiers (priv/constexpr) are consumed by the caller and passed as flags.
+fn parse_func(flags: i64) -> i64 {
+    if (expect(Tok::Kw_fn as i64, string_from_slice("expected 'fn'")) < 0) { return -1; }
+    let ntok: i64 = expect(Tok::Ident as i64, string_from_slice("expected function name"));
+    if (p_err != 0) { return -1; }
+    let f: i64 = alloc_node(NK::FnDecl as i64);
+    if (p_err != 0) { return -1; }
+    set_tok(f, ntok);
+    set_d(f, flags);
+
+    if (expect(Tok::LParen as i64, string_from_slice("expected '('")) < 0) { return -1; }
+    let mut first_p: i64 = -1;
+    let mut prev_p: i64 = -1;
+    if (at(Tok::RParen as i64) == 0) {
+        let mut go: i64 = 1;
+        while (go == 1) {
+            let p: i64 = parse_param();
+            if (p_err != 0) { return -1; }
+            if (first_p < 0) { first_p = p; }
+            else { set_next(prev_p, p); }
+            prev_p = p;
+            if (accept(Tok::Comma as i64) == 0) { go = 0; }
+        }
+    }
+    if (first_p >= 0) { set_a(f, first_p); }
+    if (expect(Tok::RParen as i64, string_from_slice("expected ')'")) < 0) { return -1; }
+
+    let mut ret: i64 = -1;
+    if (accept(Tok::Arrow as i64) == 1) {
+        ret = parse_type();
+        if (p_err != 0) { return -1; }
+    } else {
+        ret = alloc_node(NK::Type as i64);
+        if (p_err != 0) { return -1; }
+        set_d(ret, Prim::Void as i64);
+    }
+    set_b(f, ret);
+
+    let body: i64 = parse_block();
+    if (p_err != 0) { return -1; }
+    set_c(f, body);
+    return f;
+}
+
+// parse a struct declaration: 'struct' name '{' field: type ; ... '}'
+fn parse_struct() -> i64 {
+    if (expect(Tok::Kw_struct as i64, string_from_slice("expected 'struct'")) < 0) { return -1; }
+    let ntok: i64 = expect(Tok::Ident as i64, string_from_slice("expected struct name"));
+    if (p_err != 0) { return -1; }
+    let s: i64 = alloc_node(NK::StructDecl as i64);
+    if (p_err != 0) { return -1; }
+    set_tok(s, ntok);
+    if (expect(Tok::LBrace as i64, string_from_slice("expected '{'")) < 0) { return -1; }
+    let mut first_f: i64 = -1;
+    let mut prev_f: i64 = -1;
+    while (at(Tok::RBrace as i64) == 0 && at(Tok::Eof as i64) == 0) {
+        let ft: i64 = expect(Tok::Ident as i64, string_from_slice("expected field name"));
+        if (p_err != 0) { return -1; }
+        if (expect(Tok::Colon as i64, string_from_slice("expected ':'")) < 0) { return -1; }
+        let ty: i64 = parse_type();
+        if (p_err != 0) { return -1; }
+        if (expect(Tok::Semicolon as i64, string_from_slice("expected ';'")) < 0) { return -1; }
+        let fd: i64 = alloc_node(NK::Field as i64);
+        if (p_err != 0) { return -1; }
+        set_tok(fd, ft);
+        set_a(fd, ty);
+        if (first_f < 0) { first_f = fd; }
+        else { set_next(prev_f, fd); }
+        prev_f = fd;
+    }
+    if (first_f >= 0) { set_a(s, first_f); }
+    if (expect(Tok::RBrace as i64, string_from_slice("expected '}'")) < 0) { return -1; }
+    return s;
+}
+
+// parse an enum: 'enum' name [':' type] '{' variant ['=' expr] {, variant} [,] '}'
+fn parse_enum() -> i64 {
+    if (expect(Tok::Kw_enum as i64, string_from_slice("expected 'enum'")) < 0) { return -1; }
+    let ntok: i64 = expect(Tok::Ident as i64, string_from_slice("expected enum name"));
+    if (p_err != 0) { return -1; }
+    let e: i64 = alloc_node(NK::EnumDecl as i64);
+    if (p_err != 0) { return -1; }
+    set_tok(e, ntok);
+    // optional backing type
+    if (accept(Tok::Colon as i64) == 1) {
+        let bt: i64 = parse_type();
+        if (p_err != 0) { return -1; }
+        set_a(e, bt);   // backing type in `a` (also used for first variant — see below)
+    }
+    if (expect(Tok::LBrace as i64, string_from_slice("expected '{'")) < 0) { return -1; }
+    // NOTE: `a` is overloaded — if a backing type was parsed it's there; otherwise
+    // it holds the first variant. A production parser would use distinct slots;
+    // for v1 we keep variants in `b` (first-child) and backing type in `a`.
+    let mut first_v: i64 = -1;
+    let mut prev_v: i64 = -1;
+    if (at(Tok::RBrace as i64) == 0 && at(Tok::Eof as i64) == 0) {
+        let mut go: i64 = 1;
+        while (go == 1) {
+            let vtok: i64 = expect(Tok::Ident as i64, string_from_slice("expected enum variant name"));
+            if (p_err != 0) { return -1; }
+            let v: i64 = alloc_node(NK::Variant as i64);
+            if (p_err != 0) { return -1; }
+            set_tok(v, vtok);
+            if (accept(Tok::Assign as i64) == 1) {
+                let val: i64 = parse_expr();
+                if (p_err != 0) { return -1; }
+                set_a(v, val);
+            }
+            if (first_v < 0) { first_v = v; }
+            else { set_next(prev_v, v); }
+            prev_v = v;
+            if (accept(Tok::Comma as i64) == 0) { go = 0; }
+            if (at(Tok::RBrace as i64) == 1 || at(Tok::Eof as i64) == 1) { go = 0; }
+        }
+    }
+    if (first_v >= 0) { set_b(e, first_v); }
+    if (expect(Tok::RBrace as i64, string_from_slice("expected '}'")) < 0) { return -1; }
+    return e;
+}
+
+// parse a global / const declaration: ('global' | 'const') name ':' type '=' expr ';'
+fn parse_global(is_const: i64) -> i64 {
+    // the 'global'/'const' keyword is consumed by the caller
+    let ntok: i64 = expect(Tok::Ident as i64, string_from_slice("expected global name"));
+    if (p_err != 0) { return -1; }
+    if (expect(Tok::Colon as i64, string_from_slice("expected ':'")) < 0) { return -1; }
+    let ty: i64 = parse_type();
+    if (p_err != 0) { return -1; }
+    if (expect(Tok::Assign as i64, string_from_slice("expected '='")) < 0) { return -1; }
+    let init: i64 = parse_expr();
+    if (p_err != 0) { return -1; }
+    if (expect(Tok::Semicolon as i64, string_from_slice("expected ';'")) < 0) { return -1; }
+    let g: i64 = alloc_node(NK::GlobalDecl as i64);
+    if (p_err != 0) { return -1; }
+    set_tok(g, ntok);
+    set_a(g, ty);
+    set_b(g, init);
+    if (is_const == 1) { set_d(g, 1); }
+    return g;
+}
+
+// parse a link declaration: 'link' string ['as' ident] ';'
+fn parse_link() -> i64 {
+    if (expect(Tok::Kw_link as i64, string_from_slice("expected 'link'")) < 0) { return -1; }
+    let t: i64 = expect(Tok::StringLit as i64, string_from_slice("expected module name or .em path"));
+    if (p_err != 0) { return -1; }
+    let ld: i64 = alloc_node(NK::LinkDecl as i64);
+    if (p_err != 0) { return -1; }
+    set_tok(ld, t);
+    if (accept(Tok::Kw_as as i64) == 1) {
+        let a: i64 = expect(Tok::Ident as i64, string_from_slice("expected module alias"));
+        if (p_err != 0) { return -1; }
+        set_a(ld, a);
+    }
+    if (expect(Tok::Semicolon as i64, string_from_slice("expected ';'")) < 0) { return -1; }
+    return ld;
+}
+
+// parse a namespace: 'namespace' name '{' decls... '}'
+// v1: namespace members are flattened into the program's top-level list, each
+// tagged with the namespace name via the node's `e` slot (the ns-name token
+// index). This mirrors the C++ parser's ns-stamping, simplified.
+fn parse_namespace() -> i64 {
+    if (expect(Tok::Kw_namespace as i64, string_from_slice("expected 'namespace'")) < 0) { return -1; }
+    let ntok: i64 = expect(Tok::Ident as i64, string_from_slice("expected namespace name"));
+    if (p_err != 0) { return -1; }
+    let ns: i64 = alloc_node(NK::NamespaceDecl as i64);
+    if (p_err != 0) { return -1; }
+    set_tok(ns, ntok);
+    if (expect(Tok::LBrace as i64, string_from_slice("expected '{'")) < 0) { return -1; }
+    let mut first_d: i64 = -1;
+    let mut prev_d: i64 = -1;
+    while (at(Tok::RBrace as i64) == 0 && at(Tok::Eof as i64) == 0) {
+        let d: i64 = parse_top_decl();
+        if (p_err != 0) { return -1; }
+        // stamp the namespace name on the member (in `e`, if the kind supports it)
+        set_e(d, ntok);
+        if (first_d < 0) { first_d = d; }
+        else { set_next(prev_d, d); }
+        prev_d = d;
+    }
+    if (first_d >= 0) { set_a(ns, first_d); }
+    if (expect(Tok::RBrace as i64, string_from_slice("expected '}'")) < 0) { return -1; }
+    return ns;
+}
+
+// parse one top-level declaration (annotations + modifiers + fn/struct/enum/
+// global/const/link/namespace/static_assert). Returns the decl node index.
+fn parse_top_decl() -> i64 {
+    // gather annotations
+    let mut ann_first: i64 = -1;
+    let mut ann_prev: i64 = -1;
+    while (at(Tok::At as i64) == 1) {
+        let a: i64 = parse_annotation();
+        if (p_err != 0) { return -1; }
+        // annotations are recorded as token indices in a linked list via a
+        // synthetic node; v1 discards them (the C++ parser stores them on the
+        // fn only). We consume them so parsing advances. Store the first ann
+        // token on a lightweight list for completeness.
+        if (ann_first < 0) { ann_first = a; }
+        else { ann_first = ann_first; }  // no-op; v1 keeps only the first
+        ann_prev = a;
+    }
+    // v1: annotations are consumed but not attached (a later pass can extend
+    // the node layout to carry them). The C++ parser attaches to fn only.
+    let dummy: i64 = ann_first;
+    let _u: i64 = ann_prev;
+    let _u2: i64 = dummy;
+
+    // modifiers: priv / constexpr, in any order, at most once each
+    let mut flags: i64 = 0;
+    let mut pass: i64 = 0;
+    while (pass < 2) {
+        if (at(Tok::Kw_priv as i64) == 1 && (flags & FD_PRIV) == 0) {
+            p_adv();
+            flags = flags | FD_PRIV;
+            pass = pass + 1;
+            continue;
+        }
+        if (at(Tok::Kw_constexpr as i64) == 1 && (flags & FD_CEXPR) == 0) {
+            p_adv();
+            flags = flags | FD_CEXPR;
+            pass = pass + 1;
+            continue;
+        }
+        pass = 2;
+    }
+
+    let k: i64 = cur_kind();
+    if (k == (Tok::Kw_fn as i64)) {
+        return parse_func(flags);
+    }
+    if (k == (Tok::Kw_struct as i64)) {
+        return parse_struct();
+    }
+    if (k == (Tok::Kw_global as i64) || k == (Tok::Kw_const as i64)) {
+        let mut is_c: i64 = 0;
+        if (k == (Tok::Kw_const as i64)) { is_c = 1; }
+        p_adv();  // consume 'global' or 'const'
+        return parse_global(is_c);
+    }
+    if (k == (Tok::Kw_link as i64)) {
+        return parse_link();
+    }
+    if (k == (Tok::Kw_enum as i64)) {
+        return parse_enum();
+    }
+    if (k == (Tok::Kw_static_assert as i64)) {
+        return parse_static_assert_body(NK::StaticAssertDecl as i64);
+    }
+    if (k == (Tok::Kw_namespace as i64)) {
+        return parse_namespace();
+    }
+    if (k == (Tok::Semicolon as i64)) {
+        p_adv();  // empty top-level stmt — skip (return a no-op node)
+        let n: i64 = alloc_node(NK::ExprStmt as i64);
+        if (p_err != 0) { return -1; }
+        // an empty expr stmt with a = -1 (no expr) = no-op
+        return n;
+    }
+    return err(string_from_slice("expected fn/struct/enum/global/namespace at top level"));
+}
+
+// parse_program — loop over top-level decls until EOF. Returns a Program node
+// whose `a` = first decl (linked via c=next).
+fn parse_program() -> i64 {
+    let prog: i64 = alloc_node(NK::Program as i64);
+    if (p_err != 0) { return -1; }
+    let mut first: i64 = -1;
+    let mut prev: i64 = -1;
+    while (at(Tok::Eof as i64) == 0) {
+        let d: i64 = parse_top_decl();
+        if (p_err != 0) { return -1; }
+        if (first < 0) { first = d; }
+        else { set_next(prev, d); }
+        prev = d;
+    }
+    if (first >= 0) { set_a(prog, first); }
+    return prog;
+}
+
+// -----------------------------------------------------------------------------
+// the entry point. Lex `source`, then parse the token stream into an AST.
+// Returns the Program node index on success, or -1 on error. The AST lives in
+// g_nodes (a fresh array per call); g_toks holds the tokens (so tok_text works
+// for name retrieval).
+// -----------------------------------------------------------------------------
+
+fn parse(source: string) -> i64 {
+    // lex
+    g_toks = lex(source);
+    if (lex_failed() != 0) {
+        p_err = 1;
+        p_errline = g_errline;   // the lexer's error position (its own globals)
+        p_errcol = g_errcol;
+        p_errmsg = string_from_slice("lex error");
+        return -1;
+    }
+    g_tcount = tok_count(g_toks);
+    g_ti = 0;
+    g_nodes = array_new(8, 0);
+    p_err = 0;
+    p_errline = 0;
+    p_errcol = 0;
+    p_errmsg = string_from_slice("");
+
+    let prog: i64 = parse_program();
+    if (p_err != 0) { return -1; }
+    return prog;
+}
+
+// whether the parser hit an error (set by err() during parse()).
+fn parse_failed() -> i64 {
+    return p_err;
+}
+
+// the error position (1-based line/col) and message, for diagnostics.
+fn parse_err_line() -> i64 { return p_errline; }
+fn parse_err_col() -> i64 { return p_errcol; }
+fn parse_err_msg() -> string { return p_errmsg; }
+
+// the AST node array handle (for callers that want to traverse it directly).
+fn parse_nodes() -> i64 { return g_nodes; }
+
+// the token array handle (for callers that want to re-derive token text).
+fn parse_tokens() -> i64 { return g_toks; }
