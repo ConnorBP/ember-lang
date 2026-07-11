@@ -3405,8 +3405,6 @@ const Type* Checker::check_lambda(LambdaExpr& le) {
         env_off += 8;  // every capture occupies one 8-byte slot (v1 scalars)
     }
     int32_t env_size = env_off;
-    fprintf(stderr, "[check_lambda] %s: %zu captures:", le.synthetic_fn_name.c_str(), caps.size());
-    for (auto& cc : caps) fprintf(stderr, " %s", cc.c_str()); fprintf(stderr, "\n");
     // Record capture metadata on BOTH the LambdaExpr (creation-site codegen)
     // and the synthetic FuncDecl (body codegen loads captures from env).
     le.captures = caps;
@@ -4390,7 +4388,6 @@ SemaResult sema(Program& prog,
     // body holds the LambdaExpr). Checking lambda fns after all their
     // enclosing fns ensures lf->lambda_captures is populated before
     // check_lambda_func binds them.
-    for (auto& f : prog.funcs) fprintf(stderr, "[sema-order] %s is_lambda=%d\n", f.name.c_str(), (int)f.is_lambda);
     for (auto& f : prog.funcs) {
         if (!f.is_lambda) c.check_func(f);
     }
