@@ -1,8 +1,0 @@
-fn main() -> i64 {
-    // pre-size to 1024 (capacity), then push -1 (no reallocation needed)
-    let a: i64 = array_new(8, 1024);
-    // push appends at index 0 (size was 0, capacity 1024, no realloc)
-    array_push_i64(a, -1);
-    array_push_i64(a, -1);
-    return array_get_i64(a, 0) + 100;
-}
