@@ -9,8 +9,10 @@
 #include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <new>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace ember;  // bind_handle, BindingBuilder, type_* singletons
@@ -98,6 +100,24 @@ extern "C" {
         auto* x = str_slot(a); auto* y = str_slot(b);
         return (x && y && *x == *y) ? 1 : 0;
     }
+    // string_find: returns the index of the first occurrence of substring b in
+    // string a, or -1 if not found.
+    static int64_t n_string_find(int64_t a, int64_t b) {
+        auto* x = str_slot(a); auto* y = str_slot(b);
+        if (!x || !y) return -1;
+        size_t pos = x->find(*y);
+        return pos == std::string::npos ? int64_t(-1) : int64_t(pos);
+    }
+    // string_substr: returns a new string that is the substring of a starting
+    // at index start with length len (clamped to the string's bounds).
+    static int64_t n_string_substr(int64_t a, int64_t start, int64_t len) {
+        auto* x = str_slot(a);
+        if (!x || start < 0) return str_new("");
+        size_t s = size_t(start);
+        if (s >= x->size()) return str_new("");
+        size_t actual_len = (len < 0) ? (x->size() - s) : std::min(size_t(len), x->size() - s);
+        return str_new(x->substr(s, actual_len));
+    }
 }
 
 const std::string* slot(int64_t handle) {
@@ -130,6 +150,8 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
     b.add("string_from_f64",   bind_handle("string"), {type_f64()},        (void*)&n_string_from_f64);
     b.add("string_from_bool",  bind_handle("string"), {type_bool()},       (void*)&n_string_from_bool);
     b.add("string_identity",   bind_handle("string"), {bind_handle("string")}, (void*)&n_string_identity);
+    b.add("string_find",      type_i64(), {bind_handle("string"),bind_handle("string")}, (void*)&n_string_find);
+    b.add("string_substr",    bind_handle("string"), {bind_handle("string"),type_i64(),type_i64()}, (void*)&n_string_substr);
     NativeTable t = b.build();
     for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
     // NOTE: print_string stays in the host (it routes through the host
