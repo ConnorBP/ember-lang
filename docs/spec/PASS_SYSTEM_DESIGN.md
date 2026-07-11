@@ -306,11 +306,11 @@ The pass manager is an optional field on `CodeGenCtx` (default nullptr = no pass
 
 ## 8. Migration without a flag-day rewrite
 
-- **Step 1**: `src/ember_pass.hpp` + `src/ember_pass_registry.hpp` + `src/ember_pass_pipeline.hpp` — the infrastructure (no passes yet). A unit test builds a registry, adds a no-op pass, runs it, asserts it ran.
-- **Step 2**: `extensions/opt/ext_opt.cpp` + `ConstPropPass` — the first real pass. Behind `enable_ir_passes`. The benchmark gates whether it helps.
-- **Step 3**: `DeadCodeElimPass` + `CSEPass` — more passes, same shape.
-- **Step 4**: `EmberAnalysisManager` (when a pass needs it) + `LICMPass` (the first pass that needs a CFG/loop analysis).
-- **Step 5**: Obfuscation passes (`extensions/obf/ext_obf.cpp`) — `SubstitutionPass`, `FlatteningPass`, `MBAPass`, with `is_required = true` (bypass skip gates).
+- **Step 1 — SHIPPED (2026-07-11).** `src/ember_pass.hpp` + `src/ember_pass.cpp` + `src/ember_pass_registry.hpp` + `src/ember_pass_pipeline.hpp` — the infrastructure (pass manager, registry, pipeline parser, instrumentation, PreservedAnalyses). `examples/ember_pass_test.cpp` (ctest `ember_pass`) pins it with 25 checks across 7 sections.
+- **Step 2 — SHIPPED (2026-07-11).** `extensions/opt/ext_opt.{hpp,cpp}` (a new `ember_ext_opt` extension lib) + `ConstPropPass` + `DeadCodeElimPass` + `CSEPass`. `examples/ir_passes_test.cpp` (ctest `ir_passes`) verifies each pass is value-preserving + instr-count-reducing.
+- **Step 3 — SHIPPED (2026-07-11).** Pass manager wired into `CodeGenCtx` (src/codegen.hpp + codegen.cpp); CLI `--passes constprop,cse,dce` (examples/ember_cli.cpp); benchmark harness `EMBER_IR_PASS` env var (bench/bench_codegen_paths.cpp). End-to-end verified: code-size reductions visible (constprop_fold 406→318B, dce 382→326B, cse 418→404B).
+- **Step 4 — FUTURE.** `EmberAnalysisManager` (when a pass needs it) + `LICMPass` (the first pass that needs a CFG/loop analysis).
+- **Step 5 — FUTURE.** Obfuscation passes (`extensions/obf/ext_obf.cpp`) — `SubstitutionPass`, `FlatteningPass`, `MBAPass`, with `is_required = true` (bypass skip gates).
 
 Each step is independently testable: the gate is the benchmark (does the pass reduce instr count / runtime?) + a correctness test (the pass is value-preserving — the IR path still produces the same i64 return).
 
