@@ -84,17 +84,25 @@ inline bool fold_scalar_init(const Expr& init, const Type* ty, uint8_t* dst) {
             return true;
         }
     } else if (ty->is_float()) {
-        float v;
-        if (try_eval_const_f32(init, v)) {
-            size_t w = ty->byte_size();
-            if (w == 0) w = (ty->prim == Prim::F64) ? 8 : 4;
-            if (ty->prim == Prim::F64) {
-                double dv = double(v);
-                std::memcpy(dst, &dv, 8);
-            } else {
-                std::memcpy(dst, &v, 4);
+        // C6: an f64 field/element must bake the FULL double bits, not a
+        // float-narrowed value. try_eval_const_f32 casts through float, which
+        // loses precision for an f64 literal (0.1 -> 0.10000000149...); that
+        // baked value then compares unequal to an equal-precision f64 local
+        // (codegen's FloatLit f64 case stores the real double). So for F64 we
+        // fold through try_eval_const_f64 (no narrowing) and memcpy the raw
+        // double bytes; for F32 we keep the float fold + 4-byte store.
+        if (ty->prim == Prim::F64) {
+            double v;
+            if (try_eval_const_f64(init, v)) {
+                std::memcpy(dst, &v, 8);
+                return true;
             }
-            return true;
+        } else {
+            float v;
+            if (try_eval_const_f32(init, v)) {
+                std::memcpy(dst, &v, 4);
+                return true;
+            }
         }
     } else if (ty->is_bool()) {
         bool v;
@@ -193,14 +201,25 @@ inline size_t eval_global_initializers(const Program& prog, GlobalInitCtx gic) {
                 ++baked;
             }
         } else if (t && t->is_float()) {
-            float v;
-            if (try_eval_const_f32(*g.init, v)) {
-                if (t->prim == Prim::F64) {
-                    double dv = double(v); std::memcpy(slot, &dv, 8);
-                } else {
-                    std::memcpy(slot, &v, 4);
+            // C6: preserve full double precision for an f64 global. Folding
+            // through try_eval_const_f32 narrows 0.1 to a float first, then
+            // promotes back to double — the baked bytes no longer match the
+            // real 0.1 double an f64 local holds (codegen stores the full
+            // double for an f64 literal), so `g == local` compares unequal.
+            // try_eval_const_f64 folds at double precision and memcpys the raw
+            // f64 bytes, matching codegen's FloatLit f64 path exactly.
+            if (t->prim == Prim::F64) {
+                double v;
+                if (try_eval_const_f64(*g.init, v)) {
+                    std::memcpy(slot, &v, 8);
+                    ++baked;
                 }
-                ++baked;
+            } else {
+                float v;
+                if (try_eval_const_f32(*g.init, v)) {
+                    std::memcpy(slot, &v, 4);
+                    ++baked;
+                }
             }
         } else if (t && t->is_bool()) {
             bool v;

@@ -2807,7 +2807,9 @@ void CG::eval(const Expr& ex) {
     if (auto* v = dynamic_cast<const ViewExpr*>(&ex)) {
         // arr[..]: fixed array T[N] -> slice T[] {ptr=&arr, len=N}. v1 scope:
         // base must be a bare local Ident (a fixed-array frame slot has a
-        // real address to take; a general expression would need a temp).
+        // real address to take; a general expression would need a temp) OR
+        // a bare GLOBAL Ident of a fixed-array type (c3: the array lives in
+        // the globals block, so its address is globals_base + global_offset).
         if (auto* bid = dynamic_cast<const Ident*>(v->base.get())) {
             auto it = locals.find(bid->name);
             if (it != locals.end() && local_types[bid->name]->array_len > 0) {
@@ -2815,6 +2817,36 @@ void CG::eval(const Expr& ex) {
                 // rax = &arr (lea rax, [rbp+off]); rdx = N
                 e.byte(0x48); e.byte(0x8D); e.byte(0x85); e.imm32(it->second); // lea rax, [rbp+off]
                 e.mov_reg_imm64(Reg::rdx, int64_t(lt->array_len));
+            } else {
+                // c3: GLOBAL fixed-array base. Resolve the global's typed byte
+                // offset (globals_offsets if wired, else index*8) and emit
+                // rax = globals_base + global_offset; rdx = array_len. Without
+                // this branch the ViewExpr fell through and emitted nothing,
+                // leaving rax/rdx as garbage so g[..] yielded a junk slice.
+                const auto* gidx = ctx.globals_index ? ctx.globals_index : (g_globals_for_codegen ? &g_globals_for_codegen->index : nullptr);
+                const auto* goffsets = ctx.globals_offsets ? ctx.globals_offsets : (g_globals_for_codegen ? &g_globals_for_codegen->offsets : nullptr);
+                const auto* gtypes = ctx.globals_types ? ctx.globals_types : (g_globals_for_codegen ? &g_globals_for_codegen->types : nullptr);
+                if (gidx && gtypes) {
+                    int32_t goff = 0; bool found = false;
+                    if (goffsets) { auto oit = goffsets->find(bid->name); if (oit != goffsets->end()) { goff = int32_t(oit->second); found = true; } }
+                    if (!found) { auto gi = gidx->find(bid->name); if (gi != gidx->end()) { goff = int32_t(gi->second) * 8; found = true; } }
+                    if (found) {
+                        auto tit = gtypes->find(bid->name);
+                        const Type* gt = (tit != gtypes->end()) ? tit->second : nullptr;
+                        if (gt && gt->array_len > 0) {
+                            // rax = globals_base + goff; rdx = N. Mirrors the
+                            // IndexExpr global fixed-array base above (mov r11,
+                            // GlobalsBase; add goff) plus a final mov rax,r11.
+                            e.mov_reg_imm64_external(Reg::r11, AbsFixup::GlobalsBase);
+                            if (goff != 0) {
+                                e.mov_reg_imm64(Reg::rax, int64_t(goff));
+                                e.add_reg_reg(Reg::r11, Reg::rax);
+                            }
+                            e.mov_reg_reg(Reg::rax, Reg::r11);
+                            e.mov_reg_imm64(Reg::rdx, int64_t(gt->array_len));
+                        }
+                    }
+                }
             }
         }
         return;

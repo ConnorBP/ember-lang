@@ -94,6 +94,7 @@ StructLayoutTable build_struct_layouts(const Program& prog);
 // folded value matches what the runtime path would compute (sema.cpp comment).
 bool try_eval_const_i64(const Expr& e, int64_t& out);
 bool try_eval_const_f32(const Expr& e, float& out);
+bool try_eval_const_f64(const Expr& e, double& out);
 bool try_eval_const_bool(const Expr& e, bool& out);
 
 struct SemaResult {

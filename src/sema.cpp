@@ -206,6 +206,38 @@ bool try_eval_const_f32(const Expr& e, float& out) {
     return false;
 }
 
+// f64-preserving variant: folds a FloatLit/UnaryExpr/BinExpr at FULL double
+// precision without the f32 narrowing try_eval_const_f32 applies. Used by the
+// global-initializer path (globals.hpp) so an `f64` global's literal
+// initializer (e.g. `global g : f64 = 0.1;`) bakes the exact double bytes into
+// the globals block — codegen's FloatLit f64 case already stores the full
+// double for an f64 local, so without this the global would hold a
+// float-narrowed value and compare unequal to an equal-precision local
+// (the C6 defect). Mirrors try_eval_const_f32's shape; the only difference is
+// the operand type + the absence of the `float(...)` cast on the literal.
+bool try_eval_const_f64(const Expr& e, double& out) {
+    if (auto* lit = dynamic_cast<const FloatLit*>(&e)) { out = lit->v; return true; }
+    if (auto* u = dynamic_cast<const UnaryExpr*>(&e)) {
+        double v;
+        if (u->op != UnaryExpr::Op::Neg) return false;
+        if (!try_eval_const_f64(*u->operand, v)) return false;
+        out = -v; return true;
+    }
+    if (auto* b = dynamic_cast<const BinExpr*>(&e)) {
+        double l, r;
+        if (!try_eval_const_f64(*b->lhs, l)) return false;
+        if (!try_eval_const_f64(*b->rhs, r)) return false;
+        switch (b->op) {
+        case BinExpr::Op::Add: out = l + r; return true;
+        case BinExpr::Op::Sub: out = l - r; return true;
+        case BinExpr::Op::Mul: out = l * r; return true;
+        case BinExpr::Op::Div: out = l / r; return true; // well-defined (IEEE754), safe to fold
+        default: return false;
+        }
+    }
+    return false;
+}
+
 bool try_eval_const_bool(const Expr& e, bool& out) {
     if (auto* lit = dynamic_cast<const BoolLit*>(&e)) { out = lit->v; return true; }
     if (auto* u = dynamic_cast<const UnaryExpr*>(&e)) {
@@ -678,7 +710,10 @@ struct Checker {
         case Prim::U8:  if (v >= 0 && v <= 0xFF)        { lit.ty = target; return; } break;
         case Prim::U16: if (v >= 0 && v <= 0xFFFF)     { lit.ty = target; return; } break;
         case Prim::U32: if (v >= 0 && v <= 0xFFFFFFFFLL){ lit.ty = target; return; } break;
-        case Prim::U64: if (v >= 0)                    { lit.ty = target; return; } break;
+        // U64: the lexer bit-casts the full u64 range into a signed int64_t, so
+        // values >= 2^63 appear negative as int64_t. Any 64-bit bit pattern is a
+        // valid u64, so accept unconditionally (no `>= 0` guard).
+        case Prim::U64: lit.ty = target; return;
         case Prim::I8:  if (v >= -128 && v <= 127)     { lit.ty = target; return; } break;
         case Prim::I16: if (v >= -32768 && v <= 32767) { lit.ty = target; return; } break;
         case Prim::I32: if (v >= -2147483648LL && v <= 2147483647LL){ lit.ty = target; return; } break;

@@ -56,6 +56,7 @@ static int64_t call(M& m, const std::string& fn) {
     void* e = m.table->get(m.slots[fn]); using F=int64_t(*)(); return reinterpret_cast<F>(e)();
 }
 static float g_f32(M& m, int idx){ float v; std::memcpy(&v, &m.gbs[idx*8], 4); return v; }
+static double g_f64(M& m, int idx){ double v; std::memcpy(&v, &m.gbs[idx*8], 8); return v; }
 static int64_t g_i64(M& m, int idx){ int64_t v; std::memcpy(&v, &m.gbs[idx*8], 8); return v; }
 
 int main() {
@@ -82,6 +83,22 @@ int main() {
     // (9) zero-initialized globals (no init / init=0) stay zero — not falsely baked
     { auto m=compile("global g : f32 = 0.0f;\nglobal n : i64 = 0;\nfn main() -> i64 { return 1; }\n");
       ck(g_f32(*m,0)==0.0f && g_i64(*m,1)==0, "(9) zero-init globals stay zero (no false baking)"); }
+    // (10) C6 regression: an f64 global's literal initializer must preserve
+    // FULL double precision. Before the fix the global was folded through
+    // try_eval_const_f32 (which casts 0.1 to float first, truncating it to
+    // 0.10000000149...), then promoted back to double for the 8-byte store —
+    // so the baked bytes were NOT the real 0.1 double. codegen's FloatLit f64
+    // path already stores the full double for an f64 local, so `g == local`
+    // compared unequal (g held the float-narrowed value, local the real one).
+    // The fix folds f64 globals through try_eval_const_f64 (no narrowing) and
+    // memcpys the raw double bytes. Two non-circular checks: (a) the baked
+    // globals-block bytes bit-match the real 0.1 double, and (b) the in-
+    // language `g == local` returns 1 (the user-visible symptom).
+    { auto m=compile("global g : f64 = 0.1;\nfn main() -> i64 { return 1; }\n");
+      double real01 = 0.1;
+      ck(g_f64(*m,0) == real01, "(10a) f64 global initializer preserves full double (g==0.1 bit-exact)"); }
+    { auto m=compile("global g : f64 = 0.1;\nfn main() -> i64 { let local : f64 = 0.1; if (g == local) { return 1; } return 0; }\n");
+      ck(call(*m,"main")==1, "(10b) f64 global == f64 local of equal literal (g==local -> 1)"); }
     std::printf("\nfloat-global regression: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail;
 }

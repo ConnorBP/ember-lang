@@ -1273,9 +1273,24 @@ struct EmitCtx {
             break;
         }
         case ThinOp::MakeSlice: {
-            // materialize slice {rax=ptr, rdx=len} from a frame slot (array backing)
-            // meta.frame_off = backing array offset; meta.len = slice length
-            e.byte(0x48); e.byte(0x8D); e.byte(0x85); e.imm32(in.meta.frame_off); // lea rax, [rbp+frame_off]
+            // materialize slice {rax=ptr, rdx=len} from a backing array.
+            //   LOCAL fixed array: ptr = lea rax, [rbp + meta.frame_off]
+            //   GLOBAL fixed array: ptr = globals_base + meta.addend
+            //     (the lowerer sets meta.base_kind = GlobalsBase +
+            //      meta.addend = global_offset for a global-array ViewExpr;
+            //      without this check MakeSlice always used the frame-relative
+            //      lea, so g[..] pointed at a stack slot instead of the global —
+            //      the C3 defect. Mirrors the IndexAddr GlobalsBase path above.)
+            if (in.meta.base_kind == AbsFixup::GlobalsBase) {
+                e.mov_reg_imm64_external(Reg::r11, AbsFixup::GlobalsBase);
+                if (in.meta.addend != 0) {
+                    e.mov_reg_imm64(Reg::rax, int64_t(int32_t(in.meta.addend)));
+                    e.add_reg_reg(Reg::r11, Reg::rax);
+                }
+                e.mov_reg_reg(Reg::rax, Reg::r11);
+            } else {
+                e.byte(0x48); e.byte(0x8D); e.byte(0x85); e.imm32(in.meta.frame_off); // lea rax, [rbp+frame_off]
+            }
             e.mov_reg_imm64(Reg::rdx, int64_t(in.meta.len));
             record_dst_rax(in.dst, in.meta.type);
             if (in.dst != 0) {

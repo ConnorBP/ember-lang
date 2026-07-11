@@ -238,6 +238,22 @@ int main() {
         else { ck(call0_i64(*m, "main") == 3, "[3] slice global element read: s[2] == 3"); }
     }
     {
+        // C3 regression: g[..] view of a GLOBAL fixed array must yield a live
+        // slice whose elements read back from the globals block. Before the
+        // fix the tree-walker's ViewExpr case only handled a LOCAL fixed-array
+        // base and emitted nothing for a global, so rax/rdx were garbage and
+        // s[1] read a junk address; the thin-IR MakeSlice likewise used a
+        // frame-relative lea instead of globals_base. Both paths now resolve
+        // the global base, so g[..] -> slice {ptr = globals_base + offset,
+        // len = 3} and s[1] reads 20. Non-circular: the host reads the i64
+        // return out of rax in C.
+        auto m = compile(
+            "global g : i64[3] = [10, 20, 30];\n"
+            "fn main() -> i64 { let s : i64[] = g[..]; return s[1]; }\n");
+        if (!m) { ck(false, "[3b] global fixed-array view g[..] (compile)"); }
+        else { ck(call0_i64(*m, "main") == 20, "[3b] global fixed-array view g[..]: s[1] == 20"); }
+    }
+    {
         // struct global passed by-value as a call arg (c1 interaction: the
         // struct-arg-copy block must fall back to the global base for a global
         // Ident, not look up a frame slot that doesn't exist).
