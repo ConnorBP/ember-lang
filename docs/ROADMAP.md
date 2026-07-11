@@ -40,11 +40,12 @@ wiring to the B1 model (the `--tick` thread-safety bug, fixed), and a demo
 script (`examples/scripts/dynamic_registration.ember`). See
 `planning/v1.0_INTEGRATION_NOTES.md` §5.
 
-The current tree configures 33 CTest targets by default (incl.
-`bench_codegen_paths`; +`bench_ember_vs_as` when the AngelScript SDK is
-present, for 34 total with the SDK). The four `plan_*.md` files in `docs/` are
-historical design records; shipped contracts in the main docs take precedence
-where those plans describe earlier states.
+The current tree configures 37 CTest targets total (35 excluding the two
+bench targets `bench_codegen_paths` and `bench_ember_vs_as`; the latter is
+only configured when the AngelScript SDK is present, so a no-SDK build
+configures 36). The four `plan_*.md` files in `docs/` are historical design
+records; shipped contracts in the main docs take precedence where those plans
+describe earlier states.
 
 ## Tier 0 - standard addon set (ships with v1.0, host C++ side)
 
@@ -70,7 +71,15 @@ actually writable (`planning/GAP_ANALYSIS.md` Section 3):
 - **`vec2/vec3/vec4`, `quat`, `mat4`** ✓ opaque nominal handles with
   constructors/accessors and registered overloads. `sync` ✓ provides atomics,
   swap buffers, and SPSC/MPSC/MPMC queues; `lifecycle` ✓ provides dynamic
-  routine registration.
+  routine registration; `io` ✓ shipped 2026-07-11 (the CLI Family B trigger,
+  below) — console I/O (`print`, `println`, `print_i64`, `print_f64`,
+  `read_line`), file I/O (`file_read_bytes`, `file_write_bytes`,
+  `file_exists`), and path ops (`path_exists`, `path_basename`,
+  `path_dirname`). ALL `io` natives are `PERM_FFI`-gated — a module compiled
+  without the FFI permission bit has every I/O call site rejected at sema
+  time (the CLI grants the bit via `--ffi` / `--allow-io`; without it the
+  natives are registered but not callable). See the Family B entry below for
+  the full shipped contract.
 
 **Trigger to build:** v1.0 milestone. No JIT/type-system changes
 needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
@@ -438,17 +447,42 @@ here so the decision and its evidence have a tracked home.
     bounds), structs (by-value arg/return/field/reassign), strings (native +
     inline-XOR decrypt), defer-cleanup emission, fixed-array indexed store.
     `src/thin_ir.{hpp,cpp}` (the IR + stable `ThinOp` serialization boundary) +
-    `src/thin_lower.{hpp,cpp}` + `src/thin_emit.{hpp,cpp}`. This is the
+    `src/thin_lower.{hpp,cpp}` + `src/thin_emit.{hpp,cpp}`. This was the
     foundation for Stage B (`.em` IR serialization — the security property) and
-    Stage C (IR optimization passes over the `ThinFunction`). The FULL Stage 2
-    (carrying the Stage 1 peephole/regalloc over as `ThinPass`es + cross-block
-    CSE/LICM) and Stage 3 (full SSA-lite rename + linear-scan) remain the
-    still-future upgrade path, gated on Stage A's insufficiency or cross-block
-    evidence. See `../spec/CODEGEN_OPTIMIZATION_DESIGN.md` §8 (Stage A status).
+    Stage C (IR optimization passes over the `ThinFunction`). **Stage C has now
+    shipped** — see the Stage C entry below (composable pass system + eight IR
+    optimization passes + one obfuscation pass). The FULL Stage 2 (carrying the
+    Stage 1 peephole/regalloc over as `ThinPass`es) and Stage 3 (full SSA-lite
+    rename + linear-scan) remain the still-future upgrade path, gated on Stage
+    A's insufficiency or cross-block evidence. See
+    `../spec/CODEGEN_OPTIMIZATION_DESIGN.md` §8 (Stage A status).
   - **Stage 3** — full SSA-lite rename + linear-scan regalloc (COMPILER_PIPELINE
     §5's target). Gated on Stage 2's insufficiency. Gate: Stage 2 insufficient
     on a spill-heavy workload (CODEGEN_SPEC §5 acceptance criteria become the
     test surface).
+
+  - **Stage C — SHIPPED (steps 1-5 + 4 additional passes, 2026-07-10/11).** The
+    composable IR pass system over the `ThinFunction`, wired into `CodeGenCtx`
+    and the CLI (`--passes <names>`, `EMBER_IR_PASS` bench env). Steps 1-5
+    shipped 2026-07-10: step 1 the pass-system infrastructure + unit test; step
+    2 the first three IR optimization passes (ConstProp, DCE, CSE); step 3 the
+    pass-manager wiring into `CodeGenCtx` + CLI `--passes` + the `EMBER_IR_PASS`
+    bench knob; step 4 LICM (loop-invariant code motion); step 5 the
+    SubstitutionPass (MBA obfuscation, `extensions/obf/`). Four additional IR
+    optimization passes then shipped 2026-07-11: store-to-load forwarding
+    (`forward`), copy propagation (`copyprop`), instruction combining
+    (`instcombine`), and dead-store elimination (`dse`). The tree now carries
+    **eight IR optimization passes** (`constprop`, `dce`, `cse`, `licm`,
+    `forward`, `copyprop`, `instcombine`, `dse` — `extensions/opt/ext_opt.cpp`)
+    + **one obfuscation pass** (`subst` — `extensions/obf/ext_obf.cpp`) = nine
+    total. The pass system infrastructure and all nine passes are shipped (no
+    `partial` status remains — LICM and SubstitutionPass are complete). Pinned
+    by `examples/ember_pass_test.cpp` (ctest target `ember_pass`) and
+    `examples/ir_passes_test.cpp` (ctest target `ir_passes`). Spec/design:
+    `../spec/PASS_SYSTEM_DESIGN.md`. The still-future upgrade path is Stage 3
+    (full SSA-lite rename + linear-scan) and carrying the Stage 1 peephole/
+    regalloc over as `ThinPass`es — gated on Stage A's insufficiency or
+    cross-block evidence.
 
   **Ordered optimization entries (research prediction, confirmed/reordered by
   the benchmark; build first):**
@@ -609,7 +643,7 @@ pervasive and error-prone.
 
 ---
 
-## CLI tooling (Family A built; B & C deferred)
+## CLI tooling (Family A built; B shipped; C deferred)
 
 ### Family A — compute-engine CLI (no new natives; shipped/next)
 
@@ -627,18 +661,45 @@ pervasive and error-prone.
   refactor: extracting the compile-to-entry flow from `main` into a reusable
   helper so `test` can call it per-file without duplicating ~200 lines.
 
-### Family B — ember as a scripting language with real I/O (DEFERRED)
+### Family B — ember as a scripting language with real I/O (SHIPPED 2026-07-11)
 
-Add a small `io` extension registered in the CLI: `print`, `println`,
-`read_line`, `read_file`, `write_file` (+ argv access). `print`/`println`
-ungated; `read_file`/`write_file` `PERM_FFI`-gated (file I/O is a real
-security surface — `PERM_FFI` exists for exactly this). This turns ember into
-a usable scripting language and unlocks arbitrary CLI tools (data processing,
-code-gen, templating, build helpers). **Deferred because it's a language
-feature + a security decision, not just a tool** — and the demos should
-demonstrate concrete I/O starvation before we commit to the extension surface.
-Re-entry trigger: a demo or real use that is genuinely blocked on output
-beyond the exit code.
+✓ **SHIPPED.** The `io` extension (`extensions/io/`, `ext_io.cpp` +
+`ext_io.hpp`) is registered in the CLI and provides the core I/O surface a
+scripting language needs. API (11 natives): console output `print(s)`,
+`println(s)`, `print_i64(n)`, `print_f64(n)`; console input `read_line() -> s`;
+file I/O `file_read_bytes(path) -> array<u8> handle`, `file_write_bytes(path,
+buf) -> i64`, `file_exists(path) -> i64`; path ops `path_exists(p) -> i64`,
+`path_basename(p) -> s`, `path_dirname(p) -> s`. Text natives take/return
+ember `string` handles; byte natives use `array<u8>` handles (ext_io calls
+into ext_string + ext_array, one-directional coupling).
+
+**Gating — ALL 11 natives are `PERM_FFI`-gated.** A module compiled without
+the FFI permission bit has every I/O call site rejected at sema time (before
+codegen — zero runtime cost, no bypass path; see `SAFETY_AND_SANDBOX.md` §6).
+The CLI grants the bit via `--ffi` / `--allow-io`; without it the natives are
+registered but not callable (security by default). This is the
+deliberate-for-the-core-subset posture: the full plan ungates `print`/
+`println` as output-only (no security surface), but the core subset gates
+everything so a host that has not opted into I/O at all sees a uniform
+permission wall. A host that wants ungated print can register its own ungated
+print native (the extension is the menu, not the mandate). Two layers of
+defense: (1) registration — a host that does not call `register_natives` has
+NO I/O surface (a script calling `print` gets "unknown function"); (2)
+permission — `PERM_FFI` even when registered. The extension provides RAW
+CAPABILITY, NOT POLICY: it does not sandbox paths, restrict `read_line`
+(blocking stdin), or rate-limit; a host that wants policy wraps the natives
+or configures the process environment.
+
+**Design rationale (preserved from the deferral):** this turns ember into a
+usable scripting language and unlocks arbitrary CLI tools (data processing,
+code-gen, templating, build helpers). It was deferred because it is a
+language feature + a security decision, not just a tool — the re-entry
+trigger was a demo or real use genuinely blocked on output beyond the exit
+code, which fired (the `io` extension is now also listed in the Tier 0
+standard addon set above). See `extensions/io/ext_io.hpp` for the full
+scope/state notes and `docs/planning/plan_OS_IO_EXTENSIONS.md` for the
+full-plan extension surface (directory listing + subprocess execution as
+separate sub-registration functions, still future).
 
 ### Family C — ember as a unique compute module/pipeline tool (DEFERRED)
 
