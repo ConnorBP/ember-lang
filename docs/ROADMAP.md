@@ -753,6 +753,32 @@ here so the decision and its evidence have a tracked home.
   handles a subset of ember; expanding it to the full language is the
   ongoing work (step 7 of the path above).
 
+## Platform support (current + TODO)
+
+**Current:** Windows x64 only. The JIT emits x86-64 machine code (MinGW g++ +
+Ninja build, Win64 calling convention). The .em format, the codegen, the
+frame layout, and the ABI are all x64-specific.
+
+**TODO (platform ports):**
+- **Linux x64** — port the JIT memory (alloc_executable_rw / seal_executable
+  uses VirtualProtect on Windows; needs mmap/mprotect on Linux), the ABI
+  (System V vs Win64 calling convention differences: arg registers, struct
+  passing, shadow space), and the OS-specific bits (fibers → ucontext,
+  GetModuleFileName → /proc/self/exe, etc.).
+- **macOS x64 / ARM64** — same as Linux + the Apple-specific differences
+  (Mach-O, Apple's hardened runtime, JIT page permissions).
+- **32-bit x86 (x86)** — the codegen emits 64-bit instructions (REX.W prefixes);
+  a 32-bit port needs a separate emitter (32-bit calling convention, 32-bit
+  registers, no REX prefixes).
+- **ARM64 (AArch64)** — a full backend port: the emitter, the calling
+  convention, the register file, the instruction encoding. The thin-IR
+  (ThinFunction) is backend-agnostic in its IR; a new emit_arm64.cpp would
+  consume the same IR.
+
+The thin-IR backend (Stage A/B/C) is designed to be backend-agnostic — the
+ThinOp IR can be lowered to any target. A new backend (emit_arm64, emit_x86)
+consumes the same ThinFunction. The tree-walker codegen is x64-specific.
+
 ## Re-evaluation cadence
 
 This roadmap was originally revisited after the v0.5 benchmark milestone
