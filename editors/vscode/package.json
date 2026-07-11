@@ -1,0 +1,43 @@
+{
+  "name": "ember",
+  "displayName": "Ember",
+  "description": "Language support for ember — a native-JIT embedded scripting language. Syntax highlighting, bracket matching, and comment toggling for .ember files.",
+  "version": "0.1.0",
+  "publisher": "ember-lang",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "ember",
+    "jit",
+    "scripting",
+    "game-engine",
+    "embedded"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "ember",
+        "aliases": [
+          "Ember",
+          "ember"
+        ],
+        "extensions": [
+          ".ember"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "ember",
+        "scopeName": "source.ember",
+        "path": "./syntaxes/ember.tmLanguage.json"
+      }
+    ]
+  }
+}

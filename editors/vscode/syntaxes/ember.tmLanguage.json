@@ -1,0 +1,260 @@
+{
+  "name": "Ember",
+  "scopeName": "source.ember",
+  "fileTypes": ["ember"],
+  "uuid": "f4a8c2e1-7b3d-4e6a-9c5f-1a2b3c4d5e6f",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#raw-string" },
+    { "include": "#f-string" },
+    { "include": "#plain-string" },
+    { "include": "#numbers" },
+    { "include": "#annotations" },
+    { "include": "#type-decl" },
+    { "include": "#fn-decl" },
+    { "include": "#enum-variant" },
+    { "include": "#keywords-control" },
+    { "include": "#keywords-declaration" },
+    { "include": "#keywords-operator" },
+    { "include": "#types" },
+    { "include": "#constants" },
+    { "include": "#function-call" },
+    { "include": "#operators" },
+    { "include": "#punctuation" },
+    { "include": "#identifiers" }
+  ],
+  "repository": {
+    "comments": {
+      "comment": "Line comments // and block comments /* */ (lexer: lexer.cpp line-comment + block-comment branches)",
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.ember",
+          "match": "//.*"
+        },
+        {
+          "name": "comment.block.ember",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.ember" } },
+          "endCaptures": { "0": { "name": "punctuation.definition.comment.ember" } }
+        }
+      ]
+    },
+
+    "raw-string": {
+      "comment": "Raw triple-quoted string r\"\"\"...\"\"\" — every byte taken literally, no escape processing (lexer: r\"\"\" branch)",
+      "name": "string.quoted.triple.ember",
+      "begin": "r\"\"\"",
+      "end": "\"\"\"",
+      "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.ember" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.string.end.ember" } }
+    },
+
+    "f-string": {
+      "comment": "f-string f\"...\" with {expr} interpolation and nested plain strings (lexer: f-string branch, brace-depth aware)",
+      "name": "string.quoted.other.ember",
+      "begin": "\\bf\"",
+      "end": "\"",
+      "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.ember" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.string.end.ember" } },
+      "patterns": [
+        {
+          "name": "constant.character.escape.ember",
+          "match": "\\\\[ntr\\\\\"0]"
+        },
+        {
+          "comment": "doubled braces collapse to a literal brace",
+          "name": "constant.character.escape.ember",
+          "match": "\\{\\{|\\}\\}"
+        },
+        {
+          "contentName": "meta.embedded.ember",
+          "begin": "\\{",
+          "end": "\\}",
+          "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.ember" } },
+          "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.ember" } },
+          "patterns": [
+            { "include": "#ember-expression" }
+          ]
+        }
+      ]
+    },
+
+    "plain-string": {
+      "comment": "Plain double-quoted string, single physical line unless \\-continued (lexer: plain string branch). Unescaped newline is a lex error -> mark invalid.",
+      "name": "string.quoted.double.ember",
+      "begin": "\"",
+      "end": "\"",
+      "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.ember" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.string.end.ember" } },
+      "patterns": [
+        {
+          "comment": "line continuation: trailing backslash + newline -> literal newline",
+          "name": "constant.character.escape.ember",
+          "match": "\\\\\\n"
+        },
+        {
+          "name": "constant.character.escape.ember",
+          "match": "\\\\[ntr\\\\\"0]"
+        },
+        {
+          "name": "constant.character.escape.ember",
+          "match": "\\\\."
+        },
+        {
+          "name": "invalid.illegal.unescaped-newline.ember",
+          "match": "\\n"
+        }
+      ]
+    },
+
+    "numbers": {
+      "comment": "Hex, float (with optional exponent + f/F suffix), decimal int. Integer width suffixes (u8/i64...) are rejected by the lexer but tokenized here so they highlight as numbers rather than splitting.",
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.ember",
+          "match": "\\b0[xX][0-9a-fA-F]+\\b"
+        },
+        {
+          "name": "constant.numeric.float.ember",
+          "match": "\\b[0-9]+\\.[0-9]+(?:[eE][+-]?[0-9]+)?[fF]?\\b"
+        },
+        {
+          "name": "constant.numeric.float.ember",
+          "match": "\\b[0-9]+[eE][+-]?[0-9]+[fF]?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.ember",
+          "match": "\\b[0-9]+(?:_?(?:i8|i16|i32|i64|u8|u16|u32|u64))?\\b"
+        }
+      ]
+    },
+
+    "annotations": {
+      "comment": "Lifecycle / optimization annotations: @entry, @on_tick, @on_unload, @obf(\"mba\"), ... (lexer: Tk::At + identifier)",
+      "match": "(@)([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "punctuation.definition.annotation.ember" },
+        "2": { "name": "entity.other.attribute-name.ember" }
+      }
+    },
+
+    "type-decl": {
+      "comment": "struct/enum name -> entity.name.type",
+      "match": "\\b(struct|enum)\\b\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.ember" },
+        "2": { "name": "entity.name.type.ember" }
+      }
+    },
+
+    "fn-decl": {
+      "comment": "fn name -> entity.name.function",
+      "match": "\\b(fn)\\b\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.ember" },
+        "2": { "name": "entity.name.function.ember" }
+      }
+    },
+
+    "enum-variant": {
+      "comment": "Enum variant access Name::Variant (e.g. Damage::Physical, Tag::A)",
+      "match": "\\b([A-Z][A-Za-z0-9_]*)\\s*(::)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "entity.name.type.ember" },
+        "2": { "name": "keyword.operator.namespace.ember" },
+        "3": { "name": "constant.other.enum-variant.ember" }
+      }
+    },
+
+    "keywords-control": {
+      "comment": "Control-flow keywords incl. match and for-each 'in' (lexer: Kw_match, Kw_in)",
+      "match": "\\b(if|else|while|do|for|switch|case|default|break|continue|return|match|in)\\b",
+      "name": "keyword.control.ember"
+    },
+
+    "keywords-declaration": {
+      "comment": "Declaration keywords (struct/enum/fn also captured by type-decl/fn-decl above when followed by a name)",
+      "match": "\\b(let|mut|const|constexpr|defer|priv|global|struct|enum|fn|link)\\b",
+      "name": "keyword.declaration.ember"
+    },
+
+    "keywords-operator": {
+      "comment": "Cast / meta keywords: as, auto, sizeof, offsetof",
+      "match": "\\b(as|auto|sizeof|offsetof)\\b",
+      "name": "keyword.operator.ember"
+    },
+
+    "types": {
+      "comment": "Primitive types (lexer: Kw_bool, Kw_i8..Kw_u64, Kw_f32/f64, Kw_void)",
+      "match": "\\b(bool|i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|void)\\b",
+      "name": "support.type.primitive.ember"
+    },
+
+    "constants": {
+      "comment": "Boolean literals (lexer maps true/false to BoolLit)",
+      "match": "\\b(true|false)\\b",
+      "name": "constant.language.ember"
+    },
+
+    "function-call": {
+      "comment": "Identifier immediately followed by '(' -> function call (keywords are matched earlier so if(/while(/switch( etc. are not mis-tagged)",
+      "match": "([A-Za-z_][A-Za-z0-9_]*)\\s*(\\()",
+      "captures": {
+        "1": { "name": "entity.name.function.ember" },
+        "2": { "name": "punctuation.paren.open.ember" }
+      }
+    },
+
+    "operators": {
+      "comment": "All operators incl. => (FatArrow), -> (Arrow), :: (DoubleColon), .. (DotDot), shift/compound-assign (lexer operator switch, longest-first)",
+      "match": "=>|->|::|\\.\\.|<<=|>>=|<<|>>|&&|\\|\\||==|!=|<=|>=|\\+\\+|--|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|[+\\-*/%<>=!&|^~?]",
+      "name": "keyword.operator.ember"
+    },
+
+    "punctuation": {
+      "comment": "Brackets, separators, terminators, dot, single colon",
+      "match": "(\\()|(\\))|(\\{)|(\\})|(\\[)|(\\])|(,)|(;)|(:)|(\\.)",
+      "captures": {
+        "1": { "name": "punctuation.paren.open.ember" },
+        "2": { "name": "punctuation.paren.close.ember" },
+        "3": { "name": "punctuation.brace.open.ember" },
+        "4": { "name": "punctuation.brace.close.ember" },
+        "5": { "name": "punctuation.bracket.open.ember" },
+        "6": { "name": "punctuation.bracket.close.ember" },
+        "7": { "name": "punctuation.separator.comma.ember" },
+        "8": { "name": "punctuation.terminator.semicolon.ember" },
+        "9": { "name": "punctuation.separator.colon.ember" },
+        "10": { "name": "punctuation.accessor.dot.ember" }
+      }
+    },
+
+    "identifiers": {
+      "comment": "Fallback identifier",
+      "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b",
+      "name": "variable.other.ember"
+    },
+
+    "ember-expression": {
+      "comment": "Patterns valid inside an f-string {interpolation} — excludes raw/f-string begins to avoid mis-nesting, but allows plain strings (lexer permits nested plain strings inside interpolations)",
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#plain-string" },
+        { "include": "#numbers" },
+        { "include": "#annotations" },
+        { "include": "#type-decl" },
+        { "include": "#fn-decl" },
+        { "include": "#enum-variant" },
+        { "include": "#keywords-control" },
+        { "include": "#keywords-declaration" },
+        { "include": "#keywords-operator" },
+        { "include": "#types" },
+        { "include": "#constants" },
+        { "include": "#function-call" },
+        { "include": "#operators" },
+        { "include": "#punctuation" },
+        { "include": "#identifiers" }
+      ]
+    }
+  }
+}
