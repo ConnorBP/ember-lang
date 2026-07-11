@@ -1242,11 +1242,19 @@ fn cg_compile_func(fd: i64) -> i64 {
     cg_compile_block(body);
     if (cg_err != 0) { return 0; }
 
-    // bind the epilogue label + emit the epilogue
-    // (every return jumps here; also the implicit fallthrough return)
-    cg_bind(cg_epilogue_label);
-    // implicit void return: rax = 0 (in case the fn falls off the end)
+    // implicit void return: rax = 0 (only reached by fallthrough — a fn
+    // that falls off the end without an explicit return gets rax = 0).
+    // This MUST come before the epilogue label bind: every ReturnStmt evals
+    // its value into rax then jumps to cg_epilogue_label, so the label must
+    // land at the epilogue itself (mov rsp, rbp; pop rbp; ret) — NOT here —
+    // or the implicit zeroing would overwrite the return value. (The C++
+    // reference codegen emits emit_epilogue() inline at each return instead
+    // of jumping to a shared label; this codegen uses the shared-label form,
+    // which is equivalent only if the implicit zero is fallthrough-only.)
     cg_mov_reg_imm64(RAX, 0);
+    // bind the epilogue label + emit the epilogue (returns jump here, with
+    // rax already holding their value)
+    cg_bind(cg_epilogue_label);
     cg_emit_epilogue();
 
     // resolve all label fixups

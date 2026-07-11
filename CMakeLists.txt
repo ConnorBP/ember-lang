@@ -171,13 +171,19 @@ ember_add_extension(obf extensions/obf/ext_obf.cpp)           # Stage C Step 5: 
 # one-directional (ext_io calls into them; they do not know about ext_io).
 ember_add_extension(io extensions/io/ext_io.cpp)
 target_link_libraries(ember_ext_io PUBLIC ember_ext_array ember_ext_string)
-# ext_call_raw: raw x64 function-pointer call native (call_raw(fn_ptr,arg)->i64).
-# The ONE native the self-hosting milestone (plan_SELF_HOSTING.md Stage 4 gap)
-# identified: lets the ember-written codegen's output be executed. Stateless
-# (no host slot vector); depends only on ember_frontend (BindingBuilder +
-# type_i64). PERM_FFI-gated at the sema call site (calling raw function
-# pointers is a security surface — gated the same way ext_io is).
+# ext_call_raw: raw x64 execution natives (the self-hosting Stage 4 gap).
+# Three PERM_FFI-gated natives that bridge the ember-written codegen's output
+# to actual execution: make_executable(array<u8>) -> fn_ptr (copies bytes to a
+# W^X RX page via jit_memory), call_raw(fn_ptr, arg) -> i64 (invokes the entry),
+# free_executable_ptr(ptr) (releases the page). Depends on ember_ext_array
+# (make_executable reads the array<u8> handle via ext_array::get_bytes) + the
+# ember core lib (jit_memory: alloc_executable / free_executable, pulled in
+# transitively via ember_frontend -> ember). Stateless (no host slot vector;
+# executable pages are caller-owned via free_executable_ptr). PERM_FFI-gated
+# at the sema call site (minting + calling executable pages is a security
+# surface — gated the same way ext_io is).
 ember_add_extension(call_raw extensions/call_raw/ext_call_raw.cpp)
+target_link_libraries(ember_ext_call_raw PUBLIC ember_ext_array)
 
 # ---- tests: .em pre-compile round-trip + live import cross-module round-trip ----
 # These link only ember + ember_frontend (no prism/prism_script_host) so they

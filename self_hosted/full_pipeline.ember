@@ -1,0 +1,148 @@
+// self_hosted/full_pipeline.ember — the ember-compiling-ember end-to-end demo.
+//
+// This is the self-hosting milestone made concrete: a SINGLE ember script
+// imports the four self-hosted compiler stages (each written IN ember) +
+// chains them into a complete pipeline that takes ember SOURCE as a string,
+// compiles it all the way to x64 machine code, and EXECUTES the result via
+// the host's call_raw native — returning whatever the compiled program
+// returns.
+//
+//   source string
+//     ->  lex.ember      (Stage 1: lex   source -> token array)
+//     ->  parse.ember    (Stage 2: parse tokens -> AST)
+//     ->  sema.ember     (Stage 3: type-check AST)
+//     ->  codegen.ember  (Stage 4: emit AST -> x64 bytes in array<u8>)
+//     ->  make_executable(array<u8>) -> fn pointer   (host native: W^X page)
+//     ->  call_raw(fn_ptr, arg) -> i64               (host native: execute)
+//     ->  the compiled program's return value
+//
+// The four stage files are imported (import "lex.ember"; import "parse.ember";
+// import "sema.ember"; import "codegen.ember";), so this script literally is
+// "ember source compiled by the ember-written compiler, then executed" — the
+// bootstrapping milestone's proof of concept. The C++ compiler (ember_cli)
+// compiles THIS script; this script then compiles + runs a second ember
+// program using only ember-written frontend code + the two host execution
+// natives.
+//
+// === Why a single self-contained fn ===
+//
+// The self-hosted codegen emits call targets as a placeholder
+// `mov rax, 0; call rax` (the fn entry address is a placeholder the host
+// fills at JIT time, like the C++ dispatch-table call). make_executable does
+// NOT patch placeholders — it copies the bytes to an RX page verbatim — so a
+// program that CALLS another fn would branch to address 0. The demo therefore
+// uses a single self-contained fn (`fn main() -> i64 { return 1 + 2 * 3; }`)
+// whose body is pure arithmetic (no calls): its bytes are directly executable,
+// and the entry is the first byte of the buffer (the codegen lays functions
+// out in declaration order, so a single-fn program's entry is at offset 0).
+// call_raw(ptr, 0) invokes it as int64_t(*)(int64_t); the unused arg is
+// harmless on Win64 (extra args are ignored, rax holds the return).
+//
+// === Natives used (PERM_FFI-gated; run with --ffi) ===
+//
+//   make_executable(bytes: i64) -> i64   copy array<u8> to an RX page, return ptr
+//   call_raw(fn_ptr: i64, arg: i64) -> i64   invoke the entry, return its result
+//   free_executable_ptr(ptr: i64) -> void   release the RX page
+//
+// Run:
+//   ./buildt/ember_cli.exe run self_hosted/full_pipeline.ember --fn main --ffi
+// (exit code = the compiled program's return value; for 1 + 2 * 3 that is 7.)
+
+import "lex.ember";
+import "parse.ember";
+import "sema.ember";
+import "codegen.ember";
+
+// -----------------------------------------------------------------------------
+// compile_and_run(source) — the full pipeline. Takes an ember program as a
+// string, runs it through all four self-hosted stages, executes the emitted
+// x64 bytes, and returns the compiled program's return value. Returns a
+// negative code on a stage failure (so a failure is observable, not a silent
+// 0): -1xx = lex, -2xx = parse, -3xx = sema, -4xx = codegen, -5xx = exec.
+// -----------------------------------------------------------------------------
+fn compile_and_run(source: string) -> i64 {
+    // ---- Stage 1: lex source -> token array ----
+    // lex() returns an opaque array<u8>-backed token handle + sets the lexer's
+    // globals (g_src, g_toks). lex_failed() reports a scan error.
+    let toks: i64 = lex(source);
+    if (lex_failed() != 0) { return -101; }
+    let ntok: i64 = tok_count(toks);
+    if (ntok < 2) { return -102; }   // at least one real token + Eof
+
+    // ---- Stage 2: parse tokens -> AST ----
+    // parse() takes the source (it re-lexes internally to populate its token
+    // cursor — the self-hosted parser's only entry point is parse(source),
+    // there is no parse_tokens(toks) variant yet). It returns the Program
+    // node index, or -1 on a structural error; parse_failed() / parse_err_*
+    // expose the state. parse_tokens() recovers the token array parse built
+    // (== toks for the same source).
+    let prog: i64 = parse(source);
+    if (parse_failed() != 0) { return -201; }
+    if (prog < 0) { return -202; }
+    // sanity: the program node is an NK::Program
+    if (nk_kind(prog) != (NK::Program as i64)) { return -203; }
+
+    // ---- Stage 3: type-check the AST ----
+    // sema() takes the source (it calls parse() internally, then runs the
+    // type checker over the AST). Returns 0 on success, 1 on a sema error,
+    // 2 on a parse error. sema_failed() / sema_err_* expose the state.
+    let sr: i64 = sema(source);
+    if (sr != 0) { return -301 - sr; }   // -302 = parse error, -302.. = sema error
+
+    // ---- Stage 4: codegen AST -> x64 bytes ----
+    // codegen() takes the source (it calls sema() internally, then emits x64
+    // bytes into an array<u8>). Returns the array handle (0 on error).
+    // codegen_failed() / codegen_byte_count() / codegen_byte_at() expose state.
+    let bytes: i64 = codegen(source);
+    if (codegen_failed() != 0) { return -401; }
+    let nbytes: i64 = codegen_byte_count();
+    if (nbytes <= 0) { return -402; }
+
+    // sanity: the buffer starts with the x64 function prologue
+    //   0x55           push rbp
+    //   0x48 0x89 0xE5 mov rbp, rsp
+    // (the first function's entry is at offset 0; this is what we will execute)
+    if (codegen_byte_at(0) != 0x55) { return -403; }
+    if (codegen_byte_at(1) != 0x48) { return -404; }
+    if (codegen_byte_at(2) != 0x89) { return -405; }
+    if (codegen_byte_at(3) != 0xE5) { return -406; }
+
+    // ---- Execute the emitted x64 bytes via the host natives ----
+    // make_executable copies the array<u8> to a W^X executable page (RW ->
+    // memcpy -> seal RX) and returns the entry pointer (0 on failure). The
+    // entry is the first byte of the buffer = the first fn's prologue.
+    let ptr: i64 = make_executable(bytes);
+    if (ptr == 0) { return -501; }
+
+    // call_raw casts ptr to int64_t(*)(int64_t) and calls it. The compiled
+    // program is `fn main() -> i64 { return <expr>; }` — it takes no real
+    // args (the one i64 arg is ignored) and returns its result in rax, which
+    // call_raw reads back. This is the moment the self-hosted compiler's
+    // output actually RUNS.
+    let result: i64 = call_raw(ptr, 0);
+
+    // release the executable page (it was minted just for this call)
+    free_executable_ptr(ptr);
+
+    return result;
+}
+
+// -----------------------------------------------------------------------------
+// run_demo — the end-to-end demo entry. Compiles + executes the canonical
+// program
+//   fn main() -> i64 { return 1 + 2 * 3; }
+// and returns its result (7, since * binds tighter than + : 1 + (2*3) = 7).
+// The CLI propagates this as the process exit code (masked to 31 bits), so
+//   ./buildt/ember_cli.exe run self_hosted/full_pipeline.ember --fn run_demo --ffi
+// exits 7.
+//
+// (This file deliberately does NOT declare a top-level `main` — it is a
+// library, like lex.ember / parse.ember / sema.ember / codegen.ember, so it
+// can be imported by full_pipeline_test.ember without a duplicate-`main`
+// collision. The test's own `main` is the driver; `run_demo` is this file's
+// runnable demo entry.)
+// -----------------------------------------------------------------------------
+fn run_demo() -> i64 {
+    let src: string = string_from_slice("fn main() -> i64 { return 1 + 2 * 3; }");
+    return compile_and_run(src);
+}

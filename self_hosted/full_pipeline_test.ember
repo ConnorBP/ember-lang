@@ -1,0 +1,228 @@
+// self_hosted/full_pipeline_test.ember — tests for the end-to-end pipeline
+// (self_hosted/full_pipeline.ember).
+//
+// TDD: the full_pipeline demo is exercised end-to-end. The test runs
+// compile_and_run() on a spread of known ember programs + verifies the
+// EXECUTED result matches the expected value (so a codegen bug that produces
+// wrong x64 — e.g. the return-value-clobbering epilogue-label bug this test
+// was written to catch — surfaces as a mismatch, not a silent pass). It also
+// checks the error paths (a sema error + a parse error return negative
+// codes, not 0). main() returns 0 on full success, or a nonzero code
+// identifying the first failing check (so a failure is harness-observable,
+// not a silent 0).
+//
+// Run: ./buildt/ember_cli.exe run self_hosted/full_pipeline_test.ember --fn main --ffi
+// (exit 0 == all tests pass).
+//
+// This test is the validation gate for the self-hosting milestone: it proves
+// the ember-written compiler (lex + parse + sema + codegen, all in ember)
+// produces x64 bytes that EXECUTE CORRECTLY via the host's call_raw native.
+// The byte-pattern codegen_test could not catch execution bugs (it never
+// runs the code); this test does.
+
+import "full_pipeline.ember";
+
+// ---------------------------------------------------------------------------
+// assertion helpers. ck returns 0 to continue or a nonzero code to bail; the
+// driver returns immediately on the first failure. (Same protocol as
+// lex_test.ember / parse_test.ember / sema_test.ember / codegen_test.ember.)
+// ---------------------------------------------------------------------------
+global g_pass : i64 = 0;
+
+// Check `got == want`; if so, bump g_pass and return 0, else return `code`
+// (a nonzero identifier for this check). The driver checks the return: 0 =
+// keep going, nonzero = bail with that code.
+fn ck(got: i64, want: i64, code: i64) -> i64 {
+    if (got == want) { g_pass = g_pass + 1; return 0; }
+    return code;
+}
+
+// Check `got < 0` (a negative error code); same protocol. Used for the error
+// paths — compile_and_run returns negative on a stage failure, so a SUCCESS
+// of the error-path check is "the result is negative".
+fn ck_neg(got: i64, code: i64) -> i64 {
+    if (got < 0) { g_pass = g_pass + 1; return 0; }
+    return code;
+}
+
+// ---------------------------------------------------------------------------
+// Test 1 — the canonical program from the task spec:
+//   fn main() -> i64 { return 1 + 2 * 3; }
+// Expected: 7 (multiplication binds tighter than addition: 1 + (2*3) = 7).
+// This is the headline self-hosting check: ember source compiled by the
+// ember-written compiler + executed, returning the right answer.
+// ---------------------------------------------------------------------------
+fn test_canonical() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { return 1 + 2 * 3; }"));
+    return ck(r, 7, 1010);
+}
+
+// ---------------------------------------------------------------------------
+// Test 2 — integer literal return.
+//   fn main() -> i64 { return 42; }
+// Expected: 42 (the mov rax, imm64 + return path).
+// ---------------------------------------------------------------------------
+fn test_int_literal() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { return 42; }"));
+    return ck(r, 42, 1020);
+}
+
+// ---------------------------------------------------------------------------
+// Test 3 — subtraction.
+//   fn main() -> i64 { return 10 - 3; }
+// Expected: 7 (the sub rax, rcx path).
+// ---------------------------------------------------------------------------
+fn test_sub() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { return 10 - 3; }"));
+    return ck(r, 7, 1030);
+}
+
+// ---------------------------------------------------------------------------
+// Test 4 — two multiplications + an addition (precedence + the push/pop
+// stash across a nested binary tree).
+//   fn main() -> i64 { return 2 * 3 + 4 * 5; }
+// Expected: 26 ((2*3) + (4*5) = 6 + 20 = 26).
+// ---------------------------------------------------------------------------
+fn test_mul_add() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { return 2 * 3 + 4 * 5; }"));
+    return ck(r, 26, 1040);
+}
+
+// ---------------------------------------------------------------------------
+// Test 5 — parentheses override precedence.
+//   fn main() -> i64 { return (1 + 2) * 3; }
+// Expected: 9 ((1+2) * 3 = 3 * 3 = 9). Confirms the parser's grouping +
+// the codegen's nested-eval both work under execution.
+// ---------------------------------------------------------------------------
+fn test_parens() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { return (1 + 2) * 3; }"));
+    return ck(r, 9, 1050);
+}
+
+// ---------------------------------------------------------------------------
+// Test 6 — zero return (the implicit-fallthrough vs explicit-return
+// distinction: an explicit `return 0` must return 0, AND a nonzero return
+// must NOT be clobbered to 0 by the epilogue label — test_canonical already
+// proves the nonzero case; this nails the zero baseline).
+//   fn main() -> i64 { return 0; }
+// Expected: 0.
+// ---------------------------------------------------------------------------
+fn test_zero() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { return 0; }"));
+    return ck(r, 0, 1060);
+}
+
+// ---------------------------------------------------------------------------
+// Test 7 — bitwise AND + OR + XOR composition.
+//   fn main() -> i64 { return (12 & 10) | (3 ^ 5); }
+// Expected: (12 & 10) = 8 (0b1100 & 0b1010 = 0b1000); (3 ^ 5) = 6
+// (0b011 ^ 0b101 = 0b110); 8 | 6 = 14 (0b1000 | 0b0110 = 0b1110).
+// Exercises the and/or/xor codegen paths under execution.
+// ---------------------------------------------------------------------------
+fn test_bitwise() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { return (12 & 10) | (3 ^ 5); }"));
+    return ck(r, 14, 1070);
+}
+
+// ---------------------------------------------------------------------------
+// Test 8 — left shift.
+//   fn main() -> i64 { return 1 << 4; }
+// Expected: 16 (shl rax, cl path).
+// ---------------------------------------------------------------------------
+fn test_shl() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { return 1 << 4; }"));
+    return ck(r, 16, 1080);
+}
+
+// ---------------------------------------------------------------------------
+// Test 9 — unary negation.
+//   fn main() -> i64 { return -5; }
+// Expected: -5 (neg rax path). Also confirms a NEGATIVE result survives the
+// full pipeline + call_raw (not just nonneg values).
+// ---------------------------------------------------------------------------
+fn test_unary_neg() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { return -5; }"));
+    return ck(r, -5, 1090);
+}
+
+// ---------------------------------------------------------------------------
+// Test 10 — division.
+//   fn main() -> i64 { return 20 / 4; }
+// Expected: 5 (cqo + idiv rcx path).
+// ---------------------------------------------------------------------------
+fn test_div() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { return 20 / 4; }"));
+    return ck(r, 5, 1100);
+}
+
+// ---------------------------------------------------------------------------
+// Test 11 — a larger composed expression mixing several ops + precedence.
+//   fn main() -> i64 { return 2 * 3 + 4 * 5 - 6 / 2; }
+// Expected: 6 + 20 - 3 = 23.
+// ---------------------------------------------------------------------------
+fn test_composed() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { return 2 * 3 + 4 * 5 - 6 / 2; }"));
+    return ck(r, 23, 1110);
+}
+
+// ---------------------------------------------------------------------------
+// Test 12 — the demo entry itself: run_demo() (full_pipeline.ember's
+// runnable demo) compiles + executes the canonical program + returns 7.
+// This confirms the demo file's own entry point is correct, not just the
+// reusable compile_and_run it wraps.
+// ---------------------------------------------------------------------------
+fn test_run_demo() -> i64 {
+    let r: i64 = run_demo();
+    return ck(r, 7, 1120);
+}
+
+// ---------------------------------------------------------------------------
+// Test N1 (negative) — a sema error: returning bool from an i64 fn.
+//   fn main() -> i64 { return true; }
+// compile_and_run must return a NEGATIVE code (the sema stage fails), not 0
+// or 1. This confirms the pipeline reports stage failures rather than
+// silently executing garbage.
+// ---------------------------------------------------------------------------
+fn test_neg_sema_error() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { return true; }"));
+    return ck_neg(r, 2101);
+}
+
+// ---------------------------------------------------------------------------
+// Test N2 (negative) — a parse error: a dangling `+` with no right operand.
+//   fn main() -> i64 { return 1 + ; }
+// compile_and_run must return a NEGATIVE code (the parse stage fails).
+// ---------------------------------------------------------------------------
+fn test_neg_parse_error() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { return 1 + ; }"));
+    return ck_neg(r, 2102);
+}
+
+// ---------------------------------------------------------------------------
+// the driver. Runs every test; returns 0 on full success, or the first
+// failing check's code. The CLI exit code is this value mod 256; 0 == pass.
+// ---------------------------------------------------------------------------
+fn main() -> i64 {
+    let mut r: i64 = 0;
+
+    // positive (executed-result) checks
+    r = test_canonical();     if (r != 0) { return r; }
+    r = test_int_literal();   if (r != 0) { return r; }
+    r = test_sub();           if (r != 0) { return r; }
+    r = test_mul_add();       if (r != 0) { return r; }
+    r = test_parens();        if (r != 0) { return r; }
+    r = test_zero();          if (r != 0) { return r; }
+    r = test_bitwise();       if (r != 0) { return r; }
+    r = test_shl();           if (r != 0) { return r; }
+    r = test_unary_neg();     if (r != 0) { return r; }
+    r = test_div();           if (r != 0) { return r; }
+    r = test_composed();      if (r != 0) { return r; }
+    r = test_run_demo();     if (r != 0) { return r; }
+
+    // negative (error-path) checks
+    r = test_neg_sema_error();  if (r != 0) { return r; }
+    r = test_neg_parse_error(); if (r != 0) { return r; }
+
+    // every test passed
+    return 0;
+}
