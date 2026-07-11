@@ -69,8 +69,9 @@ themselves*:
 
 2. **`int64_t budget_remaining`** (`context.hpp:64`). Decremented by JIT'd
    code at each budget charge site (function entry and loop back-edges;
-   reach-aware per-statement charging is in flight): `src/codegen.cpp:319`–`340`
-   (`emit_budget_check`). The JIT'd body does `mov rax, <budget_ptr>; sub qword
+   reach-aware per-statement charging is SHIPPED — see `src/codegen.cpp`
+   `emit_budget_check` + `expr_cost`/`stmt_cost`/`block_cost`): The JIT'd body
+   does `mov rax, <budget_ptr>; sub qword
    [rax], body_cost; jg .continue; else trap` (B1 mode decrements through
    `[r14 + off_budget]` instead of a baked pointer). Two threads decrementing
    the same `int64_t` is a classic read-modify-write race — lost decrements (a
