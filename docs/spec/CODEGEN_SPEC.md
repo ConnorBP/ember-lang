@@ -234,6 +234,29 @@ struct RipFixup {
 > **Not implemented in v1.0.** The shipped backend walks the AST directly and
 > stack-spills expression intermediates. Everything in this section is a future,
 > benchmark-gated design, not a description of current codegen.
+>
+> **Implementation note (Stage A, 2026-07-10):** a thin three-address IR — a
+> deliberate subset of this SSA-lite design (three-address `dst = op src1 src2`
+> form, basic blocks, but NO SSA renaming, NO phi, and reassigned locals stay
+> slot-backed via `LoadFrame`/`StoreFrame` exactly as the "would-be-phi" note
+> below describes) — is now implemented behind `CodeGenCtx::enable_ir_backend`
+> as the Stage-2 stepping stone. `src/thin_ir.{hpp,cpp}` ship the
+> `ThinFunction`/`ThinBlock`/`ThinInstr` + the stable `ThinOp` enum (the
+> serialization-ready contract); `src/thin_lower.{hpp,cpp}` ship the
+> AST→`ThinFunction` lowering (`lower_function`); `src/thin_emit.{hpp,cpp}`
+> ship the `ThinFunction`→x64 emit (`emit_x64`). Default off → the tree-walker
+> above runs unchanged (byte-identical); on → value-equivalent (not
+> byte-identical). The `ThinOp` instruction set is a subset of the
+> `IrInstr::Op` vocabulary, so the Stage-3 upgrade (SSA rename + slot-back +
+> liveness + linear-scan) is additive, not a rewrite. See `COMPILER_PIPELINE.md`
+> §5 (the Stage-A note there) and `CODEGEN_OPTIMIZATION_DESIGN.md` §4.3/§4.6
+> (the hybrid thin-IR option + the `ThinFunction` representation) and §8
+> (Stage A status). The Stage-B v5 IR `.em` serialization (the on-disk IR
+> format + the re-emit-at-load security model) is documented in
+> `BUNDLING_AND_EM_MODULES.md` §2.5.2; the `ir_blob` codec is
+> `src/thin_ir_ser.{hpp,cpp}`. The full SSA-lite + linear-scan (this section)
+> remains the still-future Stage-3 upgrade, gated on Stage A's insufficiency or
+> cross-block evidence.
 
 "SSA-lite" (see COMPILER_PIPELINE.md Section 5 for the deferred IR definition): each
 IR value is assigned exactly once, values are typed, control flow is
@@ -933,3 +956,91 @@ The globals block is no longer a flat `i64[]` of 8-byte scalar slots; it is a
   process. This is the slice-`.em`-relocation path; `aggregate_global_test`
   probe [8] pins it (slice global `.em` round-trip with relative-ptr
   relocation), green.
+
+## 17. `for-each` lowering (2026-07-11)
+
+`for (x in slice)` (Tier 1, `ForEachStmt`) desugars to a while-loop-with-
+indexing over the slice's `{ptr, len}` representation. The iterable must be a
+slice `T[]` (sema rejects non-slice iterables, `TYPE_SYSTEM.md` §13); `x` gets
+the element type. The lowering runs in the tree-walker only — the IR backend
+marks a function using for-each as `non_serializable` (falls back to the
+tree-walker), so this section describes the only shipped lowering.
+
+Frame layout (one set of compiler-hidden locals per for-each, uniquely named
+with a per-function counter so nested for-each never collide):
+- `__fe_ptr$N` — an i64 slot holding the slice's `ptr`.
+- `__fe_len$N` — an i64 slot holding the slice's `len`.
+- `__fe_idx$N` — an i64 slot holding the current index (starts at 0).
+- `x` — the loop variable slot, sized to the element type's `value_bytes`
+  (≤8 bytes; a struct element is loaded as its first word — a scalar slot,
+  full-struct for-each is a future enhancement).
+
+Emission:
+1. Evaluate the iterable expression → `rax = ptr`, `rdx = len` (the slice ABI,
+   §8). Store `ptr` to `__fe_ptr$N`, store `len` to `__fe_len$N`, store
+   immediate `0` to `__fe_idx$N`.
+2. **Loop top** (`top` label): load `idx` and `len` into `rax`/`rdx`, `cmp rax,
+   rdx`, `jcc ge, end` (signed compare — index < len continues). This is the
+   bounds check: an index ≥ len exits the loop.
+3. **Element load.** Load `ptr` into `rax`, `idx` into `rcx`. Compute the element
+   address `rax = ptr + idx * elem_size`. For power-of-2 element sizes (1, 2, 4,
+   8) use a SIB-scaled `lea` (`lea rax, [rax + rcx*scale]`); for non-power-of-2
+   sizes (e.g. 12 for a 3-float struct) use `imul rcx, elem_size; add rax, rcx`
+   (the C2 fix — the old `shl`-based scale miscompiled non-power-of-2 element
+   sizes). Load the element (≤8 bytes via `load_elem_to_rax` at the element
+   width) and store it to `x`'s frame slot.
+4. **Body.** Execute the loop body. `break` lowers to `jmp end`; `continue`
+   lowers to `jmp latch` (the back-edge).
+5. **Latch** (`latch` label): load `idx`, `add rax, 1`, store back to `idx`.
+   Emit the per-frame budget check (`emit_budget_check(block_cost(body),
+   "budget exceeded at for-each back-edge")`) at the back-edge, then `jmp top`.
+6. **End** (`end` label): fall through to whatever follows the for-each.
+
+The loop context pushed for `break`/`continue` carries `latch` as the continue
+target (so `continue` runs the index increment + budget charge, never skipping
+them) and `end` as the break target. The budget check is at the back-edge (the
+same place `while`'s is), so a for-each is budget-charged once per iteration.
+
+## 18. `match` lowering (2026-07-11)
+
+`match (expr) { pattern => body, ... _ => default }` (Tier 1, `MatchStmt`)
+lowers to a per-arm compare-and-branch cascade — like `switch` (§12) but with
+no fallthrough and no `break` (each arm is a separate branch that jumps to the
+exit). The subject must be an integer or bool (sema rejects other types,
+`TYPE_SYSTEM.md` §13); patterns are integer/bool literals or the `_` wildcard.
+The lowering runs in the tree-walker only — the IR backend marks a function
+using match as `non_serializable` (falls back to the tree-walker), same as
+for-each.
+
+Emission:
+1. Evaluate the subject expression → `rax`, then `mov r10, rax` to hold the
+   subject in a volatile register across the compare cascade (the cascade
+   re-evaluates each pattern into `rax` and compares against `r10`).
+2. **Allocate one label per arm** (`arm_labels[i]`) plus an `end_label`. Record
+   the wildcard arm's index (there is at most one `_` — sema rejects a second).
+3. **Compare cascade.** For each non-wildcard arm `i`, in source order:
+   evaluate the pattern expression → `rax`, `cmp r10, rax`, `jcc e, arm_labels[i]`
+   (jump to that arm's body on match). This is a linear cascade (the sparse form
+   of §12's switch lowering); match does not use a jump table even for dense
+   integer pattern sets (v1 keeps it simple — a future refinement could pick
+   the jump-table form for dense integer patterns).
+4. After the last non-wildcard compare, `jmp` to the wildcard arm's label if one
+   exists, otherwise `jmp end_label` (no match + no wildcard = no-op, falls
+   through to whatever follows the match).
+5. **Arm bodies.** For each arm `i` (including the wildcard): bind `arm_labels[i]`,
+   push a loop context with `end_label` as the break target (so `break` inside
+   an arm body breaks out of the enclosing loop or switch, NOT the match — match
+   is break-only in the sense that an arm body's `break` targets the nearest
+   enclosing loop/switch, never the match itself), execute the arm body, then
+   `jmp end_label` (no fallthrough — each arm jumps to the exit). Pop the loop
+   context.
+6. **End** (`end_label`): fall through to whatever follows the match.
+
+Pattern-type checking (sema, `TYPE_SYSTEM.md` §13): each non-wildcard pattern
+must be a literal constant (`IntLit` or `BoolLit`) whose type matches the
+subject (same type, or both integer — an `i32` pattern against an `i64`
+subject is accepted since both are integer). The compare cascade therefore
+compares bit patterns of the same width. `match` does not guarantee
+exhaustiveness in v1 — a match with no wildcard and no matching arm falls
+through to the exit (no-op), which is correct for a non-exhaustive match (the
+ROADMAP notes struct destructure + guards as a later refinement).

@@ -15,7 +15,12 @@ layout, conversions, and ABI limits; future extensions are labeled inline.
 | `void` | 0 |  -  | Return-type only. Not a value type  -  cannot declare a `void` variable/field/param. |
 
 No `char`/`wchar` distinct type in v1 - text is `u8` byte slices
-(Section 4). No arbitrary-width integers, no `usize`/pointer-sized integer
+(Section 4). String literals come in two forms: `"..."` (the regular
+form, supporting the minimal escape set `\n \t \\ \"`) and `r"""..."""`
+(triple-quoted raw strings — no escape processing, may span lines; the lexer
+produces a `RawStringLit` token whose bytes are used verbatim). Both produce a
+`slice<u8>` value at the type level (the owned `string` handle is a separate
+extension type, see the string extension + §11.7). No arbitrary-width integers, no `usize`/pointer-sized integer
 type exposed to script (slices carry length as `i64` explicitly,
 avoids "is usize 32 or 64 bit" ambiguity entirely).
 
@@ -360,23 +365,28 @@ rejects unknown field names). These never emit code - they're folded
 to literals at sema using the struct-layout pass results (Section 2 / sema
 pass 1, COMPILER_PIPELINE.md Section 4).
 
-### 11.5 `const` / `constexpr`
+### 11.5 `const`
 
 - `const x: T = expr;` - an **immutable local** (or global, when at
-  module scope: `global const x: T = expr;`). Assignment after
-  declaration is a compile error (sema-only enforcement, zero runtime
-  cost - storage is identical to `let`, just with write-after-init
-  rejected). `expr` is typechecked normally (implicit conversions per
-  Section 6 apply).
-- `constexpr` - a marker that an expression/value is **compile-time-
-  evaluable**. v1 restricts what can be `constexpr`: literal values,
-  `sizeof`/`offsetof`, and integer arithmetic on other `constexpr`
-  values (no function calls, no runtime values). Used in: array sizes
-  (`let buf: [u8; constexpr 256]` - though v1 array sizes already
-  must be literals, `constexpr` lets a *named* compile-time value be
-  used, `const N: u32 = 256; let buf: [u8; N]`), `switch` case
-  labels, `offsetof`/`sizeof` arg contexts. Full const-eval (recursive
-  `constexpr fn`s, `static_assert`) is v2 (`../ROADMAP.md` Tier 1).
+  module scope: `global const x: T = expr;`, or `const x: T = expr;` at
+  module scope). Assignment after declaration is a compile error (sema-only
+  enforcement, zero runtime cost - storage is identical to `let`, just with
+  write-after-init rejected). `expr` is typechecked normally (implicit
+  conversions per Section 6 apply).
+
+`constexpr` is a **RESERVED keyword with no parser/sema support** (see
+`COMPILER_PIPELINE.md` §1): using it is a **parse error**. The earlier spec
+claim that `constexpr` works as a compile-time-evaluable marker for array
+sizes / `switch` case labels / `offsetof`/`sizeof` args is **removed** — that
+restricted form is a `../ROADMAP.md` Tier 1 **deferral**, not a shipped feature.
+`const N: u32 = 256; let buf: [u8; N];` is a **parse error** today (the parser
+has no `constexpr` case and array sizes must be integer literals, not named
+constants). What DOES fold at sema without `constexpr`: `sizeof`/`offsetof`
+(§11.4) fold to `u64` literals; array sizes must be integer literals (§3);
+`switch` case labels must be `try_eval_const_i64`-foldable integer expressions
+(§11.6); enum variant explicit values fold via `try_eval_const_i64`.
+Full const-eval (recursive `constexpr fn`s, `static_assert`, named constants
+as array sizes) is v2 (`../ROADMAP.md` Tier 1).
 
 ### 11.6 `do-while` / `switch` / `defer` (semantics, grammar in
 COMPILER_PIPELINE.md Section 2)
@@ -544,3 +554,112 @@ initialized in a fn (`v3_up()`, `make_config()`).
   general-expr struct arg work (materializing a temp); c3 made a struct global
   readable as that arg's source. Pinned by `aggregate_global_test` probes [4]
   (struct global by-value arg) and [5] (struct global by-value return).
+
+## 13. `match` + `for-each` type rules (2026-07-11)
+
+Two Tier 1 control-flow features shipped 2026-07-11 whose type rules belong
+in the type-system spec (the grammar is in `COMPILER_PIPELINE.md` §2/§2a, the
+lowering is in `CODEGEN_SPEC.md` §17/§18).
+
+### 13.1 `match` subject + pattern type rules
+
+`match (expr) { pattern => body, ... _ => default }` — pattern matching with
+no-fallthrough arms (unlike `switch`). The type rules:
+
+- **Subject type.** The subject `expr` must be an **integer or `bool`** type
+  (`is_int() || is_bool()`). Any other subject type (float, struct, slice,
+  string handle) is a **compile error** ("match subject must be an integer or
+  bool"). This is narrower than `switch`'s rule only in that `match` and
+  `switch` share the same integer-or-bool constraint — neither accepts floats
+  or aggregates as a scrutinee in v1. (Struct destructure patterns are a later
+  refinement; v1 patterns are literals + `_` only.)
+- **Pattern type.** Each non-wildcard pattern must be a **literal constant** —
+  an `IntLit` or a `BoolLit` (sema rejects a non-literal pattern with "match
+  pattern must be a literal constant"). The pattern's type must **match the
+  subject**: either the same type, or both integer (an `i32` pattern against
+  an `i64` subject is accepted since both are `is_int()`; a `bool` pattern
+  against an `i64` subject is a type mismatch). A type mismatch is a compile
+  error ("match pattern type mismatch (match on T, pattern is U)").
+- **Wildcard.** The `_` wildcard arm matches any subject value. At most one
+  `_` arm is allowed (a second is a compile error, "match has more than one
+  `_` wildcard arm"). The wildcard is the default/fall-through arm.
+- **Exhaustiveness.** `match` does **not** guarantee exhaustiveness in v1 — a
+  match with no wildcard and no matching arm falls through to the exit (no-op).
+  A non-exhaustive match is not a compile error (unlike a non-void function
+  missing a return path). The wildcard is the way to guarantee exhaustiveness.
+- **No fallthrough.** Each arm is a separate branch; there is no `break` and no
+  fallthrough-to-next-arm (the body jumps to the match exit). An arm body may
+  be a block (`{ ... }`) or a single statement (`expr;` / `return ...;` / etc.).
+- **Return-path coverage.** `match` does **not** contribute to the
+  return-path-coverage check (§8) — a `match` with all-returning arms does NOT
+  satisfy "every path returns" for the enclosing function, because the match
+  may fall through (no exhaustiveness guarantee). A function ending in a
+  `match` still needs a trailing `return` or an `else`-balanced `if` to satisfy
+  §8. (A future refinement could track exhaustiveness and let an all-returning
+  + wildcard match satisfy §8; v1 does not.)
+
+### 13.2 `for-each` iterable + element type rules
+
+`for (x in slice) { body }` — iterates a slice, binding each element to `x`.
+The type rules:
+
+- **Iterable type.** The iterable expression must be a **slice** `T[]`
+  (`is_slice == true`). Any other iterable type (fixed array, struct, scalar)
+  is a **compile error** ("for-each iterable must be a slice"). v1 for-each is
+  slice-specific; iterating a fixed array directly requires a `arr[..]` view
+  first (the whole-array view produces a slice, §4). The `iterable()`
+  `TypeBuilder` hook for general collection iteration is still deferred.
+- **Element variable type.** `x` gets the slice's **element type** (`T` from
+  `T[]`), declared in a fresh per-iteration scope (the loop body's scope, with
+  `x` declared before the body is checked). `x` is immutable per iteration
+  (reassigning it is allowed but overwritten on the next iteration — it is a
+  regular local, not a `const`).
+- **Loop variable scoping.** `x` is in scope only inside the loop body
+  (pushed/popped scope per `for-each`); it is not visible after the loop.
+  `break`/`continue` inside the body target the for-each (break exits, continue
+  runs the index increment + budget charge then re-tests).
+
+## 14. `map<K,V>` extension API (2026-07-11)
+
+The `map` extension (`extensions/map/`, `ember_ext_map`) ships a `map<K,V>`
+host-store type — an **opaque i64 handle** backed by a host-side
+`std::unordered_map<int64_t,int64_t>`. It is a Tier 0 standard addon
+(`../ROADMAP.md` Tier 0), registered via `register_natives` the same way as
+the other addon extensions (`extensions/README.md`). The handle is a 1-indexed
+slot into a process-wide vector of maps (same pattern as `ext_array`/
+`ext_string`). All ops are bounds-checked + exception-safe (an invalid handle
+returns 0 / is a no-op, not a crash).
+
+**v1 key/value convention.** `K` and `V` are both **`i64`** in v1 (the
+opaque-handle convention). Typed keys/values are a v2 concern. A host that
+needs string keys hashes them to `i64` first (the host's responsibility, not
+the extension's). This keeps the extension a pure `NativeSig` addon with no
+type-system change — `map` is not a script-visible generic type, it is an
+i64 handle with a documented host-side representation.
+
+**API** (all natives take the handle as the first i64 arg, return i64):
+
+| Native | Signature | Behavior |
+|---|---|---|
+| `map_new` | `() -> i64` | Allocate a fresh empty map; returns its handle (1-indexed). |
+| `map_set` | `(i64 h, i64 k, i64 v) -> i64` | Insert/overwrite `k -> v`. Returns 0 (void convention). |
+| `map_get` | `(i64 h, i64 k) -> i64` | Look up `k`; returns the stored value, or **0 if missing** (a missing key and a stored 0 value are indistinguishable — use `map_contains` first if 0 is a meaningful value). |
+| `map_contains` | `(i64 h, i64 k) -> i64` | Returns 1 if `k` is present, 0 otherwise. |
+| `map_length` | `(i64 h) -> i64` | Returns the number of entries. |
+| `map_remove` | `(i64 h, i64 k) -> i64` | Removes `k` if present; returns 0 (void convention). |
+| `map_clear` | `(i64 h) -> i64` | Removes all entries; returns 0 (void convention). |
+
+**Bounds behavior.** An **invalid handle** (0, or a handle not in the store)
+is a no-op for every op: `map_set`/`map_remove`/`map_clear` return 0;
+`map_get` returns 0; `map_contains` returns 0; `map_length` returns 0. A
+**missing key**: `map_get` returns 0 (not a trap); `map_remove` is a no-op;
+`map_contains` returns 0. There is no OOB trap — the only failure mode is the
+0-return for an invalid handle or missing key.
+
+**No operator overloads.** `map` has no `OpOverloadTable` entries (like
+`ext_array`/`ext_sync`/`ext_lifecycle`, it is a method-call-native extension).
+`map` values are passed and returned as plain i64 handles; the host owns the
+storage. See `extensions/map/ext_map.hpp` for the C++ contract +
+`examples/ext_map_test.cpp` for the ctest coverage (registration smoke +
+happy-path set/get/contains/length/remove/clear + bounds: invalid handle,
+missing key).

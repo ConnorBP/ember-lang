@@ -6,26 +6,35 @@ and tree-walking lowering, plus explicitly deferred IR/regalloc design.
 ## 1. Lexer token set
 
 ```
-Literals:   INT_LIT (e.g. 42, 42u, 42i64 - optional type suffix,
-            see Section 6 default-type rule), FLOAT_LIT (e.g. 1.0, 1.0f),
-            STRING_LIT ("..."), BOOL_LIT (true/false)
+Literals:   INT_LIT (e.g. 42 — no integer width suffix; the lexer REJECTS
+            `42u`/`42i64`-style suffixes with "integer literal width suffixes
+            are unsupported; use an explicit `as` cast"), FLOAT_LIT (e.g. 1.0,
+            1.0f — the `f` suffix forces f32), STRING_LIT ("..."),
+            RAW_STRING_LIT (r"""...""" — triple-quoted raw string, no escape
+            processing, may span lines), BOOL_LIT (true/false)
 Identifiers: IDENT
 Keywords:   fn struct global enum if else while do for switch case
-            default break continue return as auto defer const constexpr
+            default break continue return as auto defer const
             link true false bool i8 i16 i32 i64 u8 u16 u32 u64
-            f32 f64 void sizeof offsetof
+            f32 f64 void sizeof offsetof in match
             (v1.0: `enum` + `link`/`switch`/`case`/`default`/`do`/`defer`/
-            `const`/`constexpr`/`sizeof`/`offsetof` were all added as the frontend
+            `const`/`sizeof`/`offsetof`/`in`/`match` were all added as the frontend
             grew past the v0.1 spec this list was written against; see the
             v0.2–v1.0 milestones in `../planning/DESIGN.md`. The `fn` keyword is
             overloaded: a *declaration* (`fn name(...) -> ret`) starts at
             `parse_top`, a *type* (`fn`, in `parse_type`) is the v1.0
             function-handle type — i64 with `is_fn_handle=true`, a bare
-            handle that accepts any fn — see Section 2's `&fn`/`handle(args)`.)
-Punctuation: ( ) { } [ ] , ; : -> . .. ::
+            handle that accepts any fn — see Section 2's `&fn`/`handle(args)`.
+            `constexpr` is a RESERVED keyword: it lexes as `Kw_constexpr` but
+            has NO parser or sema support — using it is a **parse error**. The
+            spec's earlier `constexpr`-works claims (TYPE_SYSTEM §11.5,
+            COMPILER_PIPELINE §6) are removed; the restricted `constexpr` form
+            is a ROADMAP Tier 1 deferral, not a shipped feature. `const`
+            (immutable local/global) DOES ship.)
+Punctuation: ( ) { } [ ] , ; : -> . .. :: =>
             (`::` is the v0.5 cross-module selector `mod::fn` AND the v1.0
             enum-variant access `E::A`; the one-token lookahead split is in
-            Section 2.)
+            Section 2. `=>` is the Tier 1 match-arm separator.)
 Operators:  + - * / % = == != < <= > >= && || ! & | ^ ~ << >> += -=
             *= /= %=  (v1.0: prefix `&` in `parse_unary` is
             function-handle-take `&fn_name`, distinct from the bitwise-AND
@@ -41,13 +50,14 @@ Annotation: @ (starts an annotation, followed by IDENT and optional
 - Comments: `//` line and `/* */` block, stripped by the lexer,
   never reach the parser (no doc-comment/attribute-comment special
   handling in v1).
-- String literals: no escape-sequence processing beyond `\n \t \\ \"`
-  (the minimal set needed for readable script source) - no unicode
-  escapes, no raw strings; a script string literal's bytes are used
-  exactly as the host would want for e.g. an event name or log
-  message, which is the only realistic v1 use case (TYPE_SYSTEM.md Section 6
-  - no runtime string manipulation library in v1, strings are opaque
-  byte slices handed to native functions).
+- String literals: `"..."` supports the minimal escape set `\n \t \\ \"`
+  (no unicode escapes). Raw strings `r"""..."""` (triple-quoted, no escape
+  processing, may span lines) are also supported — the lexer produces a
+  `RawStringLit` token whose `.text` is the raw bytes between the delimiters; a
+  raw string is the way to embed literal newlines/quotes/backslashes without
+  escaping. These are the only two string forms in v1; a script string literal's
+  bytes are used exactly as the host would want for e.g. an event name or log
+  message (TYPE_SYSTEM.md Section 6).
 - Lexer error (invalid character, unterminated string/comment):
   produces one `Diagnostic` (Section 7) and the lexer synchronizes by
   skipping to the next whitespace/statement-terminator-looking
@@ -61,14 +71,21 @@ Annotation: @ (starts an annotation, followed by IDENT and optional
 ## 2. Grammar (informal BNF)
 
 ```
-program      := (annotation* func_decl | struct_decl | global_decl)*
+program      := (annotation* func_decl | struct_decl | enum_decl
+               | global_decl | link_decl | import_decl)*
 
 annotation   := '@' IDENT ('(' (literal (',' literal)*)? ')')?
 
 struct_decl  := 'struct' IDENT '{' field_decl* '}'
 field_decl   := IDENT ':' type ';'
 
-global_decl  := 'global' IDENT ':' type '=' literal ';'
+enum_decl    := 'enum' IDENT '{' (variant (',' variant)* ','?)? '}'   // Tier 1 (Section 2a)
+variant      := IDENT ('=' constexpr_int_expr)?                       // auto-increment from 0 or last explicit value
+
+global_decl  := ('global'|'const') IDENT ':' type '=' expr ';'        // const = immutable global (Section 11.5)
+
+link_decl    := 'link' STRING_LIT ('as' IDENT)? ';'                   // v0.5 cross-module: link "foo.em" as foo; / link "foo" as foo;
+import_decl  := 'import' STRING_LIT ';'                               // parse-time textual inclusion (cycle-detected, deduped)
 
 func_decl    := ('priv')? 'fn' IDENT '(' param_list? ')' ('->' type)? block
 param_list   := param (',' param)*
@@ -85,6 +102,7 @@ param        := IDENT ':' type
 type         := prim_type | IDENT              // IDENT = struct name
                | type '[' INT_LIT ']'          // fixed array
                | type '[' ']'                  // slice
+               | 'fn'                          // Tier 2: bare function-handle type (i64 with is_fn_handle=true)
 prim_type    := 'bool'|'i8'|'i16'|'i32'|'i64'
                |'u8'|'u16'|'u32'|'u64'|'f32'|'f64'|'void'
 
@@ -92,18 +110,22 @@ block        := '{' stmt* '}'
 stmt         := 'let' IDENT (':' type)? '=' expr ';'      // local decl
                | 'const' IDENT ':' type '=' expr ';'       // immutable local
                | 'defer' expr ';'                          // lexical-block-exit LIFO cleanup (Section 6, CODEGEN_SPEC.md Section 13)
-               | 'auto' IDENT '=' expr ';'                 // TYPE_SYSTEM.md Section 9
+               | 'auto' IDENT '=' expr ';'                 // TYPE_SYSTEM.md Section 9 (deprecated)
                | 'if' '(' expr ')' block ('else' (block|stmt))?
                | 'while' '(' expr ')' block
                | 'do' block 'while' '(' expr ')' ';'
-               | 'for' '(' for_init? ';' expr? ';' for_step? ')' block
+               | 'for' '(' for_init? ';' expr? ';' for_step? ')' block   // C-style for
+               | 'for' '(' IDENT 'in' expr ')' block                    // for-each over a slice (Tier 1, Section 2a + CODEGEN_SPEC.md Section 17)
                | 'switch' '(' expr ')' '{' case_clause* '}'    // CODEGEN_SPEC.md Section 12
+               | 'match' '(' expr ')' '{' match_arm* '}'       // Tier 1 pattern match (Section 2a + CODEGEN_SPEC.md Section 18)
                | 'break' ';' | 'continue' ';'
                | 'return' expr? ';'
                | expr ';'                                   // expr-statement (calls, assignments)
                | block                                      // nested scope
 case_clause  := 'case' literal ':' stmt* ('break' ';')?       // break required, no fallthrough (Section 2)
                | 'default' ':' stmt* ('break' ';')?
+match_arm    := (pattern | '_') '=>' (block | stmt) (',')?     // no fallthrough, no break; trailing comma optional (Tier 1)
+pattern      := INT_LIT | BOOL_LIT                            // literal constant; struct destructure + guards are a later refinement
 
 for_init     := 'let' IDENT (':' type)? '=' expr
 for_step     := expr
@@ -124,16 +146,24 @@ mul_expr     := cast_expr (('*'|'/'|'%') cast_expr)*
 cast_expr    := unary_expr ('as' type)*
                | 'sizeof' '(' type ')'
                | 'offsetof' '(' type ',' IDENT ')'
-unary_expr   := ('++'|'--'|'-'|'!'|'~')? postfix_expr      // prefix ++/--; postfix in postfix_expr
-postfix_expr := primary (call_suffix | index_suffix | field_suffix | view_suffix | '++' | '--')*
+unary_expr   := ('++'|'--'|'-'|'!'|'~'|'&')? postfix_expr   // prefix ++/--; prefix '&' is Tier 2 fn-handle-take (Section 2a)
+postfix_expr := primary (call_suffix | index_suffix | field_suffix | enum_access | view_suffix | '++' | '--')*
 call_suffix  := '(' arg_list? ')'
 index_suffix := '[' expr ']'
 field_suffix := '.' IDENT
+enum_access  := '::' IDENT                                   // Tier 1: E::A enum-variant access (value); also the v0.5 mod::fn cross-module selector
 view_suffix  := '[' '.' '.' ']'                              // arr[..] whole-array view, MEMORY_AND_GC.md Section 3
-primary      := INT_LIT | FLOAT_LIT | STRING_LIT | BOOL_LIT
-               | IDENT | '(' expr ')' | struct_literal
+primary      := INT_LIT | FLOAT_LIT | STRING_LIT | RAW_STRING_LIT | BOOL_LIT
+               | IDENT | '(' expr ')' | struct_literal | array_literal
 struct_literal := IDENT '{' (IDENT ':' expr (',' IDENT ':' expr)*)? '}'
+array_literal  := '[' (expr (',' expr)*)? ']'                  // Tier 1: fixed-array or slice literal at PRIMARY position (TYPE_SYSTEM.md Section 12.1)
 ```
+
+`=>` (FatArrow) is the match-arm separator (Tier 1). `::` (ColonColon) is both
+the Tier 1 enum-variant selector `E::A` and the v0.5 cross-module call selector
+`mod::fn` — the one-token lookahead split (Section 2a) keeps `mod::fn(args)` on
+the cross-module call path and `E::A` (second IDENT not followed by `(`) on the
+enum-access path.
 
 Standard C precedence climb, matching TYPE_SYSTEM.md Section 7's operator
 rules exactly (the grammar enforces *syntactic* structure only; the
@@ -167,7 +197,7 @@ a semantic property, not a parseable one).
 ## 3. AST node types (representative, not exhaustive C++ decl)
 
 ```cpp
-struct Program { vector<StructDecl> structs; vector<GlobalDecl> globals; vector<FuncDecl> funcs; };
+struct Program { vector<StructDecl> structs; vector<GlobalDecl> globals; vector<FuncDecl> funcs; vector<EnumDecl> enums; vector<LinkDecl> links; };   // Tier 1 enums + v0.5 link decls live on Program
 struct FuncDecl { string name; vector<Param> params; TypeRef ret; vector<Annotation> annotations; Block body; SourceLoc loc; bool is_exported=true; };  // F1: is_exported=false for `priv fn`
 struct StructDecl { string name; vector<FieldDecl> fields; SourceLoc loc; };
 struct GlobalDecl { string name; TypeRef type; Expr init; SourceLoc loc; };
@@ -177,10 +207,13 @@ struct LetStmt { string name; optional<TypeRef> type; Expr init; bool is_auto; S
 struct IfStmt { Expr cond; Block then_block; optional<variant<Block, unique_ptr<Stmt>>> else_branch; };
 struct WhileStmt { Expr cond; Block body; };
 struct ForStmt { optional<LetStmt> init; optional<Expr> cond; optional<Expr> step; Block body; };
+struct ForEachStmt { string var; Expr iter; Block body; SourceLoc loc; };   // Tier 1: `for (x in slice)` — desugars to a while loop with index + bounds check (CODEGEN_SPEC.md Section 17)
 struct ReturnStmt { optional<Expr> value; };
 struct BreakStmt {}; struct ContinueStmt {};
 struct ExprStmt { Expr value; };
 struct BlockStmt { Block block; };  // nested scope
+struct MatchArm { Expr pattern; bool is_wildcard = false; Block body; };   // Tier 1: one match arm — pattern is a literal constant or `_` (is_wildcard)
+struct MatchStmt { Expr subject; vector<MatchArm> arms; SourceLoc loc; };  // Tier 1: `match (expr) { pat => body, _ => default }` — per-arm branches, no fallthrough (CODEGEN_SPEC.md Section 18)
 
 // expressions - every Expr node carries a SourceLoc and, post-sema,
 // a resolved static Type (filled in during the type-check pass, Section 4 -
@@ -204,12 +237,17 @@ struct ViewExpr    { unique_ptr<Expr> base; };                     // arr[..]
 struct IdentExpr   { string name; };
 struct LiteralExpr { LiteralValue value; };
 struct StructLiteralExpr { string type_name; vector<pair<string,Expr>> fields; };
+struct ArrayLit { vector<Expr> elements; };                            // Tier 1: `[a, b, c]` at PRIMARY position — fixed-array or slice literal (TYPE_SYSTEM.md Section 12.1)
 struct AssignExpr  { unique_ptr<Expr> target; optional<BinOp> compound_op; unique_ptr<Expr> value; };
 ```
 
 (`EnumDecl` + `EnumVariant` — `enum E { A, B, C }` / `variant = constexpr_int` —
-live on `Program` (Tier 1, `src/ast.hpp`); `CallExpr::indirect_target`/
-`is_indirect` and the standalone `FnHandleExpr` node are Tier 2.)
+live on `Program` (Tier 1, `src/ast.hpp`); `LinkDecl` — `link "foo.em" as foo;`
+— lives on `Program` (v0.5, `src/ast.hpp`); `ArrayLit` — `[a, b, c]` — is a
+first-class expression (Tier 1, `src/ast.hpp`, `TYPE_SYSTEM.md` §12.1);
+`ForEachStmt`/`MatchStmt`/`MatchArm` — `for (x in slice)` / `match (e) { pat => body }`
+— are Tier 1 statements (`src/ast.hpp`, `CODEGEN_SPEC.md` §17/§18);
+`CallExpr::indirect_target`/`is_indirect` and the standalone `FnHandleExpr` node are Tier 2.)
 
 ### 2a. New v1.0 surface syntax (Tier 1 enums + Tier 2 function refs)
 
@@ -238,6 +276,28 @@ Tier 2 batch, all verified in `src/parser.cpp`:
 - **`fn` type keyword** (`parse_type`): a bare `fn` is the function-handle
   type — `Prim::I64` with `is_fn_handle=true` (a bare handle that accepts any
   fn). A parameterized `fn(i64)->i64` form is v2+.
+- **`for-each`** (`parse_for`, Tier 1, 2026-07-11): `for (IDENT 'in' expr)
+  block` — detected by `at(Ident) && peek(1).kind == Kw_in` inside the `for`
+  paren. Builds a `ForEachStmt { var, iter, body }`. The iterable must be a
+  slice `T[]` (sema rejects non-slice); `var` gets the element type. Lowers to
+  a while-loop-with-indexing over the slice's `{ptr, len}` (`CODEGEN_SPEC.md`
+  §17). The IR backend marks a function using for-each as `non_serializable`
+  (falls back to the tree-walker). See `TYPE_SYSTEM.md` §13 + `ROADMAP.md`
+  Tier 1.
+- **`match`** (`parse_stmt` `Kw_match` case, Tier 1, 2026-07-11):
+  `match (expr) '{' (pattern | '_') '=>' (block | stmt) (',')? '}'` — builds a
+  `MatchStmt { subject, arms }` where each `MatchArm` is `{ pattern, is_wildcard,
+  body }`. Patterns are `IntLit`/`BoolLit` literals (sema rejects non-literal
+  patterns); `_` is the wildcard (at most one, sema rejects a second). Each arm
+  is a separate branch with no fallthrough and no `break` (the body jumps to the
+  exit). `=>` is the `FatArrow` token. Lowers to a per-arm compare-and-branch
+  cascade (`CODEGEN_SPEC.md` §18). The subject must be an integer or bool
+  (`TYPE_SYSTEM.md` §13). The IR backend marks a function using match as
+  `non_serializable` (falls back to the tree-walker). See `ROADMAP.md` Tier 1.
+- **Array literals** (`parse_primary` `[` case, Tier 1): `[` at **primary**
+  position constructs an `ArrayLit` (distinct from the postfix `[` index/view
+  operator); `[a, b, c]` is a fixed-array or slice literal depending on the
+  declared target type (`TYPE_SYSTEM.md` §12.1).
 
 Sema: `EnumAccessExpr` is rewritten **in place** to an `IntLit` (value i32,
 sign-extended into the `IntLit`'s i64 `v` field) by `lower_enum_access_expr`
@@ -353,7 +413,10 @@ succeeded)
      annotation to `NativeSig` so C3 can distinguish copying natives from
      retaining ones). See `../../demo/SLICE_ESCAPE_SAFETY_INVESTIGATION.md`
      for the 5-category escape matrix.
-   - Index-expression unsigned-type check (TYPE_SYSTEM.md Section 7).
+   - Index-expression integer-type check (TYPE_SYSTEM.md Section 7 — the
+     implementation accepts any signed or unsigned integer index, not
+     unsigned-only; the spec's "unsigned index" claim is relaxed to match).
+     A constant index into a fixed array is bounds-checked at compile time.
    - Annotation argument grammar check (TYPE_SYSTEM.md Section 10 - literals
      only, no identifiers/expressions).
    - `PERM_FFI` gating check on every native call site
@@ -562,17 +625,19 @@ struct IrFunction {
   existing string handles use `string_identity`. Concatenation is lowered via
   the registered string `+` overload. `__fstring_to_string` is not a native
   API and no `__fmt` native exists.
-- **`const`/`constexpr` locals**: `const x: T = expr;` lowers like
+- **`const` locals**: `const x: T = expr;` lowers like
   an ordinary local whose `StoreFrameSlot` happens once and whose
   subsequent assignment is rejected at sema (compile error, not a
   runtime check - `const`-ness is purely a sema-level property, zero
   runtime cost, the storage is identical to a `let` local).
-  `constexpr` (when used as an array size, `offsetof`/`sizeof` arg,
-  or `switch` case label) is **folded at sema** to a literal - v1
-  `constexpr` expressions are restricted to literals, `sizeof`/
-  `offsetof`, and integer arithmetic on other `constexpr` values; no
-  function calls, no full const-eval interpreter (`../ROADMAP.md` Tier 1
-  for the broadened version).
+  `constexpr` is a RESERVED keyword with NO parser/sema support (Section 1):
+  using it is a **parse error**. The earlier spec claim that `constexpr`
+  folds at sema for array sizes / `offsetof`/`sizeof` args / `switch` case
+  labels is removed — that form is a ROADMAP Tier 1 deferral, not a shipped
+  feature. (`sizeof`/`offsetof` DO fold at sema to literals; array sizes must
+  be integer literals; `switch` case labels must be `try_eval_const_i64`-
+  foldable integer expressions — none of these require the `constexpr`
+  keyword.)
 
 ## 7. Error reporting
 

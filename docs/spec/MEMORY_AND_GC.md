@@ -15,6 +15,11 @@ exactly one of these)
    handed a `slice`/struct pointer into via a native call return or a
    host-mapped struct field (TYPE_SYSTEM.md Section 4). Lifetime is entirely
    the host's responsibility; ember never frees it, never tracks it.
+   **Extension-owned handles** (`array`/`string`/`map`/`vec`/`quat`/`mat`/
+   `sync`/`lifecycle`) are also in this category: an opaque i64 handle indexes
+   into a host-side vector (e.g. `std::string` for the `string` extension), the
+   host owns the storage, and `reset()` clears the store between runs. The
+   owned `string` handle (Section 6) is the canonical example.
 3. **Module-global storage** - supported scalar/handle `global` variables,
    one fixed block per compiled/loaded module. It is independent of individual
    function pages and is unchanged by the shipped single-function reload.
@@ -178,28 +183,58 @@ void  arena_reset(Arena*, size_t mark = 0);            // rewind offset, invalid
 
 ## 6. String representation
 
-Strings are `slice<u8>` (TYPE_SYSTEM.md Section 1/Section 4) - no distinct `string`
-type, no owned/heap string type in v1. A string literal in script
-source (`"hello"`) is emitted as a `RipFixup`-referenced rodata blob
-(CODEGEN_SPEC.md Section 4) embedded in the *literal's containing function's*
-compiled code - i.e. string literals are function-local rodata, valid
-for exactly as long as that function's code page is alive (which, per
-../HOT_RELOAD.md Section 5's guarded epoch retirement is at least as long as any
-in-flight outer call that could execute that function version - so a literal's lifetime
-is never shorter than any code that could reference it). A slice
-value derived from a literal follows the same "cannot escape via
-return/global-store from a *different* code page than the one holding
-the literal" concern as Section 3 - but since the literal's rodata lives in
-the *same* code page as the function using it, and returning that
-slice value from the function is fine (it's not escaping the code
-page, just the frame - the underlying bytes live exactly as long as
-the code that returns them), a literal-derived slice is **not** subject
-to Section 3's dangling-check on the unencrypted path; only
-locally-computed `arr[..]` views of stack data are.
+There are **two** string representations in v1:
 
-There are now **two** string-literal lowering paths (the 2026-07-10
-inline-stack-XOR string-encryption lowering, commit `e98dc87`; see
-`../ROADMAP.md` "Runtime string encryption — DONE"):
+1. **`slice<u8>` (the literal / view form).** A string literal in script
+   source (`"hello"` or a raw `r"""..."""`) is a `slice<u8>` — a two-word
+   `{ptr, len}` value (TYPE_SYSTEM.md Section 1/Section 4). No distinct
+   compile-time `string` type for this form; it IS `slice<u8>`. String literals
+   are emitted as a `RipFixup`-referenced rodata blob (CODEGEN_SPEC.md Section 4)
+   embedded in the *literal's containing function's* compiled code - i.e. string
+   literals are function-local rodata, valid for exactly as long as that
+   function's code page is alive (which, per ../HOT_RELOAD.md Section 5's guarded
+   epoch retirement is at least as long as any in-flight outer call that could
+   execute that function version - so a literal's lifetime is never shorter than
+   any code that could reference it). A slice value derived from a literal
+   follows the same "cannot escape via return/global-store from a *different*
+   code page than the one holding the literal" concern as Section 3 - but since
+   the literal's rodata lives in the *same* code page as the function using it,
+   and returning that slice value from the function is fine (it's not escaping
+   the code page, just the frame - the underlying bytes live exactly as long as
+   the code that returns them), a literal-derived slice is **not** subject to
+   Section 3's dangling-check on the unencrypted path; only locally-computed
+   `arr[..]` views of stack data are.
+
+2. **The owned `string` handle (the extension form).** The `string` extension
+   (`extensions/string/`, `ember_ext_string`) ships a **mutable, owned `string`
+   host-store type** — an **opaque i64 handle** backed by a host-side
+   `std::string` (1-indexed slot into a process-wide vector of strings, same
+   pattern as `ext_array`/`ext_map`). This IS a distinct type from `slice<u8>`:
+   it owns its storage (the host owns the `std::string`, the handle is the
+   reference), it survives across calls/frames (the host store is
+   process-scoped, not frame-scoped), and it supports mutation + concatenation
+   (`Add`/`Eq` operator overloads) + the `from_slice`/`from_i64`/`from_f32`/
+   `from_f64`/`from_bool`/`identity`/`length`/`char_at`/`find`/`substr` natives.
+   The f-string pipeline (TYPE_SYSTEM.md §11.7) lowers through
+   `__fstring_to_string` to these `string_from_*` natives and produces an owned
+   `string` handle as the result. A `string` handle is in ownership category 2
+   (host-owned, script-referenced) — the host allocates and owns the
+   `std::string`; script holds the i64 handle. The handle is not a GC object
+   (the host store is a vector indexed by handle; `reset()` clears it between
+   runs for determinism). See `extensions/README.md` + `extensions/string/` +
+   `TYPE_SYSTEM.md` §11.7.
+
+The earlier spec claim "no distinct `string` type, no owned/heap string type in
+v1" is **superseded**: the owned `string` handle ships as an extension type
+(category 2, host-owned). The `slice<u8>` literal/view form (category 1 or
+rodata-derived) still exists and is the compile-time representation of string
+literals; the two are siblings, not the same thing. (A raw `slice<u8>` literal
+that needs to outlive the expression is copied into an owned `string` handle
+via `string_from_slice` — the handle owns the only persistent copy.)
+
+There are now **two** string-literal lowering paths for the `slice<u8>` form
+(the 2026-07-10 inline-stack-XOR string-encryption lowering, commit `e98dc87`;
+see `../ROADMAP.md` "Runtime string encryption — DONE"):
 - **Unencrypted path (`Program::string_xor_key == 0`):** the literal's
   bytes are function-local rodata as described above - a raw rodata
   pointer, lifetime = the code page. A `slice<u8>` derived from it is

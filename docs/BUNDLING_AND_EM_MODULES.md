@@ -445,6 +445,163 @@ and validates the complete file before publication:
 `memcpy` + two pointer writes per function. This is the design's
 core payoff.
 
+### 2.5.2 Version 5 — IR `.em` (Stage B, IL-`.em`)
+
+**Status: shipped (Stage A + Stage B, 2026-07-10).** The thin three-address IR
+backend (Stage A, `COMPILER_PIPELINE.md` §5's Stage-A note + `CODEGEN_SPEC.md`
+§5's Stage-A note) produces a serializable `ThinFunction` per script function.
+Stage B ships the v5 `.em` format that carries that IR on disk instead of raw
+x86. The on-disk contract is `src/em_file.hpp` (the `EM_VERSION_V5` constant +
+the v5 per-function record + the SECURITY MODEL block) and `src/thin_ir_ser.hpp`
+(the `ir_blob` codec — `serialize_thin_function` / `deserialize_thin_function` /
+`validate_thin_function`).
+
+**What v5 changes (additive, per-function only).** The 40-byte header, the
+globals block, and the name directory (export table) are **byte-identical** to
+v3/v4; only the per-function record is redesigned. Each per-function record
+now begins with an **`is_ir` byte** that selects between two body shapes:
+
+```
+v5 per-function record (header version=5):
+  name_len        : u16
+  name            : bytes[name_len]   (UTF-8, no NUL)
+  slot_index      : u32
+  is_ir           : u8   (1 = IR function; 0 = raw-x86 fallback)
+  signature       : canonical export signature (SAME encoding as v2+:
+                    emit_type(ret) + u32 param_count + emit_type per param)
+  if is_ir == 1:  // IR function — carries IR, NOT machine code
+    ir_blob_len   : u32
+    ir_blob       : bytes[ir_blob_len]  (OPAQUE to the .em container =
+                    serialize_thin_function output; parsed ONLY by the IR
+                    deserializer, never by the .em loader). NO
+                    code/rodata/relocs/native_bindings fields follow.
+  if is_ir == 0:  // raw-x86 fallback (byte-identical to the v4 per-fn body
+                  // AFTER the is_ir byte; the signature was hoisted above
+                  // the branch in v5):
+    code_size     : u32, rodata_size : u32, code : bytes, rodata : bytes,
+    reloc_count   : u32, relocs[reloc_count] { offset:u32, kind:u8, addend:u32 },
+    native_binding_count : u32, native_bindings (SAME as v2+)
+```
+
+A v5 module may **mix** IR and raw-x86 functions per-function ("mixed mode"):
+IR-serializable functions ship IR; non-serializable functions — aggregate,
+string, struct, or defer gaps flagged by `ThinFunction::non_serializable` —
+ship raw x86. On disk the `is_ir` byte is derived as `!ir_blob.empty()`. The
+additive design means a v4 reader that ignored trailing bytes would reject a
+v5 file as corrupt (the `is_ir` byte and the hoisted signature shift the
+record) rather than misread it — no silent misparse.
+
+**The `ir_blob` record.** The blob is **opaque to the `.em` container**: `em_writer.cpp`
+writes it as raw bytes (`ir_blob_len` + `ir_blob`) and `em_loader.cpp` reads it
+as raw bytes, then hands it to the IR deserializer. The `.em` layer never parses
+inside the blob. The blob's own format (little-endian, self-contained,
+counts-up-front) is pinned in `src/thin_ir_ser.hpp`:
+
+```
+ir_blob format:
+  Header:
+    ir_magic     : u32 = 0x4952464E ("IRFN") — reject garbage immediately
+    ir_version   : u16 = 1           — IR serialization format version
+    slot         : i32               — dispatch slot
+    max_vreg     : u32               — highest VReg+1; all VReg refs < this
+    num_blocks   : u16 (<= 65535)
+    has_ret_type : u8                — 0=nullptr, 1=type follows
+    [ret_type    : canonical type via emit_type/parse_type if has_ret_type]
+  Frame plan:
+    frame_size, rbx_save_offset, struct_ret_ptr_offset,
+      arg_temps_base, next_local_off  : 5×i32
+    returns_struct_by_ptr : u8
+    num_params            : u16 (<= 1024)
+    per param: name_len:u16, name, has_type:u8, [type], off:i32, word0:i32, nwords:i32
+    num_native_fixup_names : u16 (<= 1024)
+    per name: name_len:u16, name
+  Rodata:
+    rodata_len  : u32 (checked <= remaining blob)
+    rodata      : bytes[rodata_len]
+  Blocks (repeated num_blocks times):
+    block_id    : u32
+    num_instrs  : u16 (<= 65535)
+    per instr:
+      op        : u16 (validated against the ThinOp enum range — STABLE,
+                  serialized VERBATIM; new ops append at the END only)
+      dst,src1,src2 : 3×u32 (< max_vreg or 0)
+      imm_i     : i64
+      imm_f     : f64 (raw 8 bytes)
+      meta: frame_off/width/len/slot/mod_id/field_off : 6×i32,
+            base_kind:u8 (validated against AbsFixup::Kind range),
+            addend:u32, native_name_len:u16 + native_name,
+            has_type:u8 + [type], cmp/is_unsigned/is_f32/trap_reason : 4×u8
+      num_args  : u8 (<= 255), args : u32[num_args]
+      num_arg_frame_offs : u8, arg_frame_offs : i32[num_arg_frame_offs]
+      num_arg_types      : u8, arg_types      : per has_type:u8 + [type]
+      has_ret_type       : u8, [ret_type]
+      loc_line : u32, loc_col : u32
+    terminator:
+      term_kind : u8 (validated against TermKind enum range)
+      cond, target, false_target, ret : 4×u32
+      trap_reason : u8
+```
+
+The serialization boundary (`thin_ir.hpp` pins this): `ThinOp` is a stable
+`uint16_t` enum serialized verbatim. The only raw-pointer fields in the IR are
+**not** serialized as pointers — `ThinInstr::native_fn` is dropped (the symbolic
+binding is carried by `meta.native_name`; the loader rebinds `native_fn` at load
+time by looking up the name in the host native table, never by reverse-mapping a
+pointer), and every `const Type*` field is encoded via `em_type_codec`'s
+`emit_type`/`parse_type` (canonical `Prim` + `struct_name` + `is_slice` +
+`array_len` + `elem` chain), each prefixed by a `has_type:u8`. `abs_fixups` is
+**not** serialized — it is populated by `emit_x64` at load time (the re-emit
+produces the same `AbsFixup` list the tree-walker would). `rodata` IS serialized
+(function-local string-literal bytes).
+
+**Re-emit-at-load security model.** This is the core v5 security property and
+the reason v5 exists. A v5 `.em` carries **IR, not machine code**. The load
+path for an `is_ir == 1` function is:
+
+1. **Deserialize** the `ir_blob` via `deserialize_thin_function` (structural
+   validation only: magic `"IRFN"`, `ir_version`, count bounds, cursor bounds,
+   `ThinOp` range, `TermKind` range, `base_kind` range, canonical-type shape).
+   Every count is checked against a hard maximum **before** the corresponding
+   resize/reserve; all cursor arithmetic uses `uint64_t` for `avail = end - cur`
+   with `n > avail` (no `uint32_t` addition that can wrap); no exceptions escape
+   the deserializer — it returns `false` + error on any structural failure.
+2. **Rebind natives by name.** The loader looks up each `meta.native_name` in
+   the host native table and sets `native_fn`. An unknown name is a **load
+   error** (the core v5 security gate — a tampered blob naming a native the
+   host did not register is rejected here, before any x64 exists).
+3. **Semantically validate** via `validate_thin_function` (block-id bounds,
+   block 0 is entry, every block has a terminator, block-target bounds,
+   terminator shape consistency, VReg bounds, rodata bounds, `CallScript` slot
+   < dispatch size, `CallCrossModule` mod_id < registry size, cmp predicate in
+   `[0,5]`, `CallNative` has a non-empty name, frame-plan sanity).
+4. **Re-emit x64** via `emit_x64` (`src/thin_emit.hpp`) — the loader IS a
+   codegen for the IR path, producing the same x64 the tree-walker would.
+5. **Only then** `alloc_executable_rw` + patch relocations (the `abs_fixups`
+   `emit_x64` just produced) + `seal_executable` (RW→RX W^X).
+
+The load-bearing invariant: **deserialize → validate → re-emit happens BEFORE
+`alloc_executable_rw`**, so a tampered or malformed v5 `.em` is **rejected at IR
+validation with no executable page allocated**. This is the defense-in-depth the
+F2 audit's "secondary" option named: a malicious input must survive structural +
+semantic validation before any x64 is emitted, and the emitted x64 is produced
+by the host's own `emit_x64` from validated IR (not `memcpy`'d from the file).
+The reduction is "malicious x64 bytes → malicious IR that must survive type /
+structure validation before becoming x64," not "malicious input → no native
+execution" — a valid-but-malicious IR that passes validation still lowers to x64
+that runs with host privileges. The raw-x86 fallback (`is_ir == 0`) is the v4
+per-function body and does NOT get this re-emit protection.
+
+**Signing and v5.** v5 is **unsigned** for Stage B (no Ed25519 signature block)
+— the v3 "trailing bytes == 0" rule still holds. A v5 module is not routed
+through the v4 Ed25519 verification path (the loader checks `version == 4` for
+the signed path; v5 falls into the unsigned branch). In signed-only mode
+(non-empty keyring) the entire v5 module is rejected; in dev mode the raw-x86
+fallback is accepted without signature verification (same as v3). A **v5-signed
+variant** (v5 layout + the additive Ed25519 block) is explicitly **future work**
+that would give the raw-x86 fallback v4-level content authentication; do not
+implement it in Stage B. `EM_VERSION` stays 4 (the default writer version); v5
+is off-by-default and inert until a v5 writer/loader code path is selected.
+
 ### 2.6 Host API + CLI
 
 - Source compilation is assembled from the public lexer/parser/sema/codegen
@@ -527,8 +684,8 @@ Mirrors secure-boot: keys present == signed-only; keys absent == unsigned dev OK
 ### 2.7 Versioning and forward-compat
 
 - The writer emits version 4 (signed, via `write_em_file_signed`) or version 3
-  (unsigned, via `write_em_file`). The loader accepts exactly v1, v2, v3, and
-  v4 and rejects other versions outright (no guessing). Bumping the
+  (unsigned, via `write_em_file`). The loader accepts exactly v1, v2, v3, v4,
+  and v5 and rejects other versions outright (no guessing). Bumping the
   version on any format change is mandatory - a `.em` is a
   de-facto ABI, and silent misreads are worse than loud rejects.
 - v4 (F2, docs/spec/SPEC_AUDIT_2026-07-10.md F2) is v3 layout + an additive
@@ -537,6 +694,15 @@ Mirrors secure-boot: keys present == signed-only; keys absent == unsigned dev OK
   is self-describing (a `sig_magic` "EMSG" sentinel + a `payload_len` the loader
   cross-checks against the name-directory end), so a v3 reader that ignored
   trailing bytes would still reject a v4 file as corrupt rather than misread it.
+- v5 (Stage B, IL-`.em`, §2.5.2 above) redesigns only the per-function record
+  (the `is_ir` byte + the hoisted signature + the `ir_blob` / raw-x86 branch);
+  the 40-byte header, globals block, and name directory are byte-identical to
+  v3/v4. v5 is unsigned for Stage B (no Ed25519 block; the "trailing bytes == 0"
+  rule holds). The `is_ir` byte + the hoisted signature shift the per-fn record,
+  so a v4 reader that ignored trailing bytes would reject a v5 file as corrupt
+  rather than misread it. See `src/em_file.hpp` (`EM_VERSION_V5` + the v5
+  per-function record + the SECURITY MODEL block) and `src/thin_ir_ser.hpp`
+  (the `ir_blob` codec).
 - The `flags` field reserves bit 0 for "embeds source" (future
   reload-from-`.em`) and leaves the rest zero. Unused bits are not
   repurposed without a version bump.
@@ -555,6 +721,17 @@ Mirrors secure-boot: keys present == signed-only; keys absent == unsigned dev OK
 3. **Live modules:** implemented by `ModuleRegistry`, kind-2 relocations,
    `module_linker.hpp`, and the `link` grammar. JIT and loaded modules share the
    same export and dispatch model.
+4. **v5 IR `.em` (Stage B, IL-`.em`):** the thin three-address IR backend
+   (Stage A, `src/thin_ir.{hpp,cpp}` / `src/thin_lower.{hpp,cpp}` /
+   `src/thin_emit.{hpp,cpp}`) produces a serializable `ThinFunction`; the v5
+   `.em` format (`src/em_file.hpp` `EM_VERSION_V5` + the v5 per-function record)
+   carries that IR on disk via the `is_ir` byte + the `ir_blob` record; the
+   `ir_blob` codec is `src/thin_ir_ser.{hpp,cpp}`
+   (`serialize_thin_function` / `deserialize_thin_function` /
+   `validate_thin_function`). The loader deserializes + validates + re-emits the
+   IR to x64 via `emit_x64` BEFORE `alloc_executable_rw` (§2.5.2, the re-emit-
+   at-load security model). `EM_VERSION` stays 4 (the default writer version);
+   v5 is the Stage-B contract.
 
 ---
 
