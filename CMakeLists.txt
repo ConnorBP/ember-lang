@@ -508,6 +508,31 @@ if(WIN32)
 endif()
 add_test(NAME codegen_opt COMMAND codegen_opt_test)
 
+# thin_ir_test - Stage A c5 (IL-.em): the IR-backend CORRECTNESS GATE. Models
+# the Stage 1 gate (codegen_opt_test): a compile(src, ir_on, ...) helper that
+# runs the full pipeline with CodeGenCtx::enable_ir_backend set, captures
+# main's pre-finalize bytes, finalizes, installs the dispatch table; a
+# call0_i64 / call_i64_i64_i64 caller; the ck() assertion macro. Three
+# assertion classes: (1) flags-OFF = byte-identical (the flag is inert when
+# off — the default tree-walker path is unchanged); (2) flags-ON =
+# value-equivalent (compile each corpus source both ways, call main, assert
+# identical i64 returns — covers int arith/overflow, comparisons, short-
+# circuit, control flow, break/continue, recursion, script + native calls,
+# slices, structs, strings, defer, cast, ternary); (3) the flag actually runs
+# (ir-on bytes differ from off; lower_function produces a non-empty
+# ThinFunction). Links the SIX standard extensions (vec quat mat string array
+# math) so the corpus can use array/string/math natives, matching sema_check's
+# link line. The flag is default-off everywhere (ember_cli + engine helpers do
+# NOT set it), so the lang suite is unaffected and stays 268/0/0.
+add_executable(thin_ir_test examples/thin_ir_test.cpp)
+target_link_libraries(thin_ir_test PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_vec ember_ext_quat ember_ext_mat ember_ext_string ember_ext_array ember_ext_math)
+if(WIN32)
+    target_link_libraries(thin_ir_test PRIVATE kernel32)
+endif()
+add_test(NAME thin_ir COMMAND thin_ir_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 # thin_ir_struct_test - Stage A c1 (IL-.em): pins the thin three-address IR
 # data-structure CONTRACT that the lowering (c2) and the emit (c3) will
 # independently implement against. Builds a small fib-shaped ThinFunction BY
@@ -541,5 +566,5 @@ add_test(NAME aggregate_global COMMAND aggregate_global_test)
 
 set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
     v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
-    array_lit aggregate_global em_signed codegen_opt thin_ir_struct
+    array_lit aggregate_global em_signed codegen_opt thin_ir_struct thin_ir
     PROPERTIES TIMEOUT 30)

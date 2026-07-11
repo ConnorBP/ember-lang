@@ -459,6 +459,57 @@ struct ThinLowerer {
         if (auto* al = dynamic_cast<const ArrayLit*>(&ex)) { for (auto& el : al->elements) count_str_temps_expr(*el, total); return; }
     }
 
+    // Count short-circuit (&&/||) result temps: one 8-byte bool frame slot per
+    // LAnd/LOr BinExpr (the IR lowering's join-block result vreg must be frame-
+    // backed; see the logical-temp note in the frame-plan computation). Recurses
+    // into every expr/stmt shape that can contain a BinExpr (the same shapes the
+    // other count_*_temps walkers cover).
+    void count_logical_temps_block(const Block& b, int32_t& total) { for (auto& s : b.stmts) count_logical_temps_stmt(*s, total); }
+    void count_logical_temps_stmt(const Stmt& s, int32_t& total) {
+        if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_logical_temps_expr(*ls->init, total); return; }
+        if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_logical_temps_expr(*es->expr, total); return; }
+        if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) { if (rs->value) count_logical_temps_expr(*rs->value, total); return; }
+        if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) { count_logical_temps_expr(*ds->expr, total); return; }
+        if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
+            count_logical_temps_expr(*is->cond, total); count_logical_temps_block(is->then_b, total);
+            if (is->has_else) count_logical_temps_block(is->else_b, total); return;
+        }
+        if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_logical_temps_expr(*ws->cond, total); count_logical_temps_block(ws->body, total); return; }
+        if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_logical_temps_block(ds->body, total); count_logical_temps_expr(*ds->cond, total); return; }
+        if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
+            if (fs->init) count_logical_temps_stmt(*fs->init, total);
+            if (fs->cond) count_logical_temps_expr(*fs->cond, total);
+            if (fs->step) count_logical_temps_expr(*fs->step, total);
+            count_logical_temps_block(fs->body, total); return;
+        }
+        if (auto* bs = dynamic_cast<const BlockStmt*>(&s)) { count_logical_temps_block(bs->block, total); return; }
+        if (auto* sw = dynamic_cast<const SwitchStmt*>(&s)) {
+            count_logical_temps_expr(*sw->subject, total);
+            for (auto& c : sw->cases) count_logical_temps_block(c.body, total);
+            return;
+        }
+    }
+    void count_logical_temps_expr(const Expr& ex, int32_t& total) {
+        if (auto* b = dynamic_cast<const BinExpr*>(&ex)) {
+            if (b->op == BinExpr::Op::LAnd || b->op == BinExpr::Op::LOr) total += 8;
+            count_logical_temps_expr(*b->lhs, total); count_logical_temps_expr(*b->rhs, total); return;
+        }
+        if (auto* c = dynamic_cast<const CallExpr*>(&ex)) {
+            if (c->receiver) count_logical_temps_expr(*c->receiver, total);
+            for (auto& a : c->args) count_logical_temps_expr(*a, total);
+            return;
+        }
+        if (auto* u = dynamic_cast<const UnaryExpr*>(&ex)) { count_logical_temps_expr(*u->operand, total); return; }
+        if (auto* c = dynamic_cast<const CastExpr*>(&ex)) { count_logical_temps_expr(*c->operand, total); return; }
+        if (auto* t = dynamic_cast<const TernaryExpr*>(&ex)) { count_logical_temps_expr(*t->cond, total); count_logical_temps_expr(*t->then_e, total); count_logical_temps_expr(*t->else_e, total); return; }
+        if (auto* a = dynamic_cast<const AssignExpr*>(&ex)) { if (a->target) count_logical_temps_expr(*a->target, total); count_logical_temps_expr(*a->value, total); return; }
+        if (auto* ix = dynamic_cast<const IndexExpr*>(&ex)) { count_logical_temps_expr(*ix->base, total); count_logical_temps_expr(*ix->index, total); return; }
+        if (auto* fx = dynamic_cast<const FieldExpr*>(&ex)) { count_logical_temps_expr(*fx->base, total); return; }
+        if (auto* v = dynamic_cast<const ViewExpr*>(&ex)) { count_logical_temps_expr(*v->base, total); return; }
+        if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) count_logical_temps_expr(*kv.second, total); return; }
+        if (auto* al = dynamic_cast<const ArrayLit*>(&ex)) { for (auto& el : al->elements) count_logical_temps_expr(*el, total); return; }
+    }
+
     void collect_defers(const Block& b) {
         for (auto& s : b.stmts) {
             if (auto* ds = dynamic_cast<const DeferStmt*>(s.get())) {
@@ -922,6 +973,15 @@ struct ThinLowerer {
         int32_t struct_temp_bytes = 0; count_struct_temps_block(f.body, struct_temp_bytes); locals_area += struct_temp_bytes;
         int32_t arr_temp_bytes = 0;    count_arr_temps_block(f.body, arr_temp_bytes);       locals_area += arr_temp_bytes;
         int32_t str_temp_bytes = 0;    count_str_temps_block(f.body, str_temp_bytes);       locals_area += str_temp_bytes;
+        // Short-circuit (&&/||) result temps: the IR lowering materializes the
+        // 0/1 result into a FRAME-BACKED vreg (defined in the false/true blocks,
+        // joined in the end block). A join-block vreg MUST be frame-backed (the
+        // emit's in-rax model is unsound across a join when an intervening instr
+        // clobbers rax), so the lowering allocates a bool temp per &&/||. The
+        // tree-walker needs no such temp (it keeps the result in rax inline), so
+        // this is an IR-path-only 8 bytes per &&/|| — value-equivalent, not
+        // byte-identical (the Stage-A contract).
+        int32_t logical_temp_bytes = 0; count_logical_temps_block(f.body, logical_temp_bytes); locals_area += logical_temp_bytes;
 
         collect_defers(f.body);
         locals_area += int32_t(defer_sites.size()) * 8;
@@ -992,6 +1052,97 @@ struct ThinLowerer {
             // run remaining cleanups through depth 0, then return void
             emit_cleanups_to(0, f.loc);
             set_term_return(0);
+        }
+
+        // ── Post-lowering vreg spill pass (the IR-emit correctness fix) ──
+        // The emit's vreg-materialization model is "a VReg is either frame-backed
+        // (reloadable from its frame slot) or the current rax_vreg". A producing
+        // instr that leaves its dst in rax but does NOT spill to a frame slot is
+        // only reloadable while rax_vreg still points at it — once any later instr
+        // (e.g. the LHS load of an outer BinExpr, or the `0` literal of an
+        // if-compare) clobbers rax, the dst is GONE and load_int_vreg's best-effort
+        // path silently reuses the stale rax (a wrong value). This breaks nested
+        // expressions (`a + b * c`), if/while conditions on computed bools, and
+        // short-circuit joins.
+        //
+        // Fix: give every PLAIN scalar/float intermediate-result vreg a frame
+        // slot (8 bytes) so it is always reloadable. We walk the lowered blocks
+        // and, for each producing instr whose dst is a plain scalar/float (NOT a
+        // slice — slice vregs use dst+1 and 16-byte slots handled at their own
+        // emit sites; NOT a struct — structs are frame slots not vregs; NOT
+        // already frame-backed — LoadFrame/ConstInt-with-frame_off/etc. keep
+        // their existing slot), assign a fresh 8-byte frame slot in meta.frame_off.
+        // Then recompute frame_size so the prologue reserves room for the spill
+        // slots. This makes the emit spill every intermediate result and reload
+        // it on use — value-equivalent (the tree-walker computes the same value
+        // inline in rax; spilling+reloading just makes it durable across rax
+        // clobbers). NOT byte-identical (the Stage-A contract is value-equiv).
+        //
+        // Scope is deliberately conservative: only plain scalar/float results
+        // (ConstInt/ConstFloat/ConstBool, Move, int arith, float arith, Cmp,
+        // Cast, scalar-returning calls). Slice/struct/address producers keep
+        // their existing frame handling (slice dsts use dst+1; addresses are
+        // consumed immediately by a following load/store). Spill slots go BELOW
+        // the arg-temps area (which sits at -(locals_area+8) ..
+        // -(locals_area+8+arg_temps_area)), so they never collide with a named
+        // local, a temp, or an arg temp. Base = locals_area + arg_temps_area;
+        // each spill slot grows downward from there.
+        int32_t spill_base = locals_area + arg_temps_area;
+        int32_t spill_top = spill_base;
+        // Assign spill slots per-VREG (not per-instr): a vreg defined in multiple
+        // blocks (a join — ternary/short-circuit result) MUST share one frame
+        // slot across all its defs, or load_int_vreg would read the wrong slot at
+        // the join. Map each dst vreg to its slot the first time we see it; reuse
+        // the same slot for every subsequent def of that vreg.
+        std::unordered_map<VReg, int32_t> vreg_spill_slot;
+        auto is_plain_scalar_dst = [&](const ThinInstr& in) -> bool {
+            if (in.dst == 0) return false;
+            if (in.meta.frame_off != 0) return false;  // already frame-backed
+            switch (in.op) {
+            case ThinOp::ConstInt: case ThinOp::ConstFloat: case ThinOp::ConstBool:
+            case ThinOp::Move:
+            case ThinOp::Add: case ThinOp::Sub: case ThinOp::Mul: case ThinOp::Div:
+            case ThinOp::Mod: case ThinOp::And: case ThinOp::Or: case ThinOp::Xor:
+            case ThinOp::Shl: case ThinOp::Shr: case ThinOp::Neg: case ThinOp::Not:
+            case ThinOp::BitNot:
+            case ThinOp::FAdd: case ThinOp::FSub: case ThinOp::FMul: case ThinOp::FDiv:
+            case ThinOp::FMod:
+            case ThinOp::Cmp: case ThinOp::Cast:
+                // exclude slice-typed results (rare for these ops, but guard):
+                if (in.meta.type && in.meta.type->is_slice) return false;
+                return true;
+            case ThinOp::CallNative: case ThinOp::CallScript:
+            case ThinOp::CallIndirect: case ThinOp::CallCrossModule:
+                // only scalar/float returns (not slice/struct/void)
+                if (in.ret_type && !in.ret_type->is_slice &&
+                    in.ret_type->struct_name.empty() && !in.ret_type->is_void())
+                    return true;
+                return false;
+            default:
+                return false;
+            }
+        };
+        for (auto& blk : out.blocks) {
+            for (auto& in : blk.instrs) {
+                if (is_plain_scalar_dst(in)) {
+                    auto it = vreg_spill_slot.find(in.dst);
+                    int32_t slot;
+                    if (it == vreg_spill_slot.end()) {
+                        spill_top += 8;
+                        slot = -spill_top;
+                        vreg_spill_slot[in.dst] = slot;
+                    } else {
+                        slot = it->second;  // reuse the same slot for this vreg
+                    }
+                    in.meta.frame_off = slot;
+                }
+            }
+        }
+        if (spill_top > spill_base) {
+            int32_t total = spill_top + 16;
+            frame_size = round16(total);
+            out.frame.frame_size = frame_size;
+            out.frame.next_local_off = spill_top;
         }
 
         out.non_serializable = non_serializable;
@@ -1260,6 +1411,16 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
             if (b->op == BinExpr::Op::LAnd) set_term_branch(cond, false_bb, rhs_bb);
             else                             set_term_branch(cond, rhs_bb, true_bb);
             VReg res = new_vreg(&type_bool());
+            // The result vreg `res` is defined in BOTH false_bb (=0) and true_bb
+            // (=1) and consumed in the join block end_bb. A join-block vreg MUST
+            // be frame-backed: the emit's in-rax model is unsound across a join
+            // (an intervening instr in end_bb — e.g. the `0` literal for an
+            // `if (res)` compare — clobbers rax before res is reloaded, and with
+            // no frame slot load_int_vreg can only best-effort trust rax). So
+            // spill res to a dedicated bool frame temp (counted in the frame plan
+            // by count_logical_temps_block) and set meta.frame_off on both defs;
+            // the emit stores each def to the slot and load_int_vreg reloads it.
+            int32_t res_off = alloc_struct_temp(&type_bool());
             // rhs_bb: lower rhs; cond2 = (rhs==0). Both: eq0 -> false, else true.
             enter_block(rhs_bb);
             {
@@ -1272,15 +1433,15 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
                 c2.meta.is_unsigned = (lt && lt->is_uint()) ? 1 : 0;
                 set_term_branch(cond2, false_bb, true_bb);
             }
-            // false_bb: res = 0 -> end
+            // false_bb: res = 0 -> end  (frame-backed: store to res_off)
             enter_block(false_bb);
-            { ThinInstr& ci = emit(ThinOp::ConstInt, res, 0, 0, loc); ci.imm.i = 0; ci.meta.type = &type_bool(); ci.meta.width = 1; }
+            { ThinInstr& ci = emit(ThinOp::ConstInt, res, 0, 0, loc); ci.imm.i = 0; ci.meta.type = &type_bool(); ci.meta.width = 1; ci.meta.frame_off = res_off; }
             set_term_jmp(end_bb);
-            // true_bb: res = 1 -> end
+            // true_bb: res = 1 -> end  (frame-backed: store to res_off)
             enter_block(true_bb);
-            { ThinInstr& ci = emit(ThinOp::ConstInt, res, 0, 0, loc); ci.imm.i = 1; ci.meta.type = &type_bool(); ci.meta.width = 1; }
+            { ThinInstr& ci = emit(ThinOp::ConstInt, res, 0, 0, loc); ci.imm.i = 1; ci.meta.type = &type_bool(); ci.meta.width = 1; ci.meta.frame_off = res_off; }
             set_term_jmp(end_bb);
-            // end_bb: continue
+            // end_bb: continue (res is frame-backed; load_int_vreg reloads it)
             enter_block(end_bb);
             return { LoweredValue::Scalar, res, 0, &type_bool() };
         }
@@ -1312,11 +1473,23 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
         }
 
         // Integer path
+        // If the RHS is an IntLit, use the IMMEDIATE form (src2=0 + imm.i) —
+        // the emit's int binop + cmp both have an imm-form path that bakes the
+        // literal directly into the op (op rax, imm32 / cmp rax, imm32), avoiding
+        // a separate ConstInt vreg for the RHS. This matters for the emit's
+        // vreg-materialization model: a ConstInt RHS vreg is NOT frame-backed, so
+        // reloading it after the LHS load clobbers rax would fail (load_int_vreg's
+        // best-effort path would reuse the stale LHS in rax). The imm form sidesteps
+        // the reload entirely. (The general intermediate-result spill is a
+        // separate concern; this fix covers the common literal-operand case.)
+        auto* rhs_lit = dynamic_cast<const IntLit*>(b->rhs.get());
+        bool rhs_is_imm = rhs_lit && !is_float;
         LoweredValue lhs = lower_expr(*b->lhs);
-        LoweredValue rhs = lower_expr(*b->rhs);
+        LoweredValue rhs = rhs_is_imm ? LoweredValue{} : lower_expr(*b->rhs);
         if (is_cmp) {
             VReg res = new_vreg(&type_bool());
-            ThinInstr& in = emit(ThinOp::Cmp, res, lhs.vreg, rhs.vreg, loc);
+            ThinInstr& in = emit(ThinOp::Cmp, res, lhs.vreg, rhs_is_imm ? 0 : rhs.vreg, loc);
+            if (rhs_is_imm) in.imm.i = rhs_lit->v;
             in.meta.cmp = uint8_t(int(b->op) - int(BinExpr::Op::Eq));
             in.meta.type = lt; in.meta.width = value_bytes(lt, ctx.structs);
             in.meta.is_unsigned = (lt && lt->is_uint()) ? 1 : 0;
@@ -1326,7 +1499,7 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
         bool is_unsigned = lt && lt->is_uint();
         if (is_div && !is_unsigned) {
             // signed div/mod: overflow check first (mirrors emit_integer_divmod)
-            emit_div_overflow_check(lhs.vreg, rhs.vreg, loc);
+            emit_div_overflow_check(lhs.vreg, rhs_is_imm ? 0 : rhs.vreg, loc);
         }
         ThinOp op = ThinOp::Add;
         switch (b->op) {
@@ -1343,7 +1516,8 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
         default: break;
         }
         VReg res = new_vreg(lt);
-        ThinInstr& in = emit(op, res, lhs.vreg, rhs.vreg, loc);
+        ThinInstr& in = emit(op, res, lhs.vreg, rhs_is_imm ? 0 : rhs.vreg, loc);
+        if (rhs_is_imm) in.imm.i = rhs_lit->v;
         in.meta.type = lt; in.meta.width = value_bytes(lt, ctx.structs);
         in.meta.is_unsigned = is_unsigned ? 1 : 0;
         return { LoweredValue::Scalar, res, 0, lt };
@@ -1614,20 +1788,28 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
         } else if (!ix->index_is_const) {
             emit_bounds_check(idx.vreg, 0, int64_t(bt->array_len), loc);
         }
-        // IndexAddr: dst = base + idx*width. For local fixed-array, base = rbp+base_off
-        //   (FieldAddr-style frame base); for slice, base = base_ptr vreg; for global, base = globals.
+        // IndexAddr: dst = base + idx*width. The EMIT convention is
+        //   src1 = base, src2 = index (vreg; or src2==0 + imm.i for an imm index)
+        //   base resolution: src1==0 -> fixed-array base at meta.frame_off (local)
+        //     or globals_base+addend (global, base_kind=GlobalsBase); src1 != 0 ->
+        //     if src1 is a slice vreg, load_slice_vreg (ptr+len); else load_int_vreg.
+        // So: slice base -> src1=base_ptr(slice vreg), src2=idx; local fixed array
+        // -> src1=0 + meta.frame_off=base_off, src2=idx; global -> src1=0 +
+        //   base_kind=GlobalsBase+addend, src2=idx.
         VReg addr = new_vreg(&type_i64());
-        ThinInstr& ia = emit(ThinOp::IndexAddr, addr, idx.vreg, 0, loc);
+        ThinInstr& ia = emit(ThinOp::IndexAddr, addr, 0, idx.vreg, loc);  // src1=base(set below), src2=idx
         ia.meta.width = width;
         ia.meta.type = elem;
         if (is_slice_base) {
-            ia.src2 = base_ptr;            // base = slice ptr vreg
-            ia.meta.frame_off = 0;         // offset within base = 0 (idx*width is in src1)
+            ia.src1 = base_ptr;            // base = slice ptr vreg (emit loads it as a slice)
+            ia.meta.frame_off = 0;
         } else if (is_global_base) {
+            ia.src1 = 0;                   // base = globals_base + addend
             ia.meta.base_kind = AbsFixup::GlobalsBase;
-            ia.meta.addend = uint32_t(base_off);  // base = globals_base + goff
+            ia.meta.addend = uint32_t(base_off);
         } else {
-            ia.meta.frame_off = base_off;  // base = rbp + base_off (local fixed array)
+            ia.src1 = 0;                   // base = rbp + base_off (local fixed array)
+            ia.meta.frame_off = base_off;
         }
         // load element
         if (elem && elem->is_float()) {
