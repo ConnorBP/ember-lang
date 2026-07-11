@@ -352,7 +352,7 @@ target_link_libraries(ember_cli PRIVATE
     ember ember_frontend ember_import
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
-    ember_ext_sync ember_ext_lifecycle)
+    ember_ext_sync ember_ext_lifecycle ember_ext_opt)
 
 # End-to-end H12 regression: invoke the real CLI emit-em path, then load the
 # artifact and inspect its nonzero initialized-global bytes.
@@ -443,7 +443,7 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/bench_codegen_paths.cpp)
     target_link_libraries(bench_codegen_paths PRIVATE
         ember ember_frontend ember_import
         ember_ext_vec ember_ext_quat ember_ext_mat
-        ember_ext_string ember_ext_array ember_ext_math)
+        ember_ext_string ember_ext_array ember_ext_math ember_ext_opt)
     if(WIN32)
         target_link_libraries(bench_codegen_paths PRIVATE kernel32)
     endif()

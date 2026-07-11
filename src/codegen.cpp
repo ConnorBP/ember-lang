@@ -4,6 +4,7 @@
 #include "peephole.hpp"  // Stage 1: post-emit peephole pipeline (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4.5)
 #include "thin_lower.hpp"  // Stage A c2: AST -> ThinFunction lowering (the IR-backend path)
 #include "thin_emit.hpp"   // Stage A c3: ThinFunction -> x86-64 emit (the IR-backend path)
+#include "ember_pass.hpp"  // Stage C: EmberPassManager (run IR optimization passes)
 #include <cassert>
 #include <cstring>
 #include <algorithm>
@@ -3412,7 +3413,14 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
         }
         if (!uses_obf && !(ctx.obf.mba || ctx.obf.opaque || ctx.obf.keyed)) {
             ThinFunction thf = lower_function(f, ctx);
-            if (!thf.blocks.empty()) return emit_x64(thf, ctx);
+            if (!thf.blocks.empty()) {
+                // Stage C: run IR optimization passes between lower and emit.
+                if (ctx.pass_manager) {
+                    EmberAnalysisManager am;
+                    ctx.pass_manager->run(thf, am);
+                }
+                return emit_x64(thf, ctx);
+            }
             // empty body / lowering gave up (non_serializable) -> fall through to tree-walker
         }
     }

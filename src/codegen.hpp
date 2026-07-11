@@ -13,6 +13,12 @@
 
 namespace ember {
 
+// Forward decl: the pass manager (Stage C) is defined in ember_pass.hpp.
+// Used by CodeGenCtx::pass_manager (run IR optimization passes between
+// lower_function and emit_x64 when enable_ir_backend is true).
+class EmberPassManager;
+class EmberAnalysisManager;
+
 struct CompiledFn;
 
 // Globals block: a TYPED layout (chunk c3) - one per-global (offset, size)
@@ -172,6 +178,18 @@ struct CodeGenCtx {
     // peephole). Obfuscated functions (@obf_keyed/mba/opaque) fall back to the
     // tree-walker (the lowering marks them non_serializable; see thin_lower.hpp).
     bool enable_ir_backend = false;
+
+    // --- Stage C: IR optimization passes (docs/spec/PASS_SYSTEM_DESIGN.md) ---
+    // When non-null AND enable_ir_backend is true, compile_func runs the pass
+    // manager's passes over the ThinFunction BETWEEN lower_function and
+    // emit_x64. Default null = no passes (unchanged IR-path behavior). The
+    // host builds the pass manager from a registry + pipeline string:
+    //   EmberPassRegistry reg; ext_opt::register_passes(reg);
+    //   EmberPassManager pm;
+    //   build_pipeline_from_string("constprop,cse,dce", reg, pm, &err);
+    //   ctx.pass_manager = &pm;
+    EmberPassManager* pass_manager = nullptr;
+    EmberAnalysisManager* analysis_manager = nullptr;
 };
 
 // Compile one function. Returns the JIT'd bytes + (after finalize) entry.

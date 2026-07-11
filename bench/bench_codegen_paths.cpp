@@ -38,6 +38,10 @@
 #include "binding_builder.hpp"
 #include "thin_ir.hpp"        // Stage C: ThinFunction (IR instr count metric)
 #include "thin_lower.hpp"     // Stage C: lower_function (IR instr count metric)
+#include "ember_pass.hpp"     // Stage C: EmberPassManager
+#include "ember_pass_registry.hpp" // Stage C: EmberPassRegistry
+#include "ember_pass_pipeline.hpp" // Stage C: build_pipeline_from_string
+#include "ext_opt.hpp"         // Stage C: register_passes
 
 #include "ext_vec.hpp"
 #include "ext_quat.hpp"
@@ -184,6 +188,22 @@ static std::unique_ptr<BenchModule> ember_compile(const std::string& src, bool s
         if (const char* o = std::getenv("EMBER_IR_BACKEND")) {
             std::string s(o);
             if (s == "1" || s == "on" || s == "true") ctx.enable_ir_backend = true;
+        }
+    }
+    // Stage C: EMBER_IR_PASS="constprop,cse,dce" — build a pass pipeline from
+    // the opt extension registry and run it between lower_function and emit_x64.
+    // Only effective when enable_ir_backend is on (set above or by EMBER_IR_BACKEND).
+    EmberPassRegistry pass_reg;
+    ext_opt::register_passes(pass_reg);
+    EmberPassManager pass_pm;
+    if (ctx.enable_ir_backend) {
+        if (const char* o = std::getenv("EMBER_IR_PASS")) {
+            std::string spec(o);
+            if (!spec.empty()) {
+                std::string pass_err;
+                if (build_pipeline_from_string(spec, pass_reg, pass_pm, &pass_err))
+                    ctx.pass_manager = &pass_pm;
+            }
         }
     }
     if (safety_on) {

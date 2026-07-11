@@ -62,6 +62,10 @@
 #include "ext_math.hpp"
 #include "ext_sync.hpp"
 #include "ext_lifecycle.hpp"
+#include "ext_opt.hpp"        // Stage C: register_passes (IR optimization passes)
+#include "../src/ember_pass.hpp"       // Stage C: EmberPassManager
+#include "../src/ember_pass_registry.hpp" // Stage C: EmberPassRegistry
+#include "../src/ember_pass_pipeline.hpp" // Stage C: build_pipeline_from_string
 
 #include <cstdio>
 #include <csetjmp>   // setjmp/longjmp (v0.4 safe-execution checkpoint)
@@ -240,6 +244,7 @@ int main(int argc, char** argv) {
     bool dump = false;
     std::string emit_em_path;   // v0.5: --emit-em <out> pre-compiles to a .em bundle
     std::string load_em_path;
+    std::string passes_spec;     // Stage C: --passes <spec> run IR optimization passes
     bool tick_mode = false;     // v0.6: --tick runs @on_tick fns on a thread until a keybind
     int tick_interval_ms = 16;  // v0.6: --tick-interval (default ~60fps)
     int tick_max = 0;           // v0.6: --tick-count N auto-stop after N ticks (0 = until keybind; for tests/non-interactive)
@@ -253,6 +258,9 @@ int main(int argc, char** argv) {
             fn_name = argv[i];
         } else if (a == "--dump") {
             dump = true;
+        } else if (a == "--passes") {
+            if (++i >= argc) { std::fprintf(stderr, "ember: --passes needs a spec (e.g. constprop,cse,dce)\n"); return 2; }
+            passes_spec = argv[i];
         } else if (a == "--emit-em") {
             if (++i >= argc) { std::fprintf(stderr, "ember: --emit-em needs a path\n"); return 2; }
             emit_em_path = argv[i];
@@ -525,6 +533,23 @@ int main(int argc, char** argv) {
     if (emit_em_path.empty()) {
         ctx.fn_allowlist_base = int64_t(fn_allowlist.data());
         ctx.fn_slot_count = int64_t(slots.size());
+    }
+
+    // Stage C: --passes <spec> — build an IR optimization pass pipeline from
+    // the registry + the user's pipeline string. Only effective when the IR
+    // backend is on (enable_ir_backend). The IR backend is on by default when
+    // --passes is given (the passes operate on the ThinFunction IR).
+    EmberPassRegistry pass_reg;
+    ext_opt::register_passes(pass_reg);
+    EmberPassManager pass_pm;
+    if (!passes_spec.empty()) {
+        std::string pass_err;
+        if (!build_pipeline_from_string(passes_spec, pass_reg, pass_pm, &pass_err)) {
+            std::fprintf(stderr, "ember: --passes: %s\n", pass_err.c_str());
+            return 2;
+        }
+        ctx.pass_manager = &pass_pm;
+        ctx.enable_ir_backend = true;  // passes need the IR path
     }
 
     // ---- compile + finalize each function ----
