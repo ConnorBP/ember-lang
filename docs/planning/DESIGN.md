@@ -175,8 +175,8 @@ Non-goals for v1:
   game-engine integration (event hooks via annotations).
 
   **Concurrency + Tier 2 batch shipped v1.0 (commit e5d1814 + follow-ons):**
-  four features, each verified in source/tests; the current tree has 20 CTest
-  tests with AngelScript and 19 without —
+  four features, each verified in source/tests; the current tree has 32 CTest
+  tests with AngelScript and 31 without —
   - **Context thread-safety (Option D + B1)** — `context_t` restructured
     to a POD prefix; `CodeGenCtx::use_context_reg` makes the budget/depth/
     trap emits read `context_t` fields through `r14` (the per-call context

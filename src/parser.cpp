@@ -456,7 +456,7 @@ struct P {
                 //   mod::fn(args)         - cross-module call; e is already a CallExpr
                 //                          with module_alias set (built by the '::' case above)
                 std::unique_ptr<CallExpr> c;
-                if (auto existing = dynamic_cast<CallExpr*>(e.get())) {
+                if (dynamic_cast<CallExpr*>(e.get())) {
                     // mod::fn(args): take the half-built CallExpr, fill its args.
                     c = std::unique_ptr<CallExpr>(static_cast<CallExpr*>(e.release()));
                 } else if (auto id = dynamic_cast<Ident*>(e.get())) {

@@ -276,7 +276,8 @@ struct ThinLowerer {
         if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) { prescan_expr(*ds->expr); return; }
         if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
             prescan_expr(*is->cond); prescan_block(is->then_b);
-            if (is->has_else) prescan_block(is->else_b); return;
+            if (is->has_else) prescan_block(is->else_b);
+            return;
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { prescan_expr(*ws->cond); prescan_block(ws->body); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { prescan_block(ds->body); prescan_expr(*ds->cond); return; }
@@ -324,7 +325,8 @@ struct ThinLowerer {
         if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) { count_struct_temps_expr(*ds->expr, total); return; }
         if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
             count_struct_temps_expr(*is->cond, total); count_struct_temps_block(is->then_b, total);
-            if (is->has_else) count_struct_temps_block(is->else_b, total); return;
+            if (is->has_else) count_struct_temps_block(is->else_b, total);
+            return;
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_struct_temps_expr(*ws->cond, total); count_struct_temps_block(ws->body, total); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_struct_temps_block(ds->body, total); count_struct_temps_expr(*ds->cond, total); return; }
@@ -371,7 +373,8 @@ struct ThinLowerer {
         if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) { count_arr_temps_expr(*ds->expr, total); return; }
         if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
             count_arr_temps_expr(*is->cond, total); count_arr_temps_block(is->then_b, total);
-            if (is->has_else) count_arr_temps_block(is->else_b, total); return;
+            if (is->has_else) count_arr_temps_block(is->else_b, total);
+            return;
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_arr_temps_expr(*ws->cond, total); count_arr_temps_block(ws->body, total); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_arr_temps_block(ds->body, total); count_arr_temps_expr(*ds->cond, total); return; }
@@ -420,7 +423,8 @@ struct ThinLowerer {
         if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) { count_str_temps_expr(*ds->expr, total); return; }
         if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
             count_str_temps_expr(*is->cond, total); count_str_temps_block(is->then_b, total);
-            if (is->has_else) count_str_temps_block(is->else_b, total); return;
+            if (is->has_else) count_str_temps_block(is->else_b, total);
+            return;
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_str_temps_expr(*ws->cond, total); count_str_temps_block(ws->body, total); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_str_temps_block(ds->body, total); count_str_temps_expr(*ds->cond, total); return; }
@@ -473,7 +477,8 @@ struct ThinLowerer {
         if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) { count_logical_temps_expr(*ds->expr, total); return; }
         if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
             count_logical_temps_expr(*is->cond, total); count_logical_temps_block(is->then_b, total);
-            if (is->has_else) count_logical_temps_block(is->else_b, total); return;
+            if (is->has_else) count_logical_temps_block(is->else_b, total);
+            return;
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_logical_temps_expr(*ws->cond, total); count_logical_temps_block(ws->body, total); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_logical_temps_block(ds->body, total); count_logical_temps_expr(*ds->cond, total); return; }
@@ -538,7 +543,8 @@ struct ThinLowerer {
         if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) { count_pin_refs_expr(*ds->expr, counts); return; }
         if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
             count_pin_refs_expr(*is->cond, counts); count_pin_refs_block(is->then_b, counts);
-            if (is->has_else) count_pin_refs_block(is->else_b, counts); return;
+            if (is->has_else) count_pin_refs_block(is->else_b, counts);
+            return;
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_pin_refs_expr(*ws->cond, counts); count_pin_refs_block(ws->body, counts); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_pin_refs_block(ds->body, counts); count_pin_refs_expr(*ds->cond, counts); return; }

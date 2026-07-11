@@ -21,15 +21,15 @@ its posture from which option is picked here.
 These are read-only or already-atomic after compilation, so two host threads
 can touch them concurrently without ember-side synchronization:
 
-- **The dispatch table slots.** `src/dispatch_table.hpp:6` declares
+- **The dispatch table slots.** `src/dispatch_table.hpp:14` declares
   `std::vector<std::atomic<void*>> slots`; `set` does `store(...,
-  memory_order_release)` (`:9`), `get` does `load(memory_order_acquire)` (`:12`).
+  memory_order_release)` (`:30`), `get` does `load(memory_order_acquire)` (`:34`).
   `../HOT_RELOAD.md §1` states the invariant ("a slot write during reload must be
   observed atomically by any thread concurrently executing a `call [slot]`"),
   and §4 ("slot indices never change for the lifetime of the `module_t`")
   means a host may cache a **slot index** across threads safely (caching a raw
   pointer is explicitly unsafe, `../HOT_RELOAD.md §7`). Script→script calls go
-  through `call [dispatch_base + slot*8]` (`src/codegen.cpp:647`, `:656`),
+  through `call [dispatch_base + slot*8]` (`src/codegen.cpp:2522`, `:2523`),
   re-reading the slot on every call. → **multi-thread reads of the dispatch
   table are safe today.** Retired-page reclamation subsequently shipped as
   the host-visible guarded epoch protocol in `../HOT_RELOAD.md §5`; every outer
@@ -47,20 +47,20 @@ can touch them concurrently without ember-side synchronization:
 - **The `ModuleRegistry`** (`src/module_registry.hpp`), to the extent the
   host doesn't mutate it concurrently with calls. `cross_module` calls bake
   `registry_base` as a kind-2 reloc and read `[registry_base + mod_id*8]`
-  (`src/codegen.cpp:718`–`724`). A registry that's done being built before
+  (`src/codegen.cpp:552`–`556`). A registry that's done being built before
   threads start is read-only at call time.
 
 ### 1.2 What is NOT safe — the four pieces of per-call state, and the baked pointers
 
-`context_t` (`src/context.hpp:44`–`72`) is a plain struct with no atomicity
+`context_t` (`src/context.hpp:60`–`86`) is a plain struct with no atomicity
 and no synchronization. Four fields are mutated while JIT'd code runs, and a
 fifth piece of state (the trap target) is *baked into the JIT'd bytes
 themselves*:
 
-1. **`jmp_buf checkpoint` + `bool has_checkpoint`** (`context.hpp:47`–`48`).
-   `ember_call` (in the CLI: `examples/ember_cli.cpp:425`–`431`) does
+1. **`jmp_buf checkpoint` + `bool has_checkpoint`** (`context.hpp:73`–`74`).
+   `ember_call` (in the CLI: `examples/ember_cli.cpp:731`–`740`) does
    `__builtin_setjmp(ctx.checkpoint)` before entering JIT'd code; the trap
-   stub `ember_cli_trap` (`ember_cli.cpp:97`–`110`) does
+   stub `ember_cli_trap` (`ember_cli.cpp:112`–`121`) does
    `__builtin_longjmp(ctx->checkpoint, 1)`. **Two threads setjmp'ing into the
    same `checkpoint` is undefined** — the second setjmp clobbers the first's
    saved rsp/rbp/ip, and a longjmp from thread B unwinds to whatever thread A
@@ -79,15 +79,15 @@ themselves*:
    overwrites it) and torn reads on the `jg` branch.
 
 3. **`int32_t call_depth`** (`context.hpp:68`). Incremented before every
-   script-to-script call and decremented after: `src/codegen.cpp:364`–`407`
-   (`emit_depth_check` `:364`–`392` / `emit_depth_leave` `:394`–`407`).
+   script-to-script call and decremented after: `src/codegen.cpp:430`–`472`
+   (`emit_depth_check` `:430`–`457` / `emit_depth_leave` `:460`–`472`).
    Same RMW race as the budget — lost incs/deczs mean the depth guard can both
    false-trap (one thread's incs counted against the other's max) and fail to
    trap (real overflow hidden by a lost inc).
 
 4. **`TrapReason last_trap` + `std::string last_error`** (`context.hpp:70`,
-   `:75`). Written by the trap stub before the longjmp (`ember_cli.cpp:106`–
-   `107`). Two
+   `:75`). Written by the trap stub before the longjmp (`ember_cli.cpp:113`–
+   `114`). Two
    concurrent traps racing these fields produce garbage error reporting
    (interleaved bytes in `last_error`, a `last_trap` from the wrong thread).
    Lower severity than 1–3 (it's diagnostics, not control flow), but still a
@@ -95,14 +95,14 @@ themselves*:
 
 5. **The decisive constraint — `trap_ctx`, `budget_ptr`, `depth_ptr` are
    ABSOLUTE `imm64`s BAKED INTO THE JIT'd CODE.** At JIT time, codegen emits:
-   - `src/codegen.cpp:242` — `mov rcx, imm64(ctx.trap_ctx)` (the trap stub's
+   - `src/codegen.cpp:359` — `mov rcx, imm64(ctx.trap_ctx)` (the trap stub's
      first arg, the `context_t*`).
-   - `src/codegen.cpp:268` — `mov rax, imm64(ctx.budget_ptr)` (the budget
+   - `src/codegen.cpp:398` — `mov rax, imm64(ctx.budget_ptr)` (the budget
      counter address).
-   - `src/codegen.cpp:295` and `:307` — `mov rax, imm64(ctx.depth_ptr)` /
+   - `src/codegen.cpp:451` and `:470` — `mov rax, imm64(ctx.depth_ptr)` /
      `mov r10, imm64(ctx.depth_ptr)` (the depth counter address).
 
-   `CodeGenCtx` (`src/codegen.hpp:36`–`73`) carries these as plain pointers:
+   `CodeGenCtx` (`src/codegen.hpp:57`–`193`) carries these as plain pointers:
    `void* trap_ctx`, `int64_t* budget_ptr`, `int32_t* depth_ptr`. They are
    stamped into the function body once, at `compile_func` time. **A single
    JIT'd function body therefore has exactly ONE `context_t*` baked into it.**
@@ -113,15 +113,15 @@ themselves*:
 
 Two distinct races, both real, both named in the user's brief:
 
-- **Emit-time race on `g_globals_for_codegen`.** `src/codegen.hpp:95`
+- **Emit-time race on `g_globals_for_codegen`.** `src/codegen.hpp:201`
   declares `extern GlobalsBlock* g_globals_for_codegen;`, defined at
-  `src/codegen.cpp:2059` as a single process-wide pointer. The comment at
-  `codegen.hpp:91`–`94` says it plainly: *"A single process-wide pointer
+  `src/codegen.cpp:3500` as a single process-wide pointer. The comment at
+  `codegen.hpp:199`–`200` says it plainly: *"A single process-wide pointer
   (v1 frontend; the host wires one block per engine)."* The globals
   load/store paths read it directly at emit time to decide whether an
   `Ident` is a global and to look up its index/type:
-  - `src/codegen.cpp:951`–`957` (global load in `eval`'s `Ident` case)
-  - `src/codegen.cpp:1360`–`1365` (global store in `AssignExpr`'s `Ident` target)
+  - `src/codegen.cpp:1686`–`1688` (global load in `eval`'s `Ident` case)
+  - `src/codegen.cpp:2234`–`2236` (global store in `AssignExpr`'s `Ident` target)
 
   If two host threads concurrently `compile_func` against **different**
   `GlobalsBlock`s (e.g. two modules with their own globals, compiled in
@@ -133,11 +133,11 @@ Two distinct races, both real, both named in the user's brief:
   option that wants parallel compilation.**
 
 - **Run-time race on the shared globals block.** The baked `GlobalsBase`
-  reloc is filled from `ctx.globals_base` at finalize (`src/codegen.cpp:2289`,
+  reloc is filled from `ctx.globals_base` at finalize (`src/codegen.cpp:3812`,
   `AbsFixup::GlobalsBase`). The JIT'd body does `mov r11, <globals_base>; mov
-  rax, [r11 + off]` (`load_global_to_rax`, `codegen.cpp:878`–`883`) and the
-  matching store (`store_rax_to_global`, `:885`–`888`; float variant
-  `:891`–`900`). If two threads run functions that read/write the **same**
+  rax, [r11 + off]` (`load_global_to_rax`, `codegen.cpp:1606`–`1610`) and the
+  matching store (`store_rax_to_global`, `:1611`–`1618`; float variant
+  `:1625`–`1629`). If two threads run functions that read/write the **same**
   globals block, the writes race (a non-atomic `mov [r11+off], rax`).
   `../spec/SAFETY_AND_SANDBOX.md §8` puts this squarely on the host: *"script-visible
   global mutable state shared across contexts is a host-design question, not
@@ -230,7 +230,7 @@ of each, an explicit verdict on the two cases the user named:
 **Idea.** The spec's nested-`ember_call` checkpoint **stack**
 (`../spec/SAFETY_AND_SANDBOX.md §2`: *"each call pushes its own checkpoint onto a small
 stack of checkpoints on the `context_t`; a trap unwinds to the innermost
-checkpoint only"*) is today shipped as a single `jmp_buf` (`context.hpp:8`–`11`
+checkpoint only"*) is today shipped as a single `jmp_buf` (`context.hpp:14`–`16`
 comment: *"v0.4 ships the single-call checkpoint … the spec's nested
 ember_call checkpoint STACK is v1.0"*). Option A extends that stack so
 concurrent calls don't share: each host→script entry pushes a fresh
@@ -238,7 +238,7 @@ concurrent calls don't share: each host→script entry pushes a fresh
 
 **What changes.**
 - `context_t` gains a small `std::vector<CallFrame>` (or a fixed-depth ring)
-  holding per-call state; `reset_for_call` (`context.hpp:65`) becomes a push.
+  holding per-call state; `reset_for_call` (`context.hpp:77`) becomes a push.
 - The CLI's hand-rolled `__builtin_setjmp(ectx.checkpoint)`
   (`ember_cli.cpp:425`–`431`) becomes "push a frame, setjmp into *that*
   frame's `checkpoint`." A real `ember_call` wrapper (which the spec describes
@@ -250,7 +250,7 @@ concurrent calls don't share: each host→script entry pushes a fresh
 
 **The trap-stub-finds-the-right-context problem (the crux).** This is where
 §1.2 item 5 bites. The trap stub receives `rcx = ctx.trap_ctx` — a single
-baked pointer (`codegen.cpp:242`). For Option A to work with a *shared*
+baked pointer (`codegen.cpp:359`). For Option A to work with a *shared*
 `context_t`, the stub must, at trap time, find the **right** frame for the
 **calling thread**. Two sub-paths:
 
@@ -267,7 +267,7 @@ baked pointer (`codegen.cpp:242`). For Option A to work with a *shared*
     solves the checkpoint; it pushes the counter problem onto B.
 
   - **A2 — per-call budget/depth too, resolved at JIT time is impossible.**
-    The baked `budget_ptr` (`codegen.cpp:268`) is a compile-time imm64. You
+    The baked `budget_ptr` (`codegen.cpp:398`) is a compile-time imm64. You
     cannot give each *call* its own counter while reusing the same compiled
     bytes, unless the bytes load the counter through an indirection that's
     resolved per-call (a `thread_local` pointer — option B). So **pure**
@@ -305,7 +305,7 @@ thread-safety answer.
 `thread_local` pointer rather than a baked imm64.
 
 **What changes — the JIT'd code must change what it reads.** Today the body
-does `mov rax, imm64(budget_ptr); sub qword [rax], cost` (`codegen.cpp:267`–`272`).
+does `mov rax, imm64(budget_ptr); sub qword [rax], cost` (`codegen.cpp:398`–`404`).
 Under B, the body must instead load a `thread_local` pointer and indirect
 through it. Two implementations:
 
@@ -454,8 +454,8 @@ remains about context safety; a context does not itself own reclamation state.
   `context_t` pool or a `thread_local context_t*` (which is B1's
   `ember_active_ctx`).
 - **JIT'd code — the baked pointers.** Here's the catch: today, the trap_ctx,
-  budget_ptr, depth_ptr are baked at *compile* time (`codegen.cpp:242`,
-  `:268`, `:295`, `:307`) from `ctx.trap_ctx`/`ctx.budget_ptr`/`ctx.depth_ptr`.
+  budget_ptr, depth_ptr are baked at *compile* time (`codegen.cpp:359`,
+  `:398`, `:451`, `:470`) from `ctx.trap_ctx`/`ctx.budget_ptr`/`ctx.depth_ptr`.
   If you compile once and want N contexts to run the same bytes, the baked
   pointers point at ONE of them. So D, as-is, only works if either:
   - **D-shared-compile (compile once, N contexts): requires B1.** The JIT'd
@@ -540,7 +540,7 @@ cross-thread' the answer, or is shared-globals a real blocker?"*
    `CodeGenCtx`** so each `compile_func` call uses the caller's block. The
    `load_global_to_rax`/`store_rax_to_global` helpers already take `base` as
    a (now-unused) parameter and resolve the *runtime* address through
-   `AbsFixup::GlobalsBase` filled from `ctx.globals_base` (`codegen.cpp:2289`)
+   `AbsFixup::GlobalsBase` filled from `ctx.globals_base` (`codegen.cpp:3812`)
    — so the *runtime* path already goes through `ctx`; only the *emit-time*
    decision (is this name a global? which index?) reads the global pointer.
    Moving that decision onto `ctx` (e.g. `ctx.globals_index`, `ctx.globals_types`)
@@ -618,8 +618,8 @@ to the `aint*` batch — U2).
 
 1. **`g_globals_for_codegen` emit-time fix.** Thread the globals
    `index`/`types` (or the `GlobalsBlock*`) through `CodeGenCtx` so
-   `compile_func` no longer reads a process-wide pointer (`codegen.cpp:951`,
-   `:1360`). No JIT-bytes change (runtime path already uses
+   `compile_func` no longer reads a process-wide pointer (`codegen.cpp:1686`,
+   `:2234`). No JIT-bytes change (runtime path already uses
    `AbsFixup::GlobalsBase` from `ctx.globals_base`). **Blocks parallel
    compilation; ships regardless.**
 
@@ -631,12 +631,12 @@ to the `aint*` batch — U2).
 3. **Option B1 JIT change: `thread_local context_t*` indirection.** The trap
    stub and the budget/depth emit read through a `thread_local` active-context
    pointer instead of baked `imm64`s. Specifically:
-   - `emit_trap` (`codegen.cpp:222`–`253`): rcx (the `context_t*`) comes from
+   - `emit_trap` (`codegen.cpp:346`–`362`): rcx (the `context_t*`) comes from
      the `thread_local` active ctx, not `ctx.trap_ctx`.
-   - `emit_budget_check` (`:266`–`282`): load the budget counter via the
+   - `emit_budget_check` (`:385`–`404`): load the budget counter via the
      `thread_local` ctx (+ `offsetof(budget_remaining)`), not a baked
      `budget_ptr`.
-   - `emit_depth_check`/`emit_depth_leave` (`:293`–`310`): same for
+   - `emit_depth_check`/`emit_depth_leave` (`:430`–`472`): same for
      `call_depth`.
    - One TLS-pointer load per function entry into a callee-saved register;
      per-check uses `[reg+off]`.
@@ -648,7 +648,7 @@ to the `aint*` batch — U2).
 
 5. **A checkpoint-stack forward-compat note.** The spec's nested-`ember_call`
    checkpoint stack (`SAFETY §2`, shipped as single-`jmp_buf` today,
-   `context.hpp:8`–`11`) remains a v1.0 item; the first pass keeps the
+   `context.hpp:14`–`16`) remains a v1.0 item; the first pass keeps the
    single-`jmp_buf` per `context_t` but makes that `jmp_buf` provably
    single-thread (which is what D + B1 gives). The stack ships later, on top
    of the now-thread-safe single-`jmp_buf`.
@@ -762,20 +762,20 @@ test. Those are later batches.
 |---|---|
 | `context_t` fields are non-atomic | `src/context.hpp:60`–`86` |
 | Single `jmp_buf` checkpoint (not the spec's stack) | `src/context.hpp:14`–`16` |
-| `budget_remaining` decremented at budget charge sites (entry + back-edges) | `src/codegen.cpp:319`–`340` (`emit_budget_check`) |
-| `call_depth` inc/dec at script-to-script calls | `src/codegen.cpp:364`–`407`; call sites `:415`,`:944`,`:952`,`:1951`,`:1961`,`:1974` |
-| `trap_ctx` baked as imm64 | `src/codegen.cpp:293` |
-| `budget_ptr` baked as imm64 | `src/codegen.cpp:332` |
-| `depth_ptr` baked as imm64 | `src/codegen.cpp:385`, `:404` |
-| `CodeGenCtx` carries the three pointers | `src/codegen.hpp:43`–`116` (`trap_stub` `:70`/`trap_ctx` `:73`/`budget_ptr` `:81`/`depth_ptr` `:89`) |
-| `g_globals_for_codegen` process-wide pointer (defn) | `src/codegen.cpp:2631`; decl `src/codegen.hpp:124` |
-| Globals emit-time decision reads process-wide ptr | `src/codegen.cpp:1253`–`1254` (load), `:1695`–`1696` (store) |
-| Globals run-time address via `AbsFixup::GlobalsBase` | `src/codegen.cpp:1169`–`1196` (helpers), `:2875`–`2885` (reloc fill) |
+| `budget_remaining` decremented at budget charge sites (entry + back-edges) | `src/codegen.cpp:385`–`404` (`emit_budget_check`) |
+| `call_depth` inc/dec at script-to-script calls | `src/codegen.cpp:430`–`472`; call sites `:481`,`:1300`,`:1308`,`:2499`,`:2509`,`:2522` |
+| `trap_ctx` baked as imm64 | `src/codegen.cpp:359` |
+| `budget_ptr` baked as imm64 | `src/codegen.cpp:398` |
+| `depth_ptr` baked as imm64 | `src/codegen.cpp:451`, `:470` |
+| `CodeGenCtx` carries the three pointers | `src/codegen.hpp:57`–`193` (`trap_stub` `:88`/`trap_ctx` `:91`/`budget_ptr` `:99`/`depth_ptr` `:107`) |
+| `g_globals_for_codegen` process-wide pointer (defn) | `src/codegen.cpp:3500`; decl `src/codegen.hpp:201` |
+| Globals emit-time decision reads process-wide ptr | `src/codegen.cpp:1686`–`1688` (load), `:2234`–`2236` (store) |
+| Globals run-time address via `AbsFixup::GlobalsBase` | `src/codegen.cpp:1606`–`1629` (helpers), `:3812` (reloc fill) |
 | Dispatch table is `std::atomic<void*>` release/acquire | `src/dispatch_table.hpp:14` |
 | Slot indices stable; cache index not pointer | `../HOT_RELOAD.md §1`, `§4`, `§7` |
-| `--tick` spawns a thread reusing one `ectx` (the live bug; **remediated in v1.0**) | `examples/ember_cli.cpp:542`–`589`, esp. `:549`–`:571` — the tick thread now uses its OWN `tick_ctx` (`context_t tick_ctx;` at `:549`) via `ember_call_void`/`ember_call_i64`, isolated from the main thread's `ectx`; the pre-B1 shared-`ectx` bug this plan flagged is fixed |
-| CLI calls JIT'd entry (v1.0 via `ember_call_void`, not raw fn-ptr) | `examples/ember_cli.cpp:511` (`ember::ember_call_void(entry, &ectx)`); the pre-B1 raw `reinterpret_cast<F0>(entry)()` is gone — `src/engine.hpp:97`–`98` declares `ember_call_void`/`ember_call_i64` |
-| Trap stub `__builtin_longjmp`s the passed ctx | `examples/ember_cli.cpp:99`–`113` |
+| `--tick` spawns a thread reusing one `ectx` (the live bug; **remediated in v1.0**) | `examples/ember_cli.cpp:788`–`810`, esp. `:794`–`:805` — the tick thread now uses its OWN `tick_ctx` (`context_t tick_ctx;` at `:794`) via `ember_call_void`/`ember_call_i64`, isolated from the main thread's `ectx`; the pre-B1 shared-`ectx` bug this plan flagged is fixed |
+| CLI calls JIT'd entry (v1.0 via `ember_call_void`, not raw fn-ptr) | `examples/ember_cli.cpp:740` (`ember::ember_call_void(entry, &ectx)`); the pre-B1 raw `reinterpret_cast<F0>(entry)()` is gone — `src/engine.hpp:97`–`98` declares `ember_call_void`/`ember_call_i64` |
+| Trap stub `__builtin_longjmp`s the passed ctx | `examples/ember_cli.cpp:112`–`121` |
 | Spec: per-`context_t` parallelism allowed, in-context not | `../spec/SAFETY_AND_SANDBOX.md §8` |
 | Hot reload: outer-call guards + concurrent epoch reclamation | `../HOT_RELOAD.md §5` |
 | ROADMAP: `aint*`/`thread` deferred; multi-context covers most | `../ROADMAP.md` Tier 5 (`:119`–`125`) |

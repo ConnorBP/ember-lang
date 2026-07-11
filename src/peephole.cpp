@@ -31,11 +31,6 @@ static int64_t read_le_i64(const std::vector<uint8_t>& b, size_t pos) {
     std::memcpy(&v, b.data() + pos, 8);
     return v;
 }
-static int32_t read_le_i32(const std::vector<uint8_t>& b, size_t pos) {
-    int32_t v = 0;
-    std::memcpy(&v, b.data() + pos, 4);
-    return v;
-}
 static void write_le_i32(std::vector<uint8_t>& b, size_t pos, int32_t v) {
     std::memcpy(b.data() + pos, &v, 4);
 }
