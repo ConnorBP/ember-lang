@@ -57,8 +57,14 @@ target to remain a separate module with its own stable identity,
 looked up at load time. That is `import`, and `include` is
 structurally incapable of it without ceasing to be `include`.
 
-The trigger has not fired. Until a real game ships a mod that loads
-another mod's `.em` at runtime, this is YAGNI - spec'd, not built.
+The original Tier 6 trigger ("a real runtime mod-loading use case") had not
+fired when this section was written, but the **v0.5 live-module trigger since
+fired** and the `link` grammar + `ModuleRegistry` + cross-module call path
+**shipped** (see §6 below + `BUNDLING_AND_EM_MODULES.md` Part 3 item 3). The
+core live-module surface is therefore NOT "spec'd, not built" — it is the
+implemented surface this doc is the design reference for. What remains
+genuinely future is the re-entry-trigger-gated work in §6 (whole-module
+reload, late `relink_imports`, the removed-function trap stub).
 
 ---
 

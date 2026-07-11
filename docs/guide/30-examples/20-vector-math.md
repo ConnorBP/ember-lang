@@ -1,5 +1,13 @@
 # Vector Math Walkthrough
 
+> **STALENESS NOTICE (2026-07-11):** the file
+> `examples/scripts/vector_math_demo.ember` **does not exist** in the tree.
+> The "Full Source" below is illustrative. It uses `assert_eq_f32`, a
+> **prism-host** native not registered by the standalone `ember` CLI. See
+> `examples/scripts/` for the real shipped example scripts (`control.ember`,
+> `struct.ember`, `string.ember`, `game_logic.ember`, `io_test.ember`,
+> `dynamic_registration.ember`, `read_line_test.ember`, `fib.ember`).
+
 This page walks through `examples/scripts/vector_math_demo.ember`, a small script that exercises `vec3`, `vec4`, `quat`, and `mat4` together the way a physics or graphics math layer would. It is not rendering- or game-specific, it is a tour of the math handle types and their operator overloads. For the full function reference behind every call here, see [20-api/40-math-vectors.md](../20-api/40-math-vectors.md).
 
 ## Full Source

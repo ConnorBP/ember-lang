@@ -8,10 +8,10 @@ A host application may register additional, host-specific natives on top of thes
 
 Each functional category has its own page. A script rarely needs the whole surface at once, so grouping by purpose keeps each page short enough to scan while writing a script.
 
-- [I/O and Debug](10-io-debug.md): `print_i64`, `print_f32`, and `print_str`, for getting values out of a running script
+- [I/O and Debug](10-io-debug.md): `print`, `println`, `print_i64`, `print_f64`, and `read_line` (the `io` extension's console natives), plus `file_*`/`path_*` — all `PERM_FFI`-gated
 - [Assertions](20-assertions.md): `assert_eq_*`, lightweight in-script self-checks
-- [Strings](30-strings.md): `string_*`, `str_compare`, `str_length`, plus the string `+` and `==` overloads
-- [Math and Vectors](40-math-vectors.md): `vec2`/`vec3`/`vec4`/`quat`/`mat4` handle types and scalar math helpers
+- [Strings](30-strings.md): the `string` extension's `string_new`/`string_from_slice`/`string_from_i64`/`string_from_f32`/`string_from_f64`/`string_from_bool`/`string_length`/`string_char_at`/`string_find`/`string_substr`/`string_identity`, plus the string `+` and `==` overloads. (`str_compare`/`str_length` are **prism-host** natives, not the standard extension — see the note on that page.)
+- [Math and Vectors](40-math-vectors.md): `vec2`/`vec3`/`vec4`/`quat`/`mat4` handle types and the `math` extension's scalar helpers (`sqrt`/`sin`/`cos`/`tan` f32; `*_f64` + `floor_f64`/`ceil_f64`/`abs_f64`/`pow_f64`/`abs_i64`). (`aim_atan2`/`clamp` are **prism-host** natives, not the standard extension.)
 - [Arrays](50-arrays.md): `array_*` handle functions for the `array of T` handle type
 
 ## Naming Conventions

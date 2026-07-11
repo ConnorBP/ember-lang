@@ -53,7 +53,13 @@ assert_eq_f32(mat4_get(scale6, 2, 2), 6.0f);
 
 ## Scalar Math
 
-Free functions operating on `f32` values. None of these are methods on a handle type; call them directly.
+> **NOTE:** the `math` extension (`extensions/math/ext_math.cpp`) ships the
+> f32 functions `sqrt`/`sin`/`cos`/`tan`, the f64 functions `sqrt_f64`/
+> `sin_f64`/`cos_f64`/`tan_f64`/`floor_f64`/`ceil_f64`/`abs_f64`/`pow_f64`, and
+> `abs_i64`. The `aim_atan2` and `clamp` entries below are **prism-host**
+> natives (per `extensions/README.md` "What stayed in prism"), not the
+> standard `math` extension. Free functions operating on `f32` values. None
+> of these are methods on a handle type; call them directly.
 
 | Function | Returns | Description |
 |---|---|---|
@@ -61,8 +67,17 @@ Free functions operating on `f32` values. None of these are methods on a handle 
 | `sin(v: f32)` | `f32` | Sine of `v`, in radians |
 | `cos(v: f32)` | `f32` | Cosine of `v`, in radians |
 | `tan(v: f32)` | `f32` | Tangent of `v`, in radians |
-| `aim_atan2(y: f32, x: f32)` | `f32` | `atan2(y, x)`, the angle of the vector `(x, y)` from the positive x-axis |
-| `clamp(v: f32, lo: f32, hi: f32)` | `f32` | Clamps `v` into the range `lo` to `hi` |
+| `sqrt_f64(v: f64)` | `f64` | Square root of `v` (f64) |
+| `sin_f64(v: f64)` | `f64` | Sine of `v` (f64) |
+| `cos_f64(v: f64)` | `f64` | Cosine of `v` (f64) |
+| `tan_f64(v: f64)` | `f64` | Tangent of `v` (f64) |
+| `floor_f64(v: f64)` | `f64` | Floor of `v` (f64) |
+| `ceil_f64(v: f64)` | `f64` | Ceiling of `v` (f64) |
+| `abs_f64(v: f64)` | `f64` | Absolute value of `v` (f64) |
+| `pow_f64(base: f64, exp: f64)` | `f64` | `base` raised to `exp` (f64) |
+| `abs_i64(v: i64)` | `i64` | Absolute value of `v` (i64) |
+| `aim_atan2(y: f32, x: f32)` | *(prism-host native, not the standard extension)* | Not registered by `ext_math`. |
+| `clamp(v: f32, lo: f32, hi: f32)` | *(prism-host native, not the standard extension)* | Not registered by `ext_math`. |
 
 ```ember
 let angle: f32 = aim_atan2(3.0f, 4.0f);
@@ -244,4 +259,4 @@ assert_eq_f32(mat4_get(m, 3, 0), 5.0f);
 
 ---
 
-> **NOTE:** For a complete script exercising every type on this page together (vec3 physics integration, vec4 color tinting, the quat Hamilton product, and mat4 scale composition), see the vector math example script in `examples/scripts/vector_math_demo.ember`.
+> **NOTE:** For a complete script exercising every type on this page together (vec3 physics integration, vec4 color tinting, the quat Hamilton product, and mat4 scale composition), see the vector math walkthrough in [30-examples/20-vector-math.md](../30-examples/20-vector-math.md). (That page's "Full Source" is illustrative; the `examples/scripts/vector_math_demo.ember` file it names does not exist in the tree — see the staleness notice on that page.)

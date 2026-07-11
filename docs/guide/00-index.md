@@ -1,5 +1,38 @@
 # Ember Developer Guide
 
+> **STALENESS NOTICE (2026-07-11):** this guide was written against an early
+> pre-v1.0 state of ember and has **not** been kept current with the v1.0
+> language. Several claims below are now **wrong** or **incomplete**:
+> - **Bounds checking IS now emitted at runtime** for slice/fixed-array
+>   indexing (`TrapReason::BoundsCheck`, `src/codegen.cpp`); this guide
+>   repeatedly says indexing is *not* bounds-checked — that is **false**.
+> - **Structs CAN now be passed by value** across a call boundary (≤8 bytes in
+>   a register, >8 bytes via the Win64 hidden-pointer path, native args up to
+>   128 bytes); this guide says they cannot — that is **false**.
+> - **`for (x in slice)` / `for (x in array_handle)` for-each**, **`match`**,
+>   **enums** (untyped + typed `enum E : T`), **`try`/`catch`/`throw`**,
+>   **`constexpr fn`**, **`static_assert`**, **namespaces**, **lambdas**,
+>   **coroutines** (`yield`), **parameterized `fn(Args)->Ret` types**, and
+>   **cross-module `&mod::fn` handles** all **shipped** and are **not**
+>   documented here.
+> - The **standard extension API** documented in §20-api is the **prism host's**
+>   native set (`print_str`/`print_f32`/`print_string`/`assert_eq_*`/
+>   `str_compare`/`str_length`/`aim_atan2`/`clamp`), **not** the natives the
+>   `ember` `io`/`string`/`math` extensions actually ship (`print`/`println`/
+>   `print_i64`/`print_f64`/`read_line`, `string_find`/`string_substr`,
+>   `floor_f64`/`ceil_f64`/`abs_f64`/`pow_f64`/`abs_i64`, ...). Several
+>   guide examples call natives that are **not** in the standard extension set.
+> - The example scripts referenced (`fibonacci.ember`, `vector_math_demo.ember`,
+>   `bubble_sort.ember`) **do not exist** in `examples/scripts/`; their
+>   "Full Source" blocks are illustrative, not real files.
+>
+> For **accurate, current** language + extension documentation, see the **spec
+> docs** (`docs/spec/TYPE_SYSTEM.md`, `COMPILER_PIPELINE.md`, `CODEGEN_SPEC.md`,
+> `SAFETY_AND_SANDBOX.md`, `BINDING_API.md`, `MEMORY_AND_GC.md`), the
+> **README.md**, `extensions/README.md`, and `docs/ROADMAP.md`. The fixes below
+> correct the most actively-false claims; a full guide rewrite is tracked as a
+> follow-up.
+
 Ember is a small, statically-typed scripting language that compiles to native code for embedding in host applications. It gives you fast, checked, near-native execution with a syntax deliberately kept close to C-family languages, plus a standard extension API surface (printing, assertions, string handling, math and vector types, arrays, and more) that every Ember host can expose into a running script.
 
 > **NOTE:** This guide is for people writing `.ember` scripts against *any* host application that embeds Ember. It documents the language itself and the standard extension API that ships with Ember. It does not cover the Ember compiler internals, code generation, or how to embed the Ember toolchain into a new host application. Host-specific natives (a particular host's drawing, memory access, UI widgets, and so on) are documented by that host, not here.

@@ -28,6 +28,13 @@ Neither of those can express "an array whose length is decided at runtime and ma
 | `array_set_i64` | `(h: i64, i: i64, v: i64) -> void` | Writes an `i64` element at index `i`. |
 | `array_get_i64` | `(h: i64, i: i64) -> i64` | Reads an `i64` element at index `i`. |
 | `array_push_u8` | `(h: i64, v: i64) -> void` | Appends a `u8` element, growing the array by one. |
+| `array_push_f32` | `(h: i64, v: f32) -> void` | Appends an `f32` element, growing the array by one. |
+| `array_push_i64` | `(h: i64, v: i64) -> void` | Appends an `i64` element, growing the array by one. |
+| `array_pop_u8` | `(h: i64) -> i64` | Removes and returns the last `u8` element. |
+| `array_pop_f32` | `(h: i64) -> f32` | Removes and returns the last `f32` element. |
+| `array_pop_i64` | `(h: i64) -> i64` | Removes and returns the last `i64` element. |
+| `array_clear` | `(h: i64) -> void` | Removes all elements (length → 0). |
+| `array_remove` | `(h: i64, i: i64) -> void` | Removes the element at index `i`, shifting later elements down. |
 
 ## Choosing `elem_size`
 
@@ -35,7 +42,7 @@ Neither of those can express "an array whose length is decided at runtime and ma
 
 ## Indexing
 
-The index parameter `i` on every `array_` accessor is a plain `i64`. Slice and fixed-array indexing (`arr[i]`) accepts any integer type for `i`, signed or unsigned, since sema only requires *some* integer type there too. Out-of-range indices are a host-side concern for the `array_` handle, and are entirely unchecked for `arr[i]` on a slice or fixed array as well, keep `i` within `[0, array_length(h))` (or the array/slice's own length) yourself.
+The index parameter `i` on every `array_` accessor is a plain `i64`. Slice and fixed-array indexing (`arr[i]`) accepts any integer type for `i`, signed or unsigned, since sema only requires *some* integer type there too. Out-of-range indices on the `array_` handle are a host-side concern (the extension's own bounds handling); `arr[i]` on a slice or fixed array **is bounds-checked at runtime** (a `TrapReason::BoundsCheck` trap, not UB — see `docs/spec/CODEGEN_SPEC.md` §9). Keep `i` within `[0, array_length(h))` (or the array/slice's own length) yourself for the `array_` handle accessors.
 
 ## Basic Usage
 

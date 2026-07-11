@@ -214,7 +214,12 @@ fn move_point(mut p: Point, dx: f32, dy: f32) -> f32 {
 }
 ```
 
-> **NOTE:** Structs cannot be passed by value across a function call boundary in this version of Ember. A function that needs to operate on a struct's fields takes those fields as separate scalar parameters instead of taking the struct itself.
+> **NOTE:** Structs **can** be passed by value across a function call
+> boundary (shipped 2026-07-10): ≤8 bytes in one register, >8 bytes via the
+> Win64 hidden-pointer by-value path, native by-value args up to 128 bytes.
+> The earlier "Structs cannot be passed by value in this version" note in
+> this guide is **false** — see `docs/spec/TYPE_SYSTEM.md` §12 +
+> `docs/spec/CODEGEN_SPEC.md` §16.
 
 ## Method-Call Sugar
 

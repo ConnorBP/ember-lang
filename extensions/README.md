@@ -199,15 +199,17 @@ accessor natives, so they expose no accessor.
 
 `ember/CMakeLists.txt` defines one static library per extension
 (`ember_ext_vec`, `ember_ext_quat`, `ember_ext_mat`, `ember_ext_string`,
-`ember_ext_array`, `ember_ext_math`, `ember_ext_sync`, `ember_ext_lifecycle`,
-`ember_ext_map`, `ember_ext_io`, plus the `ember_ext_opt`/`ember_ext_obf` pass-extension
-libs). Each links `ember_frontend` PUBLIC (for `make_prim`/`make_slice`/`Type` symbols,
+`ember_ext_array`, `ember_ext_math`, `ember_ext_map`, `ember_ext_sync`,
+`ember_ext_thread`, `ember_ext_coroutine`, `ember_ext_lifecycle`,
+`ember_ext_io`, `ember_ext_call_raw`, plus the `ember_ext_opt`/`ember_ext_obf`
+pass-extension libs). Each links `ember_frontend` PUBLIC (for `make_prim`/`make_slice`/`Type` symbols,
 defined in `ember_frontend`'s `types.cpp`) and exposes its `ext_*.hpp` header via
 a PUBLIC include directory. A consumer links whichever extensions it wants;
 prism links the original six (sync + lifecycle + map + io are host-arranged per consumer
 — see `examples/ext_sync_test.cpp` / `examples/ext_lifecycle_test.cpp` for
-the wiring; the standalone `ember` CLI links all ten addon extensions, plus the
-`opt`/`obf` pass extensions).
+the wiring; the standalone `ember` CLI links all thirteen addon extensions
+(vec/quat/mat/string/array/math/map/sync/thread/coroutine/lifecycle/io/call_raw),
+plus the `opt`/`obf` pass extensions).
 
 ## Purity
 

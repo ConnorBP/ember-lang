@@ -59,8 +59,13 @@ let y: i32 = x as i32;   // explicit narrowing cast required
 
 ## Structs
 
-A struct is a script-declared aggregate of named fields, laid out using MSVC x64 layout rules. Fields are
-separated by semicolons, not commas.
+A struct is a script-declared aggregate of named fields, laid out using
+**Ember's tight-packed layout** — fields are placed in declaration order at
+consecutive offsets with **no alignment padding and no trailing padding**
+(the offset of each field is the sum of the previous fields' Ember sizes;
+`build_struct_layouts` in `src/sema.cpp`). This is **not** MSVC/C layout; a
+host that needs a C-layout struct uses an explicit host-mapped struct
+(`BINDING_API.md`). Fields are separated by semicolons, not commas.
 
 ```ember
 struct Vec2i {
@@ -76,9 +81,15 @@ Struct rules:
 - Empty structs are allowed and have size 0, alignment 1.
 - Structs cannot declare methods directly. Any methods you see called with `obj.method(args)` syntax on a struct
   come from host-registered operator overloads, not script-side struct declarations.
-- Structs cannot be passed by value across a function call boundary in v1. This is a deliberate scope limit,
-  enforced as a sema error. A function that logically needs a struct's data takes the individual fields as
-  separate scalar parameters instead.
+- **Structs CAN be passed by value across a function call boundary** (shipped
+  2026-07-10). A struct ≤8 bytes is passed in one register; a struct >8 bytes
+  uses the Win64 hidden-pointer by-value path (caller allocates, passes a
+  pointer in the first arg slot, callee fills it). A native by-value arg is
+  rejected only if its registered struct size exceeds **128 bytes**. A fn can
+  also `return V3 { ... };` directly (a struct-literal return) and pass a
+  struct literal / struct-returning call as a by-value arg. The earlier
+  "structs cannot be passed by value in v1" claim in this guide is **false** —
+  see `docs/spec/TYPE_SYSTEM.md` §12 + `docs/spec/CODEGEN_SPEC.md` §16.
 
 ```ember
 struct Rect {
@@ -98,6 +109,9 @@ Struct values are read and written field by field with `.` access:
 ```ember
 let mut r: Rect = Rect { width: 4.0, height: 2.0 };
 let a: f32 = area(r.width, r.height);
+// structs can also be passed by value now:
+fn rect_area(r: Rect) -> f32 { return r.width * r.height; }
+let a2: f32 = rect_area(r);
 ```
 
 See [Declarations](20-declarations.md) for full `struct` declaration syntax and field initialization.
@@ -113,9 +127,14 @@ let first: i32 = scores[0u];
 ```
 
 An array index can be any integer type, signed or unsigned (`i8`...`i64`, `u8`...`u64`); sema only requires the
-index expression to be *some* integer type. Indexing is **not** bounds-checked at runtime: an out-of-range index
-computes an address past the end of the array (or slice) and reads or writes whatever memory is there instead of
-trapping. Keeping every index inside `[0, N)` is entirely the script's responsibility.
+index expression to be *some* integer type. Indexing **is bounds-checked at
+runtime**: an out-of-range index (including a negative signed index, which
+appears as a huge unsigned value under the single unsigned `cmp`/`jae`) traps
+via `TrapReason::BoundsCheck` — a recoverable non-local unwind to the host,
+not undefined behavior. A compile-time-constant index into a fixed array of
+known size is checked at **compile time** instead (zero runtime cost). Keeping
+indices in range is still good practice (the trap aborts the call), but the
+language no longer silently reads/writes past the end.
 
 ```ember
 let mut buf: u8[16];
@@ -136,7 +155,9 @@ let mut buf: u8[16];
 let view: u8[] = buf[..];
 ```
 
-Like fixed arrays, slice indexing accepts any integer index type and is not bounds-checked at runtime.
+Like fixed arrays, slice indexing accepts any integer index type and is
+**bounds-checked at runtime** (a slice's length is a runtime field, so the
+check is always a runtime `cmp idx, len; jae .trap`).
 
 ```ember
 fn sum_all(values: u32[]) -> u64 {
@@ -264,7 +285,7 @@ Exact constructor and accessor names are listed in [Arrays](../20-api/50-arrays.
 | Boolean | `bool` | value | none |
 | Integer | `i8`...`i64`, `u8`...`u64` | value | none |
 | Floating point | `f32`, `f64` | value | none |
-| Struct | script-declared `struct Name { ... }` | value | none, and cannot cross call boundaries by value |
+| Struct | script-declared `struct Name { ... }` | value | none (tight-packed; passable by value — ≤8B in a register, >8B via hidden pointer) |
 | Fixed array | `T[N]` | value | none (contiguous inline storage) |
 | Slice | `T[]` | value (pointer + length) | one level, the only indirection in Ember |
 | String literal | `"..."`, `f"...{}..."` | converts to slice or handle by context | n/a |

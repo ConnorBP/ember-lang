@@ -346,9 +346,16 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
   lowers the loop to that type's length + element-access primitives. Only the
   array case is implemented now; the rest is deferred. Dep: per-type length/
   element-access primitives (a map would need map_size + map_iter, etc.).
-- **Struct destructure + guards in match** - **TODO.** A later refinement of
-  the shipped `match`: let a pattern destructure a struct (`Point{ x, y } =>`)
-  and carry a guard (`Point{ x, y } if x > 0 =>`). Dep: parser + sema work.
+- **Struct destructure + guards in match** - **✓ SHIPPED** (Tier 1). A
+  match arm pattern can destructure a struct (`Point{x, y} =>` or
+  `Point{x: 0, y: 0} =>`) and carry an optional guard (`Point{x, y} if x > 0
+  =>`). The parser builds a `StructPattern` (`parse_match` / `parse_pattern`,
+  `src/parser.cpp`); sema type-checks the pattern against the subject struct
+  and binds captured fields as locals (`src/sema.cpp`); codegen emits the
+  per-arm struct-destructure match (`src/codegen.cpp`). The subject must be a
+  struct (a non-struct subject with a struct pattern is a sema error).
+  Pinned by `tests/lang/valid_struct_destructure.ember` +
+  `tests/lang/valid_match_guards.ember`.
 
 ## Tier 2 - function references + dynamic registration
 
@@ -384,19 +391,28 @@ needed - pure host C++ against the v1 `NativeFn`/`TypeBuilder` API.
     budgets/bounds. This is a **type-soundness hole, not a sandbox
     violation** (a `let f: fn = &add; f(1);` call dispatches into `add`
     with `rcx=1, rdx=garbage` and returns a garbage result with no sema
-    error). The fix is `fn(i64)->i64` parameterized function types (a
-    real type-system expansion — signature equality, parameterized
-    types) — **TODO**. The guard ensures the *call target* is always
-    safe; the *args* are the caller's responsibility at the bare-`fn`
-    type, same as a C function pointer with no prototype.
-  - **Cross-module function handles — TODO.** `&mod::fn` /
-    `mod::fn` returning a handle is not in scope: the allowlist is
-    per-module (built from this module's `script_slots`), and a handle
-    from another module is that module's slot index, meaningless against
-    this module's dispatch table. Cross-module handles need either a
-    global `(module_id, slot)` handle space or per-module allowlists with
-    a guard that knows which module a handle is for. Tier 2 ships
-    intra-module handles only.
+    error). **The fix — `fn(i64)->i64` parameterized function types —
+    ✓ SHIPPED.** A `fn(Args)->Ret`-typed parameter records its signature
+    (`has_recorded_sig`) and sema type-checks the call-site args against
+    it, closing the hole for the typed form; a bare `fn` stays the unsound
+    backward-compat fallback (the runtime guard still validates the
+    handle). Supports higher-order types (`fn(i64)->fn(i64)->i64`,
+    `fn(fn(i64)->i64)->i64`), `fn()->void`, and fn types in struct fields.
+    Pinned by `examples/fn_types_test.cpp` (ctest `fn_types`) +
+    `tests/lang/valid_fn_types.ember`. The guard ensures the *call target*
+    is always safe; with a typed `fn(Args)->Ret` the *args* are now
+    type-checked too. The bare-`fn` form remains for backward compat.
+  - **Cross-module function handles — ✓ SHIPPED.** `&mod::fn` produces a
+    CROSS-MODULE handle (`is_cross_module_handle=true` + `module_alias` +
+    `fn_name`, `src/ast.hpp`). Sema resolves it against the linked module's
+    export table and records `(cross_module_id, cross_module_slot)`; the
+    runtime call-target-provenance guard validates the handle against a
+    per-module allowlist before dispatch through the module registry
+    (`CallCrossModule`). `Type::same` treats a cross-module handle and an
+    intra-module handle with matching recorded sigs as compatible (a
+    hatch so a cross-module handle can still be passed to a `fn`-typed
+    param). Pinned by `examples/cross_module_handles_test.cpp` (ctest
+    `cross_module_handles`) + `tests/lang/sema_invalid_cross_module_handle_unlinked.ember`.
 
 - **`register_routine`-style dynamic registration** ✓ shipped v1.0 (follow-on
   commits) — the host-native half of the surveyed native-JIT language's
@@ -423,37 +439,80 @@ OOP/polymorphism (classes, interfaces, mixins, templates) was moved to the
 hard non-goals (ember is C-style procedural, not OOP). GC stays — it unlocks
 lambdas-with-capture and coroutines, not classes.
 
-- **Tracing GC** - TODO. Unlocks lambdas with by-reference capture and
-  coroutines (suspended-frame heap storage), NOT classes (OOP is a non-goal).
-  `spec/MEMORY_AND_GC.md` Section 8 has the design rationale. Dep: a
-  write-barrier or safepoint-based GC (mark-sweep or incremental), root
-  scanning across JIT frames (needs frame-layout metadata retained per
-  function - `spec/CODEGEN_SPEC.md` Section 2 already specifies the frame layout
-  in a GC-friendly shape, so the metadata is derivable). Significant subsystem.
-- **`new`/`delete` + lambdas with capture** - TODO, depends on GC. Lambdas
-  that capture by value can be done without GC (capture is a struct copy);
-  by-reference capture needs GC for the captured refs' lifetime. Dep: GC.
+- **Tracing GC** - **✓ CORE SHIPPED** (foundational infra); full script-visible
+  heap objects still TODO. A tracing mark-sweep GC core (`src/gc.{hpp,cpp}`,
+  `ember::gc::GcHeap`) has shipped as the foundational infrastructure for
+  lambdas-with-capture (#20) and coroutines (#21): `alloc`/`collect`/
+  `add_root`/`remove_root`, precise root scanning via `RefMap` (which byte
+  offsets hold GC pointers), mark-sweep over the reachable graph, cycle
+  collection, and stats. Pinned by `examples/gc_test.cpp` (ctest `gc_core`).
+  The core is **not yet wired into codegen/sema** — lambdas currently use a
+  frame-based env_ptr (by-value capture is a struct copy into a temp frame
+  slot), and coroutines use Windows fibers, so no script-visible heap object
+  requires tracing yet. The remaining TODO is the integration: root scanning
+  across JIT frames (needs frame-layout metadata retained per function —
+  `spec/CODEGEN_SPEC.md` Section 2 already specifies the frame layout in a
+  GC-friendly shape, so the metadata is derivable) + a write-barrier or
+  safepoint-based collection strategy. `spec/MEMORY_AND_GC.md` Section 8 has
+  the design rationale (the "v2 GC deferral" framing there is superseded by
+  the shipped core — see this section's MEMORY_AND_GC update).
+- **Lambdas with by-value capture** - **✓ SHIPPED** (#20, no GC needed).
+  A lambda (`fn(args){body}` with an optional capture list) is a 16-byte
+  pair `{fn_slot, env_ptr}`; by-value capture is a struct copy into a
+  compiler-hidden env temp frame slot (no GC — the env lives in the frame
+  for the lambda's lifetime). Sema sets `is_lambda`; a lambda-typed local is
+  called via a dedicated path that passes `env_ptr` as the hidden first arg.
+  Supports nested capture, lambda-as-argument, and no-capture lambdas.
+  Pinned by `tests/lang/valid_lambda.ember` + `valid_lambda_as_arg.ember` +
+  `valid_lambda_nested.ember` + `valid_lambda_no_capture.ember`.
+  **By-reference capture + `new`/`delete`** remain TODO (depend on the GC
+  integration above — by-ref capture needs GC for the captured refs'
+  lifetime; a `new`/`delete` script-visible heap needs the GC wired into
+  codegen). Dep: GC integration.
 
 ## Tier 4 - concurrency + exceptions (was Tier 5)
 
-- **Coroutines / `yield`** - **TODO** (blocked on GC/heap). Needs suspended-
-  frame storage (copy a frame off the native stack into a heap allocation on
-  `yield`, restore on `next()`). A real game wants script-driven cutscenes/AI
-  with sequential-looking code. Dep: heap/GC for the suspended frame storage
-  (Tier 3). Moderate.
-- **Exceptions `try`/`catch`/`throw`** - **TODO.** v1's `runtime_error`/
-  `runtime_exception` host-signal + non-local unwind
-  (`spec/SAFETY_AND_SANDBOX.md` Section 7) covers host→script abort. In-language
-  `try`/`catch` is a different thing (script catches script-thrown errors at
-  specific frames). Dep: per-frame catch-handler registration (extends the
-  checkpoint stack in `spec/SAFETY_AND_SANDBOX.md` Section 2). Moderate, but
-  complicates the unwind machinery.
-- **In-context threads (`thread` addon, `aint*` atomics)** - **TODO** (largest,
-  highest-risk). Multithreaded script execution inside one context. Dep: GC
-  thread-safety, per-context arena, the whole memory model gets harder.
-  Multi-context parallelism (shipped) covers most real cases without in-
-  context threading; this is the residual case for compute-heavy mods that
-  need parallelism within one script context.
+- **Coroutines / `yield`** - **✓ SHIPPED** (Tier 4). `yield expr;`
+  suspends a coroutine and emits `expr` as the next value; `coroutine_start`/
+  `coroutine_next`/`coroutine_done` (the `coroutine` extension,
+  `extensions/coroutine/`, `ember_ext_coroutine`) drive it over **Windows fibers**
+  (NOT the GC/heap the original entry predicted — a fiber copies the frame
+  off the native stack on `yield` and restores it on `next()`, so no GC is
+  needed). Sema marks a fn containing `yield` as `is_coroutine`; the
+  tree-walker lowers `yield` to the `__ember_coro_yield` native with shadow-
+  space setup. The IR backend falls back to the tree-walker for coroutines
+  (non_serializable). Pinned by `tests/lang/valid_coroutine_*` (basic, arg,
+  control_flow, done, interleaved). The original "blocked on GC/heap" dep was
+  resolved by the fiber approach — GC is not required.
+- **Exceptions `try`/`catch`/`throw`** - **✓ SHIPPED** (Tier 4).
+  `try { ... } catch (name) { ... }` establishes a catch handler; `throw expr;`
+  raises an exception (an `i64` value for v1) that unwinds to the nearest
+  enclosing catch. The `catch_name` is bound as an `i64` local holding the
+  thrown value (sema); codegen reads it from `context_t::thrown_value` after
+  the longjmp-to-catch resumes. The catch stack is `context_t::catch_bufs`
+  (per-frame catch-handler registration, extending the checkpoint machinery
+  `SAFETY_AND_SANDBOX.md` §2 exactly as the original entry's dep named). A
+  throw with no enclosing `try` falls through to the host checkpoint as a
+  `TrapReason::UnhandledThrow` (a recoverable runtime trap, not a sema
+  error — the script may legitimately throw from a fn with no try, expecting
+  a host catch). Pinned by `examples/try_catch_test.cpp` (ctest `try_catch`)
+  + `tests/lang/valid_try_catch`/`valid_nested_try_catch`/`valid_throw_*`/
+  `valid_catch_return`/`valid_try_return`/`sema_invalid_throw_*`.
+- **In-context threads (`thread` addon, `aint*` atomics)** - **✓ PARTIALLY
+  SHIPPED** (Tier 4). The `thread` extension (`extensions/thread/`,
+  `ember_ext_thread`) ships `thread_spawn(fn h, i64 data)` / `thread_join` /
+  `thread_trap_reason` — a script can spawn a worker that runs a fn handle on
+  its **own `context_t`**, serialized against the caller via a per-context
+  `call_mutex` (the multi-context model, not concurrent calls on one
+  context). Pinned by `examples/in_context_threads_test.cpp` (ctest
+  `in_context_threads`). The `aint*` atomics live in the `sync` extension
+  (`extensions/sync/`, shipped v1.0 — see the shipped bullet below). The
+  residual TODO is **true concurrent execution inside one `context_t`**
+  (two ember-calling threads on one context still races — the `call_mutex`
+  serializes, it does not parallelize); that needs GC thread-safety, a
+  per-context arena, and a relaxed memory model. Multi-context parallelism
+  (shipped) + the `thread` addon cover most real cases; true in-context
+  parallelism is the remaining compute-heavy-mod case.
 
   **Shipped v1.0 (the two pieces short of in-context threading):**
   - **Context thread-safety (Option D + B1).** A `context_t` is per-thread
@@ -507,9 +566,14 @@ lambdas-with-capture and coroutines, not classes.
 ## Tier 6 - language ecosystem (never strictly required)
 
 - **Modules / live `link`** ✓ shipped in v0.5 — bidirectional script↔`.em` cross-module linking. `link "foo.em" as foo;` loads+registers a pre-compiled `.em` (or `link "foo" as foo;` links to an already-registered module); `foo::bar(args)` is the cross-module call. The runtime half (ModuleRegistry + kind-2 reloc) was built earlier; v0.5 added the source half (grammar, sema resolution, codegen emission, a linker/loader, an `--emit-em` pre-compile CLI mode). See `MODULES.md` (now implemented, not just a design sketch) + `examples/v0_5_live_modules_test.cpp`. The *textual* `import "path";` (parse-time source merge into one module) is unchanged and remains the one-file-bundle mechanism. Open: the `link` to an already-registered module (bare-name form) is host-driven in v0.5 (a host pre-registers); a future linker could resolve bare-name links against a module search path.
-- **Namespaces** - **TODO.** Name scoping within a module. Dep: modules
-  (now shipped), or usable standalone. Trigger: module size makes flat scope
-  crowded.
+- **Namespaces** - **✓ SHIPPED** (Tier 6). `namespace Name { fn... global...
+  struct... enum... }` is a naming prefix — its members are qualified as
+  `Name::member`. The parser flattens a namespace decl into the `Program`'s
+  existing vectors, stamping each member's `ns` field with the namespace name;
+  sema resolves `Name::member` references against the `ns` prefix. A member
+  inside a namespace is callable intra-namespace by bare name and cross-
+  namespace by qualified name. Pinned by `tests/lang/valid_namespaces.ember` +
+  `valid_namespaces_intra_call.ember` + `valid_namespaces_two_ns.ember`.
 - **Preprocessor** - deliberately never; `engine.define(name,value)`
   (`planning/DESIGN.md` Section 8) + `const`/`constexpr` cover the legitimate
   compile-time-conditional needs without C-preprocessor footguns.
@@ -901,7 +965,7 @@ pervasive and error-prone.
 
 ### Family A — compute-engine CLI (no new natives; shipped/next)
 
-- **`ember bench`** — SHIPPED (2026-07-10, commit pending). Microbenchmark
+- **`ember bench`** — ✓ SHIPPED (2026-07-10). Microbenchmark
   the entry fn: warmup + N timed iterations, each under its own fresh
   checkpoint. Reports min/median/mean/p99/max/stddev/CV% + the return value +
   machine/compiler/date provenance. **Closes the 07-09 §6.1/§6.3
@@ -961,16 +1025,23 @@ scope/state notes and `docs/planning/plan_OS_IO_EXTENSIONS.md` for the
 full-plan extension surface (directory listing + subprocess execution as
 separate sub-registration functions, still future).
 
-### Family C — ember as a unique compute module/pipeline tool (TODO)
+### Family C — ember as a unique compute module/pipeline tool (SHIPPED)
 
-- **`ember pipe`** — **TODO.** A dataflow pipeline runner: load several `.em`
-  modules, wire their functions into a directed graph (`A.process -> B.reduce`),
-  run a stream of i64 values through it, report the transformed result.
-  Exercises the bundler + module linking + the array/sync extensions. "ember as
-  a dataflow compute kernel" — distinct from a general script runner.
-- **`ember live`** — **TODO.** A live-coding/reload runner: `--tick` +
+- **`ember pipe`** — **✓ SHIPPED.** A dataflow pipeline runner: load several
+  `.em` modules, wire their functions into a directed stage graph
+  (`A.process -> B.reduce`), run a stream of i64 values through it, report the
+  transformed result. Exercises the bundler + module linking + the array/sync
+  extensions. Implemented in `examples/ember_cli.cpp` (the `ember pipe
+  <config>` action); pipeline config files use the `.pipe` extension (see
+  `tests/features/pipe_2stage.pipe`, `pipe_3stage.pipe`, `pipe_a/b/c.ember`).
+  Pinned by `examples/ember_cli_pipe_live_test.cpp` (ctest
+  `ember_cli_pipe_live`).
+- **`ember live`** — **✓ SHIPPED.** A live-coding/reload runner: `--tick` +
   hot-reload watching a `.ember` file, recompiling on change, showing the tick
-  output evolve. Turns the hot-reload demo into a tool.
+  output evolve (the `HotReloadDomain` + `ExecutionGuard` machinery, `src/hot_reload.hpp`).
+  Implemented in `examples/ember_cli.cpp` (the `ember live <file.ember>`
+  action). Pinned by the same `ember_cli_pipe_live` ctest +
+  `tests/features/live_tick.ember`.
 
 ### Standalone exe bundler — TODO
 

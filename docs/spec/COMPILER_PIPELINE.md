@@ -754,7 +754,23 @@ struct Diagnostic {
   the same compile - same best-effort-continuation philosophy as the
   lexer (Section 1), not a guarantee of zero cascade errors.
 
-## 8. Deferred regalloc/codegen interface (not implemented)
+## 8. Deferred full-SSA regalloc/codegen interface (a linear-scan subset shipped)
+
+> **Status update (2026-07-11):** a **linear-scan register allocator over the
+> thin IR has shipped** as Stage 3 (`src/regalloc.{hpp,cpp}`, `run_regalloc`,
+> wired into `compile_func` at `src/codegen.cpp` behind `CodeGenCtx::
+> enable_regalloc` — default off, only effective when `enable_ir_backend` is
+> also true). It assigns scalar int/bool VRegs to Win64 callee-saved
+> registers (rbx/rsi/rdi/r12/r13/r15) with linear-scan spilling to frame slots
+> under pressure, and the emit consumes the regalloc map. Pinned by
+> `examples/regalloc_test.cpp` (ctest `regalloc`). **What remains future** is
+> the full SSA-lite design below — SSA renaming, phi nodes, and the
+> `IrFunction`/`run_linear_scan` interface this section specifies (a different,
+> richer IR than the shipped `ThinFunction`). The shipped regalloc is the
+> linear-scan-over-thin-IR subset of this target; the `ThinOp` instruction set
+> is a subset of the `IrInstr::Op` vocabulary, so the full-SSA upgrade is
+> additive. See `codegen.hpp` (`enable_regalloc` + the Stage-3 note) and
+> `../ROADMAP.md` "Codegen optimization" Stage 3 (TODO).
 
 ```cpp
 // lowering produces this; regalloc consumes it and produces physical assignments;

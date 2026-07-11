@@ -1,5 +1,13 @@
 # Bubble Sort
 
+> **STALENESS NOTICE (2026-07-11):** the file `examples/scripts/bubble_sort.ember`
+> **does not exist** in the tree. The "Full Source" below is illustrative. It
+> uses `assert_eq_i64`, a **prism-host** native not registered by the
+> standalone `ember` CLI, and repeats two pre-v1.0 claims that are now
+> **false**: that indexing is not bounds-checked (it **is** —
+> `TrapReason::BoundsCheck`), and that `for` has no for-each form (`for (x in
+> slice)` shipped). The algorithm walkthrough itself is still accurate.
+
 This page walks through `examples/scripts/bubble_sort.ember`, a small script that sorts a fixed-size array of
 eight `i64` values in place using the classic bubble sort algorithm. It is a compact demonstration of three
 things at once: fixed arrays with indexed read and write, C-style nested `for` loops, and the `arr[..]` view
@@ -60,9 +68,10 @@ Each `arr[i] = value` is an indexed write: an assignment whose left-hand side is
 of a plain variable name. Reading an element back out, as in `a[i]` inside `is_sorted`, is the same indexing
 syntax used as an expression instead of an assignment target. The index literals here (`0`, `1`, `2`, and so on)
 are plain `i64` in this snippet; sema only requires an index to be *some* integer type, signed or unsigned, so a
-plain `i64` literal (or variable) works directly as an index. Note also that indexing is not bounds-checked at
-runtime: an out-of-range index computes an address past the end of the array and reads or writes whatever memory
-happens to be there instead of trapping, so keeping every index inside `[0, N)` is the script's responsibility.
+plain `i64` literal (or variable) works directly as an index. Note also that indexing **is bounds-checked at
+runtime**: an out-of-range index traps via `TrapReason::BoundsCheck` (a recoverable non-local unwind to the
+host), rather than reading/writing past the end. The earlier "indexing is not bounds-checked" claim in this
+guide is false — see `docs/spec/CODEGEN_SPEC.md` §9.
 For the full rule on index types, see [Types](../10-language/10-types.md).
 
 ## The Nested-Loop Sort
@@ -99,8 +108,10 @@ This is the standard three-step swap: without `tmp` holding the original `arr[j]
 overwrite `arr[j]` before its old value could be written into `arr[j + 1]`. `tmp` is declared fresh inside the
 `if` block, so a new binding is created on every swap and none of it survives past that block's closing brace.
 
-Both `for` loops here desugar internally to `while` loops; Ember's `for` is C-style three-clause only (init,
-condition, step) with no range or for-each form. See [Statements](../10-language/30-statements.md) for the full
+Both `for` loops here desugar internally to `while` loops; Ember's `for` is C-style three-clause (init,
+condition, step), **and** also ships a `for (x in slice)` / `for (x in array_handle)` for-each form (see
+[Statements](../10-language/30-statements.md)). The manual index loop here is used because the sort needs the
+index to shrink the inner bound. See [Statements](../10-language/30-statements.md) for the full
 loop and control-flow reference.
 
 ## Checking Order With a Slice Parameter

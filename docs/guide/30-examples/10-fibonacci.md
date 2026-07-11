@@ -1,5 +1,14 @@
 # Example: fibonacci.ember
 
+> **STALENESS NOTICE (2026-07-11):** the file `examples/scripts/fibonacci.ember`
+> **does not exist** in the tree (the real file is `examples/scripts/fib.ember`,
+> a much shorter `fib(10)` script whose content does **not** match the "Full
+> Source" below). The "Full Source" here is illustrative. It also uses
+> `assert_eq_i64`, a **prism-host** native not registered by the standalone
+> `ember` CLI, and repeats the (false) pre-v1.0 claim that `for` has no
+> for-each form — `for (x in slice)` shipped. See `examples/scripts/fib.ember`
+> for the real canonical recursion + dispatch-call test.
+
 This example lives at `examples/scripts/fibonacci.ember`. It is a good first non-trivial script to read end to end: it defines two versions of the same computation, cross-checks them against each other with assertions, and uses a global counter plus `defer` to prove that a piece of cleanup logic ran exactly once. Nothing here touches the host application beyond printing; the whole script runs on plain Ember control flow and arithmetic.
 
 ## Full Source
@@ -56,7 +65,7 @@ fn main() -> i64 {
 
 `fib_recursive` is the textbook definition translated directly into Ember: `fib(0) = 0`, `fib(1) = 1`, and every later term is the sum of the two before it. The base case `if (n <= 1) { return n; }` handles both `fib(0)` and `fib(1)` in one branch, and the recursive case adds the two smaller calls together.
 
-`fib_iterative` computes the same sequence with a running pair of accumulators instead of recursion. `a` and `b` start as `fib(0)` and `fib(1)`, and the `for` loop walks forward from index `2` up to `n`, sliding `b` into `a` and the new sum into `b` on each step. Because Ember's `for` is C-style three-clause only (see [Statements](../10-language/30-statements.md)), the loop variable `i` is declared right in the init clause and scoped to the loop.
+`fib_iterative` computes the same sequence with a running pair of accumulators instead of recursion. `a` and `b` start as `fib(0)` and `fib(1)`, and the `for` loop walks forward from index `2` up to `n`, sliding `b` into `a` and the new sum into `b` on each step. Ember's `for` is C-style three-clause (see [Statements](../10-language/30-statements.md); a `for (x in slice)` for-each form also shipped), so the loop variable `i` is declared right in the init clause and scoped to the loop.
 
 The two functions exist side by side deliberately. `fib_recursive` is easy to read and obviously correct against the definition, but it does redundant work, recomputing the same sub-terms many times, and its call depth grows with `n`. `fib_iterative` does a fixed amount of work per term and never recurses, so it is the version `print_sequence` actually calls in a loop. Keeping both in the same script gives you a slow-but-obviously-right oracle to check the fast-but-less-obviously-right version against, which is exactly what `main` does.
 

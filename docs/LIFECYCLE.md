@@ -117,12 +117,25 @@ for the `HotReloadDomain`-based migration recipe).
 
 ## 5. What this deliberately does NOT cover (cross-ref)
 
-- Coroutines / `yield` (`ROADMAP.md` Tier 5) - v1 has no sequential-
-  looking-code primitive; per-frame routines + state in globals is
-  the v1 state-machine pattern (adequate for most game tick logic).
-- Exceptions caught in-script (`ROADMAP.md` Tier 5) - a routine that
-  faults aborts the whole `ember_call_void`/`ember_call_i64` invocation via the non-local unwind
-  (`spec/SAFETY_AND_SANDBOX.md` Section 2/Section 7); the host logs and the routine is
-  simply not rescheduled if the host decides (the host controls the
-  per-frame call loop, so "stop calling a faulting routine" is a
-  host-side policy, not an ember mechanism).
+- **Coroutines / `yield`** (`ROADMAP.md` Tier 4) — **shipped** as the
+  `coroutine` extension (`extensions/coroutine/`, `ember_ext_coroutine`):
+  `coroutine_start`/`coroutine_next`/`coroutine_done` over Windows fibers, a
+  `yield expr;` statement (sema marks the containing fn `is_coroutine`), and
+  the `__ember_coro_yield` native the tree-walker lowers `yield` to. Pinned by
+  the `tests/lang/valid_coroutine_*` lang tests. The per-frame `@on_tick` /
+  `@event` routine model in §1–§2 is the *static* state-machine pattern;
+  coroutines are the *sequential-looking-code* primitive on top of it. See
+  `ROADMAP.md` Tier 4 (coroutines ✓ shipped).
+- **Exceptions caught in-script** (`ROADMAP.md` Tier 4) — **shipped** as
+  `try { ... } catch (name) { ... }` / `throw expr;` (`TryCatchStmt` /
+  `ThrowStmt` in `src/ast.hpp`). A `throw` (an `i64` value for v1) unwinds to
+  the nearest enclosing `catch` via the per-context catch-handler stack
+  (`context_t::catch_bufs`); a throw with no enclosing `try` falls through to
+  the host checkpoint as a `TrapReason::UnhandledThrow` (a recoverable runtime
+  trap, not a sema error). Pinned by the `try_catch` ctest + the
+  `tests/lang/valid_try_catch`/`valid_nested_try_catch`/`valid_throw_*` lang
+  tests. See `ROADMAP.md` Tier 4 (exceptions ✓ shipped). Before try/catch
+  shipped, a routine that faulted aborted the whole `ember_call_void`/
+  `ember_call_i64` invocation via the non-local unwind
+  (`spec/SAFETY_AND_SANDBOX.md` Section 2/Section 7); in-language `try`/`catch`
+  now lets the script recover at a chosen frame instead.

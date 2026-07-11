@@ -1,5 +1,19 @@
 # I/O and Debug
 
+> **STALENESS NOTICE (2026-07-11):** this page documents `print_i64`,
+> `print_f32`, and `print_str`. **Only `print_i64` is in the standard `io`
+> extension.** The actual `io` extension (`extensions/io/ext_io.cpp`) ships:
+> `print(s: string)`, `println(s: string)`, `print_i64(n: i64)`,
+> `print_f64(n: f64)`, `read_line() -> string`, `file_read_bytes(path) ->
+> array<u8>`, `file_write_bytes(path, buf) -> i64`, `file_exists(path) -> i64`,
+> `path_exists(p) -> i64`, `path_basename(p) -> string`, `path_dirname(p) ->
+> string` — **all `PERM_FFI`-gated** (the CLI grants the bit via `--ffi` /
+> `--allow-io`). `print_f32` and `print_str` are **prism-host** natives (per
+> `extensions/AUDIT.md`), not the standard extension. The examples below use
+> the prism naming and are not accurate against the standalone `ember` CLI;
+> see `extensions/README.md` + `docs/ROADMAP.md` (Family B) for the real
+> surface. A full rewrite of this page is tracked as a follow-up.
+
 These are the native functions Ember scripts use to get information out to the host: raw value printing. They are the first natives most scripts touch, since they are the only way to observe what a running script is doing without a debugger attached.
 
 All functions on this page return `void`. They are one-way: value in, text out. None of them read anything back into the script.
@@ -10,9 +24,21 @@ A host may expose additional printing natives on top of these (for example a str
 
 | Function | Signature | Purpose |
 |---|---|---|
-| `print_i64` | `print_i64(v: i64) -> void` | Print a 64-bit integer |
-| `print_f32` | `print_f32(v: f32) -> void` | Print a 32-bit float |
-| `print_str` | `print_str(s: u8[]) -> void` | Print a raw byte slice |
+| `print` | `print(s: string) -> void` | Print a string handle (io extension, `PERM_FFI`-gated) |
+| `println` | `println(s: string) -> void` | Print a string handle + newline (io extension, `PERM_FFI`-gated) |
+| `print_i64` | `print_i64(v: i64) -> void` | Print a 64-bit integer (io extension, `PERM_FFI`-gated) |
+| `print_f64` | `print_f64(v: f64) -> void` | Print a 64-bit float (io extension, `PERM_FFI`-gated) |
+| `read_line` | `read_line() -> string` | Read a line from stdin into a string handle (io extension, `PERM_FFI`-gated) |
+| `file_read_bytes` | `file_read_bytes(path: string) -> array<u8>` | Read a file into a byte array handle (io extension, `PERM_FFI`-gated) |
+| `file_write_bytes` | `file_write_bytes(path: string, buf: array<u8>) -> i64` | Write a byte array to a file (io extension, `PERM_FFI`-gated) |
+| `file_exists` | `file_exists(path: string) -> i64` | 1 if the file exists, 0 otherwise (io extension, `PERM_FFI`-gated) |
+| `path_exists` | `path_exists(p: string) -> i64` | 1 if the path exists, 0 otherwise (io extension, `PERM_FFI`-gated) |
+| `path_basename` | `path_basename(p: string) -> string` | The basename of a path (io extension, `PERM_FFI`-gated) |
+| `path_dirname` | `path_dirname(p: string) -> string` | The dirname of a path (io extension, `PERM_FFI`-gated) |
+
+> The `print_f32` and `print_str` entries in the original version of this page
+> are **prism-host** natives, not the standard `io` extension — they are not
+> registered by `ext_io::register_natives`.
 
 ## print_i64
 

@@ -51,7 +51,10 @@ for (let mut i: i64 = 0; i < 5; i += 1) {
 }
 ```
 
-`for` is strictly C-style with three clauses (init, condition, step) separated by semicolons. There is no range-based or for-each form in Ember, iterating a slice or array means writing an index-based loop by hand:
+`for` is strictly C-style with three clauses (init, condition, step) separated by semicolons. **Ember also
+ships a `for (x in slice)` / `for (x in array_handle)` for-each form** (see
+`docs/spec/TYPE_SYSTEM.md` §13.2 + `CODEGEN_SPEC.md` §17) — the index-based
+loop below is the manual alternative when you need the index:
 
 ```ember
 fn sum_all(values: i64[], count: u64) -> i64 {
@@ -165,6 +168,13 @@ fn log_only(msg: string) {
 A void function (no `-> rettype`, or an explicit `-> void`) uses a bare `return;` with no expression, or may omit a final `return` entirely and just fall off the end of the block. A value-returning function must return a value of the declared return type on every possible path through its body, sema checks this exhaustively and rejects any function where a path exists that does not end in a `return expr;`. This is what drives the trailing-return-after-switch requirement described above.
 
 ## defer
+
+> **Also shipped (not documented in this guide):** `match (expr) { pat =>
+> body, _ => default }` pattern matching (no fallthrough, integer/bool
+> literals + `_` wildcard + **struct destructure patterns + guards** —
+> `Point{x, y} if x > 0 =>`; see `docs/spec/CODEGEN_SPEC.md` §18), and
+> `try { ... } catch (name) { ... }` / `throw expr;` in-language exceptions
+> (see `docs/ROADMAP.md` Tier 4). This guide predates both.
 
 ```ember
 fn demo() {

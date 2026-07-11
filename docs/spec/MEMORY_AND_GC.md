@@ -29,7 +29,10 @@ exactly one of these)
 
 There is deliberately **no** category for "script-owned heap object
 with unknown lifetime" - that category is what a GC would exist to
-manage, and ../planning/DESIGN.md Section 1 excludes a GC from v1. Every category above
+manage, and ../planning/DESIGN.md Section 1 excludes a **script-visible** GC
+heap from v1 (a tracing GC **core** has shipped as foundational infra —
+`src/gc.{hpp,cpp}` — but is not yet wired into codegen; see Section 8).
+Every category above
 has a lifetime that's either lexically scoped (1), externally owned
 (2), or engine-object-scoped (3/4) - no case requires tracing.
 
@@ -268,7 +271,21 @@ No array representation in this language ever implies heap ownership
  -  consistent with "no script-managed heap" (../planning/DESIGN.md Section 7) holding all
 the way down.
 
-## 8. v2 GC deferral - explicit rationale (not just "later")
+## 8. GC status - core shipped; full integration deferred (not just "later")
+
+> **Status update (2026-07-11):** a tracing mark-sweep **GC core has shipped**
+> as foundational infrastructure for lambdas-with-capture (#20) and coroutines
+> (#21): `src/gc.{hpp,cpp}` (`ember::gc::GcHeap` — `alloc`/`collect`/
+> `add_root`/`remove_root`, precise root scanning via `RefMap`, mark-sweep,
+> cycle collection, stats), pinned by `examples/gc_test.cpp` (ctest `gc_core`).
+> The core is **not yet wired into codegen/sema** — lambdas currently use a
+> frame-based env_ptr (by-value capture is a struct copy into a temp frame
+> slot, category 1), and coroutines use Windows fibers, so no script-visible
+> heap object requires tracing yet. The deferral rationale below now applies
+> to the **integration** (root scanning across JIT frames + a write-barrier /
+> safepoint collection strategy + a script-visible `new`/`delete` or
+> by-reference-capture surface), not to the core itself. See `../ROADMAP.md`
+> Tier 3 (Tracing GC — ✓ core shipped).
 
 Recorded here so the reasoning isn't lost: a tracing GC would be
 needed only if script code could create heap references with

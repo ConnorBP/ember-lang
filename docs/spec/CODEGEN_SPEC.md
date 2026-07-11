@@ -257,6 +257,19 @@ struct RipFixup {
 > `src/thin_ir_ser.{hpp,cpp}`. The full SSA-lite + linear-scan (this section)
 > remains the still-future Stage-3 upgrade, gated on Stage A's insufficiency or
 > cross-block evidence.
+>
+> **Implementation note (Stage 3 regalloc, 2026-07-11):** a **linear-scan
+> register allocator over the thin IR** has shipped as the Stage-3 subset
+> (`src/regalloc.{hpp,cpp}`, `run_regalloc(ThinFunction&)`, wired into
+> `compile_func` behind `CodeGenCtx::enable_regalloc` — default off, only
+> effective with `enable_ir_backend`). It assigns scalar int/bool VRegs to
+> Win64 callee-saved registers (rbx/rsi/rdi/r12/r13/r15) with linear-scan
+> spilling to frame slots under pressure; the emit consumes the regalloc map.
+> Pinned by `examples/regalloc_test.cpp` (ctest `regalloc`). **What remains
+> future** is the full SSA-lite design below (SSA renaming + phi nodes over
+> the richer `IrFunction`) — the shipped regalloc is the linear-scan-over-
+> thin-IR subset, NOT the full `run_linear_scan(const IrFunction&)` interface
+> this section specifies. See `codegen.hpp` (`enable_regalloc`).
 
 "SSA-lite" (see COMPILER_PIPELINE.md Section 5 for the deferred IR definition): each
 IR value is assigned exactly once, values are typed, control flow is
@@ -458,10 +471,16 @@ Edge cases:
   perspective a `Slice<T>` script param is exactly `(T* ptr, int64_t
   len)`, two normal C ABI args; the native-side binding signature
   documents this explicitly (BINDING_API.md Section 6).
-- Native struct-by-value arguments are supported only when the tightly packed
-  Ember aggregate is at most 8 bytes. Sema rejects larger native aggregate
-  arguments before codegen; a correct Win64 indirect-by-value implementation
-  for those shapes is deferred.
+- Native struct-by-value arguments are supported when the tightly packed
+  Ember aggregate is at most **128 bytes** (sema rejects a native by-value
+  arg whose registered struct size exceeds 128 bytes — `reject_large_native_
+  aggregate` in `src/sema.cpp`; enough for Mat4 = 64 bytes with room for
+  larger). ≤8-byte aggregates go in one GP register; >8-byte aggregates use
+  the Win64 hidden-pointer by-value path (caller allocates, passes the ptr in
+  the first arg slot, callee fills). The earlier "at most 8 bytes ... a
+  correct Win64 indirect-by-value implementation for those shapes is
+  deferred" claim is **superseded** — the hidden-pointer path is implemented
+  and tested (`binding_abi_test`).
 - Return value: `rax`/`xmm0` per convention; struct return >8 bytes
   uses the hidden-pointer-return convention (Section 1) - caller allocates
   the destination slot (a local, or the caller's own struct-return

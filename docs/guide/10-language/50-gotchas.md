@@ -20,16 +20,23 @@ fn sum(values: i64[], count: u64) -> i64 {
 
 There is no way to take the address of a local, a field, or an array element. If you need to share mutable state across calls, pass a slice into the function and let it write through the slice; that is the only indirection primitive you get.
 
-## Indexing Is Not Bounds-Checked
+## Indexing Is Bounds-Checked At Runtime
 
-Despite the slice's `{pointer, length}` shape, neither slice indexing nor fixed-array indexing is bounds-checked at runtime. `arr[i]` compiles to a direct address computation, `base + i * sizeof(T)`, with no comparison against the array's or slice's length anywhere in the generated code.
-
-> **WARNING:** An out-of-range index is not a trap and is not caught at compile time (even when the index is a literal constant that sema could in principle check). It silently reads or writes whatever memory happens to sit past the end of the array or slice, exactly like unchecked pointer arithmetic in C. There is nothing else guarding this: keeping every index inside `[0, length)` is entirely the script's own responsibility.
+> **CORRECTED (2026-07-11):** this section previously claimed indexing is not
+> bounds-checked. That was **false**. Slice and fixed-array indexing **are
+> bounds-checked at runtime**: `arr[i]` compiles to a single unsigned
+> `cmp idx, len; jae .oob_trap` before the address computation, and an
+> out-of-range index (including a negative signed index, which appears as a
+> huge unsigned value under the unsigned compare) traps via
+> `TrapReason::BoundsCheck` — a recoverable non-local unwind to the host, not
+> undefined behavior. A compile-time-constant index into a fixed array of
+> known size is checked at **compile time** instead (zero runtime cost). See
+> `docs/spec/CODEGEN_SPEC.md` §9 + `docs/spec/SAFETY_AND_SANDBOX.md` §5.
 
 ```ember
 let mut buf: i64[4];
 buf[0] = 1; buf[1] = 2; buf[2] = 3; buf[3] = 4;
-let bad: i64 = buf[10]; // compiles fine; reads past the end of buf at runtime, undefined result
+let bad: i64 = buf[10]; // traps at runtime with TrapReason::BoundsCheck (no UB)
 ```
 
 An index can be any integer type, signed or unsigned, sema only requires it to be *some* integer type. There is no requirement to use an unsigned type for indexing, that is a convention some example scripts follow, not a rule the compiler enforces.
@@ -109,27 +116,31 @@ let result: string = "score: " + score_to_string(points);
 
 The `+` above is resolved at compile time to whichever overload was registered for `(string, string)`. If you pass a type pair that was never registered, for example adding a `vec3` to a `quat` when no such overload exists, the compiler rejects it before the script ever runs.
 
-## Structs Cannot Cross a Function Call Boundary by Value
+## Structs Can Be Passed By Value Across a Call Boundary
 
-This is a deliberate scope limit for v1, enforced as a sema error. A script-declared struct cannot be passed by value into a function, and a function cannot return one by value. Functions that logically operate on a struct pass its fields as separate scalar parameters instead.
-
-> **WARNING:** `fn f(p: Point) -> void` does not compile if `Point` is a script-declared struct. Split the struct into its scalar fields at the call site and take those fields as separate parameters.
+> **CORRECTED (2026-07-11):** this section previously claimed structs cannot
+> cross a call boundary by value. That was **false**. Structs **can** be
+> passed by value and returned by value (shipped 2026-07-10): a struct ≤8
+> bytes is passed in one register; a struct >8 bytes uses the Win64
+> hidden-pointer by-value path (caller allocates, passes a pointer in the
+> first arg slot, callee fills it). A native by-value arg is rejected only if
+> its registered struct size exceeds 128 bytes. A fn can `return V3 { ... };`
+> directly and pass a struct literal / struct-returning call as a by-value
+> arg. See `docs/spec/TYPE_SYSTEM.md` §12 + `docs/spec/CODEGEN_SPEC.md` §16.
 
 ```ember
 struct Point { x: f32; y: f32; }
 
-fn distance(x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
-    let dx: f32 = x2 - x1;
-    let dy: f32 = y2 - y1;
+fn distance(a: Point, b: Point) -> f32 {   // structs by value — works now
+    let dx: f32 = b.x - a.x;
+    let dy: f32 = b.y - a.y;
     return sqrt(dx * dx + dy * dy);
 }
 
 let a: Point = Point { x: 0.0, y: 0.0 };
 let b: Point = Point { x: 3.0, y: 4.0 };
-let d: f32 = distance(a.x, a.y, b.x, b.y);
+let d: f32 = distance(a, b);
 ```
-
-You can still declare and use structs freely for local bookkeeping, `sizeof` and `offsetof` work as expected, but the moment you want to hand one to a function, unpack it into scalars first.
 
 ## No Implicit Int-to-Bool
 

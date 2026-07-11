@@ -1,5 +1,17 @@
 # Assertions
 
+> **STALENESS NOTICE (2026-07-11):** `assert_eq_i64`/`assert_eq_f32`/
+> `assert_eq_bool`/`assert_eq_str` are **prism-host** natives, not a standard
+> ember extension (per `extensions/AUDIT.md` + `extensions/README.md` "What
+> stayed in prism"). They route through prism's host print sink + assert-
+> failure counter. The standalone `ember` CLI does **not** register them; a
+> script calling `assert_eq_*` against the CLI gets "unknown function". The
+> standard `ember test` runner (the `ember test [dir]` CLI action) classifies
+> `.ember` files by expected outcome instead (a `// expect: N` comment → run,
+> expect exit N; `invalid_*` → parse-only, expect fail; etc.). This page
+> documents the prism assertion surface for historical context; a host that
+> wants in-script assertions registers its own `assert_eq_*` natives.
+
 Assertions are how Ember scripts check their own work while running. There is no separate test runner, no assertion library to import, and no test discovery step: `assert_eq_*` is a small family of native functions, always available, that compare two values and trap the script if they do not match.
 
 > **NOTE:** A trap is not a normal error. When an `assert_eq_*` call fails, it prints `ASSERT FAIL` along with the two values, then halts script execution immediately. There is no catch, no recovery, and no continuing past it.

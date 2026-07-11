@@ -41,10 +41,13 @@ Two layout modes, chosen per struct at declaration:
   declaration order**, with no alignment gaps or trailing padding. Nested
   structs and fixed arrays contribute their recursively resolved Ember size.
   This is Ember layout, not MSVC/C host layout. Native by-value aggregate
-  arguments are supported only through 8 bytes; sema rejects larger native
-  aggregate arguments. Large aggregate returns use the tested hidden-return
-  path. Hosts needing arbitrary C layouts must use explicit bindings/handles;
-  a host-layout builder remains deferred.
+  arguments are supported through **128 bytes** (sema rejects a native
+  by-value arg whose registered struct size exceeds 128 bytes — enough for
+  Mat4 = 64 bytes with room for larger; `reject_large_native_aggregate` in
+  `src/sema.cpp`); ≤8 bytes go in one register, >8 bytes use the Win64
+  hidden-pointer by-value path. Large aggregate returns use the tested
+  hidden-return path. Hosts needing arbitrary C layouts must use explicit
+  bindings/handles; a host-layout builder remains deferred.
 - **Nested structs**: allowed, computed recursively with the rule
   above. **Self-referential structs** (a struct containing a field of
   its own type, or a cycle through multiple structs) are a **compile

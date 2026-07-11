@@ -138,10 +138,13 @@ void register_native(engine_t* engine, const NativeFn& fn);
   for each `NativeParam`, if `type == t_slice`, **two** C++ parameters
   (`ElemType*, int64_t`) consecutively; otherwise **one** C++
   parameter of the C++ type corresponding to the `TypeId` (Section 4 mapping
-  table). The shipped path accepts native by-value aggregate parameters only
-  through 8 bytes; larger aggregate arguments are rejected by sema. Large
-  aggregate returns use the tested hidden-return path. The broader descriptor
-  design must not be read as expanding those v1 ABI limits.
+  table). The shipped path accepts native by-value aggregate parameters through
+  **128 bytes** (sema rejects a native by-value arg whose registered struct
+  size exceeds 128 bytes — `reject_large_native_aggregate` in `src/sema.cpp`);
+  ≤8-byte aggregates go in one register, >8-byte aggregates use the Win64
+  hidden-pointer by-value path. Large aggregate returns use the tested
+  hidden-return path. The broader descriptor design must not be read as
+  expanding those v1 ABI limits.
 - **Arity/type mismatch between `NativeFn` descriptor and the actual
   `fn_ptr` signature is not detectable by ember** (C++ function
   pointers are type-erased to `void*` at the registration API) - this
@@ -268,7 +271,7 @@ before the code.
 | `f64` | `double` | xmm reg/stack |
 | `slice<T>` | `T*, int64_t` (two consecutive slots) | GP+GP (or GP+stack / stack+stack once slot index exceeds 4, per CODEGEN_SPEC.md Section 1's slot-parallel rule) |
 | `struct` <=8 bytes, POD | the struct type, passed by value | packed into one GP reg (bitcast, matches MSVC's small-POD-by-value-in-register rule) |
-| `struct` >8 bytes argument | deferred/unsupported | v1 sema rejects native by-value aggregate arguments over 8 bytes |
+| `struct` >8 bytes argument (up to 128 bytes) | the struct type, passed by value | Win64 hidden-pointer by-value: caller allocates, passes ptr in first arg slot, callee fills (sema rejects a registered struct >128 bytes — `reject_large_native_aggregate`) |
 | `struct` return >8 bytes | the struct type, returned by value | hidden pointer as first arg (`rcx`), also returned in `rax` |
 
 This table is authoritative for both directions (script calling

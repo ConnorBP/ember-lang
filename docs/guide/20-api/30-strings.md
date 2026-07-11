@@ -1,5 +1,19 @@
 # Strings
 
+> **STALENESS NOTICE (2026-07-11):** the native table below lists
+> `str_compare` and `str_length`. Those are **prism-host** natives (raw-
+> pointer string ops), **not** the standard `string` extension — they are not
+> registered by `ext_string::register_natives`. The standard `string`
+> extension ships `string_new`/`string_from_slice`/`string_from_i64`/
+> `string_from_f32`/`string_from_f64`/`string_from_bool`/`string_length`/
+> `string_char_at`/`string_identity`/`string_find`/`string_substr` — the table
+> below **omits `string_find` and `string_substr`** (both shipped). Use `==`
+> for content comparison (the `str_compare` stub note is obsolete — the
+> standard extension never had a `str_compare`). The `print_string` calls in
+> the examples are also prism-host natives; the standard `io` extension uses
+> `print(s: string)` / `println(s: string)` instead. See
+> `extensions/string/ext_string.cpp` for the authoritative native list.
+
 String values in Ember are handles: opaque `i64` references to host-owned string memory. A script never sees the bytes directly. All string work goes through the native functions on this page, or through the `+` and `==` operator overloads registered for the string type. For the underlying type rules (handle types, string literals, byte slices), see [10-language/10-types.md](../10-language/10-types.md).
 
 ## Implicit conversion from string literals
@@ -35,8 +49,10 @@ In `greet`, `"Hello, "` and `"!"` are bare literals next to a `+` on a string, s
 | `string_from_f64` | `(v: f64) -> i64` | Formats an `f64` value as a string handle. |
 | `string_from_bool` | `(v: bool) -> i64` | Formats a `bool` as `"true"` or `"false"`. |
 | `string_identity` | `(s: i64) -> i64` | Returns its input string handle unchanged. |
-| `str_compare` | `(a: i64, b: i64) -> i32` | Currently a stub. Always returns `0`. Do not use it for real comparisons yet; use `==` instead. |
-| `str_length` | `(ptr: i64) -> i64` | C-string length of a raw, null-terminated pointer. This is for interop with raw memory, not string handles, and is unrelated to `string_length`. |
+| `string_find` | `(s: i64, sub: i64) -> i64` | Byte offset of the first occurrence of `sub` in `s`, or -1 if not found. |
+| `string_substr` | `(s: i64, start: i64, len: i64) -> i64` | A new string handle with the substring `[start, start+len)`. |
+| `str_compare` | *(prism-host native, not the standard extension)* | Not registered by `ext_string`. Use `==` for content comparison. |
+| `str_length` | *(prism-host native, not the standard extension)* | Not registered by `ext_string`. Use `string_length` for string handles. |
 
 ### string_new
 

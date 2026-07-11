@@ -17,12 +17,15 @@ modding embedding. The **default codegen path is a baseline JIT** —
 correctness-first, tree-walking, stack-spilling, no inlining or loop opts —
 so it will *not* match an optimizing compiler everywhere (five of six codegen
 paths are 5-9× slower than `g++ -O2`); closing that gap is benchmark-gated work.
-A thin three-address IR backend, `.em` v5 IR serialization, and **eight IR
+A thin three-address IR backend, `.em` v5 IR serialization, **eight IR
 optimization passes** (constprop/dce/cse/licm/forward/copyprop/instcombine/dse,
-plus an MBA obfuscation pass) have shipped behind flags (`enable_ir_backend`,
+plus an MBA obfuscation pass), and a **linear-scan register allocator** over the
+thin IR have shipped behind flags (`enable_ir_backend`, `enable_regalloc`,
 `--passes`) as the staged path toward that goal — default-off, so the default
-path is the unchanged baseline tree-walker. Full SSA-lite + linear-scan
-regalloc remains the future upgrade. Current version: **v1.0**.
+path is the unchanged baseline tree-walker. Full SSA construction (phi nodes,
+SSA renaming) remains the future upgrade; the shipped regalloc is the
+linear-scan-over-thin-IR subset (assigns scalar int/bool VRegs to Win64
+callee-saved registers, spills to frame slots under pressure). Current version: **v1.0**.
 
 ## What it looks like
 
@@ -121,7 +124,7 @@ cd ember
 mkdir buildt && cd buildt
 cmake -G Ninja -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe ..
 cmake --build .          # or: ninja
-ctest                    # 42 tests (40 excluding the two benchmarks)
+ctest                    # 54 tests (52 excluding the two benchmarks)
 ```
 
 Run and bench a script (`ember` = `buildt/ember_cli.exe`):
@@ -140,6 +143,8 @@ ember emit-em <file.ember> <out.em>      # precompile without running
 ember bench <file.ember> [--fn NAME] [--iters N] [--warmup N]
 ember test [dir]                        # run every .ember file in <dir> (default tests/lang/)
 ember run --load-em <file.em> [--fn NAME]
+ember pipe <config>                     # dataflow pipeline runner (Family C): load N .em modules, wire a stage graph, stream i64s through it
+ember live <file.ember> [--tick ...]    # live-coding/reload runner: recompile on file change, show tick output evolve
 ```
 
 - `run` compiles and calls the entry function (default `main`). An `i64` return
@@ -231,11 +236,12 @@ ABI/process-trusted (process-local pointers), not a portable format —
 cross-process portability is a versioned-relocation v2+ item.
 
 **Binding API.** Register natives with `BindingBuilder` + `NativeSig`; the
-host maps script types to Win64 slots and ships a slice convention. The ten
-`NativeSig` extensions (`vec`/`quat`/`mat`/`string`/`array`/`math`/`map`/`sync`/`lifecycle`/`io`)
-register their `NativeSig` + `OpOverloadTable` entries the same way. Two pass
-extensions (`opt`, `obf`) are a separate category — they register IR→IR
-transforms via `register_passes` (not `register_natives`); see
+host maps script types to Win64 slots and ships a slice convention. The thirteen
+`NativeSig` addon extensions (`vec`/`quat`/`mat`/`string`/`array`/`math`/`map`/
+`sync`/`thread`/`coroutine`/`lifecycle`/`io`/`call_raw`) register their
+`NativeSig` + `OpOverloadTable` entries the same way. Two pass extensions
+(`opt`, `obf`) are a separate category — they register IR→IR transforms via
+`register_passes` (not `register_natives`); see
 `docs/spec/PASS_SYSTEM_DESIGN.md`. The fluent `TypeBuilder`/`StructBuilder`
 surface stays trigger-gated on a host needing script-visible C++ struct types.
 
