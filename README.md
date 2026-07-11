@@ -1,5 +1,7 @@
 # ember
-
+![calcifer in a prism (the ember logo kind of)](./img/calcifer_prism.png)
+Blazing fast JIT Scripting Language for Nerds
+---
 C-style scripting language, JIT-compiles to native x86-64. AngelScript
 ergonomics, an optimizing native-JIT language's speed. Game-engine/modding embedding target.
 
