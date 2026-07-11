@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -21,6 +22,11 @@ namespace ember::ext_string {
 
 // --- string host store (opaque i64 handle; host owns a mutable std::string).
 static std::vector<std::string> g_strings;
+// Serializes all g_strings store operations (push_back in str_new, str_slot
+// lookups) so concurrent context_t's calling string natives cannot race on
+// vector reallocation (Sec-5). Mirrors the g_store_mutex pattern in ext_sync.cpp
+// and g_mutex in ext_lifecycle.cpp.
+static std::mutex g_store_mutex;
 // Match the other host containers: one string may own at most 1 GiB.
 static constexpr size_t MAX_STRING_BYTES = size_t(1) << 30;
 static int64_t str_new(std::string s) noexcept {
@@ -36,8 +42,9 @@ static int64_t str_new(std::string s) noexcept {
 }
 static std::string* str_slot(int64_t h) { if (h<1 || h>int64_t(g_strings.size())) return nullptr; return &g_strings[size_t(h-1)]; }
 extern "C" {
-    static int64_t n_string_new() { return str_new(std::string()); }
+    static int64_t n_string_new() { std::lock_guard<std::mutex> lock(g_store_mutex); return str_new(std::string()); }
     static int64_t n_string_from_slice(uint8_t* p, int64_t len) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         if (len < 0 || uint64_t(len) > uint64_t(MAX_STRING_BYTES) || (!p && len != 0)) return 0;
         try {
             if (len == 0) return str_new(std::string());
@@ -46,18 +53,21 @@ extern "C" {
         catch (const std::bad_alloc&) { return 0; }
         catch (const std::length_error&) { return 0; }
     }
-    static int64_t n_string_length(int64_t h) { auto* s = str_slot(h); return s ? int64_t(s->size()) : 0; }
+    static int64_t n_string_length(int64_t h) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s = str_slot(h); return s ? int64_t(s->size()) : 0; }
     static int64_t n_string_char_at(int64_t h, int64_t i) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* s = str_slot(h);
         if (!s || i < 0 || size_t(i) >= s->size()) return 0;
         return int64_t(uint8_t((*s)[size_t(i)]));
     }
     static int64_t n_string_from_i64(int64_t v) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         try { return str_new(std::to_string(v)); }
         catch (const std::bad_alloc&) { return 0; }
         catch (const std::length_error&) { return 0; }
     }
     static int64_t n_string_from_f32(float v) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         char buf[64]; std::snprintf(buf, sizeof buf, "%g", v);
         try { return str_new(std::string(buf)); }
         catch (const std::bad_alloc&) { return 0; }
@@ -69,12 +79,14 @@ extern "C" {
     // f64 interpolation isn't exercised by the test suite until that
     // separate gap is closed.
     static int64_t n_string_from_f64(double v) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         char buf[64]; std::snprintf(buf, sizeof buf, "%g", v);
         try { return str_new(std::string(buf)); }
         catch (const std::bad_alloc&) { return 0; }
         catch (const std::length_error&) { return 0; }
     }
     static int64_t n_string_from_bool(int64_t v) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         try { return str_new(v != 0 ? std::string("true") : std::string("false")); }
         catch (const std::bad_alloc&) { return 0; }
         catch (const std::length_error&) { return 0; }
@@ -84,6 +96,7 @@ extern "C" {
     // always resolves to SOME native call (uniform, no codegen special case).
     static int64_t n_string_identity(int64_t h) { return h; }
     static int64_t n_string_concat(int64_t a, int64_t b) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* x = str_slot(a); auto* y = str_slot(b);
         if (!x || !y) return 0;
         const size_t xn = x->size(), yn = y->size();
@@ -97,12 +110,14 @@ extern "C" {
         catch (const std::length_error&) { return 0; }
     }
     static int64_t n_string_eq(int64_t a, int64_t b) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* x = str_slot(a); auto* y = str_slot(b);
         return (x && y && *x == *y) ? 1 : 0;
     }
     // string_find: returns the index of the first occurrence of substring b in
     // string a, or -1 if not found.
     static int64_t n_string_find(int64_t a, int64_t b) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* x = str_slot(a); auto* y = str_slot(b);
         if (!x || !y) return -1;
         size_t pos = x->find(*y);
@@ -111,6 +126,7 @@ extern "C" {
     // string_substr: returns a new string that is the substring of a starting
     // at index start with length len (clamped to the string's bounds).
     static int64_t n_string_substr(int64_t a, int64_t start, int64_t len) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* x = str_slot(a);
         if (!x || start < 0) return str_new("");
         size_t s = size_t(start);
@@ -124,10 +140,12 @@ extern "C" {
 }
 
 const std::string* slot(int64_t handle) {
+    std::lock_guard<std::mutex> lock(g_store_mutex);
     return str_slot(handle);
 }
 
 int64_t alloc(std::string s) {
+    std::lock_guard<std::mutex> lock(g_store_mutex);
     return str_new(std::move(s));
 }
 
@@ -173,6 +191,7 @@ void register_overloads(OpOverloadTable& overloads) {
 }
 
 void reset() {
+    std::lock_guard<std::mutex> lock(g_store_mutex);
     g_strings.clear();
 }
 

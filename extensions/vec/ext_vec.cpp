@@ -7,6 +7,7 @@
 #include "ext_vec.hpp"
 #include "ast.hpp"       // ember public: Type, make_prim, make_slice, Prim
 #include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <vector>
@@ -18,6 +19,12 @@ namespace ember::ext_vec {
 // --- vec3 host store (opaque i64 handle; host owns {float x,y,z}) ---
 struct Vec3 { float x, y, z; };
 static std::vector<Vec3> g_vec3s;
+// Serializes all vec/vec2/vec3/vec4 store operations (push_back in v*_new,
+// v*_slot lookups) so concurrent context_t's calling vec natives cannot race
+// on vector reallocation (Sec-5). Mirrors the g_store_mutex pattern in
+// ext_sync.cpp and g_mutex in ext_lifecycle.cpp. One mutex covers all three
+// stores; they are all cold allocation/creation paths.
+static std::mutex g_store_mutex;
 static int64_t v3_new(float x, float y, float z) noexcept {
     try {
         g_vec3s.push_back({x,y,z});
@@ -30,17 +37,17 @@ static int64_t v3_new(float x, float y, float z) noexcept {
 }
 static Vec3* v3_slot(int64_t h) { if (h<1 || h>int64_t(g_vec3s.size())) return nullptr; return &g_vec3s[size_t(h-1)]; }
 extern "C" {
-    static int64_t n_vec3_new(float x, float y, float z) { return v3_new(x,y,z); }
-    static float n_vec3_x(int64_t h) { auto* v=v3_slot(h); return v?v->x:0; }
-    static float n_vec3_y(int64_t h) { auto* v=v3_slot(h); return v?v->y:0; }
-    static float n_vec3_z(int64_t h) { auto* v=v3_slot(h); return v?v->z:0; }
-    static void n_vec3_set_x(int64_t h, float v) { auto* s=v3_slot(h); if(s) s->x=v; }
-    static void n_vec3_set_y(int64_t h, float v) { auto* s=v3_slot(h); if(s) s->y=v; }
-    static void n_vec3_set_z(int64_t h, float v) { auto* s=v3_slot(h); if(s) s->z=v; }
-    static int64_t n_vec3_add(int64_t a, int64_t b) { auto* x=v3_slot(a); auto* y=v3_slot(b); return (x&&y)?v3_new(x->x+y->x, x->y+y->y, x->z+y->z):0; }
-    static int64_t n_vec3_sub(int64_t a, int64_t b) { auto* x=v3_slot(a); auto* y=v3_slot(b); return (x&&y)?v3_new(x->x-y->x, x->y-y->y, x->z-y->z):0; }
-    static int64_t n_vec3_mul(int64_t a, int64_t b) { auto* x=v3_slot(a); auto* y=v3_slot(b); return (x&&y)?v3_new(x->x*y->x, x->y*y->y, x->z*y->z):0; }
-    static int64_t n_vec3_eq(int64_t a, int64_t b) { auto* x=v3_slot(a); auto* y=v3_slot(b); return (x&&y&&x->x==y->x && x->y==y->y && x->z==y->z) ? 1 : 0; }
+    static int64_t n_vec3_new(float x, float y, float z) { std::lock_guard<std::mutex> lock(g_store_mutex); return v3_new(x,y,z); }
+    static float n_vec3_x(int64_t h) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* v=v3_slot(h); return v?v->x:0; }
+    static float n_vec3_y(int64_t h) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* v=v3_slot(h); return v?v->y:0; }
+    static float n_vec3_z(int64_t h) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* v=v3_slot(h); return v?v->z:0; }
+    static void n_vec3_set_x(int64_t h, float v) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s=v3_slot(h); if(s) s->x=v; }
+    static void n_vec3_set_y(int64_t h, float v) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s=v3_slot(h); if(s) s->y=v; }
+    static void n_vec3_set_z(int64_t h, float v) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s=v3_slot(h); if(s) s->z=v; }
+    static int64_t n_vec3_add(int64_t a, int64_t b) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* x=v3_slot(a); auto* y=v3_slot(b); return (x&&y)?v3_new(x->x+y->x, x->y+y->y, x->z+y->z):0; }
+    static int64_t n_vec3_sub(int64_t a, int64_t b) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* x=v3_slot(a); auto* y=v3_slot(b); return (x&&y)?v3_new(x->x-y->x, x->y-y->y, x->z-y->z):0; }
+    static int64_t n_vec3_mul(int64_t a, int64_t b) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* x=v3_slot(a); auto* y=v3_slot(b); return (x&&y)?v3_new(x->x*y->x, x->y*y->y, x->z*y->z):0; }
+    static int64_t n_vec3_eq(int64_t a, int64_t b) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* x=v3_slot(a); auto* y=v3_slot(b); return (x&&y&&x->x==y->x && x->y==y->y && x->z==y->z) ? 1 : 0; }
 }
 
 // --- vec2 host store (opaque i64 handle; host owns {float x,y}) ---
@@ -58,15 +65,15 @@ static int64_t v2_new(float x, float y) noexcept {
 }
 static Vec2* v2_slot(int64_t h) { if (h<1 || h>int64_t(g_vec2s.size())) return nullptr; return &g_vec2s[size_t(h-1)]; }
 extern "C" {
-    static int64_t n_vec2_new(float x, float y) { return v2_new(x,y); }
-    static float n_vec2_x(int64_t h) { auto* v=v2_slot(h); return v?v->x:0; }
-    static float n_vec2_y(int64_t h) { auto* v=v2_slot(h); return v?v->y:0; }
-    static void n_vec2_set_x(int64_t h, float v) { auto* s=v2_slot(h); if(s) s->x=v; }
-    static void n_vec2_set_y(int64_t h, float v) { auto* s=v2_slot(h); if(s) s->y=v; }
-    static int64_t n_vec2_add(int64_t a, int64_t b) { auto* x=v2_slot(a); auto* y=v2_slot(b); return (x&&y)?v2_new(x->x+y->x, x->y+y->y):0; }
-    static int64_t n_vec2_sub(int64_t a, int64_t b) { auto* x=v2_slot(a); auto* y=v2_slot(b); return (x&&y)?v2_new(x->x-y->x, x->y-y->y):0; }
-    static int64_t n_vec2_mul(int64_t a, int64_t b) { auto* x=v2_slot(a); auto* y=v2_slot(b); return (x&&y)?v2_new(x->x*y->x, x->y*y->y):0; }
-    static int64_t n_vec2_eq(int64_t a, int64_t b) { auto* x=v2_slot(a); auto* y=v2_slot(b); return (x&&y&&x->x==y->x && x->y==y->y) ? 1 : 0; }
+    static int64_t n_vec2_new(float x, float y) { std::lock_guard<std::mutex> lock(g_store_mutex); return v2_new(x,y); }
+    static float n_vec2_x(int64_t h) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* v=v2_slot(h); return v?v->x:0; }
+    static float n_vec2_y(int64_t h) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* v=v2_slot(h); return v?v->y:0; }
+    static void n_vec2_set_x(int64_t h, float v) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s=v2_slot(h); if(s) s->x=v; }
+    static void n_vec2_set_y(int64_t h, float v) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s=v2_slot(h); if(s) s->y=v; }
+    static int64_t n_vec2_add(int64_t a, int64_t b) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* x=v2_slot(a); auto* y=v2_slot(b); return (x&&y)?v2_new(x->x+y->x, x->y+y->y):0; }
+    static int64_t n_vec2_sub(int64_t a, int64_t b) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* x=v2_slot(a); auto* y=v2_slot(b); return (x&&y)?v2_new(x->x-y->x, x->y-y->y):0; }
+    static int64_t n_vec2_mul(int64_t a, int64_t b) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* x=v2_slot(a); auto* y=v2_slot(b); return (x&&y)?v2_new(x->x*y->x, x->y*y->y):0; }
+    static int64_t n_vec2_eq(int64_t a, int64_t b) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* x=v2_slot(a); auto* y=v2_slot(b); return (x&&y&&x->x==y->x && x->y==y->y) ? 1 : 0; }
 }
 
 // --- vec4 host store (opaque i64 handle; host owns {float x,y,z,w}) ---
@@ -84,19 +91,19 @@ static int64_t v4_new(float x, float y, float z, float w) noexcept {
 }
 static Vec4* v4_slot(int64_t h) { if (h<1 || h>int64_t(g_vec4s.size())) return nullptr; return &g_vec4s[size_t(h-1)]; }
 extern "C" {
-    static int64_t n_vec4_new(float x, float y, float z, float w) { return v4_new(x,y,z,w); }
-    static float n_vec4_x(int64_t h) { auto* v=v4_slot(h); return v?v->x:0; }
-    static float n_vec4_y(int64_t h) { auto* v=v4_slot(h); return v?v->y:0; }
-    static float n_vec4_z(int64_t h) { auto* v=v4_slot(h); return v?v->z:0; }
-    static float n_vec4_w(int64_t h) { auto* v=v4_slot(h); return v?v->w:0; }
-    static void n_vec4_set_x(int64_t h, float v) { auto* s=v4_slot(h); if(s) s->x=v; }
-    static void n_vec4_set_y(int64_t h, float v) { auto* s=v4_slot(h); if(s) s->y=v; }
-    static void n_vec4_set_z(int64_t h, float v) { auto* s=v4_slot(h); if(s) s->z=v; }
-    static void n_vec4_set_w(int64_t h, float v) { auto* s=v4_slot(h); if(s) s->w=v; }
-    static int64_t n_vec4_add(int64_t a, int64_t b) { auto* x=v4_slot(a); auto* y=v4_slot(b); return (x&&y)?v4_new(x->x+y->x, x->y+y->y, x->z+y->z, x->w+y->w):0; }
-    static int64_t n_vec4_sub(int64_t a, int64_t b) { auto* x=v4_slot(a); auto* y=v4_slot(b); return (x&&y)?v4_new(x->x-y->x, x->y-y->y, x->z-y->z, x->w-y->w):0; }
-    static int64_t n_vec4_mul(int64_t a, int64_t b) { auto* x=v4_slot(a); auto* y=v4_slot(b); return (x&&y)?v4_new(x->x*y->x, x->y*y->y, x->z*y->z, x->w*y->w):0; }
-    static int64_t n_vec4_eq(int64_t a, int64_t b) { auto* x=v4_slot(a); auto* y=v4_slot(b); return (x&&y&&x->x==y->x && x->y==y->y && x->z==y->z && x->w==y->w) ? 1 : 0; }
+    static int64_t n_vec4_new(float x, float y, float z, float w) { std::lock_guard<std::mutex> lock(g_store_mutex); return v4_new(x,y,z,w); }
+    static float n_vec4_x(int64_t h) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* v=v4_slot(h); return v?v->x:0; }
+    static float n_vec4_y(int64_t h) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* v=v4_slot(h); return v?v->y:0; }
+    static float n_vec4_z(int64_t h) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* v=v4_slot(h); return v?v->z:0; }
+    static float n_vec4_w(int64_t h) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* v=v4_slot(h); return v?v->w:0; }
+    static void n_vec4_set_x(int64_t h, float v) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s=v4_slot(h); if(s) s->x=v; }
+    static void n_vec4_set_y(int64_t h, float v) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s=v4_slot(h); if(s) s->y=v; }
+    static void n_vec4_set_z(int64_t h, float v) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s=v4_slot(h); if(s) s->z=v; }
+    static void n_vec4_set_w(int64_t h, float v) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s=v4_slot(h); if(s) s->w=v; }
+    static int64_t n_vec4_add(int64_t a, int64_t b) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* x=v4_slot(a); auto* y=v4_slot(b); return (x&&y)?v4_new(x->x+y->x, x->y+y->y, x->z+y->z, x->w+y->w):0; }
+    static int64_t n_vec4_sub(int64_t a, int64_t b) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* x=v4_slot(a); auto* y=v4_slot(b); return (x&&y)?v4_new(x->x-y->x, x->y-y->y, x->z-y->z, x->w-y->w):0; }
+    static int64_t n_vec4_mul(int64_t a, int64_t b) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* x=v4_slot(a); auto* y=v4_slot(b); return (x&&y)?v4_new(x->x*y->x, x->y*y->y, x->z*y->z, x->w*y->w):0; }
+    static int64_t n_vec4_eq(int64_t a, int64_t b) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* x=v4_slot(a); auto* y=v4_slot(b); return (x&&y&&x->x==y->x && x->y==y->y && x->z==y->z && x->w==y->w) ? 1 : 0; }
 }
 
 // Registered surface is byte-identical to the old I/H/add lambda form:
@@ -154,6 +161,7 @@ void register_overloads(OpOverloadTable& overloads) {
 }
 
 void reset() {
+    std::lock_guard<std::mutex> lock(g_store_mutex);
     g_vec2s.clear(); g_vec3s.clear(); g_vec4s.clear();
 }
 

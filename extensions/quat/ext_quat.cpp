@@ -5,6 +5,7 @@
 #include "ext_quat.hpp"
 #include "ast.hpp"
 #include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <vector>
@@ -16,6 +17,11 @@ namespace ember::ext_quat {
 // --- quat host store (opaque i64 handle; host owns {float x,y,z,w}) ---
 struct Quat { float x, y, z, w; };
 static std::vector<Quat> g_quats;
+// Serializes all g_quats store operations (push_back in q_new, q_slot lookups)
+// so concurrent context_t's calling quat natives cannot race on vector
+// reallocation (Sec-5). Mirrors the g_store_mutex pattern in ext_sync.cpp and
+// g_mutex in ext_lifecycle.cpp.
+static std::mutex g_store_mutex;
 static int64_t q_new(float x, float y, float z, float w) noexcept {
     try {
         g_quats.push_back({x,y,z,w});
@@ -28,20 +34,21 @@ static int64_t q_new(float x, float y, float z, float w) noexcept {
 }
 static Quat* q_slot(int64_t h) { if (h<1 || h>int64_t(g_quats.size())) return nullptr; return &g_quats[size_t(h-1)]; }
 extern "C" {
-    static int64_t n_quat_new(float x, float y, float z, float w) { return q_new(x,y,z,w); }
-    static float n_quat_x(int64_t h) { auto* v=q_slot(h); return v?v->x:0; }
-    static float n_quat_y(int64_t h) { auto* v=q_slot(h); return v?v->y:0; }
-    static float n_quat_z(int64_t h) { auto* v=q_slot(h); return v?v->z:0; }
-    static float n_quat_w(int64_t h) { auto* v=q_slot(h); return v?v->w:0; }
-    static void n_quat_set_x(int64_t h, float v) { auto* s=q_slot(h); if(s) s->x=v; }
-    static void n_quat_set_y(int64_t h, float v) { auto* s=q_slot(h); if(s) s->y=v; }
-    static void n_quat_set_z(int64_t h, float v) { auto* s=q_slot(h); if(s) s->z=v; }
-    static void n_quat_set_w(int64_t h, float v) { auto* s=q_slot(h); if(s) s->w=v; }
-    static int64_t n_quat_add(int64_t a, int64_t b) { auto* x=q_slot(a); auto* y=q_slot(b); return (x&&y)?q_new(x->x+y->x, x->y+y->y, x->z+y->z, x->w+y->w):0; }
-    static int64_t n_quat_sub(int64_t a, int64_t b) { auto* x=q_slot(a); auto* y=q_slot(b); return (x&&y)?q_new(x->x-y->x, x->y-y->y, x->z-y->z, x->w-y->w):0; }
+    static int64_t n_quat_new(float x, float y, float z, float w) { std::lock_guard<std::mutex> lock(g_store_mutex); return q_new(x,y,z,w); }
+    static float n_quat_x(int64_t h) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* v=q_slot(h); return v?v->x:0; }
+    static float n_quat_y(int64_t h) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* v=q_slot(h); return v?v->y:0; }
+    static float n_quat_z(int64_t h) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* v=q_slot(h); return v?v->z:0; }
+    static float n_quat_w(int64_t h) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* v=q_slot(h); return v?v->w:0; }
+    static void n_quat_set_x(int64_t h, float v) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s=q_slot(h); if(s) s->x=v; }
+    static void n_quat_set_y(int64_t h, float v) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s=q_slot(h); if(s) s->y=v; }
+    static void n_quat_set_z(int64_t h, float v) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s=q_slot(h); if(s) s->z=v; }
+    static void n_quat_set_w(int64_t h, float v) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s=q_slot(h); if(s) s->w=v; }
+    static int64_t n_quat_add(int64_t a, int64_t b) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* x=q_slot(a); auto* y=q_slot(b); return (x&&y)?q_new(x->x+y->x, x->y+y->y, x->z+y->z, x->w+y->w):0; }
+    static int64_t n_quat_sub(int64_t a, int64_t b) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* x=q_slot(a); auto* y=q_slot(b); return (x&&y)?q_new(x->x-y->x, x->y-y->y, x->z-y->z, x->w-y->w):0; }
     // Hamilton product (real quaternion multiplication, not component-wise -
     // this is what `*` means mathematically for a quat).
     static int64_t n_quat_mul(int64_t a, int64_t b) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* p=q_slot(a); auto* q=q_slot(b);
         if (!p || !q) return 0;
         float x = p->w*q->x + p->x*q->w + p->y*q->z - p->z*q->y;
@@ -50,7 +57,7 @@ extern "C" {
         float w = p->w*q->w - p->x*q->x - p->y*q->y - p->z*q->z;
         return q_new(x, y, z, w);
     }
-    static int64_t n_quat_eq(int64_t a, int64_t b) { auto* x=q_slot(a); auto* y=q_slot(b); return (x&&y&&x->x==y->x && x->y==y->y && x->z==y->z && x->w==y->w) ? 1 : 0; }
+    static int64_t n_quat_eq(int64_t a, int64_t b) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* x=q_slot(a); auto* y=q_slot(b); return (x&&y&&x->x==y->x && x->y==y->y && x->z==y->z && x->w==y->w) ? 1 : 0; }
 }
 
 // Registered surface is byte-identical to the old I/H/add lambda form
@@ -83,6 +90,7 @@ void register_overloads(OpOverloadTable& overloads) {
 }
 
 void reset() {
+    std::lock_guard<std::mutex> lock(g_store_mutex);
     g_quats.clear();
 }
 

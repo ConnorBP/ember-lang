@@ -5,6 +5,7 @@
 #include "ext_mat.hpp"
 #include "ast.hpp"
 #include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <vector>
@@ -16,6 +17,11 @@ namespace ember::ext_mat {
 // --- mat4 host store (opaque i64 handle; host owns 16 floats, row-major) ---
 struct Mat4 { float m[16]; };
 static std::vector<Mat4> g_mat4s;
+// Serializes all g_mat4s store operations (push_back in m4_new_zero /
+// m4_new_identity, m4_slot lookups) so concurrent context_t's calling mat4
+// natives cannot race on vector reallocation (Sec-5). Mirrors the g_store_mutex
+// pattern in ext_sync.cpp and g_mutex in ext_lifecycle.cpp.
+static std::mutex g_store_mutex;
 static int64_t m4_new_zero() noexcept {
     try {
         Mat4 z{}; g_mat4s.push_back(z);
@@ -40,20 +46,23 @@ static int64_t m4_new_identity() noexcept {
 }
 static Mat4* m4_slot(int64_t h) { if (h<1 || h>int64_t(g_mat4s.size())) return nullptr; return &g_mat4s[size_t(h-1)]; }
 extern "C" {
-    static int64_t n_mat4_new() { return m4_new_zero(); }
-    static int64_t n_mat4_identity() { return m4_new_identity(); }
+    static int64_t n_mat4_new() { std::lock_guard<std::mutex> lock(g_store_mutex); return m4_new_zero(); }
+    static int64_t n_mat4_identity() { std::lock_guard<std::mutex> lock(g_store_mutex); return m4_new_identity(); }
     static float n_mat4_get(int64_t h, int64_t row, int64_t col) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* m=m4_slot(h);
         if (!m || row<0 || row>3 || col<0 || col>3) return 0;
         return m->m[size_t(row*4+col)];
     }
     static void n_mat4_set(int64_t h, int64_t row, int64_t col, float v) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* m=m4_slot(h);
         if (!m || row<0 || row>3 || col<0 || col>3) return;
         m->m[size_t(row*4+col)] = v;
     }
     // standard row-major 4x4 matrix product (not component-wise)
     static int64_t n_mat4_mul(int64_t a, int64_t b) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* x=m4_slot(a); auto* y=m4_slot(b);
         if (!x || !y) return 0;
         int64_t h = m4_new_zero();
@@ -67,6 +76,7 @@ extern "C" {
         return h;
     }
     static int64_t n_mat4_eq(int64_t a, int64_t b) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* x=m4_slot(a); auto* y=m4_slot(b);
         if (!x || !y) return 0;
         for (int i=0;i<16;++i) if (x->m[size_t(i)] != y->m[size_t(i)]) return 0;
@@ -99,6 +109,7 @@ void register_overloads(OpOverloadTable& overloads) {
 }
 
 void reset() {
+    std::lock_guard<std::mutex> lock(g_store_mutex);
     g_mat4s.clear();
 }
 

@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -20,6 +21,12 @@ struct MapSlot {
 
 std::vector<MapSlot> g_maps;
 
+// Serializes all g_maps store operations (emplace_back in n_map_new, map_slot
+// lookups) so concurrent context_t's calling map natives cannot race on
+// vector reallocation (Sec-5). Mirrors the g_store_mutex pattern in ext_sync.cpp
+// and g_mutex in ext_lifecycle.cpp.
+std::mutex g_store_mutex;
+
 constexpr int64_t MAX_MAPS = 100000;
 
 MapSlot* map_slot(int64_t h) {
@@ -29,6 +36,7 @@ MapSlot* map_slot(int64_t h) {
 
 extern "C" {
     static int64_t n_map_new() {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         if (int64_t(g_maps.size()) >= MAX_MAPS) return 0;
         try {
             g_maps.emplace_back();
@@ -36,28 +44,34 @@ extern "C" {
         } catch (...) { return 0; }
     }
     static void n_map_set(int64_t h, int64_t k, int64_t v) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* s = map_slot(h);
         if (s) s->entries[k] = v;
     }
     static int64_t n_map_get(int64_t h, int64_t k) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* s = map_slot(h);
         if (!s) return 0;
         auto it = s->entries.find(k);
         return it != s->entries.end() ? it->second : 0;
     }
     static int64_t n_map_contains(int64_t h, int64_t k) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* s = map_slot(h);
         return (s && s->entries.count(k)) ? 1 : 0;
     }
     static int64_t n_map_length(int64_t h) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* s = map_slot(h);
         return s ? int64_t(s->entries.size()) : 0;
     }
     static void n_map_remove(int64_t h, int64_t k) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* s = map_slot(h);
         if (s) s->entries.erase(k);
     }
     static void n_map_clear(int64_t h) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* s = map_slot(h);
         if (s) s->entries.clear();
     }
@@ -78,6 +92,6 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
     for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }
 
-void reset() { g_maps.clear(); }
+void reset() { std::lock_guard<std::mutex> lock(g_store_mutex); g_maps.clear(); }
 
 } // namespace ember::ext_map
