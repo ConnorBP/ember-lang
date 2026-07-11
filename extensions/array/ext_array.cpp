@@ -72,6 +72,46 @@ extern "C" {
         try { s->bytes.push_back(uint8_t(v)); }
         catch (const std::bad_alloc&) {} catch (const std::length_error&) {}
     }
+    static void n_array_push_f32(int64_t h, float v) {
+        auto* s = arr_slot(h);
+        if (!s || s->elem_size != 4 || s->bytes.size() + 4 > MAX_CONTAINER_BYTES) return;
+        try { size_t off = s->bytes.size(); s->bytes.resize(off + 4); std::memcpy(&s->bytes[off], &v, 4); }
+        catch (const std::bad_alloc&) {} catch (const std::length_error&) {}
+    }
+    static void n_array_push_i64(int64_t h, int64_t v) {
+        auto* s = arr_slot(h);
+        if (!s || s->elem_size != 8 || s->bytes.size() + 8 > MAX_CONTAINER_BYTES) return;
+        try { size_t off = s->bytes.size(); s->bytes.resize(off + 8); std::memcpy(&s->bytes[off], &v, 8); }
+        catch (const std::bad_alloc&) {} catch (const std::length_error&) {}
+    }
+    static int64_t n_array_pop_u8(int64_t h) {
+        auto* s = arr_slot(h);
+        if (!s || s->elem_size != 1 || s->bytes.empty()) return 0;
+        uint8_t v = s->bytes.back(); s->bytes.pop_back(); return int64_t(v);
+    }
+    static float n_array_pop_f32(int64_t h) {
+        auto* s = arr_slot(h);
+        if (!s || s->elem_size != 4 || s->bytes.size() < 4) return 0;
+        float v; std::memcpy(&v, &s->bytes[s->bytes.size() - 4], 4);
+        s->bytes.resize(s->bytes.size() - 4); return v;
+    }
+    static int64_t n_array_pop_i64(int64_t h) {
+        auto* s = arr_slot(h);
+        if (!s || s->elem_size != 8 || s->bytes.size() < 8) return 0;
+        int64_t v; std::memcpy(&v, &s->bytes[s->bytes.size() - 8], 8);
+        s->bytes.resize(s->bytes.size() - 8); return v;
+    }
+    static void n_array_clear(int64_t h) {
+        auto* s = arr_slot(h);
+        if (s) s->bytes.clear();
+    }
+    static void n_array_remove(int64_t h, int64_t i) {
+        auto* s = arr_slot(h);
+        if (!s || i < 0 || size_t(i) * size_t(s->elem_size) + size_t(s->elem_size) > s->bytes.size()) return;
+        size_t off = size_t(i) * size_t(s->elem_size);
+        s->bytes.erase(s->bytes.begin() + ptrdiff_t(off),
+                       s->bytes.begin() + ptrdiff_t(off + size_t(s->elem_size)));
+    }
 }
 
 // Exposed so a host native that receives an array<u8> handle (process
@@ -104,6 +144,13 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
     b.add("array_set_i64",type_void(), {type_i64(),type_i64(),type_i64()}, (void*)&n_array_set_i64);
     b.add("array_get_i64",type_i64(), {type_i64(),type_i64()}, (void*)&n_array_get_i64);
     b.add("array_push_u8",type_void(), {type_i64(),type_i64()}, (void*)&n_array_push_u8);
+    b.add("array_push_f32",type_void(), {type_i64(),type_f32()}, (void*)&n_array_push_f32);
+    b.add("array_push_i64",type_void(), {type_i64(),type_i64()}, (void*)&n_array_push_i64);
+    b.add("array_pop_u8", bind_prim(Prim::U8), {type_i64()}, (void*)&n_array_pop_u8);
+    b.add("array_pop_f32",type_f32(), {type_i64()}, (void*)&n_array_pop_f32);
+    b.add("array_pop_i64",type_i64(), {type_i64()}, (void*)&n_array_pop_i64);
+    b.add("array_clear", type_void(), {type_i64()}, (void*)&n_array_clear);
+    b.add("array_remove",type_void(), {type_i64(),type_i64()}, (void*)&n_array_remove);
     NativeTable t = b.build();
     for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }
