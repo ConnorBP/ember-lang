@@ -1918,6 +1918,87 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
                     }
                 }
             }
+        } else if (auto* ix = dynamic_cast<const IndexExpr*>(fl->base.get())) {
+            // arr[i].field: base is an IndexExpr into an array/slice of structs.
+            // The bare-Ident base above only handles a local/global struct
+            // variable's field; an indexed struct element needs the element
+            // ADDRESS computed (base + index*struct_size) before the field
+            // offset is added. Mirrors the IndexExpr case's base resolution,
+            // then emits IndexAddr (element address) + LoadFrame at the field
+            // offset. v1 scope: ix->base must be a bare Ident (same
+            // restriction IndexExpr itself enforces).
+            const Type* bt = ix->base->ty;          // array/slice type
+            const Type* elem = ix->ty;              // struct element type (sema sets ix->ty = base->elem)
+            const Type* ft = nullptr; int32_t field_off = 0;
+            if (elem && !elem->struct_name.empty() && ctx.structs) {
+                auto sit = ctx.structs->find(elem->struct_name);
+                if (sit != ctx.structs->end()) {
+                    auto fit = sit->second.fields.find(fl->field);
+                    if (fit != sit->second.fields.end()) {
+                        ft = fit->second.ty; field_off = fit->second.offset;
+                    }
+                }
+            }
+            if (!ft) return { LoweredValue::Scalar, 0, 0, ex.ty };
+            int32_t struct_width = value_bytes(elem, ctx.structs);
+            // Resolve base (identical to the IndexExpr case): local fixed
+            // array (base_off), local slice (base_ptr slice vreg), global
+            // fixed array (GlobalsBase + addend), global slice (slice vreg).
+            VReg base_ptr = 0, base_len = 0; int32_t base_off = 0;
+            bool ready = false, is_slice_base = false, is_global_base = false;
+            if (auto* ibid = dynamic_cast<const Ident*>(ix->base.get())) {
+                auto lit = locals.find(ibid->name);
+                if (lit != locals.end()) {
+                    const Type* lt = local_types.count(ibid->name) ? local_types.at(ibid->name) : ix->base->ty;
+                    if (lt && lt->is_slice) {
+                        LoweredValue b = load_scalar_local(lit->second, lt, loc);
+                        base_ptr = b.vreg; base_len = b.vreg + 1; ready = true; is_slice_base = true;
+                    } else if (lt && lt->array_len > 0) {
+                        base_off = lit->second; ready = true;
+                    }
+                } else {
+                    int32_t goff = 0; const Type* gt = nullptr;
+                    if (resolve_global(ibid->name, goff, gt)) {
+                        if (gt && gt->is_slice) {
+                            LoweredValue b = lower_expr(*ix->base);  // LoadGlobal slice
+                            base_ptr = b.vreg; base_len = b.vreg + 1; ready = true; is_slice_base = true;
+                        } else if (gt && gt->array_len > 0) {
+                            is_global_base = true; base_off = goff; ready = true;
+                        }
+                    }
+                }
+            }
+            if (!ready) return { LoweredValue::Scalar, 0, 0, ex.ty };
+            LoweredValue idx = lower_expr(*ix->index);
+            // bounds check (same policy as IndexExpr)
+            if (is_slice_base) {
+                emit_bounds_check(idx.vreg, base_len, 0, loc);
+            } else if (!ix->index_is_const) {
+                emit_bounds_check(idx.vreg, 0, int64_t(bt->array_len), loc);
+            }
+            // IndexAddr: dst = base + idx*struct_width (element address).
+            VReg addr = new_vreg(&type_i64());
+            ThinInstr& ia = emit(ThinOp::IndexAddr, addr, 0, idx.vreg, loc);
+            ia.meta.width = struct_width;
+            ia.meta.type = elem;
+            if (is_slice_base) {
+                ia.src1 = base_ptr;
+                ia.meta.frame_off = 0;
+            } else if (is_global_base) {
+                ia.src1 = 0;
+                ia.meta.base_kind = AbsFixup::GlobalsBase;
+                ia.meta.addend = uint32_t(base_off);
+            } else {
+                ia.src1 = 0;
+                ia.meta.frame_off = base_off;
+            }
+            // LoadFrame from [element_addr + field_off] (src1=addr -> [r11+off]).
+            VReg res = new_vreg(ft);
+            ThinInstr& ld = emit(ThinOp::LoadFrame, res, 0, 0, loc);
+            ld.src1 = addr; ld.meta.frame_off = field_off; ld.meta.type = ft;
+            ld.meta.width = value_bytes(ft, ctx.structs);
+            if (ft && ft->is_float()) ld.meta.is_f32 = (ft->prim == Prim::F32) ? 1 : 0;
+            return { LoweredValue::Scalar, res, 0, ft };
         }
         return { LoweredValue::Scalar, 0, 0, ex.ty };
     }

@@ -91,6 +91,11 @@ StructLayoutTable build_struct_layouts(const Program& prog) {
             return es * int64_t(t.array_len);
         }
         if (!t.struct_name.empty()) {
+            // If it's a script-declared struct, recurse into its layout.
+            // If it's NOT in decls (an opaque host handle like "string",
+            // "vec3" — not a script struct), treat it as 8 bytes (i64 handle).
+            auto di = decls.find(t.struct_name);
+            if (di == decls.end()) return 8;  // opaque handle
             if (!build(t.struct_name)) return -1;
             return out.at(t.struct_name).size;
         }
@@ -2035,9 +2040,11 @@ SemaResult sema(Program& prog,
                 structs->find(t.struct_name) == structs->end())
                 t.prim = Prim::I64;
         };
-        // Resolve types in function signatures + local let types + globals.
+        // Resolve types in struct fields, function signatures, local let types, globals.
         // The parser sets prim=Void for all named types; sema resolves to
         // I64 for opaque handles (not in the StructLayoutTable).
+        for (auto& sd : prog.structs)
+            for (auto& fd : sd.fields) if (fd.ty) resolve_type(*fd.ty);
         for (auto& fn : prog.funcs) {
             if (fn.ret) resolve_type(*fn.ret);
             for (auto& p : fn.params) if (p.ty) resolve_type(*p.ty);

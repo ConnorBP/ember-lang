@@ -1149,8 +1149,25 @@ struct CG {
         }
         if (auto* fx = dynamic_cast<const FieldExpr*>(&ex)) {
             // Same reasoning as IndexExpr: a global struct base clobbers r10.
+            // A FieldExpr whose base is itself an IndexExpr (arr[i].field)
+            // clobbers r10 exactly when that IndexExpr does - a local SLICE
+            // or GLOBAL array/slice base loads through r10, and the index
+            // expression may too (a call, a signed div/mod); a local
+            // FIXED-ARRAY base with an r10-safe index does not (rbp-relative
+            // addressing, r11/rcx/rax only - see the FieldExpr IndexExpr-base
+            // eval case).
             if (auto* bid = dynamic_cast<const Ident*>(fx->base.get())) {
                 if (locals.find(bid->name) == locals.end()) return true;
+            } else if (auto* ix = dynamic_cast<const IndexExpr*>(fx->base.get())) {
+                if (auto* ibid = dynamic_cast<const Ident*>(ix->base.get())) {
+                    auto it = locals.find(ibid->name);
+                    if (it == locals.end()) return true;          // global array/slice base -> r10
+                    const Type* lt = local_types.count(ibid->name) ? local_types.at(ibid->name) : ix->base->ty;
+                    if (lt && lt->is_slice) return true;           // local slice base -> r10
+                } else {
+                    return true; // non-Ident array base -> conservative clobber
+                }
+                return expr_clobbers_r10(*ix->index);
             } else {
                 return true;
             }
@@ -2911,6 +2928,103 @@ void CG::eval(const Expr& ex) {
                             }
                         }
                     }
+                }
+            }
+        } else if (auto* ix = dynamic_cast<const IndexExpr*>(fl->base.get())) {
+            // arr[i].field: base is an IndexExpr into an array/slice of
+            // structs (e.g. `arr[0].a` on `P[3]` or `s[2].a` on `P[]`). The
+            // bare-Ident base above only handles a local/global struct
+            // variable's field; an indexed struct element needs the element
+            // ADDRESS computed (base + index*struct_size) before the field
+            // offset is added. Mirrors IndexExpr's base-resolution logic for
+            // the four base kinds (local fixed array, local slice, global
+            // fixed array, global slice), then loads the field at
+            // [element_base + field_offset].
+            const Type* bt = ix->base->ty;                 // array/slice type
+            const Type* elem = ix->ty;                     // struct element type (sema sets ix->ty = base->elem)
+            if (!elem || elem->struct_name.empty() || !ctx.structs) return;
+            auto sit = ctx.structs->find(elem->struct_name);
+            if (sit == ctx.structs->end()) return;
+            auto fit = sit->second.fields.find(fl->field);
+            if (fit == sit->second.fields.end()) return;
+            int32_t struct_width = value_bytes(elem, ctx.structs);
+            int32_t field_off = fit->second.offset;
+            const Type* ft = fit->second.ty;
+            // Resolve the array/slice base to (base_reg, base_off), exactly
+            // as IndexExpr's eval does. v1 scope: ix->base must be a bare
+            // Ident (the same restriction IndexExpr itself enforces).
+            Reg base_reg = Reg::rbp;
+            int32_t base_off = 0;
+            bool base_ready = false;
+            bool is_slice_base = false;
+            if (auto* bid = dynamic_cast<const Ident*>(ix->base.get())) {
+                auto it = locals.find(bid->name);
+                if (it != locals.end()) {
+                    const Type* lt = local_types[bid->name];
+                    if (lt && lt->is_slice) {
+                        eval(*ix->base);           // rax=ptr, rdx=len
+                        e.mov_reg_reg(Reg::r10, Reg::rax); // r10 = base ptr (survives index eval)
+                        e.mov_reg_reg(Reg::r9, Reg::rdx);  // r9 = len (survives index eval)
+                        base_reg = Reg::r10; base_off = 0; base_ready = true; is_slice_base = true;
+                    } else if (lt && lt->array_len > 0) {
+                        base_reg = Reg::rbp; base_off = it->second; base_ready = true;
+                    }
+                } else {
+                    // array/slice GLOBAL base (c3): same resolution as IndexExpr.
+                    const auto* gidx = ctx.globals_index ? ctx.globals_index : (g_globals_for_codegen ? &g_globals_for_codegen->index : nullptr);
+                    const auto* goffsets = ctx.globals_offsets ? ctx.globals_offsets : (g_globals_for_codegen ? &g_globals_for_codegen->offsets : nullptr);
+                    const auto* gtypes = ctx.globals_types ? ctx.globals_types : (g_globals_for_codegen ? &g_globals_for_codegen->types : nullptr);
+                    if (gidx && gtypes) {
+                        int32_t goff = 0; bool found = false;
+                        if (goffsets) { auto oit = goffsets->find(bid->name); if (oit != goffsets->end()) { goff = int32_t(oit->second); found = true; } }
+                        if (!found) { auto gi = gidx->find(bid->name); if (gi != gidx->end()) { goff = int32_t(gi->second) * 8; found = true; } }
+                        if (found) {
+                            auto tit = gtypes->find(bid->name);
+                            const Type* gt = (tit != gtypes->end()) ? tit->second : nullptr;
+                            if (gt && gt->is_slice) {
+                                eval(*ix->base);       // rax=absolute ptr, rdx=len
+                                e.mov_reg_reg(Reg::r10, Reg::rax);
+                                e.mov_reg_reg(Reg::r9, Reg::rdx);
+                                base_reg = Reg::r10; base_off = 0; base_ready = true; is_slice_base = true;
+                            } else if (gt && gt->array_len > 0) {
+                                e.mov_reg_imm64_external(Reg::r10, AbsFixup::GlobalsBase);
+                                base_reg = Reg::r10; base_off = goff; base_ready = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if (base_ready) {
+                eval(*ix->index);                  // rax = index
+                // Bounds check - same policy as IndexExpr: a slice always
+                // checks (len is runtime-only); a fixed array with a
+                // compile-time-constant index was already verified by sema;
+                // a fixed array with a non-constant index checks here.
+                if (is_slice_base) {
+                    e.mov_reg_reg(Reg::rcx, Reg::rax);       // stash index (rcx is free here)
+                    emit_bounds_check_reg(Reg::rcx, Reg::r9); // idx (unsigned) < len
+                } else if (!ix->index_is_const) {
+                    e.mov_reg_reg(Reg::rcx, Reg::rax);
+                    emit_bounds_check_imm(Reg::rcx, int64_t(bt->array_len));
+                }
+                if (struct_width > 1) {
+                    e.mov_reg_imm64(Reg::rcx, int64_t(struct_width));
+                    e.imul_reg_reg(Reg::rax, Reg::rcx);   // rax = index * struct_width
+                }
+                e.mov_reg_reg(Reg::r11, base_reg);
+                e.add_reg_reg(Reg::r11, Reg::rax);        // r11 = element address
+                // Field lives at element_base + field_offset; base_off is the
+                // array's offset from base_reg (frame slot / globals addend / 0
+                // for a slice ptr), so the full load offset is base_off + field_off.
+                int32_t addr_off = base_off + field_off;
+                if (ft->prim == Prim::F64 && !ft->is_slice) {
+                    e.movsd_xmm_mem(Xmm::xmm0, Reg::r11, addr_off);
+                } else if (ft->prim == Prim::F32 && !ft->is_slice) {
+                    e.movss_xmm_mem(Xmm::xmm0, Reg::r11, addr_off);
+                } else {
+                    bool is_signed = ft->prim==Prim::I8||ft->prim==Prim::I16||
+                                     ft->prim==Prim::I32||ft->prim==Prim::I64;
+                    e.load_elem_to_rax(Reg::r11, addr_off, value_bytes(ft, ctx.structs), is_signed);
                 }
             }
         }

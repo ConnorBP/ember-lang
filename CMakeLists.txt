@@ -523,6 +523,24 @@ if(WIN32)
 endif()
 add_test(NAME array_lit COMMAND array_lit_test)
 
+# field_of_index_test - pins the C1 fix: `arr[i].field` on a struct array /
+# slice (FieldExpr { base: IndexExpr { arr, i }, field }). Before the fix,
+# both backends only handled a bare-Ident base for struct field reads; the
+# tree-walker emitted nothing and the thin IR returned VReg 0, so
+# `arr[0].a` silently returned 0/garbage. This probe compiles tiny .ember
+# sources through the full tree-walker pipeline and reads the i64/f64
+# return directly via C (non-circular direct-value probe, matching
+# array_lit_test's shape). Pure language features (no native calls), so
+# links only the core libs. Covers fixed-array + slice bases, zero and
+# non-zero indices, zero and non-zero field offsets, and the f64 movsd
+# load path.
+add_executable(field_of_index_test examples/field_of_index_test.cpp)
+target_link_libraries(field_of_index_test PRIVATE ember ember_frontend ember_import)
+if(WIN32)
+    target_link_libraries(field_of_index_test PRIVATE kernel32)
+endif()
+add_test(NAME field_of_index COMMAND field_of_index_test)
+
 # codegen_opt_test - pins the Stage 1 codegen-optimization peephole + local
 # regalloc rewrites' VALUE EQUIVALENCE (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4.7).
 # For each rewrite, compiles the SAME source with the Stage-1 flags OFF and ON,

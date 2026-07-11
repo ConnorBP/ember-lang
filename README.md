@@ -19,40 +19,86 @@ benchmark-gated v2+ goal, not a v1 claim. Current version: **v1.0**.
 
 ## What it looks like
 
-A squad of archers fires volleys; tally the hits that land in range — structs,
-an enum, a script function, a loop, and a native call (`sqrt`):
+A modular damage calculator that exercises type inference, enums, structs,
+for-each over slices, pattern matching, operator overloads, and native calls —
+with comments marking where ember's unique properties show:
 
 ```rust
-enum Stance { Cautious, Aggressive }
+// Enums are untyped i32 constants (v1: no typed enums, no tag). Auto-
+// increment from 0; an explicit `= N` sets the next base.
+enum Damage { Physical, Fire = 10, Ice, Lightning }
 
-struct Archer {
-    stance: i64;
-    arrows: i64;
-    range: f32;
+// Structs are value types with Ember's tight-packed layout (no C++ alignment).
+// Passed by value: ≤8 bytes → one register; >8 bytes → hidden pointer (Win64 ABI).
+struct Enemy {
+    hp: i64;
+    weakness: i64;   // holds a Damage enum value (untyped i32 → i64)
+    name: string;     // opaque host handle — string is an extension type
 }
 
-fn volley(a: Archer, targets: i64) -> i64 {
-    let mut hits: i64 = 0;
-    let mut k: i64 = 0;
-    while (k < a.arrows) {
-        let d: f32 = sqrt((targets as f32) + (k as f32));
-        if (d <= a.range) { hits = hits + 1; }
-        k = k + 1;
+// Type inference: `let x = expr` infers x's type from the initializer.
+// No need to write `let x: i64 = 0` — ember infers it.
+fn compute_damage(base: i64, type: i64) -> i64 {
+    // match: pattern matching with no-fallthrough arms (unlike switch).
+    // Each arm is a separate branch — no `break` needed.
+    // `_` is the wildcard/default arm.
+    match (type) {
+        Damage::Physical => { return base; },
+        Damage::Fire     => { return base * 2; },
+        _                => { return base; },
     }
-    return hits;
+    return 0;
+}
+
+// Operator overloads: `string + string` concatenates (registered by the
+// string extension via BindingBuilder::add_overload). The `+` here is
+// a real native call, not syntax sugar.
+fn label(e: Enemy) -> string {
+    return e.name + string_from_i64(e.hp);
 }
 
 fn main() -> i64 {
+    // Array literal — a fixed-size i64[3] allocated on the frame.
+    let hps: i64[3] = [100, 200, 50];
+
+    // View: `arr[..]` creates a slice {ptr, len} pointing at the array's
+    // backing storage. No copy — the slice is a two-word {pointer, length}.
+    let slice: i64[] = hps[..];
+
+    // for-each: iterates a slice, binding each element to `hp`.
+    // Desugars to a while loop with index + bounds check.
+    // The element type is inferred from the slice's element type.
     let mut total: i64 = 0;
-    let mut i: i64 = 0;
-    while (i < 5) {
-        let a: Archer = Archer{stance: Stance::Aggressive, arrows: 4, range: 8.0f};
-        total = total + volley(a, i * i);
-        i = i + 1;
+    for (hp in slice) {
+        // `as` is the explicit cast operator. Implicit narrowing is rejected
+        // by sema (i64 → i32 requires `as i32`; `let y: i8 = x_i64` is an error).
+        let d: i64 = compute_damage(hp as i64, Damage::Fire);
+        total = total + d;
     }
-    return total;
+
+    // String construction via the string extension's native functions.
+    let goblin: Enemy = Enemy { hp: 150, weakness: Damage::Fire, name: string_from_i64(0) };
+    let tagged: string = label(goblin);  // operator overload: string + string
+    let len: i64 = string_length(tagged); // opaque handle → i64
+
+    // The i64 return becomes the process exit code (8-bit, so >255 wraps).
+    return total + len;
 }
 ```
+
+**What this example shows:**
+- **Type inference** (`let total = 0`, `let d = compute_damage(...)`) — no redundant type annotations
+- **Enums** with auto-increment + explicit values (`Damage::Fire = 10`, `Damage::Ice = 11`)
+- **Structs** as value types with field access (`e.hp`, `e.name`)
+- **for-each** over a slice (`for (hp in slice)`) — no manual index loop
+- **match** with no-fallthrough arms + wildcard (`_ => default`)
+- **Operator overloads** (`string + string` → concatenation via a registered native)
+- **Explicit casts** (`hp as i64`) — no implicit narrowing
+- **Opaque host handles** (`string` — an i64 backed by a host-side `std::string`)
+- **Slice views** (`arr[..]` — zero-copy {ptr, len} pair)
+- **Native calls** (`string_from_i64`, `string_length`, `sqrt` — registered via `BindingBuilder`)
+
+All of this compiles to native x86-64 machine code at runtime — no interpreter, no bytecode.
 
 ## Getting started
 
