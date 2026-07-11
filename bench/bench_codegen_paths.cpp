@@ -36,6 +36,8 @@
 #include "engine.hpp"        // ember_call_void, CompiledFn, finalize, free_executable
 #include "dispatch_table.hpp"
 #include "binding_builder.hpp"
+#include "thin_ir.hpp"        // Stage C: ThinFunction (IR instr count metric)
+#include "thin_lower.hpp"     // Stage C: lower_function (IR instr count metric)
 
 #include "ext_vec.hpp"
 #include "ext_quat.hpp"
@@ -103,6 +105,7 @@ struct PathBench {
     uint8_t string_xor;        // 0 = no encryption; nonzero = encrypt (string_decrypt path)
     long long inner_n;         // inner-loop count (substituted into ember %N, passed to baseline)
     bool check_correctness;    // is ember==baseline the right invariant? (string_decrypt: no — baseline is a non-decrypt reference, delta is the finding)
+    bool ir_safe;              // does this path work with enable_ir_backend? (scalar/control-flow/calls = yes; slices/strings/structs = no, Stage A known gaps)
 };
 
 // ---- compile an ember source into a callable module (the v0_4/bench_ember_vs_as shape) ----
@@ -115,10 +118,15 @@ struct BenchModule {
     Program prog;
     std::unordered_map<std::string, NativeSig> natives;
     StructLayoutTable layouts;
+    // Compile-time metrics (Stage C: for measuring pass overhead + effectiveness).
+    double compile_ns = 0;      // total compile time (tokenize→parse→sema→codegen→finalize)
+    size_t code_bytes = 0;      // total emitted x86 bytes (all fns)
+    size_t ir_instr_count = 0;  // total ThinFunction instrs (if enable_ir_backend; 0 otherwise)
     BenchModule(int n) : table(n) {}
 };
 
-static std::unique_ptr<BenchModule> ember_compile(const std::string& src, bool safety_on, uint8_t string_xor) {
+static std::unique_ptr<BenchModule> ember_compile(const std::string& src, bool safety_on, uint8_t string_xor, bool ir_safe = true) {
+    auto t0 = std::chrono::steady_clock::now();  // compile-time start
     auto m = std::make_unique<BenchModule>(8);
     auto lr = tokenize(src, "<bench>");
     if (!lr.ok) { std::fprintf(stderr, "  ember lex: %s\n", lr.error.c_str()); return nullptr; }
@@ -167,6 +175,17 @@ static std::unique_ptr<BenchModule> ember_compile(const std::string& src, bool s
         else if (s == "regalloc") ctx.enable_local_regalloc = true;
         else if (s == "both")     { ctx.enable_peephole = true; ctx.enable_local_regalloc = true; }
     }
+    // Stage C: enable the IR backend (lower_function → ThinFunction → emit_x64)
+    // so we can measure IR instr count + the IR path's compile/run cost.
+    // Toggled via EMBER_IR_BACKEND=1. Default off = tree-walker (unchanged).
+    // Only enabled for ir_safe paths (scalar/control-flow/calls); the known-
+    // gap paths (slices/strings/structs) would crash the IR path (Stage A gaps).
+    if (ir_safe) {
+        if (const char* o = std::getenv("EMBER_IR_BACKEND")) {
+            std::string s(o);
+            if (s == "1" || s == "on" || s == "true") ctx.enable_ir_backend = true;
+        }
+    }
     if (safety_on) {
         // safety-on: budget + depth + trap. budget set huge (INT64_MAX) so we
         // measure the guard's INSTRUCTION COST (sub+jg per entry/back-edge +
@@ -178,11 +197,21 @@ static std::unique_ptr<BenchModule> ember_compile(const std::string& src, bool s
         // them on the per-call context_t (ectx) before each call.
     }
     for (auto& fn : m->prog.funcs) {
+        // Stage C: if IR backend is on, lower to ThinFunction first to count
+        // instrs (the pass-effectiveness metric: instr count before/after).
+        if (ctx.enable_ir_backend) {
+            ThinFunction thf = lower_function(fn, ctx);
+            for (const auto& blk : thf.blocks)
+                m->ir_instr_count += blk.instrs.size();
+        }
         CompiledFn cf = compile_func(fn, ctx);
         finalize(cf);
+        m->code_bytes += cf.bytes.size();
         m->table.set(fn.slot, cf.entry);
         m->fns.push_back(std::move(cf));
     }
+    auto t1 = std::chrono::steady_clock::now();  // compile-time end
+    m->compile_ns = double(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
     return m;
 }
 
@@ -272,22 +301,22 @@ static std::vector<PathBench> make_paths() {
     return {
         {"int_div",
             "fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 1; while (i < %N) { s = s + (i*7)/(i+1) + (i*13)%(i+2); i = i + 1; } return s; }\n",
-            "bench_int_div", "cqo+idiv x2 + div0-guard (always on)", false, 2000, 50, 0, 1000, true},
+            "bench_int_div", "cqo+idiv x2 + div0-guard (always on)", false, 2000, 50, 0, 1000, true, true},
         {"call_overhead",
             "fn c(x: i64) -> i64 { return x + 1; }\n"
             "fn b(x: i64) -> i64 { return c(x) + c(x); }\n"
             "fn a(x: i64) -> i64 { return b(x) + b(x); }\n"
             "fn main() -> i64 { let mut sum: i64 = 0; let mut i: i64 = 0; while (i < %N) { sum = sum + a(i); i = i + 1; } return sum; }\n",
-            "bench_call_overhead", "dispatch indirect call + prologue/epilogue x4/iter", true, 2000, 50, 0, 100000, true},
+            "bench_call_overhead", "dispatch indirect call + prologue/epilogue x4/iter", true, 2000, 50, 0, 100000, true, true},
         {"loop_overhead",
             "fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; while (i < %N) { s = s + i; i = i + 1; } return s; }\n",
-            "bench_loop_overhead", "jmp back-edge + loop-body budget charge (safety-on)", true, 200, 20, 0, 10000000, true},
+            "bench_loop_overhead", "jmp back-edge + loop-body budget charge (safety-on)", true, 200, 20, 0, 10000000, true, true},
         {"slice_bounds",
             "fn main() -> i64 { let mut a: i64[64]; let mut k: i64 = 0; while (k < 64) { a[k] = k; k = k + 1; } let mut s: i64 = 0; let mut i: i64 = 0; while (i < %N) { s = s + a[i % 64]; i = i + 1; } return s; }\n",
-            "bench_slice_bounds", "indexing w/ bounds check (always on); C++ unchecked", false, 200, 20, 0, 1000000, true},
+            "bench_slice_bounds", "indexing w/ bounds check (always on); C++ unchecked", false, 200, 20, 0, 1000000, true, false},
         {"string_decrypt",
             "fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; while (i < %N) { s = s + string_length(\"hello world!\"); i = i + 1; } return s; }\n",
-            "bench_string_decrypt", "inline-stack-XOR decrypt per use (string_xor!=0)", true, 2000, 50, 0xA5, 100000, false},
+            "bench_string_decrypt", "inline-stack-XOR decrypt per use (string_xor!=0)", true, 2000, 50, 0xA5, 100000, false, false},
         {"struct_by_value",
             "struct P { a: i32; b: i32; c: i32; }\n"
             "fn mkp(a: i32, b: i32, c: i32) -> P { let p: P = P { a: a, b: b, c: c }; return p; }\n"
@@ -296,7 +325,29 @@ static std::vector<PathBench> make_paths() {
             // n=20: a larger inner loop (>=~25) triggers a known struct-by-value-
             // in-loop codegen corruption (see findings note in BENCHMARK_SYSTEM_DESIGN.md);
             // both ember and the baseline use the SAME n so the comparison is fair.
-            "bench_struct_by_value", "hidden-pointer ABI temp copy; struct-by-value arg + return", true, 2000, 50, 0, 20, true},
+            "bench_struct_by_value", "hidden-pointer ABI temp copy; struct-by-value arg + return", true, 2000, 50, 0, 20, true, false},
+        // ── IR-pass workloads (Stage C): each exercises one optimization pass's ──
+        // ── eliminable pattern. These are the workloads the pass system gates on. ──
+        {"cse_redundant",
+            // CSE: `x*7 + x*7` — the `x*7` is computed twice; CSE should fold
+            // the second into a reuse of the first.
+            "fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; while (i < %N) { let a: i64 = i * 7; s = s + a + a; i = i + 1; } return s; }\n",
+            "bench_cse_redundant", "CSE: redundant i*7 computed twice", false, 2000, 50, 0, 1000000, true, true},
+        {"dce_dead_store",
+            // DCE: `let dead = i * 13;` is computed but never used; DCE should
+            // remove it entirely.
+            "fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; while (i < %N) { let dead: i64 = i * 13; s = s + i; i = i + 1; } return s; }\n",
+            "bench_dce_dead_store", "DCE: dead store (i*13 unused)", false, 2000, 50, 0, 1000000, true, true},
+        {"constprop_fold",
+            // Const-prop: `let b = 3; let c = b + 4;` — b and c are constants;
+            // const-prop should fold `c` to 7 at compile time.
+            "fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; while (i < %N) { let b: i64 = 3; let c: i64 = b + 4; s = s + c; i = i + 1; } return s; }\n",
+            "bench_constprop_fold", "const-prop: b=3, c=b+4 fold to c=7", false, 2000, 50, 0, 1000000, true, true},
+        {"licm_invariant",
+            // LICM: `let k = 100 * 200;` is loop-invariant (computed every
+            // iteration); LICM should hoist it out of the loop.
+            "fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; while (i < %N) { let k: i64 = 100 * 200; s = s + k + i; i = i + 1; } return s; }\n",
+            "bench_licm_invariant", "LICM: 100*200 loop-invariant", false, 2000, 50, 0, 1000000, true, true},
     };
 }
 
@@ -372,8 +423,13 @@ int main(int argc, char** argv) {
 
         for (bool safety_on : {false, true}) {
             const char* mode = safety_on ? "on" : "off";
-            auto m = ember_compile(src, safety_on, p.string_xor);
+            auto m = ember_compile(src, safety_on, p.string_xor, p.ir_safe);
             if (!m || m->fns.empty()) { std::fprintf(stderr, "  ember compile FAILED (%s)\n", mode); any_compile_fail = true; continue; }
+            // Stage C: compile-time + code-size + IR-instr-count metrics.
+            // Printed once per (path, safety) cell so the pass system can gate
+            // on compile overhead + instr-count reduction + code-size delta.
+            std::printf("  [compile] safety=%-3s  compile=%8.0f ns  code=%5zu B  ir_instrs=%zu\n",
+                        mode, m->compile_ns, m->code_bytes, m->ir_instr_count);
             context_t ectx;
             ectx.max_call_depth = 8192;       // generous: we measure guard cost, not trap behavior
             ectx.budget_remaining = INT64_MAX;

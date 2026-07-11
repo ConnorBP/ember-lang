@@ -126,3 +126,28 @@ extern "C" long long bench_struct_by_value(long long N) {
     g_sink = s;
     return s;
 }
+
+// ---- IR-pass workloads (Stage C) — the g++ -O2 baselines ----
+// g++ -O2 will optimize these (CSE, DCE, const-prop, LICM all fire at -O2);
+// the ratio shows how much ember's IR passes close the gap.
+
+extern "C" long long bench_cse_redundant(long long N) {
+    long long s = 0; long long i = 0;
+    while (i < N) { long long a = i * 7; s += a + a; i = i + 1; }
+    g_sink = s; return s;
+}
+extern "C" long long bench_dce_dead_store(long long N) {
+    long long s = 0; long long i = 0;
+    while (i < N) { long long dead = i * 13; (void)dead; s += i; i = i + 1; }
+    g_sink = s; return s;
+}
+extern "C" long long bench_constprop_fold(long long N) {
+    long long s = 0; long long i = 0;
+    while (i < N) { long long b = 3; long long c = b + 4; s += c; i = i + 1; }
+    g_sink = s; return s;
+}
+extern "C" long long bench_licm_invariant(long long N) {
+    long long s = 0; long long i = 0;
+    while (i < N) { long long k = 100 * 200; s += k + i; i = i + 1; }
+    g_sink = s; return s;
+}
