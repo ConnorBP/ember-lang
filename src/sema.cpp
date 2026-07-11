@@ -326,11 +326,25 @@ struct Checker {
     // built by the enum-resolution pass (pass 1.5, before any function body is
     // checked). `enum_names` is the set of registered enum names, used by the
     // type-position enum-name rejection (Section 4.5: `let x: Color = ...` is a
-    // clean error in v1, the hook the typed-enum upgrade later flips).
+    // clean error in v1 for an UNTYPED enum, the hook the typed-enum upgrade
+    // flips to accept for a typed one).
     std::unordered_map<std::string, std::unordered_map<std::string, int64_t>> enum_values;
     std::unordered_set<std::string> enum_names;
 
     bool is_enum_name(const std::string& n) const { return enum_names.count(n) != 0; }
+
+    // Tier 1 typed enums (docs/planning/plan_ENUMS.md §6): `enum E : T { ... }`
+    // makes E a real type backed by the integer T. typed_enum_backing maps the
+    // enum name to its backing Prim; typed_enum_types caches the interned
+    // Type (prim=backing, struct_name="", enum_name=E) handed out to type
+    // positions + EnumAccessExpr rewrites. Populated by register_typed_enums
+    // (a pre-pass BEFORE resolve_type, so a `let c: Color` annotation resolves
+    // to the typed enum type — not the opaque-handle I64 the untyped path
+    // would produce). An enum name NOT in this map is untyped (backward compat:
+    // variants are plain i32, the name is not a type).
+    std::unordered_map<std::string, Prim> typed_enum_backing;
+    std::unordered_map<std::string, const Type*> typed_enum_types;
+    bool is_typed_enum(const std::string& n) const { return typed_enum_backing.count(n) != 0; }
 
     // script function signatures: name -> (ret type, param types)
     struct ScriptSig {
@@ -388,7 +402,7 @@ struct Checker {
     // but are nominal types.  Only actual, untagged integer types participate
     // in v1's integer compatibility rule.
     static bool is_plain_integer(const Type* t) {
-        return t && t->is_int() && !t->is_fn_handle && t->struct_name.empty();
+        return t && t->is_int() && !t->is_fn_handle && t->struct_name.empty() && t->enum_name.empty();
     }
     bool is_by_value_aggregate(const Type* t) const {
         return t && (t->array_len > 0 || is_registered_struct(t));
@@ -406,6 +420,15 @@ struct Checker {
     static bool can_implicitly_convert(const Type* want, const Type* got) {
         if (!want || !got) return false;
         if (want->same(*got)) return true;
+        // Tier 1 typed enums (§6.3): enum->backing-int implicit widening. A
+        // typed-enum value (enum_name set) flows to a plain integer target
+        // when the backing prim widens to (or exactly matches) the target —
+        // same signedness, backing width <= target width. The reverse
+        // (int->enum) is NOT implicit: is_plain_integer(want) is false for a
+        // typed-enum target, so the plain-int matrix below does not accept it.
+        if (!got->enum_name.empty() && is_plain_integer(want)) {
+            return got->is_uint() == want->is_uint() && int_width(got) <= int_width(want);
+        }
         return is_plain_integer(want) && is_plain_integer(got) &&
                want->is_uint() == got->is_uint() && int_width(got) < int_width(want);
     }
@@ -477,45 +500,104 @@ struct Checker {
 
     // --- Tier 1 enums (docs/planning/plan_ENUMS.md) ---
     //
-    // Pass 1.5 (Section 4.1): resolve every enum variant's i32 value. First
+    // Pass 1.4 (typed-enum registration, §6): BEFORE resolve_type runs, scan
+    // every enum and register the typed ones (those with a `: type` backing
+    // declaration). For each typed enum we validate the backing type is an
+    // integer primitive, then cache (name -> backing Prim) and the interned
+    // typed-enum Type (prim=backing, struct_name="", enum_name=name). This
+    // MUST precede resolve_type so a `let c: Color` annotation resolves to
+    // the typed enum type instead of the opaque-handle I64 the untyped path
+    // would produce (a typed enum name is not in the StructLayoutTable).
+    void register_typed_enums() {
+        for (auto& e : prog->enums) {
+            if (!e.is_typed()) continue;
+            const Type* bt = e.backing_type.get();
+            if (!bt || !bt->is_int() || !bt->struct_name.empty()) {
+                err("enum '" + e.name + "' backing type must be an integer (i8/i16/i32/i64/u8/u16/u32/u64)",
+                    e.loc.line, e.loc.col);
+                continue;
+            }
+            typed_enum_backing[e.name] = bt->prim;
+            Type t = make_prim(bt->prim);
+            t.enum_name = e.name;
+            typed_enum_types[e.name] = intern(std::move(t));
+        }
+    }
+    // Range (min,max) for a signed/unsigned integer Prim, used to range-check
+    // enum variant values against the enum's backing type (i32 for untyped,
+    // the declared backing for typed). Returns true iff `v` fits.
+    static bool int_fits(Prim p, int64_t v) {
+        switch (p) {
+        case Prim::I8:  return v >= -128 && v <= 127;
+        case Prim::U8:  return v >= 0 && v <= 0xFF;
+        case Prim::I16: return v >= -32768 && v <= 32767;
+        case Prim::U16: return v >= 0 && v <= 0xFFFF;
+        case Prim::I32: return v >= -2147483648LL && v <= 2147483647LL;
+        case Prim::U32: return v >= 0 && v <= 0xFFFFFFFFLL;
+        case Prim::I64: return true;  // full int64_t range
+        case Prim::U64: return true;  // the lexer bit-casts full u64 into int64_t
+        default: return false;
+        }
+    }
+    static const char* prim_name(Prim p) {
+        switch (p) {
+        case Prim::I8: return "i8";  case Prim::U8: return "u8";
+        case Prim::I16: return "i16"; case Prim::U16: return "u16";
+        case Prim::I32: return "i32"; case Prim::U32: return "u32";
+        case Prim::I64: return "i64"; case Prim::U64: return "u64";
+        default: return "?";
+        }
+    }
+    //
+    // Pass 1.5 (Section 4.1): resolve every enum variant's value. First
     // variant defaults to 0; each variant without an explicit `= value` is
     // prev+1; an explicit `= constexpr_int` sets the next base. Explicit
     // values are restricted to what try_eval_const_i64 already folds
-    // (IntLit / -IntLit / BinExpr-of-literals) - no new evaluator. Values are
-    // i32-range-checked (reusing the bound from adapt_int_lit) and duplicate
-    // values / duplicate variant names within one enum are errors (stricter
-    // than C - the one footgun C allows that v1 rejects). Builds the
-    // (enum_name -> (variant -> i32)) table for EnumAccessExpr resolution and
-    // the enum_names set for the type-position rejection (Section 4.5).
+    // (IntLit / -IntLit / BinExpr-of-literals) - no new evaluator - EXCEPT a
+    // constexpr fn call is ALSO accepted: lower_constexpr_calls_expr folds it
+    // to an IntLit first (the enum-from-constexpr-expr feature, §6.2), so a
+    // variant value like `X = base()` where base is a `constexpr fn` works.
+    // Values are range-checked against the backing type (i32 for untyped, the
+    // declared backing for typed) and duplicate values / duplicate variant
+    // names within one enum are errors (stricter than C). Builds the
+    // (enum_name -> (variant -> value)) table for EnumAccessExpr resolution
+    // and the enum_names set for the type-position rejection (Section 4.5,
+    // untyped-only now that typed enums are real types).
     void resolve_enums() {
         std::unordered_set<std::string> seen_enum_names;
         for (auto& e : prog->enums) {
             if (!seen_enum_names.insert(e.name).second)
                 err("duplicate enum declaration '" + e.name + "'", e.loc.line, e.loc.col);
             enum_names.insert(e.name);
+            Prim backing = is_typed_enum(e.name) ? typed_enum_backing[e.name] : Prim::I32;
             int64_t next = 0;
-            std::unordered_set<int32_t> seen_values;
+            std::unordered_set<int64_t> seen_values;
             std::unordered_set<std::string> seen_variant_names;
             for (auto& v : e.variants) {
                 if (!seen_variant_names.insert(v.name).second)
                     err("enum '" + e.name + "' has duplicate variant '" + v.name + "'",
                         v.loc.line, v.loc.col);
                 if (v.explicit_value) {
+                    // enum-from-constexpr-expr (§6.2): fold any constexpr fn
+                    // call in the variant value to an IntLit BEFORE the const
+                    // check, so `X = base()` (base a constexpr fn) resolves.
+                    lower_constexpr_calls_expr(v.explicit_value);
                     int64_t ev = 0;
                     if (!try_eval_const_i64(*v.explicit_value, ev)) {
                         err("enum variant '" + e.name + "::" + v.name +
                             "' explicit value must be a compile-time integer constant",
                             v.loc.line, v.loc.col);
-                    } else if (ev < -2147483648LL || ev > 2147483647LL) {
+                    } else if (!int_fits(backing, ev)) {
                         err("enum variant '" + e.name + "::" + v.name +
-                            "' value " + std::to_string(ev) + " out of i32 range",
+                            "' value " + std::to_string(ev) + " out of " +
+                            prim_name(backing) + " range",
                             v.loc.line, v.loc.col);
                     } else {
                         next = ev;
                     }
                 }
                 v.resolved = next;
-                if (!seen_values.insert(int32_t(next)).second)
+                if (!seen_values.insert(next).second)
                     err("enum '" + e.name + "' has duplicate value " + std::to_string(next) +
                         " (variant '" + v.name + "')", v.loc.line, v.loc.col);
                 enum_values[e.name][v.name] = next;
@@ -524,13 +606,17 @@ struct Checker {
         }
     }
 
-    // Pass 1.6 (Section 4.5 follow-through): reject an enum name used in a
-    // type position (`let x: Color = ...`, `fn f(p: Color)`, a struct field,
-    // a global, a return type). In v1 an enum is untyped (its values ARE
-    // i32); the hook flips from reject to accept when typed enums land (Tier 2).
+    // Pass 1.6 (Section 4.5 follow-through): reject an UNTYPED enum name used
+    // in a type position (`let x: Color = ...`, `fn f(p: Color)`, a struct
+    // field, a global, a return type). A TYPED enum name (`enum Color : i32`)
+    // IS a real type and is accepted (resolve_type already rewrote it to the
+    // backing-prim + enum_name form by this point, so its struct_name is
+    // empty and this check is a no-op for typed enums — the explicit
+    // is_typed_enum guard is defensive).
     void check_type_not_enum(const Type* t, const Loc& loc) {
-        if (t && !t->struct_name.empty() && is_enum_name(t->struct_name))
-            err("enum '" + t->struct_name + "' is not a type in v1; declare the binding as `i32`",
+        if (t && !t->struct_name.empty() && is_enum_name(t->struct_name) &&
+            !is_typed_enum(t->struct_name))
+            err("enum '" + t->struct_name + "' is untyped; declare the binding with an integer type, or declare the enum as `enum " + t->struct_name + " : <int>`",
                 loc.line, loc.col);
     }
     // Walk every declared type in the program (struct fields, func params,
@@ -635,10 +721,19 @@ struct Checker {
             }
             auto lit = std::make_unique<IntLit>();
             lit->loc = ea->loc;
-            lit->v = vit->second;       // the resolved i32 value, sign-extended into i64
-            // ty is finalized by check_expr's IntLit case (adapt_int_lit to the
-            // expected context, defaulting to i32 here per Section 1.4).
-            lit->ty = intern(make_prim(Prim::I32));
+            lit->v = vit->second;       // the resolved value, sign-extended into i64
+            // Tier 1 typed enums (§6): a typed enum's variant literal carries
+            // the typed-enum type (prim=backing, enum_name=enum) so a
+            // `let c: Color = Color::Red` binding type-checks (Color==Color)
+            // and a raw `let c: Color = 5` is rejected (5 stays a plain int,
+            // see adapt_int_lit's typed-enum guard). An untyped enum's variant
+            // stays a plain i32 (backward compat: `let x: i64 = Color::Blue`
+            // + arithmetic on variants keep working exactly as before). ty is
+            // still refinable by check_expr's IntLit case for a plain-int
+            // expected context (adapt_int_lit re-types to the target int).
+            auto tit = typed_enum_types.find(ea->enum_name);
+            lit->ty = (tit != typed_enum_types.end()) ? tit->second
+                                                      : intern(make_prim(Prim::I32));
             slot = std::move(lit);
             return;
         }
@@ -798,6 +893,14 @@ struct Checker {
     // try to adapt an IntLit's type to `target` (a numeric int type) if value fits
     void adapt_int_lit(IntLit& lit, const Type* target) {
         if (!target || !target->is_int()) return;
+        // Tier 1 typed enums (§6.3): never adapt a raw integer literal to a
+        // typed-enum type. This is what rejects `let c: Color = 5` — the
+        // literal 5 is NOT re-typed to Color, so it stays a plain int and the
+        // let's type compatibility check fails (int->enum is not implicit). A
+        // Color::Red variant literal, by contrast, already carries ty=Color
+        // (set by lower_enum_access_expr) and is never passed through here
+        // with a typed-enum target it would need to adopt.
+        if (!target->enum_name.empty()) return;
         // only adopt if the literal currently is default i64 and fits target
         int64_t v = lit.v;
         switch (target->prim) {
@@ -1403,7 +1506,22 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
             }
         }
         if (is_cmp) {
-            if (!types_compatible(lt, rt))
+            // Tier 1 typed enums (§6.3): a typed-enum value may be compared
+            // to a plain integer (the enum widens to its backing int for the
+            // comparison) — `if (c != 2)` where c: Color, or `Color::Red == 0`.
+            // Codegen normalizes both sides to 64-bit in rax/rcx, so a
+            // mixed-width compare is value-correct; the condition code's
+            // signedness follows the lhs (an unsigned-backed enum selects the
+            // unsigned setcc). Two DIFFERENT typed enums (Color vs Hue) stay
+            // rejected (neither is a plain int), matching the rule that an
+            // enum's variants only compare within their own enum.
+            bool cmp_ok = types_compatible(lt, rt);
+            if (!cmp_ok && lt && rt) {
+                if ((!lt->enum_name.empty() && is_plain_integer(rt)) ||
+                    (!rt->enum_name.empty() && is_plain_integer(lt)))
+                    cmp_ok = true;
+            }
+            if (!cmp_ok)
                 err("comparison requires same-type operands (got " + lt->to_string() + " and " + rt->to_string() + ")",
                     b->loc.line, b->loc.col);
             e.ty = &type_bool(); return e.ty;
@@ -1449,13 +1567,19 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
         // handles can only take a same-type no-op cast.
         const bool same = from && from->same(*to);
         const bool int_to_int = is_plain_integer(from) && is_plain_integer(to);
+        // Tier 1 typed enums (§6.3): explicit enum->int cast (the explicit
+        // spelling of the implicit enum->backing-int widening). The operand
+        // is a typed-enum value (enum_name set); the target is a plain int.
+        // int->enum is NOT in the explicit matrix (a raw int has no enum_name,
+        // so enum_from_int is false) — reclassify via `as` is deliberately out.
+        const bool enum_to_int = from && !from->enum_name.empty() && is_plain_integer(to);
         const bool float_to_float = from && to && from->is_float() && to->is_float();
         // The x64 backend currently implements signed integer/float conversion.
         // Unsigned conversion (especially u64 above INT64_MAX) needs a distinct
         // lowering, so it is deliberately outside the v1 cast matrix.
         const bool int_float = (is_plain_integer(from) && !from->is_uint() && to && to->is_float()) ||
                                (from && from->is_float() && is_plain_integer(to) && !to->is_uint());
-        if (!same && !int_to_int && !float_to_float && !int_float) {
+        if (!same && !int_to_int && !enum_to_int && !float_to_float && !int_float) {
             err("invalid cast from '" + (from ? from->to_string() : std::string("?")) +
                 "' to '" + to->to_string() + "'", c->loc.line, c->loc.col);
         } else if (same && is_by_value_aggregate(from) &&
@@ -2694,15 +2818,35 @@ SemaResult sema(Program& prog,
     c.module_exports = module_exports;
     c.prog = &prog;
 
+    // Tier 1 typed enums (docs/planning/plan_ENUMS.md §6): register typed
+    // enum names + their backing Prim BEFORE resolve_type runs, so a typed
+    // enum name used in a type position (`let c: Color`, `fn f(p: Color)`, a
+    // global/field/return) resolves to the typed-enum type (prim=backing,
+    // struct_name="", enum_name=name) instead of the opaque-handle I64 the
+    // untyped path below would produce (a typed enum name is not in the
+    // StructLayoutTable). Validates each typed enum's backing type is an
+    // integer; bad backing types are recorded as sema errors here.
+    c.register_typed_enums();
+
     // Resolve named types: the parser sets prim=Void for all named types.
     // A named type that IS in the StructLayoutTable is a by-value struct
     // (prim stays Void). A named type that is NOT in the table is an opaque
-    // handle (prim → I64). This must happen before any type checking.
+    // handle (prim → I64). A named type that is a TYPED enum resolves to its
+    // backing integer prim (struct_name cleared, enum_name set). This must
+    // happen before any type checking.
     if (structs) {
         auto resolve_type = [&](Type& t) {
-            if (t.prim == Prim::Void && !t.struct_name.empty() &&
-                structs->find(t.struct_name) == structs->end())
-                t.prim = Prim::I64;
+            if (t.prim == Prim::Void && !t.struct_name.empty()) {
+                auto teit = c.typed_enum_backing.find(t.struct_name);
+                if (teit != c.typed_enum_backing.end()) {
+                    t.prim = teit->second;   // backing integer prim
+                    t.enum_name = t.struct_name;
+                    t.struct_name.clear();
+                    return;
+                }
+                if (structs->find(t.struct_name) == structs->end())
+                    t.prim = Prim::I64;
+            }
         };
         // Resolve types in struct fields, function signatures, local let types, globals.
         // The parser sets prim=Void for all named types; sema resolves to

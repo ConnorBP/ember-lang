@@ -1,3 +1,4 @@
+// expect: 177
 // constexpr fn call used inside a larger expression + a global initializer.
 // The folded value (square(6) = 36) is visible to downstream consumers:
 //   - global init: global g : i64 = square(6) + 100;  -> 136

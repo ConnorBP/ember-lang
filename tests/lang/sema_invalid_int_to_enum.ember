@@ -1,0 +1,13 @@
+// sema_invalid_int_to_enum — int->enum implicit assignment is a sema error.
+// `let c: Color = 5` must fail: 5 is a raw integer literal, and adapt_int_lit
+// refuses to re-type a raw literal to a typed-enum type (the typed-enum
+// guard), so 5 stays a plain i64. can_implicitly_convert(Color, i64) is
+// false (int->enum is not implicit — only enum->int widens), so the let's
+// type compatibility check fails: "let type mismatch (Color = i64)".
+// A Color value must come from a Color::Variant (or another Color binding).
+enum Color : i32 { Red, Green, Blue }
+
+fn main() -> i64 {
+    let c: Color = 5;
+    return 0;
+}

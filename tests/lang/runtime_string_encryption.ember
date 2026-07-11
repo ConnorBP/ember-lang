@@ -1,3 +1,4 @@
+// expect: 42
 // runtime_string_encryption.ember — regression for the inline-stack-XOR
 // string-encryption lowering (2026-07-10).
 //

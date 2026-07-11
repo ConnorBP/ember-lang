@@ -1,3 +1,4 @@
+// expect: 78
 fn main() -> i64 {
     let a: i64 = -17;
     let b: i64 = 5;

@@ -1,3 +1,4 @@
+// expect: 3
 // runtime_struct_reassign_multi — regression for the struct-local
 // REASSIGNMENT codegen bug, 3x reassignment with no loop (the "case D" shape
 // from the isolation). Confirms the fix holds across multiple consecutive

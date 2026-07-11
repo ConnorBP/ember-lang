@@ -1,3 +1,4 @@
+// expect: 101
 // import_dotdot.ember - the driver for the dotdot relative-import case.
 // This file lives in tests/lang/; it imports sub/deep.ember (one level down),
 // which itself imports ../lib2/nested_c.ember (back up to this level, then

@@ -52,6 +52,7 @@ uint32_t Type::align() const {
 bool Type::same(const Type& o) const {
     if (prim != o.prim) return false;
     if (struct_name != o.struct_name) return false;
+    if (enum_name != o.enum_name) return false;
     if (is_slice != o.is_slice) return false;
     if (array_len != o.array_len) return false;
     if (elem && o.elem) { if (!elem->same(*o.elem)) return false; }
@@ -79,6 +80,7 @@ std::string Type::to_string() const {
     if (is_void()) return "void";
     if (is_slice) return (elem?elem->to_string():std::string("?")) + "[]";
     if (array_len) return (elem?elem->to_string():std::string("?")) + "[" + std::to_string(array_len) + "]";
+    if (!enum_name.empty()) return enum_name;   // typed enum type (enum E : T)
     if (!struct_name.empty()) return struct_name;
     if (is_fn_handle) return "fn";   // v1.0 Tier 2: display alias for i64-with-fn-handle-tag
     switch (prim) {

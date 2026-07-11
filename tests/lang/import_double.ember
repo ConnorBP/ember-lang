@@ -1,3 +1,4 @@
+// expect: 100
 // import_double.ember - the same file imported twice, directly, back-to-back.
 // The second `import` is an idempotent-skip (the file is already in the `seen`
 // set after the first), so its body is NOT inlined a second time -> no

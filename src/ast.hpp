@@ -24,6 +24,17 @@ struct Type {
     bool is_slice = false;          // T[]
     uint32_t array_len = 0;        // 0 = not a fixed array; >0 = T[N]
     std::shared_ptr<Type> elem;     // element type for slice/array
+    // Tier 1 typed enums (docs/planning/plan_ENUMS.md §6): a typed enum
+    // `enum Color : i32 { ... }` makes `Color` a REAL type. It is represented
+    // representationally as its backing integer (prim = backing prim,
+    // struct_name empty — so codegen/byte_size/align treat it as the backing
+    // int and ALL existing int code paths work unchanged), tagged with
+    // enum_name = "Color" so Type::same() distinguishes it from a plain int
+    // (int->enum assignment is rejected) and from every other typed enum.
+    // is_int()/is_uint() return true for a typed enum (it IS an integer
+    // value); sema's is_plain_integer() excludes typed enums (enum_name set)
+    // so the int<->int widening matrix does not silently accept int->enum.
+    std::string enum_name;          // non-empty iff this is a typed-enum type
 
     // v1.0 Tier 2 first-class function refs (docs/planning/plan_FUNCTION_REFS.md §2): a
     // function handle is Prim::I64 with is_fn_handle=true. Representation is
@@ -353,6 +364,13 @@ struct EnumDecl {
     std::string name;
     std::vector<EnumVariant> variants;
     Loc loc;
+    // Tier 1 typed enums (docs/planning/plan_ENUMS.md §6): `enum E : T { ... }`
+    // declares E as a real type backed by the integer T. null = untyped (the
+    // original v1 shape — variants are plain i32 constants, E is NOT a type);
+    // non-null = typed (E is a type, a Color-typed binding accepts only
+    // Color::Variant values, int->enum is rejected, enum->int widens).
+    std::shared_ptr<Type> backing_type;
+    bool is_typed() const { return backing_type != nullptr; }
 };
 
 struct Program {

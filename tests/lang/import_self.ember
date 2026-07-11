@@ -1,3 +1,4 @@
+// expect: 42
 // import_self.ember - a file that imports ITSELF. The resolver adds the file
 // to the `seen` set BEFORE recursing into its imports, so when the recursive
 // resolve encounters the same file again it's already in `seen` -> idempotent

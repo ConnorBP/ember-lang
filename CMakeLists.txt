@@ -410,6 +410,15 @@ target_link_libraries(ember_cli PRIVATE
     ember_ext_sync ember_ext_lifecycle ember_ext_opt ember_ext_obf ember_ext_map
     ember_ext_io)
 
+# Family A: `ember test` — native test runner (classify + compile + run/sema-check
+# every .ember file in tests/lang/). The CLI's built-in test command replaces
+# the bash-only runner for non-bash environments; run_lang_tests.sh stays as
+# the fallback (lang_suite ctest still invokes it). Runs from the source dir
+# so tests/lang/ resolves + import paths work.
+add_test(NAME ember_test_cli COMMAND ember_cli test ${CMAKE_CURRENT_SOURCE_DIR}/tests/lang
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(ember_test_cli PROPERTIES TIMEOUT 120)
+
 # End-to-end H12 regression: invoke the real CLI emit-em path, then load the
 # artifact and inspect its nonzero initialized-global bytes.
 add_executable(em_cli_emit_test examples/em_cli_emit_test.cpp)
@@ -623,6 +632,23 @@ if(WIN32)
     target_link_libraries(static_assert_test PRIVATE kernel32)
 endif()
 add_test(NAME static_assert COMMAND static_assert_test)
+
+# typed_enum_test - Tier 1 typed enums (enum E : T) + enum-from-constexpr-expr.
+# `enum Color : i32 { ... }` makes Color a real type backed by i32: a
+# Color-typed binding accepts Color::Variant values, rejects raw ints (int->
+# enum), and widens to a backing int (enum->int, return c from an i64 fn). A
+# variant's explicit value may be a constexpr fn call (resolve_enums folds it
+# before the const-check). Covers typed-enum let/match/param/global, u8 + i64
+# backings, enum->int implicit + explicit (as) widening, enum-from-constexpr
+# (zero-arg + with-args), and the three sema rejections (int->enum, enum
+# mismatch, non-integer backing). Pure language features (no natives), so
+# links only the core libs — matching constexpr_test's shape.
+add_executable(typed_enum_test examples/typed_enum_test.cpp)
+target_link_libraries(typed_enum_test PRIVATE ember ember_frontend ember_import)
+if(WIN32)
+    target_link_libraries(typed_enum_test PRIVATE kernel32)
+endif()
+add_test(NAME typed_enum COMMAND typed_enum_test)
 
 # codegen_opt_test - pins the Stage 1 codegen-optimization peephole + local
 # regalloc rewrites' VALUE EQUIVALENCE (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4.7).

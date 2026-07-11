@@ -1,3 +1,4 @@
+// expect: 50
 // runtime_struct_reassign_loop — regression for the struct-local
 // REASSIGNMENT codegen bug in a loop (the §8.4 shape). Before the fix, a single
 // `s = step(s);` already segfaulted (the bug is not loop-specific - it's the

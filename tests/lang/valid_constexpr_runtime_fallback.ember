@@ -1,3 +1,4 @@
+// expect: 20
 // constexpr fn called with a NON-constant (runtime) argument. This must still
 // WORK — a constexpr fn CAN be called at runtime. The call falls back to a
 // normal runtime call (no error). The const-eval pre-pass skips it because

@@ -1,3 +1,4 @@
+// expect: 42
 // runtime_string_encryption_long.ember — regression for the RUNTIME-LOOP
 // XOR path of the inline-stack-XOR string-encryption lowering (2026-07-10).
 //

@@ -1,3 +1,4 @@
+// expect: 94
 // Valid M5 regression: defer cleanup occurs at lexical block exit while
 // declaration-before-use locals are still live and addressable.
 global trace: i64 = 0;

@@ -1,3 +1,4 @@
+// expect: 77
 struct Inner { a: i16; b: u8; }
 struct Outer { tag: u8; inner: Inner; words: i32[2]; }
 

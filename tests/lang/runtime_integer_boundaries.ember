@@ -1,3 +1,4 @@
+// expect: 79
 // Table-driven-equivalent boundary matrix for every signed/unsigned integer width.
 // Each width checks upper wrapping, lower/sign normalization, comparison, and shift.
 fn main() -> i64 {

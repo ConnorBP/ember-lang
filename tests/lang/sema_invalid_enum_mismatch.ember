@@ -1,0 +1,14 @@
+// sema_invalid_enum_mismatch — a typed enum's variants only bind to their
+// OWN enum type. `let c: Color = Hue::A` must fail: Hue::A lowers to an
+// IntLit carrying the Hue typed-enum type (prim=i32, enum_name="Hue"), and
+// Color.same(Hue) is false (distinct enum_names), so the let type check
+// fails: "let type mismatch (Color = Hue)". This is the nominal-typing rule
+// that makes typed enums distinct from each other AND from plain ints — the
+// same representation (i32) but different enum_name tags.
+enum Color : i32 { Red, Green, Blue }
+enum Hue : i32 { A, B, C }
+
+fn main() -> i64 {
+    let c: Color = Hue::A;
+    return 0;
+}

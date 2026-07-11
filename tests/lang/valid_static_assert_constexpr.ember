@@ -1,3 +1,4 @@
+// expect: 49
 // static_assert with a constexpr fn condition — the constexpr-call pre-pass
 // (lower_constexpr_calls_expr) rewrites square(7) to an IntLit (49) BEFORE
 // check_static_assert runs, so try_eval_const_bool sees `49 == 49` and folds

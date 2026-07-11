@@ -1,3 +1,4 @@
+// expect: 111
 // import_nested.ember - validates recursive import resolution.
 // main imports nested_a (in lib2/); nested_a imports nested_b (sibling);
 // nested_b imports nested_c (sibling). Each is resolved relative to its OWN

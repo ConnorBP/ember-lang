@@ -1,3 +1,4 @@
+// expect: 93
 // Positive execution coverage for audit D6/D7/M5: control flow, compile-time
 // layout constants, lexical-scope LIFO defer, return ABI preservation, f64,
 // integer boundaries, and f-string lowering through the string extension.

@@ -1,3 +1,4 @@
+// expect: 2003
 // import_diamond.ember - diamond-shaped import graph: main -> {b, c}, b -> d, c -> d.
 // The shared leaf diamond_d is reachable via TWO paths (through b and c).
 // The import resolver's idempotent-skip (the `seen` set) must inline d

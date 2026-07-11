@@ -1,3 +1,4 @@
+// expect: 42
 // F1 visibility (docs/spec/SPEC_AUDIT_2026-07-10.md F1): a `priv fn` is a
 // module-private helper - NOT published to the module's export table, so other
 // modules cannot call it cross-module - but it is still callable from WITHIN

@@ -1,3 +1,4 @@
+// expect: 42
 fn main() -> i64 {
     let neg: i64 = -9223372036854775807 - 1;
     let d: f64 = neg as f64;

@@ -1,3 +1,4 @@
+// expect: 42
 // runtime_global_string_init.ember — regression for the global string-
 // initializer bug surfaced by demo/compiler. Before the fix, a `string`-typed
 // global with a literal initializer compiled but its handle was never baked

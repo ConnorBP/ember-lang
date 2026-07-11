@@ -1,3 +1,4 @@
+// expect: 42
 // runtime_struct_reassign_single — regression for the struct-local
 // REASSIGNMENT codegen bug (t113 false-negative: a prior agent concluded the
 // crash did not exist; it segfaulted 20/20).

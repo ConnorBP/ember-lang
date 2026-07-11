@@ -239,18 +239,25 @@ struct P {
         return ld;
     }
 
-    // Tier 1 script-side enum (docs/planning/plan_ENUMS.md Section 3.3):
-    //   enum_decl := 'enum' IDENT '{' (variant (',' variant)* ','?)? '}'
+    // Tier 1 script-side enum (docs/planning/plan_ENUMS.md Section 3.3 + §6):
+    //   enum_decl := 'enum' IDENT (':' type)? '{' (variant (',' variant)* ','?)? '}'
     //   variant   := IDENT ('=' constexpr_int_expr)?
     // The explicit-value expr is parsed as a full parse_expr(); the
     // restriction to a compile-time integer constant is enforced by sema
     // (try_eval_const_i64), identical to how GlobalDecl::init and array
     // sizes are handled - the parser stays dumb. Trailing comma allowed.
+    // The optional `: type` declares a TYPED enum (§6): the enum name becomes
+    // a real type backed by the named integer type. sema validates the
+    // backing type is an integer. null backing_type = untyped (backward compat).
     std::unique_ptr<EnumDecl> parse_enum() {
         auto e = std::make_unique<EnumDecl>();
         expect(Tk::Kw_enum, "'enum'");
         e->name = expect(Tk::Ident, "enum name").text;
         e->loc = loc(toks[i-1]);
+        if (at(Tk::Colon)) {
+            adv();  // consume ':'
+            e->backing_type = parse_type();
+        }
         expect(Tk::LBrace, "'{'");
         if (!at(Tk::RBrace) && !at(Tk::Eof)) {
             do {

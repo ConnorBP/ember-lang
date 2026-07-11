@@ -1,3 +1,4 @@
+// expect: 42
 // static_assert(cond, "msg") — Tier 1 compile-time assertion.
 //
 // A passing assertion (cond folds to true at sema time) is ELIDED: it produces
