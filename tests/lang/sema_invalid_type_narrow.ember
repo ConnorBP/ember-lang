@@ -1,0 +1,268 @@
+// sema_invalid_type_narrow — the cases the type system MUST reject.
+//
+// A companion to valid_type_stress.ember: every form of implicit narrowing,
+// signedness change, int<->float, int->enum, enum narrowing, mixed-type
+// arithmetic, and the out-of-v1-matrix casts that the spec (TYPE_SYSTEM.md
+// Section 6/7) makes explicit-only or disallows. Each case is a standalone
+// function so one rejection does not mask the next (sema reports all errors;
+// the runner only asserts the file fails sema, rc != 0).
+//
+// Each case is annotated with the rule it pins. This file must PARSE ok and
+// FAIL sema (the runner classifies sema_invalid_* as parse-ok + sema-err).
+
+// ---- 1. INTEGER NARROWING (variable -> variable, same signedness) ----
+// i64 -> i32: wider to narrower is never implicit (requires `as`).
+fn narrow_i64_to_i32() -> i64 {
+    let x: i64 = 5;
+    let y: i32 = x;          // sema err: let type mismatch (i32 = i64)
+    return 0;
+}
+// u64 -> u32: unsigned narrowing is equally explicit-only.
+fn narrow_u64_to_u32() -> i64 {
+    let x: u64 = 5;
+    let y: u32 = x;          // sema err: let type mismatch (u32 = u64)
+    return 0;
+}
+// i32 -> i16: a one-step narrow is still a narrow.
+fn narrow_i32_to_i16() -> i64 {
+    let x: i32 = 5;
+    let y: i16 = x;          // sema err: let type mismatch (i16 = i32)
+    return 0;
+}
+
+// ---- 2. SIGNEDNESS CHANGE (same width, never implicit) ----
+// i32 -> u32: the classic bug source, explicit-only.
+fn sign_i32_to_u32() -> i64 {
+    let x: i32 = 5;
+    let y: u32 = x;          // sema err: let type mismatch (u32 = i32)
+    return 0;
+}
+// u32 -> i32: reverse direction, same rule.
+fn sign_u32_to_i32() -> i64 {
+    let x: u32 = 5;
+    let y: i32 = x;          // sema err: let type mismatch (i32 = u32)
+    return 0;
+}
+// i64 -> u64: width-equal signedness flip.
+fn sign_i64_to_u64() -> i64 {
+    let x: i64 = 5;
+    let y: u64 = x;          // sema err: let type mismatch (u64 = i64)
+    return 0;
+}
+
+// ---- 3. NARROWING AT THE RETURN SITE ----
+// i64 value returned from an i32 fn (narrowing).
+fn ret_narrow_i64_to_i32() -> i32 {
+    let x: i64 = 5;
+    return x;                // sema err: return type mismatch (got i64, fn returns i32)
+}
+// u8 value returned from an i64 fn (signedness change).
+fn ret_sign_u8_to_i64() -> i64 {
+    let x: u8 = 5;
+    return x;                // sema err: return type mismatch (got u8, fn returns i64)
+}
+
+// ---- 4. NARROWING / SIGNEDNESS AT THE CALL SITE ----
+// i64 arg to an i32 param (narrowing).
+fn sink_i32(p: i32) -> i64 { return p; }
+fn arg_narrow_i64_to_i32() -> i64 {
+    let x: i64 = 7;
+    return sink_i32(x);      // sema err: arg 1 of 'sink_i32': expected i32, got i64
+}
+// u8 arg to an i64 param (signedness change).
+fn sink_i64(p: i64) -> i64 { return p; }
+fn arg_sign_u8_to_i64() -> i64 {
+    let x: u8 = 7;
+    return sink_i64(x);      // sema err: arg 1 of 'sink_i64': expected i64, got u8
+}
+// literal 300 to a u8 param (literal does not fit -> stays i64 -> mismatch).
+fn sink_u8(p: u8) -> i64 { return p as i64; }
+fn arg_lit_300_to_u8() -> i64 {
+    return sink_u8(300);     // sema err: arg 1 of 'sink_u8': expected u8, got i64
+}
+
+// ---- 5. MIXED-TYPE ARITHMETIC (no C-style promotion) ----
+// i32 + i64: different widths -> compile error, not a promotion.
+fn mixed_i32_plus_i64() -> i64 {
+    let a: i32 = 1; let b: i64 = 2;
+    let c = a + b;           // sema err: operator requires same-type operands (got i32 and i64)
+    return c;
+}
+// u32 + i32: signedness differs -> compile error.
+fn mixed_u32_plus_i32() -> i64 {
+    let a: u32 = 1; let b: i32 = 2;
+    let c = a + b;           // sema err: operator requires same-type operands (got u32 and i32)
+    return c as i64;
+}
+// i8 + u8: signed + unsigned of same width -> compile error.
+fn mixed_i8_plus_u8() -> i64 {
+    let a: i8 = 1; let b: u8 = 2;
+    let c = a + b;           // sema err: operator requires same-type operands (got i8 and u8)
+    return c as i64;
+}
+// f32 + f64: mixed float widths -> compile error.
+fn mixed_f32_plus_f64() -> i64 {
+    let a: f32 = 1.0f; let b: f64 = 2.0;
+    let c = a + b;           // sema err: operator requires same-type operands (got f32 and f64)
+    return c as i64;
+}
+
+// ---- 6. MIXED-TYPE COMPARISON (same rule as arithmetic) ----
+// i32 == i64: different widths -> compile error.
+fn cmp_i32_eq_i64() -> i64 {
+    let a: i32 = 1; let b: i64 = 1;
+    if (a == b) { return 1; }  // sema err: comparison requires same-type operands
+    return 0;
+}
+// u32 < i32: signedness differs -> compile error.
+fn cmp_u32_lt_i32() -> i64 {
+    let a: u32 = 1; let b: i32 = 2;
+    if (a < b) { return 1; }   // sema err: comparison requires same-type operands
+    return 0;
+}
+
+// ---- 7. FLOAT NARROWING + INT<->FLOAT (never implicit) ----
+// f64 -> f32: float narrowing is explicit-only.
+fn narrow_f64_to_f32() -> i64 {
+    let x: f64 = 1.5;
+    let y: f32 = x;          // sema err: let type mismatch (f32 = f64)
+    return 0;
+}
+// i64 var -> f32: int-to-float is never implicit (even widening-looking).
+fn int_var_to_f32() -> i64 {
+    let x: i64 = 5;
+    let y: f32 = x;          // sema err: let type mismatch (f32 = i64)
+    return 0;
+}
+// f32 literal -> i64: float-to-int is never implicit.
+fn float_lit_to_i64() -> i64 {
+    let x: i64 = 5.0f;       // sema err: let type mismatch (i64 = f32)
+    return x;
+}
+// f64 var -> i64: float-to-int is never implicit.
+fn float_var_to_i64() -> i64 {
+    let x: f64 = 5.0;
+    let y: i64 = x;          // sema err: let type mismatch (i64 = f64)
+    return y;
+}
+
+// ---- 8. INT -> ENUM (never implicit, even with a cast) ----
+// Raw int literal to a typed-enum binding.
+enum Color : i32 { Red, Green, Blue }
+fn int_to_enum_let() -> i64 {
+    let c: Color = 5;        // sema err: let type mismatch (Color = i64)
+    return 0;
+}
+// int -> enum via explicit `as` is NOT in the v1 cast matrix either.
+fn int_to_enum_cast() -> i64 {
+    let c: Color = 0 as Color;  // sema err: invalid cast from 'i64' to 'Color'
+    return 0;
+}
+// Different typed enum to a typed-enum binding (nominal typing).
+enum Hue : i32 { A, B, C }
+fn enum_mismatch_let() -> i64 {
+    let c: Color = Hue::A;   // sema err: let type mismatch (Color = Hue)
+    return 0;
+}
+// Two different typed enums compared.
+fn enum_mismatch_cmp() -> i64 {
+    let a: Color = Color::Red; let b: Hue = Hue::A;
+    if (a == b) { return 1; }  // sema err: comparison requires same-type operands (got Color and Hue)
+    return 0;
+}
+
+// ---- 9. ENUM NARROWING / SIGNEDNESS CHANGE (variant literal + variable) ----
+// i32-backed enum variant literal to i16 (narrowing) — regression for the
+// adapt_int_lit re-type bug that used to silently narrow a variant literal.
+fn enum_lit_narrow_i16() -> i64 {
+    let x: i16 = Color::Red;  // sema err: let type mismatch (i16 = Color)
+    return x as i64;
+}
+// i32-backed enum variant literal to u8 (signedness change) — same regression.
+fn enum_lit_sign_u8() -> i64 {
+    let x: u8 = Color::Red;   // sema err: let type mismatch (u8 = Color)
+    return x as i64;
+}
+// i32-backed enum variable to i16 (narrowing).
+fn enum_var_narrow_i16() -> i64 {
+    let c: Color = Color::Red;
+    let x: i16 = c;           // sema err: let type mismatch (i16 = Color)
+    return x as i64;
+}
+// i32-backed enum variable to u64 (signedness change).
+fn enum_var_sign_u64() -> i64 {
+    let c: Color = Color::Red;
+    let x: u64 = c;           // sema err: let type mismatch (u64 = Color)
+    return x as i64;
+}
+// i32-backed enum in an i16 array literal (narrowing) — array-element matrix.
+fn enum_in_narrow_array() -> i64 {
+    let a: i16[2] = [Color::Red, Color::Green];  // sema err: array element type mismatch (expected i16, got Color)
+    return a[0] as i64;
+}
+// enum->int arg narrowing: i32-backed enum to an i16 param.
+fn sink_i16(p: i16) -> i64 { return p as i64; }
+fn enum_arg_narrow_i16() -> i64 {
+    let c: Color = Color::Red;
+    return sink_i16(c);       // sema err: arg 1 of 'sink_i16': expected i16, got Color
+}
+
+// ---- 10. NON-INTEGER BACKING TYPE (typed-enum registration) ----
+// A typed enum must be backed by an integer primitive.
+enum Bad : f32 { X, Y }       // sema err: enum 'Bad' backing type must be an integer
+
+// ---- 11. OUT-OF-V1-MATRIX CASTS ----
+// unsigned int -> float (the v1 backend only signed cvtsi2sd).
+fn cast_u64_to_f64() -> i64 {
+    let x: u64 = 5;
+    let y: f64 = x as f64;    // sema err: invalid cast from 'u64' to 'f64'
+    return 0;
+}
+// float -> unsigned int (the v1 backend only signed cvttsd2si).
+fn cast_f64_to_u64() -> i64 {
+    let x: f64 = 5.0;
+    let y: u64 = x as u64;    // sema err: invalid cast from 'f64' to 'u64'
+    return 0;
+}
+// u8 -> f32 (unsigned int -> float, any width unsigned is out of matrix).
+fn cast_u8_to_f32() -> i64 {
+    let x: u8 = 5;
+    let y: f32 = x as f32;    // sema err: invalid cast from 'u8' to 'f32'
+    return 0;
+}
+// f32 -> u32 (float -> unsigned int).
+fn cast_f32_to_u32() -> i64 {
+    let x: f32 = 5.0f;
+    let y: u32 = x as u32;    // sema err: invalid cast from 'f32' to 'u32'
+    return 0;
+}
+
+// ---- 12. ARRAY INDEX TYPE (non-integer index) ----
+// float index.
+fn index_float() -> i64 {
+    let a: i64[3];
+    let i: f32 = 0.0f;
+    return a[i];              // sema err: array index must be an integer (got f32)
+}
+// bool index.
+fn index_bool() -> i64 {
+    let a: i64[3];
+    return a[true];           // sema err: array index must be an integer (got bool)
+}
+
+// ---- 13. INT-AS-BOOL (no truthiness) ----
+// An i32 in an if condition.
+fn int_as_bool_if() -> i64 {
+    let x: i32 = 1;
+    if (x) { return 1; }      // sema err: if condition must be bool
+    return 0;
+}
+// A typed enum in an if condition.
+enum E2 : i32 { A }
+fn enum_as_bool_if() -> i64 {
+    let c: E2 = E2::A;
+    if (c) { return 1; }      // sema err: if condition must be bool
+    return 0;
+}
+
+fn main() -> i64 { return 0; }

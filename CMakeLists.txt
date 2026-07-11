@@ -650,6 +650,25 @@ if(WIN32)
 endif()
 add_test(NAME typed_enum COMMAND typed_enum_test)
 
+# type_stress_test - auto type-detection stress suite. A programmatic
+# companion to tests/lang/valid_type_stress.ember + sema_invalid_type_narrow.ember
+# / sema_invalid_type_edge.ember: compiles small probes through the full
+# parse->sema->codegen->finalize->call pipeline and asserts either the i64
+# return (positive probe) or sema REJECTION (negative probe). Covers every
+# integer width/signedness, typed enums, floats, and the constexpr-fold
+# interaction across the full usage chain (decl -> assign -> binop -> arg ->
+# return -> cast -> index -> match -> native). Also pins the three bugs the
+# suite was built to find: [B1] f32->f64 implicit widening (was rejected),
+# [B2] typed-enum variant literal narrowing/signedness (was silently
+# accepted), [B3] binary bitwise on floats (was silently accepted). Pure
+# language features (no natives), so links only the core libs.
+add_executable(type_stress_test examples/type_stress_test.cpp)
+target_link_libraries(type_stress_test PRIVATE ember ember_frontend ember_import)
+if(WIN32)
+    target_link_libraries(type_stress_test PRIVATE kernel32)
+endif()
+add_test(NAME type_stress COMMAND type_stress_test)
+
 # codegen_opt_test - pins the Stage 1 codegen-optimization peephole + local
 # regalloc rewrites' VALUE EQUIVALENCE (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4.7).
 # For each rewrite, compiles the SAME source with the Stage-1 flags OFF and ON,

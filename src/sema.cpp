@@ -429,6 +429,15 @@ struct Checker {
         if (!got->enum_name.empty() && is_plain_integer(want)) {
             return got->is_uint() == want->is_uint() && int_width(got) <= int_width(want);
         }
+        // Float widening (docs/spec/TYPE_SYSTEM.md Section 6): f32->f64 is the
+        // one lossless implicit float conversion (matches C/Rust). The reverse
+        // (f64->f32) is narrowing and stays explicit (`as`); int<->float is
+        // never implicit either. Codegen already emits cvtss2sd for the
+        // CastExpr this synthesizes (the explicit `f32 as f64` path), so this
+        // is purely the sema gate.
+        if (got->is_float() && want->is_float() &&
+            got->prim == Prim::F32 && want->prim == Prim::F64)
+            return true;
         return is_plain_integer(want) && is_plain_integer(got) &&
                want->is_uint() == got->is_uint() && int_width(got) < int_width(want);
     }
@@ -901,6 +910,22 @@ struct Checker {
         // (set by lower_enum_access_expr) and is never passed through here
         // with a typed-enum target it would need to adopt.
         if (!target->enum_name.empty()) return;
+        // Symmetric guard: a literal that ALREADY carries a typed-enum type
+        // (a variant literal, e.g. Color::Red which is an IntLit with
+        // ty=Color backing i32) must NOT be re-typed to a plain integer here.
+        // Without this, `let x: i16 = Color::Red` and `let x: u8 = Color::Red`
+        // would silently narrow / change signedness of the i32-backed enum
+        // value (adapt_int_lit re-types by raw value fit alone, discarding
+        // the enum's backing width + signedness constraint) — a downgrade
+        // that the spec (Section 6) makes explicit-only and that an enum
+        // *variable* is already correctly rejected for. Keeping the enum
+        // type routes the value through check_value's enum->int widening
+        // gate (can_implicitly_convert: backing width <= target, same
+        // signedness), so a widening target still accepts and a narrowing /
+        // signedness-change target correctly errors. Codegen handles the
+        // synthesized enum->int CastExpr via the same normalize_rax path a
+        // plain int cast uses (a typed enum's backing value is in rax).
+        if (lit.ty && !lit.ty->enum_name.empty()) return;
         // only adopt if the literal currently is default i64 and fits target
         int64_t v = lit.v;
         switch (target->prim) {
@@ -1546,6 +1571,18 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
             err("operator requires same-type operands (got " + lt->to_string() + " and " + rt->to_string() + ")",
                 b->loc.line, b->loc.col);
             e.ty = lt; return e.ty;
+        }
+        // Bitwise binary ops (& | ^) are integer-only (docs/spec/TYPE_SYSTEM.md
+        // Section 7: "Bitwise only defined on integer types"). The unary form
+        // (~) already rejects floats (sema_invalid_bitnot_non_int); the binary
+        // forms must too — without this, `1.0f & 2.0f` would silently compile
+        // and codegen would emit an integer `and` over the float bit patterns
+        // in rax, a value-wrong no-trap miscompile. Arithmetic (+ - * / %)
+        // remains valid on floats (the is_float() branch below).
+        bool is_bitwise = (b->op==BinExpr::Op::And || b->op==BinExpr::Op::Or || b->op==BinExpr::Op::Xor);
+        if (is_bitwise && !lt->is_int()) {
+            err("bitwise operator requires integer operands (got " + lt->to_string() + " and " + rt->to_string() + ")",
+                b->loc.line, b->loc.col);
         }
         if (!lt->is_int() && !lt->is_float()) {
             err("operator requires numeric operands", b->loc.line, b->loc.col);
