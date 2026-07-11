@@ -1098,6 +1098,21 @@ struct ThinLowerer {
             set_term_return(0);
         }
 
+        // Defensive fallback: if any expression lowering hit the unhandled-node
+        // default in lower_expr (a future Expr type, or an EnumAccessExpr that
+        // escaped the sema pre-pass), it set non_serializable mid-lowering with
+        // a poison return value. Bail to the tree-walker rather than emit IR
+        // containing a silent zero/scratch value. The tree-walker's eval() has
+        // its own defensive trap for the same case, so a miscompile stays loud.
+        if (non_serializable) {
+            out.non_serializable = true;
+            out.non_serializable_reason = non_serializable_reason.empty()
+                ? std::string("unhandled expression node in IR lowering; falling back to tree-walker")
+                : non_serializable_reason;
+            out.blocks.clear();
+            return out;
+        }
+
         // ── Post-lowering vreg spill pass (the IR-emit correctness fix) ──
         // The emit's vreg-materialization model is "a VReg is either frame-backed
         // (reloadable from its frame slot) or the current rax_vreg". A producing
@@ -2066,6 +2081,16 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
         }
         return { LoweredValue::Aggregate, 0, 0, st };
     }
+    // Defensive: any expression node sema did not classify (a future node
+    // type, or an EnumAccessExpr that escaped the enum-access pre-pass) must
+    // NOT silently lower to a zero/scratch vreg. Previously lower_expr fell
+    // off the end returning a poison {Scalar, vreg=0} with no diagnostic, and
+    // the IR emit would produce wrong code. Flag non_serializable so the
+    // whole function falls back to the tree-walker (whose eval() has its own
+    // defensive trap) instead of emitting a silent miscompile.
+    non_serializable = true;
+    non_serializable_reason =
+        "unhandled expression node reached IR lowering; falling back to tree-walker";
     return { LoweredValue::Scalar, 0, 0, ex.ty };
 }
 
@@ -2757,6 +2782,13 @@ void ThinLowerer::lower_stmt(const Stmt& s) {
         }
         return;
     }
+    // Defensive: any statement type not handled above (a future node, or a
+    // ForEachStmt/MatchStmt that escaped the has_for_each pre-scan) must NOT
+    // silently lower to nothing. Flag non_serializable so the function falls
+    // back to the tree-walker (the post-lowering check honors it).
+    non_serializable = true;
+    non_serializable_reason =
+        "unhandled statement node reached IR lowering; falling back to tree-walker";
 }
 
 } // namespace

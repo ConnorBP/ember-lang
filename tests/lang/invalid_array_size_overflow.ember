@@ -1,0 +1,8 @@
+// invalid: a fixed-array size that overflows uint32_t silently truncates.
+// `i64[4294967297]` (2^32 + 1) used to truncate to `i64[1]` via uint32_t()
+// with no error, producing a one-element array where a huge one was asked
+// for. The parser must reject an array size outside [1, UINT32_MAX].
+fn bad() -> i64 {
+    let a: i64[4294967297];
+    return 0;
+}

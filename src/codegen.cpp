@@ -3074,6 +3074,23 @@ void CG::eval(const Expr& ex) {
         return;
     }
     // StructLit is handled at its LetStmt init site; it is multi-word.
+    // (eval never sees a StructLit for a sema-clean program.)
+    if (dynamic_cast<const StructLit*>(&ex)) {
+        // intentionally a no-op here: a bare StructLit rvalue is multi-word and
+        // is materialized by the LetStmt-init / return / call-arg paths, never
+        // by eval(). Reaching this point for a StructLit means a NEW call site
+        // forgot to handle it; trap rather than silently emit nothing.
+        emit_trap(int(TrapReason::IllegalInstruction),
+                  "internal: StructLit reached eval() as a scalar rvalue (should be handled at its let/return/call-arg site)");
+        return;
+    }
+    // Defensive: any expression node sema did not classify (a future node type,
+    // or an EnumAccessExpr that escaped the enum-access pre-pass) must NOT
+    // silently compile to whatever rax happens to hold. Previously eval()
+    // fell off the end with no emitted instruction, producing wrong code with
+    // zero diagnostic. Trap so a miscompile is loud, not silent.
+    emit_trap(int(TrapReason::IllegalInstruction),
+              "internal: unhandled expression node reached codegen eval()");
 }
 
 void CG::exec_block(const Block& b) {
@@ -3668,6 +3685,15 @@ void CG::exec_stmt(const Stmt& s) {
         }
         return;
     }
+    // Defensive: any statement type not handled above (a future node, or a
+    // ForEachStmt/MatchStmt that escaped the IR-backend pre-scan on the
+    // tree-walker path) must NOT silently compile to nothing. Previously
+    // exec_stmt fell off the end emitting no instructions for the stmt,
+    // producing wrong runtime behavior with zero diagnostic. Trap so a
+    // miscompile is loud, not silent. (ForEachStmt/MatchStmt ARE handled
+    // above; this catches anything genuinely unhandled.)
+    emit_trap(int(TrapReason::IllegalInstruction),
+              "internal: unhandled statement node reached codegen exec_stmt()");
 }
 
 // v0.4/M4 instruction-budget cost estimator (docs/spec/SAFETY_AND_SANDBOX.md §3).

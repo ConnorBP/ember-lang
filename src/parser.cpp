@@ -115,6 +115,25 @@ struct P {
                 t->is_slice = true; t->elem = e;
             } else {
                 const Token& n = expect(Tk::IntLit, "integer array size");
+                // Validate the array size before the uint32_t truncation:
+                // `uint32_t(n.ivalue)` silently wraps for sizes > UINT32_MAX
+                // (e.g. `i64[4294967297]` -> `i64[1]`, a one-element array
+                // where a huge one was asked for) and accepts a zero size
+                // (`i64[0]` later surfaces as a confusing "cannot have void
+                // type" because the array's default-prim is Void). Reject both
+                // here with a precise parse error. n.ivalue is a bit-cast u64
+                // for literals above i64::MAX, so compare as uint64_t.
+                uint64_t sz_raw = uint64_t(n.ivalue);
+                if (n.ivalue <= 0) {
+                    throw ParseError("array size must be a positive integer (got " +
+                                     std::to_string(n.ivalue) + ")", n.line, n.col);
+                }
+                if (sz_raw > uint64_t(0xFFFFFFFFu)) {
+                    throw ParseError("array size " + std::to_string(sz_raw) +
+                                     " overflows the uint32 element count (max " +
+                                     std::to_string(uint64_t(0xFFFFFFFFu)) + ")",
+                                     n.line, n.col);
+                }
                 auto e = std::make_shared<Type>(*t);
                 *t = Type{};
                 t->array_len = uint32_t(n.ivalue);

@@ -304,6 +304,15 @@ LexResult tokenize(std::string_view src, const char*) {
                     if (i >= src.size()) break;
                     char e = src[i];
                     if (e == '\n') { s.push_back('\n'); ++line; col = 1; ++i; continue; }  // line continuation: same as an explicit \n
+                    // Reject unknown escape sequences rather than silently
+                    // dropping the backslash and keeping the raw character
+                    // (previously `"\q"` silently became `"q"`, masking a
+                    // likely typo such as `\t` misspelled as `\q`). Only the
+                    // six documented escapes (n t r \ " 0) plus the line-
+                    // continuation form above are valid in a plain string. A
+                    // raw string r"""...""" takes every byte literally if a
+                    // literal backslash+letter is actually wanted.
+                    uint32_t esc_col = col;
                     adv(1);
                     switch (e) {
                     case 'n': s.push_back('\n'); break;
@@ -312,7 +321,11 @@ LexResult tokenize(std::string_view src, const char*) {
                     case '\\': s.push_back('\\'); break;
                     case '"': s.push_back('"'); break;
                     case '0': s.push_back('\0'); break;
-                    default: s.push_back(e); break;
+                    default:
+                        r.ok = false;
+                        r.error = std::string("unknown escape sequence '\\") + e + "' in string literal (valid: \\n \\t \\r \\\\ \\\" \\0; use a raw string for a literal backslash)";
+                        r.err_line = line; r.err_col = esc_col;
+                        return r;
                     }
                 } else { s.push_back(src[i]); ++col; ++i; }
             }

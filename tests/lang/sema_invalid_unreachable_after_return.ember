@@ -1,0 +1,10 @@
+// invalid for sema: unreachable code after an unconditional return. A
+// statement that follows a direct `return` in the same block is dead code
+// (never executed). Sema must hard-fail on it rather than silently accepting
+// and emitting never-run instructions (almost always a bug: a forgotten
+// early return or leftover debug stmt).
+fn bad() -> i64 {
+    return 1;
+    let x: i64 = 2;
+    return x;
+}

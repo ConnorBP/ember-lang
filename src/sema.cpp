@@ -1565,6 +1565,19 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
             if (!lt->is_int() || !rt->is_int())
                 err("shift requires integer operands (got " + lt->to_string() + " and " + rt->to_string() + ")",
                     b->loc.line, b->loc.col);
+            // A compile-time-negative shift count is undefined behavior (in C
+            // it's UB; here codegen masks with `& 63` so `x << -1` currently
+            // silently yields a surprising value instead of erroring). A
+            // negative amount is almost always a typo or logic bug, so hard-
+            // fail at sema when the rhs folds to a negative constant. A
+            // runtime (non-constant) negative count still reaches codegen's
+            // mask and is left as-is (no cheap compile-time proof of sign).
+            int64_t shift_amt;
+            if (try_eval_const_i64(*b->rhs, shift_amt) && shift_amt < 0) {
+                err("shift amount cannot be negative (got " + std::to_string(shift_amt) +
+                    "); shifting by a negative count is undefined behavior",
+                    b->rhs->loc.line, b->rhs->loc.col);
+            }
             e.ty = lt; return e.ty;
         }
         if (!lt->same(*rt)) {
@@ -2274,7 +2287,28 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
 void Checker::check_block(Block& b, const Type* ret_ty, bool& returns) {
     returns = false;
     push_scope();
+    bool reported_unreachable = false;
     for (auto& s : b.stmts) {
+        // Unreachable-code guard: once a DIRECT child of this block is an
+        // unconditional terminator (return / break / continue, or an if/else
+        // where BOTH branches terminate), every subsequent direct child is
+        // dead code. Previously this was silently accepted (sema kept
+        // type-checking the dead stmts and codegen kept emitting them, never
+        // executed). A dead statement after a return is almost always a bug
+        // (forgotten early return, leftover debug stmt), so hard-fail on the
+        // FIRST unreachable stmt rather than silently accept it. Keep type-
+        // checking the rest (so any other real errors in the dead stmts still
+        // surface) but report the unreachability only once per block.
+        if (returns) {
+            if (!reported_unreachable) {
+                err("unreachable code after a return/break/continue in this block",
+                    s->loc.line, s->loc.col);
+                reported_unreachable = true;
+            }
+            bool r = false;
+            check_stmt(*s, ret_ty, r);
+            continue;
+        }
         bool r = false;
         check_stmt(*s, ret_ty, r);
         if (r) returns = true;

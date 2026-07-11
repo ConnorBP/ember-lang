@@ -1,0 +1,8 @@
+// invalid: a fixed-array size of zero. `i64[0]` is not a valid v1 shape
+// (a zero-length fixed array has no storage). The parser must reject a
+// zero array size with a clear message rather than letting it reach sema
+// as a confusing "cannot have void type" (the array's default-prim is Void).
+fn bad() -> i64 {
+    let a: i64[0];
+    return 0;
+}
