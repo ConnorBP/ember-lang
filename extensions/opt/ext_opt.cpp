@@ -99,7 +99,11 @@ size_t count_instrs(const ThinFunction& f) {
 }
 
 // Compute the set of VRegs that are USED anywhere in the function (as src1,
-// src2, args, term.cond, term.ret).
+// src2, args, term.cond, term.ret). CopyBytes is special: its `dst` field holds
+// a dest-pointer VReg that is READ (not produced) — copy_frame_vptr /
+// copy_global_vptr set in.dst to the runtime dest ptr. Without this, DCE would
+// remove the LoadFrame that produces the hidden return pointer, leaving
+// CopyBytes reading an undefined VReg (a crash).
 std::unordered_set<VReg> compute_used_vregs(const ThinFunction& f) {
     std::unordered_set<VReg> used;
     for (const auto& blk : f.blocks) {
@@ -107,6 +111,10 @@ std::unordered_set<VReg> compute_used_vregs(const ThinFunction& f) {
             if (in.src1) used.insert(in.src1);
             if (in.src2) used.insert(in.src2);
             for (VReg a : in.args) if (a) used.insert(a);
+            // CopyBytes reads its dst VReg as a dest pointer (copy_frame_vptr /
+            // copy_global_vptr). The copy_frame_global sentinel lives in src1
+            // (not dst), so dst is always a real VReg here when non-zero.
+            if (in.op == ThinOp::CopyBytes && in.dst != 0) used.insert(in.dst);
         }
         if (blk.term.cond) used.insert(blk.term.cond);
         if (blk.term.ret)  used.insert(blk.term.ret);
@@ -115,7 +123,12 @@ std::unordered_set<VReg> compute_used_vregs(const ThinFunction& f) {
 }
 
 // Compute the set of frame_off values that are READ by any LoadFrame,
-// CopyBytes, or FieldAddr in the function.
+// CopyBytes, or FieldAddr in the function. For CopyBytes, the SOURCE offset is
+// meta.field_off (when the source is frame-relative) and the dest offset is
+// meta.frame_off (when the dest is frame-relative, i.e. in.dst == 0). Both must
+// be tracked so DCE does not remove the StoreFrame that feeds the CopyBytes
+// source. We conservatively add both offsets — a false positive only keeps a
+// dead store alive (a missed optimization), never removes a needed one.
 std::unordered_set<int32_t> compute_read_slots(const ThinFunction& f) {
     std::unordered_set<int32_t> read;
     for (const auto& blk : f.blocks) {
@@ -123,6 +136,18 @@ std::unordered_set<int32_t> compute_read_slots(const ThinFunction& f) {
             if (in.op == ThinOp::LoadFrame || in.op == ThinOp::CopyBytes ||
                 in.op == ThinOp::FieldAddr)
                 read.insert(in.meta.frame_off);
+            // CopyBytes reads a byte RANGE from the source (meta.field_off ..
+            // meta.field_off + meta.len). A StoreFrame anywhere in that range
+            // feeds the copy and must not be removed. Add every 8-byte-aligned
+            // offset in the range (StoreFrame targets are word-aligned). Also add
+            // meta.frame_off (the dest, when in.dst == 0 — already added above)
+            // so a subsequent frame->frame copy's dest is tracked too.
+            if (in.op == ThinOp::CopyBytes && in.meta.len > 0) {
+                int32_t start = in.meta.field_off;
+                int32_t end = start + in.meta.len;
+                for (int32_t off = start; off < end; off += 8)
+                    read.insert(off);
+            }
         }
     }
     return read;

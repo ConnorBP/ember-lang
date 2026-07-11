@@ -420,9 +420,14 @@ struct EmitCtx {
         static const Reg int_arg_regs[4] = {Reg::rcx, Reg::rdx, Reg::r8, Reg::r9};
         static const Xmm flt_arg_regs[4] = {Xmm::xmm0, Xmm::xmm1, Xmm::xmm2, Xmm::xmm3};
 
+        // total_words mirrors compile_func: 1 for the hidden return ptr (if
+        // any) + the real params' word counts. The __struct_ret_ptr sentinel
+        // in thf.frame.params (p.ty == nullptr) is NOT a real param — the hidden
+        // ptr is already accounted for by the initial +1 and spilled separately
+        // below — so it MUST be skipped here and in the spill loop.
         int32_t total_words = thf.frame.returns_struct_by_ptr ? 1 : 0;
         for (const auto& p : thf.frame.params)
-            total_words += words_for_type(p.ty, structs());
+            if (p.ty != nullptr) total_words += words_for_type(p.ty, structs());
 
         auto spill_word = [&](int32_t w, int32_t dst_off, const Type* float_ty) {
             if (w < 4) {
@@ -461,6 +466,7 @@ struct EmitCtx {
         uint32_t next_vreg = 1;
         for (const auto& p : thf.frame.params) {
             const Type* pt = p.ty;
+            if (pt == nullptr) continue;  // skip the __struct_ret_ptr sentinel
             bool is_struct = is_registered_struct(pt, structs());
             if (is_struct) {
                 // struct param: spill ceil(size/8) words with last-word byte trimming
@@ -512,11 +518,13 @@ struct EmitCtx {
 
     // Build the operand word layout from the instr's args[]/arg_types[]/arg_frame_offs[].
     // Returns the total word count; fills `slot0` per logical arg into `op_slots`.
+    // When `ret_struct` is true, args[0] is the hidden return-dest encoding (not a
+    // real operand) and is skipped — the caller decodes it separately.
     struct CallArg { VReg vreg; const Type* ty; int32_t slot0; int words; bool is_struct; int32_t struct_frame_off; };
-    std::vector<CallArg> build_call_args(const ThinInstr& in) {
+    std::vector<CallArg> build_call_args(const ThinInstr& in, bool ret_struct) {
         std::vector<CallArg> ops;
         int32_t next_slot = 0;
-        for (size_t i = 0; i < in.args.size(); ++i) {
+        for (size_t i = ret_struct ? 1 : 0; i < in.args.size(); ++i) {
             VReg v = in.args[i];
             const Type* ty = i < in.arg_types.size() ? in.arg_types[i] : nullptr;
             int32_t afo = i < in.arg_frame_offs.size() ? in.arg_frame_offs[i] : -1;
@@ -538,15 +546,19 @@ struct EmitCtx {
         return ops;
     }
 
-    // Emit the arg stash + ABI reg reload for a call. `hidden_ptr_off` is the
-    // frame slot holding the hidden return pointer (for struct-by-ptr calls),
-    // or 0 for regular calls. The handle word (for indirect calls) is at
+    // Emit the arg stash + ABI reg reload for a call. For a struct-by-ptr
+    // return call, `ret_struct` is true and the hidden dest address is encoded
+    // in `hidden_dest_vreg` (a vreg holding the dest pointer, when != 0) or, if
+    // that is 0, in `hidden_dest_off` (a frame slot the callee writes into, via
+    // `lea rax, [rbp+hidden_dest_off]`). For regular calls both are 0 and
+    // `ret_struct` is false. The handle word (for indirect calls) is at
     // [rsp+stash_size] if `is_indirect`.
     void emit_call_arg_stash(const ThinInstr& in, std::vector<CallArg>& ops,
-                             int32_t hidden_ptr_off, bool is_indirect) {
+                             bool ret_struct, VReg hidden_dest_vreg,
+                             int32_t hidden_dest_off, bool is_indirect) {
         int n = 0;
         for (auto& op : ops) n += op.words;
-        if (hidden_ptr_off != 0) n += 1;  // word 0 = hidden ptr
+        if (ret_struct) n += 1;  // word 0 = hidden dest ptr
         int32_t stash_size = n * 8;
         int32_t handle_word = is_indirect ? 8 : 0;
         int32_t outgoing = std::max(0, n - 4) * 8;
@@ -558,13 +570,23 @@ struct EmitCtx {
         if (is_indirect) {
             e.byte(0x48); e.byte(0x89); e.byte(0x84); e.byte(0x24); e.imm32(stash_size);
         }
-        // hidden ptr at word 0 (if struct-by-ptr return)
-        if (hidden_ptr_off != 0) {
-            e.load_reg_mem(Reg::rax, Reg::rbp, hidden_ptr_off);
+        // hidden dest address at word 0 (if struct-by-ptr return)
+        if (ret_struct) {
+            if (hidden_dest_vreg != 0) {
+                // dest ptr is in the vreg (forward-return: the loaded incoming
+                // hidden ptr, or an IndexAddr/FieldAddr result)
+                load_int_vreg(hidden_dest_vreg);
+            } else {
+                // dest is a frame slot (local/temp): lea rax, [rbp + hidden_dest_off]
+                e.byte(0x48); e.byte(0x8D); e.byte(0x85); e.imm32(hidden_dest_off);
+            }
             e.store_reg_mem(Reg::rsp, 0, Reg::rax);
+            // rax now holds the dest address; clear rax_vreg so a later
+            // load_int_vreg does not take the stale-rax shortcut.
+            rax_vreg = 0;
         }
         // stash each operand
-        int32_t word_offset = (hidden_ptr_off != 0) ? 8 : 0;  // shift past hidden ptr
+        int32_t word_offset = ret_struct ? 8 : 0;  // shift past hidden ptr
         for (auto& op : ops) {
             int32_t off = word_offset + op.slot0 * 8;
             if (op.is_struct) {
@@ -588,7 +610,7 @@ struct EmitCtx {
         }
         // per-word float width
         std::vector<bool> word_is_float(size_t(n), false), word_is_f64(size_t(n), false);
-        int32_t widx = (hidden_ptr_off != 0) ? 1 : 0;
+        int32_t widx = ret_struct ? 1 : 0;
         for (auto& op : ops) {
             if (op.words == 1 && !op.is_struct && op.ty && op.ty->is_float()) {
                 word_is_float[size_t(widx)] = true;
@@ -623,9 +645,12 @@ struct EmitCtx {
     int32_t last_call_total = 0;
     int32_t last_call_stash_size = 0;
 
-    // Emit a native call (CallNative): depth check + mov_reg_native + call + depth leave.
+    // Emit a native call: mov_reg_native + call + depth leave. The depth CHECK
+    // is emitted as a separate DepthCheck ThinInstr before the call instr (by
+    // lower_call); we only emit the depth LEAVE here to balance it. Emitting
+    // depth_check again here would double-increment the depth counter (a leak
+    // that overflows the call-depth limit on deep recursion like fib(15)).
     void emit_native_call(const ThinInstr& in) {
-        emit_depth_check();
         // mov rax, native (relocatable); record pending native binding
         const std::string& name = in.meta.native_name;
         if (name.empty() || !in.ret_type || in.arg_types.empty()) {
@@ -647,26 +672,26 @@ struct EmitCtx {
         e.call_reg(Reg::rax);
         emit_depth_leave();
     }
-    // Emit a script call (CallScript): depth check + dispatch table + call + depth leave.
+    // Emit a script call: dispatch table + call + depth leave. (Depth check is
+    // the separate DepthCheck ThinInstr; see emit_native_call for the rationale.)
     void emit_script_call(const ThinInstr& in) {
-        emit_depth_check();
         e.mov_reg_imm64_external(Reg::r11, AbsFixup::DispatchTableBase);
         e.call_mem(Reg::r11, int32_t(in.meta.slot) * 8);
         emit_depth_leave();
     }
-    // Emit a cross-module call (CallCrossModule): depth check + registry hop + call + depth leave.
+    // Emit a cross-module call: registry hop + call + depth leave. (Depth check
+    // is the separate DepthCheck ThinInstr.)
     void emit_cross_module_call(const ThinInstr& in) {
-        emit_depth_check();
         e.mov_reg_imm64_external(Reg::r11, AbsFixup::ModuleRegistryBase);
         e.load_reg_mem(Reg::r11, Reg::r11, int32_t(in.meta.mod_id) * 8);
         e.load_reg_mem(Reg::r11, Reg::r11, int32_t(in.meta.slot) * 8);
         e.call_reg(Reg::r11);
         emit_depth_leave();
     }
-    // Emit an indirect call (CallIndirect): depth check + reload handle + lea + load + call + depth leave.
-    // The handle was stashed at [rsp+stash_size] by emit_call_arg_stash.
+    // Emit an indirect call (CallIndirect): reload handle + lea + load + call +
+    // depth leave. (Depth check is the separate DepthCheck ThinInstr.) The
+    // handle was stashed at [rsp+stash_size] by emit_call_arg_stash.
     void emit_indirect_call() {
-        emit_depth_check();
         e.load_reg_mem(Reg::rax, Reg::rsp, last_call_stash_size);  // reload handle
         e.mov_reg_imm64_external(Reg::r11, AbsFixup::DispatchTableBase);
         e.lea_reg_mem_sib(Reg::r11, Reg::r11, Reg::rax, 3);  // lea r11, [r11 + rax*8]
@@ -1089,8 +1114,45 @@ struct EmitCtx {
             break;
         }
         case ThinOp::CopyBytes: {
-            // copy meta.len bytes from [rbp+meta.frame_off] to [rbp+meta.field_off]
-            copy_bytes(Reg::rbp, in.meta.field_off, Reg::rbp, in.meta.frame_off, in.meta.len);
+            // Copy meta.len bytes. Representation convention (set by the
+            // copy_* helpers in thin_lower.cpp):
+            //   meta.field_off = SOURCE offset
+            //   meta.frame_off = DEST offset (0 when the dest is a vreg-held ptr)
+            //   in.dst (vreg) != 0            -> dest = [vreg + 0] (a runtime ptr,
+            //                                   e.g. the struct-return hidden ptr)
+            //   meta.base_kind == GlobalsBase -> one side lives in the globals
+            //                                   block; which side is disambiguated
+            //                                   by the src1 sentinel (see below):
+            //     in.dst != 0                 -> SOURCE is global (copy_global_vptr)
+            //     in.dst == 0 && in.src1 != 0 -> DEST   is global (copy_frame_global)
+            //     in.dst == 0 && in.src1 == 0 -> SOURCE is global (copy_global_frame)
+            //   otherwise both sides are rbp-relative (copy_frame_frame /
+            //   copy_frame_vptr). copy_bytes() touches only rax, so r10 (globals
+            //   base) and r11 (vreg dest ptr) are safe as base registers here.
+            const int32_t len = in.meta.len;
+            const bool dst_is_vreg  = (in.dst != 0);
+            const bool global       = (in.meta.base_kind == AbsFixup::GlobalsBase);
+            const bool src_is_global = global && (dst_is_vreg || in.src1 == 0);
+            const bool dst_is_global = global && !dst_is_vreg && in.src1 != 0;
+
+            Reg dst_base = Reg::rbp; int32_t dst_off = in.meta.frame_off;
+            Reg src_base = Reg::rbp; int32_t src_off = in.meta.field_off;
+
+            if (dst_is_vreg) {
+                load_int_vreg(in.dst);                // hidden ptr -> rax
+                e.mov_reg_reg(Reg::r11, Reg::rax);    // r11 = dest ptr
+                dst_base = Reg::r11; dst_off = 0;
+            } else if (dst_is_global) {
+                e.mov_reg_imm64_external(Reg::r10, AbsFixup::GlobalsBase);
+                dst_base = Reg::r10; dst_off = in.meta.frame_off;
+            }
+            if (src_is_global) {
+                e.mov_reg_imm64_external(Reg::r10, AbsFixup::GlobalsBase);
+                src_base = Reg::r10; src_off = in.meta.field_off;
+            }
+            copy_bytes(dst_base, dst_off, src_base, src_off, len);
+            // copy_bytes clobbers rax; reset the register tracking.
+            rax_vreg = 0;
             break;
         }
 
@@ -1700,7 +1762,27 @@ struct EmitCtx {
     void emit_call(const ThinInstr& in) {
         bool is_indirect = (in.op == ThinOp::CallIndirect);
         bool ret_struct = call_returns_struct_by_ptr(in.ret_type);
-        int32_t hidden_ptr_off = ret_struct ? thf.frame.struct_ret_ptr_offset : 0;
+
+        // Decode the hidden dest for a struct-by-ptr return call. lower_call
+        // encodes it as args[0]: either a vreg (hidden_dest_vreg != 0, with
+        // arg_frame_offs[0] == -1 — a forward-return forwarding the incoming
+        // hidden ptr, or a computed dest address) or a sentinel (args[0] == 0,
+        // with arg_frame_offs[0] = the dest frame slot offset). We must NOT use
+        // thf.frame.struct_ret_ptr_offset here — that is THIS function's own
+        // incoming hidden ptr, which is only the right dest for a forward-
+        // returning call (and that case is already encoded in args[0] as the
+        // loaded-ptr vreg).
+        VReg hidden_dest_vreg = 0;
+        int32_t hidden_dest_off = 0;
+        if (ret_struct) {
+            VReg a0 = in.args.empty() ? 0 : in.args[0];
+            int32_t afo0 = in.arg_frame_offs.empty() ? -1 : in.arg_frame_offs[0];
+            if (a0 != 0 && afo0 == -1) {
+                hidden_dest_vreg = a0;  // dest ptr is in this vreg
+            } else {
+                hidden_dest_off = afo0;  // dest is a frame slot
+            }
+        }
 
         // For indirect calls: materialize the target handle into rax + guard BEFORE the stash.
         // src1 = the handle VReg for CallIndirect.
@@ -1709,11 +1791,11 @@ struct EmitCtx {
             emit_call_target_guard();
         }
 
-        // Build operand layout
-        std::vector<CallArg> ops = build_call_args(in);
+        // Build operand layout (skip args[0] = hidden dest when ret_struct)
+        std::vector<CallArg> ops = build_call_args(in, ret_struct);
 
         // Emit arg stash + ABI reg reload (handles sub rsp, stash, reg load, outgoing)
-        emit_call_arg_stash(in, ops, hidden_ptr_off, is_indirect);
+        emit_call_arg_stash(in, ops, ret_struct, hidden_dest_vreg, hidden_dest_off, is_indirect);
 
         // The actual call instruction
         switch (in.op) {
@@ -1734,6 +1816,11 @@ struct EmitCtx {
 
         // add rsp, total (balance the sub rsp from the stash)
         e.add_reg_imm32(Reg::rsp, last_call_total);
+
+        // Any call clobbers rax / xmm0 (Win64 ABI); reset the register tracking
+        // so a subsequent load_int_vreg does not take the stale-rax shortcut.
+        rax_vreg = 0;
+        xmm0_vreg = 0;
 
         // Record the result
         if (ret_struct) {

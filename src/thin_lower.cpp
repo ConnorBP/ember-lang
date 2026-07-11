@@ -809,9 +809,13 @@ struct ThinLowerer {
         in.meta.frame_off = dst_off; in.meta.field_off = goff; in.meta.len = len;
     }
     // CopyBytes from [rbp+src_off] to [globals_base+goff], len bytes (temp -> global).
+    // src1 is a sentinel (NOT a vreg): the emit decodes base_kind==GlobalsBase +
+    // dst vreg==0 + src1!=0 as "the DEST is the global side" (copy_frame_global),
+    // vs src1==0 "the SOURCE is the global side" (copy_global_frame). CopyBytes
+    // never uses src1 as a real operand, so this is an unambiguous signal.
     void copy_frame_global(int32_t goff, int32_t src_off, int32_t len, Loc loc) {
-        ThinInstr& in = emit(ThinOp::CopyBytes, 0, 0, 0, loc);
-        in.meta.base_kind = AbsFixup::GlobalsBase;  // dst is global (both vregs 0 -> dst global)
+        ThinInstr& in = emit(ThinOp::CopyBytes, 0, 1, 0, loc);
+        in.meta.base_kind = AbsFixup::GlobalsBase;  // dst is global (src1=1 sentinel)
         in.meta.frame_off = goff; in.meta.field_off = src_off; in.meta.len = len;
     }
     // CopyBytes from [rbp+src_off] to [vreg-ptr+0], len bytes (return local struct through hidden ptr).
