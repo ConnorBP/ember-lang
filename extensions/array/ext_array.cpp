@@ -62,10 +62,10 @@ extern "C" {
     }
     static void n_array_set_u8(int64_t h, int64_t i, int64_t v) { auto* s = arr_slot(h); if (s && i>=0 && i<int64_t(s->bytes.size())) s->bytes[size_t(i)] = uint8_t(v); }
     static int64_t n_array_get_u8(int64_t h, int64_t i) { auto* s = arr_slot(h); return (s && i>=0 && i<int64_t(s->bytes.size())) ? int64_t(s->bytes[size_t(i)]) : 0; }
-    static void n_array_set_f32(int64_t h, int64_t i, float v) { auto* s = arr_slot(h); if (s && i>=0 && size_t(i)*4+4<=s->bytes.size()) std::memcpy(&s->bytes[size_t(i)*4], &v, 4); }
-    static float n_array_get_f32(int64_t h, int64_t i) { auto* s = arr_slot(h); float v=0; if (s && i>=0 && size_t(i)*4+4<=s->bytes.size()) std::memcpy(&v, &s->bytes[size_t(i)*4], 4); return v; }
-    static void n_array_set_i64(int64_t h, int64_t i, int64_t v) { auto* s = arr_slot(h); if (s && i>=0 && size_t(i)*8+8<=s->bytes.size()) std::memcpy(&s->bytes[size_t(i)*8], &v, 8); }
-    static int64_t n_array_get_i64(int64_t h, int64_t i) { auto* s = arr_slot(h); int64_t v=0; if (s && i>=0 && size_t(i)*8+8<=s->bytes.size()) std::memcpy(&v, &s->bytes[size_t(i)*8], 8); return v; }
+    static void n_array_set_f32(int64_t h, int64_t i, float v) { auto* s = arr_slot(h); if (s && i>=0 && s->elem_size==4 && size_t(i) < s->bytes.size()/s->elem_size) std::memcpy(&s->bytes[size_t(i)*4], &v, 4); }
+    static float n_array_get_f32(int64_t h, int64_t i) { auto* s = arr_slot(h); float v=0; if (s && i>=0 && s->elem_size==4 && size_t(i) < s->bytes.size()/s->elem_size) std::memcpy(&v, &s->bytes[size_t(i)*4], 4); return v; }
+    static void n_array_set_i64(int64_t h, int64_t i, int64_t v) { auto* s = arr_slot(h); if (s && i>=0 && s->elem_size==8 && size_t(i) < s->bytes.size()/s->elem_size) std::memcpy(&s->bytes[size_t(i)*8], &v, 8); }
+    static int64_t n_array_get_i64(int64_t h, int64_t i) { auto* s = arr_slot(h); int64_t v=0; if (s && i>=0 && s->elem_size==8 && size_t(i) < s->bytes.size()/s->elem_size) std::memcpy(&v, &s->bytes[size_t(i)*8], 8); return v; }
     static void n_array_push_u8(int64_t h, int64_t v) {
         auto* s = arr_slot(h);
         if (!s || s->elem_size != 1 || s->bytes.size() >= MAX_CONTAINER_BYTES) return;
@@ -107,7 +107,9 @@ extern "C" {
     }
     static void n_array_remove(int64_t h, int64_t i) {
         auto* s = arr_slot(h);
-        if (!s || i < 0 || size_t(i) * size_t(s->elem_size) + size_t(s->elem_size) > s->bytes.size()) return;
+        if (!s || i < 0 || s->elem_size == 0) return;
+        size_t count = s->bytes.size() / s->elem_size;
+        if (size_t(i) >= count) return;
         size_t off = size_t(i) * size_t(s->elem_size);
         s->bytes.erase(s->bytes.begin() + ptrdiff_t(off),
                        s->bytes.begin() + ptrdiff_t(off + size_t(s->elem_size)));

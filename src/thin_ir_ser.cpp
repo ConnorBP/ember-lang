@@ -636,16 +636,16 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err,
                 if (err) *err = "thin_ir_ser: validate: negative len for BoundsCheck";
                 return false;
             }
-            // Item 12a fix: frame_off must be within the function's frame for
-            // instrs that use it as an rbp-relative displacement. An
-            // attacker-controlled frame_off can read/write outside the stack
-            // frame (stack smash/leak). frame_off must be negative (stack
-            // grows down) and >= -frame_size.
-            if ((in.op == ThinOp::LoadFrame || in.op == ThinOp::StoreFrame ||
-                 in.op == ThinOp::CopyBytes || in.op == ThinOp::FieldAddr ||
-                 in.op == ThinOp::IndexAddr || in.op == ThinOp::StructLitInit ||
-                 in.op == ThinOp::ArrayLitInit) &&
-                thf.frame.frame_size > 0) {
+            // Item 12a fix (extended): frame_off must be within the function's
+            // frame for ANY instr that uses it as an rbp-relative displacement.
+            // The original check only covered 7 specific ops, but emit_x64
+            // writes to [rbp + frame_off] for ~20 producing ops (ConstInt, Add,
+            // etc. via record_dst/store_rax_to_rbp). An attacker-controlled
+            // frame_off on ANY of those can write outside the stack frame
+            // (stack smash / return-address overwrite). frame_off must be
+            // negative (stack grows down) and >= -frame_size. frame_off == 0
+            // means "not frame-backed" and is safe to skip.
+            if (in.meta.frame_off != 0 && thf.frame.frame_size > 0) {
                 if (in.meta.frame_off >= 0 || in.meta.frame_off < -thf.frame.frame_size) {
                     if (err) *err = "thin_ir_ser: validate: frame_off out of frame bounds";
                     return false;
