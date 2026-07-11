@@ -498,6 +498,11 @@ struct Checker {
         // sigs. This bridges the two representations without making them
         // globally `same` (which would break fn-handle equality elsewhere).
         if ((want->is_lambda || want->is_fn_handle) && (got->is_lambda || got->is_fn_handle)) {
+            // Cross-module handles are a distinct space from intra-module —
+            // don't bridge across that boundary (the cross_module_handles
+            // test expects cross != intra even with matching sigs).
+            if (want->is_cross_module_handle != got->is_cross_module_handle)
+                return false;
             if (want->has_recorded_sig && got->has_recorded_sig) {
                 if (want->recorded_params.size() != got->recorded_params.size()) return false;
                 for (size_t i = 0; i < want->recorded_params.size(); ++i)
