@@ -130,6 +130,18 @@ struct M {
     std::vector<uint8_t> gbs;
     StructLayoutTable layouts;
     Program prog;
+    // The execution context. The workloads are compiled with use_context_reg=
+    // true + emit_depth_checks=true, so the JIT'd code reads/writes the
+    // call-depth counter via [r14 + offset]. A raw `int64_t (*)()` call leaves
+    // r14 as whatever garbage the CRT left, so the depth check's `inc [r14+off]`
+    // writes a random memory location and its `cmp [r14+max_depth]` reads one —
+    // silent corruption that eventually surfaces as a SIGILL in a later,
+    // unrelated workload (the call-heavy workloads corrupt memory; the next
+    // JIT'd function trips over it). ember_call_void installs ctx into r14
+    // (the B1 thunk), so the depth check touches THIS context's real fields
+    // and the call-depth guard works as designed. Mirrors the in_context/
+    // thread_safety harnesses (which pass a real context_t to ember_call_*).
+    ember::context_t ctx{};
     M() : table(std::make_unique<DispatchTable>(0)) {}
 };
 
@@ -210,8 +222,16 @@ static int64_t call0_i64(M& m, const std::string& fn) {
     auto it = m.slots.find(fn);
     if (it == m.slots.end()) return -1;
     void* e = m.table->get(it->second);
-    using F = int64_t (*)();
-    return reinterpret_cast<F>(e)();
+    // Install a fresh per-call state on the context + enter via the B1 thunk
+    // (sets r14 = &m.ctx). The workloads use use_context_reg + depth checks,
+    // so r14 MUST point at a real context_t — a raw call leaves it garbage and
+    // the depth guard corrupts memory (see the M::ctx note). budget is left
+    // high (no false budget traps); depth starts at 0.
+    m.ctx.call_depth = 0;
+    m.ctx.catch_depth = 0;
+    m.ctx.thrown_value = 0;
+    m.ctx.budget_remaining = 2'000'000'000LL;
+    return ember::ember_call_void(e, &m.ctx);
 }
 
 int main() {

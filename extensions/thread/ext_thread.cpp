@@ -251,15 +251,30 @@ static int64_t n_thread_spawn(int64_t handle, int64_t arg) {
 // wakes + reacquires. The lock is balanced (one unlock + one lock here), so
 // the caller's ember_call still owns exactly one lock on return.
 //
+// g_setup_mutex is held ONLY for the slot lookup, then RELEASED before the
+// cv wait. This is critical for nested spawn (test 7): the joined worker may
+// itself call thread_spawn for a grandchild, and thread_spawn needs
+// g_setup_mutex to allocate a slot. If join held g_setup_mutex across the
+// wait, the worker's nested thread_spawn would block on it, the worker could
+// never finish, and join's done_cv would never fire -> deadlock. The
+// ThreadSlot* is stable for the thread's lifetime (reset() never erases an
+// in_use slot), so it is safe to use after releasing g_setup_mutex.
+//
 // The slot is NOT freed here: the result/trap data must stay readable so a
 // subsequent thread_trap_reason(handle) works (the script inspects it after
 // join). The slot is reclaimed by thread_reset (the host's between-runs
 // isolation gesture). The std::thread IS joined here (OS resources reclaimed);
 // the slot just keeps the result fields + in_use=true.
 static int64_t n_thread_join(int64_t handle) {
-    std::lock_guard<std::recursive_mutex> guard(g_setup_mutex);
-    if (!g_ctx) return 0;
-    ThreadSlot* s = raw_slot(handle);
+    // Look up the slot under g_setup_mutex, then release it. The slot pointer
+    // is stable for the worker's lifetime (in_use slots are never erased), so
+    // we can use it after unlocking the registry mutex.
+    ThreadSlot* s;
+    {
+        std::lock_guard<std::recursive_mutex> guard(g_setup_mutex);
+        if (!g_ctx) return 0;
+        s = raw_slot(handle);
+    }
     if (!s) return 0;
 
     // Release the context call_mutex so the worker can acquire it. The caller
@@ -269,7 +284,8 @@ static int64_t n_thread_join(int64_t handle) {
     g_ctx->call_mutex.unlock();
 
     // Wait for the worker to publish done. cv.wait handles the
-    // unlock-wait-reacquire of done_lock atomically.
+    // unlock-wait-reacquire of done_lock atomically. g_setup_mutex is NOT held
+    // here, so a nested thread_spawn inside the worker can proceed.
     bool trapped = false;
     int64_t result = 0;
     {
