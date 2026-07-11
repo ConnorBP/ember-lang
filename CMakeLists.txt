@@ -80,6 +80,7 @@ add_library(ember_frontend STATIC
     src/parser.cpp
     src/sema.cpp
     src/codegen.cpp
+    src/peephole.cpp
 )
 target_include_directories(ember_frontend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ember_frontend PUBLIC ember)
@@ -481,6 +482,22 @@ if(WIN32)
 endif()
 add_test(NAME array_lit COMMAND array_lit_test)
 
+# codegen_opt_test - pins the Stage 1 codegen-optimization peephole + local
+# regalloc rewrites' VALUE EQUIVALENCE (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4.7).
+# For each rewrite, compiles the SAME source with the Stage-1 flags OFF and ON,
+# calls both, asserts identical return values. The rewritten bytes differ but
+# the computed value is identical. Also pins flags-OFF = byte-identical (the
+# gate's "no flag-day rewrite" discipline) and flags-ON = bytes differ where a
+# rewrite applies (the flag is not a silent no-op). Links only the core libs
+# (the probes are pure int arithmetic, no natives) — independent of the
+# extension refactor and of F2's em-signed work.
+add_executable(codegen_opt_test examples/codegen_opt_test.cpp)
+target_link_libraries(codegen_opt_test PRIVATE ember ember_frontend ember_import)
+if(WIN32)
+    target_link_libraries(codegen_opt_test PRIVATE kernel32)
+endif()
+add_test(NAME codegen_opt COMMAND codegen_opt_test)
+
 # aggregate_global_test - pins aggregate globals (chunk c3): struct globals
 # `global cfg : Config = Config{...};`, fixed-array globals `global arr : i64[3]
 # = [10,20,30];`, slice globals `global s : i64[] = [1,2,3];`. Compiles tiny
@@ -501,5 +518,5 @@ add_test(NAME aggregate_global COMMAND aggregate_global_test)
 
 set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
     v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
-    array_lit aggregate_global em_signed
+    array_lit aggregate_global em_signed codegen_opt
     PROPERTIES TIMEOUT 30)

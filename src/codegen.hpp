@@ -126,6 +126,40 @@ struct CodeGenCtx {
     // Both 0 = no allowlist -> the guard is skipped (function refs unused).
     int64_t fn_allowlist_base = 0;
     int64_t fn_slot_count = 0;
+
+    // --- Stage 1 codegen optimization (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4) ---
+    // Two independent flags, BOTH default false -> the codegen is BYTE-IDENTICAL
+    // to the pre-Stage-1 tree-walker (the 24/24 ctest gate + 268/0/0 lang gate
+    // hold unchanged). Enabled per-function for benchmark comparison; the bench
+    // harness (bench/bench_codegen_paths.cpp) is the perf validation.
+    //
+    // enable_peephole: run the post-emit peephole pipeline (src/peephole.{hpp,cpp})
+    // over the function's final emitted byte buffer after resolve_fixups + the
+    // AbsFixup/native-fixup patching. Ships SmartImmPass (W4: `mov r,imm64`->
+    // cheaper imm32 forms for small literals, skipping relocatable AbsFixup/
+    // NativeFixup loads). SetccMovzxPass (W10) is inert in Stage 1 (the in-place
+    // `xor;setcc` rewrite clobbers the cmp's flags; a correct W10 needs a
+    // cross-instruction pre-cmp zeroing = Stage 2). The peephole is a strictly
+    // local in-place rewrite padded with trailing NOPs, so NO label offset ever
+    // shifts and NO branch fixup needs re-resolving.
+    //
+    // enable_local_regalloc: keep BinExpr integer operands in a VOLATILE scratch
+    // register (r10) across the RHS eval instead of `push rax; ...; pop rax`
+    // (design W1, the single most-executed spill). The outermost no-call-in-RHS
+    // BinExpr in a statement uses r10; a RHS containing a call falls back to
+    // push/pop (r10 is volatile, clobbered by calls); a nested BinExpr whose r10
+    // is occupied also falls back (correctness: a single holding register can't
+    // nest). r10 is VOLATILE so there is NO prologue save/restore tax — zero
+    // overhead on any function (a callee-saved holding register would need per-
+    // function save/restore and net WORSE on call-heavy code where the tax
+    // exceeds the per-BinExpr win; the volatile design avoids that). r10 is free
+    // by default (MBA uses rdx, dispatch/guard use r11, opaque junk is off by
+    // default); the regalloc is also disabled when obf.mba/obf.opaque is on as a
+    // defensive guard against the r10-using obfuscation paths. This generalizes
+    // the existing hot-local pinning (§1.2) from "one register, one loop" to "a
+    // second volatile accumulator, every no-call integer BinExpr".
+    bool enable_peephole = false;
+    bool enable_local_regalloc = false;
 };
 
 // Compile one function. Returns the JIT'd bytes + (after finalize) entry.

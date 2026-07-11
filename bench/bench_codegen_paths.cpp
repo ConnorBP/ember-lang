@@ -48,6 +48,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <chrono>
 #include <string>
@@ -156,6 +157,16 @@ static std::unique_ptr<BenchModule> ember_compile(const std::string& src, bool s
     ctx.script_slots = &m->slots;
     ctx.structs = &m->layouts;
     ctx.use_context_reg = true;   // B1: r14 = ctx, so ember_call_void works (both modes)
+    // Stage 1 codegen optimization (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4):
+    // toggled via the EMBER_STAGE1_OPTS env var so the bench can run twice (off
+    // vs on) and compare. Values: "peephole", "regalloc", "both". Default
+    // (unset/other) = both off = byte-identical to today (the gate holds).
+    if (const char* o = std::getenv("EMBER_STAGE1_OPTS")) {
+        std::string s(o);
+        if (s == "peephole")      ctx.enable_peephole = true;
+        else if (s == "regalloc") ctx.enable_local_regalloc = true;
+        else if (s == "both")     { ctx.enable_peephole = true; ctx.enable_local_regalloc = true; }
+    }
     if (safety_on) {
         // safety-on: budget + depth + trap. budget set huge (INT64_MAX) so we
         // measure the guard's INSTRUCTION COST (sub+jg per entry/back-edge +
@@ -307,6 +318,12 @@ int main(int argc, char** argv) {
                 "unknown", sizeof(void*)*8
 #endif
     );
+    // Stage 1 opts mode (the env var toggles peephole/regalloc; recorded so the
+    // results MD is self-describing about which configuration produced it).
+    if (const char* o = std::getenv("EMBER_STAGE1_OPTS"))
+        std::printf("#   stage1_opts: %s\n", o);
+    else
+        std::printf("#   stage1_opts: (none — flags off, byte-identical baseline)\n");
     std::printf("#   date:     %s %s\n\n", __DATE__, __TIME__);
 
     // ---- load the g++ -O2 baseline DLL (compiled at runtime by run_bench.sh) ----
@@ -421,6 +438,11 @@ int main(int argc, char** argv) {
         std::fprintf(f, "Machine: %s %s, %s-bit. Date: %s %s.\n",
             kCc, kCcVer, "64", __DATE__, __TIME__);
         std::fprintf(f, "Baseline: g++ -O2 -std=c++17 (compiled from source this run).\n");
+        // Record the Stage-1 opts mode so the results MD is self-describing.
+        if (const char* o = std::getenv("EMBER_STAGE1_OPTS"))
+            std::fprintf(f, "Stage1 opts: %s (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4).\n", o);
+        else
+            std::fprintf(f, "Stage1 opts: none (flags off — byte-identical baseline).\n");
         std::fprintf(f, "Headline = **median ns** (resistant to scheduler outliers). ");
         std::fprintf(f, "ratio = ember/g++-O2 (median). >1 = ember slower than an optimizing native compiler.\n\n");
         std::fprintf(f, "| path | safety | ember med ns | g++-O2 med ns | ember/g++-O2 | verdict |\n");

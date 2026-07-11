@@ -393,13 +393,25 @@ here so the decision and its evidence have a tracked home.
   benchmark-PROVEN warranted on 5 of 6 paths, not speculative.
 
   **Recommended architecture (staged, no flag-day rewrite):**
-  - **Stage 1** — a peephole + per-basic-block local register allocator
-    LAYERED OVER the current tree-walker (keep it, add a post-emit peephole
-    pass over the emitted byte buffer + a local regalloc that keeps values in
-    regs within a basic block, spilling at block boundaries). Ships behind a
-    flag (`enable_peephole`/`enable_local_regalloc`, default off → byte-
-    identical to today, the gate holds). Least invasive, gets much of the win.
-    Gate: the 5-9x call/loop/slice/string slowdowns are spill-bound (confirmed).
+  - **Stage 1** — DONE (2026-07-10). A peephole + per-basic-block local register
+    allocator LAYERED OVER the current tree-walker (kept; added a post-emit
+    peephole pass over the emitted byte buffer + a BinExpr integer-path local
+    regalloc using the volatile r10 holding register, gated on an
+    `expr_clobbers_r10` check). Ships behind flags (`enable_peephole`/
+    `enable_local_regalloc`, default off → byte-identical to today; the 26/26
+    ctest gate + 268/0/0 lang gate hold with flags off AND on — the optimizations
+    are correctness-preserving). `src/peephole.{hpp,cpp}` ship the SmartImmPass (W4)
+    + the inert SetccMovzxPass (W10) placeholder; `examples/codegen_opt_test.cpp`
+    pins each rewrite's value-equivalence. Measured (bench/bench_codegen_paths,
+    safety-off median): call_overhead -14% (1225700→1058700 ns), loop_overhead
+    -15% regalloc-only (9546300→8100000 ns), slice_bounds +8% regression (the
+    `mov r10/rax` reg-reg dependency chain + 6 bytes is net slower than the hot-L1
+    `push/pop` store-to-load forwarding for the simple `i+1` pattern — the
+    microarchitectural finding Stage 2's cost-model regalloc addresses). See
+    `../spec/CODEGEN_OPTIMIZATION_DESIGN.md` §8 for the full table. Gate (the
+    5-9x call/loop/slice/string slowdowns are spill-bound): CONFIRMED; Stage 1
+    ships the working subset (the loop/call wins; the slice regression motivates
+    Stage 2).
   - **Stage 2** — a thin three-address IR replacing the tree-walker's `eval`
     with `lower_expr` + emit, with the Stage 1 peephole table carried over as IR
     passes. Gated on Stage 1's brittleness or cross-block evidence. Gate: Stage 1

@@ -519,15 +519,24 @@ each stage gated on t109's evidence, matching the spec's "testable stages rather
 than one monolithic pass" principle.
 
 **Stage 1 — (b): peephole + per-basic-block local regalloc over the tree-walker.**
-- Ships as additive passes: a `peephole(vector<uint8_t>&, Fixups&)` over the
-  emitted buffer, and a per-block local-allocator mode in the tree-walker
-  (generalizing the existing pinning from "one register, one loop" to "a small
-  register pool, every basic block, liveness-driven, spill at block boundaries").
+- **SHIPPED (2026-07-10).** Ships as additive passes: a `peephole(vector<uint8_t>&, Fixups&)`
+  over the emitted buffer (`src/peephole.{hpp,cpp}` — `SmartImmPass` W4 + the
+  inert `SetccMovzxPass` W10 placeholder), and a per-expression local-allocator
+  mode in the tree-walker's BinExpr integer path (a volatile r10 holding
+  register gated on an `expr_clobbers_r10` check, generalizing the existing
+  pinning from "one register, one loop" to "a second volatile accumulator,
+  every r10-safe integer BinExpr"). Behind flags (`CodeGenCtx::enable_peephole` /
+  `enable_local_regalloc`, default off → byte-identical to today; the 26/26 ctest
+  gate + 268/0/0 lang gate hold with flags off AND on). See §8 for the measured
+  before/after bench numbers (call_overhead -14%, loop_overhead -15%
+  regalloc-only, slice_bounds +8% regression — the mixed result that motivates
+  Stage 2's cost-model regalloc).
 - **No tree-walker rewrite.** The existing emit logic stays; the peephole runs after;
-  the local allocator is a mode of the existing `eval`/`exec_stmt` that allocates
-  into a small register pool per block instead of always `rax`+push.
+  the local allocator is a mode of the existing `eval` that allocates into a
+  volatile holding register per BinExpr instead of always `rax`+push.
 - Gates: t109 shows W1/W2/W3 (per-expression spills) and W4–W10 (per-site bytes)
-  are the dominant cost on the hot workloads.
+  are the dominant cost on the hot workloads (CONFIRMED — the bench proved the
+  5-9x call/loop/slice/string slowdowns; int_div 1.00x YAGNI vindicated).
 - Effort: ~2–4 weeks (peephole table + local allocator generalization of pinning).
 
 **Stage 2 — (c): thin three-address IR, if Stage 1's peephole is brittle or the
@@ -632,11 +641,15 @@ IR maturity.
 The staging above is the migration plan. Each stage is independently testable:
 
 - **Stage 1 ships behind a flag** (`CodeGenCtx::enable_peephole`,
-  `enable_local_regalloc`, default off → byte-identical to today, the 22/22 ctest
-  gate holds). Enabled per-function for benchmark comparison. The existing
-  `ember_check`/`sema_check`/`binding_abi_test`/`win64_abi_test` suite pins
-  correctness; a new `codegen_opt_test` pins each peephole rewrite's byte
-  equivalence (the rewritten sequence computes the same value).
+  `enable_local_regalloc`, default off → byte-identical to today, the 26/26 ctest
+  gate + 268/0/0 lang gate hold). **SHIPPED 2026-07-10.** Enabled per-function
+  for benchmark comparison (the bench harness toggles via the `EMBER_STAGE1_OPTS`
+  env var: `peephole`/`regalloc`/`both`). The existing `ember_check`/`sema_check`/
+  `binding_abi_test`/`win64_abi_test` suite pins correctness (all pass with flags
+  on — the optimizations are correctness-preserving); a new `codegen_opt_test`
+  (ctest target `codegen_opt`) pins each peephole rewrite's + the regalloc's value
+  equivalence (the rewritten sequence computes the same value — design §4.7's
+  correctness pin).
 - **Stage 2 is gated on Stage 1's brittleness or cross-block evidence.** It
   replaces the tree-walker's `eval` with `lower_expr` + a `ThinFunction → bytes`
   emit. The Stage 1 peephole table carries over as `ThinPass`es. The 22/22 gate
@@ -796,10 +809,60 @@ See `docs/ROADMAP.md` for the committed entries.
 
 ## 8. Status
 
-**Design complete; not implemented.** This doc is the design/planning side of the
-performance work; a parallel benchmark investigation (t109) gathers the evidence
-that gates which optimization to build first. The roadmap entries
-(`docs/ROADMAP.md`'s new "Codegen optimization (gated on benchmark evidence)"
-section) are the committed artifacts; the user reviews. No `src/` edits; the design
-is gated on t109's evidence for the ordering and on a per-entry benchmark result
-for the build decision.
+**Stage 1 SHIPPED (2026-07-10).** The peephole + per-basic-block local
+register allocator layered over the tree-walker, behind flags
+(`CodeGenCtx::enable_peephole` / `enable_local_regalloc`, default off →
+byte-identical to the pre-Stage-1 tree-walker; the 26/26 ctest gate + 268/0/0
+lang gate hold unchanged with flags off AND with flags on — the optimizations
+are correctness-preserving). `src/peephole.{hpp,cpp}` ship the post-emit peephole
+framework + two passes; the tree-walker's BinExpr integer path gained an r10
+volatile-holding-register mode; `examples/codegen_opt_test.cpp` pins each
+rewrite's value-equivalence (design §4.7).
+
+**Measured (bench/bench_codegen_paths, safety-off median, ember ns):**
+
+| path | flags off | flags on | on/off | verdict |
+|---|---|---|---|---|
+| int_div | 2700 | 2700 | 1.00 | flat (YAGNI) |
+| call_overhead | 1225700 | 1058700 | 0.86 | **-14%** ✓ |
+| loop_overhead (regalloc-only) | 9546300 | 8100000 | 0.85 | **-15%** ✓ |
+| slice_bounds | 1540300 | 1669600 | 1.08 | **+8%** ✗ (regression) |
+| string_decrypt | 1481200 | 1509800 | 1.02 | flat |
+| struct_by_value | 200 | 200 | 1.00 | flat |
+
+**What shipped:**
+- **SmartImmPass (W4):** `mov r, imm64` (10 bytes) → `mov eax, imm32` (5 B,
+  u32-fit, zero-extends) or `mov r, imm32` (7 B, s32-fit, sign-extends) for
+  small literals, skipping relocatable AbsFixup/NativeFixup loads. Strictly
+  local in-place rewrite padded with trailing NOPs (no label shift). A pure
+  code-size win (icache); never worse than baseline.
+- **SetccMovzxPass (W10):** shipped INERT. The in-place `xor rax,rax; setcc al`
+  rewrite clobbers the `cmp`'s flags (which `setcc` reads); a correct W10 needs
+  the zeroing moved before the `cmp` (a cross-instruction peephole = Stage 2).
+  Retained in the pipeline as a placeholder so the Stage-2 upgrade is additive.
+- **Local regalloc (W1):** the BinExpr integer path keeps lhs in the VOLATILE
+  scratch r10 across the RHS eval instead of `push rax; ...; pop rax`, gated on
+  an `expr_clobbers_r10` check (falls back to push/pop when the RHS contains a
+  call, a signed Div/Mod (emit_integer_divmod's INT64_MIN check uses r10), or a
+  global/slice aggregate access (the IndexExpr/FieldExpr base path uses r10)).
+  r10 is volatile → NO prologue save/restore tax (a callee-saved holding
+  register would need per-function save/restore and net WORSE on call-heavy
+  code; the volatile design avoids that). A nested BinExpr whose r10 is
+  occupied falls back to push/pop (a single holding register can't nest).
+
+**The mixed perf result is honest and motivates Stage 2.** The regalloc is a
+strong win on tight arithmetic loops (loop_overhead -15% regalloc-only, where
+both `s+i` and `i+1` fire) and on call chains combined with the peephole
+(call_overhead -14%), but a regression on slice_bounds (+8%, where only the
+`i+1` BinExpr fires and the `mov r10/rax` reg-reg dependency chain + 6 bytes is
+net slower than the hot-L1 `push/pop` store-to-load forwarding for that simple
+pattern). This is the microarchitectural finding Stage 2's cost-model regalloc
+addresses: a holding register helps when it eliminates a reload that would stall,
+but for a simple `a + <cheap rhs>` the stack slot is hot in L1 and push/pop is
+cheaper than a reg-reg dependency chain. Stage 1 ships the working subset
+(flags off = inert = gate holds; flags on = correctness-preserving = gate holds +
+the measured wins, with the documented slice_bounds regression).
+
+The design (§4 architecture, §5 pass interface, §6 representation, §7 migration)
+is unchanged; the sections below are the design as written pre-ship, with §4.2/§4.5/§4.7
+updated to mark Stage 1 SHIPPED and record the measured numbers.

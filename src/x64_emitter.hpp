@@ -461,6 +461,14 @@ public:
     // internal error, docs/spec/CODEGEN_SPEC.md Section 4).
     void resolve_fixups();
 
+    // Read-only view of the resolved label map (label_id -> byte offset) for
+    // the Stage-1 post-emit peephole (src/peephole.{hpp,cpp}). Only meaningful
+    // after resolve_fixups(). The Stage-1 peepholes are strictly local in-place
+    // rewrites padded with trailing NOPs, so they do NOT shift label offsets
+    // and do NOT consume this map; it is threaded for the Stage-2 cross-block
+    // passes (rel32->rel8 branch shrink) that will need to re-resolve fixups.
+    const std::unordered_map<uint32_t, uint32_t>& resolved_labels_view() const { return bound; }
+
 private:
     uint8_t rsp_mod16_ = 8; // Win64 function-entry parity (return address is on stack)
     uint32_t next_label = 0;

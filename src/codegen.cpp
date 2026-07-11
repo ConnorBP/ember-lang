@@ -1,6 +1,7 @@
 #include "codegen.hpp"
 #include "engine.hpp"
 #include "context.hpp"   // TrapReason (unified trap surface, v0.4)
+#include "peephole.hpp"  // Stage 1: post-emit peephole pipeline (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4.5)
 #include <cassert>
 #include <cstring>
 #include <algorithm>
@@ -129,7 +130,9 @@ struct CG {
     };
     std::vector<PendingNative> pending_natives;
 
-    CG(const CodeGenCtx& c, const FuncDecl& fn) : ctx(c), f(fn) {}
+    CG(const CodeGenCtx& c, const FuncDecl& fn) : ctx(c), f(fn) {
+        enable_local_regalloc = c.enable_local_regalloc;
+    }
 
     void emit_native(Reg dst, void* ptr, const std::string& name,
                      const Type* ret, const std::vector<Type>* params,
@@ -1045,6 +1048,7 @@ struct CG {
         // shared exit path (every ReturnStmt and the implicit fallthrough
         // all call this), so one edit here covers every exit uniformly.
         e.load_reg_mem(Reg::rbx, Reg::rbp, rbx_save_offset);
+        // (Stage 1 local regalloc uses volatile r10 — no callee-saved restore here.)
         e.mov_reg_reg(Reg::rsp, Reg::rbp);
         e.pop(Reg::rbp);
         e.ret();
@@ -1076,6 +1080,72 @@ struct CG {
     // those two fast paths needs to know pinning exists at all.
     struct PinState { std::string name; int32_t offset; Reg reg; };
     std::optional<PinState> active_pin;
+
+    // enable_local_regalloc mirrors ctx.enable_local_regalloc, captured once in
+    // the CG ctor so the BinExpr eval path reads a cheap member instead of
+    // threading ctx through every eval recursion.
+    bool enable_local_regalloc = false;
+    // r10_holding_lhs: true while the volatile scratch r10 holds a BinExpr LHS
+    // across an RHS eval that contains NO r10-clobbering operation. r10 is volatile
+    // (no prologue save/restore needed -> ZERO tax on any function, unlike a
+    // callee-saved holding register which would need per-function save/restore
+    // and can net WORSE on call-heavy code where the tax exceeds the per-BinExpr
+    // win). A RHS that clobbers r10 falls back to the push/pop path (the stack).
+    // A NESTED BinExpr whose r10 is already claimed also falls back (a single
+    // holding register can't nest). Cleared after the op.
+    bool r10_holding_lhs = false;
+    // Does `ex` transitively contain anything that CLOBBERS r10? The regalloc's
+    // r10 holding path is only safe when the RHS leaves r10 untouched. r10 is
+    // clobbered by: (a) a CallExpr (r10 is volatile); (b) a SIGNED Div/Mod
+    // (emit_integer_divmod's signed overflow check does `mov r10, INT64_MIN`);
+    // (c) a global struct/array/slice access (the IndexExpr/FieldExpr global
+    // base path does `mov r10, GlobalsBase` + copy_bytes through r10). A scalar
+    // global read, a local-array/slice index, and arithmetic other than signed
+    // div/mod are all r10-safe. Conservative: if in doubt, return true (fallback
+    // to push/pop) — correctness over the micro-win.
+    bool expr_clobbers_r10(const Expr& ex) const {
+        if (dynamic_cast<const CallExpr*>(&ex)) return true;
+        if (auto* b = dynamic_cast<const BinExpr*>(&ex)) {
+            // A signed Div/Mod clobbers r10 (emit_integer_divmod's INT64_MIN check).
+            // An unsigned Div/Mod does not (xor rdx; div). is_uint is on the LHS type.
+            if ((b->op == BinExpr::Op::Div || b->op == BinExpr::Op::Mod) &&
+                !(b->lhs->ty && b->lhs->ty->is_uint())) return true;
+            return expr_clobbers_r10(*b->lhs) || expr_clobbers_r10(*b->rhs);
+        }
+        if (auto* u = dynamic_cast<const UnaryExpr*>(&ex)) return expr_clobbers_r10(*u->operand);
+        if (auto* c = dynamic_cast<const CastExpr*>(&ex)) return expr_clobbers_r10(*c->operand);
+        if (auto* t = dynamic_cast<const TernaryExpr*>(&ex)) return expr_clobbers_r10(*t->cond) || expr_clobbers_r10(*t->then_e) || expr_clobbers_r10(*t->else_e);
+        if (auto* a = dynamic_cast<const AssignExpr*>(&ex)) { if (a->target && expr_clobbers_r10(*a->target)) return true; return expr_clobbers_r10(*a->value); }
+        if (auto* ix = dynamic_cast<const IndexExpr*>(&ex)) {
+            // A global aggregate base clobbers r10 (the global-base load path),
+            // AND a local SLICE base clobbers r10 (the IndexExpr slice-base path
+            // does `mov r10, rax` to hold the slice ptr across the index eval).
+            // A local FIXED-ARRAY base does not (it uses rbp). A non-Ident base is
+            // conservative-clobber (may eval through r10).
+            if (auto* bid = dynamic_cast<const Ident*>(ix->base.get())) {
+                auto it = locals.find(bid->name);
+                if (it == locals.end()) return true;          // global base -> r10
+                const Type* lt = local_types.count(bid->name) ? local_types.at(bid->name) : ix->base->ty;
+                if (lt && lt->is_slice) return true;           // local slice base -> r10
+            } else {
+                return true; // non-Ident base -> conservative clobber
+            }
+            return expr_clobbers_r10(*ix->index);
+        }
+        if (auto* fx = dynamic_cast<const FieldExpr*>(&ex)) {
+            // Same reasoning as IndexExpr: a global struct base clobbers r10.
+            if (auto* bid = dynamic_cast<const Ident*>(fx->base.get())) {
+                if (locals.find(bid->name) == locals.end()) return true;
+            } else {
+                return true;
+            }
+            return false;
+        }
+        if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) if (expr_clobbers_r10(*kv.second)) return true; return false; }
+        // Ident (local scalar/global scalar), IntLit, BoolLit, FloatLit, StringLit,
+        // FnHandleExpr, ViewExpr, ArrayLit: none clobber r10 in their eval.
+        return false;
+    }
 
     // --- lexical defer cleanup scopes ---
     // Every lexical Block pushes one cleanup scope while it is emitted. A
@@ -1791,10 +1861,46 @@ void CG::eval(const Expr& ex) {
         // Integer path:
         if (!is_float) {
             eval(*b->lhs);
-            e.push(Reg::rax);
+            // Stage 1 local regalloc (design W1): keep lhs in a register across
+            // the RHS eval instead of `push rax; ...; pop rax`. Use the VOLATILE
+            // scratch r10 (NOT a callee-saved register) so there is NO prologue
+            // save/restore tax on any function — zero overhead when the RHS
+            // happens to contain a call (that case falls back to push/pop below).
+            //
+            // The win applies to the no-call-in-RHS case (loop bodies, simple
+            // arithmetic — the loop_overhead `s+i` and the arithmetic parts of
+            // every path). r10 is free by default: MBA uses rdx, the call-target
+            // guard + dispatch use r11, opaque junk (off by default) is the only
+            // other r10 user and it runs in the OP (after the holding reg is
+            // restored), not during the RHS eval.
+            //
+            // Two fallbacks to the pre-Stage-1 push/pop path (correctness):
+            //   (1) the RHS clobbers r10 — a CallExpr (r10 volatile), a SIGNED
+            //       Div/Mod (emit_integer_divmod's INT64_MIN check uses r10), or a
+            //       global aggregate access (the global-base load uses r10). The
+            //       stack must hold lhs across those;
+            //   (2) r10 is already holding a nested BinExpr's lhs — a single
+            //       holding register can't nest, so the inner one uses the stack.
+            // r10_holding_lhs is cleared after the op, so it is free for the next
+            // statement's outermost r10-safe BinExpr.
+            bool used_r10 = false;
+            bool rhs_clobbers = expr_clobbers_r10(*b->rhs);
+            if (enable_local_regalloc && !r10_holding_lhs && !rhs_clobbers &&
+                !(obf.mba || obf.opaque)) {
+                e.mov_reg_reg(Reg::r10, Reg::rax);   // r10 = lhs (no stack spill)
+                r10_holding_lhs = true;
+                used_r10 = true;
+            } else {
+                e.push(Reg::rax);                    // lhs spills to stack (pre-Stage-1)
+            }
             eval(*b->rhs);
-            e.mov_reg_reg(Reg::rcx, Reg::rax); // rcx = rhs
-            e.pop(Reg::rax);                    // rax = lhs
+            e.mov_reg_reg(Reg::rcx, Reg::rax);       // rcx = rhs
+            if (used_r10) {
+                e.mov_reg_reg(Reg::rax, Reg::r10);   // rax = lhs (no stack reload)
+                r10_holding_lhs = false;
+            } else {
+                e.pop(Reg::rax);                     // rax = lhs (pre-Stage-1)
+            }
             switch (b->op) {
             case BinExpr::Op::Add:
             case BinExpr::Op::Sub:
@@ -3399,6 +3505,10 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
     // load_reg_mem restore. Unconditional regardless of whether this
     // function's own pinning heuristic ends up using rbx.
     cg.e.store_reg_mem(Reg::rbp, cg.rbx_save_offset, Reg::rbx);
+    // (Stage 1 local regalloc uses the VOLATILE r10 as its holding register, so
+    // there is NO callee-saved save/restore in the prologue — zero tax on any
+    // function. A RHS containing a call falls back to push/pop since r10 is
+    // volatile; a no-call RHS uses r10 with no prologue cost.)
 
     // spill incoming params to frame slots (Win64: rcx/rdx/r8/r9 int, xmm0-3 float).
     // Done BEFORE the CPUID gate (cpuid clobbers rcx/rdx) and before the body.
@@ -3577,6 +3687,29 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
         for (int i = 0; i < 8; ++i)
             cg.e.code[pending.binding.code_offset + i] = uint8_t(v >> (8 * i));
     }
+
+    // --- Stage 1: post-emit peephole (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4.5) ---
+    // Runs ONLY when ctx.enable_peephole (default false -> byte-identical to
+    // the pre-Stage-1 tree-walker, the gate holds). Runs AFTER resolve_fixups
+    // AND after the AbsFixup/native-fixup patching above, so: (a) the guarded
+    // regions (AbsFixup/NativeFixup code_offsets) now point at the real filled
+    // addresses and the peephole skips them (they are relocatable; the `.em`
+    // serializer reads the fixup list by offset, so they must stay 10 bytes);
+    // (b) the plain `mov r, imm64` literals (IntLit loads, baked fn ptrs) read
+    // their final imm64 values, so the SmartImm range checks see the real
+    // constants. The peephole is a strictly local in-place rewrite padded with
+    // trailing NOPs, so NO label offset shifts and NO branch fixup needs re-
+    // resolving. out.abs_fixups / out.native_fixups (captured above) keep their
+    // original code_offsets (the peephole does not touch the guarded regions).
+    if (ctx.enable_peephole && !cg.e.code.empty()) {
+        PeepholeGuardedRegions guarded;
+        for (const auto& af : out.abs_fixups) guarded.imm64_offsets.insert(af.code_offset);
+        for (const auto& nf : out.native_fixups) guarded.imm64_offsets.insert(nf.code_offset);
+        PeepholeCtx pctx{ cg.e.code, cg.e.resolved_labels_view(), std::move(guarded) };
+        auto pipeline = make_stage1_pipeline();
+        pipeline.run_all(pctx);
+    }
+
     out.rodata = std::move(cg.rodata);
     out.non_serializable_reason = std::move(cg.non_serializable_reason);
     out.bytes = std::move(cg.e.code);
