@@ -164,6 +164,7 @@ int main() {
     ck(reg.has("constprop"), "registry has \"constprop\"");
     ck(reg.has("dce"), "registry has \"dce\"");
     ck(reg.has("cse"), "registry has \"cse\"");
+    ck(reg.has("licm"), "registry has \"licm\"");
 
     // The four workloads.
     struct Workload { const char* name; const char* src; };
@@ -176,12 +177,13 @@ int main() {
     const int NW = 4;
 
     // For each pass: (a) value-preserving on all 4 workloads, (b) instr-count
-    // reduction on its target workload.
-    struct PassTest { const char* name; const char* target; };
+    // reduction on its target workload (except LICM which moves, not removes).
+    struct PassTest { const char* name; const char* target; bool check_instr_reduction; };
     PassTest passes[] = {
-        {"constprop", "constprop_fold"},
-        {"dce",       "dce_dead_store"},
-        {"cse",       "cse_redundant"},
+        {"constprop", "constprop_fold", true},
+        {"dce",       "dce_dead_store", true},
+        {"cse",       "cse_redundant",  true},
+        {"licm",      "licm_invariant", false},  // LICM hoists, doesn't remove
     };
 
     for (const auto& pt : passes) {
@@ -206,21 +208,25 @@ int main() {
             ck(rb == rp, msg);
         }
 
-        // (b) Instr-count reduction on the target workload.
-        size_t before = 0, after = 0;
-        const char* target_src = nullptr;
-        for (int wi = 0; wi < NW; ++wi)
-            if (std::string(workloads[wi].name) == pt.target) { target_src = workloads[wi].src; break; }
-        EmberPassManager pm;
-        pm.add_pass_concept(reg.create(pt.name));
-        auto mt = compile_with(target_src, &pm, &after, &before);
-        if (mt) {
-            char msg[128];
-            std::snprintf(msg, sizeof(msg), "%s reduces instr count on %s (before=%zu after=%zu)",
-                          pt.name, pt.target, before, after);
-            ck(after < before, msg);
-        } else {
-            ck(false, "target compile failed");
+        // (b) Instr-count reduction on the target workload (skip for LICM —
+        // it hoists instructions, doesn't remove them; the benefit is runtime,
+        // not code size. Just check value-preservation, already done in (a)).
+        if (pt.check_instr_reduction) {
+            size_t before = 0, after = 0;
+            const char* target_src = nullptr;
+            for (int wi = 0; wi < NW; ++wi)
+                if (std::string(workloads[wi].name) == pt.target) { target_src = workloads[wi].src; break; }
+            EmberPassManager pm;
+            pm.add_pass_concept(reg.create(pt.name));
+            auto mt = compile_with(target_src, &pm, &after, &before);
+            if (mt) {
+                char msg[128];
+                std::snprintf(msg, sizeof(msg), "%s reduces instr count on %s (before=%zu after=%zu)",
+                              pt.name, pt.target, before, after);
+                ck(after < before, msg);
+            } else {
+                ck(false, "target compile failed");
+            }
         }
     }
 

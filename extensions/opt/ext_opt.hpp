@@ -45,7 +45,12 @@ struct CSEPass : EmberPassInfoMixin<CSEPass> {
     EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
 };
 
-// Register all three passes by name. Mirrors register_natives(NativeTable&).
+struct LICMPass : EmberPassInfoMixin<LICMPass> {
+    static constexpr const char* pass_name = "licm";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+// Register all passes by name. Mirrors register_natives(NativeTable&).
 void register_passes(EmberPassRegistry& reg);
 
 } // namespace ember::ext_opt

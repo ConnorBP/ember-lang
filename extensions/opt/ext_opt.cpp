@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -443,6 +444,175 @@ EmberPreserved CSEPass::run(ThinFunction& f, EmberAnalysisManager&) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// LICMPass: loop-invariant code motion
+// ═══════════════════════════════════════════════════════════════════════════
+
+EmberPreserved LICMPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    bool changed = false;
+    const size_t num_blocks = f.blocks.size();
+    if (num_blocks < 3) return EmberPreserved::all();  // no loop possible
+
+    // Build a block-id → index map (block ids may not be sequential).
+    std::unordered_map<uint32_t, size_t> id_to_idx;
+    for (size_t i = 0; i < num_blocks; ++i)
+        id_to_idx[f.blocks[i].id] = i;
+
+    // Build a predecessor map: for each block, which blocks jump to it?
+    std::vector<std::vector<uint32_t>> preds(num_blocks);
+    for (size_t i = 0; i < num_blocks; ++i) {
+        const auto& blk = f.blocks[i];
+        if (blk.term.kind == TermKind::Jmp)
+            preds[id_to_idx[blk.term.target]].push_back(uint32_t(i));
+        else if (blk.term.kind == TermKind::Branch) {
+            preds[id_to_idx[blk.term.target]].push_back(uint32_t(i));
+            preds[id_to_idx[blk.term.false_target]].push_back(uint32_t(i));
+        }
+    }
+
+    // Find back-edges: a Jmp/Branch whose target index < current index.
+    // (The lowering produces blocks in topological-ish order, so a back-edge
+    // is a jump to an earlier block.)
+    struct Loop { uint32_t header_idx; uint32_t latch_idx; std::set<uint32_t> body; };
+    std::vector<Loop> loops;
+    for (size_t i = 0; i < num_blocks; ++i) {
+        const auto& blk = f.blocks[i];
+        auto check_back = [&](uint32_t target) {
+            auto it = id_to_idx.find(target);
+            if (it == id_to_idx.end()) return;
+            uint32_t target_idx = uint32_t(it->second);
+            if (target_idx < i) {
+                // Back-edge: i → target_idx. Natural loop = {target_idx} ∪
+                // {all blocks that can reach i without going through target_idx}.
+                Loop loop;
+                loop.header_idx = target_idx;
+                loop.latch_idx = uint32_t(i);
+                loop.body.insert(target_idx);
+                // Reverse BFS from latch to header, avoiding the header.
+                std::vector<uint32_t> stack = {uint32_t(i)};
+                while (!stack.empty()) {
+                    uint32_t b = stack.back(); stack.pop_back();
+                    if (b == target_idx) continue;
+                    if (loop.body.count(b)) continue;
+                    loop.body.insert(b);
+                    for (uint32_t p : preds[b])
+                        if (!loop.body.count(p)) stack.push_back(p);
+                }
+                loops.push_back(loop);
+            }
+        };
+        if (blk.term.kind == TermKind::Jmp)
+            check_back(blk.term.target);
+        else if (blk.term.kind == TermKind::Branch) {
+            check_back(blk.term.target);
+            check_back(blk.term.false_target);
+        }
+    }
+
+    if (loops.empty()) return EmberPreserved::all();
+
+    // For each loop, find the pre-header (the single non-loop predecessor of
+    // the header). If there are 0 or >1 non-loop predecessors, skip (no safe
+    // pre-header for hoisting).
+    //
+    // Then identify loop-invariant instructions in the loop body and hoist
+    // them to the pre-header (at the end of its instrs, before the terminator).
+    //
+    // An instruction is loop-invariant if:
+    // - It's a ConstInt/ConstFloat/ConstBool (no operands → always invariant).
+    // - It's a pure arithmetic op (Add/Sub/Mul/...) and ALL its source VRegs
+    //   are defined OUTSIDE the loop (in a block not in the loop body), or the
+    //   source is the immediate form (src2==0, using imm.i — always invariant).
+    // - It's a LoadFrame from a slot that is NEVER written (StoreFrame) inside
+    //   the loop.
+    // - It's a Move whose src1 is invariant.
+    //
+    // We do NOT hoist StoreFrame (memory writes) in this first implementation —
+    // hoisting stores requires proving the slot is not read before the store in
+    // the loop, which is more complex. The hoisted pure instructions reduce the
+    // per-iteration compute cost even if the store stays in the loop.
+
+    for (const auto& loop : loops) {
+        // Find the pre-header.
+        uint32_t pre_header = UINT32_MAX;
+        int non_loop_preds = 0;
+        for (uint32_t p : preds[loop.header_idx]) {
+            if (!loop.body.count(p)) {
+                non_loop_preds++;
+                pre_header = p;
+            }
+        }
+        if (non_loop_preds != 1 || pre_header == UINT32_MAX)
+            continue;  // no safe pre-header
+
+        // Compute the set of VRegs defined INSIDE the loop.
+        std::set<VReg> loop_def_vregs;
+        // Compute the set of frame slots written INSIDE the loop.
+        std::set<int32_t> loop_written_slots;
+        for (uint32_t bi : loop.body) {
+            for (const auto& in : f.blocks[bi].instrs) {
+                if (in.dst) loop_def_vregs.insert(in.dst);
+                if (in.op == ThinOp::StoreFrame)
+                    loop_written_slots.insert(in.meta.frame_off);
+            }
+        }
+
+        // Check if a VReg is loop-invariant (defined outside the loop).
+        auto is_invariant_vreg = [&](VReg v) -> bool {
+            if (v == 0) return true;  // 0 = invalid/none/immediate
+            return !loop_def_vregs.count(v);
+        };
+
+        // Check if an instruction is loop-invariant and hoistable (pure).
+        auto is_invariant_instr = [&](const ThinInstr& in) -> bool {
+            if (is_side_effecting(in.op)) return false;
+            if (in.op == ThinOp::StoreFrame) return false;  // don't hoist stores (conservative)
+            if (in.op == ThinOp::ConstInt || in.op == ThinOp::ConstFloat ||
+                in.op == ThinOp::ConstBool)
+                return true;  // constants are always invariant
+            if (in.op == ThinOp::LoadFrame)
+                return !loop_written_slots.count(in.meta.frame_off);
+            if (in.op == ThinOp::Move)
+                return is_invariant_vreg(in.src1);
+            // Binary int ops / Cmp / Cast: all source VRegs must be invariant.
+            // The immediate form (src2==0) is always invariant.
+            return is_invariant_vreg(in.src1) && is_invariant_vreg(in.src2);
+        };
+
+        // Collect hoistable instructions from the loop body (excluding the
+        // header — don't hoist from the header because the header may execute
+        // differently on the first vs subsequent iterations).
+        std::vector<std::pair<uint32_t, size_t>> to_hoist;  // (block_idx, instr_idx)
+        for (uint32_t bi : loop.body) {
+            if (bi == loop.header_idx) continue;  // skip header
+            auto& instrs = f.blocks[bi].instrs;
+            for (size_t ii = 0; ii < instrs.size(); ++ii) {
+                if (is_invariant_instr(instrs[ii]))
+                    to_hoist.push_back({bi, ii});
+            }
+        }
+
+        if (to_hoist.empty()) continue;
+
+        // Hoist: move each invariant instruction to the end of the pre-header's
+        // instrs (before the terminator). Remove from the original block.
+        // Process in reverse order so indices don't shift as we erase.
+        std::sort(to_hoist.begin(), to_hoist.end(),
+            [](const auto& a, const auto& b) {
+                return a.first != b.first ? a.first > b.first : a.second > b.second;
+            });
+        auto& pre_hdr_instrs = f.blocks[pre_header].instrs;
+        for (const auto& [bi, ii] : to_hoist) {
+            ThinInstr hoisted = std::move(f.blocks[bi].instrs[ii]);
+            f.blocks[bi].instrs.erase(f.blocks[bi].instrs.begin() + ptrdiff_t(ii));
+            pre_hdr_instrs.push_back(std::move(hoisted));
+            changed = true;
+        }
+    }
+
+    return changed ? EmberPreserved::none() : EmberPreserved::all();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // register_passes
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -450,6 +620,7 @@ void register_passes(EmberPassRegistry& reg) {
     reg.add<ConstPropPass>("constprop");
     reg.add<DeadCodeElimPass>("dce");
     reg.add<CSEPass>("cse");
+    reg.add<LICMPass>("licm");
 }
 
 } // namespace ember::ext_opt
