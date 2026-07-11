@@ -1,0 +1,216 @@
+// ember_stub_main - standalone ember runtime stub (docs/planning/plan_STANDALONE_BUNDLER.md).
+//
+// The `ember bundle` command copies this exe to <output.exe> + appends a
+// .em blob + a 12-byte footer. At runtime this main() reads its own file,
+// finds the appended .em via the footer, loads it via `load_em_bytes`, and
+// calls the entry function — the script runs as a self-contained exe with
+// no separate ember install.
+//
+// This is the CLI's `--load-em` path (examples/ember_cli.cpp lines 912-922)
+// with the .em source swapped from `load_em_file(path)` to
+// `load_em_bytes(embedded_ptr, embedded_len)`. No lexer, no parser, no sema,
+// no codegen-tree-walker at runtime — the .em is pre-compiled; load is
+// memcpy + reloc patch + native binding resolution.
+//
+// Links: ember + ember_frontend + the standard extension libs (the same
+// native allowlist the CLI registers, so any CLI-compiled .em loads). Does
+// NOT link ember_import (no source imports at runtime). Does NOT parse/sema/
+// codegen (the .em is pre-compiled — the v4 raw-x86 load path is memcpy +
+// reloc patch, no re-emit).
+//
+// Footer format (12 bytes, little-endian, appended AFTER the .em at the very
+// end of the file):
+//   magic      : u32 = 0x454D4244  ("EMBD" — ember bundle, appended)
+//   em_length  : u64              (byte length of the .em just appended)
+//
+// The stub reads the last 12 bytes of its own file, checks the magic, reads
+// em_length, seeks back 12 + em_length bytes from the end, reads the .em.
+
+#include "../src/engine.hpp"          // call_i64_i64
+#include "../src/em_loader.hpp"       // load_em_bytes, LoadedModule
+#include "../src/em_file.hpp"         // EM_MAGIC etc. (for reference)
+
+#include "ext_vec.hpp"
+#include "ext_quat.hpp"
+#include "ext_mat.hpp"
+#include "ext_string.hpp"
+#include "ext_array.hpp"
+#include "ext_math.hpp"
+#include "ext_map.hpp"
+#include "ext_sync.hpp"
+#include "ext_lifecycle.hpp"
+#include "ext_io.hpp"
+
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#if defined(_WIN32)
+#  include <windows.h>
+#endif
+
+// The appended-bundle footer magic ("EMBD" — ember bundle, appended).
+// Distinct from EM_MAGIC ("EMBL" = 0x454D424C) and EM_SIG_MAGIC ("EMSG" =
+// 0x454D5347) so the stub can tell "I have an embedded module" from "I'm a
+// plain stub with no .em" and from a coincidental byte pattern.
+constexpr uint32_t EM_BUNDLE_MAGIC      = 0x454D4244u;
+constexpr uint32_t EM_BUNDLE_FOOTER_SIZE = 12u;  // u32 magic + u64 em_length
+
+// Mirror the CLI's register_standard_bindings (same native allowlist). The
+// stub must register every native the script uses so the loader can resolve
+// the .em's symbolic native bindings by name. Registering all standard
+// extensions means any script that compiles with the CLI loads with the stub.
+static void register_standard_bindings(
+        std::unordered_map<std::string, ember::NativeSig>& natives) {
+    using namespace ember;
+    ext_vec::register_natives(natives); ext_quat::register_natives(natives);
+    ext_mat::register_natives(natives); ext_string::register_natives(natives);
+    ext_array::register_natives(natives); ext_math::register_natives(natives);
+    ext_map::register_natives(natives);
+    ext_sync::register_natives(natives); ext_lifecycle::register_natives(natives);
+    ext_io::register_natives(natives);
+    // Publish overload names into the allowlist (same as the CLI: the .em
+    // loader resolves overloads by their sema-resolved fn_name).
+    OpOverloadTable overloads;
+    ext_vec::register_overloads(overloads); ext_quat::register_overloads(overloads);
+    ext_mat::register_overloads(overloads); ext_string::register_overloads(overloads);
+    for (const auto& item : overloads.entries) {
+        const OpOverload& o = item.second;
+        NativeSig sig; sig.name = o.fn_name; sig.fn_ptr = o.fn_ptr;
+        sig.ret = o.ret; sig.params = o.params;
+        natives[o.fn_name] = std::move(sig);
+    }
+}
+
+// Find this exe's own path. argv[0] is unreliable (may be a relative path,
+// may differ from the actual loaded module path on some platforms).
+// On Windows, GetModuleFileNameW gives the definitive answer.
+static std::filesystem::path get_own_exe_path() {
+#if defined(_WIN32)
+    wchar_t buf[MAX_PATH];
+    DWORD len = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return std::filesystem::path();
+    return std::filesystem::path(buf);
+#else
+    // POSIX: read /proc/self/exe (Linux) or use argv[0] as a fallback.
+    std::error_code ec;
+    auto p = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec && !p.empty()) return p;
+    return std::filesystem::path();
+#endif
+}
+
+int main(int argc, char** argv) {
+    // 1. Find this exe's own path.
+    std::filesystem::path self = get_own_exe_path();
+    if (self.empty()) {
+        std::fprintf(stderr, "ember_stub: cannot determine own executable path\n");
+        return 2;
+    }
+
+    // 2. Read the footer (last 12 bytes) + the appended .em.
+    std::ifstream f(self, std::ios::binary | std::ios::ate);
+    if (!f) {
+        std::fprintf(stderr, "ember_stub: cannot open own executable: %s\n",
+                     self.string().c_str());
+        return 2;
+    }
+    std::streampos end_pos = f.tellg();
+    if (end_pos < 0) {
+        std::fprintf(stderr, "ember_stub: cannot determine file size\n");
+        return 2;
+    }
+    uint64_t file_size = static_cast<uint64_t>(end_pos);
+    if (file_size < EM_BUNDLE_FOOTER_SIZE) {
+        std::fprintf(stderr, "ember_stub: no embedded module (file too small)\n");
+        return 2;
+    }
+
+    // Read the footer (12 bytes: u32 magic + u64 em_length) in one read so
+    // gcount() reflects the full 12 bytes.
+    f.seekg(static_cast<std::streamoff>(file_size - EM_BUNDLE_FOOTER_SIZE));
+    if (!f) {
+        std::fprintf(stderr, "ember_stub: seek to footer failed\n");
+        return 2;
+    }
+    uint8_t footer[EM_BUNDLE_FOOTER_SIZE] = {};
+    f.read(reinterpret_cast<char*>(footer), EM_BUNDLE_FOOTER_SIZE);
+    if (!f || f.gcount() < static_cast<std::streamsize>(EM_BUNDLE_FOOTER_SIZE)) {
+        std::fprintf(stderr, "ember_stub: short footer read\n");
+        return 2;
+    }
+    uint32_t magic = 0;
+    uint64_t em_len = 0;
+    for (int i = 0; i < 4; ++i)
+        magic |= uint32_t(footer[i]) << (8 * i);
+    for (int i = 0; i < 8; ++i)
+        em_len |= uint64_t(footer[4 + i]) << (8 * i);
+    if (magic != EM_BUNDLE_MAGIC) {
+        std::fprintf(stderr, "ember_stub: no embedded module (bad footer magic)\n");
+        return 2;
+    }
+    if (em_len == 0 || file_size < uint64_t(EM_BUNDLE_FOOTER_SIZE) + em_len) {
+        std::fprintf(stderr, "ember_stub: bad em_length in footer\n");
+        return 2;
+    }
+
+    // Read the .em (em_len bytes ending just before the footer).
+    f.seekg(static_cast<std::streamoff>(file_size - EM_BUNDLE_FOOTER_SIZE - em_len));
+    if (!f) {
+        std::fprintf(stderr, "ember_stub: seek to em blob failed\n");
+        return 2;
+    }
+    std::vector<uint8_t> em_bytes(static_cast<size_t>(em_len));
+    f.read(reinterpret_cast<char*>(em_bytes.data()), static_cast<std::streamsize>(em_len));
+    if (!f || static_cast<uint64_t>(f.gcount()) < em_len) {
+        std::fprintf(stderr, "ember_stub: short em read\n");
+        return 2;
+    }
+    f.close();
+
+    // 3. Register the native allowlist (same as CLI --load-em).
+    std::unordered_map<std::string, ember::NativeSig> natives;
+    register_standard_bindings(natives);
+
+    // 4. Load the .em from memory.
+    ember::LoadedModule mod;
+    std::string lerr;
+    if (!ember::load_em_bytes(em_bytes.data(), em_bytes.size(), mod, &lerr,
+                              nullptr, &natives)) {
+        std::fprintf(stderr, "ember_stub: load failed: %s\n", lerr.c_str());
+        return 2;
+    }
+
+    // 5. Find the entry. An optional --fn NAME argument overrides the default
+    //    (@entry slot, else "main"). This mirrors the CLI --load-em path.
+    std::string fn_name = "main";
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--fn" && i + 1 < argc) {
+            fn_name = argv[++i];
+        }
+    }
+    void* entry = mod.entry_by_name(fn_name.c_str());
+    if (!entry) entry = mod.entry();
+    if (!entry) {
+        std::fprintf(stderr, "ember_stub: entry '%s' not found\n", fn_name.c_str());
+        return 2;
+    }
+
+    // 6. Determine the return type (void -> exit 0, i64 -> exit code).
+    //    Matches the CLI --load-em contract exactly.
+    uint32_t selected_slot = mod.entry_slot;
+    for (const auto& item : mod.name_table)
+        if (item.first == fn_name) { selected_slot = item.second; break; }
+    bool is_void = selected_slot < mod.signatures_by_slot.size() &&
+                   mod.signatures_by_slot[selected_slot].ret.is_void();
+
+    // 7. Call + exit code.
+    int64_t result = ember::call_i64_i64(entry);
+    return is_void ? 0 : int(result);
+}

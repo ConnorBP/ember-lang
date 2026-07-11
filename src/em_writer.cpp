@@ -264,6 +264,21 @@ bool write_em_file(const EmModule& mod, const char* path, std::string* err) {
     return true;
 }
 
+// Serialize `mod` to an in-memory byte buffer (no temp file). Same format as
+// `write_em_file` (unsigned v3). Uses a `std::ostringstream` (which IS a
+// `std::ostream`, the type `emit_em_content` takes) so the serialize-to-buffer
+// shares the exact same emit path as the file writer.
+bool write_em_bytes(const EmModule& mod, std::vector<uint8_t>& out, std::string* err) {
+    uint64_t rodata_total = 0;
+    if (!preflight_em_module(mod, err, rodata_total)) return false;
+    std::ostringstream ofs(std::ios::binary | std::ios::out);
+    if (!emit_em_content(ofs, mod, EM_VERSION_V3, rodata_total, err)) return false;
+    ofs.flush();
+    std::string s = ofs.str();
+    out.assign(s.begin(), s.end());
+    return true;
+}
+
 // v5 (Stage B, IL-.em): write an UNSIGNED v5 module. A v5 module carries IR
 // (not raw x86) for IR-serializable functions (ir_blob non-empty -> is_ir=1)
 // and raw-x86 fallback for non-serializable functions (ir_blob empty ->

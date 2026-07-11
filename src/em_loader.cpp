@@ -541,46 +541,16 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
     return true;
 }
 
-bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
-                       ModuleRegistry* registry,
-                       const std::unordered_map<std::string, NativeSig>* natives,
-                       const EmVerifyPolicy* verify) {
-    if (!path) {
-        set_error(err, "em_loader: argument: null path");
-        return false;
-    }
-
-    std::ifstream ifs(path, std::ios::binary | std::ios::in | std::ios::ate);
-    if (!ifs) {
-        set_error(err, std::string("em_loader: io: could not open input file: ") + path);
-        return false;
-    }
-    const std::streampos end = ifs.tellg();
-    if (end < 0) {
-        set_error(err, "em_loader: io: could not determine file length");
-        return false;
-    }
-    const uint64_t file_size = static_cast<uint64_t>(end);
-    if (file_size < EM_HEADER_SIZE) {
-        set_error(err, "em_loader: format: file shorter than header");
-        return false;
-    }
-    if (file_size > MAX_FILE_SIZE) {
-        set_error(err, "em_loader: limit: file exceeds MAX_FILE_SIZE");
-        return false;
-    }
-    ifs.seekg(0, std::ios::beg);
-    if (!ifs) {
-        set_error(err, "em_loader: io: seek failed");
-        return false;
-    }
-    std::vector<uint8_t> file(static_cast<size_t>(file_size));
-    if (!ifs.read(reinterpret_cast<char*>(file.data()),
-                  static_cast<std::streamsize>(file.size()))) {
-        set_error(err, "em_loader: io: short file read");
-        return false;
-    }
-
+// The post-file-read tail of `load_em_file_impl`: parse the in-memory buffer,
+// verify the signature (v4), stage + publish the exec pages. Shared by the
+// file-path entry (`load_em_file_impl` reads the file then calls this) and the
+// byte-buffer entry (`load_em_bytes_impl` takes the buffer directly). The
+// `file` vector is the full .em content (the signed-payload bytes are its
+// leading `parsed.sig_payload_len` bytes, which parse_file cross-checked).
+bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
+                        std::string* err, ModuleRegistry* registry,
+                        const std::unordered_map<std::string, NativeSig>* natives,
+                        const EmVerifyPolicy* verify) {
     ParsedModule parsed;
     if (!parse_file(file, parsed, registry, natives, err)) return false;
 
@@ -831,6 +801,50 @@ bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
 
 } // namespace
 
+// ---- internal: file-path entry (reads the file, then delegates to the
+// byte-buffer impl above) ----
+bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
+                       ModuleRegistry* registry,
+                       const std::unordered_map<std::string, NativeSig>* natives,
+                       const EmVerifyPolicy* verify) {
+    if (!path) {
+        set_error(err, "em_loader: argument: null path");
+        return false;
+    }
+
+    std::ifstream ifs(path, std::ios::binary | std::ios::in | std::ios::ate);
+    if (!ifs) {
+        set_error(err, std::string("em_loader: io: could not open input file: ") + path);
+        return false;
+    }
+    const std::streampos end = ifs.tellg();
+    if (end < 0) {
+        set_error(err, "em_loader: io: could not determine file length");
+        return false;
+    }
+    const uint64_t file_size = static_cast<uint64_t>(end);
+    if (file_size < EM_HEADER_SIZE) {
+        set_error(err, "em_loader: format: file shorter than header");
+        return false;
+    }
+    if (file_size > MAX_FILE_SIZE) {
+        set_error(err, "em_loader: limit: file exceeds MAX_FILE_SIZE");
+        return false;
+    }
+    ifs.seekg(0, std::ios::beg);
+    if (!ifs) {
+        set_error(err, "em_loader: io: seek failed");
+        return false;
+    }
+    std::vector<uint8_t> file(static_cast<size_t>(file_size));
+    if (!ifs.read(reinterpret_cast<char*>(file.data()),
+                  static_cast<std::streamsize>(file.size()))) {
+        set_error(err, "em_loader: io: short file read");
+        return false;
+    }
+    return load_em_bytes_impl(file, out, err, registry, natives, verify);
+}
+
 LoadedModule::~LoadedModule() {
     for (void* p : pages) free_executable(p);
 }
@@ -881,6 +895,40 @@ bool load_em_file(const char* path, LoadedModule& out, std::string* err,
     // failures are always reported as false plus a categorized error.
     try {
         return load_em_file_impl(path, out, err, registry, native_bindings, verify);
+    } catch (const std::bad_alloc&) {
+        set_error(err, "em_loader: allocation: std::bad_alloc");
+    } catch (const std::length_error&) {
+        set_error(err, "em_loader: allocation: std::length_error");
+    } catch (const std::exception&) {
+        set_error(err, "em_loader: exception: std::exception");
+    } catch (...) {
+        set_error(err, "em_loader: exception: unknown failure");
+    }
+    return false;
+}
+
+bool load_em_bytes(const uint8_t* data, size_t len, LoadedModule& out,
+                   std::string* err,
+                   ModuleRegistry* registry,
+                   const std::unordered_map<std::string, NativeSig>* native_bindings,
+                   const EmVerifyPolicy* verify) {
+    // Complete public no-throw boundary: malformed input and allocation/library
+    // failures are always reported as false plus a categorized error.
+    try {
+        if (!data) {
+            set_error(err, "em_loader: argument: null data");
+            return false;
+        }
+        if (len < EM_HEADER_SIZE) {
+            set_error(err, "em_loader: format: buffer shorter than header");
+            return false;
+        }
+        if (len > MAX_FILE_SIZE) {
+            set_error(err, "em_loader: limit: buffer exceeds MAX_FILE_SIZE");
+            return false;
+        }
+        std::vector<uint8_t> file(data, data + len);
+        return load_em_bytes_impl(file, out, err, registry, native_bindings, verify);
     } catch (const std::bad_alloc&) {
         set_error(err, "em_loader: allocation: std::bad_alloc");
     } catch (const std::length_error&) {

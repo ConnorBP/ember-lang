@@ -196,4 +196,24 @@ bool load_em_file(const char* path, LoadedModule& out, std::string* err,
                   const std::unordered_map<std::string, NativeSig>* native_bindings = nullptr,
                   const EmVerifyPolicy* verify = nullptr);
 
+// Load a `.em` from an in-memory byte buffer (the standalone-exe stub's path —
+// the `.em` is appended to the stub's own exe, read into memory, loaded here).
+// Same semantics as `load_em_file`: returns true + fills `out` on success,
+// false + *err on failure. `registry`/`native_bindings`/`verify` are the same
+// optional args. This is the `load_em_file` body AFTER the ifstream read —
+// factored out so the file-path and byte-buffer paths share one impl. The
+// parsing is already buffer-based (`parse_file` in em_loader.cpp takes a
+// `const std::vector<uint8_t>&`), so this is a mechanical split: the buffer
+// is copied into the vector `parse_file` expects (O(n), n = .em size; the
+// copy is negligible vs exec-page allocation).
+//
+// No-throw boundary: same as `load_em_file` — malformed data, allocation
+// failures, signature-verification failures, and standard-library exceptions
+// all surface as `false` plus a categorized `*err` message.
+bool load_em_bytes(const uint8_t* data, size_t len, LoadedModule& out,
+                   std::string* err,
+                   ModuleRegistry* registry = nullptr,
+                   const std::unordered_map<std::string, NativeSig>* native_bindings = nullptr,
+                   const EmVerifyPolicy* verify = nullptr);
+
 } // namespace ember

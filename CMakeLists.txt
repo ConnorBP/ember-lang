@@ -173,6 +173,14 @@ add_executable(em_roundtrip_test examples/em_roundtrip_test.cpp)
 target_link_libraries(em_roundtrip_test PRIVATE ember ember_frontend)
 add_test(NAME em_roundtrip COMMAND em_roundtrip_test)
 
+# em_bytes_test: unit test for the in-memory .em round-trip (write_em_bytes /
+# load_em_bytes — the APIs the standalone exe bundler + stub use). Covers the
+# happy path (compile -> serialize -> load -> run -> compare to JIT) and the
+# error paths (null data, short buffer, bad magic).
+add_executable(em_bytes_test examples/em_bytes_test.cpp)
+target_link_libraries(em_bytes_test PRIVATE ember ember_frontend)
+add_test(NAME em_bytes COMMAND em_bytes_test)
+
 add_executable(import_roundtrip_test examples/import_roundtrip_test.cpp)
 target_link_libraries(import_roundtrip_test PRIVATE ember ember_frontend)
 add_test(NAME import_roundtrip COMMAND import_roundtrip_test)
@@ -409,6 +417,42 @@ target_link_libraries(ember_cli PRIVATE
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_opt ember_ext_obf ember_ext_map
     ember_ext_io)
+
+# ---- standalone exe bundler (docs/planning/plan_STANDALONE_BUNDLER.md) ----
+# The stub: a pre-built runtime that links ember + ember_frontend + the
+# standard extensions (the same load path as ember_cli's --load-em, minus
+# ember_import — no source imports at runtime). Its main() reads its own
+# file, finds a 12-byte footer (EMBD magic + .em length), loads the appended
+# .em via load_em_bytes, and calls the entry. The bundler copies this exe
+# to <output.exe> + appends the .em + footer.
+add_executable(ember_stub_main examples/ember_stub_main.cpp)
+target_link_libraries(ember_stub_main PRIVATE
+    ember ember_frontend
+    ember_ext_vec ember_ext_quat ember_ext_mat
+    ember_ext_string ember_ext_array ember_ext_math
+    ember_ext_sync ember_ext_lifecycle ember_ext_map
+    ember_ext_io)
+
+# The bundler tool: compiles a .ember -> .em (the emit-em pipeline), copies
+# the stub to <output.exe>, appends the .em + footer. Links the same libs as
+# ember_cli (it runs the full compile pipeline). The OUTPUT exe (the stub)
+# links only the load path.
+add_executable(ember_bundle examples/ember_bundle.cpp)
+target_link_libraries(ember_bundle PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_vec ember_ext_quat ember_ext_mat
+    ember_ext_string ember_ext_array ember_ext_math
+    ember_ext_sync ember_ext_lifecycle ember_ext_map
+    ember_ext_io)
+
+# End-to-end bundler test: bundle .ember scripts into standalone exes, run
+# them, assert exit codes. Covers simple scripts, multi-function, imports,
+# globals, natives, and malformed-bundle rejection. Receives the bundler +
+# stub exe paths via $<TARGET_FILE:...>.
+add_executable(bundler_test examples/bundler_test.cpp)
+add_test(NAME bundler_test COMMAND bundler_test
+    $<TARGET_FILE:ember_bundle> $<TARGET_FILE:ember_stub_main>)
+set_tests_properties(bundler_test PROPERTIES TIMEOUT 60)
 
 # Family A: `ember test` — native test runner (classify + compile + run/sema-check
 # every .ember file in tests/lang/). The CLI's built-in test command replaces

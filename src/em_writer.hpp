@@ -38,6 +38,14 @@ namespace ember {
 // unchanged.
 bool write_em_file(const EmModule& mod, const char* path, std::string* err);
 
+// Serialize `mod` to an in-memory byte buffer (the standalone-exe bundler's
+// path — the .em is held in memory and appended to the stub exe, no temp
+// file). Same format as `write_em_file` (unsigned v3). Returns true on
+// success, false + *err on failure. This is the symmetric companion to
+// `load_em_bytes`: the bundler serializes to a buffer, appends it to the
+// stub, and the stub loads it from the appended bytes.
+bool write_em_bytes(const EmModule& mod, std::vector<uint8_t>& out, std::string* err);
+
 // F2 (docs/spec/SPEC_AUDIT_2026-07-10.md F2): write a SIGNED `.em` v4 module — the
 // v3 layout (header -> per-fn records -> globals -> name directory) followed by
 // an additive Ed25519 signature block (em_file.hpp `EM_SIG_BLOCK_SIZE`). The
