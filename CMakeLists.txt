@@ -65,6 +65,7 @@ endif()
 # ---- core runtime lib: JIT memory, engine, .em serialize/load, module registry ----
 add_library(ember STATIC
     src/jit_memory.cpp
+    src/platform.cpp         # platform abstraction (JIT memory, exec path) — groundwork for Linux/macOS/ARM ports
     src/engine.cpp
     src/em_writer.cpp
     src/module_registry.cpp

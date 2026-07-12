@@ -1,7 +1,6 @@
 #include "jit_memory.hpp"
+#include "platform.hpp"
 #include <cstring>
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
 
 namespace ember {
 
@@ -9,7 +8,7 @@ void* alloc_executable(const std::vector<uint8_t>& code) {
     void* mem = alloc_executable_rw(code);
     if (!mem) return nullptr;
     if (!seal_executable(mem, code.size())) {
-        VirtualFree(mem, 0, MEM_RELEASE);
+        ember::platform::free_page(mem, code.size());
         return nullptr;
     }
     return mem;
@@ -18,9 +17,7 @@ void* alloc_executable(const std::vector<uint8_t>& code) {
 // Two-phase: RW page, code copied in, NOT yet executable. Caller patches,
 // then seal_executable() flips RX.
 void* alloc_executable_rw(const std::vector<uint8_t>& code) {
-    SIZE_T size = code.size();
-    void* mem = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE,
-                             PAGE_READWRITE);
+    void* mem = ember::platform::alloc_rw(code.size());
     if (!mem) return nullptr;
     std::memcpy(mem, code.data(), code.size());
     return mem;
@@ -28,12 +25,13 @@ void* alloc_executable_rw(const std::vector<uint8_t>& code) {
 
 // W^X seal: RW -> RX. After this the page is executable and NOT writable.
 bool seal_executable(void* ptr, size_t size) {
-    DWORD old_prot = 0;
-    return VirtualProtect(ptr, size, PAGE_EXECUTE_READ, &old_prot) != 0;
+    return ember::platform::protect_rx(ptr, size);
 }
 
 void free_executable(void* ptr) {
-    if (ptr) VirtualFree(ptr, 0, MEM_RELEASE);
+    // size unknown here (Windows VirtualFree doesn't need it; Linux munmap does
+    // but we track it via the alloc_rw size). For Windows, size is ignored.
+    if (ptr) ember::platform::free_page(ptr, 0);
 }
 
 } // namespace ember
