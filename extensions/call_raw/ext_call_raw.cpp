@@ -60,6 +60,13 @@ namespace ember::ext_call_raw {
 // rax), so no trampoline is needed — the native IS the call.
 static int64_t n_call_raw(int64_t fn_ptr, int64_t arg) {
     using Fn = int64_t(*)(int64_t);
+    // Security guard: reject null/garbage fn_ptr instead of crashing the process
+    // (audit MEDIUM finding — the original design deliberately crashed, but a
+    // recoverable error is safer for a scripting language). Returns INT64_MIN
+    // as a sentinel error value (same convention as thread_join trap signal).
+    if (fn_ptr == 0) {
+        return INT64_MIN;  // null function pointer — recoverable error
+    }
     Fn f = reinterpret_cast<Fn>(fn_ptr);
     return f(arg);
 }

@@ -300,7 +300,13 @@ LexResult tokenize(std::string_view src, const char*) {
         if (c == '"') {
             uint32_t sl = line, sc = col; adv(1);
             std::string s;
+            static constexpr size_t MAX_STRING_LITERAL = 1 << 20;  // 1MB cap (audit LOW finding: prevent memory-exhaustion DoS)
             while (i < src.size() && src[i] != '"') {
+                if (s.size() >= MAX_STRING_LITERAL) {
+                    r.ok = false;
+                    r.error = "string literal exceeds the 1MB maximum (possible memory-exhaustion attempt)";
+                    r.err_line = sl; r.err_col = sc; return r;
+                }
                 if (src[i] == '\n') {
                     r.ok = false;
                     r.error = "unescaped newline in string literal - end the line with '\\' to continue it, or use a raw string r\"\"\"...\"\"\" for literal embedded newlines";

@@ -4889,7 +4889,15 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
     // Let's set arg_temps_base so arg_temps[i] = arg_temps_base - i*8 lives below locals.
     // Simpler: arg_temps at [-locals_area - 8 - i*8]. Set arg_temps_base = -(locals_area + 8).
     cg.arg_temps_base = -(locals_area + 8);
-    int32_t total = locals_area + arg_temps_area + 16; // +16 slack
+    // Security: check for int32_t overflow in frame size accumulation (audit MEDIUM finding).
+    // locals_area + arg_temps_area + 16 could overflow int32_t for pathological functions.
+    int64_t total_check = int64_t(locals_area) + int64_t(arg_temps_area) + 16;
+    if (total_check > INT32_MAX) {
+        std::fprintf(stderr, "ember: frame size overflow (locals=%d args=%d) — function too large\n",
+                     locals_area, arg_temps_area);
+        return CompiledFn{};  // empty fn — caller checks exec != nullptr
+    }
+    int32_t total = int32_t(total_check); // +16 slack
     cg.frame_size = round16(total);
     // sub rsp, frame_size
     cg.e.sub_reg_imm32(Reg::rsp, cg.frame_size);
