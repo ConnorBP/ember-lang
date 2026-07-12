@@ -1418,8 +1418,11 @@ struct EmitCtx {
                     e.add_reg_reg(Reg::r11, Reg::rax);
                 }
             } else {
-                // fixed array base at meta.frame_off (local)
-                e.byte(0x48); e.byte(0x8D); e.byte(0x9D); e.imm32(in.meta.frame_off); // lea r11, [rbp+frame_off]
+                // fixed array base at meta.frame_off (local). REX.R must be set
+                // because the LEA destination is r11 (the old 0x48 prefix
+                // encoded rbx, leaving r11 uninitialized and making StoreAddr
+                // write through a garbage pointer).
+                e.byte(0x4C); e.byte(0x8D); e.byte(0x9D); e.imm32(in.meta.frame_off); // lea r11, [rbp+frame_off]
             }
             e.add_reg_reg(Reg::r11, Reg::rcx);  // r11 = base + index*width
             e.mov_reg_reg(Reg::rax, Reg::r11);  // rax = element address
