@@ -429,7 +429,7 @@ static std::vector<PathBench> make_paths() {
             "bench_loop_overhead", "jmp back-edge + loop-body budget charge (safety-on)", true, 200, 20, 0, 10000000, true, true},
         {"slice_bounds",
             "fn main() -> i64 { let mut a: i64[64]; let mut k: i64 = 0; while (k < 64) { a[k] = k; k = k + 1; } let mut s: i64 = 0; let mut i: i64 = 0; while (i < %N) { s = s + a[i % 64]; i = i + 1; } return s; }\n",
-            "bench_slice_bounds", "indexing w/ bounds check (always on); C++ unchecked", false, 200, 20, 0, 1000000, true, false},
+            "bench_slice_bounds", "indexing w/ bounds check (always on); C++ unchecked", false, 200, 20, 0, 1000000, true, true},
         {"string_decrypt",
             "fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; while (i < %N) { s = s + string_length(\"hello world!\"); i = i + 1; } return s; }\n",
             "bench_string_decrypt", "inline-stack-XOR decrypt per use (string_xor!=0)", true, 2000, 50, 0xA5, 100000, false, true},
