@@ -89,10 +89,34 @@ echo "[2/5] Building release artifacts..."
 ARTIFACT_DIR="buildt/release-$VERSION"
 mkdir -p "$ARTIFACT_DIR"
 
-# Copy executables
+# Native compiler + runner (the C++ JIT compiler)
+echo "  Copying native compiler (ember_cli.exe)..."
 cp buildt/ember_cli.exe "$ARTIFACT_DIR/" 2>/dev/null || echo "  WARN: ember_cli.exe not found"
+
+# Bundler tool + runtime stub
+echo "  Copying bundler + runtime stub..."
 cp buildt/ember_bundle.exe "$ARTIFACT_DIR/" 2>/dev/null || echo "  WARN: ember_bundle.exe not found"
 cp buildt/ember_stub_main.exe "$ARTIFACT_DIR/" 2>/dev/null || echo "  WARN: ember_stub_main.exe not found"
+
+# Self-hosted compiler (ember compiler written in ember, bundled as standalone exe)
+echo "  Bundling self-hosted compiler (ember_selfhost.exe)..."
+if [ -f "buildt/ember_bundle.exe" ] && [ -f "self_hosted/emberc.ember" ]; then
+    ./buildt/ember_bundle.exe self_hosted/emberc.ember "$ARTIFACT_DIR/ember_selfhost.exe" --fn main 2>/dev/null \
+        && echo "  OK: ember_selfhost.exe bundled" \
+        || echo "  WARN: could not bundle ember_selfhost.exe (emberc.ember may need --ffi or different entry)"
+    # Also copy the self-hosted source files for reference/hot-reload
+    mkdir -p "$ARTIFACT_DIR/self_hosted"
+    cp self_hosted/*.ember "$ARTIFACT_DIR/self_hosted/" 2>/dev/null || true
+    cp self_hosted/README.md "$ARTIFACT_DIR/self_hosted/" 2>/dev/null || true
+else
+    echo "  WARN: cannot bundle self-hosted compiler (ember_bundle.exe or emberc.ember not found)"
+fi
+
+# VST3 plugin (if built)
+if [ -d "buildt/VST3/Release/ember_gain.vst3" ]; then
+    echo "  Copying VST3 plugin (ember_gain.vst3)..."
+    cp -r buildt/VST3/Release/ember_gain.vst3 "$ARTIFACT_DIR/" 2>/dev/null || true
+fi
 
 # Copy docs and examples
 cp -r docs "$ARTIFACT_DIR/" 2>/dev/null || true
@@ -117,11 +141,30 @@ cat > "$NOTES_FILE" << EOF
 # ember $VERSION
 
 ## Release Artifacts
-- \`ember_cli.exe\` — native compiler + runner (Windows x64)
-- \`ember_bundle.exe\` — standalone exe bundler
+
+### Compilers
+- \`ember_cli.exe\` — **native compiler** (C++ JIT, full language support)
+  This is the primary compiler. It compiles ember scripts to native x86-64 machine
+  code at runtime. Supports the full ember language including structs, enums,
+  floats, lambdas, coroutines, and all extensions.
+
+- \`ember_selfhost.exe\` — **self-hosted compiler** (ember written in ember, experimental)
+  This is the ember compiler written IN ember itself. It supports a SUBSET of the
+  language (i64/bool/void, let, if/while/for, arithmetic, calls, recursion).
+  Use this to experiment with the self-hosting milestone. The self_hosted/ directory
+  contains the source .ember files for hot-reload experimentation.
+
+### Tools
+- \`ember_bundle.exe\` — standalone exe bundler (bundle .ember → .exe)
 - \`ember_stub_main.exe\` — runtime stub for bundled exes
+
+### VST3 Plugin (if present)
+- \`ember_gain.vst3/\` — VST3 audio plugin wrapper (ember DSP, hot-reloadable)
+
+### Other
 - \`docs/\` — documentation
 - \`examples/\` — example scripts
+- \`self_hosted/\` — self-hosted compiler source files
 - \`checksums.sha256\` — SHA256 checksums
 
 ## Changes
