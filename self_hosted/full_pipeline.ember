@@ -24,19 +24,23 @@
 // program using only ember-written frontend code + the two host execution
 // natives.
 //
-// === Why a single self-contained fn ===
+// === Multi-fn programs + in-buffer calls ===
 //
-// The self-hosted codegen emits call targets as a placeholder
-// `mov rax, 0; call rax` (the fn entry address is a placeholder the host
-// fills at JIT time, like the C++ dispatch-table call). make_executable does
-// NOT patch placeholders — it copies the bytes to an RX page verbatim — so a
-// program that CALLS another fn would branch to address 0. The demo therefore
-// uses a single self-contained fn (`fn main() -> i64 { return 1 + 2 * 3; }`)
-// whose body is pure arithmetic (no calls): its bytes are directly executable,
-// and the entry is the first byte of the buffer (the codegen lays functions
-// out in declaration order, so a single-fn program's entry is at offset 0).
-// call_raw(ptr, 0) invokes it as int64_t(*)(int64_t); the unused arg is
-// harmless on Win64 (extra args are ignored, rax holds the return).
+// The self-hosted codegen emits script-to-script calls as a direct
+// `call rel32` to the callee's entry label. cg_resolve_fixups patches each
+// call's rel32 to the callee's real prologue offset within the SAME code
+// buffer (every fn is laid out in declaration order in one contiguous
+// buffer). make_executable copies the whole buffer to one RX page, so a
+// relative call between fns resolves correctly at runtime without any host
+// patching — multi-fn programs (helper fns + main, calls, if/else, let mut
+// + assignment, comparisons, while loops) execute end-to-end.
+//
+// Because fns are laid out in declaration order, `main` may not be at
+// offset 0 (helper fns declared first are). compile_and_run therefore
+// locates `main`'s entry offset by name (codegen_fn_entry_offset) and calls
+// page_ptr + main_offset — not the first fn. call_raw casts that to
+// int64_t(*)(int64_t); the unused arg is harmless on Win64 (rax holds the
+// return).
 //
 // === Natives used (PERM_FFI-gated; run with --ffi) ===
 //
@@ -101,25 +105,37 @@ fn compile_and_run(source: string) -> i64 {
     // sanity: the buffer starts with the x64 function prologue
     //   0x55           push rbp
     //   0x48 0x89 0xE5 mov rbp, rsp
-    // (the first function's entry is at offset 0; this is what we will execute)
+    // (the first function's entry is at offset 0 — not necessarily `main`,
+    // since the codegen lays fns out in declaration order; the actual entry
+    // we invoke is resolved by name below via codegen_fn_entry_offset)
     if (codegen_byte_at(0) != 0x55) { return -403; }
     if (codegen_byte_at(1) != 0x48) { return -404; }
     if (codegen_byte_at(2) != 0x89) { return -405; }
     if (codegen_byte_at(3) != 0xE5) { return -406; }
 
+    // locate `main`'s entry offset within the buffer. The codegen binds an
+    // entry label per fn at its prologue offset; codegen_fn_entry_offset
+    // returns it by name. For a single-fn program this is 0 (the only fn);
+    // for a multi-fn program (helper fns declared before main) it is main's
+    // prologue offset, and we call page_ptr + offset to invoke main — not
+    // the first fn.
+    let main_off: i64 = codegen_fn_entry_offset(string_from_slice("main"));
+    if (main_off < 0) { return -502; }
+
     // ---- Execute the emitted x64 bytes via the host natives ----
     // make_executable copies the array<u8> to a W^X executable page (RW ->
-    // memcpy -> seal RX) and returns the entry pointer (0 on failure). The
-    // entry is the first byte of the buffer = the first fn's prologue.
+    // memcpy -> seal RX) and returns the page base pointer (0 on failure).
     let ptr: i64 = make_executable(bytes);
     if (ptr == 0) { return -501; }
 
-    // call_raw casts ptr to int64_t(*)(int64_t) and calls it. The compiled
-    // program is `fn main() -> i64 { return <expr>; }` — it takes no real
-    // args (the one i64 arg is ignored) and returns its result in rax, which
-    // call_raw reads back. This is the moment the self-hosted compiler's
-    // output actually RUNS.
-    let result: i64 = call_raw(ptr, 0);
+    // call_raw casts (ptr + main_off) to int64_t(*)(int64_t) and calls it.
+    // The compiled `main` takes no real args (the one i64 arg is ignored)
+    // and returns its result in rax, which call_raw reads back. Calls from
+    // main to other fns in the same program resolve via in-buffer call rel32
+    // (patched by cg_resolve_fixups to each callee's entry offset), so a
+    // multi-fn program runs end-to-end. This is the moment the self-hosted
+    // compiler's output actually RUNS.
+    let result: i64 = call_raw(ptr + main_off, 0);
 
     // release the executable page (it was minted just for this call)
     free_executable_ptr(ptr);
@@ -143,6 +159,10 @@ fn compile_and_run(source: string) -> i64 {
 // runnable demo entry.)
 // -----------------------------------------------------------------------------
 fn run_demo() -> i64 {
-    let src: string = string_from_slice("fn main() -> i64 { return 1 + 2 * 3; }");
+    // A multi-fn program exercising the expanded feature set: a helper fn
+    // with two i64 params (multi-arg call), `let mut` + assignment, an
+    // if/else, and a comparison (<). 1 < 5 is true -> x = add(1, 6) = 7;
+    // else x = 0. Returns 7 (so `--fn run_demo --ffi` exits 7).
+    let src: string = string_from_slice("fn add(a: i64, b: i64) -> i64 { return a + b; } fn main() -> i64 { let mut x: i64 = 1; if (x < 5) { x = add(x, 6); } else { x = 0; } return x; }");
     return compile_and_run(src);
 }

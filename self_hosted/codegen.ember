@@ -121,6 +121,14 @@ global cg_scope_mark_len : i64 = 0;
 global cg_next_off   : i64 = 0;   // next local offset (grows downward, negative)
 global cg_frame_size : i64 = 0;   // the current fn's frame size
 
+// function-entry labels for direct call_rel32 between fns in the same code
+// buffer. Allocated up-front for every FnDecl (name_tok -> label_id); each
+// fn's label is bound at its prologue offset, and a call to it is a rel32
+// fixup patched after all fns are compiled. This replaces the v1 placeholder
+// `mov rax, 0; call rax` (which branched to address 0 under make_executable)
+// with a real in-buffer relative call, so multi-fn programs execute.
+global cg_fn_labels : i64 = 0;   // array, stride 2 [ name_tok, label_id ]
+
 // error state
 global cg_err     : i64 = 0;
 global cg_errmsg  : string = "";
@@ -399,6 +407,19 @@ fn cg_call_reg(r: i64) -> i64 {
     return 0;
 }
 
+// call rel32 (direct, in-buffer) -> E8 rel32. The rel32 is a placeholder
+// recorded as a fixup for `label_id`; cg_resolve_fixups patches it after all
+// labels (including other fns' entry labels) are bound. Used for script-to-
+// script calls so a multi-fn program's calls resolve to the callee's real
+// entry offset within the same executable page (make_executable copies bytes
+// verbatim, so a relative call within the buffer works without host patching).
+fn cg_call_rel32(label_id: i64) -> i64 {
+    cg_byte(0xE8);
+    cg_add_fixup(label_id);
+    cg_imm32(0);  // placeholder rel32
+    return 0;
+}
+
 // ret -> C3
 fn cg_ret() -> i64 {
     cg_byte(0xC3);
@@ -561,6 +582,21 @@ fn cg_lookup_local(name_tok: i64) -> i64 {
     return 0;  // 0 = not found (all real offsets are negative)
 }
 
+// look up a function's entry label by name. Returns the label id, or -1 if
+// the name is not in cg_fn_labels (i.e. the fn was not declared in the
+// program). Names are stored as token indices and compared by text via
+// tok_name (same trick as cg_lookup_local + sema's tables).
+fn cg_lookup_fn_label(name: string) -> i64 {
+    let n: i64 = array_length(cg_fn_labels) / 2;
+    let mut i: i64 = 0;
+    while (i < n) {
+        let tok: i64 = array_get_i64(cg_fn_labels, i * 2);
+        if (tok_name(tok) == name) { return array_get_i64(cg_fn_labels, i * 2 + 1); }
+        i = i + 1;
+    }
+    return -1;
+}
+
 // =============================================================================
 // codegen state init.
 // =============================================================================
@@ -570,6 +606,7 @@ fn cg_init() -> i64 {
     cg_next_label = 0;
     cg_labels = array_new(8, 0);
     cg_fixups = array_new(8, 0);
+    cg_fn_labels = array_new(8, 0);
     cg_err = 0;
     cg_errmsg = string_from_slice("");
     return 0;
@@ -894,9 +931,11 @@ fn cg_eval_assignexpr(e: i64) -> i64 {
 
 // evaluate a call expression.
 // v1: up to 4 i64 args in rcx/rdx/r8/r9 (Win64). The call target is a script
-// function; we emit mov rax, <placeholder 0>; call rax — the 8-byte placeholder
-// is the function's entry address (to be filled by the host at JIT time, like
-// the C++ codegen's dispatch-table call). The bytes are valid x64 encoding.
+// function; we emit a direct `call rel32` to the callee's entry label, which
+// cg_resolve_fixups patches to the callee's real prologue offset within the
+// same code buffer after all fns are compiled. Because every fn lives in one
+// contiguous executable page (make_executable copies the whole buffer), a
+// relative call between fns resolves correctly without any host patching.
 fn cg_eval_callexpr(e: i64) -> i64 {
     let name: string = nk_name(e);
     let fn_row: i64 = find_fn(name);
@@ -959,10 +998,18 @@ fn cg_eval_callexpr(e: i64) -> i64 {
     if (argc >= 3) { cg_load_reg_mem(R8, RSP, 16); }
     if (argc >= 4) { cg_load_reg_mem(R9, RSP, 24); }
 
-    // call the target: mov rax, 0 (placeholder for the fn entry address); call rax
-    // The host fills the 8-byte placeholder at JIT time (like the C++ dispatch-table call).
-    cg_mov_reg_imm64(RAX, 0);
-    cg_call_reg(RAX);
+    // call the target: a direct call rel32 to the callee's entry label.
+    // cg_fn_labels maps the callee's name to a label bound at its prologue
+    // offset; the rel32 fixup is patched after all fns are compiled. This
+    // resolves to the callee's real entry within the same executable page, so
+    // multi-fn programs execute correctly under make_executable (which copies
+    // bytes verbatim and does not patch placeholders).
+    let callee_label: i64 = cg_lookup_fn_label(name);
+    if (callee_label < 0) {
+        if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: no entry label for function '") + name + string_from_slice("'"); }
+        return 0;
+    }
+    cg_call_rel32(callee_label);
 
     // add rsp, call_frame (restore the stack)
     cg_add_reg_imm32(RSP, call_frame);
@@ -1257,8 +1304,10 @@ fn cg_compile_func(fd: i64) -> i64 {
     cg_bind(cg_epilogue_label);
     cg_emit_epilogue();
 
-    // resolve all label fixups
-    cg_resolve_fixups();
+    // NOTE: label fixups are NOT resolved here — inter-function call rel32
+    // fixups reference other fns' entry labels, which are only bound after
+    // every fn is compiled. cg_resolve_fixups() is called once at the end of
+    // codegen() after all fns are compiled + all entry labels bound.
     return 0;
 }
 
@@ -1306,15 +1355,39 @@ fn codegen(source: string) -> i64 {
         return 0;
     }
 
-    // compile each function declaration in the program
+    // Allocate an entry label for every function up front, so a call to a fn
+    // declared later (forward reference) gets a fixup for a label that will be
+    // bound when that fn is compiled. Stored in cg_fn_labels (name_tok, label).
     let mut d: i64 = nk_a(prog);
     while (d >= 0) {
         if (nk_kind(d) == (NK::FnDecl as i64)) {
+            let lab: i64 = cg_alloc_label();
+            array_push_i64(cg_fn_labels, nk_tok(d));
+            array_push_i64(cg_fn_labels, lab);
+        }
+        d = nk_next(d);
+    }
+
+    // compile each function declaration in the program, binding its entry
+    // label at its prologue offset (the current code position) first so any
+    // call to it — including a self-recursive call inside its own body —
+    // resolves to the right entry offset.
+    d = nk_a(prog);
+    while (d >= 0) {
+        if (nk_kind(d) == (NK::FnDecl as i64)) {
+            let lab: i64 = cg_lookup_fn_label(nk_name(d));
+            if (lab >= 0) { cg_bind(lab); }   // entry = current code offset
             cg_compile_func(d);
             if (cg_err != 0) { return 0; }
         }
         d = nk_next(d);
     }
+
+    // resolve ALL label fixups now that every fn's entry label (and every
+    // intra-fn if/while label) is bound. This patches inter-function call
+    // rel32 fixups to the callee's real entry offset within the buffer.
+    cg_resolve_fixups();
+    if (cg_err != 0) { return 0; }
 
     return cg_code;  // the array<u8> handle
 }
@@ -1334,4 +1407,16 @@ fn codegen_byte_count() -> i64 {
 fn codegen_byte_at(i: i64) -> i64 {
     if (i < 0 || i >= array_length(cg_code)) { return -1; }
     return array_get_u8(cg_code, i) as i64;
+}
+
+// the code offset of a named function's entry (prologue) within the buffer.
+// Returns -1 if the fn is not in cg_fn_labels or its label was never bound.
+// Used by the end-to-end pipeline to call `main` specifically (the codegen
+// lays fns out in declaration order, so `main` may not be at offset 0 when
+// the program declares helper fns first); call_raw(page_ptr + entry_offset)
+// invokes it.
+fn codegen_fn_entry_offset(name: string) -> i64 {
+    let lab: i64 = cg_lookup_fn_label(name);
+    if (lab < 0) { return -1; }
+    return cg_label_offset(lab);
 }

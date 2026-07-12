@@ -177,6 +177,107 @@ fn test_run_demo() -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// Test 13 — multi-arg function call (the task's example target).
+//   fn add(a: i64, b: i64) -> i64 { return a + b; }
+//   fn main() -> i64 { let mut x: i64 = 5; if (x > 3) { x = add(x, 10); } else { x = 0; } return x; }
+// Expected: 15. Exercises: a two-arg helper fn, `let mut` + assignment, an
+// if/else, a comparison (>), and a multi-arg call whose result is stored
+// back into a local. This is the headline expanded-feature check — the
+// self-hosted codegen's call rel32 + entry-by-name resolution + the if/else /
+// assignment / comparison codegen paths all execute correctly together.
+// ---------------------------------------------------------------------------
+fn test_call_multiarg() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn add(a: i64, b: i64) -> i64 { return a + b; } fn main() -> i64 { let mut x: i64 = 5; if (x > 3) { x = add(x, 10); } else { x = 0; } return x; }"));
+    return ck(r, 15, 1130);
+}
+
+// ---------------------------------------------------------------------------
+// Test 14 — if/else with the ELSE branch taken (the then branch must NOT
+// run, and the else assignment must survive to the return).
+//   fn main() -> i64 { let mut x: i64 = 0; if (2 > 3) { x = 1; } else { x = 99; } return x; }
+// Expected: 99 (2 > 3 is false, so the else branch sets x = 99).
+// ---------------------------------------------------------------------------
+fn test_if_else_else_branch() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { let mut x: i64 = 0; if (2 > 3) { x = 1; } else { x = 99; } return x; }"));
+    return ck(r, 99, 1140);
+}
+
+// ---------------------------------------------------------------------------
+// Test 15 — while loop with a comparison condition + mutation.
+//   fn main() -> i64 { let mut i: i64 = 0; let mut sum: i64 = 0; while (i < 5) { sum = sum + i; i = i + 1; } return sum; }
+// Expected: 10 (0+1+2+3+4). Exercises the while back-edge (jmp top), the
+// condition re-evaluation each iteration, and assignment to a mutable local
+// inside the loop body.
+// ---------------------------------------------------------------------------
+fn test_while_loop() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { let mut i: i64 = 0; let mut sum: i64 = 0; while (i < 5) { sum = sum + i; i = i + 1; } return sum; }"));
+    return ck(r, 10, 1150);
+}
+
+// ---------------------------------------------------------------------------
+// Test 16 — all six comparison operators (< <= > >= == !=) produce 0/1.
+// Packs each result into a bit of a number so a single execution checks all
+// six. 5<10=1, 10<5=0, 5<=5=1, 5>10=0, 10>=10=1, 5==5=1, 5!=6=1 ->
+// 1 + 4 + 16 + 32 + 64 = 117.
+// ---------------------------------------------------------------------------
+fn test_comparisons() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { let a: i64 = 0; if (5 < 10) { a = 1; } let b: i64 = 0; if (10 < 5) { b = 1; } let c: i64 = 0; if (5 <= 5) { c = 1; } let d: i64 = 0; if (5 > 10) { d = 1; } let e: i64 = 0; if (10 >= 10) { e = 1; } let f: i64 = 0; if (5 == 5) { f = 1; } let g: i64 = 0; if (5 != 6) { g = 1; } return a + b*2 + c*4 + d*8 + e*16 + f*32 + g*64; }"));
+    return ck(r, 117, 1160);
+}
+
+// ---------------------------------------------------------------------------
+// Test 17 — `let mut` + assignment without any control flow: confirm a
+// mutable local can be reassigned and the new value is read back.
+//   fn main() -> i64 { let mut x: i64 = 10; x = x + 5; x = x * 2; return x; }
+// Expected: 30 ((10+5)*2 = 30).
+// ---------------------------------------------------------------------------
+fn test_let_mut_assign() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { let mut x: i64 = 10; x = x + 5; x = x * 2; return x; }"));
+    return ck(r, 30, 1170);
+}
+
+// ---------------------------------------------------------------------------
+// Test 18 — recursion (a fn calling itself). Confirms the call rel32 fixup
+// resolves a BACKWARD branch to the fn's own entry, and that each recursive
+// frame has its own locals/params (the prologue/epilogue + param spill work
+// across nested calls).
+//   fn fact(n: i64) -> i64 { if (n <= 1) { return 1; } return n * fact(n - 1); }
+//   fn main() -> i64 { return fact(5); }
+// Expected: 120 (5! = 120).
+// ---------------------------------------------------------------------------
+fn test_recursion() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn fact(n: i64) -> i64 { if (n <= 1) { return 1; } return n * fact(n - 1); } fn main() -> i64 { return fact(5); }"));
+    return ck(r, 120, 1180);
+}
+
+// ---------------------------------------------------------------------------
+// Test 19 — forward reference: a caller declared BEFORE the callee. The
+// callee's entry label is allocated up front + bound when the callee is
+// compiled later, so the caller's call rel32 fixup resolves to a FORWARD
+// target. Confirms the up-front label allocation in codegen() handles
+// declaration order independent of call direction.
+//   fn main() -> i64 { return helper(7); }
+//   fn helper(n: i64) -> i64 { return n * 2; }
+// Expected: 14.
+// ---------------------------------------------------------------------------
+fn test_forward_call() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { return helper(7); } fn helper(n: i64) -> i64 { return n * 2; }"));
+    return ck(r, 14, 1190);
+}
+
+// ---------------------------------------------------------------------------
+// Test 20 — four-arg call (the Win64 register ceiling: rcx, rdx, r8, r9).
+//   fn sum4(a: i64, b: i64, c: i64, d: i64) -> i64 { return a + b + c + d; }
+//   fn main() -> i64 { return sum4(1, 2, 3, 4); }
+// Expected: 10. Confirms all four argument registers are loaded + the callee
+// spills all four params to its frame slots correctly.
+// ---------------------------------------------------------------------------
+fn test_call_four_args() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn sum4(a: i64, b: i64, c: i64, d: i64) -> i64 { return a + b + c + d; } fn main() -> i64 { return sum4(1, 2, 3, 4); }"));
+    return ck(r, 10, 1200);
+}
+
+// ---------------------------------------------------------------------------
 // Test N1 (negative) — a sema error: returning bool from an i64 fn.
 //   fn main() -> i64 { return true; }
 // compile_and_run must return a NEGATIVE code (the sema stage fails), not 0
@@ -218,6 +319,18 @@ fn main() -> i64 {
     r = test_div();           if (r != 0) { return r; }
     r = test_composed();      if (r != 0) { return r; }
     r = test_run_demo();     if (r != 0) { return r; }
+
+    // expanded-feature (executed-result) checks: multi-arg call, if/else
+    // (else branch), while loop, comparisons, let mut + assignment, recursion,
+    // forward call, four-arg call.
+    r = test_call_multiarg();        if (r != 0) { return r; }
+    r = test_if_else_else_branch();  if (r != 0) { return r; }
+    r = test_while_loop();           if (r != 0) { return r; }
+    r = test_comparisons();          if (r != 0) { return r; }
+    r = test_let_mut_assign();       if (r != 0) { return r; }
+    r = test_recursion();            if (r != 0) { return r; }
+    r = test_forward_call();         if (r != 0) { return r; }
+    r = test_call_four_args();       if (r != 0) { return r; }
 
     // negative (error-path) checks
     r = test_neg_sema_error();  if (r != 0) { return r; }
