@@ -1,0 +1,11 @@
+@realtime
+fn process(in_l: i64, in_r: i64, out_l: i64, out_r: i64, frames: i64, gain: f32) -> void {
+    let mut i: i64 = 0;
+    while (i < frames) {
+        let l: f32 = load_f32(in_l, i);
+        let r: f32 = load_f32(in_r, i);
+        store_f32(out_l, i, l * gain);
+        store_f32(out_r, i, r * gain);
+        i = i + 1;
+    }
+}

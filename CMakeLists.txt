@@ -190,6 +190,21 @@ target_link_libraries(ember_ext_call_raw PUBLIC ember_ext_array)
 # The six bindings are PERM_FFI-gated because scripts supply raw pointers.
 ember_add_extension(audio extensions/audio/ext_audio.cpp)
 
+# ---- optional VST3 SDK + Phase 3 Ember gain effect ----
+# The SDK is pinned as thirdparty/vst3sdk (git submodule, v3.8.0_build_66).
+# Keep its samples/GUI/host utilities out of Ember's normal build; only the SDK
+# libraries and our minimal combined IComponent/IAudioProcessor are built.
+option(EMBER_BUILD_VST3 "Build the Ember stereo gain VST3 plug-in" ON)
+if(EMBER_BUILD_VST3 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/vst3sdk/CMakeLists.txt")
+    set(SMTG_ENABLE_VST3_PLUGIN_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(SMTG_ENABLE_VST3_HOSTING_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(SMTG_ENABLE_VSTGUI_SUPPORT OFF CACHE BOOL "" FORCE)
+    set(SMTG_CREATE_PLUGIN_LINK OFF CACHE BOOL "" FORCE)
+    set(SMTG_RUN_VST_VALIDATOR OFF CACHE BOOL "" FORCE)
+    add_subdirectory(thirdparty/vst3sdk EXCLUDE_FROM_ALL)
+    add_subdirectory(examples/vst3_wrapper)
+endif()
+
 # ---- tests: .em pre-compile round-trip + live import cross-module round-trip ----
 # These link only ember + ember_frontend (no prism/prism_script_host) so they
 # stay free of the prism panel-API link surface - the test functions use no
