@@ -108,11 +108,22 @@ struct ParsedFn {
     std::vector<uint8_t> rodata;
     std::vector<EmReloc> relocs;
     std::vector<EmNativeBinding> native_bindings;
-    // v5 (Stage B): when non-empty, this function is an IR function — the
-    // ir_blob is the output of serialize_thin_function (opaque to parse_file;
-    // deserialized + validated + re-emitted in load_em_file_impl). When empty,
-    // the function is a raw-x86 fallback (code/rodata/relocs/native_bindings
-    // are populated as in v3/v4).
+    // v5 (Stage B): the explicit per-function IR/raw marker, read from the
+    // on-disk `is_ir` byte. `is_ir == true` -> this is an IR function: ir_blob
+    // is the output of serialize_thin_function (opaque to parse_file;
+    // deserialized + validated + re-emitted in load_em_bytes_impl) and
+    // code/rodata/relocs/native_bindings stay empty. `is_ir == false` -> this
+    // is a raw-x86 fallback: code/rodata/relocs/native_bindings are populated
+    // as in v3/v4 and ir_blob stays empty. This is the SECURE-DEFAULT
+    // discriminator: load_em_bytes_impl rejects any v5 function with
+    // is_ir == false under the secure default (allow_raw_x86 == false) before
+    // any executable allocation — a raw-x86 function is an arbitrary-code-
+    // execution surface by construction (FIX 3 extended from v1-v4 to the v5
+    // per-function level). `ir_blob.empty()` tracks is_ir for v5 (an is_ir=1
+    // function must carry a non-empty blob, enforced in parse_file as the P6
+    // fix), but the explicit `is_ir` marker is the load-side gate so the
+    // secure-default rejection does not lean on an empty-blob side effect.
+    bool is_ir = false;
     std::vector<uint8_t> ir_blob;
 };
 
@@ -298,6 +309,11 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
                 set_error(err, "em_loader: format: invalid v5 is_ir byte (must be 0 or 1)");
                 return false;
             }
+            // Record the explicit per-function IR/raw marker. This is the
+            // SECURE-DEFAULT discriminator load_em_bytes_impl gates on (a
+            // raw-x86 v5 function, is_ir=0, is rejected under the secure
+            // default before any executable allocation).
+            f.is_ir = (is_ir != 0);
             if (!parse_signature(rd, f.signature, err)) return false;
             if (is_ir) {
                 // IR function: read the opaque ir_blob. parse_file does NOT
@@ -586,6 +602,34 @@ bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
         return false;
     }
 
+    // v5 mixed-mode secure default (EM_FORMAT_RED_TEAM 2026-07-11, D8
+    // follow-up / MAINTENANCE_LOG 2026-07-12 candidate #1): a v5 module may
+    // MIX IR and raw-x86 functions per-function (the on-disk is_ir byte). The
+    // IR functions (is_ir=1) are re-emitted from validated IR (safe). The
+    // raw-x86 fallback functions (is_ir=0) are an arbitrary-code-execution
+    // surface by construction — exactly the surface FIX 3 rejects for v1-v4.
+    // The secure default therefore rejects a v5 module that contains ANY
+    // raw-x86 function, BEFORE any executable allocation and BEFORE the
+    // signature/dev-mode policy, so a raw-x86-bearing v5 module is rejected
+    // regardless of its (unsigned, for Stage B) signature status. Only an
+    // all-IR v5 module is accepted by the secure default. A host that needs
+    // to load mixed/raw v5 artifacts passes EmLoadPolicy{allow_raw_x86=true}
+    // for back-compat (the explicit opt-in; under it the raw-x86 functions
+    // load as raw x86 and the IR functions re-emit as usual). The explicit
+    // ParsedFn::is_ir marker is the discriminator (not ir_blob.empty()) so
+    // the gate does not lean on an empty-blob side effect.
+    if (parsed.version == EM_VERSION_V5 && !allow_raw_x86) {
+        for (const auto& pf : parsed.functions) {
+            if (!pf.is_ir) {
+                set_error(err, "em_loader: format: v5 function \"" + pf.name +
+                               "\" ships raw x86 (is_ir=0), rejected by default " +
+                               "(only v5 IR functions accepted); pass " +
+                               "EmLoadPolicy{allow_raw_x86=true} for back-compat");
+                return false;
+            }
+        }
+    }
+
     // F2 (docs/spec/SPEC_AUDIT_2026-07-10.md F2): verify the .em CONTENT
     // authentication BEFORE any executable page is allocated. This is the
     // load-bearing security fix — a maliciously-modified `.em` is rejected
@@ -681,7 +725,7 @@ bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
         ictx.safe_defaults();
 
         for (auto& pf : parsed.functions) {
-            if (pf.ir_blob.empty()) continue;  // raw-x86 fallback — skip
+            if (!pf.is_ir) continue;  // raw-x86 fallback — skip (re-emit IR only)
             ThinFunction thf;
             const uint8_t* cur = pf.ir_blob.data();
             const uint8_t* end = pf.ir_blob.data() + pf.ir_blob.size();

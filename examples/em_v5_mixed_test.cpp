@@ -1,19 +1,42 @@
-// em_v5_mixed_test.cpp — D8: v5 mixed-mode (.em with IR + raw-x86 functions).
+// em_v5_mixed_test.cpp — D8: v5 mixed-mode (.em with IR + raw-x86 functions) +
+// the v5 secure-default raw-x86 rejection (EM_FORMAT_RED_TEAM 2026-07-11,
+// D8 follow-up / MAINTENANCE_LOG 2026-07-12 candidate #1).
 //
 // The v5 loader supports MIXED mode: a single .em module where SOME functions
 // ship an ir_blob (is_ir=1, re-emitted from IR at load time) and OTHERS ship
 // raw x86 (is_ir=0, the v4 per-fn body). This is a first-class supported
-// combination (src/em_loader.cpp:287-347, src/em_file.hpp:42-66) with NO test
-// coverage until now (audit finding D8, docs/audit/AUDIT_2026-07-11_DOCS_TESTS.md).
+// combination (src/em_loader.cpp, src/em_file.hpp:42-66) (audit finding D8,
+// docs/audit/AUDIT_2026-07-11_DOCS_TESTS.md).
+//
+// SECURITY MODEL (the fix this test pins): the secure default
+// (EmLoadPolicy == nullptr, i.e. allow_raw_x86 = false) accepts ONLY all-IR
+// v5 modules. A v5 module that contains ANY raw-x86 fallback function
+// (is_ir=0) is an arbitrary-code-execution surface by construction — exactly
+// the surface FIX 3 rejects for v1-v4 — so the secure default REJECTS it
+// BEFORE any executable allocation, with a clear "raw x86 ... rejected by
+// default ... allow_raw_x86=true" error and NO exec page. A host that needs
+// to load mixed/raw v5 artifacts passes EmLoadPolicy{allow_raw_x86=true} for
+// back-compat (the explicit opt-in); under that policy the raw-x86 functions
+// load as raw x86 and the IR functions re-emit as usual.
 //
 // This test builds a 2-function v5 module:
 //   - add(a,b):   IR function (is_ir=1)  — lower_function + serialize_thin_function
 //   - double(x):  raw-x86 (is_ir=0)       — compile_func with IR OFF, raw bytes
 //
-// Both are simple (no cross-calls, no natives) so no relocs/native_bindings are
-// needed — the test focuses purely on the MIXED is_ir format. Writes v5, loads
-// it, calls BOTH functions, asserts value-equivalence. Also tests the malformed
-// mixed case: is_ir=1 with ir_blob_len=0 (must reject, no exec page).
+// and asserts, in order:
+//   Part 1: the mixed module is well-formed (IR fn + raw-x86 fn).
+//   Part 2: the SECURE DEFAULT (no EmLoadPolicy) REJECTS the mixed module —
+//           load fails with a "raw x86 ... rejected by default" error and NO
+//           exec page is allocated.
+//   Part 2b: the secure default ACCEPTS an all-IR v5 module (only `add`) —
+//           proving the secure default distinguishes all-IR v5 loading from
+//           raw-x86-bearing v5 loading.
+//   Part 3: the mixed module LOADS under explicit EmLoadPolicy{allow_raw_x86=true}
+//           (back-compat opt-in); both functions are callable and
+//           value-equivalent (add(3,4)==7, double(21)==42).
+//   Part 4: the malformed is_ir=1+empty-ir_blob case (P6) is rejected — this
+//           is a parse-level rejection covered directly by em_v5_ir_test
+//           Part 2 case (c); we reference it rather than duplicate it.
 
 #include "../src/lexer.hpp"
 #include "../src/parser.hpp"
@@ -56,7 +79,7 @@ static int64_t call2_i64(void* entry, int64_t a, int64_t b) {
 }
 
 int main() {
-    std::printf("=== em_v5_mixed_test: D8 v5 mixed-mode (IR + raw-x86) ===\n");
+    std::printf("=== em_v5_mixed_test: D8 v5 mixed-mode + secure-default raw-x86 rejection ===\n");
 
     // Source: two independent functions, no cross-calls, no natives.
     //   add(a,b)    -> a+b          (will be the IR function, is_ir=1)
@@ -157,54 +180,148 @@ int main() {
     check(mod.functions[1].ir_blob.empty() && !mod.functions[1].code.empty(),
           "fn 1 (double) is raw-x86: ir_blob empty, code non-empty");
 
-    // --- write v5 ---
-    auto tmp = std::filesystem::temp_directory_path() / "em_v5_mixed_test.em";
+    // --- write the mixed v5 module ---
+    auto mixed_path = std::filesystem::temp_directory_path() / "em_v5_mixed_test.em";
     std::string werr;
-    if (!write_em_file_v5(mod, tmp.string().c_str(), &werr)) {
+    if (!write_em_file_v5(mod, mixed_path.string().c_str(), &werr)) {
         std::printf("FAIL: write_em_file_v5: %s\n", werr.c_str()); return 1;
     }
     check(true, "write_em_file_v5 succeeded for mixed module");
 
-    // --- load v5 (deserialize + validate + re-emit IR fn + load raw-x86 fn) ---
-    LoadedModule lm;
-    std::string lerr;
-    bool loaded = load_em_file(tmp.string().c_str(), lm, &lerr, nullptr, &natives);
-    if (!loaded) {
-        std::printf("FAIL: load_em_file: %s\n", lerr.c_str());
-        std::filesystem::remove(tmp); return 1;
+    // ============================================================
+    // Part 2: SECURE DEFAULT (no EmLoadPolicy) REJECTS the mixed module.
+    // The mixed module contains a raw-x86 function (double, is_ir=0) — an
+    // arbitrary-code-execution surface. The secure default (allow_raw_x86 =
+    // false) must reject it BEFORE any executable allocation, with a clear
+    // error and NO exec page. This is the v5 mixed-mode raw-x86 secure-default
+    // gate (the fix this test pins).
+    // ============================================================
+    std::printf("\nPart 2: secure default rejects mixed (raw-x86-bearing) v5 module\n");
+    {
+        LoadedModule lm;
+        std::string lerr;
+        // NO EmLoadPolicy (nullptr == secure default: allow_raw_x86 = false).
+        bool loaded = load_em_file(mixed_path.string().c_str(), lm, &lerr,
+                                   nullptr, &natives, nullptr, nullptr);
+        bool rejected = !loaded && lm.pages.empty();
+        bool clear = !loaded &&
+                     lerr.find("raw x86") != std::string::npos &&
+                     lerr.find("rejected by default") != std::string::npos &&
+                     lerr.find("allow_raw_x86") != std::string::npos;
+        check(rejected, "mixed v5 module rejected by secure default (no exec page)");
+        check(clear, "rejection error names 'raw x86', 'rejected by default', 'allow_raw_x86'");
+        if (!loaded && !clear)
+            std::printf("    err: %s\n", lerr.c_str());
+        if (loaded)
+            std::printf("    UNEXPECTED: secure default loaded a raw-x86-bearing v5 module\n");
     }
-    check(lm.format_version == EM_VERSION_V5, "loaded mixed module is v5");
-    check(!lm.pages.empty(), "exec page allocated (IR re-emit + raw-x86 load)");
 
-    // --- call both functions ---
-    void* loaded_add = lm.entry_by_name("add");
-    void* loaded_dbl = lm.entry_by_name("double");
-    if (!loaded_add) { std::printf("FAIL: entry_by_name(\"add\") null\n"); std::filesystem::remove(tmp); return 1; }
-    if (!loaded_dbl) { std::printf("FAIL: entry_by_name(\"double\") null\n"); std::filesystem::remove(tmp); return 1; }
-    check(loaded_add != nullptr, "entry_by_name(add) resolved");
-    check(loaded_dbl != nullptr, "entry_by_name(double) resolved");
+    // ============================================================
+    // Part 2b: SECURE DEFAULT ACCEPTS an all-IR v5 module.
+    // The secure default must distinguish all-IR v5 loading (safe — every
+    // function re-emitted from validated IR) from raw-x86-bearing v5 loading
+    // (the Part 2 rejection). Build a module with ONLY the IR `add` function
+    // and load it with no policy — it must be accepted, and add must work.
+    // ============================================================
+    std::printf("\nPart 2b: secure default accepts all-IR v5 module\n");
+    {
+        EmModule ir_only;
+        {
+            EmFunctionRecord rec;
+            rec.name = "add";
+            rec.slot_index = uint32_t(add_decl->slot);
+            rec.ir_blob = add_blob;  // is_ir=1, no code
+            rec.signature.ret = Type{Prim::I64};
+            rec.signature.params.push_back(Type{Prim::I64});
+            rec.signature.params.push_back(Type{Prim::I64});
+            ir_only.functions.push_back(std::move(rec));
+        }
+        ir_only.globals = {};
+        ir_only.entry_slot = uint32_t(slots["add"]);
+        ir_only.name_table.emplace_back("add", uint32_t(slots["add"]));
 
-    // add: IR-re-emitted function.
-    int64_t r_add_3_4 = call2_i64(loaded_add, 3, 4);
-    int64_t r_add_neg = call2_i64(loaded_add, -10, 25);
-    check(r_add_3_4 == 7, "mixed: add(3,4) == 7 (IR function, re-emitted)");
-    check(r_add_neg == 15, "mixed: add(-10,25) == 15 (IR function)");
+        auto ir_path = std::filesystem::temp_directory_path() / "em_v5_ir_only_test.em";
+        std::string iwerr;
+        if (!write_em_file_v5(ir_only, ir_path.string().c_str(), &iwerr)) {
+            std::printf("FAIL: write_em_file_v5(ir_only): %s\n", iwerr.c_str());
+            std::filesystem::remove(mixed_path);
+            return 1;
+        }
 
-    // double: raw-x86 function.
-    int64_t r_dbl_21 = call1_i64(loaded_dbl, 21);
-    int64_t r_dbl_0  = call1_i64(loaded_dbl, 0);
-    check(r_dbl_21 == 42, "mixed: double(21) == 42 (raw-x86 function)");
-    check(r_dbl_0 == 0, "mixed: double(0) == 0 (raw-x86 function)");
+        LoadedModule lm;
+        std::string lerr;
+        // NO EmLoadPolicy (secure default) — all-IR v5 must be accepted.
+        bool loaded = load_em_file(ir_path.string().c_str(), lm, &lerr,
+                                   nullptr, &natives, nullptr, nullptr);
+        check(loaded && lm.format_version == EM_VERSION_V5,
+              "all-IR v5 module accepted by secure default (v5)");
+        check(loaded && !lm.pages.empty(),
+              "all-IR v5 module got an exec page (IR re-emit)");
+        if (!loaded) {
+            std::printf("    err: %s\n", lerr.c_str());
+            std::filesystem::remove(ir_path);
+            std::filesystem::remove(mixed_path);
+            return 1;
+        }
+        void* ir_add = lm.entry_by_name("add");
+        check(ir_add != nullptr, "entry_by_name(add) resolved (all-IR)");
+        if (ir_add) {
+            check(call2_i64(ir_add, 3, 4) == 7, "all-IR: add(3,4) == 7 (secure default)");
+            check(call2_i64(ir_add, -10, 25) == 15, "all-IR: add(-10,25) == 15 (secure default)");
+        }
+        std::filesystem::remove(ir_path);
+    }
 
-    std::filesystem::remove(tmp);
+    // ============================================================
+    // Part 3: EXPLICIT EmLoadPolicy{allow_raw_x86=true} ACCEPTS the mixed
+    // module (back-compat opt-in). Under this policy the raw-x86 `double`
+    // loads as raw x86 and the IR `add` re-emits; both are callable and
+    // value-equivalent.
+    // ============================================================
+    std::printf("\nPart 3: explicit allow_raw_x86=true accepts mixed module (back-compat)\n");
+    {
+        LoadedModule lm;
+        std::string lerr;
+        EmLoadPolicy allow{0u, true};  // allow_raw_x86 = true (back-compat opt-in)
+        bool loaded = load_em_file(mixed_path.string().c_str(), lm, &lerr,
+                                   nullptr, &natives, nullptr, &allow);
+        if (!loaded) {
+            std::printf("FAIL: load_em_file(allow_raw_x86=true): %s\n", lerr.c_str());
+            std::filesystem::remove(mixed_path); return 1;
+        }
+        check(loaded && lm.format_version == EM_VERSION_V5,
+              "mixed module accepted with allow_raw_x86=true (v5)");
+        check(!lm.pages.empty(), "exec page allocated (IR re-emit + raw-x86 load)");
 
-    // --- malformed: is_ir=1 with ir_blob_len=0 ---
-    // This case (P6 fix) is already covered by em_v5_ir_test Part 2 (the
-    // "empty ir_blob" rejection). We confirm the mixed-mode happy path above;
-    // the per-function malformed rejection is format-level and identical
-    // whether the module is all-IR or mixed. No need to re-test here.
-    std::printf("\nPart 2: malformed is_ir=1+empty (covered by em_v5_ir_test)\n");
-    check(true, "malformed is_ir=1+empty ir_blob rejection covered by em_v5_ir_test Part 2");
+        void* loaded_add = lm.entry_by_name("add");
+        void* loaded_dbl = lm.entry_by_name("double");
+        if (!loaded_add) { std::printf("FAIL: entry_by_name(\"add\") null\n"); std::filesystem::remove(mixed_path); return 1; }
+        if (!loaded_dbl) { std::printf("FAIL: entry_by_name(\"double\") null\n"); std::filesystem::remove(mixed_path); return 1; }
+        check(loaded_add != nullptr, "entry_by_name(add) resolved");
+        check(loaded_dbl != nullptr, "entry_by_name(double) resolved");
+
+        // add: IR-re-emitted function.
+        check(call2_i64(loaded_add, 3, 4) == 7, "mixed: add(3,4) == 7 (IR function, re-emitted)");
+        check(call2_i64(loaded_add, -10, 25) == 15, "mixed: add(-10,25) == 15 (IR function)");
+
+        // double: raw-x86 function (loaded as raw x86 under the opt-in).
+        check(call1_i64(loaded_dbl, 21) == 42, "mixed: double(21) == 42 (raw-x86 function)");
+        check(call1_i64(loaded_dbl, 0) == 0, "mixed: double(0) == 0 (raw-x86 function)");
+    }
+
+    std::filesystem::remove(mixed_path);
+
+    // ============================================================
+    // Part 4: malformed is_ir=1 + empty ir_blob (P6) rejection.
+    // This is a parse-level rejection (an IR function must carry a non-empty
+    // blob), independent of EmLoadPolicy, and is covered directly by
+    // em_v5_ir_test Part 2 case (c) ("empty ir_blob -> rejected, no exec
+    // page"). We reference it here rather than duplicate the case; the
+    // secure-default gate (Part 2) and the all-IR acceptance (Part 2b) are
+    // the load-policy behaviors this test owns.
+    // ============================================================
+    std::printf("\nPart 4: malformed is_ir=1+empty (covered by em_v5_ir_test Part 2 case c)\n");
+    check(true, "is_ir=1+empty ir_blob parse-level rejection covered by em_v5_ir_test");
 
     std::printf("\nem_v5_mixed_test: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

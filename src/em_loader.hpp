@@ -110,24 +110,31 @@ struct EmVerifyPolicy {
 //     Default 0 (no permissions) is the secure default: a host that passes no
 //     policy gets no FFI natives bound, matching the compile-side default.
 //
-//   - allow_raw_x86: if false (the default), the loader REFUSES v1-v4 (raw
-//     x86) modules — they are an arbitrary-code-execution surface by
-//     construction (the loader maps the bytes executable with no validation).
-//     Only v5 (IR, re-emitted through emit_x64 + the structural validator) is
-//     accepted. If true, v1-v4 are accepted subject to the existing
-//     EmVerifyPolicy (dev mode: unsigned v1/v2/v3 accepted, v4 rejected;
-//     signed-only: v4 accepted if signed). This flag is the back-compat /
-//     dev-test opt-in; production hosts that load untrusted .em should leave
-//     it false.
+//   - allow_raw_x86: if false (the default), the loader REFUSES raw x86 in
+//     ALL its forms: (a) v1-v4 modules (the whole module is raw x86), and
+//     (b) v5 modules that contain ANY raw-x86 fallback function (is_ir=0 in
+//     the v5 per-function record). Both are an arbitrary-code-execution
+//     surface by construction (the loader maps the bytes executable with no
+//     validation). Only an ALL-IR v5 module (every function is_ir=1, re-
+//     emitted through emit_x64 + the structural validator) is accepted by the
+//     secure default. If true, raw x86 is accepted subject to the existing
+//     EmVerifyPolicy: v1-v4 modules load as before (dev mode: unsigned
+//     v1/v2/v3 accepted, v4 rejected; signed-only: v4 accepted if signed),
+//     and a v5 module's raw-x86 fallback functions load as raw x86 alongside
+//     the re-emitted IR functions (mixed mode). This flag is the back-compat
+//     / dev-test opt-in; production hosts that load untrusted .em should
+//     leave it false.
 //
 // `null` policy (the default arg) == the SECURE DEFAULT: module_permissions =
-// 0, allow_raw_x86 = false. A host that loads v1-v4 artifacts (existing tests,
-// the CLI's --load-em back-compat path, the standalone-exe stub) passes a
-// non-null policy with allow_raw_x86 = true. See docs/audit/
-// EM_FORMAT_RED_TEAM_2026-07-11.md Finding B + the raw-x86 recommendation.
+// 0, allow_raw_x86 = false. A host that loads v1-v4 artifacts OR mixed/raw v5
+// artifacts (existing tests, the CLI's --load-em back-compat path, the
+// standalone-exe stub) passes a non-null policy with allow_raw_x86 = true.
+// See docs/audit/EM_FORMAT_RED_TEAM_2026-07-11.md Finding B + the raw-x86
+// recommendation, and the v5 mixed-mode secure-default gate in
+// load_em_bytes_impl (MAINTENANCE_LOG 2026-07-12).
 struct EmLoadPolicy {
     uint32_t module_permissions = 0;  // PERM_FFI etc. granted to the loading module
-    bool allow_raw_x86 = false;       // if true, accept v1-v4 (raw x86); default false (v5 IR only)
+    bool allow_raw_x86 = false;       // if true, accept v1-v4 + v5 raw-x86 fallback fns; default false (all-IR v5 only)
 };
 
 // A loaded `.em` module: owns the dispatch table, the globals block, and the
@@ -222,9 +229,11 @@ struct LoadedModule {
 //
 // `load_policy` is optional (additive, default nullptr == SECURE DEFAULT):
 // the load-side safety policy. See `EmLoadPolicy`. The secure default
-// (null) grants module_permissions = 0 and allow_raw_x86 = false — only v5
-// (IR) modules are accepted, and PERM_FFI-gated natives are rejected at bind
-// time. A host that loads v1-v4 artifacts (back-compat / dev tests) passes a
+// (null) grants module_permissions = 0 and allow_raw_x86 = false — only
+// ALL-IR v5 modules are accepted (a v5 module containing any raw-x86
+// fallback function is rejected before any executable allocation), and
+// PERM_FFI-gated natives are rejected at bind time. A host that loads v1-v4
+// artifacts OR mixed/raw v5 artifacts (back-compat / dev tests) passes a
 // non-null policy with allow_raw_x86 = true; a host that trusts the loading
 // module with FFI passes module_permissions = PERM_FFI.
 //

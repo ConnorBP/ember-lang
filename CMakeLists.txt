@@ -1118,9 +1118,14 @@ endif()
 add_test(NAME aggregate_global COMMAND aggregate_global_test)
 
 # em_v5_mixed_test - D8: v5 mixed-mode (.em with IR + raw-x86 functions in one
-# module). Builds a 2-function v5 module: `add` (is_ir=1, IR blob) + `double`
-# (is_ir=0, raw-x86). Writes v5, loads, calls BOTH, asserts value-equivalence.
-# Covers the mixed is_ir format (audit finding D8).
+# module) + the v5 secure-default raw-x86 rejection. Builds a 2-function v5
+# module: `add` (is_ir=1, IR blob) + `double` (is_ir=0, raw-x86). Asserts the
+# SECURE DEFAULT (no EmLoadPolicy) rejects the mixed module (raw-x86-bearing)
+# before any exec allocation with a clear 'allow_raw_x86' error, that the
+# secure default accepts an all-IR v5 module, and that explicit
+# EmLoadPolicy{allow_raw_x86=true} accepts the mixed module with both
+# functions value-equivalent. Covers the mixed is_ir format + the secure-
+# default gate (audit finding D8 + MAINTENANCE_LOG 2026-07-12 candidate #1).
 add_executable(em_v5_mixed_test examples/em_v5_mixed_test.cpp)
 target_link_libraries(em_v5_mixed_test PRIVATE ember ember_frontend)
 if(WIN32)

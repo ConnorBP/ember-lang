@@ -170,8 +170,28 @@ format hardening pass + several fixes. The full commit log (oldest → newest):
     permission enforcement added.
   - **Raw x86 v1–v4 dropped** — the historical raw-x86 format versions (an
     arbitrary-code-execution surface by construction, accepted in dev mode)
-    are no longer accepted. The v5 IR path (re-lowered + validated at load
-    time) is the only code-carrying path.
+    are no longer accepted by the secure default. The v5 IR path (re-lowered
+    + validated at load time) is the only code-carrying path accepted by the
+    secure default.
+  - **v5 mixed-mode raw-x86 secure-default bypass — CLOSED** (2026-07-12,
+    MAINTENANCE_LOG candidate #1): the v5 per-function record lets a single
+    module MIX IR functions (is_ir=1, re-emitted from validated IR) and
+    raw-x86 fallback functions (is_ir=0, the v4 per-fn body). The original
+    FIX 3 only rejected raw x86 at the MODULE level (v1-v4), so a v5 module
+    containing a raw-x86 function was accepted by the secure default
+    (`EmLoadPolicy == nullptr`, `allow_raw_x86 == false`) — the raw-x86
+    function mapped executable with no validation, the exact surface FIX 3
+    closed for v1-v4. Fixed: the loader now records an explicit per-function
+    `is_ir` marker (read from the on-disk byte, not inferred from
+    `ir_blob.empty()`) and, under the secure default, rejects a v5 module
+    containing ANY `is_ir=0` function BEFORE any executable allocation and
+    before signature/dev-mode policy, with a clear `allow_raw_x86=true`
+    error. The secure default therefore accepts ONLY all-IR v5 modules
+    (every function is_ir=1); mixed/raw v5 modules load only under the
+    explicit `EmLoadPolicy{allow_raw_x86=true}` compatibility opt-in (the
+    raw-x86 functions then load as raw x86 alongside the re-emitted IR
+    functions). Pinned by `em_v5_mixed_test` (Parts 2/2b/3) + `em_v5_ir` /
+    `em_redteam_audit` (all-IR v5 default-accept preserved).
 - **Self-hosting Stage 1 — lexer** (`ac7425f`) — `self_hosted/lex.ember`
   (910 lines) + `lex_test.ember`.
 - **Self-hosting Stage 2 — parser** (`0022102` + `bfa1ffe`) —

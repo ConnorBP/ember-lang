@@ -128,15 +128,21 @@
 // raw-x86 fallback (is_ir=0) is the v4 per-fn body, but v5 is UNSIGNED for
 // Stage B: a v5 module is NOT routed through the v4 Ed25519 verification
 // path (the loader checks version==4 for the signed path; v5 falls into the
-// unsigned branch). In signed-only mode the entire v5 module is rejected; in
-// dev mode the raw-x86 fallback is accepted without signature verification
-// (same as v3). A v5-signed variant (v5 + the additive Ed25519 block) is
-// FUTURE work that would give the raw-x86 fallback v4-level content
-// authentication. v5 is OFF-BY-DEFAULT and INERT until the
-// Stage-B writer/loader land: EM_VERSION stays 4 (the default writer version),
-// and no v5 code path exists in em_writer.cpp / em_loader.cpp yet. The
-// constants + the ir_blob field + this layout spec are the contract those
-// parallel chunks implement against.
+// unsigned branch). SECURE DEFAULT (EmLoadPolicy == nullptr,
+// allow_raw_x86 == false): the loader rejects a v5 module that contains ANY
+// raw-x86 fallback function (is_ir=0) BEFORE any executable allocation — a
+// raw-x86 function is an arbitrary-code-execution surface by construction
+// (the same surface FIX 3 rejects for v1-v4). Only an ALL-IR v5 module (every
+// function is_ir=1) is accepted by the secure default. In signed-only mode the
+// entire (unsigned) v5 module is rejected regardless. EXPLICIT OPT-IN
+// (EmLoadPolicy{allow_raw_x86=true}): the raw-x86 fallback functions load as
+// raw x86 (without signature verification, same as v3 in dev mode) alongside
+// the re-emitted IR functions (mixed mode) — the back-compat / dev-test path.
+// A v5-signed variant (v5 + the additive Ed25519 block) is FUTURE work that
+// would give the raw-x86 fallback v4-level content authentication. The
+// constants + the ir_blob field + this layout spec are the contract the
+// Stage-B writer/loader implement against (both have landed: write_em_file_v5
+// + the v5 parse/re-emit paths in em_loader.cpp).
 //
 // KEY MANAGEMENT (F2): the signing key stays OFF the host (the build tool that
 // emits `.em` signs it). The loader takes a set of TRUSTED verification public

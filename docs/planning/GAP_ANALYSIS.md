@@ -117,7 +117,16 @@ and exports carry `unknown_sig` (no canonical signatures, no build/ABI identity 
 the v1 compatibility contract). v2 `.em` ships canonical `Type` signatures plus
 build/ABI identity, and sema/loader verify arity, ordered parameter types, and
 return type at link before page publication; portability and signatures are now
-shipped v2 guarantees (`../MODULES.md` Section 5), not H12/H14 redesigns.
+shipped v2 guarantees (`../MODULES.md` Section 5), not H12/H14 redesigns. The
+load-side secure default (`EmLoadPolicy == nullptr`, `allow_raw_x86 == false`)
+refuses raw x86 in all its forms — v1–v4 modules AND v5 modules containing any
+raw-x86 fallback function (is_ir=0) — before any executable allocation; only an
+all-IR v5 module (every function is_ir=1, re-emitted from validated IR) is
+accepted by default. Mixed/raw v5 artifacts load only under the explicit
+`EmLoadPolicy{allow_raw_x86=true}` compatibility opt-in. The v5 mixed-mode
+raw-x86 secure-default bypass that let a raw-x86-bearing v5 module through the
+secure default is CLOSED (2026-07-12; `em_v5_mixed_test`, `em_v5_ir`,
+`em_redteam_audit`; see `../ROADMAP.md` + `../MAINTENANCE_LOG.md`).
 
 ## 4. Honest performance caveat ("MUCH faster than AngelScript")
 
