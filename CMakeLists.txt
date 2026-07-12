@@ -260,6 +260,15 @@ add_test(NAME vst_dsp_harness COMMAND vst_dsp_harness
     ${CMAKE_CURRENT_SOURCE_DIR}/examples/scripts/delay_plugin.ember)
 set_tests_properties(vst_dsp_harness PROPERTIES TIMEOUT 60)
 
+if(TARGET vst3_stress_tests)
+    add_test(NAME vst3_stress COMMAND vst3_stress_tests stress)
+    add_test(NAME vst3_realtime_contract COMMAND vst3_stress_tests realtime)
+    add_test(NAME vst3_fuzz COMMAND vst3_stress_tests fuzz)
+    add_test(NAME vst3_soak COMMAND vst3_stress_tests soak --seconds 30)
+    set_tests_properties(vst3_stress vst3_realtime_contract vst3_fuzz PROPERTIES TIMEOUT 60)
+    set_tests_properties(vst3_soak PROPERTIES TIMEOUT 60 LABELS soak)
+endif()
+
 # for_each_array_test: pins the iterable() hook's array<T> case (Tier 1) -
 # `for (x in array_handle)` lowered to array_length(h) + array_get_*(h, i).
 # Each probe compiles a tiny .ember through the full pipeline with the array

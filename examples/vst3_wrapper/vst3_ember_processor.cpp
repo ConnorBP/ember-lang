@@ -347,7 +347,6 @@ bool EmberProcessor::loadEmberScript() {
         std::fprintf(stderr, "[Ember VST3] %s: %s\n", script_path_.c_str(), error.c_str());
         return false;
     }
-    process_dispatch_.set(0, reinterpret_cast<void*>(candidate->process_f32));
     current_.store(candidate.release(), std::memory_order_release);
     return true;
 }
@@ -401,46 +400,17 @@ void EmberProcessor::watchScript() {
             continue;
         }
 
-        EmberModule* rawCandidate = candidate.release();
-        pending_.store(rawCandidate, std::memory_order_release);
-        const auto publication = reload_domain_.publish(
-            process_dispatch_, 0, reinterpret_cast<void*>(rawCandidate->process_f32));
-        if (!publication.ok) {
-            EmberModule* expected = rawCandidate;
-            pending_.compare_exchange_strong(expected, nullptr,
-                                             std::memory_order_acq_rel);
-            delete rawCandidate;
-            std::fprintf(stderr,
-                         "[Ember VST3] hot reload publication failed; keeping last known-good module\n");
-            continue;
-        }
-
-        // publish() owns the replaced process page now. Disown it immediately
-        // so reclamation and the old ProcessPlan destructor cannot double-free.
-        if (EmberModule* old = current_.load(std::memory_order_acquire))
-            old->relinquishProcessPage();
+        pending_.store(candidate.release(), std::memory_order_release);
         std::fprintf(stderr,
-                     "[Ember VST3] compiled update for %s; awaiting block boundary (epoch %llu)\n",
-                     script_path_.c_str(),
-                     static_cast<unsigned long long>(publication.publication_epoch));
+                     "[Ember VST3] compiled update for %s; awaiting block boundary\n",
+                     script_path_.c_str());
     }
     reclaimRetiredModule();
 }
 
-EmberModule* EmberProcessor::activatePendingModule(
-    ember::HotReloadDomain::ExecutionGuard&) noexcept {
-    // Publication and consumption both serialize through the domain mutex.
-    // Taking this short-lived nested guard gives us a coherent snapshot of the
-    // dispatch slot and pending ProcessPlan without adding another audio lock.
-    std::optional<ember::HotReloadDomain::ExecutionGuard> publicationSnapshot;
-    publicationSnapshot.emplace(reload_domain_.guard());
-    EmberModule* candidate = pending_.load(std::memory_order_acquire);
-    if (!candidate || process_dispatch_.get(0) != reinterpret_cast<void*>(candidate->process_f32))
-        return nullptr;
-    if (!pending_.compare_exchange_strong(candidate, nullptr,
-                                          std::memory_order_acq_rel,
-                                          std::memory_order_acquire))
-        return nullptr;
+EmberModule* EmberProcessor::activatePendingModule() noexcept {
+    EmberModule* candidate = pending_.exchange(nullptr, std::memory_order_acq_rel);
+    if (!candidate) return nullptr;
 
     EmberModule* old = current_.load(std::memory_order_acquire);
     int64_t statePointer = 0;
@@ -465,15 +435,13 @@ EmberModule* EmberProcessor::activatePendingModule(
     latency_samples_.store(boundedReport(candidate->get_latency), std::memory_order_release);
     tail_samples_.store(boundedReport(candidate->get_tail), std::memory_order_release);
     if (old) retired_.store(old, std::memory_order_release);
-    std::fprintf(stderr, "[Ember VST3] activated update at block boundary\n");
     return old;
 }
 
 void EmberProcessor::reclaimRetiredModule() {
-    // reclaim() is nonblocking. The module object can be destroyed only after
-    // its retired process page was freed, which proves all pre-publication
-    // ExecutionGuards (and therefore all old module calls) have left.
-    if (reload_domain_.reclaim() == 0) return;
+    // The watcher is the sole reclaimer. acquire observes process() reader
+    // enrollment/exit; zero is the grace period for the old immutable plan.
+    if (audio_readers_.load(std::memory_order_acquire) != 0) return;
     delete retired_.exchange(nullptr, std::memory_order_acq_rel);
 }
 
@@ -482,7 +450,8 @@ tresult PLUGIN_API EmberProcessor::terminate() {
     stopHotReload();
 
     delete pending_.exchange(nullptr, std::memory_order_acq_rel);
-    reload_domain_.quiesce();
+    while (audio_readers_.load(std::memory_order_acquire) != 0)
+        std::this_thread::yield();
     delete retired_.exchange(nullptr, std::memory_order_acq_rel);
     delete current_.exchange(nullptr, std::memory_order_acq_rel);
     module_.reset();
@@ -541,7 +510,6 @@ tresult PLUGIN_API EmberProcessor::canProcessSampleSize(int32 sampleSize) {
 }
 
 void EmberProcessor::refreshLatencyAndTail() noexcept {
-    auto execution = reload_domain_.guard();
     EmberModule* current = current_.load(std::memory_order_acquire);
     const auto boundedReport = [](ReportSamplesFn callback) -> uint32 {
         if (!callback) return 0;
@@ -746,14 +714,12 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
     context.output_event_capacity = static_cast<int64_t>(output_events_.size());
     context.output_events_ptr = reinterpret_cast<int64_t>(output_events_.data());
 
-    // The guard is acquired before the block-boundary publication. It pins the
-    // old page if a publication occurs here, covering save_state(), the optional
-    // old-processor crossfade render, and the new processor call.
+    // Lock-free reader enrollment pins the old module through publication,
+    // state migration, the optional crossfade render, and the DSP call.
+    audio_readers_.fetch_add(1, std::memory_order_acq_rel);
     {
-        auto execution = reload_domain_.guard();
-        EmberModule* old = activatePendingModule(execution);
+        EmberModule* old = activatePendingModule();
         EmberModule* current = current_.load(std::memory_order_acquire);
-        ProcessFn processFn = reinterpret_cast<ProcessFn>(process_dispatch_.get(0));
 
         const std::size_t fadeFrames = !sample64 && old && old->process_f32 &&
             crossfade_channels_[0]
@@ -772,9 +738,11 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
         }
 
         ProcessFn selectedProcess = sample64
-            ? (current ? current->process_f64 : nullptr) : processFn;
+            ? (current ? current->process_f64 : nullptr)
+            : (current ? current->process_f32 : nullptr);
         if (!current || !selectedProcess) {
             bypass(data);
+            audio_readers_.fetch_sub(1, std::memory_order_release);
             return kResultOk;
         }
         selectedProcess(reinterpret_cast<int64_t>(&context), data.numSamples);
@@ -792,6 +760,7 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
             }
         }
     }
+    audio_readers_.fetch_sub(1, std::memory_order_release);
     if (changeCount > 0) {
         for (std::size_t index = 0; index < changeCount; ++index) {
             const auto id = parameter_changes_[index].param_id;
@@ -840,7 +809,12 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
     }
     // Conservatively clear silence when Ember ran: an instrument may generate
     // signal from events even when there is no input or the input is silent.
-    data.outputs[0].silenceFlags = blockRemainsSilent ? 3u : 0u;
+    const uint64 channelMask = data.outputs[0].numChannels >= 64
+        ? ~uint64 {0}
+        : ((uint64 {1} << data.outputs[0].numChannels) - 1);
+    const bool silentInput = data.numInputs == 0 ||
+        (data.inputs[0].silenceFlags & channelMask) == channelMask;
+    data.outputs[0].silenceFlags = (silentInput || blockRemainsSilent) ? channelMask : 0u;
     return kResultOk;
 }
 
@@ -863,7 +837,6 @@ tresult PLUGIN_API EmberProcessor::setState(IBStream* state) {
 
     parameter_values_[0] = std::clamp(saved, 0.0f, 2.0f);
     setParamNormalized(kGainParamId, parameter_values_[0] / 2.0f);
-    auto execution = reload_domain_.guard();
     EmberModule* current = current_.load(std::memory_order_acquire);
     if (current && current->load_state) {
         current->load_state(reinterpret_cast<int64_t>(scriptState.data()), scriptSize);
@@ -876,7 +849,6 @@ tresult PLUGIN_API EmberProcessor::getState(IBStream* state) {
 
     const uint8_t* scriptBytes = nullptr;
     int64 scriptSize = 0;
-    auto execution = reload_domain_.guard();
     EmberModule* current = current_.load(std::memory_order_acquire);
     if (current && current->save_state) {
         const auto* saved = reinterpret_cast<const ScriptStateBuffer*>(current->save_state());

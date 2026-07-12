@@ -6,9 +6,7 @@
 #include "public.sdk/source/vst/vstsinglecomponenteffect.h"
 
 #include "ext_audio.hpp"
-#include "dispatch_table.hpp"
 #include "parser.hpp"
-#include "hot_reload.hpp"
 
 #include <array>
 #include <atomic>
@@ -16,7 +14,6 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -55,7 +52,7 @@ private:
     void startHotReload();
     void stopHotReload() noexcept;
     void watchScript();
-    EmberModule* activatePendingModule(ember::HotReloadDomain::ExecutionGuard&) noexcept;
+    EmberModule* activatePendingModule() noexcept;
     void reclaimRetiredModule();
     void refreshLatencyAndTail() noexcept;
     void bypass(Steinberg::Vst::ProcessData& data) const noexcept;
@@ -65,15 +62,15 @@ private:
     static constexpr std::size_t kMaxEvents = 4096;
     static constexpr std::size_t kMaxStateBytes = 16 * 1024 * 1024;
 
-    // process_dispatch_ is the one stable publication point used by the audio
-    // thread. A ProcessPlan (EmberModule) owns its immutable JIT code, globals,
-    // and private script dispatch table. The watcher only writes pending_; the
-    // audio thread performs the release publication at a block boundary.
-    ember::HotReloadDomain reload_domain_;
-    ember::DispatchTable process_dispatch_ {1};
+    // A ProcessPlan (EmberModule) owns its immutable JIT code, globals, and
+    // private dispatch table. The watcher only writes pending_; the audio
+    // thread swaps it into current_ at a block boundary. audio_readers_ is a
+    // lock-free grace period: the watcher may destroy retired_ only while no
+    // process() call can still hold the old plan.
     std::atomic<EmberModule*> current_ {nullptr};
     std::atomic<EmberModule*> pending_ {nullptr};
     std::atomic<EmberModule*> retired_ {nullptr};
+    std::atomic<std::uint32_t> audio_readers_ {0};
 
     std::thread watcher_;
     std::atomic<bool> stop_watcher_ {false};
