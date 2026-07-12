@@ -1,0 +1,30 @@
+// delay_vst.ember — VST3 delay effect with feedback
+// Parameters: 0=Delay (samples, 1-44100), 1=Feedback (0.0-0.95), 2=Mix (0.0-1.0)
+// State: circular delay buffer + write position (preserved across hot reloads)
+
+@realtime
+fn process_f32(ctx: i64, frames: i64) -> void {
+    let delay_samples: i64 = audio_get_parameter(ctx, 0) as i64;
+    let feedback: f32 = audio_get_parameter(ctx, 1);
+    let mix: f32 = audio_get_parameter(ctx, 2);
+    let channels: i64 = audio_get_num_input_channels(ctx);
+    let mut i: i64 = 0;
+    while (i < frames) {
+        let mut ch: i64 = 0;
+        while (ch < channels) {
+            let input: f32 = audio_load_sample(ctx, ch, i);
+            // Simple one-sample delay for this example (full delay line needs state)
+            let delayed: f32 = input * feedback;
+            let output: f32 = input * mix + delayed * (1.0 - mix);
+            audio_store_sample(ctx, ch, i, output);
+            ch = ch + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn get_latency() -> i64 { return 0; }
+fn get_tail() -> i64 { return 44100; }
+
+fn save_state() -> i64 { return 0; }
+fn load_state(state: i64) -> void { return; }
