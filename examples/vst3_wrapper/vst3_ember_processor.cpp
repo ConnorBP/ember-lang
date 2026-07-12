@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -98,6 +99,21 @@ std::size_t crossfadeSamples() {
     if (end == configured || *end != '\0') return kDefaultCrossfadeSamples;
     return static_cast<std::size_t>(std::min<unsigned long long>(
         value, kMaxCrossfadeSamples));
+}
+
+enum class ScriptProfile { Gain, Delay, Filter, Oscillator };
+
+ScriptProfile scriptProfile(const std::string& path) {
+    std::string name = path;
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (name.find("delay_vst") != std::string::npos) return ScriptProfile::Delay;
+    if (name.find("filter_vst") != std::string::npos) return ScriptProfile::Filter;
+    if (name.find("oscillator_vst") != std::string::npos ||
+        name.find("synth_vst") != std::string::npos)
+        return ScriptProfile::Oscillator;
+    return ScriptProfile::Gain;
 }
 
 } // namespace
@@ -325,9 +341,55 @@ tresult PLUGIN_API EmberProcessor::initialize(FUnknown* context) {
     addEventInput(STR16("Event In"));
     addEventOutput(STR16("Event Out"));
     processContextRequirements.needTransportState().needTempo().needProjectTimeMusic();
-    parameters.addParameter(new RangeParameter(
-        STR16("Gain"), kGainParamId, nullptr, 0.0, 2.0, 1.0, 0,
-        ParameterInfo::kCanAutomate));
+    script_path_ = scriptPath();
+    const ScriptProfile profile = scriptProfile(script_path_);
+    gain_profile_ = profile == ScriptProfile::Gain;
+    switch (profile) {
+        case ScriptProfile::Delay:
+            plugin_parameter_count_ = 3;
+            parameter_values_ = {{12000.0f, 0.35f, 0.5f}};
+            parameter_minimums_ = {{1.0f, 0.0f, 0.0f}};
+            parameter_maximums_ = {{96000.0f, 0.99f, 1.0f}};
+            parameters.addParameter(new RangeParameter(
+                STR16("Delay Time"), kGainParamId, STR16("samples"),
+                1.0, 96000.0, 12000.0, 0, ParameterInfo::kCanAutomate));
+            parameters.addParameter(new RangeParameter(
+                STR16("Feedback"), kParameter1Id, nullptr,
+                0.0, 0.99, 0.35, 0, ParameterInfo::kCanAutomate));
+            parameters.addParameter(new RangeParameter(
+                STR16("Mix"), kParameter2Id, nullptr,
+                0.0, 1.0, 0.5, 0, ParameterInfo::kCanAutomate));
+            break;
+        case ScriptProfile::Filter:
+            plugin_parameter_count_ = 2;
+            parameter_values_ = {{1000.0f, 0.2f, 0.0f}};
+            parameter_minimums_ = {{20.0f, 0.0f, 0.0f}};
+            parameter_maximums_ = {{20000.0f, 1.0f, 1.0f}};
+            parameters.addParameter(new RangeParameter(
+                STR16("Cutoff"), kGainParamId, STR16("Hz"),
+                20.0, 20000.0, 1000.0, 0, ParameterInfo::kCanAutomate));
+            parameters.addParameter(new RangeParameter(
+                STR16("Resonance"), kParameter1Id, nullptr,
+                0.0, 1.0, 0.2, 0, ParameterInfo::kCanAutomate));
+            break;
+        case ScriptProfile::Oscillator:
+            plugin_parameter_count_ = 2;
+            parameter_values_ = {{0.0f, 0.7f, 0.0f}};
+            parameter_minimums_ = {{0.0f, 0.0f, 0.0f}};
+            parameter_maximums_ = {{2.0f, 1.0f, 1.0f}};
+            parameters.addParameter(new RangeParameter(
+                STR16("Waveform"), kGainParamId, nullptr,
+                0.0, 2.0, 0.0, 2, ParameterInfo::kCanAutomate));
+            parameters.addParameter(new RangeParameter(
+                STR16("Volume"), kParameter1Id, nullptr,
+                0.0, 1.0, 0.7, 0, ParameterInfo::kCanAutomate));
+            break;
+        case ScriptProfile::Gain:
+            parameters.addParameter(new RangeParameter(
+                STR16("Gain"), kGainParamId, nullptr, 0.0, 2.0, 1.0, 0,
+                ParameterInfo::kCanAutomate));
+            break;
+    }
 
     if (!loadEmberScript()) {
         SingleComponentEffect::terminate();
@@ -341,7 +403,7 @@ tresult PLUGIN_API EmberProcessor::initialize(FUnknown* context) {
 bool EmberProcessor::loadEmberScript() {
     auto candidate = std::make_unique<EmberModule>();
     std::string error;
-    script_path_ = scriptPath();
+    if (script_path_.empty()) script_path_ = scriptPath();
     watched_source_ = readTextFile(script_path_);
     if (!candidate->compileSource(watched_source_, script_path_, error)) {
         std::fprintf(stderr, "[Ember VST3] %s: %s\n", script_path_.c_str(), error.c_str());
@@ -570,7 +632,7 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
             IParamValueQueue* queue = data.inputParameterChanges->getParameterData(queueIndex);
             if (!queue) continue;
             const ParamID id = queue->getParameterId();
-            if (id >= parameter_values_.size()) continue;
+            if (id >= plugin_parameter_count_) continue;
 
             for (int32 pointIndex = 0;
                  pointIndex < queue->getPointCount() && changeCount < parameter_changes_.size();
@@ -579,8 +641,10 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
                 ParamValue normalized = 0.0;
                 if (queue->getPoint(pointIndex, sampleOffset, normalized) != kResultTrue)
                     continue;
-                const float value =
-                    static_cast<float>(std::clamp(normalized, 0.0, 1.0) * 2.0);
+                const float minimum = parameter_minimums_[id];
+                const float maximum = parameter_maximums_[id];
+                const float value = minimum + static_cast<float>(
+                    std::clamp(normalized, 0.0, 1.0)) * (maximum - minimum);
                 // VST3 permits a zero-sample parameter-flush call. Preserve
                 // its final value even though there is no sample event to emit.
                 if (data.numSamples <= 0) {
@@ -592,7 +656,6 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
                 ember::ext_audio::ParameterChange change;
                 change.param_id = static_cast<int64_t>(id);
                 change.sample_offset = sampleOffset;
-                // Gain's VST normalized [0, 1] range maps to Ember's [0, 2].
                 change.value = value;
                 std::size_t insert = changeCount;
                 while (insert > 0 &&
@@ -684,10 +747,13 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
         }
     }
 
-    const bool blockStartsSilent = parameter_values_[0] == 0.0f;
+    const bool blockStartsSilent = gain_profile_ && parameter_values_[0] == 0.0f;
     bool blockRemainsSilent = blockStartsSilent;
-    for (std::size_t index = 0; index < changeCount; ++index)
-        blockRemainsSilent = blockRemainsSilent && parameter_changes_[index].value == 0.0f;
+    for (std::size_t index = 0; index < changeCount; ++index) {
+        if (parameter_changes_[index].param_id == kGainParamId)
+            blockRemainsSilent = blockRemainsSilent &&
+                parameter_changes_[index].value == 0.0f;
+    }
 
     ember::ext_audio::AudioContext context;
     context.sample_rate = static_cast<int64_t>(processSetup.sampleRate);
@@ -705,7 +771,7 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
         if ((data.processContext->state & ProcessContext::kProjectTimeMusicValid) != 0)
             context.transport_ppq = data.processContext->projectTimeMusic;
     }
-    context.parameter_count = static_cast<int64_t>(parameter_values_.size());
+    context.parameter_count = static_cast<int64_t>(plugin_parameter_count_);
     context.parameter_values_ptr = reinterpret_cast<int64_t>(parameter_values_.data());
     context.parameter_change_count = static_cast<int64_t>(changeCount);
     context.parameter_changes_ptr = reinterpret_cast<int64_t>(parameter_changes_.data());
@@ -835,8 +901,11 @@ tresult PLUGIN_API EmberProcessor::setState(IBStream* state) {
     if (scriptSize > 0 && stream.readRaw(scriptState.data(), scriptSize) != scriptSize)
         return kResultFalse;
 
-    parameter_values_[0] = std::clamp(saved, 0.0f, 2.0f);
-    setParamNormalized(kGainParamId, parameter_values_[0] / 2.0f);
+    parameter_values_[0] = std::clamp(
+        saved, parameter_minimums_[0], parameter_maximums_[0]);
+    const float span = parameter_maximums_[0] - parameter_minimums_[0];
+    setParamNormalized(kGainParamId, span > 0.0f
+        ? (parameter_values_[0] - parameter_minimums_[0]) / span : 0.0f);
     EmberModule* current = current_.load(std::memory_order_acquire);
     if (current && current->load_state) {
         current->load_state(reinterpret_cast<int64_t>(scriptState.data()), scriptSize);

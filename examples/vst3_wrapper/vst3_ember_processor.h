@@ -21,6 +21,8 @@
 namespace EmberVst3 {
 
 inline constexpr Steinberg::Vst::ParamID kGainParamId = 0;
+inline constexpr Steinberg::Vst::ParamID kParameter1Id = 1;
+inline constexpr Steinberg::Vst::ParamID kParameter2Id = 2;
 extern const Steinberg::FUID kProcessorUID;
 
 class EmberModule;
@@ -57,7 +59,7 @@ private:
     void refreshLatencyAndTail() noexcept;
     void bypass(Steinberg::Vst::ProcessData& data) const noexcept;
 
-    static constexpr std::size_t kParameterCount = 1;
+    static constexpr std::size_t kParameterCount = 3;
     static constexpr std::size_t kMaxParameterChanges = 4096;
     static constexpr std::size_t kMaxEvents = 4096;
     static constexpr std::size_t kMaxStateBytes = 16 * 1024 * 1024;
@@ -85,7 +87,11 @@ private:
 
     // Kept until the implementation switches initial ownership into current_.
     std::unique_ptr<EmberModule> module_;
-    std::array<float, kParameterCount> parameter_values_ {{1.0f}};
+    std::array<float, kParameterCount> parameter_values_ {{1.0f, 0.0f, 0.0f}};
+    std::array<float, kParameterCount> parameter_minimums_ {{0.0f, 0.0f, 0.0f}};
+    std::array<float, kParameterCount> parameter_maximums_ {{2.0f, 1.0f, 1.0f}};
+    std::size_t plugin_parameter_count_ {1};
+    bool gain_profile_ {true};
     std::array<ember::ext_audio::ParameterChange, kMaxParameterChanges> parameter_changes_ {};
     std::array<ember::ext_audio::AudioEvent, kMaxEvents> input_events_ {};
     std::array<ember::ext_audio::AudioEvent, kMaxEvents> output_events_ {};
