@@ -273,6 +273,201 @@ EmberPreserved SubstitutionPass::run(ThinFunction& f, EmberAnalysisManager&) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// MBAExpansionPass: seeded mixed boolean/arithmetic expansion
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Candidate sites are selected by a stable per-function RNG. Add/Sub accept
+// either the VReg or immediate IR form; immediate operands are first
+// materialized into fresh VRegs. Each identity is valid modulo 2^N, matching
+// Ember's fixed-width integer normalization:
+//
+//   a + b = (a ^ b) + ((a & b) << 1)
+//   a + b = (a | b) + (a & b)
+//   a - b = (a ^ b) - ((~a & b) << 1)
+//   a - b = a + (~b + 1)
+//   a * 2 = a << 1
+//
+// New instructions are deliberately not revisited during this invocation, so
+// one pass run always terminates and does not recursively expand itself.
+
+EmberPreserved MBAExpansionPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    StableRng rng(pass_seed(f, pass_name));
+    MutationState mut(f);
+
+    for (auto& blk : f.blocks) {
+        std::vector<ThinInstr> expanded;
+        expanded.reserve(blk.instrs.size() * 2);
+
+        for (auto& in : blk.instrs) {
+            const bool add_or_sub = in.op == ThinOp::Add || in.op == ThinOp::Sub;
+            const bool mul_two = in.op == ThinOp::Mul && in.src1 != 0 &&
+                                 in.src2 == 0 && in.imm.i == 2;
+            if ((!add_or_sub && !mul_two) || in.src1 == 0 ||
+                !is_plain_integer(in) || (rng.next() & 1U) == 0) {
+                expanded.push_back(std::move(in));
+                continue;
+            }
+
+            const VReg a = in.src1;
+            VReg b = in.src2;
+            const int32_t width = in.meta.width;
+            const Type* ty = in.meta.type;
+            const Loc loc = in.loc;
+
+            auto append_fresh = [&](ThinOp op, VReg src1, VReg src2,
+                                    int64_t imm = 0) -> VReg {
+                auto [dst, off] = mut.scalar();
+                expanded.push_back(make_value_instr(
+                    op, dst, off, src1, src2, imm, width, ty, loc));
+                return dst;
+            };
+
+            if (mul_two) {
+                in.op = ThinOp::Shl;
+                in.src2 = 0;
+                in.imm.i = 1;
+                expanded.push_back(std::move(in));
+                mut.changed = true;
+                continue;
+            }
+
+            // The immediate form uses VReg 0 as its sentinel. Materializing it
+            // makes the two operands available to all MBA identities.
+            if (b == 0) {
+                b = append_fresh(ThinOp::ConstInt, 0, 0, in.imm.i);
+            }
+
+            if (in.op == ThinOp::Add) {
+                if ((rng.next() & 1U) == 0) {
+                    const VReg x = append_fresh(ThinOp::Xor, a, b);
+                    const VReg carry = append_fresh(ThinOp::And, a, b);
+                    const VReg twice_carry = append_fresh(ThinOp::Shl, carry, 0, 1);
+                    in.src1 = x;
+                    in.src2 = twice_carry;
+                } else {
+                    const VReg either = append_fresh(ThinOp::Or, a, b);
+                    const VReg both = append_fresh(ThinOp::And, a, b);
+                    in.src1 = either;
+                    in.src2 = both;
+                }
+                in.imm.i = 0;
+            } else if ((rng.next() & 1U) == 0) {
+                const VReg x = append_fresh(ThinOp::Xor, a, b);
+                const VReg not_a = append_fresh(ThinOp::BitNot, a, 0);
+                const VReg borrow = append_fresh(ThinOp::And, not_a, b);
+                const VReg twice_borrow = append_fresh(ThinOp::Shl, borrow, 0, 1);
+                in.src1 = x;
+                in.src2 = twice_borrow;
+                in.imm.i = 0;
+            } else {
+                const VReg not_b = append_fresh(ThinOp::BitNot, b, 0);
+                const VReg neg_b = append_fresh(ThinOp::Add, not_b, 0, 1);
+                in.op = ThinOp::Add;
+                in.src1 = a;
+                in.src2 = neg_b;
+                in.imm.i = 0;
+            }
+
+            expanded.push_back(std::move(in));
+            mut.changed = true;
+        }
+        blk.instrs = std::move(expanded);
+    }
+
+    mut.finish();
+    return mut.changed ? EmberPreserved::none() : EmberPreserved::all();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ConstantEncodingPass: seeded integer constant encoding
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Replaces each selected ConstInt c (except 0/1) with one of four exact forms:
+//   c = (c - k) + k
+//   c = (c + k) - k
+//   c = (c ^ k) ^ k
+//   c = (c << 1) >> 1       (only when that signed/unsigned shift round-trip
+//                             is valid for the destination width)
+// The first three identities are valid modulo 2^N and therefore include all
+// signed/unsigned values without invoking host-language signed arithmetic.
+
+EmberPreserved ConstantEncodingPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    StableRng rng(pass_seed(f, pass_name));
+    MutationState mut(f);
+
+    for (auto& blk : f.blocks) {
+        std::vector<ThinInstr> encoded;
+        encoded.reserve(blk.instrs.size() * 2);
+
+        for (auto& in : blk.instrs) {
+            if (in.op != ThinOp::ConstInt || in.imm.i == 0 || in.imm.i == 1 ||
+                !is_plain_integer(in) || (rng.next() & 1U) == 0) {
+                encoded.push_back(std::move(in));
+                continue;
+            }
+
+            const int32_t bits = in.meta.width * 8;
+            const uint64_t mask = bits == 64 ? ~uint64_t{0}
+                                             : ((uint64_t{1} << bits) - 1);
+            const uint64_t value = static_cast<uint64_t>(in.imm.i) & mask;
+            uint64_t key = rng.next() & mask;
+            if (key == 0 || key == 1) key = (uint64_t{0x5a} & mask);
+            if (key == 0 || key == 1) key = 2;
+
+            size_t form = rng.index(4);
+            const uint64_t top_two = value >> (bits - 2);
+            const bool shift_safe = in.meta.type && in.meta.type->is_uint()
+                ? (value & (uint64_t{1} << (bits - 1))) == 0
+                : (top_two == 0 || top_two == 3);
+            if (form == 3 && !shift_safe) form = rng.index(3);
+
+            const uint64_t base_bits = form == 0 ? ((value - key) & mask)
+                                      : form == 1 ? ((value + key) & mask)
+                                      : form == 2 ? ((value ^ key) & mask)
+                                                  : value;
+            const uint64_t sign_bit = uint64_t{1} << (bits - 1);
+            const int64_t base = (bits < 64 && (base_bits & sign_bit) != 0)
+                ? static_cast<int64_t>(base_bits | ~mask)
+                : static_cast<int64_t>(base_bits);
+            const int64_t encoded_key = (bits < 64 && (key & sign_bit) != 0)
+                ? static_cast<int64_t>(key | ~mask)
+                : static_cast<int64_t>(key);
+            auto [base_v, base_off] = mut.scalar();
+            encoded.push_back(make_value_instr(
+                ThinOp::ConstInt, base_v, base_off, 0, 0, base,
+                in.meta.width, in.meta.type, in.loc));
+
+            in.src1 = base_v;
+            in.src2 = 0;
+            if (form == 0) {
+                in.op = ThinOp::Add;
+                in.imm.i = encoded_key;
+            } else if (form == 1) {
+                in.op = ThinOp::Sub;
+                in.imm.i = encoded_key;
+            } else if (form == 2) {
+                in.op = ThinOp::Xor;
+                in.imm.i = encoded_key;
+            } else {
+                auto [shifted_v, shifted_off] = mut.scalar();
+                encoded.push_back(make_value_instr(
+                    ThinOp::Shl, shifted_v, shifted_off, base_v, 0, 1,
+                    in.meta.width, in.meta.type, in.loc));
+                in.op = ThinOp::Shr;
+                in.src1 = shifted_v;
+                in.imm.i = 1;
+            }
+            encoded.push_back(std::move(in));
+            mut.changed = true;
+        }
+        blk.instrs = std::move(encoded);
+    }
+
+    mut.finish();
+    return mut.changed ? EmberPreserved::none() : EmberPreserved::all();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // OpaquePredicatesPass: fixed predicates with a harmless rejoining path
 // ═══════════════════════════════════════════════════════════════════════════
 //
@@ -446,6 +641,8 @@ EmberPreserved DeadCodeInjectionPass::run(ThinFunction& f, EmberAnalysisManager&
 
 void register_passes(EmberPassRegistry& reg) {
     reg.add<SubstitutionPass>("subst");
+    reg.add<MBAExpansionPass>("mba_expand");
+    reg.add<ConstantEncodingPass>("const_encode");
     reg.add<OpaquePredicatesPass>("opaque_pred");
     reg.add<DeadCodeInjectionPass>("deadcode");
 }

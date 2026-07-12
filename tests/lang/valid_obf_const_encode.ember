@@ -1,0 +1,20 @@
+// valid_obf_const_encode.ember — integer constant encoding value preservation.
+// Run with: ember_cli run ../tests/lang/valid_obf_const_encode.ember --passes const_encode
+// expect: 42
+
+fn constants() -> i64 {
+    let pos: i64 = 123456789;
+    let neg: i64 = -9876543;
+    let small_signed: i8 = 127 as i8;
+    let small_unsigned: u8 = 255 as u8;
+
+    if (pos != 123456789) { return 1; }
+    if (neg != -9876543) { return 2; }
+    if (small_signed != 127 as i8) { return 3; }
+    if (small_unsigned != 255 as u8) { return 4; }
+    return 42;
+}
+
+fn main() -> i64 {
+    return constants();
+}

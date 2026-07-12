@@ -1,0 +1,26 @@
+// valid_obf_mba.ember — MBA expansion value preservation across widths.
+// Run with: ember_cli run ../tests/lang/valid_obf_mba.ember --passes mba_expand
+// expect: 42
+
+fn mix_i64(a: i64, b: i64) -> i64 {
+    let sum: i64 = a + b;
+    let diff: i64 = sum - b;
+    let twice: i64 = diff * 2;
+    return twice;
+}
+
+fn mix_i8(a: i8, b: i8) -> i8 {
+    return (a + b) - b;
+}
+
+fn mix_u8(a: u8, b: u8) -> u8 {
+    return (a + b) - b;
+}
+
+fn main() -> i64 {
+    if (mix_i64(30, 17) != 60) { return 1; }
+    if (mix_i64(-21, 9) != -42) { return 2; }
+    if (mix_i8(120 as i8, 20 as i8) != 120 as i8) { return 3; }
+    if (mix_u8(250 as u8, 20 as u8) != 250 as u8) { return 4; }
+    return 42;
+}

@@ -9,6 +9,10 @@
 // - SubstitutionPass ("subst"): MBA (Mixed Boolean-Arithmetic) instruction
 //   substitution. Replaces simple integer arithmetic with equivalent MBA
 //   expressions (e.g. a + b → (a ^ b) + 2*(a & b)).
+// - MBAExpansionPass ("mba_expand"): seed-selects integer Add/Sub/Mul-by-two
+//   sites and expands them into equivalent mixed boolean/arithmetic forms.
+// - ConstantEncodingPass ("const_encode"): replaces nontrivial integer
+//   constants with seeded arithmetic/bitwise computations of the same value.
 // - OpaquePredicatesPass ("opaque_pred"): splits one block and guards its
 //   continuation with a deterministic, mathematically fixed predicate.
 // - DeadCodeInjectionPass ("deadcode"): injects a pure computation chain whose
@@ -28,6 +32,18 @@ namespace ember::ext_obf {
 struct SubstitutionPass : EmberPassInfoMixin<SubstitutionPass> {
     static constexpr const char* pass_name = "subst";
     static constexpr bool is_required = true;  // obfuscation bypasses skip gates
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+struct MBAExpansionPass : EmberPassInfoMixin<MBAExpansionPass> {
+    static constexpr const char* pass_name = "mba_expand";
+    static constexpr bool is_required = true;
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+struct ConstantEncodingPass : EmberPassInfoMixin<ConstantEncodingPass> {
+    static constexpr const char* pass_name = "const_encode";
+    static constexpr bool is_required = true;
     EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
 };
 
