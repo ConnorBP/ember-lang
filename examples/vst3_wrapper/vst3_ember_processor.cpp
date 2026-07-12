@@ -8,6 +8,7 @@
 #include "codegen.hpp"
 #include "dispatch_table.hpp"
 #include "engine.hpp"
+#include "binding_builder.hpp"
 #include "ext_audio.hpp"
 #include "jit_memory.hpp"
 #include "lexer.hpp"
@@ -108,14 +109,15 @@ public:
             return false;
         }
 
-        const auto globalsLayout = ember::compute_typed_globals_layout(program, layouts);
-        globalStorage.assign(static_cast<size_t>(globalsLayout.total_size), 0);
+        const auto globalsLayout = ember::build_struct_layouts(program);
+        (void)globalsLayout;
+        globalStorage.assign(program.globals.size() * 8, 0);
         globals.base = reinterpret_cast<int64_t>(globalStorage.data());
         uint32_t globalIndex = 0;
         for (auto& global : program.globals) {
             globals.index[global.name] = globalIndex++;
-            globals.offsets[global.name] = globalsLayout.offsets.at(global.name);
-            globals.sizes[global.name] = globalsLayout.sizes.at(global.name);
+            globals.offsets[global.name] = int32_t((globalIndex - 1) * 8);
+            globals.sizes[global.name] = 8;
             globals.types[global.name] = global.ty.get();
         }
 
