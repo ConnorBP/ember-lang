@@ -674,6 +674,11 @@ bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
         ictx.script_slots = &slot_map;
         ictx.structs = &empty_structs;
         ictx.enable_ir_backend = true;  // emit_x64 is the IR-path emitter
+        // Never strip serialized budget/depth guard instructions while
+        // re-emitting v5 IR. Hosts that provide runtime guard storage get the
+        // same checks as the original JIT compilation; absent storage remains
+        // the documented no-op rather than silently changing the IR policy.
+        ictx.safe_defaults();
 
         for (auto& pf : parsed.functions) {
             if (pf.ir_blob.empty()) continue;  // raw-x86 fallback — skip

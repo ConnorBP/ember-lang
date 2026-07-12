@@ -525,9 +525,12 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
     ectx.has_checkpoint = false;
     if (opts.emit_em_path.empty()) ctx.trap_stub = reinterpret_cast<void*>(&ember_cli_trap);
     ctx.use_context_reg = opts.emit_em_path.empty();
-    ctx.emit_budget_checks = opts.emit_em_path.empty();
+    ctx.safe_defaults();
     ctx.max_call_depth = ectx.max_call_depth;
-    ctx.emit_depth_checks = opts.emit_em_path.empty();
+    if (!opts.emit_em_path.empty())
+        std::fprintf(stderr,
+            "ember: note: emitted modules retain sandbox guard metadata; the loading host "
+            "must provide execution context/checkpoint storage for runtime enforcement\n");
     std::vector<uint8_t> fn_allowlist = build_fn_allowlist(slots, int(slots.size()));
     if (opts.emit_em_path.empty()) {
         ctx.fn_allowlist_base = int64_t(fn_allowlist.data());

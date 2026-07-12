@@ -96,5 +96,6 @@ int64_t call_i64_i64(void* entry);
 // a host requiring recoverable traps must do that around the thunk call.
 int64_t ember_call_void(void* entry, context_t* ctx);
 int64_t ember_call_i64(void* entry, context_t* ctx, int64_t a);
+int64_t ember_call_i64_i64(void* entry, context_t* ctx, int64_t a, int64_t b);
 
 } // namespace ember

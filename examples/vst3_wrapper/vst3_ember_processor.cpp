@@ -9,6 +9,7 @@
 #include "public.sdk/source/vst/vstparameters.h"
 
 #include "codegen.hpp"
+#include "context.hpp"
 #include "dispatch_table.hpp"
 #include "engine.hpp"
 #include "binding_builder.hpp"
@@ -99,6 +100,14 @@ std::size_t crossfadeSamples() {
     if (end == configured || *end != '\0') return kDefaultCrossfadeSamples;
     return static_cast<std::size_t>(std::min<unsigned long long>(
         value, kMaxCrossfadeSamples));
+}
+
+extern "C" void vst3EmberTrap(ember::context_t* context, int reason,
+                                const char*) noexcept {
+    if (!context) return;
+    context->last_trap = static_cast<ember::TrapReason>(reason);
+    if (context->has_checkpoint)
+        __builtin_longjmp(context->checkpoint, 1);
 }
 
 enum class ScriptProfile { Gain, Delay, Filter, Oscillator };
@@ -257,6 +266,10 @@ public:
         context.natives = &natives;
         context.script_slots = &slots;
         context.structs = &layouts;
+        context.trap_stub = reinterpret_cast<void*>(&vst3EmberTrap);
+        context.use_context_reg = true;
+        context.max_call_depth = process_context.max_call_depth;
+        context.safe_defaults();
 
         functions.reserve(program.funcs.size());
         for (auto& fn : program.funcs) {
@@ -292,6 +305,27 @@ public:
         return true;
     }
 
+    bool callProcess(ProcessFn function, int64_t audioContext,
+                     int64_t frames) noexcept {
+        return guardedCall(process_context, reinterpret_cast<void*>(function), 2,
+                           audioContext, frames, nullptr);
+    }
+
+    bool callSaveState(int64_t& result) noexcept {
+        return guardedCall(state_context, reinterpret_cast<void*>(save_state),
+                           0, 0, 0, &result);
+    }
+
+    bool callLoadState(int64_t data, int64_t size) noexcept {
+        return guardedCall(state_context, reinterpret_cast<void*>(load_state),
+                           2, data, size, nullptr);
+    }
+
+    bool callReport(ReportSamplesFn function, int64_t& result) noexcept {
+        return guardedCall(report_context, reinterpret_cast<void*>(function),
+                           0, 0, 0, &result);
+    }
+
     void relinquishProcessPage() noexcept {
         for (auto& fn : functions) {
             if (fn.entry == reinterpret_cast<void*>(process_f32)) {
@@ -305,6 +339,32 @@ public:
         // it with the module object instead of allowing an unguarded delete.
     }
 
+private:
+    bool guardedCall(ember::context_t& executionContext, void* entry,
+                     int argumentCount, int64_t first, int64_t second,
+                     int64_t* result) noexcept {
+        if (!entry) return false;
+        executionContext.budget_remaining = 100000000;
+        executionContext.call_depth = 0;
+        executionContext.catch_depth = 0;
+        executionContext.last_trap = ember::TrapReason::None;
+        executionContext.has_checkpoint = true;
+        if (__builtin_setjmp(executionContext.checkpoint)) {
+            executionContext.has_checkpoint = false;
+            executionContext.call_depth = 0;
+            executionContext.catch_depth = 0;
+            return false;
+        }
+
+        int64_t value = argumentCount == 0
+            ? ember::ember_call_void(entry, &executionContext)
+            : ember::ember_call_i64_i64(entry, &executionContext, first, second);
+        executionContext.has_checkpoint = false;
+        if (result) *result = value;
+        return true;
+    }
+
+public:
     ember::Program program;
     std::unordered_map<std::string, int> slots;
     std::unordered_map<std::string, ember::NativeSig> natives;
@@ -313,6 +373,11 @@ public:
     std::vector<uint8_t> globalStorage;
     std::unique_ptr<ember::DispatchTable> dispatch;
     std::vector<ember::CompiledFn> functions;
+    // The DAW audio callback never contends on a checkpoint with state/report
+    // callbacks. JIT code obtains the active per-call context through r14.
+    ember::context_t process_context;
+    ember::context_t state_context;
+    ember::context_t report_context;
     ProcessFn process_f32 {nullptr};
     ProcessFn process_f64 {nullptr};
     SaveStateFn save_state {nullptr};
@@ -483,20 +548,23 @@ std::shared_ptr<EmberModule> EmberProcessor::activatePendingModule() noexcept {
     int64_t statePointer = 0;
     int64_t stateLength = 0;
     if (old && old->save_state) {
-        const auto* state = reinterpret_cast<const ScriptStateBuffer*>(old->save_state());
-        if (state && state->data && state->size > 0 &&
-            state->size <= static_cast<int64_t>(kMaxStateBytes)) {
-            statePointer = state->data;
-            stateLength = state->size;
+        int64_t savedAddress = 0;
+        if (old->callSaveState(savedAddress)) {
+            const auto* state = reinterpret_cast<const ScriptStateBuffer*>(savedAddress);
+            if (state && state->data && state->size > 0 &&
+                state->size <= static_cast<int64_t>(kMaxStateBytes)) {
+                statePointer = state->data;
+                stateLength = state->size;
+            }
         }
     }
     if (candidate->load_state)
-        candidate->load_state(statePointer, stateLength);
+        candidate->callLoadState(statePointer, stateLength);
 
     std::atomic_store_explicit(&current_, candidate, std::memory_order_release);
-    const auto boundedReport = [](ReportSamplesFn callback) -> uint32 {
-        if (!callback) return 0;
-        const int64_t value = callback();
+    const auto boundedReport = [candidate](ReportSamplesFn callback) -> uint32 {
+        int64_t value = 0;
+        if (!callback || !candidate->callReport(callback, value)) return 0;
         return value <= 0 ? 0u : static_cast<uint32>(std::min<int64_t>(value, kMaxInt32u));
     };
     latency_samples_.store(boundedReport(candidate->get_latency), std::memory_order_release);
@@ -580,9 +648,9 @@ tresult PLUGIN_API EmberProcessor::canProcessSampleSize(int32 sampleSize) {
 
 void EmberProcessor::refreshLatencyAndTail() noexcept {
     auto current = std::atomic_load_explicit(&current_, std::memory_order_acquire);
-    const auto boundedReport = [](ReportSamplesFn callback) -> uint32 {
-        if (!callback) return 0;
-        const int64_t value = callback();
+    const auto boundedReport = [current](ReportSamplesFn callback) -> uint32 {
+        int64_t value = 0;
+        if (!current || !callback || !current->callReport(callback, value)) return 0;
         return value <= 0 ? 0u : static_cast<uint32>(std::min<int64_t>(value, kMaxInt32u));
     };
     latency_samples_.store(boundedReport(current ? current->get_latency : nullptr),
@@ -793,7 +861,7 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
         auto old = activatePendingModule();
         auto current = std::atomic_load_explicit(&current_, std::memory_order_acquire);
 
-        const std::size_t fadeFrames = !sample64 && old && old->process_f32 &&
+        std::size_t fadeFrames = !sample64 && old && old->process_f32 &&
             crossfade_channels_[0]
             ? std::min<std::size_t>({crossfade_samples_,
                                      static_cast<std::size_t>(data.numSamples),
@@ -805,8 +873,10 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
             oldContext.output_buffer_ptr = reinterpret_cast<int64_t>(crossfade_channels_.data());
             oldContext.output_event_capacity = 0;
             oldContext.output_events_ptr = 0;
-            old->process_f32(reinterpret_cast<int64_t>(&oldContext),
-                             static_cast<int64_t>(fadeFrames));
+            if (!old->callProcess(old->process_f32,
+                                  reinterpret_cast<int64_t>(&oldContext),
+                                  static_cast<int64_t>(fadeFrames)))
+                fadeFrames = 0;
         }
 
         ProcessFn selectedProcess = sample64
@@ -816,7 +886,11 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
             bypass(data);
             return kResultOk;
         }
-        selectedProcess(reinterpret_cast<int64_t>(&context), data.numSamples);
+        if (!current->callProcess(selectedProcess,
+                                  reinterpret_cast<int64_t>(&context), data.numSamples)) {
+            bypass(data);
+            return kResultOk;
+        }
 
         // Linear old->new blend over the first N f32 samples. Both processors
         // see identical inputs and automation; only the new module remains active.
@@ -911,9 +985,9 @@ tresult PLUGIN_API EmberProcessor::setState(IBStream* state) {
     setParamNormalized(kGainParamId, span > 0.0f
         ? (parameter_values_[0] - parameter_minimums_[0]) / span : 0.0f);
     auto current = std::atomic_load_explicit(&current_, std::memory_order_acquire);
-    if (current && current->load_state) {
-        current->load_state(reinterpret_cast<int64_t>(scriptState.data()), scriptSize);
-    }
+    if (current && current->load_state &&
+        !current->callLoadState(reinterpret_cast<int64_t>(scriptState.data()), scriptSize))
+        return kResultFalse;
     return kResultOk;
 }
 
@@ -924,7 +998,9 @@ tresult PLUGIN_API EmberProcessor::getState(IBStream* state) {
     int64 scriptSize = 0;
     auto current = std::atomic_load_explicit(&current_, std::memory_order_acquire);
     if (current && current->save_state) {
-        const auto* saved = reinterpret_cast<const ScriptStateBuffer*>(current->save_state());
+        int64_t savedAddress = 0;
+        if (!current->callSaveState(savedAddress)) return kResultFalse;
+        const auto* saved = reinterpret_cast<const ScriptStateBuffer*>(savedAddress);
         if (saved && saved->data && saved->size > 0 &&
             saved->size <= static_cast<int64_t>(kMaxStateBytes)) {
             scriptBytes = reinterpret_cast<const uint8_t*>(saved->data);

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -230,17 +231,37 @@ bool instr_reads_off(const ThinInstr& in, int32_t off) {
 // instead of the bytes the CopyBytes wrote (hand-built IR repro confirmed
 // the LoadFrame was rewritten to a Move of the stale StoreFrame src).
 bool instr_writes_off(const ThinInstr& in, int32_t off) {
+    auto overlaps = [off](int32_t begin, int32_t bytes) {
+        // slot_const tracks scalar slots without a separate width. Treat each
+        // tracked slot as the backend's full eight-byte frame cell so partial,
+        // packed, or unaligned writes invalidate it too.
+        return bytes > 0 && begin < off + 8 && off < begin + bytes;
+    };
     if (in.op == ThinOp::CopyBytes) {
         // Dest is frame-relative when in.dst == 0 (no dest vreg) and the dest
         // side is not global-backed. copy_frame_frame / copy_global_frame set
         // meta.frame_off = dst_off; copy_frame_vptr / copy_global_vptr set
-        // in.dst to a vreg (dest is [vreg+0], not a frame slot). For a
-        // frame-relative dest, the written range is [frame_off, frame_off+len).
-        if (in.dst == 0 && in.meta.len > 0 &&
-            off >= in.meta.frame_off && off < in.meta.frame_off + in.meta.len)
-            return true;
-        return false;
+        // in.dst to a vreg (dest is [vreg+0], not a frame slot).
+        return in.dst == 0 && overlaps(in.meta.frame_off, in.meta.len);
     }
+    if (in.op == ThinOp::StoreFrame)
+        return in.src2 == 0 && overlaps(in.meta.frame_off,
+                                        std::max(in.meta.width, 1));
+    if (in.op == ThinOp::StructLitInit || in.op == ThinOp::ArrayLitInit)
+        return overlaps(in.meta.frame_off + in.meta.field_off,
+                        std::max(in.meta.width, 1));
+    if (in.op == ThinOp::StringDecrypt)
+        return overlaps(in.meta.data_temp_off, in.meta.len) ||
+               overlaps(in.meta.frame_off, 16);
+    // An indirect store can alias any address-taken frame slot.
+    if (in.op == ThinOp::StoreAddr) return true;
+
+    // Most value producers with a frame_off implicitly pin their result to
+    // that frame slot. An ordinary LoadFrame instead READS frame_off; only a
+    // computed-address load (src1 != 0) uses it as a result spill slot.
+    if (in.dst != 0 && in.meta.frame_off != 0 &&
+        (in.op != ThinOp::LoadFrame || in.src1 != 0))
+        return overlaps(in.meta.frame_off, std::max(in.meta.width, 1));
     return false;
 }
 
@@ -268,6 +289,16 @@ EmberPreserved ConstPropPass::run(ThinFunction& f, EmberAnalysisManager&) {
         };
 
         for (auto& in : blk.instrs) {
+            // Kill constants before processing every write, not just explicit
+            // StoreFrame. Thin lowering frame-backs many producer results via
+            // meta.frame_off, and aggregate/indirect writes can alias a tracked
+            // slot. Keeping the old fact across either write miscompiled the
+            // following LoadFrame. Constant producers re-establish their fact
+            // in the switch below.
+            for (auto it = slot_const.begin(); it != slot_const.end(); ) {
+                if (instr_writes_off(in, it->first)) it = slot_const.erase(it);
+                else ++it;
+            }
             switch (in.op) {
             case ThinOp::ConstInt:
                 vreg_const[in.dst] = {true, in.imm.i};
@@ -694,30 +725,43 @@ EmberPreserved CSEPass::run(ThinFunction& f, EmberAnalysisManager&) {
     bool changed = false;
 
     for (auto& blk : f.blocks) {
-        // Table: key → (first_dst VReg, index of the first instr).
-        // Key = op + src1 + src2 + imm.i + width + cmp + frame_off + base_kind + addend.
+        // Include every field that can change instruction semantics. The old
+        // key collapsed signed/unsigned shifts and compares, f32/f64 values,
+        // different float immediates, types, and aggregate lengths into one
+        // expression, allowing CSE to substitute a value with different bits.
         struct CSEKey {
             uint16_t op;
             VReg src1, src2;
             int64_t imm_i;
-            int32_t width, frame_off;
-            uint8_t cmp, base_kind;
+            uint64_t imm_f_bits;
+            int32_t width, frame_off, len, slot, mod_id, field_off, data_temp_off;
+            uint8_t cmp, base_kind, is_unsigned, is_f32, trap_reason;
             uint32_t addend;
+            const Type* type;
             bool operator==(const CSEKey& o) const {
                 return op == o.op && src1 == o.src1 && src2 == o.src2 &&
-                       imm_i == o.imm_i && width == o.width &&
-                       frame_off == o.frame_off && cmp == o.cmp &&
-                       base_kind == o.base_kind && addend == o.addend;
+                       imm_i == o.imm_i && imm_f_bits == o.imm_f_bits &&
+                       width == o.width && frame_off == o.frame_off &&
+                       len == o.len && slot == o.slot && mod_id == o.mod_id &&
+                       field_off == o.field_off && data_temp_off == o.data_temp_off &&
+                       cmp == o.cmp && base_kind == o.base_kind &&
+                       is_unsigned == o.is_unsigned && is_f32 == o.is_f32 &&
+                       trap_reason == o.trap_reason && addend == o.addend &&
+                       type == o.type;
             }
         };
         struct CSEKeyHash {
             size_t operator()(const CSEKey& k) const {
                 size_t h = k.op;
-                h = h * 31 + k.src1;
-                h = h * 31 + k.src2;
-                h = h * 31 + std::hash<int64_t>()(k.imm_i);
-                h = h * 31 + k.width;
-                h = h * 31 + k.frame_off;
+                auto mix = [&h](size_t value) { h ^= value + 0x9e3779b9u + (h << 6) + (h >> 2); };
+                mix(k.src1); mix(k.src2);
+                mix(std::hash<int64_t>()(k.imm_i));
+                mix(std::hash<uint64_t>()(k.imm_f_bits));
+                mix(uint32_t(k.width)); mix(uint32_t(k.frame_off)); mix(uint32_t(k.len));
+                mix(uint32_t(k.slot)); mix(uint32_t(k.mod_id)); mix(uint32_t(k.field_off));
+                mix(uint32_t(k.data_temp_off)); mix(k.cmp); mix(k.base_kind);
+                mix(k.is_unsigned); mix(k.is_f32); mix(k.trap_reason); mix(k.addend);
+                mix(std::hash<const Type*>()(k.type));
                 return h;
             }
         };
@@ -760,11 +804,16 @@ EmberPreserved CSEPass::run(ThinFunction& f, EmberAnalysisManager&) {
                 continue;
             }
 
+            uint64_t floatBits = 0;
+            static_assert(sizeof(floatBits) == sizeof(in.imm.f));
+            std::memcpy(&floatBits, &in.imm.f, sizeof(floatBits));
             CSEKey key{
                 static_cast<uint16_t>(in.op), in.src1, in.src2,
-                in.imm.i, in.meta.width, in.meta.frame_off,
-                in.meta.cmp, static_cast<uint8_t>(in.meta.base_kind),
-                in.meta.addend
+                in.imm.i, floatBits, in.meta.width, in.meta.frame_off,
+                in.meta.len, in.meta.slot, in.meta.mod_id, in.meta.field_off,
+                in.meta.data_temp_off, in.meta.cmp,
+                static_cast<uint8_t>(in.meta.base_kind), in.meta.is_unsigned,
+                in.meta.is_f32, in.meta.trap_reason, in.meta.addend, in.meta.type
             };
 
             auto found = table.find(key);
@@ -995,6 +1044,17 @@ EmberPreserved StoreToLoadForwardPass::run(ThinFunction& f, EmberAnalysisManager
         // Map: frame_off → VReg of the last StoreFrame's src1.
         std::unordered_map<int32_t, VReg> last_store_src;
         for (auto& in : blk.instrs) {
+            // Thin IR is SSA-like but deserialized/hand-built IR and later
+            // transforms are not required to preserve strict SSA. Forwarding
+            // the VReg name after it is redefined would read the NEW value,
+            // not the value captured by the earlier store. CopyBytes is the
+            // exception: its dst field is an input destination pointer.
+            if (in.dst != 0 && in.op != ThinOp::CopyBytes) {
+                for (auto it = last_store_src.begin(); it != last_store_src.end(); ) {
+                    if (it->second == in.dst) it = last_store_src.erase(it);
+                    else ++it;
+                }
+            }
             if (in.op == ThinOp::StoreFrame) {
                 // Record the store (or update it).
                 last_store_src[in.meta.frame_off] = in.src1;
@@ -1015,18 +1075,7 @@ EmberPreserved StoreToLoadForwardPass::run(ThinFunction& f, EmberAnalysisManager
                 // A LoadFrame does NOT kill the store (the value is still there).
                 continue;
             }
-            // Any other instruction that writes to a VReg could invalidate a
-            // store if the VReg was the store's source. But since we're only
-            // tracking frame_off → src VReg, and the src VReg is the value AT
-            // THE TIME of the store (VRegs are SSA — each VReg is written
-            // exactly once by thin_lower's monotonic new_vreg, so the src VReg
-            // is never redefined), a subsequent redefinition cannot happen.
-            // So we don't need to kill on VReg redefinition — the frame slot
-            // holds the value that was stored, regardless of what happens to
-            // the VReg later. This is correct because we're forwarding the
-            // VALUE that was stored, not the VReg itself.
-            //
-            // HOWEVER: an instruction that WRITES the frame slot directly
+            // An instruction that WRITES the frame slot directly
             // (CopyBytes whose dest range covers the slot) overwrites the
             // stored value, so a later LoadFrame must re-read the slot (not
             // forward the now-stale StoreFrame src). Kill any pending forward

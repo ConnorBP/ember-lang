@@ -73,9 +73,10 @@ struct CodeGenCtx {
     // before calling sema; the JIT'd code decrypts on the stack at each use.
 
     // --- v0.4 safety: non-local trap + budgets (docs/spec/SAFETY_AND_SANDBOX.md §2-§4) ---
-    // All compile-flag GATED for zero overhead when disabled. A host running
-    // trusted tool scripts leaves these off/null -> no new JIT instructions.
-    // A host running untrusted mods sets them -> one coarse sub+jg at each
+    // All compile-flag GATED for zero overhead when disabled. Hosts should call
+    // safe_defaults() before compiling untrusted code, then wire either the
+    // pointer fields below or use_context_reg. Enabled checks add one coarse
+    // sub+jg at each
     // function entry plus existing loop back-edges (budget), one balanced
     // inc+cmp+jcc/dec around every script-issued script or native invocation
     // (combined call-stack depth), and traps route through the stub instead
@@ -108,6 +109,16 @@ struct CodeGenCtx {
     int32_t* depth_ptr = nullptr;
     int32_t max_call_depth = 512;
     bool emit_depth_checks = false;
+
+    // Secure opt-in as one operation, avoiding the historically unsafe pattern
+    // where a host remembered only one of the independent guard flags. Pointer
+    // mode still requires budget_ptr/depth_ptr; context-register mode reads the
+    // fields from the per-call context.
+    CodeGenCtx& safe_defaults() noexcept {
+        emit_budget_checks = true;
+        emit_depth_checks = true;
+        return *this;
+    }
 
     // v1.0 thread-safety (Option B1, docs/planning/plan_CONTEXT_THREADSAFETY.md): when true,
     // the budget/depth/trap emit reads context_t fields through a context register

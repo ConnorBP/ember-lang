@@ -219,6 +219,7 @@ CompiledFn compile_native_passthrough_2arg(void* native_fn) {
 #if defined(__GNUC__) && defined(__x86_64__)
 extern "C" int64_t ember_call_void_thunk(void*, context_t*);
 extern "C" int64_t ember_call_i64_thunk(void*, context_t*, int64_t);
+extern "C" int64_t ember_call_i64_i64_thunk(void*, context_t*, int64_t, int64_t);
 
 asm(
     ".text\n"
@@ -245,6 +246,19 @@ asm(
     "  addq $32, %rsp\n"
     "  popq %r14\n"
     "  retq\n"
+    ".p2align 4\n"
+    ".globl ember_call_i64_i64_thunk\n"
+    "ember_call_i64_i64_thunk:\n"
+    "  pushq %r14\n"
+    "  subq $32, %rsp\n"
+    "  movq %rcx, %r11\n"        // entry
+    "  movq %rdx, %r14\n"        // B1 context
+    "  movq %r8, %rcx\n"         // JIT arg 0
+    "  movq %r9, %rdx\n"         // JIT arg 1
+    "  callq *%r11\n"
+    "  addq $32, %rsp\n"
+    "  popq %r14\n"
+    "  retq\n"
 );
 
 int64_t ember_call_void(void* entry, context_t* ctx) {
@@ -252,6 +266,9 @@ int64_t ember_call_void(void* entry, context_t* ctx) {
 }
 int64_t ember_call_i64(void* entry, context_t* ctx, int64_t a) {
     return ember_call_i64_thunk(entry, ctx, a);
+}
+int64_t ember_call_i64_i64(void* entry, context_t* ctx, int64_t a, int64_t b) {
+    return ember_call_i64_i64_thunk(entry, ctx, a, b);
 }
 #else
 #error "B1 context thunks require MinGW GNU assembly on x64; MSVC x64 not yet supported; use MinGW"

@@ -898,6 +898,83 @@ int main() {
         ck(!stale_move, "D11.2: no stale Move vload=v0 (forward correctly killed by CopyBytes write)");
     }
 
+    // -----------------------------------------------------------------
+    // D12: ConstProp must invalidate a frame-slot fact when a non-constant
+    // producer implicitly writes its result through meta.frame_off.
+    // -----------------------------------------------------------------
+    std::printf("\n--- D12: constprop invalidates implicit frame writes ---\n");
+    {
+        ThinFunction tf; tf.name = "constprop_implicit_writer";
+        const VReg oldValue=1, callValue=2, loaded=3, sum=4;
+        ThinBlock b0; b0.id=0;
+        { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=oldValue; x.imm.i=5;
+          x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::CallNative; x.dst=callValue;
+          x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=loaded;
+          x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=sum; x.src1=loaded; x.imm.i=1;
+          x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        b0.term.kind=TermKind::Return; b0.term.ret=sum;
+        tf.blocks.push_back(std::move(b0));
+        EmberAnalysisManager am; auto pass=reg.create("constprop"); pass->run(tf,am);
+        bool staleFold=false;
+        for (const auto& in : tf.blocks[0].instrs)
+            if (in.dst==sum && in.op==ThinOp::ConstInt && in.imm.i==6) staleFold=true;
+        ck(!staleFold, "D12.1: implicit producer write kills stale slot constant");
+    }
+
+    // -----------------------------------------------------------------
+    // D13: CSE keys include floating immediates and signedness.
+    // -----------------------------------------------------------------
+    std::printf("\n--- D13: CSE semantic fields ---\n");
+    {
+        ThinFunction tf; tf.name = "cse_semantic_fields";
+        ThinBlock b0; b0.id=0;
+        { ThinInstr x; x.op=ThinOp::ConstFloat; x.dst=1; x.imm.f=1.0;
+          x.meta.is_f32=1; x.meta.width=4; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::ConstFloat; x.dst=2; x.imm.f=2.0;
+          x.meta.is_f32=1; x.meta.width=4; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::Shr; x.dst=3; x.src1=5; x.src2=6;
+          x.meta.width=8; x.meta.is_unsigned=0; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::Shr; x.dst=4; x.src1=5; x.src2=6;
+          x.meta.width=8; x.meta.is_unsigned=1; b0.instrs.push_back(std::move(x)); }
+        b0.term.kind=TermKind::Return; b0.term.ret=4;
+        tf.blocks.push_back(std::move(b0));
+        EmberAnalysisManager am; auto pass=reg.create("cse"); pass->run(tf,am);
+        bool secondFloat=false, unsignedShift=false;
+        for (const auto& in : tf.blocks[0].instrs) {
+            if (in.dst==2 && in.op==ThinOp::ConstFloat) secondFloat=true;
+            if (in.dst==4 && in.op==ThinOp::Shr && in.meta.is_unsigned) unsignedShift=true;
+        }
+        ck(secondFloat, "D13.1: distinct float immediate is not CSE'd");
+        ck(unsignedShift, "D13.2: unsigned shift is not CSE'd with signed shift");
+    }
+
+    // -----------------------------------------------------------------
+    // D14: Forward must not use a stored source VReg after redefinition.
+    // -----------------------------------------------------------------
+    std::printf("\n--- D14: forward kills redefined source VReg ---\n");
+    {
+        ThinFunction tf; tf.name = "forward_redefined_source";
+        ThinBlock b0; b0.id=0;
+        { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=1; x.imm.i=5;
+          x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::StoreFrame; x.src1=1;
+          x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=1; x.imm.i=9;
+          x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=2;
+          x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        b0.term.kind=TermKind::Return; b0.term.ret=2;
+        tf.blocks.push_back(std::move(b0));
+        EmberAnalysisManager am; auto pass=reg.create("forward"); pass->run(tf,am);
+        bool loadPreserved=false;
+        for (const auto& in : tf.blocks[0].instrs)
+            if (in.dst==2 && in.op==ThinOp::LoadFrame) loadPreserved=true;
+        ck(loadPreserved, "D14.1: load is not forwarded from a redefined source VReg");
+    }
+
     std::printf("\n%s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }

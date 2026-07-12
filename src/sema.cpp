@@ -940,6 +940,25 @@ struct Checker {
                 e.loc.line, e.loc.col);
     }
 
+    // The default closure backend stores captured values in the creating
+    // function's stack frame.  Consequently, even a by-value closure has a
+    // dangling env_ptr if it is returned, stored globally, or handed to an API
+    // that retains it.  Sema cannot know whether a particular host will later
+    // select CodeGenCtx::use_gc_env, so preserve the GC-supported program but
+    // make every definite escape visible.  By-ref escapes remain hard errors:
+    // a GC-allocated environment still contains pointers into the dead frame.
+    void report_lambda_env_escape(const Expr& e, const std::string& destination) {
+        if (!e.ty || !e.ty->is_lambda) return;
+        if (is_by_ref_capturing_lambda(e)) {
+            reject_by_ref_lambda_escape(e);
+            return;
+        }
+        warn("lambda " + destination +
+             " may outlive its stack-allocated capture environment; compile with "
+             "GC lambda environments or keep the lambda within its creating frame",
+             e.loc.line, e.loc.col);
+    }
+
     // iterable() hook (Tier 1, array case): infer the element type of an
     // array<T> handle from its creation expression. `array_new(elem_size, n)`
     // is the only way a handle is minted in script, and elem_size statically
@@ -1377,7 +1396,7 @@ struct Checker {
                 "may retain the pointer past the frame. Materialize it to a "
                 "`string` handle or a rodata/global-backed slice first.",
                 arg.loc.line, arg.loc.col);
-        reject_by_ref_lambda_escape(arg);
+        report_lambda_env_escape(arg, "passed to an opaque callee");
     }
 
     static bool is_lvalue(const Expr& e) {
@@ -2057,7 +2076,11 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                             "Materialize it to a `string` handle or a rodata/global-"
                             "backed slice first.",
                             c->receiver->loc.line, c->receiver->loc.col);
-                    reject_by_ref_lambda_escape(*c->receiver);
+                    if (nit->second.retains && got && got->is_lambda)
+                        report_lambda_env_escape(*c->receiver,
+                            "passed to retaining native '" + c->name + "'");
+                    else
+                        reject_by_ref_lambda_escape(*c->receiver);
                     off = 1;
                 }
                 for (size_t i = 0; i < c->args.size(); ++i) {
@@ -2087,7 +2110,11 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                             "the frame. Materialize it to a `string` handle or a "
                             "rodata/global-backed slice first.",
                             c->args[i]->loc.line, c->args[i]->loc.col);
-                    reject_by_ref_lambda_escape(*c->args[i]);
+                    if (nit->second.retains && got && got->is_lambda)
+                        report_lambda_env_escape(*c->args[i],
+                            "passed to retaining native '" + c->name + "'");
+                    else
+                        reject_by_ref_lambda_escape(*c->args[i]);
                 }
                 // Compile-time assertion folding (efficiency ask, part 2):
                 // when BOTH arguments to an assert_eq_* call are compile-time
@@ -2451,10 +2478,10 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                 if (gi != globals.end() && local_view)
                     err("cannot store a slice/view derived from a stack local in a global",
                         a->loc.line, a->loc.col);
-                if (gi != globals.end() && by_ref_lambda)
-                    reject_by_ref_lambda_escape(*a->value);
+                if (gi != globals.end() && rt && rt->is_lambda)
+                    report_lambda_env_escape(*a->value, "stored in global '" + tid->name + "'");
             }
-        } else if (rt && rt->is_slice && is_local_array_view(*a->value)) {
+        } else if (rt && (rt->is_slice || rt->is_lambda)) {
             // C2b: the target is a FieldExpr (gs.data = s;) or IndexExpr
             // (garr[0] = s;). Chase to the root base; if it is a GLOBAL, the
             // store escapes the frame (the slice ptr would dangle into the
@@ -2479,10 +2506,15 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
             if (auto* rid = dynamic_cast<const Ident*>(root)) {
                 if (!lookup_local_var(rid->name)) {
                     auto gi = globals.find(rid->name);
-                    if (gi != globals.end())
-                        err("cannot store a slice/view derived from a stack local into a "
-                            "field/element of a global '" + rid->name + "'",
-                            a->loc.line, a->loc.col);
+                    if (gi != globals.end()) {
+                        if (rt->is_slice && is_local_array_view(*a->value))
+                            err("cannot store a slice/view derived from a stack local into a "
+                                "field/element of a global '" + rid->name + "'",
+                                a->loc.line, a->loc.col);
+                        if (rt->is_lambda)
+                            report_lambda_env_escape(*a->value,
+                                "stored in a field/element of global '" + rid->name + "'");
+                    }
                 }
             }
         }
@@ -2874,7 +2906,8 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
             if (vt && vt->is_slice && is_local_array_view(*rs->value))
                 err("cannot return a slice/view derived from a stack local",
                     rs->loc.line, rs->loc.col);
-            reject_by_ref_lambda_escape(*rs->value);
+            if (vt && vt->is_lambda)
+                report_lambda_env_escape(*rs->value, "returned from a function");
             // A struct-returning function's `return` value may be (a) a bare
             // local (codegen copies its bytes through the hidden return
             // pointer), (b) a call to a function with the SAME struct return
@@ -4824,7 +4857,8 @@ SemaResult sema(Program& prog,
         c.aggregate_cast_init = g.init.get();
         const Type* got = c.check_value(g.init, want);
         c.aggregate_cast_init = saved_aggregate_cast_init;
-        c.reject_by_ref_lambda_escape(*g.init);
+        if (got && got->is_lambda)
+            c.report_lambda_env_escape(*g.init, "stored in global '" + g.name + "'");
         if (!Checker::types_compatible(want, got))
             c.err("global initializer type mismatch (" + want->to_string() + " = " +
                   got->to_string() + ")", g.loc.line, g.loc.col);
