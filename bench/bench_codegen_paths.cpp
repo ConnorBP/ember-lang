@@ -130,7 +130,7 @@ struct BenchModule {
     BenchModule(int n) : table(n) {}
 };
 
-static std::unique_ptr<BenchModule> ember_compile(const std::string& src, bool safety_on, uint8_t string_xor, bool ir_safe = true) {
+static std::unique_ptr<BenchModule> ember_compile(const std::string& src, bool safety_on, uint8_t string_xor, bool ir_safe = true, bool passes_on = false) {
     auto t0 = std::chrono::steady_clock::now();  // compile-time start
     auto m = std::make_unique<BenchModule>(8);
     auto lr = tokenize(src, "<bench>");
@@ -191,13 +191,38 @@ static std::unique_ptr<BenchModule> ember_compile(const std::string& src, bool s
             if (s == "1" || s == "on" || s == "true") ctx.enable_ir_backend = true;
         }
     }
-    // Stage C: EMBER_IR_PASS="constprop,cse,dce" — build a pass pipeline from
-    // the opt extension registry and run it between lower_function and emit_x64.
-    // Only effective when enable_ir_backend is on (set above or by EMBER_IR_BACKEND).
+    // Stage C: --passes flag (bench harness). Forces the IR backend + the
+    // standard 7-pass optimization pipeline + Stage 3 linear-scan regalloc —
+    // the exact configuration the CLI's `--passes` enables (examples/ember_cli.cpp:
+    // enable_ir_backend + enable_regalloc + pass_manager). Only for ir_safe
+    // paths; slices/strings/structs are Stage A IR-backend gaps (thin_lower does
+    // not lower them), so the tree-walker stays the correctness path there and
+    // the harness reports nopass only for those paths.
+    //
+    // Pipeline (docs/audit/FINAL_SPEED_AUDIT_2026-07-11.md §5):
+    //   constprop,forward,copyprop,instcombine,dce,licm,dse
+    // (value-preserving: validation returns 177 with and without.)
+    //
+    // NOTE: the EMBER_IR_PASS env-var path below does NOT enable regalloc —
+    // that gap is exactly what --passes closes (the audit's TODO #1).
     EmberPassRegistry pass_reg;
     ext_opt::register_passes(pass_reg);
     EmberPassManager pass_pm;
-    if (ctx.enable_ir_backend) {
+    if (passes_on && ir_safe) {
+        ctx.enable_ir_backend = true;
+        ctx.enable_regalloc   = true;
+        static constexpr const char* kPassPipeline =
+            "constprop,forward,copyprop,instcombine,dce,licm,dse";
+        std::string pass_err;
+        if (build_pipeline_from_string(kPassPipeline, pass_reg, pass_pm, &pass_err)) {
+            ctx.pass_manager = &pass_pm;
+        } else {
+            std::fprintf(stderr, "  --passes pipeline: %s\n", pass_err.c_str());
+        }
+    } else if (ctx.enable_ir_backend) {
+        // EMBER_IR_PASS env var (the existing ad-hoc knob; only when the IR
+        // backend is already on via EMBER_IR_BACKEND). Unchanged behavior —
+        // this path does NOT enable regalloc (the gap --passes closes).
         if (const char* o = std::getenv("EMBER_IR_PASS")) {
             std::string spec(o);
             if (!spec.empty()) {
@@ -449,7 +474,50 @@ static const char* verdict(double r) {
     return "ember MUCH slower (SSA-IR warranted)";
 }
 
+// ---- results storage (path × safety × engine × config) ----
+// `config` is "nopass" (tree-walker, the default) or "passes" (IR backend +
+// 7-pass pipeline + Stage 3 regalloc, only for ir_safe paths). Baseline (g++-O2)
+// cells carry config "baseline". Lookups use find_cell (no index-pairing —
+// passes mode emits 2 ember cells + 1 baseline per (path,safety)).
+struct Cell {
+    const char* path; const char* safety; const char* engine; const char* config;
+    Stats st;
+    double compile_ns = 0; size_t code_bytes = 0; size_t ir_instrs = 0;
+};
+
+static const Cell* find_cell(const std::vector<Cell>& cells,
+                             const char* path, const char* safety,
+                             const char* engine, const char* config) {
+    for (const auto& c : cells)
+        if (strcmp(c.path, path) == 0 && strcmp(c.safety, safety) == 0
+            && strcmp(c.engine, engine) == 0 && strcmp(c.config, config) == 0)
+            return &c;
+    return nullptr;
+}
+
 int main(int argc, char** argv) {
+    // ---- parse args: --passes flag + first positional = baseline DLL path ----
+    // --passes: also run each ir_safe path through the IR backend + the 7-pass
+    // pipeline (constprop,forward,copyprop,instcombine,dce,licm,dse) + Stage 3
+    // regalloc, and report BOTH nopass + passes numbers per path (the audit's
+    // TODO #1: docs/audit/FINAL_SPEED_AUDIT_2026-07-11.md §5/§8).
+    bool passes_flag = false;
+    const char* dll = nullptr;
+    for (int i = 1; i < argc; ++i) {
+        std::string a(argv[i]);
+        if (a == "--passes") { passes_flag = true; continue; }
+        if (a == "--help" || a == "-h") {
+            std::printf("usage: bench_codegen_paths [baseline_dll] [--passes]\n"
+                        "  --passes   also run each ir_safe path through the IR backend +\n"
+                        "             7-pass pipeline (constprop,forward,copyprop,instcombine,\n"
+                        "             dce,licm,dse) + Stage 3 regalloc; report nopass vs passes.\n");
+            return 0;
+        }
+        if (a.rfind("--", 0) == 0) continue;   // ignore unknown flags
+        if (!dll) dll = argv[i];                // first positional = DLL path
+    }
+    if (!dll) dll = "bench/baseline_paths.dll";
+
     std::printf("=== ember per-path codegen bench (prototype) ===\n");
     std::printf("    docs/spec/BENCHMARK_SYSTEM_DESIGN.md — gate: DESIGN §9 / COMPILER_PIPELINE §5\n\n");
     std::printf("#   compiler: %s %s\n", kCc, kCcVer);
@@ -466,11 +534,14 @@ int main(int argc, char** argv) {
         std::printf("#   stage1_opts: %s\n", o);
     else
         std::printf("#   stage1_opts: (none — flags off, byte-identical baseline)\n");
-    std::printf("#   date:     %s %s\n\n", __DATE__, __TIME__);
+    std::printf("#   passes:    %s\n", passes_flag
+        ? "ON — IR backend + constprop,forward,copyprop,instcombine,dce,licm,dse + regalloc"
+        : "off (tree-walker baseline; pass --passes to enable)");
+    std::printf("#   date:      %s %s\n\n", __DATE__, __TIME__);
 
     // ---- load the g++ -O2 baseline DLL (compiled at runtime by run_bench.sh) ----
-    // The baseline MUST exist (stale-probe discipline: compile-from-source each run).
-    const char* dll = argc > 1 ? argv[1] : "bench/baseline_paths.dll";
+    // The baseline MUST exist (stale-probe discipline: compile-from-source each
+    // run). `dll` was resolved by the arg scan above (first positional arg).
     HMODULE hBaseline = LoadLibraryA(dll);
     if (!hBaseline) {
         std::fprintf(stderr, "ERROR: could not load g++ -O2 baseline DLL '%s' (err=%lu).\n"
@@ -482,9 +553,7 @@ int main(int argc, char** argv) {
 
     auto paths = make_paths();
 
-    // ---- results storage (path × safety × engine) ----
-    struct Cell { const char* path; const char* safety; const char* engine; Stats st;
-                  double compile_ns = 0; size_t code_bytes = 0; size_t ir_instrs = 0; };
+    // ---- results storage (path × safety × engine × config) ----
     std::vector<Cell> cells;
 
     bool any_compile_fail = false;
@@ -513,50 +582,73 @@ int main(int argc, char** argv) {
             src.replace(pos, 2, std::to_string(p.inner_n));
         }
 
+        // The configs to run for this path. --passes adds a passes-on config
+        // (IR backend + 7-pass pipeline + Stage 3 regalloc) for ir_safe paths.
+        // Non-ir_safe paths (slices/strings/structs) are Stage A IR-backend gaps
+        // — the tree-walker (nopass) stays the only correctness path there.
+        struct RunCfg { const char* label; bool passes_on; };
+        std::vector<RunCfg> cfgs = {{"nopass", false}};
+        if (passes_flag && p.ir_safe) cfgs.push_back({"passes", true});
+        if (passes_flag && !p.ir_safe)
+            std::printf("  [passes] skipped — ir_safe=false (Stage A IR-backend gap; tree-walker only)\n");
+
         for (bool safety_on : {false, true}) {
             const char* mode = safety_on ? "on" : "off";
-            auto m = ember_compile(src, safety_on, p.string_xor, p.ir_safe);
-            if (!m || m->fns.empty()) { std::fprintf(stderr, "  ember compile FAILED (%s)\n", mode); any_compile_fail = true; continue; }
-            // Stage C: compile-time + code-size + IR-instr-count metrics.
-            // Printed once per (path, safety) cell so the pass system can gate
-            // on compile overhead + instr-count reduction + code-size delta.
-            std::printf("  [compile] safety=%-3s  compile=%8.0f ns  code=%5zu B  ir_instrs=%zu\n",
-                        mode, m->compile_ns, m->code_bytes, m->ir_instr_count);
-            context_t ectx;
-            ectx.max_call_depth = 8192;       // generous: we measure guard cost, not trap behavior
-            ectx.budget_remaining = INT64_MAX;
-            Stats es = time_ember(*m, ectx, p.iters, p.warmup);
-            if (es.trapped) {
-                std::fprintf(stderr, "  ember TRAP (safety=%s): %s\n", mode, ectx.last_error.c_str());
-                cells.push_back({p.name, mode, "ember", es, m->compile_ns, m->code_bytes, m->ir_instr_count});
-                continue;
-            }
-            // correctness check (ember vs g++ -O2 reference) — only for paths
-            // where ember and the baseline do the SAME work. string_decrypt's
-            // baseline is a non-decrypt reference (the delta IS the finding), so
-            // byte-equality is not the invariant there.
-            if (p.check_correctness && es.result != ref) {
-                std::fprintf(stderr, "  MISMATCH (safety=%s): ember=%lld g++-O2=%lld\n",
-                             mode, (long long)es.result, (long long)ref);
-                // record the mismatch but keep timing (the mismatch itself is data)
-            }
-            cells.push_back({p.name, mode, "ember", es, m->compile_ns, m->code_bytes, m->ir_instr_count});
+            // time the g++ -O2 baseline once per (path, safety) — it is the
+            // same reference for every ember config, so we don't re-time it per
+            // config (keeps the passes/nopass comparison against ONE baseline).
             Stats bs = time_baseline(bfn, p.inner_n, p.iters, p.warmup);
-            cells.push_back({p.name, mode, "gcc_O2", bs});
+            cells.push_back({p.name, mode, "gcc_O2", "baseline", bs, 0, 0, 0});
 
-            std::printf("  safety=%-3s  ember median=%9.1f ns  g++-O2 median=%9.1f ns  ratio=%6.2f  [%s]\n",
-                        mode, es.median, bs.median, es.median / bs.median,
-                        verdict(es.median / bs.median));
-            // Paired/interleaved comparison + bootstrap 95% CI (kills shared-
-            // mode noise — the separate-loop ratio above can drift if system
-            // state changes between the ember and baseline timing windows).
-            if (!es.trapped) {
+            for (const auto& cfg : cfgs) {
+                auto m = ember_compile(src, safety_on, p.string_xor, p.ir_safe, cfg.passes_on);
+                if (!m || m->fns.empty()) {
+                    std::fprintf(stderr, "  ember compile FAILED (safety=%s cfg=%s)\n", mode, cfg.label);
+                    any_compile_fail = true; continue;
+                }
+                // Stage C: compile-time + code-size + IR-instr-count metrics.
+                // ir_instrs is the PRE-pass ThinFunction instr count (the IR
+                // backend builds the IR; passes then reduce it before emit). For
+                // nopass (tree-walker) ir_instrs stays 0 — no IR is built.
+                std::printf("  [compile] safety=%-3s cfg=%-6s compile=%8.0f ns  code=%5zu B  ir_instrs=%zu\n",
+                            mode, cfg.label, m->compile_ns, m->code_bytes, m->ir_instr_count);
+                context_t ectx;
+                ectx.max_call_depth = 8192;       // generous: we measure guard cost, not trap behavior
+                ectx.budget_remaining = INT64_MAX;
+                Stats es = time_ember(*m, ectx, p.iters, p.warmup);
+                if (es.trapped) {
+                    std::fprintf(stderr, "  ember TRAP (safety=%s cfg=%s): %s\n",
+                                 mode, cfg.label, ectx.last_error.c_str());
+                    cells.push_back({p.name, mode, "ember", cfg.label, es,
+                                     m->compile_ns, m->code_bytes, m->ir_instr_count});
+                    continue;
+                }
+                // correctness check (ember vs g++ -O2 reference) — only for paths
+                // where ember and the baseline do the SAME work. string_decrypt's
+                // baseline is a non-decrypt reference (the delta IS the finding),
+                // so byte-equality is not the invariant there. Run for BOTH
+                // configs: the passes are value-preserving (validation 177), so a
+                // passes-on mismatch is a real regression signal (recorded, not
+                // fatal — the mismatch itself is data).
+                if (p.check_correctness && es.result != ref) {
+                    std::fprintf(stderr, "  MISMATCH (safety=%s cfg=%s): ember=%lld g++-O2=%lld\n",
+                                 mode, cfg.label, (long long)es.result, (long long)ref);
+                }
+                cells.push_back({p.name, mode, "ember", cfg.label, es,
+                                 m->compile_ns, m->code_bytes, m->ir_instr_count});
+
+                std::printf("  safety=%-3s cfg=%-6s ember median=%9.1f ns  g++-O2 median=%9.1f ns  ratio=%6.2f  [%s]\n",
+                            mode, cfg.label, es.median, bs.median, es.median / bs.median,
+                            verdict(es.median / bs.median));
+                // Paired/interleaved comparison + bootstrap 95% CI (kills shared-
+                // mode noise — the separate-loop ratio above can drift if system
+                // state changes between the ember and baseline timing windows).
                 context_t pctx; pctx.max_call_depth = 8192; pctx.budget_remaining = INT64_MAX;
                 PairedStats ps = time_paired(*m, pctx, m->table.get(m->slots["main"]),
                                              bfn, p.inner_n, std::min(p.iters, 200), std::min(p.warmup, 10));
                 if (ps.n_pairs > 0) {
-                    std::printf("  [paired] safety=%-3s  paired median ratio=%5.2f  CI=[%.2f, %.2f]  (n=%d)\n",
-                                mode, ps.median_ratio, ps.ci_lo, ps.ci_hi, ps.n_pairs);
+                    std::printf("  [paired] safety=%-3s cfg=%-6s paired median ratio=%5.2f  CI=[%.2f, %.2f]  (n=%d)\n",
+                                mode, cfg.label, ps.median_ratio, ps.ci_lo, ps.ci_hi, ps.n_pairs);
                 }
             }
         }
@@ -569,8 +661,8 @@ int main(int argc, char** argv) {
     FILE* f = std::fopen("results_codegen_paths.csv", "w");
     if (!f) std::fprintf(stderr, "WARN: could not open results_codegen_paths.csv for write\n");
     if (f) {
-        std::fprintf(f, "path,safety,engine,iters,warmup,min_ns,median_ns,mean_ns,p99_ns,stddev_ns,cv_pct,result,compile_ns,code_bytes,ir_instrs,note\n");
-        // notes map per path (one note per path; safety/engine share it)
+        std::fprintf(f, "path,safety,engine,config,iters,warmup,min_ns,median_ns,mean_ns,p99_ns,stddev_ns,cv_pct,result,compile_ns,code_bytes,ir_instrs,note\n");
+        // notes map per path (one note per path; safety/engine/config share it)
         std::unordered_map<std::string, const char*> notes;
         for (auto& p : paths) notes[p.name] = p.note;
         for (auto& c : cells) {
@@ -579,8 +671,8 @@ int main(int argc, char** argv) {
             // (the harness used p.iters/p.warmup for both). Find the path.
             int iters = 0, warmup = 0;
             for (auto& p : paths) if (strcmp(p.name, c.path) == 0) { iters = p.iters; warmup = p.warmup; break; }
-            std::fprintf(f, "%s,%s,%s,%d,%d,%.1f,%.1f,%.1f,%.1f,%.1f,%.2f,%lld,%.0f,%zu,%zu,%s\n",
-                c.path, c.safety, c.engine, iters, warmup,
+            std::fprintf(f, "%s,%s,%s,%s,%d,%d,%.1f,%.1f,%.1f,%.1f,%.1f,%.2f,%lld,%.0f,%zu,%zu,%s\n",
+                c.path, c.safety, c.engine, c.config, iters, warmup,
                 c.st.min, c.st.median, c.st.mean, c.st.p99, c.st.stddev, c.st.cv,
                 (long long)c.st.result, c.compile_ns, c.code_bytes, c.ir_instrs, note);
         }
@@ -601,61 +693,137 @@ int main(int argc, char** argv) {
             std::fprintf(f, "Stage1 opts: %s (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4).\n", o);
         else
             std::fprintf(f, "Stage1 opts: none (flags off — byte-identical baseline).\n");
+        std::fprintf(f, "Passes: %s", passes_flag
+            ? "ON — IR backend + constprop,forward,copyprop,instcombine,dce,licm,dse + Stage 3 regalloc\n"
+            : "off (tree-walker baseline; pass --passes to enable)\n");
         std::fprintf(f, "Headline = **median ns** (resistant to scheduler outliers). ");
         std::fprintf(f, "ratio = ember/g++-O2 (median). >1 = ember slower than an optimizing native compiler.\n\n");
-        std::fprintf(f, "| path | safety | ember med ns | g++-O2 med ns | ember/g++-O2 | verdict |\n");
-        std::fprintf(f, "|---|---|---|---|---|---|\n");
-        for (size_t i = 0; i + 1 < cells.size(); i += 2) {
-            // cells come in pairs: ember then gcc_O2 (same path+safety)
-            // (defensive: only pair when path+safety match)
-            auto& e = cells[i]; auto& g = cells[i+1];
-            if (strcmp(e.path, g.path) != 0 || strcmp(e.safety, g.safety) != 0
-                || strcmp(e.engine, "ember") != 0 || strcmp(g.engine, "gcc_O2") != 0) {
-                continue;
-            }
-            double r = e.st.median / g.st.median;
-            const char* v = e.st.trapped ? "TRAP" : verdict(r);
-            std::fprintf(f, "| %s | %s | %.1f | %.1f | %.2f | %s |\n",
-                e.path, e.safety, e.st.median, g.st.median, r, v);
-        }
-        // safety-on overhead table
-        std::fprintf(f, "\n## safety-on overhead (guard cost = safety_on - safety_off)\n\n");
-        std::fprintf(f, "| path | safety-off med ns | safety-on med ns | guard overhead (abs / %%) |\n");
-        std::fprintf(f, "|---|---|---|---|\n");
+        // main per-path table — one row per (path, safety, config). nopass is
+        // always present; passes rows appear only when --passes ran them.
+        std::fprintf(f, "| path | safety | config | ember med ns | g++-O2 med ns | ember/g++-O2 | verdict |\n");
+        std::fprintf(f, "|---|---|---|---|---|---|---|\n");
         for (auto& p : paths) {
-            double off = 0, on = 0; bool have_off = false, have_on = false;
-            for (auto& c : cells) {
-                if (strcmp(c.path, p.name) != 0 || strcmp(c.engine, "ember") != 0) continue;
-                if (strcmp(c.safety, "off") == 0) { off = c.st.median; have_off = true; }
-                if (strcmp(c.safety, "on") == 0)  { on  = c.st.median; have_on = true; }
+            for (bool safety_on : {false, true}) {
+                const char* mode = safety_on ? "on" : "off";
+                const Cell* b = find_cell(cells, p.name, mode, "gcc_O2", "baseline");
+                if (!b) continue;
+                for (const char* cfg_label : {"nopass", "passes"}) {
+                    const Cell* e = find_cell(cells, p.name, mode, "ember", cfg_label);
+                    if (!e) continue;   // passes row absent for non-ir_safe paths / no --passes
+                    char ratio_buf[32];
+                    const char* v;
+                    if (e->st.trapped) { std::snprintf(ratio_buf, sizeof(ratio_buf), "TRAP"); v = "TRAP"; }
+                    else { std::snprintf(ratio_buf, sizeof(ratio_buf), "%.2f", e->st.median / b->st.median); v = verdict(e->st.median / b->st.median); }
+                    std::fprintf(f, "| %s | %s | %s | %.1f | %.1f | %s | %s |\n",
+                        p.name, mode, cfg_label, e->st.median, b->st.median, ratio_buf, v);
+                }
             }
-            if (have_off && have_on) {
-                double pct = off > 0 ? (on - off) / off * 100.0 : 0;
-                std::fprintf(f, "| %s | %.1f | %.1f | %+.1f ns / %+.1f%% |\n",
-                    p.name, off, on, on - off, pct);
+        }
+        // passes impact section — only when --passes ran. The headline new
+        // evidence: how much the 7 passes + regalloc close the gap to g++-O2.
+        if (passes_flag) {
+            std::fprintf(f, "\n## passes impact (nopass vs passes + Stage 3 regalloc, vs g++-O2)\n\n");
+            std::fprintf(f, "Pipeline: constprop,forward,copyprop,instcombine,dce,licm,dse + linear-scan regalloc ");
+            std::fprintf(f, "(enable_ir_backend + enable_regalloc — mirrors `ember --passes`). ");
+            std::fprintf(f, "Only ir_safe paths (slices/strings/structs are Stage A IR-backend gaps).\n");
+            std::fprintf(f, "pass speedup = nopass_med / passes_med (>1 = passes made ember faster). ");
+            std::fprintf(f, "passes ratio = passes_med / g++-O2_med.\n\n");
+            std::fprintf(f, "| path | safety | nopass med ns | passes med ns | pass speedup | g++-O2 med ns | nopass ratio | passes ratio | verdict (passes) |\n");
+            std::fprintf(f, "|---|---|---|---|---|---|---|---|---|\n");
+            for (auto& p : paths) {
+                for (bool safety_on : {false, true}) {
+                    const char* mode = safety_on ? "on" : "off";
+                    const Cell* b = find_cell(cells, p.name, mode, "gcc_O2", "baseline");
+                    const Cell* n = find_cell(cells, p.name, mode, "ember", "nopass");
+                    const Cell* s = find_cell(cells, p.name, mode, "ember", "passes");
+                    if (!b || !n) continue;
+                    double rn = n->st.median / b->st.median;
+                    if (!s) {
+                        std::fprintf(f, "| %s | %s | %.1f | N/A | N/A | %.1f | %.2f | N/A | IR-backend gap (Stage A) |\n",
+                            p.name, mode, n->st.median, b->st.median, rn);
+                        continue;
+                    }
+                    double speedup = s->st.median > 0 ? n->st.median / s->st.median : 0;
+                    double rs = s->st.median / b->st.median;
+                    std::fprintf(f, "| %s | %s | %.1f | %.1f | %.2fx | %.1f | %.2f | %.2f | %s |\n",
+                        p.name, mode, n->st.median, s->st.median, speedup, b->st.median, rn, rs, verdict(rs));
+                }
+            }
+        }
+        // safety-on overhead table — per (path, config). nopass is always
+        // present; passes rows appear only when --passes ran them, showing the
+        // guard cost on the optimized code too.
+        std::fprintf(f, "\n## safety-on overhead (guard cost = safety_on - safety_off)\n\n");
+        std::fprintf(f, "| path | config | safety-off med ns | safety-on med ns | guard overhead (abs / %%) |\n");
+        std::fprintf(f, "|---|---|---|---|---|\n");
+        for (auto& p : paths) {
+            for (const char* cfg_label : {"nopass", "passes"}) {
+                double off = 0, on = 0; bool have_off = false, have_on = false;
+                for (auto& c : cells) {
+                    if (strcmp(c.path, p.name) != 0 || strcmp(c.engine, "ember") != 0
+                        || strcmp(c.config, cfg_label) != 0) continue;
+                    if (strcmp(c.safety, "off") == 0) { off = c.st.median; have_off = true; }
+                    if (strcmp(c.safety, "on") == 0)  { on  = c.st.median; have_on = true; }
+                }
+                if (have_off && have_on) {
+                    double pct = off > 0 ? (on - off) / off * 100.0 : 0;
+                    std::fprintf(f, "| %s | %s | %.1f | %.1f | %+.1f ns / %+.1f%% |\n",
+                        p.name, cfg_label, off, on, on - off, pct);
+                }
             }
         }
         std::fclose(f);
         std::printf("wrote results_codegen_paths.md\n");
     }
 
-    // ---- stdout: slowest-3 paths vs g++ -O2 (the headline evidence) ----
-    std::printf("\n=== slowest paths vs g++ -O2 (safety-off median ratio) ===\n");
+    // ---- stdout: slowest paths vs g++ -O2 (the headline evidence) ----
+    // Ranks by safety-off nopass median ratio (the baseline gap). When --passes
+    // ran, a second summary shows the passes impact (nopass -> passes speedup).
+    std::printf("\n=== slowest paths vs g++ -O2 (safety-off, nopass median ratio) ===\n");
     std::vector<std::pair<double, std::string>> ranks;
-    for (size_t i = 0; i + 1 < cells.size(); i += 2) {
-        auto& e = cells[i]; auto& g = cells[i+1];
-        if (strcmp(e.path, g.path) != 0 || strcmp(e.safety, g.safety) != 0
-            || strcmp(e.engine, "ember") != 0 || strcmp(g.engine, "gcc_O2") != 0
-            || strcmp(e.safety, "off") != 0 || e.st.trapped) continue;
-        double r = e.st.median / g.st.median;
+    for (auto& p : paths) {
+        const Cell* e = find_cell(cells, p.name, "off", "ember", "nopass");
+        const Cell* g = find_cell(cells, p.name, "off", "gcc_O2", "baseline");
+        if (!e || !g || e->st.trapped) continue;
+        double r = e->st.median / g->st.median;
         char buf[160];
         std::snprintf(buf, sizeof(buf), "%-18s ratio=%6.2f  ember=%8.1fns  g++-O2=%8.1fns  [%s]",
-            e.path, r, e.st.median, g.st.median, verdict(r));
+            p.name, r, e->st.median, g->st.median, verdict(r));
         ranks.push_back({r, std::string(buf)});
     }
     std::sort(ranks.begin(), ranks.end(),
               [](auto& a, auto& b){ return a.first > b.first; });
     for (auto& r : ranks) std::printf("  %s\n", r.second.c_str());
+
+    if (passes_flag) {
+        std::printf("\n=== passes impact (nopass -> passes + regalloc, safety-off) ===\n");
+        std::printf("  pipeline: constprop,forward,copyprop,instcombine,dce,licm,dse + Stage 3 regalloc\n");
+        std::vector<std::pair<double, std::string>> pass_ranks;
+        for (auto& p : paths) {
+            const Cell* n = find_cell(cells, p.name, "off", "ember", "nopass");
+            const Cell* s = find_cell(cells, p.name, "off", "ember", "passes");
+            const Cell* g = find_cell(cells, p.name, "off", "gcc_O2", "baseline");
+            if (!n || !g) continue;
+            char buf[256];
+            if (!s) {
+                std::snprintf(buf, sizeof(buf),
+                    "%-18s nopass=%8.1fns  passes=N/A (IR-backend gap)  g++-O2=%8.1fns",
+                    p.name, n->st.median, g->st.median);
+                pass_ranks.push_back({-1.0, std::string(buf)});   // gap entries sort last
+                continue;
+            }
+            double speedup = s->st.median > 0 ? n->st.median / s->st.median : 0;
+            double rs = s->st.median / g->st.median;
+            std::snprintf(buf, sizeof(buf),
+                "%-18s nopass=%8.1fns  passes=%8.1fns  speedup=%5.2fx  passes/g++-O2=%5.2f  [%s]",
+                p.name, n->st.median, s->st.median, speedup, rs, verdict(rs));
+            pass_ranks.push_back({speedup, std::string(buf)});
+        }
+        // sort by speedup descending (biggest pass win first); gap entries (-1) sink
+        std::sort(pass_ranks.begin(), pass_ranks.end(),
+                  [](auto& a, auto& b){ return a.first > b.first; });
+        for (auto& r : pass_ranks) std::printf("  %s\n", r.second.c_str());
+    }
 
     std::printf("\nbench: %s\n", any_compile_fail ? "FAIL (compile error)" : "PASS (ran + wrote results)");
     return any_compile_fail ? 1 : 0;
