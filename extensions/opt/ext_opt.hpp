@@ -1,6 +1,6 @@
 // ext_opt.hpp — Stage C: the IR optimization passes extension.
 //
-// Eight IR→IR optimization passes over ThinFunction, registered by name via
+// Nine IR→IR optimization passes over ThinFunction, registered by name via
 // register_passes (the extension-style discovery pattern, mirroring
 // register_natives). The host wires it:
 //   EmberPassRegistry reg;
@@ -15,6 +15,10 @@
 //   dead ConstInt/LoadFrame defs and dead StoreFrame (slot never read).
 // - DeadCodeElimPass ("dce"): removes dead pure instrs (dst VReg unused) +
 //   dead local stores (StoreFrame to a slot never read). Iterates to fixpoint.
+// - SimplifyCFGPass ("simplifycfg"): folds locally known constant branches,
+//   removes blocks unreachable from entry, compacts block IDs/targets, and
+//   merges single-predecessor unconditional-jump chains outside loops. Loop
+//   headers and loop members are deliberately never merged.
 // - CSEPass ("cse"): local common-subexpression elimination within a block.
 //   Coalesces redundant pure instrs (same op + operands + meta) by remapping
 //   uses of the second's dst to the first's dst, then removing the second.
@@ -43,7 +47,7 @@
 //   LoadFrame of that off, the FIRST StoreFrame was overwritten before being
 //   read → remove it. Iterates to fixpoint within each block.
 //
-// All eight are VALUE-PRESERVING: after the pass, emit_x64 produces the same
+// All nine are VALUE-PRESERVING: after the pass, emit_x64 produces the same
 // i64 result. They return EmberPreserved::none() if they changed the IR,
 // Preserved::all() if they did nothing.
 #pragma once
@@ -61,6 +65,11 @@ struct ConstPropPass : EmberPassInfoMixin<ConstPropPass> {
 
 struct DeadCodeElimPass : EmberPassInfoMixin<DeadCodeElimPass> {
     static constexpr const char* pass_name = "dce";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+struct SimplifyCFGPass : EmberPassInfoMixin<SimplifyCFGPass> {
+    static constexpr const char* pass_name = "simplifycfg";
     EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
 };
 

@@ -441,6 +441,252 @@ EmberPreserved DeadCodeElimPass::run(ThinFunction& f, EmberAnalysisManager&) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SimplifyCFGPass: constant branches, unreachable blocks, trivial merges
+// ═══════════════════════════════════════════════════════════════════════════
+
+EmberPreserved SimplifyCFGPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    if (f.blocks.empty()) return EmberPreserved::all();
+
+    bool changed = false;
+
+    // Constant branch folding is intentionally local and narrow: only a
+    // ConstBool (or a chain of Moves from one) in the branch's own block is a
+    // known condition. Thin IR is not SSA, so carrying facts across blocks or
+    // treating arbitrary ConstInt values as booleans would be unsound.
+    for (auto& blk : f.blocks) {
+        std::unordered_map<VReg, bool> bool_constants;
+        std::unordered_set<VReg> integer_zero;
+        for (const auto& in : blk.instrs) {
+            if (in.op == ThinOp::ConstBool) {
+                if (in.dst) {
+                    bool_constants[in.dst] = in.imm.i != 0;
+                    integer_zero.erase(in.dst);
+                }
+            } else if (in.op == ThinOp::ConstInt && in.imm.i == 0) {
+                if (in.dst) {
+                    integer_zero.insert(in.dst);
+                    bool_constants.erase(in.dst);
+                }
+            } else if (in.op == ThinOp::Move) {
+                auto bool_src = bool_constants.find(in.src1);
+                if (in.dst) {
+                    if (bool_src != bool_constants.end())
+                        bool_constants[in.dst] = bool_src->second;
+                    else
+                        bool_constants.erase(in.dst);
+                    if (integer_zero.count(in.src1))
+                        integer_zero.insert(in.dst);
+                    else
+                        integer_zero.erase(in.dst);
+                }
+            } else if (in.op == ThinOp::Cmp && in.dst &&
+                       (in.meta.cmp == 0 || in.meta.cmp == 1)) {
+                // If/while lowering compares its boolean expression with an
+                // explicit integer zero before branching. Preserve the narrow
+                // ConstBool contract while recognizing that exact wrapper.
+                auto lhs_bool = bool_constants.find(in.src1);
+                auto rhs_bool = bool_constants.find(in.src2);
+                bool known = false;
+                bool value = false;
+                if (lhs_bool != bool_constants.end() &&
+                    integer_zero.count(in.src2)) {
+                    known = true;
+                    value = lhs_bool->second;
+                } else if (rhs_bool != bool_constants.end() &&
+                           integer_zero.count(in.src1)) {
+                    known = true;
+                    value = rhs_bool->second;
+                }
+                if (known) {
+                    bool_constants[in.dst] = in.meta.cmp == 0 ? !value : value;
+                } else {
+                    bool_constants.erase(in.dst);
+                }
+                integer_zero.erase(in.dst);
+            } else if (in.dst) {
+                bool_constants.erase(in.dst);
+                integer_zero.erase(in.dst);
+            }
+        }
+
+        if (blk.term.kind != TermKind::Branch) continue;
+        auto cond = bool_constants.find(blk.term.cond);
+        if (cond == bool_constants.end() &&
+            blk.term.target != blk.term.false_target)
+            continue;
+
+        const uint32_t taken = blk.term.target == blk.term.false_target
+            ? blk.term.target
+            : (cond->second ? blk.term.target : blk.term.false_target);
+        ThinTerm jmp;
+        jmp.kind = TermKind::Jmp;
+        jmp.target = taken;
+        blk.term = jmp;
+        changed = true;
+    }
+
+    // Remove every block not reachable from entry. A graph traversal, rather
+    // than repeatedly deleting zero-predecessor blocks, is required for dead
+    // cycles and also guarantees that loop headers reached by a backedge are
+    // retained whenever their loop is entry-reachable.
+    {
+        std::unordered_map<uint32_t, size_t> id_to_index;
+        id_to_index.reserve(f.blocks.size());
+        for (size_t i = 0; i < f.blocks.size(); ++i)
+            id_to_index[f.blocks[i].id] = i;
+
+        std::vector<uint8_t> reachable(f.blocks.size(), 0);
+        std::vector<size_t> work{0};
+        reachable[0] = 1;
+        while (!work.empty()) {
+            const size_t bi = work.back();
+            work.pop_back();
+            const ThinTerm& term = f.blocks[bi].term;
+            auto visit = [&](uint32_t target) {
+                auto found = id_to_index.find(target);
+                if (found != id_to_index.end() && !reachable[found->second]) {
+                    reachable[found->second] = 1;
+                    work.push_back(found->second);
+                }
+            };
+            if (term.kind == TermKind::Jmp) {
+                visit(term.target);
+            } else if (term.kind == TermKind::Branch) {
+                visit(term.target);
+                visit(term.false_target);
+            }
+        }
+
+        if (std::find(reachable.begin(), reachable.end(), uint8_t{0}) !=
+            reachable.end()) {
+            std::vector<ThinBlock> kept;
+            kept.reserve(f.blocks.size());
+            for (size_t i = 0; i < f.blocks.size(); ++i)
+                if (reachable[i]) kept.push_back(std::move(f.blocks[i]));
+            f.blocks = std::move(kept);
+            changed = true;
+        }
+    }
+
+    // The emitter indexes labels by block id, so every removal/merge must be
+    // followed by ID and edge compaction.
+    auto compact_ids = [&]() {
+        std::unordered_map<uint32_t, uint32_t> remap;
+        remap.reserve(f.blocks.size());
+        for (size_t i = 0; i < f.blocks.size(); ++i)
+            remap[f.blocks[i].id] = static_cast<uint32_t>(i);
+        for (size_t i = 0; i < f.blocks.size(); ++i) {
+            ThinBlock& blk = f.blocks[i];
+            if (blk.term.kind == TermKind::Jmp) {
+                auto target = remap.find(blk.term.target);
+                if (target != remap.end()) {
+                    changed |= blk.term.target != target->second;
+                    blk.term.target = target->second;
+                }
+            } else if (blk.term.kind == TermKind::Branch) {
+                auto target = remap.find(blk.term.target);
+                auto false_target = remap.find(blk.term.false_target);
+                if (target != remap.end()) {
+                    changed |= blk.term.target != target->second;
+                    blk.term.target = target->second;
+                }
+                if (false_target != remap.end()) {
+                    changed |= blk.term.false_target != false_target->second;
+                    blk.term.false_target = false_target->second;
+                }
+            }
+            changed |= blk.id != static_cast<uint32_t>(i);
+            blk.id = static_cast<uint32_t>(i);
+        }
+    };
+    compact_ids();
+
+    // Merge one edge at a time and rebuild graph facts after each merge.
+    // In addition to the required "B is not a loop header" rule, this pass is
+    // deliberately more conservative and does not merge any block belonging
+    // to a natural loop. That prevents moving a latch/backedge (notably its
+    // BudgetCheck) into the loop body, the exact value-preservation regression
+    // that caused the previous implementation to return 116 instead of 177.
+    for (;;) {
+        const size_t count = f.blocks.size();
+        std::vector<std::unordered_set<uint32_t>> predecessors(count);
+        std::vector<uint8_t> loop_header(count, 0);
+
+        for (size_t source = 0; source < count; ++source) {
+            const ThinTerm& term = f.blocks[source].term;
+            auto add_edge = [&](uint32_t target) {
+                if (target >= count) return;
+                predecessors[target].insert(static_cast<uint32_t>(source));
+                if (target <= source) loop_header[target] = 1;
+            };
+            if (term.kind == TermKind::Jmp) {
+                add_edge(term.target);
+            } else if (term.kind == TermKind::Branch) {
+                add_edge(term.target);
+                add_edge(term.false_target);
+            }
+        }
+
+        // Mark every natural-loop member by walking predecessors backwards
+        // from each latch to its header. This is conservative for irreducible
+        // graphs (it may skip a legal merge) but never changes semantics.
+        std::vector<uint8_t> in_loop(count, 0);
+        for (size_t latch = 0; latch < count; ++latch) {
+            const ThinTerm& term = f.blocks[latch].term;
+            auto mark_backedge = [&](uint32_t header) {
+                if (header >= count || header > latch) return;
+                std::vector<uint8_t> this_loop(count, 0);
+                this_loop[header] = 1;
+                std::vector<uint32_t> stack;
+                if (latch != header) stack.push_back(static_cast<uint32_t>(latch));
+                while (!stack.empty()) {
+                    const uint32_t block = stack.back();
+                    stack.pop_back();
+                    if (this_loop[block]) continue;
+                    this_loop[block] = 1;
+                    for (uint32_t pred : predecessors[block])
+                        if (!this_loop[pred]) stack.push_back(pred);
+                }
+                for (size_t i = 0; i < count; ++i)
+                    in_loop[i] |= this_loop[i];
+            };
+            if (term.kind == TermKind::Jmp) {
+                mark_backedge(term.target);
+            } else if (term.kind == TermKind::Branch) {
+                mark_backedge(term.target);
+                mark_backedge(term.false_target);
+            }
+        }
+
+        bool merged = false;
+        for (size_t ai = 0; ai < count; ++ai) {
+            ThinBlock& a = f.blocks[ai];
+            if (a.term.kind != TermKind::Jmp) continue;
+            const uint32_t bi = a.term.target;
+            if (bi == ai || bi >= count) continue;
+            if (predecessors[bi].size() != 1 ||
+                !predecessors[bi].count(static_cast<uint32_t>(ai)))
+                continue;
+            if (loop_header[bi] || in_loop[ai] || in_loop[bi]) continue;
+
+            ThinBlock& b = f.blocks[bi];
+            a.instrs.insert(a.instrs.end(),
+                            std::make_move_iterator(b.instrs.begin()),
+                            std::make_move_iterator(b.instrs.end()));
+            a.term = b.term;
+            f.blocks.erase(f.blocks.begin() + static_cast<ptrdiff_t>(bi));
+            compact_ids();
+            changed = true;
+            merged = true;
+            break;
+        }
+        if (!merged) break;
+    }
+
+    return changed ? EmberPreserved::none() : EmberPreserved::all();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // CSEPass: local common-subexpression elimination within a block
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1087,6 +1333,7 @@ EmberPreserved DeadStoreElimPass::run(ThinFunction& f, EmberAnalysisManager&) {
 void register_passes(EmberPassRegistry& reg) {
     reg.add<ConstPropPass>("constprop");
     reg.add<DeadCodeElimPass>("dce");
+    reg.add<SimplifyCFGPass>("simplifycfg");
     reg.add<CSEPass>("cse");
     reg.add<LICMPass>("licm");
     reg.add<StoreToLoadForwardPass>("forward");
