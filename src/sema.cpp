@@ -3284,6 +3284,12 @@ bool realtime_safe_native(const std::string& name) {
         // but allocation-free and explicitly realtime-safe once granted.
         "load_f32", "store_f32", "load_f64", "store_f64",
         "load_i32", "store_i32",
+        "audio_get_sample_rate", "audio_get_block_size",
+        "audio_get_num_input_channels", "audio_get_num_output_channels",
+        "audio_load_sample", "audio_store_sample", "audio_get_parameter",
+        "audio_is_playing", "audio_get_bpm", "audio_get_ppq",
+        "audio_get_param_change_count", "audio_get_param_change_id",
+        "audio_get_param_change_offset", "audio_get_param_change_value",
         // Host-provided preallocated DSP state accessors used by the headless
         // delay reference (same allocation-free contract as audio buffers).
         "delay_buffer", "delay_size",

@@ -137,7 +137,7 @@ std::unique_ptr<Module> compile_dsp(const char* path) {
     return module;
 }
 
-using GainProcess = void (*)(int64_t, int64_t, int64_t);
+using GainProcess = void (*)(int64_t, int64_t);
 using DelayProcess = int64_t (*)(int64_t, int64_t, int64_t, int64_t);
 
 int64_t ptr_i64(float* ptr) {
@@ -163,35 +163,84 @@ int64_t n_delay_size() {
     return g_delay_samples;
 }
 
-std::vector<float> make_input() {
-    std::vector<float> input(static_cast<size_t>(kSamples), 0.0f);
+std::vector<float> make_input(int64_t channels = kChannels) {
+    std::vector<float> input(static_cast<size_t>(kFrames * channels), 0.0f);
     constexpr double pi = 3.1415926535897932384626433832795;
-    for (int64_t channel = 0; channel < kChannels; ++channel) {
+    for (int64_t channel = 0; channel < channels; ++channel) {
         for (int64_t frame = 0; frame < kFrames; ++frame) {
-            const double phase = 2.0 * pi * 440.0 * double(frame) / 48000.0;
-            const double scale = channel == 0 ? 0.8 : 0.35;
+            const double phase = 2.0 * pi * (220.0 + 110.0 * double(channel)) *
+                                 double(frame) / 48000.0;
+            const double scale = 0.8 / double(channel + 1);
             input[size_t(channel * kFrames + frame)] = float(std::sin(phase) * scale);
         }
     }
     return input;
 }
 
-std::vector<float> reference_gain(const std::vector<float>& input) {
+std::vector<float> reference_gain(
+    const std::vector<float>& input, int64_t channels,
+    const std::vector<ember::ext_audio::ParameterChange>& changes = {}) {
     std::vector<float> output(input.size());
-    for (size_t i = 0; i < input.size(); ++i) output[i] = input[i] * 0.5f;
+    float gain = 0.5f;
+    size_t change_index = 0;
+    for (int64_t frame = 0; frame < kFrames; ++frame) {
+        while (change_index < changes.size() &&
+               changes[change_index].sample_offset <= frame) {
+            if (changes[change_index].param_id == 0) gain = changes[change_index].value;
+            ++change_index;
+        }
+        for (int64_t channel = 0; channel < channels; ++channel) {
+            const size_t index = size_t(channel * kFrames + frame);
+            output[index] = input[index] * gain;
+        }
+    }
     return output;
 }
 
-std::vector<float> run_gain(GainProcess process, const std::vector<float>& input,
-                            int64_t block_size) {
+std::vector<float> run_gain(
+    GainProcess process, const std::vector<float>& input, int64_t channels,
+    int64_t block_size,
+    const std::vector<ember::ext_audio::ParameterChange>& changes = {}) {
     std::vector<float> output(input.size(), 0.0f);
-    for (int64_t channel = 0; channel < kChannels; ++channel) {
-        const int64_t base = channel * kFrames;
-        for (int64_t offset = 0; offset < kFrames; offset += block_size) {
-            const int64_t frames = std::min(block_size, kFrames - offset);
-            process(ptr_i64(const_cast<float*>(input.data()) + base + offset),
-                    ptr_i64(output.data() + base + offset), frames);
+    std::vector<float*> input_channels(static_cast<size_t>(channels));
+    std::vector<float*> output_channels(static_cast<size_t>(channels));
+    float parameter_values[] = {0.5f};
+    size_t next_change = 0;
+
+    for (int64_t offset = 0; offset < kFrames; offset += block_size) {
+        const int64_t frames = std::min(block_size, kFrames - offset);
+        for (int64_t channel = 0; channel < channels; ++channel) {
+            input_channels[size_t(channel)] =
+                const_cast<float*>(input.data()) + channel * kFrames + offset;
+            output_channels[size_t(channel)] = output.data() + channel * kFrames + offset;
         }
+
+        std::vector<ember::ext_audio::ParameterChange> block_changes;
+        while (next_change < changes.size() &&
+               changes[next_change].sample_offset < offset + frames) {
+            auto change = changes[next_change++];
+            if (change.sample_offset >= offset) {
+                change.sample_offset -= offset;
+                block_changes.push_back(change);
+            }
+        }
+
+        ember::ext_audio::AudioContext context;
+        context.sample_rate = 48000;
+        context.block_size = frames;
+        context.num_input_channels = channels;
+        context.num_output_channels = channels;
+        context.input_buffer_ptr = reinterpret_cast<int64_t>(input_channels.data());
+        context.output_buffer_ptr = reinterpret_cast<int64_t>(output_channels.data());
+        context.transport_playing = 1;
+        context.transport_bpm = 123.0;
+        context.transport_ppq = 17.25;
+        context.parameter_count = 1;
+        context.parameter_values_ptr = reinterpret_cast<int64_t>(parameter_values);
+        context.parameter_change_count = static_cast<int64_t>(block_changes.size());
+        context.parameter_changes_ptr = reinterpret_cast<int64_t>(block_changes.data());
+        process(reinterpret_cast<int64_t>(&context), frames);
+        if (!block_changes.empty()) parameter_values[0] = block_changes.back().value;
     }
     return output;
 }
@@ -272,14 +321,14 @@ int main(int argc, char** argv) {
     }
 
     const std::vector<float> input = make_input();
-    const std::vector<float> gain_reference = reference_gain(input);
+    const std::vector<float> gain_reference = reference_gain(input, kChannels);
     const std::vector<int64_t> blocks = {1024, 256, 64, 1};
     int failures = 0;
 
     std::vector<float> gain_canonical;
     std::vector<float> delay_canonical;
     for (const int64_t block : blocks) {
-        const auto gain_output = run_gain(gain, input, block);
+        const auto gain_output = run_gain(gain, input, kChannels, block);
         if (gain_canonical.empty()) gain_canonical = gain_output;
         const bool gain_ok = bit_equal(gain_output, gain_reference) &&
                              bit_equal(gain_output, gain_canonical);
@@ -299,6 +348,30 @@ int main(int argc, char** argv) {
                     static_cast<long long>(kFrames / block),
                     static_cast<long long>(block));
         if (!delay_ok) ++failures;
+    }
+
+    for (const int64_t channels : {1LL, 2LL, 4LL}) {
+        const auto multichannel_input = make_input(channels);
+        const auto expected = reference_gain(multichannel_input, channels);
+        const auto actual = run_gain(gain, multichannel_input, channels, 64);
+        const bool ok = bit_equal(actual, expected);
+        std::printf("[%s] typed AudioContext: %lld channel(s)\n",
+                    ok ? "PASS" : "FAIL", static_cast<long long>(channels));
+        if (!ok) ++failures;
+    }
+
+    const std::vector<ember::ext_audio::ParameterChange> automation = {
+        {0, 0, 0.25f}, {0, 127, 1.0f}, {0, 512, 1.5f}, {0, 901, 0.0f}};
+    const auto automation_reference = reference_gain(input, kChannels, automation);
+    std::vector<float> automation_canonical;
+    for (const int64_t block : blocks) {
+        const auto output = run_gain(gain, input, kChannels, block, automation);
+        if (automation_canonical.empty()) automation_canonical = output;
+        const bool ok = bit_equal(output, automation_reference) &&
+                        bit_equal(output, automation_canonical);
+        std::printf("[%s] automation: block %lld (sample accurate)\n",
+                    ok ? "PASS" : "FAIL", static_cast<long long>(block));
+        if (!ok) ++failures;
     }
 
     std::printf("\nheadless DSP harness: %s\n", failures == 0 ? "PASS" : "FAIL");

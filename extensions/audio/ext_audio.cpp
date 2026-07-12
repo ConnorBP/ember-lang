@@ -8,6 +8,103 @@
 namespace ember::ext_audio {
 namespace {
 
+const AudioContext* audio_context(int64_t ptr) {
+    return reinterpret_cast<const AudioContext*>(ptr);
+}
+
+AudioContext* audio_context_mut(int64_t ptr) {
+    return reinterpret_cast<AudioContext*>(ptr);
+}
+
+int64_t n_audio_get_sample_rate(int64_t ptr) {
+    const auto* ctx = audio_context(ptr);
+    return ctx ? ctx->sample_rate : 0;
+}
+
+int64_t n_audio_get_block_size(int64_t ptr) {
+    const auto* ctx = audio_context(ptr);
+    return ctx ? ctx->block_size : 0;
+}
+
+int64_t n_audio_get_num_input_channels(int64_t ptr) {
+    const auto* ctx = audio_context(ptr);
+    return ctx ? ctx->num_input_channels : 0;
+}
+
+int64_t n_audio_get_num_output_channels(int64_t ptr) {
+    const auto* ctx = audio_context(ptr);
+    return ctx ? ctx->num_output_channels : 0;
+}
+
+float n_audio_load_sample(int64_t ptr, int64_t channel, int64_t index) {
+    const auto* ctx = audio_context(ptr);
+    if (!ctx || channel < 0 || channel >= ctx->num_input_channels ||
+        index < 0 || index >= ctx->block_size || !ctx->input_buffer_ptr)
+        return 0.0f;
+    auto* const* channels = reinterpret_cast<float* const*>(ctx->input_buffer_ptr);
+    return channels[channel] ? channels[channel][index] : 0.0f;
+}
+
+void n_audio_store_sample(int64_t ptr, int64_t channel, int64_t index, float value) {
+    auto* ctx = audio_context_mut(ptr);
+    if (!ctx || channel < 0 || channel >= ctx->num_output_channels ||
+        index < 0 || index >= ctx->block_size || !ctx->output_buffer_ptr)
+        return;
+    auto** channels = reinterpret_cast<float**>(ctx->output_buffer_ptr);
+    if (channels[channel]) channels[channel][index] = value;
+}
+
+float n_audio_get_parameter(int64_t ptr, int64_t param_id) {
+    const auto* ctx = audio_context(ptr);
+    if (!ctx || param_id < 0 || param_id >= ctx->parameter_count ||
+        !ctx->parameter_values_ptr)
+        return 0.0f;
+    return reinterpret_cast<const float*>(ctx->parameter_values_ptr)[param_id];
+}
+
+int64_t n_audio_is_playing(int64_t ptr) {
+    const auto* ctx = audio_context(ptr);
+    return ctx ? (ctx->transport_playing != 0) : 0;
+}
+
+double n_audio_get_bpm(int64_t ptr) {
+    const auto* ctx = audio_context(ptr);
+    return ctx ? ctx->transport_bpm : 0.0;
+}
+
+double n_audio_get_ppq(int64_t ptr) {
+    const auto* ctx = audio_context(ptr);
+    return ctx ? ctx->transport_ppq : 0.0;
+}
+
+int64_t n_audio_get_param_change_count(int64_t ptr) {
+    const auto* ctx = audio_context(ptr);
+    return ctx ? ctx->parameter_change_count : 0;
+}
+
+const ParameterChange* parameter_change(int64_t ptr, int64_t index) {
+    const auto* ctx = audio_context(ptr);
+    if (!ctx || index < 0 || index >= ctx->parameter_change_count ||
+        !ctx->parameter_changes_ptr)
+        return nullptr;
+    return reinterpret_cast<const ParameterChange*>(ctx->parameter_changes_ptr) + index;
+}
+
+int64_t n_audio_get_param_change_id(int64_t ptr, int64_t index) {
+    const auto* change = parameter_change(ptr, index);
+    return change ? change->param_id : 0;
+}
+
+int64_t n_audio_get_param_change_offset(int64_t ptr, int64_t index) {
+    const auto* change = parameter_change(ptr, index);
+    return change ? change->sample_offset : 0;
+}
+
+float n_audio_get_param_change_value(int64_t ptr, int64_t index) {
+    const auto* change = parameter_change(ptr, index);
+    return change ? change->value : 0.0f;
+}
+
 float n_load_f32(int64_t ptr, int64_t index) {
     return reinterpret_cast<float*>(ptr)[index];
 }
@@ -37,17 +134,50 @@ void n_store_i32(int64_t ptr, int64_t index, int32_t value) {
 void register_natives(std::unordered_map<std::string, NativeSig>& natives) {
     BindingBuilder builder;
     const Type i32 = make_prim(Prim::I32);
-    builder.add("load_f32",  type_f32(), {type_i64(), type_i64()},
+    const Type i64 = type_i64();
+    const Type f32 = type_f32();
+    const Type f64 = type_f64();
+
+    builder.add("audio_get_sample_rate", i64, {i64},
+                reinterpret_cast<void*>(&n_audio_get_sample_rate), PERM_FFI);
+    builder.add("audio_get_block_size", i64, {i64},
+                reinterpret_cast<void*>(&n_audio_get_block_size), PERM_FFI);
+    builder.add("audio_get_num_input_channels", i64, {i64},
+                reinterpret_cast<void*>(&n_audio_get_num_input_channels), PERM_FFI);
+    builder.add("audio_get_num_output_channels", i64, {i64},
+                reinterpret_cast<void*>(&n_audio_get_num_output_channels), PERM_FFI);
+    builder.add("audio_load_sample", f32, {i64, i64, i64},
+                reinterpret_cast<void*>(&n_audio_load_sample), PERM_FFI);
+    builder.add("audio_store_sample", type_void(), {i64, i64, i64, f32},
+                reinterpret_cast<void*>(&n_audio_store_sample), PERM_FFI);
+    builder.add("audio_get_parameter", f32, {i64, i64},
+                reinterpret_cast<void*>(&n_audio_get_parameter), PERM_FFI);
+    builder.add("audio_is_playing", i64, {i64},
+                reinterpret_cast<void*>(&n_audio_is_playing), PERM_FFI);
+    builder.add("audio_get_bpm", f64, {i64},
+                reinterpret_cast<void*>(&n_audio_get_bpm), PERM_FFI);
+    builder.add("audio_get_ppq", f64, {i64},
+                reinterpret_cast<void*>(&n_audio_get_ppq), PERM_FFI);
+    builder.add("audio_get_param_change_count", i64, {i64},
+                reinterpret_cast<void*>(&n_audio_get_param_change_count), PERM_FFI);
+    builder.add("audio_get_param_change_id", i64, {i64, i64},
+                reinterpret_cast<void*>(&n_audio_get_param_change_id), PERM_FFI);
+    builder.add("audio_get_param_change_offset", i64, {i64, i64},
+                reinterpret_cast<void*>(&n_audio_get_param_change_offset), PERM_FFI);
+    builder.add("audio_get_param_change_value", f32, {i64, i64},
+                reinterpret_cast<void*>(&n_audio_get_param_change_value), PERM_FFI);
+
+    builder.add("load_f32",  f32, {i64, i64},
                 reinterpret_cast<void*>(&n_load_f32), PERM_FFI);
-    builder.add("store_f32", type_void(), {type_i64(), type_i64(), type_f32()},
+    builder.add("store_f32", type_void(), {i64, i64, f32},
                 reinterpret_cast<void*>(&n_store_f32), PERM_FFI);
-    builder.add("load_f64",  type_f64(), {type_i64(), type_i64()},
+    builder.add("load_f64",  f64, {i64, i64},
                 reinterpret_cast<void*>(&n_load_f64), PERM_FFI);
-    builder.add("store_f64", type_void(), {type_i64(), type_i64(), type_f64()},
+    builder.add("store_f64", type_void(), {i64, i64, f64},
                 reinterpret_cast<void*>(&n_store_f64), PERM_FFI);
-    builder.add("load_i32",  i32, {type_i64(), type_i64()},
+    builder.add("load_i32",  i32, {i64, i64},
                 reinterpret_cast<void*>(&n_load_i32), PERM_FFI);
-    builder.add("store_i32", type_void(), {type_i64(), type_i64(), i32},
+    builder.add("store_i32", type_void(), {i64, i64, i32},
                 reinterpret_cast<void*>(&n_store_i32), PERM_FFI);
 
     NativeTable table = builder.build();

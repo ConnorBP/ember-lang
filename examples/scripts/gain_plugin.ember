@@ -1,10 +1,24 @@
-// Headless reference gain processor. Buffers are host-owned contiguous f32.
+// Headless typed-context gain processor with sample-accurate automation.
 @realtime
-fn process(in_ptr: i64, out_ptr: i64, frames: i64) -> void {
+fn process(ctx: i64, frames: i64) -> void {
+    let mut gain: f32 = audio_get_parameter(ctx, 0);
+    let channels: i64 = audio_get_num_input_channels(ctx);
+    let changes: i64 = audio_get_param_change_count(ctx);
+    let mut change_index: i64 = 0;
     let mut i: i64 = 0;
     while (i < frames) {
-        let s: f32 = load_f32(in_ptr, i);
-        store_f32(out_ptr, i, s * 0.5);
+        while (change_index < changes && audio_get_param_change_offset(ctx, change_index) <= i) {
+            if (audio_get_param_change_id(ctx, change_index) == 0) {
+                gain = audio_get_param_change_value(ctx, change_index);
+            }
+            change_index = change_index + 1;
+        }
+        let mut ch: i64 = 0;
+        while (ch < channels) {
+            let s: f32 = audio_load_sample(ctx, ch, i);
+            audio_store_sample(ctx, ch, i, s * gain);
+            ch = ch + 1;
+        }
         i = i + 1;
     }
 }

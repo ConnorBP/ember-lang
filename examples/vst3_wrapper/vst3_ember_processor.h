@@ -5,6 +5,9 @@
 // one Ember JIT module per plug-in instance.
 #include "public.sdk/source/vst/vstsinglecomponenteffect.h"
 
+#include "ext_audio.hpp"
+
+#include <array>
 #include <cstdint>
 #include <memory>
 
@@ -39,8 +42,12 @@ private:
     bool loadEmberScript();
     void bypass(Steinberg::Vst::ProcessData& data) const noexcept;
 
+    static constexpr std::size_t kParameterCount = 1;
+    static constexpr std::size_t kMaxParameterChanges = 4096;
+
     std::unique_ptr<EmberModule> module_;
-    float gain_ {1.0f};
+    std::array<float, kParameterCount> parameter_values_ {{1.0f}};
+    std::array<ember::ext_audio::ParameterChange, kMaxParameterChanges> parameter_changes_ {};
     bool active_ {false};
 };
 

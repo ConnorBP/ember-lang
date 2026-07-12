@@ -3,6 +3,7 @@
 #include "base/source/fstreamer.h"
 #include "pluginterfaces/base/ibstream.h"
 #include "pluginterfaces/vst/ivstparameterchanges.h"
+#include "pluginterfaces/vst/ivstprocesscontext.h"
 #include "public.sdk/source/vst/vstparameters.h"
 
 #include "codegen.hpp"
@@ -34,7 +35,7 @@ const FUID kProcessorUID(0xE34B51D2, 0xA44148B8, 0x93D690AD, 0x036CEBD1);
 
 namespace {
 
-using ProcessFn = void (*)(int64_t, int64_t, int64_t, int64_t, int64_t, float);
+using ProcessFn = void (*)(int64_t, int64_t);
 
 std::string readTextFile(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
@@ -174,6 +175,7 @@ tresult PLUGIN_API EmberProcessor::initialize(FUnknown* context) {
 
     addAudioInput(STR16("Stereo In"), SpeakerArr::kStereo);
     addAudioOutput(STR16("Stereo Out"), SpeakerArr::kStereo);
+    processContextRequirements.needTransportState().needTempo().needProjectTimeMusic();
     parameters.addParameter(new RangeParameter(
         STR16("Gain"), kGainParamId, nullptr, 0.0, 2.0, 1.0, 0,
         ParameterInfo::kCanAutomate));
@@ -245,16 +247,49 @@ void EmberProcessor::bypass(ProcessData& data) const noexcept {
 }
 
 tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
+    // Flatten all valid VST parameter points into fixed-capacity host storage.
+    // Insertion keeps the queue globally ordered by sample offset, which lets
+    // Ember consume every parameter's events in one allocation-free pass.
+    std::size_t changeCount = 0;
     if (data.inputParameterChanges) {
-        const int32 count = data.inputParameterChanges->getParameterCount();
-        for (int32 index = 0; index < count; ++index) {
-            IParamValueQueue* queue = data.inputParameterChanges->getParameterData(index);
-            if (!queue || queue->getParameterId() != kGainParamId || queue->getPointCount() < 1)
-                continue;
-            int32 sampleOffset = 0;
-            ParamValue normalized = 0.5;
-            if (queue->getPoint(queue->getPointCount() - 1, sampleOffset, normalized) == kResultTrue)
-                gain_ = static_cast<float>(std::clamp(normalized, 0.0, 1.0) * 2.0);
+        const int32 queueCount = data.inputParameterChanges->getParameterCount();
+        for (int32 queueIndex = 0; queueIndex < queueCount; ++queueIndex) {
+            IParamValueQueue* queue = data.inputParameterChanges->getParameterData(queueIndex);
+            if (!queue) continue;
+            const ParamID id = queue->getParameterId();
+            if (id >= parameter_values_.size()) continue;
+
+            for (int32 pointIndex = 0;
+                 pointIndex < queue->getPointCount() && changeCount < parameter_changes_.size();
+                 ++pointIndex) {
+                int32 sampleOffset = 0;
+                ParamValue normalized = 0.0;
+                if (queue->getPoint(pointIndex, sampleOffset, normalized) != kResultTrue)
+                    continue;
+                const float value =
+                    static_cast<float>(std::clamp(normalized, 0.0, 1.0) * 2.0);
+                // VST3 permits a zero-sample parameter-flush call. Preserve
+                // its final value even though there is no sample event to emit.
+                if (data.numSamples <= 0) {
+                    parameter_values_[id] = value;
+                    continue;
+                }
+                if (sampleOffset < 0 || sampleOffset >= data.numSamples) continue;
+
+                ember::ext_audio::ParameterChange change;
+                change.param_id = static_cast<int64_t>(id);
+                change.sample_offset = sampleOffset;
+                // Gain's VST normalized [0, 1] range maps to Ember's [0, 2].
+                change.value = value;
+                std::size_t insert = changeCount;
+                while (insert > 0 &&
+                       parameter_changes_[insert - 1].sample_offset > change.sample_offset) {
+                    parameter_changes_[insert] = parameter_changes_[insert - 1];
+                    --insert;
+                }
+                parameter_changes_[insert] = change;
+                ++changeCount;
+            }
         }
     }
 
@@ -267,19 +302,50 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
         return kResultOk;
     }
 
-    float* inLeft = data.inputs[0].channelBuffers32[0];
-    float* inRight = data.inputs[0].channelBuffers32[1];
-    float* outLeft = data.outputs[0].channelBuffers32[0];
-    float* outRight = data.outputs[0].channelBuffers32[1];
-    if (!inLeft || !inRight || !outLeft || !outRight) {
-        bypass(data);
-        return kResultOk;
+    for (int32 channel = 0; channel < data.inputs[0].numChannels; ++channel) {
+        if (!data.inputs[0].channelBuffers32[channel] ||
+            !data.outputs[0].channelBuffers32[channel]) {
+            bypass(data);
+            return kResultOk;
+        }
     }
 
-    module_->process(reinterpret_cast<int64_t>(inLeft), reinterpret_cast<int64_t>(inRight),
-                     reinterpret_cast<int64_t>(outLeft), reinterpret_cast<int64_t>(outRight),
-                     data.numSamples, gain_);
-    data.outputs[0].silenceFlags = gain_ == 0.0f ? 3u : data.inputs[0].silenceFlags;
+    const bool blockStartsSilent = parameter_values_[0] == 0.0f;
+    bool blockRemainsSilent = blockStartsSilent;
+    for (std::size_t index = 0; index < changeCount; ++index)
+        blockRemainsSilent = blockRemainsSilent && parameter_changes_[index].value == 0.0f;
+
+    ember::ext_audio::AudioContext context;
+    context.sample_rate = static_cast<int64_t>(processSetup.sampleRate);
+    context.block_size = data.numSamples;
+    context.num_input_channels = data.inputs[0].numChannels;
+    context.num_output_channels = data.outputs[0].numChannels;
+    context.input_buffer_ptr = reinterpret_cast<int64_t>(data.inputs[0].channelBuffers32);
+    context.output_buffer_ptr = reinterpret_cast<int64_t>(data.outputs[0].channelBuffers32);
+    if (data.processContext) {
+        context.transport_playing =
+            (data.processContext->state & ProcessContext::kPlaying) != 0 ? 1 : 0;
+        if ((data.processContext->state & ProcessContext::kTempoValid) != 0)
+            context.transport_bpm = data.processContext->tempo;
+        if ((data.processContext->state & ProcessContext::kProjectTimeMusicValid) != 0)
+            context.transport_ppq = data.processContext->projectTimeMusic;
+    }
+    context.parameter_count = static_cast<int64_t>(parameter_values_.size());
+    context.parameter_values_ptr = reinterpret_cast<int64_t>(parameter_values_.data());
+    context.parameter_change_count = static_cast<int64_t>(changeCount);
+    context.parameter_changes_ptr = reinterpret_cast<int64_t>(parameter_changes_.data());
+
+    module_->process(reinterpret_cast<int64_t>(&context), data.numSamples);
+    if (changeCount > 0) {
+        for (std::size_t index = 0; index < changeCount; ++index) {
+            const auto id = parameter_changes_[index].param_id;
+            if (id >= 0 && static_cast<std::size_t>(id) < parameter_values_.size())
+                parameter_values_[static_cast<std::size_t>(id)] =
+                    parameter_changes_[index].value;
+        }
+    }
+    data.outputs[0].silenceFlags = blockRemainsSilent
+        ? 3u : data.inputs[0].silenceFlags;
     return kResultOk;
 }
 
@@ -288,15 +354,15 @@ tresult PLUGIN_API EmberProcessor::setState(IBStream* state) {
     IBStreamer stream(state, kLittleEndian);
     float saved = 1.0f;
     if (!stream.readFloat(saved)) return kResultFalse;
-    gain_ = std::clamp(saved, 0.0f, 2.0f);
-    setParamNormalized(kGainParamId, gain_ / 2.0f);
+    parameter_values_[0] = std::clamp(saved, 0.0f, 2.0f);
+    setParamNormalized(kGainParamId, parameter_values_[0] / 2.0f);
     return kResultOk;
 }
 
 tresult PLUGIN_API EmberProcessor::getState(IBStream* state) {
     if (!state) return kInvalidArgument;
     IBStreamer stream(state, kLittleEndian);
-    return stream.writeFloat(gain_) ? kResultOk : kResultFalse;
+    return stream.writeFloat(parameter_values_[0]) ? kResultOk : kResultFalse;
 }
 
 } // namespace EmberVst3
