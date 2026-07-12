@@ -17,15 +17,16 @@ modding embedding. The **default codegen path is a baseline JIT** —
 correctness-first, tree-walking, stack-spilling, no inlining or loop opts —
 so it will *not* match an optimizing compiler everywhere (five of six codegen
 paths are 5-9× slower than `g++ -O2`); closing that gap is benchmark-gated work.
-A thin three-address IR backend, `.em` v5 IR serialization, **eight IR
-optimization passes** (constprop/dce/cse/licm/forward/copyprop/instcombine/dse,
-plus an MBA obfuscation pass), and a **linear-scan register allocator** over the
+A thin three-address IR backend, `.em` v5 IR serialization, **sixteen IR
+optimization + obfuscation passes** (constprop/dce/cse/licm/forward/copyprop/instcombine/dse/simplifycfg/bounds-elim
++ MBA substitution/opaque_pred/deadcode/mba_expand/const_encode), and a **linear-scan register allocator** over the
 thin IR have shipped behind flags (`enable_ir_backend`, `enable_regalloc`,
 `--passes`) as the staged path toward that goal — default-off, so the default
 path is the unchanged baseline tree-walker. Full SSA construction (phi nodes,
 SSA renaming) remains the future upgrade; the shipped regalloc is the
 linear-scan-over-thin-IR subset (assigns scalar int/bool VRegs to Win64
-callee-saved registers, spills to frame slots under pressure). Current version: **v1.0**.
+callee-saved registers, spills to frame slots under pressure, promotes hot
+loop-carried frame slots to registers). Current version: **v1.1**.
 
 ## What it looks like
 
@@ -124,7 +125,7 @@ cd ember
 mkdir buildt && cd buildt
 cmake -G Ninja -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe ..
 cmake --build .          # or: ninja
-ctest                    # 54 tests (52 excluding the two benchmarks)
+ctest                    # 61 tests (59 excluding benchmarks)
 ```
 
 Run and bench a script (`ember` = `buildt/ember_cli.exe`):
@@ -143,6 +144,7 @@ ember emit-em <file.ember> <out.em>      # precompile without running
 ember bench <file.ember> [--fn NAME] [--iters N] [--warmup N]
 ember test [dir]                        # run every .ember file in <dir> (default tests/lang/)
 ember run --load-em <file.em> [--fn NAME]
+ember bundle <file.ember> <output.exe> [--stub <stub.exe>] [--fn NAME]   # bundle into standalone exe
 ember pipe <config>                     # dataflow pipeline runner (Family C): load N .em modules, wire a stage graph, stream i64s through it
 ember live <file.ember> [--tick ...]    # live-coding/reload runner: recompile on file change, show tick output evolve
 ```
@@ -165,6 +167,128 @@ pre-compiled `.em` bundle (see the CLI reference above); the host
 directive are the embedding-side equivalents. A v1 `.em` carries embedded
 process-local pointers, so it is ABI/process-trusted, not a portable
 interchange format.
+
+## Use cases & quick start
+
+ember is built for **embedding** — you use it as a scripting layer inside a
+host application (game engine, audio plugin, tool, pipeline). Pick your use
+case and follow the quick start:
+
+### 1. Game engine scripting (hot reload, game logic)
+
+Write game logic in ember, hot-reload it while the game runs:
+
+```bash
+# Write a script with @on_tick
+ember live examples/scripts/game_logic.ember --tick --tick-interval 16
+
+# Edit the .ember file → ember recompiles on save, no restart needed
+```
+
+- **Hot reload:** `docs/HOT_RELOAD.md` — dispatch slots, epoch/quiescence reclamation
+- **Lifecycle:** `docs/LIFECYCLE.md` — `@entry`, `@on_tick`, `@event(...)` annotations
+- **Example:** `examples/scripts/game_logic.ember` — modular damage calculator
+- **Host embedding:** `examples/game_host.cpp` — how to embed ember in a C++ host
+
+### 2. VST3 audio plugins (DSP, hot reload, real-time)
+
+Write VST3 plugins **fully in ember** — the C++ wrapper handles the VST3 API,
+you write the DSP:
+
+```bash
+# Build the VST3 wrapper plugin
+cmake --build buildt -j 8
+# Output: buildt/VST3/Release/ember_gain.vst3/
+
+# Write your DSP in ember (see examples/vst3_wrapper/gain_vst.ember)
+# @realtime annotation validates real-time safety at compile time
+```
+
+- **Plan:** `docs/planning/plan_VST3_EMBER_WRAPPER.md` — full architecture
+- **Example plugin:** `examples/vst3_wrapper/gain_vst.ember` — stereo gain
+- **DSP harness:** `examples/vst_dsp_harness.cpp` — headless DSP testing
+- **Audio natives:** `extensions/audio/` — `load_f32`/`store_f32`/`audio_*`
+- **@realtime checker:** rejects GC/alloc/IO/threads/exceptions in RT functions
+
+### 3. Dataflow pipelines (stream processing)
+
+Chain ember modules into a pipeline that processes a stream of values:
+
+```bash
+# Run a 3-stage pipeline: A::process -> B::reduce -> C::square
+ember pipe tests/features/pipe_3stage.pipe
+```
+
+- **Pipeline config:** `.pipe` text format — `module <alias> <path>`, `stage <alias>::<fn>`, `input <start> <count>`
+- **Examples:** `tests/features/pipe_2stage.pipe`, `pipe_3stage.pipe`
+- **Modules:** `docs/MODULES.md` — `.em` bundling + cross-module linking
+
+### 4. Live coding (iterate on tick-based scripts)
+
+Run a script with `@on_tick` functions, recompile on file change:
+
+```bash
+ember live examples/scripts/control.ember --tick --tick-count 10 --tick-interval 100
+# Edit control.ember → ember recompiles, prints "reloaded (epoch N)"
+```
+
+- **Hot reload mechanics:** `src/hot_reload.hpp` — `HotReloadDomain`, `ExecutionGuard`
+- **Example:** `tests/features/live_tick.ember`
+
+### 5. Standalone exe bundling (distribute without ember installed)
+
+Bundle a `.ember` script + the ember runtime into a single `.exe`:
+
+```bash
+# Bundle a script into a standalone executable
+ember bundle my_script.ember my_app.exe
+# Or use the dedicated bundler:
+ember_bundle my_script.ember my_app.exe
+
+# Run it anywhere — no ember install needed
+./my_app.exe
+```
+
+- **Bundling:** `docs/BUNDLING_AND_EM_MODULES.md` — the `.em` format, relocations
+- **Stub:** `examples/ember_stub_main.cpp` — the runtime stub
+- **Bundler:** `examples/ember_bundle.cpp` — the bundler tool
+- **Release packaging:** `scripts/package_release.sh`
+
+### 6. Self-hosted compiler (ember written in ember)
+
+The ember compiler (lexer, parser, sema, codegen) is being ported to ember itself:
+
+```bash
+# Run the self-hosted end-to-end pipeline
+ember run self_hosted/full_pipeline.ember --fn run_demo --ffi
+# Compiles + executes `fn main() -> i64 { return 1 + 2 * 3; }` → 7
+```
+
+- **Stages:** `self_hosted/lex.ember`, `parse.ember`, `sema.ember`, `codegen.ember`
+- **Compiler entry:** `self_hosted/emberc.ember` — the self-hosted compiler
+- **Tests:** `self_hosted/*_test.ember` (wired into ctest)
+- **Status:** subset of ember supported (i64/bool/void, let, if/while/for, arithmetic, calls)
+
+### 7. Custom optimization & obfuscation passes
+
+Write your own IR passes — optimization or obfuscation:
+
+```bash
+# Run built-in passes
+ember run my_script.ember --passes constprop,forward,copyprop,instcombine,dce,licm,dse,simplifycfg,bounds-elim
+# Obfuscation passes
+ember run my_script.ember --passes opaque_pred,deadcode,mba_expand,const_encode
+```
+
+**16 passes shipped** (11 optimization + 5 obfuscation):
+- Optimization: ConstProp, DCE, CSE, LICM, Forward, CopyProp, InstCombine, DSE, SimplifyCFG, bounds-elim
+- Obfuscation: SubstitutionPass (MBA), opaque_pred, deadcode, mba_expand, const_encode
+
+- **Pass system:** `docs/spec/PASS_SYSTEM_DESIGN.md` — architecture, registration, lifecycle
+- **Pass authoring guide:** `docs/PASS_AUTHORING.md` — how to write a custom pass
+- **Custom pass examples:** `examples/custom_pass/` — minimal_pass, nop_injection, block_merge + README
+- **Optimization research:** `docs/planning/plan_OPTIMIZATION_PASSES.md`
+- **Obfuscation research:** `docs/planning/plan_OBFUSCATION_PASSES.md`
 
 ## Docs
 
@@ -238,11 +362,11 @@ cross-process portability is a versioned-relocation v2+ item.
 **Binding API.** Register natives with `BindingBuilder` + `NativeSig`; the
 host maps script types to Win64 slots and ships a slice convention. The thirteen
 `NativeSig` addon extensions (`vec`/`quat`/`mat`/`string`/`array`/`math`/`map`/
-`sync`/`thread`/`coroutine`/`lifecycle`/`io`/`call_raw`) register their
+`sync`/`thread`/`coroutine`/`lifecycle`/`io`/`call_raw`/`audio`) register their
 `NativeSig` + `OpOverloadTable` entries the same way. Two pass extensions
 (`opt`, `obf`) are a separate category — they register IR→IR transforms via
 `register_passes` (not `register_natives`); see
-`docs/spec/PASS_SYSTEM_DESIGN.md`. The fluent `TypeBuilder`/`StructBuilder`
+`docs/spec/PASS_SYSTEM_DESIGN.md` and `docs/PASS_AUTHORING.md`. The fluent `TypeBuilder`/`StructBuilder`
 surface stays trigger-gated on a host needing script-visible C++ struct types.
 
 ## License
