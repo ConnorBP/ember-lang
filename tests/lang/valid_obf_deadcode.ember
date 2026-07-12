@@ -1,0 +1,18 @@
+// valid_obf_deadcode.ember — dead-code injection IR pass value preservation.
+// Run with: ember_cli run ../tests/lang/valid_obf_deadcode.ember --passes deadcode
+// expect: 42
+
+fn accumulate(n: i64) -> i64 {
+    let mut total: i64 = 0;
+    let mut i: i64 = 0;
+    while (i < n) {
+        total = total + (i * 3);
+        i = i + 1;
+    }
+    return total;
+}
+
+fn main() -> i64 {
+    // 3 * (0 + 1 + 2 + 3 + 4 + 5 + 6) = 63.
+    return accumulate(7) - 21;
+}

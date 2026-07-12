@@ -1,0 +1,17 @@
+// valid_obf_opaque.ember — opaque-predicate IR pass value preservation.
+// Run with: ember_cli run ../tests/lang/valid_obf_opaque.ember --passes opaque_pred
+// expect: 42
+
+fn mix(x: i64) -> i64 {
+    let a: i64 = x * 7;
+    let b: i64 = a + 13;
+    if ((b & 1) == 0) {
+        return b - 6;
+    }
+    return b + 6;
+}
+
+fn main() -> i64 {
+    // mix(5) = 48, so the even branch returns 42.
+    return mix(5);
+}
