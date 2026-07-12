@@ -1694,6 +1694,116 @@ EmberPreserved BoundsCheckElimPass::run(ThinFunction& f,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SCCPPass: sparse conditional constant propagation across blocks
+// ═══════════════════════════════════════════════════════════════════════
+// Unlike ConstProp (per-block), SCCP tracks constants globally across
+// block boundaries using a fixpoint iteration. It ONLY replaces vreg uses
+// with constants — NO CFG modification (no block merging, no branch folding).
+// This makes it inherently value-preserving.
+
+EmberPreserved SCCPPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    bool changed = false;
+
+    // Global vreg → constant map (persists across blocks)
+    struct ConstVal { bool valid; int64_t i; };
+    std::unordered_map<VReg, ConstVal> vreg_const;
+
+    auto get_const = [&](VReg v) -> ConstVal {
+        auto it = vreg_const.find(v);
+        if (it != vreg_const.end()) return it->second;
+        return {false, 0};
+    };
+
+    auto set_const = [&](VReg v, int64_t val) {
+        auto it = vreg_const.find(v);
+        if (it != vreg_const.end() && it->second.valid && it->second.i == val)
+            return;  // no change
+        vreg_const[v] = {true, val};
+        changed = true;
+    };
+
+    // Fixpoint: iterate until no new constants are discovered
+    bool iter_changed = true;
+    while (iter_changed) {
+        iter_changed = false;
+        changed = false;  // track only this iteration's changes
+
+        for (auto& blk : f.blocks) {
+            for (auto& in : blk.instrs) {
+                switch (in.op) {
+                case ThinOp::ConstInt:
+                case ThinOp::ConstBool:
+                    set_const(in.dst, in.imm.i);
+                    break;
+
+                case ThinOp::Move: {
+                    ConstVal v = get_const(in.src1);
+                    if (v.valid) {
+                        set_const(in.dst, v.i);
+                        // Rewrite: replace Move with ConstInt
+                        in.op = ThinOp::ConstInt;
+                        in.imm.i = v.i;
+                        in.src1 = 0;
+                        in.src2 = 0;
+                        iter_changed = true;
+                    } else {
+                        vreg_const.erase(in.dst);
+                    }
+                    break;
+                }
+
+                default:
+                    if (is_foldable_int_binop(in.op) && in.meta.width != 0) {
+                        ConstVal a = get_const(in.src1);
+                        ConstVal b = (in.src2 == 0)
+                            ? ConstVal{true, in.imm.i}
+                            : get_const(in.src2);
+
+                        if (a.valid && b.valid) {
+                            // Full fold: both operands constant → ConstInt
+                            int64_t result;
+                            if (fold_int_binop(in.op, a.i, b.i, in.meta.width,
+                                               in.meta.is_unsigned != 0, &result)) {
+                                set_const(in.dst, result);
+                                in.op = ThinOp::ConstInt;
+                                in.imm.i = result;
+                                in.src1 = 0;
+                                in.src2 = 0;
+                                iter_changed = true;
+                            }
+                        } else if (a.valid && in.src2 != 0 &&
+                                   a.i >= -0x7FFFFFFFLL && a.i <= 0x7FFFFFFFLL) {
+                            // Partial: src1 is constant, move to immediate form
+                            // (swap: make src1 the vreg, imm the constant)
+                            // Only safe for commutative ops; for non-commutative,
+                            // we'd need to negate. Skip for safety.
+                            // Actually, just rewrite src2 to immediate:
+                            // The emitter handles src2==0 + imm.i as the second operand.
+                            // But we need to swap which is immediate. For now,
+                            // only fold when BOTH are constant (safe).
+                        } else if (b.valid && in.src2 != 0 &&
+                                   b.i >= -0x7FFFFFFFLL && b.i <= 0x7FFFFFFFLL) {
+                            // Partial: src2 is constant VReg → convert to immediate
+                            in.imm.i = b.i;
+                            in.src2 = 0;
+                            iter_changed = true;
+                        }
+
+                        if (in.op != ThinOp::ConstInt)
+                            vreg_const.erase(in.dst);
+                    } else {
+                        // Any other producing instr: dst is not constant
+                        if (in.dst) vreg_const.erase(in.dst);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    return changed ? EmberPreserved::none() : EmberPreserved::all();
+}
+
 // register_passes
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1708,6 +1818,7 @@ void register_passes(EmberPassRegistry& reg) {
     reg.add<InstCombinePass>("instcombine");
     reg.add<DeadStoreElimPass>("dse");
     reg.add<BoundsCheckElimPass>("bounds-elim");
+    reg.add<SCCPPass>("sccp");
 }
 
 } // namespace ember::ext_opt

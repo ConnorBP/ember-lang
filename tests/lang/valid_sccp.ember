@@ -1,0 +1,17 @@
+// valid_sccp.ember — cross-block constant propagation test.
+// Run with: ember_cli run valid_sccp.ember --passes sccp
+// expect: 42
+
+fn helper(x: i64) -> i64 {
+    return x + 10;
+}
+
+fn main() -> i64 {
+    let a: i64 = 30;
+    let b: i64 = 2;
+    // a and b are constants; helper(30) should propagate to 40
+    let c: i64 = helper(a);
+    // a + b = 32, c + 10 = 50... but helper returns a+10=40
+    // c=40, then c+2=42
+    return c + b;
+}

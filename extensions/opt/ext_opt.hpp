@@ -113,6 +113,11 @@ struct BoundsCheckElimPass : EmberPassInfoMixin<BoundsCheckElimPass> {
     EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
 };
 
+struct SCCPPass : EmberPassInfoMixin<SCCPPass> {
+    static constexpr const char* pass_name = "sccp";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
 // Register all passes by name. Mirrors register_natives(NativeTable&).
 void register_passes(EmberPassRegistry& reg);
 
