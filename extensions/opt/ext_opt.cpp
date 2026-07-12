@@ -160,6 +160,8 @@ bool call_reads_frame_off(const ThinInstr& in, int32_t off) {
     return false;
 }
 
+bool is_frame_alias_barrier(const ThinInstr& in);
+
 // Compute the set of frame_off values that are READ by any LoadFrame,
 // CopyBytes, FieldAddr, or struct-by-value call argument. CopyBytes reads a byte
 // range, and packed struct fields can begin at non-word-aligned offsets (for
@@ -171,14 +173,17 @@ std::unordered_set<int32_t> compute_read_slots(const ThinFunction& f) {
     std::unordered_set<int32_t> stored;
     for (const auto& blk : f.blocks)
         for (const auto& in : blk.instrs)
-            if (in.op == ThinOp::StoreFrame) stored.insert(in.meta.frame_off);
+            if (in.op == ThinOp::StoreFrame && in.src2 == 0)
+                stored.insert(in.meta.frame_off);
 
     std::unordered_set<int32_t> read;
     for (const auto& blk : f.blocks) {
         for (const auto& in : blk.instrs) {
-            if (in.op == ThinOp::LoadFrame || in.op == ThinOp::CopyBytes ||
-                in.op == ThinOp::FieldAddr)
+            if ((in.op == ThinOp::LoadFrame && in.src1 == 0) ||
+                in.op == ThinOp::CopyBytes || in.op == ThinOp::FieldAddr)
                 read.insert(in.meta.frame_off);
+            if (is_frame_alias_barrier(in))
+                read.insert(stored.begin(), stored.end());
             if (in.op == ThinOp::CopyBytes && in.meta.len > 0) {
                 const int32_t start = in.meta.field_off;
                 const int32_t end = start + in.meta.len;
@@ -199,6 +204,7 @@ std::unordered_set<int32_t> compute_read_slots(const ThinFunction& f) {
 // range; a struct-by-value call reads its source slot; and FieldAddr reads
 // meta.frame_off (the struct base).
 bool instr_reads_off(const ThinInstr& in, int32_t off) {
+    if (is_frame_alias_barrier(in)) return true;
     if (in.op == ThinOp::LoadFrame)
         return in.meta.frame_off == off;
     if (in.op == ThinOp::FieldAddr)
@@ -230,6 +236,27 @@ bool instr_reads_off(const ThinInstr& in, int32_t off) {
 // LoadFrame of X — the forward wrongly delivered the StoreFrame's value
 // instead of the bytes the CopyBytes wrote (hand-built IR repro confirmed
 // the LoadFrame was rewritten to a Move of the stale StoreFrame src).
+// Operations whose address/range cannot be represented by the exact-offset
+// frame-slot maps used by ConstProp, Forward, and DSE. They conservatively may
+// read or write every tracked frame slot. A StoreFrame with src2 != 0 is an
+// indirect [src2 + frame_off] store, not a write to the local frame offset.
+bool is_frame_alias_barrier(const ThinInstr& in) {
+    if (in.op == ThinOp::StoreFrame && in.src2 != 0) return true;
+    switch (in.op) {
+    case ThinOp::CopyBytes:
+    case ThinOp::CallNative:
+    case ThinOp::CallScript:
+    case ThinOp::CallIndirect:
+    case ThinOp::CallCrossModule:
+    case ThinOp::StoreAddr:
+    case ThinOp::StructLitInit:
+    case ThinOp::ArrayLitInit:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool instr_writes_off(const ThinInstr& in, int32_t off) {
     auto overlaps = [off](int32_t begin, int32_t bytes) {
         // slot_const tracks scalar slots without a separate width. Treat each
@@ -292,12 +319,15 @@ EmberPreserved ConstPropPass::run(ThinFunction& f, EmberAnalysisManager&) {
             // Kill constants before processing every write, not just explicit
             // StoreFrame. Thin lowering frame-backs many producer results via
             // meta.frame_off, and aggregate/indirect writes can alias a tracked
-            // slot. Keeping the old fact across either write miscompiled the
-            // following LoadFrame. Constant producers re-establish their fact
-            // in the switch below.
-            for (auto it = slot_const.begin(); it != slot_const.end(); ) {
-                if (instr_writes_off(in, it->first)) it = slot_const.erase(it);
-                else ++it;
+            // slot. Unknown calls, copies, and computed stores invalidate the
+            // complete exact-offset model; known writes invalidate overlaps.
+            if (is_frame_alias_barrier(in)) {
+                slot_const.clear();
+            } else {
+                for (auto it = slot_const.begin(); it != slot_const.end(); ) {
+                    if (instr_writes_off(in, it->first)) it = slot_const.erase(it);
+                    else ++it;
+                }
             }
             switch (in.op) {
             case ThinOp::ConstInt:
@@ -312,7 +342,9 @@ EmberPreserved ConstPropPass::run(ThinFunction& f, EmberAnalysisManager&) {
                     slot_const[in.meta.frame_off] = {true, in.imm.i};
                 break;
             case ThinOp::StoreFrame: {
-                // StoreFrame src1=vM off=X: if vM is constant, mark slot X.
+                // src2==0 is an exact local slot. A computed store was handled
+                // as a full alias barrier above and cannot establish a fact.
+                if (in.src2 != 0) break;
                 ConstVal v = get_vreg_const(in.src1);
                 if (v.valid) slot_const[in.meta.frame_off] = v;
                 else         slot_const.erase(in.meta.frame_off);
@@ -394,8 +426,10 @@ EmberPreserved ConstPropPass::run(ThinFunction& f, EmberAnalysisManager&) {
                 ThinInstr& in = *it;
                 bool remove = false;
                 if (in.op == ThinOp::StoreFrame) {
-                    // Dead store: slot never read by any LoadFrame/CopyBytes/FieldAddr.
-                    if (read_slots.find(in.meta.frame_off) == read_slots.end())
+                    // Only an exact local slot participates in slot liveness.
+                    // Computed stores are indirect observable writes.
+                    if (in.src2 == 0 &&
+                        read_slots.find(in.meta.frame_off) == read_slots.end())
                         remove = true;
                 } else if (is_pure(in.op) && in.dst != 0) {
                     // Dead pure def: dst VReg has no uses.
@@ -448,8 +482,10 @@ EmberPreserved DeadCodeElimPass::run(ThinFunction& f, EmberAnalysisManager&) {
                 ThinInstr& in = *it;
                 bool remove = false;
                 if (in.op == ThinOp::StoreFrame) {
-                    // Dead store: slot never read.
-                    if (read_slots.find(in.meta.frame_off) == read_slots.end())
+                    // Computed StoreFrame is an indirect write and cannot be
+                    // removed by exact local-slot liveness.
+                    if (in.src2 == 0 &&
+                        read_slots.find(in.meta.frame_off) == read_slots.end())
                         remove = true;
                 } else if (is_pure(in.op) && in.dst != 0) {
                     // Dead pure def: dst VReg unused.
@@ -968,54 +1004,102 @@ EmberPreserved LICMPass::run(ThinFunction& f, EmberAnalysisManager&) {
     for (size_t i = 0; i < num_blocks; ++i)
         id_to_idx[f.blocks[i].id] = i;
 
-    // Build a predecessor map: for each block, which blocks jump to it?
-    std::vector<std::vector<uint32_t>> preds(num_blocks);
+    // Build predecessor/successor maps. Invalid targets are ignored here; the
+    // validator diagnoses them, while an optimization pass must not index past
+    // the block vector on malformed hand-built IR.
+    std::vector<std::vector<uint32_t>> preds(num_blocks), succs(num_blocks);
     for (size_t i = 0; i < num_blocks; ++i) {
         const auto& blk = f.blocks[i];
-        if (blk.term.kind == TermKind::Jmp)
-            preds[id_to_idx[blk.term.target]].push_back(uint32_t(i));
-        else if (blk.term.kind == TermKind::Branch) {
-            preds[id_to_idx[blk.term.target]].push_back(uint32_t(i));
-            preds[id_to_idx[blk.term.false_target]].push_back(uint32_t(i));
+        auto add_edge = [&](uint32_t target) {
+            auto found = id_to_idx.find(target);
+            if (found == id_to_idx.end()) return;
+            const uint32_t target_idx = static_cast<uint32_t>(found->second);
+            succs[i].push_back(target_idx);
+            preds[target_idx].push_back(static_cast<uint32_t>(i));
+        };
+        if (blk.term.kind == TermKind::Jmp) {
+            add_edge(blk.term.target);
+        } else if (blk.term.kind == TermKind::Branch) {
+            add_edge(blk.term.target);
+            add_edge(blk.term.false_target);
         }
     }
 
-    // Find back-edges: a Jmp/Branch whose target index < current index.
-    // (The lowering produces blocks in topological-ish order, so a back-edge
-    // is a jump to an earlier block.)
+    // Compute entry reachability and dominators. A natural-loop backedge is an
+    // edge latch -> header for which header dominates latch; block ordering is
+    // not a CFG property and cannot safely identify loops.
+    std::vector<uint8_t> reachable(num_blocks, 0);
+    std::vector<uint32_t> work{0};
+    reachable[0] = 1;
+    while (!work.empty()) {
+        const uint32_t block = work.back();
+        work.pop_back();
+        for (uint32_t succ : succs[block]) {
+            if (!reachable[succ]) {
+                reachable[succ] = 1;
+                work.push_back(succ);
+            }
+        }
+    }
+
+    std::vector<std::vector<uint8_t>> dominates(
+        num_blocks, std::vector<uint8_t>(num_blocks, 0));
+    for (size_t block = 0; block < num_blocks; ++block) {
+        if (!reachable[block]) continue;
+        if (block == 0) {
+            dominates[block][0] = 1;
+        } else {
+            for (size_t candidate = 0; candidate < num_blocks; ++candidate)
+                dominates[block][candidate] = reachable[candidate];
+        }
+    }
+    bool dom_changed = true;
+    while (dom_changed) {
+        dom_changed = false;
+        for (size_t block = 1; block < num_blocks; ++block) {
+            if (!reachable[block]) continue;
+            std::vector<uint8_t> next(num_blocks, 1);
+            bool have_pred = false;
+            for (uint32_t pred : preds[block]) {
+                if (!reachable[pred]) continue;
+                if (!have_pred) {
+                    next = dominates[pred];
+                    have_pred = true;
+                } else {
+                    for (size_t candidate = 0; candidate < num_blocks; ++candidate)
+                        next[candidate] &= dominates[pred][candidate];
+                }
+            }
+            if (!have_pred) std::fill(next.begin(), next.end(), uint8_t{0});
+            next[block] = 1;
+            if (next != dominates[block]) {
+                dominates[block] = std::move(next);
+                dom_changed = true;
+            }
+        }
+    }
+
     struct Loop { uint32_t header_idx; uint32_t latch_idx; std::set<uint32_t> body; };
     std::vector<Loop> loops;
-    for (size_t i = 0; i < num_blocks; ++i) {
-        const auto& blk = f.blocks[i];
-        auto check_back = [&](uint32_t target) {
-            auto it = id_to_idx.find(target);
-            if (it == id_to_idx.end()) return;
-            uint32_t target_idx = uint32_t(it->second);
-            if (target_idx < i) {
-                // Back-edge: i → target_idx. Natural loop = {target_idx} ∪
-                // {all blocks that can reach i without going through target_idx}.
-                Loop loop;
-                loop.header_idx = target_idx;
-                loop.latch_idx = uint32_t(i);
-                loop.body.insert(target_idx);
-                // Reverse BFS from latch to header, avoiding the header.
-                std::vector<uint32_t> stack = {uint32_t(i)};
-                while (!stack.empty()) {
-                    uint32_t b = stack.back(); stack.pop_back();
-                    if (b == target_idx) continue;
-                    if (loop.body.count(b)) continue;
-                    loop.body.insert(b);
-                    for (uint32_t p : preds[b])
-                        if (!loop.body.count(p)) stack.push_back(p);
-                }
-                loops.push_back(loop);
+    for (size_t latch = 0; latch < num_blocks; ++latch) {
+        if (!reachable[latch]) continue;
+        for (uint32_t header : succs[latch]) {
+            if (!dominates[latch][header]) continue;
+            Loop loop;
+            loop.header_idx = header;
+            loop.latch_idx = static_cast<uint32_t>(latch);
+            loop.body.insert(header);
+            std::vector<uint32_t> stack{static_cast<uint32_t>(latch)};
+            while (!stack.empty()) {
+                const uint32_t block = stack.back();
+                stack.pop_back();
+                if (block == header || loop.body.count(block)) continue;
+                loop.body.insert(block);
+                for (uint32_t pred : preds[block])
+                    if (reachable[pred] && !loop.body.count(pred))
+                        stack.push_back(pred);
             }
-        };
-        if (blk.term.kind == TermKind::Jmp)
-            check_back(blk.term.target);
-        else if (blk.term.kind == TermKind::Branch) {
-            check_back(blk.term.target);
-            check_back(blk.term.false_target);
+            loops.push_back(std::move(loop));
         }
     }
 
@@ -1028,19 +1112,13 @@ EmberPreserved LICMPass::run(ThinFunction& f, EmberAnalysisManager&) {
     // Then identify loop-invariant instructions in the loop body and hoist
     // them to the pre-header (at the end of its instrs, before the terminator).
     //
-    // An instruction is loop-invariant if:
-    // - It's a ConstInt/ConstFloat/ConstBool (no operands → always invariant).
-    // - It's a pure arithmetic op (Add/Sub/Mul/...) and ALL its source VRegs
-    //   are defined OUTSIDE the loop (in a block not in the loop body), or the
-    //   source is the immediate form (src2==0, using imm.i — always invariant).
-    // - It's a LoadFrame from a slot that is NEVER written (StoreFrame) inside
-    //   the loop.
-    // - It's a Move whose src1 is invariant.
-    //
-    // We do NOT hoist StoreFrame (memory writes) in this first implementation —
-    // hoisting stores requires proving the slot is not read before the store in
-    // the loop, which is more complex. The hoisted pure instructions reduce the
-    // per-iteration compute cost even if the store stays in the loop.
+    // Only instructions that are unconditionally safe to speculate may move
+    // from a conditional/zero-trip loop into its preheader. Keep this whitelist
+    // intentionally small: constants and integer Add/Sub/Mul cannot trap and
+    // have no language-visible side effects. In particular, Div/Mod, calls,
+    // guards, mutable loads, addresses, casts, comparisons, and float ops are
+    // not hoisted. A future memory-aware LICM may admit LoadFrame only after
+    // proving both non-aliasing writes and must-execute placement.
 
     for (const auto& loop : loops) {
         // Find the pre-header.
@@ -1055,38 +1133,45 @@ EmberPreserved LICMPass::run(ThinFunction& f, EmberAnalysisManager&) {
         if (non_loop_preds != 1 || pre_header == UINT32_MAX)
             continue;  // no safe pre-header
 
-        // Compute the set of VRegs defined INSIDE the loop.
+        // Record all definitions so an operand is accepted only when every
+        // possible definition is outside the loop and dominates the preheader.
+        // This is conservative for non-SSA VRegs, but never invents a reaching
+        // value merely because its numerically named VReg appears elsewhere.
+        std::unordered_map<VReg, std::vector<uint32_t>> def_blocks;
         std::set<VReg> loop_def_vregs;
-        // Compute the set of frame slots written INSIDE the loop.
-        std::set<int32_t> loop_written_slots;
-        for (uint32_t bi : loop.body) {
+        for (size_t bi = 0; bi < num_blocks; ++bi) {
             for (const auto& in : f.blocks[bi].instrs) {
-                if (in.dst) loop_def_vregs.insert(in.dst);
-                if (in.op == ThinOp::StoreFrame)
-                    loop_written_slots.insert(in.meta.frame_off);
+                if (!in.dst || in.op == ThinOp::CopyBytes) continue;
+                def_blocks[in.dst].push_back(static_cast<uint32_t>(bi));
+                if (loop.body.count(static_cast<uint32_t>(bi)))
+                    loop_def_vregs.insert(in.dst);
             }
         }
 
-        // Check if a VReg is loop-invariant (defined outside the loop).
         auto is_invariant_vreg = [&](VReg v) -> bool {
-            if (v == 0) return true;  // 0 = invalid/none/immediate
-            return !loop_def_vregs.count(v);
+            if (v == 0) return true;
+            if (loop_def_vregs.count(v)) return false;
+            auto defs = def_blocks.find(v);
+            if (defs == def_blocks.end()) return true; // function live-in
+            for (uint32_t def_block : defs->second)
+                if (!dominates[pre_header][def_block]) return false;
+            return true;
         };
 
-        // Check if an instruction is loop-invariant and hoistable (pure).
         auto is_invariant_instr = [&](const ThinInstr& in) -> bool {
-            if (is_side_effecting(in.op)) return false;
-            if (in.op == ThinOp::StoreFrame) return false;  // don't hoist stores (conservative)
-            if (in.op == ThinOp::ConstInt || in.op == ThinOp::ConstFloat ||
-                in.op == ThinOp::ConstBool)
-                return true;  // constants are always invariant
-            if (in.op == ThinOp::LoadFrame)
-                return !loop_written_slots.count(in.meta.frame_off);
-            if (in.op == ThinOp::Move)
-                return is_invariant_vreg(in.src1);
-            // Binary int ops / Cmp / Cast: all source VRegs must be invariant.
-            // The immediate form (src2==0) is always invariant.
-            return is_invariant_vreg(in.src1) && is_invariant_vreg(in.src2);
+            switch (in.op) {
+            case ThinOp::ConstInt:
+            case ThinOp::ConstBool:
+            case ThinOp::ConstFloat:
+                return true;
+            case ThinOp::Add:
+            case ThinOp::Sub:
+            case ThinOp::Mul:
+                return is_invariant_vreg(in.src1) &&
+                       is_invariant_vreg(in.src2);
+            default:
+                return false;
+            }
         };
 
         // Collect hoistable instructions from the loop body (excluding the
@@ -1104,20 +1189,24 @@ EmberPreserved LICMPass::run(ThinFunction& f, EmberAnalysisManager&) {
 
         if (to_hoist.empty()) continue;
 
-        // Hoist: move each invariant instruction to the end of the pre-header's
-        // instrs (before the terminator). Remove from the original block.
-        // Process in reverse order so indices don't shift as we erase.
-        std::sort(to_hoist.begin(), to_hoist.end(),
-            [](const auto& a, const auto& b) {
-                return a.first != b.first ? a.first > b.first : a.second > b.second;
-            });
-        auto& pre_hdr_instrs = f.blocks[pre_header].instrs;
-        for (const auto& [bi, ii] : to_hoist) {
-            ThinInstr hoisted = std::move(f.blocks[bi].instrs[ii]);
-            f.blocks[bi].instrs.erase(f.blocks[bi].instrs.begin() + ptrdiff_t(ii));
-            pre_hdr_instrs.push_back(std::move(hoisted));
-            changed = true;
+        // Preserve the original instruction order in the preheader. Collect
+        // copies in forward block/instruction order, erase each source block
+        // from the back to keep indices valid, then append the copies forward.
+        std::sort(to_hoist.begin(), to_hoist.end());
+        std::vector<ThinInstr> hoisted;
+        hoisted.reserve(to_hoist.size());
+        for (const auto& [bi, ii] : to_hoist)
+            hoisted.push_back(f.blocks[bi].instrs[ii]);
+        for (auto it = to_hoist.rbegin(); it != to_hoist.rend(); ++it) {
+            const auto [bi, ii] = *it;
+            f.blocks[bi].instrs.erase(
+                f.blocks[bi].instrs.begin() + static_cast<ptrdiff_t>(ii));
         }
+        auto& pre_hdr_instrs = f.blocks[pre_header].instrs;
+        pre_hdr_instrs.insert(pre_hdr_instrs.end(),
+                              std::make_move_iterator(hoisted.begin()),
+                              std::make_move_iterator(hoisted.end()));
+        changed = true;
     }
 
     return changed ? EmberPreserved::none() : EmberPreserved::all();
@@ -1155,8 +1244,15 @@ EmberPreserved StoreToLoadForwardPass::run(ThinFunction& f, EmberAnalysisManager
                     else ++it;
                 }
             }
+            // Unknown calls/copies/addresses and computed stores may overwrite
+            // any tracked slot. They are barriers, and a computed StoreFrame
+            // must never establish an exact frame_off forwarding fact.
+            if (is_frame_alias_barrier(in)) {
+                last_store_src.clear();
+                continue;
+            }
             if (in.op == ThinOp::StoreFrame) {
-                // Record the store (or update it).
+                // Record an exact local store (or update it).
                 last_store_src[in.meta.frame_off] = in.src1;
                 continue;
             }
@@ -1439,7 +1535,15 @@ EmberPreserved DeadStoreElimPass::run(ThinFunction& f, EmberAnalysisManager&) {
             auto& instrs = blk.instrs;
             for (size_t i = 0; i < instrs.size(); ++i) {
                 ThinInstr& in = instrs[i];
+                // These operations may read every frame slot, so every pending
+                // store is live and cannot be removed as overwritten later.
+                if (is_frame_alias_barrier(in)) {
+                    last_store_idx.clear();
+                    continue;
+                }
                 if (in.op == ThinOp::StoreFrame) {
+                    // Alias-barrier handling above excludes computed stores;
+                    // only exact local slots reach this tracking path.
                     int32_t off = in.meta.frame_off;
                     auto it = last_store_idx.find(off);
                     if (it != last_store_idx.end()) {
@@ -1840,6 +1944,330 @@ EmberPreserved BoundsCheckElimPass::run(ThinFunction& f,
     }
 
     return changed ? EmberPreserved::none() : EmberPreserved::all();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LoopStrengthReductionPass: canonical i*K recurrence reduction
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Restrict the transform to lowering's single body/latch loop shape. The
+// induction variable must be an exact frame slot, initialized in the unique
+// preheader and updated exactly once by i=i+1. For a Mul in the body using the
+// load that reaches that update, create a private frame-backed accumulator:
+//
+//   preheader: t = i_start * K
+//   body:      old_result = LoadFrame(t)
+//              ... i = i + 1
+//              t = t + K
+//
+// Keeping the original Mul destination preserves all existing VReg and spill-
+// home uses. A fresh private frame slot avoids extending a cross-block VReg in
+// non-SSA IR. Only one candidate is transformed per loop invocation; repeated
+// pass runs can reduce additional independent products.
+
+EmberPreserved LoopStrengthReductionPass::run(ThinFunction& f,
+                                               EmberAnalysisManager&) {
+    if (f.blocks.size() < 4) return EmberPreserved::all();
+
+    std::unordered_map<uint32_t, size_t> id_to_index;
+    for (size_t i = 0; i < f.blocks.size(); ++i)
+        if (!id_to_index.emplace(f.blocks[i].id, i).second)
+            return EmberPreserved::all();
+
+    std::vector<std::vector<size_t>> preds(f.blocks.size());
+    auto add_pred = [&](size_t source, uint32_t target) {
+        auto found = id_to_index.find(target);
+        if (found == id_to_index.end()) return false;
+        preds[found->second].push_back(source);
+        return true;
+    };
+    for (size_t i = 0; i < f.blocks.size(); ++i) {
+        const ThinTerm& term = f.blocks[i].term;
+        if (term.kind == TermKind::Jmp) {
+            if (!add_pred(i, term.target)) return EmberPreserved::all();
+        } else if (term.kind == TermKind::Branch) {
+            if (!add_pred(i, term.target) || !add_pred(i, term.false_target))
+                return EmberPreserved::all();
+        }
+    }
+
+    VReg next_vreg = 1;
+    int32_t min_frame_off = f.frame.next_local_off;
+    auto inspect_storage = [&](const ThinInstr& in) {
+        next_vreg = std::max(next_vreg, in.dst + (in.dst != 0));
+        next_vreg = std::max(next_vreg, in.src1 + (in.src1 != 0));
+        next_vreg = std::max(next_vreg, in.src2 + (in.src2 != 0));
+        for (VReg arg : in.args)
+            next_vreg = std::max(next_vreg, arg + (arg != 0));
+        if (in.meta.frame_off < min_frame_off) min_frame_off = in.meta.frame_off;
+        if (in.meta.data_temp_off < min_frame_off) min_frame_off = in.meta.data_temp_off;
+        for (int32_t off : in.arg_frame_offs)
+            if (off < min_frame_off) min_frame_off = off;
+    };
+    for (const ThinBlock& block : f.blocks) {
+        next_vreg = std::max(next_vreg, block.term.cond + (block.term.cond != 0));
+        next_vreg = std::max(next_vreg, block.term.ret + (block.term.ret != 0));
+        for (const ThinInstr& in : block.instrs) inspect_storage(in);
+    }
+
+    for (size_t hi = 0; hi < f.blocks.size(); ++hi) {
+        ThinBlock& header = f.blocks[hi];
+        if (header.term.kind != TermKind::Branch || preds[hi].size() != 2)
+            continue;
+
+        // Recover the header's `i < bound` from lowering's `(i < bound)==0`
+        // branch wrapper. The bound itself need not be constant for LSR.
+        size_t wrapper_index = 0;
+        const ThinInstr* wrapper = last_def_before(
+            header, header.term.cond, header.instrs.size(), &wrapper_index);
+        if (!wrapper || wrapper->op != ThinOp::Cmp || wrapper->meta.cmp != 0)
+            continue;
+        VReg inner = 0;
+        int64_t zero = 1;
+        if (const_before(header, wrapper->src1, wrapper_index, &zero) && zero == 0)
+            inner = wrapper->src2;
+        else if (const_before(header, wrapper->src2, wrapper_index, &zero) && zero == 0)
+            inner = wrapper->src1;
+        if (inner == 0) continue;
+        size_t compare_index = 0;
+        const ThinInstr* compare = last_def_before(
+            header, inner, wrapper_index, &compare_index);
+        if (!compare || compare->op != ThinOp::Cmp || compare->meta.cmp != 2)
+            continue;
+        const ThinInstr* header_load = last_def_before(
+            header, compare->src1, compare_index);
+        if (!header_load || header_load->op != ThinOp::LoadFrame ||
+            header_load->src1 != 0 || header_load->meta.frame_off == 0)
+            continue;
+        const int32_t iv_slot = header_load->meta.frame_off;
+
+        auto body_found = id_to_index.find(header.term.false_target);
+        if (body_found == id_to_index.end()) continue;
+        const size_t bi = body_found->second;
+        if (bi == hi || preds[bi].size() != 1 || preds[bi][0] != hi)
+            continue;
+        ThinBlock& body = f.blocks[bi];
+        if (body.term.kind != TermKind::Jmp) continue;
+        auto latch_found = id_to_index.find(body.term.target);
+        if (latch_found == id_to_index.end()) continue;
+        const size_t li = latch_found->second;
+        if (li == hi || li == bi || preds[li].size() != 1 || preds[li][0] != bi)
+            continue;
+        ThinBlock& latch = f.blocks[li];
+        if (latch.term.kind != TermKind::Jmp || latch.term.target != header.id)
+            continue;
+
+        size_t pi = f.blocks.size();
+        for (size_t pred : preds[hi]) {
+            if (pred == li) continue;
+            if (pi != f.blocks.size()) { pi = f.blocks.size(); break; }
+            pi = pred;
+        }
+        if (pi == f.blocks.size()) continue;
+        ThinBlock& preheader = f.blocks[pi];
+        if (preheader.term.kind != TermKind::Jmp ||
+            preheader.term.target != header.id)
+            continue;
+
+        size_t init_index = preheader.instrs.size();
+        for (size_t i = preheader.instrs.size(); i-- > 0;) {
+            const ThinInstr& in = preheader.instrs[i];
+            if (in.op == ThinOp::StoreFrame && in.src2 == 0 &&
+                in.meta.frame_off == iv_slot) {
+                init_index = i;
+                break;
+            }
+        }
+        if (init_index == preheader.instrs.size()) continue;
+        const VReg initial_vreg = preheader.instrs[init_index].src1;
+        if (initial_vreg == 0) continue;
+        bool preheader_alias_after_init = false;
+        for (size_t i = init_index + 1; i < preheader.instrs.size(); ++i) {
+            const ThinInstr& in = preheader.instrs[i];
+            if (is_frame_alias_barrier(in) || instr_writes_off(in, iv_slot)) {
+                preheader_alias_after_init = true;
+                break;
+            }
+        }
+        if (preheader_alias_after_init) continue;
+
+        // Prove a sole exact unit increment, allowing it in body or latch.
+        ThinBlock* update_block = nullptr;
+        size_t update_index = 0;
+        const ThinInstr* update_store = nullptr;
+        unsigned iv_writes = 0;
+        bool unsafe = false;
+        auto inspect_loop = [&](ThinBlock& block) {
+            for (size_t i = 0; i < block.instrs.size(); ++i) {
+                const ThinInstr& in = block.instrs[i];
+                if (is_frame_alias_barrier(in)) unsafe = true;
+                if (in.op == ThinOp::StoreFrame && in.src2 == 0 &&
+                    in.meta.frame_off == iv_slot) {
+                    ++iv_writes;
+                    update_block = &block;
+                    update_index = i;
+                    update_store = &in;
+                } else if (instr_writes_off(in, iv_slot)) {
+                    unsafe = true;
+                }
+            }
+        };
+        inspect_loop(header);
+        inspect_loop(body);
+        inspect_loop(latch);
+        if (unsafe || iv_writes != 1 || !update_store || !update_block)
+            continue;
+        size_t add_index = 0;
+        const ThinInstr* increment = last_def_before(
+            *update_block, update_store->src1, update_index, &add_index);
+        if (!increment || increment->op != ThinOp::Add) continue;
+        bool unit_increment = false;
+        if (load_of_slot_before(*update_block, increment->src1, add_index, iv_slot)) {
+            if (increment->src2 == 0) unit_increment = increment->imm.i == 1;
+            else {
+                int64_t step = 0;
+                unit_increment = const_before(*update_block, increment->src2,
+                                              add_index, &step) && step == 1;
+            }
+        } else if (load_of_slot_before(*update_block, increment->src2,
+                                       add_index, iv_slot)) {
+            int64_t step = 0;
+            unit_increment = const_before(*update_block, increment->src1,
+                                          add_index, &step) && step == 1;
+        }
+        if (!unit_increment) continue;
+
+        // The recurrence update must execute on every path through an
+        // iteration. The accepted shape has a single body/latch chain, but an
+        // early Return/Trap in either block would bypass the update.
+        if (body.term.kind != TermKind::Jmp || latch.term.kind != TermKind::Jmp)
+            continue;
+
+        // Select a Mul before the increment that consumes a direct load of i
+        // and a loop-invariant integer constant. Require a unique definition of
+        // the Mul destination in the loop to avoid non-SSA reaching ambiguity.
+        size_t mul_index = body.instrs.size();
+        int64_t factor = 0;
+        for (size_t i = 0; i < body.instrs.size(); ++i) {
+            ThinInstr& candidate = body.instrs[i];
+            if (candidate.op != ThinOp::Mul || candidate.dst == 0 ||
+                (&body == update_block && i >= add_index))
+                continue;
+            int64_t k = 0;
+            bool left_iv = load_of_slot_before(body, candidate.src1, i, iv_slot);
+            bool right_iv = load_of_slot_before(body, candidate.src2, i, iv_slot);
+            bool constant = false;
+            if (left_iv) {
+                constant = candidate.src2 == 0
+                    ? (k = candidate.imm.i, true)
+                    : const_before(body, candidate.src2, i, &k);
+            } else if (right_iv) {
+                constant = const_before(body, candidate.src1, i, &k);
+            }
+            if (!constant) continue;
+            unsigned definitions = 0;
+            for (const ThinBlock* block : {&header, &body, &latch})
+                for (const ThinInstr& in : block->instrs)
+                    definitions += in.dst == candidate.dst &&
+                                   in.op != ThinOp::CopyBytes;
+            if (definitions != 1) continue;
+            mul_index = i;
+            factor = k;
+            break;
+        }
+        if (mul_index == body.instrs.size()) continue;
+
+        // Reserve an aligned private eight-byte frame cell and grow the frame.
+        const int64_t low = std::min<int64_t>(min_frame_off, -f.frame.frame_size);
+        int64_t acc_off64 = ((low - 8) / 8) * 8;
+        if (acc_off64 >= 0) acc_off64 = -8;
+        if (acc_off64 < INT32_MIN) continue;
+        const int32_t acc_off = static_cast<int32_t>(acc_off64);
+        min_frame_off = acc_off;
+        const int64_t needed = -acc_off64 + 16;
+        if (needed > INT32_MAX - 15) continue;
+        // Lowering reserves an additional 16-byte safety area beyond its
+        // deepest spill. Preserve that convention for the new accumulator.
+        f.frame.frame_size = static_cast<int32_t>((needed + 31) & ~int64_t{15});
+        f.frame.next_local_off = std::max(
+            f.frame.next_local_off, static_cast<int32_t>(-acc_off64));
+
+        const ThinInstr original_mul = body.instrs[mul_index];
+        // Read the reaching slot value at the end of the preheader instead of
+        // extending the initializer's source VReg across possible non-SSA
+        // redefinitions in the preheader.
+        ThinInstr load_initial;
+        load_initial.op = ThinOp::LoadFrame;
+        load_initial.dst = next_vreg++;
+        load_initial.meta = original_mul.meta;
+        load_initial.meta.frame_off = iv_slot;
+        preheader.instrs.push_back(std::move(load_initial));
+
+        ThinInstr init = original_mul;
+        init.dst = next_vreg++;
+        init.src1 = preheader.instrs.back().dst;
+        init.src2 = 0;
+        init.imm.i = factor;
+        // Give the VReg a normal private spill home, then explicitly store the
+        // initialized recurrence into acc_off. Reusing acc_off as both a VReg
+        // home and mutable slot confuses regalloc's VReg lifetime model.
+        init.meta.frame_off = acc_off - 8;
+        preheader.instrs.push_back(std::move(init));
+        ThinInstr store_initial;
+        store_initial.op = ThinOp::StoreFrame;
+        store_initial.src1 = preheader.instrs.back().dst;
+        store_initial.meta = original_mul.meta;
+        store_initial.meta.frame_off = acc_off;
+        preheader.instrs.push_back(std::move(store_initial));
+
+        // An ordinary LoadFrame uses frame_off as its source and therefore
+        // cannot simultaneously materialize the original Mul spill home.
+        // Load the accumulator into a fresh VReg, then retain the Mul's dst and
+        // home with a Move so explicit home readers keep observing the result.
+        ThinInstr load_result;
+        load_result.op = ThinOp::LoadFrame;
+        load_result.dst = next_vreg++;
+        load_result.meta = original_mul.meta;
+        load_result.meta.frame_off = acc_off;
+        body.instrs.insert(body.instrs.begin() + static_cast<ptrdiff_t>(mul_index),
+                           std::move(load_result));
+        if (update_block == &body && update_index >= mul_index) ++update_index;
+        ThinInstr replacement = original_mul;
+        replacement.op = ThinOp::Move;
+        replacement.src1 = body.instrs[mul_index].dst;
+        replacement.src2 = 0;
+        body.instrs[mul_index + 1] = std::move(replacement);
+
+        ThinInstr load_acc;
+        load_acc.op = ThinOp::LoadFrame;
+        load_acc.dst = next_vreg++;
+        load_acc.meta = original_mul.meta;
+        load_acc.meta.frame_off = acc_off;
+        ThinInstr add_acc = original_mul;
+        add_acc.op = ThinOp::Add;
+        add_acc.dst = next_vreg++;
+        add_acc.src1 = load_acc.dst;
+        add_acc.src2 = 0;
+        add_acc.imm.i = factor;
+        add_acc.meta.frame_off = acc_off - 16;
+        ThinInstr store_acc;
+        store_acc.op = ThinOp::StoreFrame;
+        store_acc.src1 = add_acc.dst;
+        store_acc.meta = original_mul.meta;
+        store_acc.meta.frame_off = acc_off;
+
+        // Insert after the induction store. If replacement and update share the
+        // body, the replacement does not alter the update index because it is
+        // in-place. Append after StoreFrame so t advances with i.
+        auto insert_at = update_block->instrs.begin() +
+                         static_cast<ptrdiff_t>(update_index + 1);
+        insert_at = update_block->instrs.insert(insert_at, std::move(load_acc));
+        insert_at = update_block->instrs.insert(insert_at + 1, std::move(add_acc));
+        update_block->instrs.insert(insert_at + 1, std::move(store_acc));
+        return EmberPreserved::none();
+    }
+
+    return EmberPreserved::all();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2449,6 +2877,7 @@ void register_passes(EmberPassRegistry& reg) {
     reg.add<SimplifyCFGPass>("simplifycfg");
     reg.add<CSEPass>("cse");
     reg.add<LICMPass>("licm");
+    reg.add<LoopStrengthReductionPass>("lsr");
     reg.add<StoreToLoadForwardPass>("forward");
     reg.add<CopyPropPass>("copyprop");
     reg.add<InstCombinePass>("instcombine");

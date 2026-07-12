@@ -1,6 +1,6 @@
 // ext_opt.hpp — Stage C: the IR optimization passes extension.
 //
-// Fifteen IR→IR optimization passes over ThinFunction, registered by name via
+// Sixteen IR→IR optimization passes over ThinFunction, registered by name via
 // register_passes (the extension-style discovery pattern, mirroring
 // register_natives). The host wires it:
 //   EmberPassRegistry reg;
@@ -23,12 +23,13 @@
 //   each block. Equivalent operands share value numbers, so expressions remain
 //   recognizable through copies. Frame stores invalidate aliasing LoadFrame
 //   entries and calls invalidate every memory-derived entry.
-// - LICMPass ("licm"): loop-invariant code motion. Detects natural loops via
-//   back-edges, finds the pre-header, and hoists invariant pure instrs
-//   (ConstInt/ConstBool/ConstFloat, pure binops with invariant operands,
-//   LoadFrame from a slot never written in the loop, Move of an invariant
-//   vreg) to the end of the pre-header. Does NOT hoist stores. Works by
-//   direct IR traversal (no EmberAnalysisManager needed yet).
+// - LICMPass ("licm"): conservative loop-invariant code motion. Detects
+//   natural loops with dominance-qualified backedges and hoists only safe-to-
+//   speculate constants and integer Add/Sub/Mul with invariant operands.
+//   Trapping operations and mutable loads remain in the loop.
+// - LoopStrengthReductionPass ("lsr"): replaces a canonical loop's i*K with
+//   a preheader accumulator initialized from i_start*K and incremented by K
+//   beside the sole proven i=i+1 update. Ambiguous/non-SSA loops are skipped.
 // - StoreToLoadForwardPass ("forward"): intra-block store-to-load forwarding.
 //   Replaces LoadFrame dst=vD off=X with Move dst=vD src1=vN when a
 //   StoreFrame src1=vN off=X is the last writer to slot X (no intervening
@@ -69,7 +70,7 @@
 // - BranchFoldingPass ("branch_folding"): replaces a conditional Branch whose
 //   true and false targets are identical with an unconditional Jmp.
 //
-// All fifteen are VALUE-PRESERVING: after the pass, emit_x64 produces the same
+// All sixteen are VALUE-PRESERVING: after the pass, emit_x64 produces the same
 // i64 result. They return EmberPreserved::none() if they changed the IR,
 // Preserved::all() if they did nothing.
 #pragma once
@@ -102,6 +103,11 @@ struct CSEPass : EmberPassInfoMixin<CSEPass> {
 
 struct LICMPass : EmberPassInfoMixin<LICMPass> {
     static constexpr const char* pass_name = "licm";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+struct LoopStrengthReductionPass : EmberPassInfoMixin<LoopStrengthReductionPass> {
+    static constexpr const char* pass_name = "lsr";
     EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
 };
 

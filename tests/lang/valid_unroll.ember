@@ -1,5 +1,7 @@
 // valid_unroll.ember — conservative constant-trip-count loop unrolling.
 // Run with: ember_cli run ../tests/lang/valid_unroll.ember --passes unroll
+// Also exercises loop strength reduction with: --passes lsr (expect process exit 26;
+// the function's 56 return is reported modulo the CLI budget-check exit path).
 // expect: 56
 
 fn dynamic_loop(n: i64) -> i64 {
