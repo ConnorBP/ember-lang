@@ -561,6 +561,18 @@ target_link_libraries(ember_cli PRIVATE
     ember_ext_sync ember_ext_lifecycle ember_ext_opt ember_ext_obf ember_ext_map
     ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_thread ember_ext_gc)
 
+# Self-hosted compiler stages. Each ember test returns 0 on success and a
+# stage-specific nonzero code on failure. Use absolute source paths so ctest
+# works from any build directory; --ffi grants the array/string/call_raw
+# natives used by the compiler implementation and full-pipeline execution.
+foreach(stage IN ITEMS lex parse sema codegen full_pipeline)
+    add_test(NAME self_hosted_${stage}
+        COMMAND $<TARGET_FILE:ember_cli> run
+                ${CMAKE_CURRENT_SOURCE_DIR}/self_hosted/${stage}_test.ember
+                --fn main --ffi)
+    set_tests_properties(self_hosted_${stage} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # ---- standalone exe bundler (docs/planning/plan_STANDALONE_BUNDLER.md) ----
 # The stub: a pre-built runtime that links ember + ember_frontend + the
 # standard extensions (the same load path as ember_cli's --load-em, minus
@@ -592,6 +604,38 @@ target_link_libraries(ember_cli PRIVATE ember_bundler)
 add_executable(ember_bundle examples/ember_bundle.cpp)
 target_compile_definitions(ember_bundle PRIVATE EMBER_BUNDLE_MAIN_ONLY)
 target_link_libraries(ember_bundle PRIVATE ember_bundler)
+
+# Bundle the Ember-written compiler as a runnable preview artifact. The custom
+# command uses the same production bundler/stub as `ember bundle`; FFI is
+# explicit because emberc reads a source file and allocates executable memory.
+set(EMBER_SELFHOST_PREVIEW ${CMAKE_CURRENT_BINARY_DIR}/ember_selfhost_preview.exe)
+add_custom_command(
+    OUTPUT ${EMBER_SELFHOST_PREVIEW}
+    COMMAND $<TARGET_FILE:ember_bundle>
+            ${CMAKE_CURRENT_SOURCE_DIR}/self_hosted/emberc.ember
+            ${EMBER_SELFHOST_PREVIEW}
+            --stub $<TARGET_FILE:ember_stub_main>
+            --fn main --permissions ffi
+    DEPENDS ember_bundle ember_stub_main
+            ${CMAKE_CURRENT_SOURCE_DIR}/self_hosted/emberc.ember
+            ${CMAKE_CURRENT_SOURCE_DIR}/self_hosted/full_pipeline.ember
+            ${CMAKE_CURRENT_SOURCE_DIR}/self_hosted/lex.ember
+            ${CMAKE_CURRENT_SOURCE_DIR}/self_hosted/parse.ember
+            ${CMAKE_CURRENT_SOURCE_DIR}/self_hosted/sema.ember
+            ${CMAKE_CURRENT_SOURCE_DIR}/self_hosted/codegen.ember
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/self_hosted
+    COMMENT "Bundling ember_selfhost_preview.exe")
+add_custom_target(ember_selfhost_preview ALL DEPENDS ${EMBER_SELFHOST_PREVIEW})
+
+# Feed a zero-return subset program to the bundled preview through stdin. This
+# exercises bundle loading, io file read, all four self-hosted stages, W^X
+# executable creation, and execution of the generated main function.
+add_test(NAME self_hosted_preview_smoke
+    COMMAND ${CMAKE_COMMAND}
+            -DPREVIEW_EXE=${EMBER_SELFHOST_PREVIEW}
+            -DINPUT_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/self_hosted/preview_smoke_input.ember
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/selfhost_preview_smoke.cmake)
+set_tests_properties(self_hosted_preview_smoke PROPERTIES TIMEOUT 60)
 
 # End-to-end bundler test: bundle .ember scripts into standalone exes, run
 # them, assert exit codes. Covers simple scripts, multi-function, imports,

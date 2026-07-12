@@ -21,10 +21,9 @@
 //   - int literals -> i64, bool literals -> bool
 //   - identifiers: look up in the local scope, then globals
 //
-// Struct / enum / field-access / indexing / slice type-checking are left for a
-// follow-on stage (the parser builds those nodes; this sema walks the subset
-// above and reports an "unsupported in v1 sema" error for the rest, so a
-// type-check of the canonical test program succeeds end-to-end).
+// Everything outside that subset is rejected before codegen. Unsupported
+// syntax returns a stable -3xx code rather than being ignored or accidentally
+// accepted.
 //
 // === Type representation ===
 //
@@ -62,7 +61,8 @@
 // sema uses a global error flag (s_err) + first-error message/position, like
 // the parser's p_err. check_* fns set the flag on a type error and return a
 // fallback type (void) so checking continues and downstream nodes still get a
-// type. sema() returns 0 on success or 1 if s_err was set; sema_failed() /
+// type. sema() returns 0 on success, 1 for an ordinary type error, 2 for a
+// parse error, or a stable -3xx unsupported-subset code. sema_failed() /
 // sema_err_* expose the state for the test.
 
 import "parse.ember";
@@ -101,6 +101,7 @@ global s_toks : i64 = 0;
 // sees the root cause, matching the parser's err() first-error policy).
 // -----------------------------------------------------------------------------
 global s_err     : i64 = 0;
+global s_errcode : i64 = 0;   // 1=type error; -3xx=outside self-hosted subset
 global s_errline : i64 = 0;
 global s_errcol  : i64 = 0;
 global s_errmsg  : string = "";
@@ -121,6 +122,7 @@ fn s_init() -> i64 {
     g_scope = array_new(8, 0);
     g_marks = array_new(8, 0);
     s_err = 0;
+    s_errcode = 0;
     s_errline = 0;
     s_errcol = 0;
     s_errmsg = string_from_slice("");
@@ -146,9 +148,24 @@ fn s_init() -> i64 {
 fn serr(msg: string, line: i64, col: i64) -> i64 {
     if (s_err == 0) {
         s_err = 1;
+        s_errcode = 1;
         s_errline = line;
         s_errcol = col;
         s_errmsg = msg;
+    }
+    return TY_VOID;
+}
+
+// Record a machine-readable subset violation. These codes are deliberately
+// distinct from ordinary type errors so emberc never sends unsupported AST
+// nodes into the x64 emitter.
+fn unsupported(code: i64, feature: string, node: i64) -> i64 {
+    if (s_err == 0) {
+        s_err = 1;
+        s_errcode = code;
+        s_errline = node_line(node);
+        s_errcol = node_col(node);
+        s_errmsg = string_from_slice("unsupported by self-hosted subset: ") + feature;
     }
     return TY_VOID;
 }
@@ -321,12 +338,15 @@ fn resolve_type(t: i64) -> i64 {
         return serr(string_from_slice("unknown type '") + nm + string_from_slice("'"),
                     node_line(t), node_col(t));
     }
-    // canonicalize the common primitives to the shared nodes
+    if (nk_f(t) == 1) { return unsupported(-310, string_from_slice("slice type"), t); }
+    if (nk_e(t) > 0 || nk_a(t) >= 0) { return unsupported(-310, string_from_slice("array type"), t); }
     if (p == (Prim::I64 as i64)) { return TY_I64; }
     if (p == (Prim::Bool as i64)) { return TY_BOOL; }
     if (p == (Prim::Void as i64)) { return TY_VOID; }
-    // other prims (i8/i16/i32/u*/f32/f64): valid, return as-is
-    return t;
+    if (p == (Prim::F32 as i64) || p == (Prim::F64 as i64)) {
+        return unsupported(-303, string_from_slice("floating-point type"), t);
+    }
+    return unsupported(-315, string_from_slice("non-i64 integer or function-handle type"), t);
 }
 
 // -----------------------------------------------------------------------------
@@ -607,19 +627,22 @@ fn check_expr(e: i64) -> i64 {
     if (k == (NK::CallExpr as i64)) {
         return check_callexpr(e);
     }
-    if (k == (NK::FieldExpr as i64)) {
-        return check_fieldexpr(e);
-    }
-    if (k == (NK::IndexExpr as i64)) {
-        return check_indexexpr(e);
-    }
     if (k == (NK::AssignExpr as i64)) {
         return check_assignexpr(e);
     }
 
-    // unsupported in the v1 subset — report once and return void
-    return serr(string_from_slice("expression kind unsupported in v1 sema"),
-                node_line(e), node_col(e));
+    if (k == (NK::FloatLit as i64)) { return unsupported(-303, string_from_slice("float literal"), e); }
+    if (k == (NK::StringLit as i64)) { return unsupported(-309, string_from_slice("string literal"), e); }
+    if (k == (NK::ArrayLit as i64)) { return unsupported(-310, string_from_slice("array literal"), e); }
+    if (k == (NK::LambdaExpr as i64)) { return unsupported(-307, string_from_slice("lambda"), e); }
+    if (k == (NK::StructLit as i64) || k == (NK::FieldExpr as i64)) {
+        return unsupported(-301, string_from_slice("struct value"), e);
+    }
+    if (k == (NK::IndexExpr as i64) || k == (NK::ViewExpr as i64)) {
+        return unsupported(-310, string_from_slice("array/slice expression"), e);
+    }
+    if (k == (NK::EnumAccess as i64)) { return unsupported(-302, string_from_slice("enum value"), e); }
+    return unsupported(-313, string_from_slice("expression kind"), e);
 }
 
 // check a binary expression. Arithmetic/bitwise require integer operands and
@@ -956,8 +979,15 @@ fn check_stmt(s: i64) -> i64 {
         return check_for(s);
     }
 
-    // unsupported statement kind in v1 (do-while, switch, match, defer, etc.)
-    serr(string_from_slice("statement kind unsupported in v1 sema"), node_line(s), node_col(s));
+    if (k == (NK::ForEachStmt as i64)) { unsupported(-311, string_from_slice("for-each"), s); return 0; }
+    if (k == (NK::SwitchStmt as i64)) { unsupported(-305, string_from_slice("switch"), s); return 0; }
+    if (k == (NK::MatchStmt as i64)) { unsupported(-304, string_from_slice("match"), s); return 0; }
+    if (k == (NK::TryCatchStmt as i64) || k == (NK::ThrowStmt as i64)) {
+        unsupported(-306, string_from_slice("try/catch or throw"), s); return 0;
+    }
+    if (k == (NK::YieldStmt as i64)) { unsupported(-308, string_from_slice("coroutine/yield"), s); return 0; }
+    if (k == (NK::DeferStmt as i64)) { unsupported(-312, string_from_slice("defer"), s); return 0; }
+    unsupported(-314, string_from_slice("statement kind"), s);
     return 0;
 }
 
@@ -1109,20 +1139,23 @@ fn check_program(prog: i64) -> i64 {
         return serr(string_from_slice("expected a program node"), 0, 0);
     }
 
-    // pass 1: register declarations
+    // pass 1: reject unsupported declaration families, then register every
+    // supported signature. No top-level node is silently ignored.
     let mut d: i64 = nk_a(prog);
     while (d >= 0) {
         let k: i64 = nk_kind(d);
         if (k == (NK::StructDecl as i64)) {
-            register_struct(d);
+            unsupported(-301, string_from_slice("struct declaration"), d);
+        } else if (k == (NK::EnumDecl as i64)) {
+            unsupported(-302, string_from_slice("enum declaration"), d);
         } else if (k == (NK::FnDecl as i64)) {
             register_fn(d);
         } else if (k == (NK::GlobalDecl as i64)) {
-            register_global(d);
+            unsupported(-317, string_from_slice("global declaration"), d);
+        } else {
+            unsupported(-316, string_from_slice("top-level declaration"), d);
         }
-        // other top-level kinds (enum, link, namespace, static_assert) are
-        // accepted-but-ignored in v1 (the canonical test has none).
-        if (s_err != 0) { return 1; }
+        if (s_err != 0) { return s_errcode; }
         d = nk_next(d);
     }
 
@@ -1132,39 +1165,40 @@ fn check_program(prog: i64) -> i64 {
         let k: i64 = nk_kind(d);
         if (k == (NK::FnDecl as i64)) {
             check_func_body(d);
-            if (s_err != 0) { return 1; }
+            if (s_err != 0) { return s_errcode; }
         } else if (k == (NK::GlobalDecl as i64)) {
             // check the initializer's type against the declared global type
             let gty: i64 = resolve_type(nk_a(d));
-            if (s_err != 0) { return 1; }
+            if (s_err != 0) { return s_errcode; }
             let init: i64 = nk_b(d);
             if (init >= 0) {
                 let ity: i64 = check_expr(init);
-                if (s_err != 0) { return 1; }
+                if (s_err != 0) { return s_errcode; }
                 if (types_compatible(gty, ity) == 0) {
                     serr(string_from_slice("global type mismatch (") + ty_name(gty) + string_from_slice(" = ")
                          + ty_name(ity) + string_from_slice(")"),
                          node_line(d), node_col(d));
-                    return 1;
+                    return s_errcode;
                 }
             }
         }
         d = nk_next(d);
     }
-    if (s_err != 0) { return 1; }
+    if (s_err != 0) { return s_errcode; }
     return 0;
 }
 
 // -----------------------------------------------------------------------------
 // the entry point. Parse `source` (via the parser), then type-check the AST.
-// Returns 0 on success (the program type-checks), 1 on a type error, or 2 if
-// parsing failed (so the test can distinguish a parse failure from a sema
-// failure). The error position + message are available via sema_err_*.
+// Returns 0 on success, 1 on an ordinary type error, 2 on parse failure, or
+// a stable -3xx code when parsed syntax is outside the supported subset. The
+// error position + message are available via sema_err_*.
 // -----------------------------------------------------------------------------
 fn sema(source: string) -> i64 {
     let prog: i64 = parse(source);
     if (parse_failed() != 0) {
         s_err = 1;
+        s_errcode = 2;
         s_errline = parse_err_line();
         s_errcol = parse_err_col();
         s_errmsg = string_from_slice("parse error: ") + parse_err_msg();
@@ -1176,6 +1210,7 @@ fn sema(source: string) -> i64 {
 
 // whether the sema flagged an error (set by serr() / a parse failure).
 fn sema_failed() -> i64 { return s_err; }
+fn sema_err_code() -> i64 { return s_errcode; }
 fn sema_err_line() -> i64 { return s_errline; }
 fn sema_err_col() -> i64 { return s_errcol; }
 fn sema_err_msg() -> string { return s_errmsg; }

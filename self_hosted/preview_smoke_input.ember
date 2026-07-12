@@ -1,0 +1,3 @@
+// Input used by the bundled self-host preview smoke test.
+fn twice(n: i64) -> i64 { return n * 2; }
+fn main() -> i64 { return twice(21); }

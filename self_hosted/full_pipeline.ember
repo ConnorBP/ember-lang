@@ -91,7 +91,11 @@ fn compile_and_run(source: string) -> i64 {
     // type checker over the AST). Returns 0 on success, 1 on a sema error,
     // 2 on a parse error. sema_failed() / sema_err_* expose the state.
     let sr: i64 = sema(source);
-    if (sr != 0) { return -301 - sr; }   // -302 = parse error, -302.. = sema error
+    // Stable -3xx values are explicit out-of-subset rejections and must be
+    // propagated unchanged. Ordinary sema/parse failures keep the pipeline's
+    // historical -302/-303 stage mapping.
+    if (sr < 0) { return sr; }
+    if (sr != 0) { return -301 - sr; }
 
     // ---- Stage 4: codegen AST -> x64 bytes ----
     // codegen() takes the source (it calls sema() internally, then emits x64

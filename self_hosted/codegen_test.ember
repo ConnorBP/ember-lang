@@ -208,7 +208,7 @@ fn test_while() -> i64 {
 //   fn add(a: i64, b: i64) -> i64 { return a + b; }
 //   fn main() -> i64 { return add(1, 2); }
 //
-// Verifies: codegen succeeds, the call instruction (FF D0 = call rax) appears.
+// Verifies: codegen succeeds, the in-buffer direct call (E8 rel32) appears.
 // ---------------------------------------------------------------------------
 fn test_call() -> i64 {
     let buf: i64 = codegen("fn add(a: i64, b: i64) -> i64 { return a + b; } fn main() -> i64 { return add(1, 2); }");
@@ -216,8 +216,9 @@ fn test_call() -> i64 {
     let len: i64 = array_length(buf);
     let r: i64 = ck_bool(len > 0, 7002); if (r != 0) { return r; }
 
-    // call rax = FF D0 (FF /2 mod=11 reg=2 rm=rax(0) = (3<<6)|(2<<3)|0 = 0xD0)
-    let found_call: i64 = cg_find_bytes2(buf, 0xFF, 0xD0);
+    // direct near call = E8 rel32. cg_resolve_fixups patches the displacement
+    // to the callee's entry in the same executable buffer.
+    let found_call: i64 = cg_find_bytes1(buf, 0xE8);
     let r2: i64 = ck(found_call, 1, 7010); if (r2 != 0) { return r2; }
 
     g_pass = g_pass + 1;
@@ -504,7 +505,7 @@ fn test_nested_calls() -> i64 {
     let len: i64 = array_length(buf);
     let r: i64 = ck_bool(len > 0, 20002); if (r != 0) { return r; }
 
-    // count call rax (FF D0) occurrences — should be at least 2
+    // count direct near calls (E8 rel32) — should be at least 2
     let count: i64 = cg_count_calls(buf);
     let r2: i64 = ck_bool(count >= 2, 20010); if (r2 != 0) { return r2; }
 
@@ -595,19 +596,20 @@ fn cg_count_prologues(buf: i64) -> i64 {
     return count;
 }
 
-// count the number of call rax (FF D0) instructions in the buffer.
+// count the number of direct near call (E8 rel32) instructions in the buffer.
 fn cg_count_calls(buf: i64) -> i64 {
     let n: i64 = array_length(buf);
-    if (n < 2) { return 0; }
     let mut count: i64 = 0;
     let mut i: i64 = 0;
-    while (i < n - 1) {
-        if (array_get_u8(buf, i) as i64 == 0xFF) {
-            if (array_get_u8(buf, i + 1) as i64 == 0xD0) {
-                count = count + 1;
-            }
+    while (i < n) {
+        if (array_get_u8(buf, i) as i64 == 0xE8) {
+            count = count + 1;
+            // Skip the four-byte displacement so an immediate byte cannot be
+            // mistaken for another opcode.
+            i = i + 5;
+        } else {
+            i = i + 1;
         }
-        i = i + 1;
     }
     return count;
 }

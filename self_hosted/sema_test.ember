@@ -133,10 +133,10 @@ fn test_for_loop() -> i64 {
     return 0;
 }
 
-// Test 11 — a global + a fn that reads it.
+// Test 11 — globals are parsed by Stage 2 but are outside the preview emitter.
 fn test_global() -> i64 {
     let r: i64 = sema("global C: i64 = 7; fn main() -> i64 { return C; }");
-    if (r != 0) { return 11000 + r; }
+    if (r != -317) { return 11001; }
     g_pass = g_pass + 1;
     return 0;
 }
@@ -238,6 +238,34 @@ fn test_neg_logical_int() -> i64 {
     return 0;
 }
 
+// Out-of-subset syntax must return its stable -3xx code. These are sema
+// rejections (not parser failures), proving unsupported AST nodes cannot
+// silently flow into codegen.
+fn reject(src: string, want: i64, code: i64) -> i64 {
+    let got: i64 = sema(src);
+    if (got != want) { return code; }
+    if (sema_failed() != 1) { return code + 1; }
+    if (sema_err_code() != want) { return code + 2; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+fn test_unsupported_features() -> i64 {
+    let mut r: i64 = 0;
+    r = reject("struct S { x: i64; }", -301, 31001); if (r != 0) { return r; }
+    r = reject("enum E { A, B }", -302, 31011); if (r != 0) { return r; }
+    r = reject("fn f() -> f64 { return 1.5; }", -303, 31021); if (r != 0) { return r; }
+    r = reject("fn f(x: i64) -> i64 { match (x) { _ => { return 0; } } }", -304, 31031); if (r != 0) { return r; }
+    r = reject("fn f(x: i64) -> i64 { switch (x) { default: return 0; } }", -305, 31041); if (r != 0) { return r; }
+    r = reject("fn f() -> i64 { try { return 1; } catch (e) { return 0; } }", -306, 31051); if (r != 0) { return r; }
+    r = reject("fn f() -> i64 { let x = fn() -> i64 { return 1; }; return 0; }", -307, 31061); if (r != 0) { return r; }
+    r = reject("fn f() -> i64 { yield 1; return 0; }", -308, 31071); if (r != 0) { return r; }
+    r = reject("fn f() -> i64 { let s = \"nope\"; return 0; }", -309, 31081); if (r != 0) { return r; }
+    r = reject("fn f() -> i64 { let a = [1, 2]; return 0; }", -310, 31091); if (r != 0) { return r; }
+    r = reject("fn f(a: i64[]) -> i64 { return 0; }", -310, 31101); if (r != 0) { return r; }
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // main — run every test in order; bail on the first nonzero return.
 // ---------------------------------------------------------------------------
@@ -269,6 +297,7 @@ fn main() -> i64 {
     r = test_neg_unknown_fn();      if (r != 0) { return r; }
     r = test_neg_arith_bool();      if (r != 0) { return r; }
     r = test_neg_logical_int();     if (r != 0) { return r; }
+    r = test_unsupported_features(); if (r != 0) { return r; }
 
     // every check passed
     return 0;
