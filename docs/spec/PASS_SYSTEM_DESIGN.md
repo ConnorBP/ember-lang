@@ -338,6 +338,9 @@ Each step is independently testable: the gate is the benchmark (does the pass re
 
 ## 10. Cross-references
 
+- [`docs/PASS_AUTHORING.md`](../PASS_AUTHORING.md) — user-facing lifecycle,
+  mutation, side-effect, invalidation, serialization, seed, registration, and
+  testing rules, with copyable examples in `examples/custom_pass/`.
 - `docs/LLVM_PASS_SYSTEM_RESEARCH.md` §9 (the 12 design patterns this implements).
 - `src/binding_builder.hpp` (the extension discovery pattern `register_passes` mirrors).
 - `docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md` §4.5 (the Stage-1 pass interface this upgrades to IR→IR).
