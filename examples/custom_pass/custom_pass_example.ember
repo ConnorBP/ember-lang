@@ -1,0 +1,28 @@
+// custom_pass_example.ember — input for the C++ passes in this directory.
+//
+// Custom passes are discovered by the HOST, not by this script. After adding
+// custom_pass::register_passes(pass_reg) to your Ember CLI host, run:
+//
+//   ember run examples/custom_pass/custom_pass_example.ember \
+//     --passes example-minimal,example-nop-injection,example-block-merge
+//
+// `example-minimal` only visits the IR. `example-nop-injection` adds a seeded,
+// unused `x + 0` chain to one deterministic block. `example-block-merge`
+// combines unconditional-jump chains that have a single predecessor.
+//
+// To demonstrate composition, append the built-in `dce` pass. It removes the
+// unused semantic-NOP chain:
+//
+//   ember run examples/custom_pass/custom_pass_example.ember \
+//     --passes example-nop-injection,dce,example-block-merge
+
+fn choose(x: i64) -> i64 {
+    if (x > 3) {
+        return x + 4;
+    }
+    return x * 2;
+}
+
+fn main() -> i64 {
+    return choose(5); // 9: every example pass must preserve this result
+}
