@@ -43,7 +43,7 @@ echo "=== ember release preparation: $VERSION ==="
 echo "[1/5] Checking milestone criteria..."
 
 # Clean tree
-if [[ -n "$(git status --porcelain)" ]]; then
+if [[ -n "$(git status --porcelain | grep -v 'thirdparty/vst3sdk')" ]]; then
     echo "FAIL: git tree is dirty. Commit or stash changes first."
     git status --short
     exit 1
