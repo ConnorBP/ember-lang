@@ -639,12 +639,172 @@ EmberPreserved DeadCodeInjectionPass::run(ThinFunction& f, EmberAnalysisManager&
     return EmberPreserved::none();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// StringEncryptionPass: plaintext rodata to inline stack decryption
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ConstStringRef and StringDecrypt have the same slice result shape. This pass
+// encrypts each referenced rodata byte with one fixed nonzero key, rewrites the
+// producer, and gives the decryptor two fresh, nonoverlapping frame regions:
+// the byte buffer and the {ptr,len} result. A single key lets shared/overlapping
+// ConstStringRef ranges remain representable while each physical byte is XORed
+// exactly once.
+
+EmberPreserved StringEncryptionPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    constexpr uint8_t key = 0xA5;
+
+    struct Site {
+        ThinInstr* in;
+        uint32_t addend;
+        uint32_t len;
+    };
+    std::vector<Site> sites;
+    std::vector<uint8_t> encrypt_byte(f.rodata.size(), 0);
+
+    // Plan the complete rodata mutation first. Malformed references are left
+    // untouched for the normal IR validator to diagnose; the pass itself must
+    // never index outside rodata or half-rewrite such an instruction.
+    for (auto& block : f.blocks) {
+        for (auto& in : block.instrs) {
+            if (in.op != ThinOp::ConstStringRef || in.meta.len < 0) continue;
+            const uint64_t begin = in.meta.addend;
+            const uint64_t end = begin + static_cast<uint32_t>(in.meta.len);
+            if (end > f.rodata.size()) continue;
+            sites.push_back({&in, in.meta.addend,
+                             static_cast<uint32_t>(in.meta.len)});
+            for (uint64_t i = begin; i < end; ++i)
+                encrypt_byte[static_cast<size_t>(i)] = 1;
+        }
+    }
+    if (sites.empty()) return EmberPreserved::all();
+
+    for (size_t i = 0; i < f.rodata.size(); ++i)
+        if (encrypt_byte[i]) f.rodata[i] ^= key;
+
+    int32_t next_off = f.frame.next_local_off;
+    for (const Site& site : sites) {
+        ThinInstr& in = *site.in;
+
+        next_off += static_cast<int32_t>(site.len);
+        const int32_t data_temp_off = -next_off;
+        next_off += 16;
+        const int32_t slice_off = -next_off;
+
+        in.op = ThinOp::StringDecrypt;
+        in.imm.i = key;
+        in.meta.addend = site.addend;
+        in.meta.len = static_cast<int32_t>(site.len);
+        in.meta.data_temp_off = data_temp_off;
+        in.meta.frame_off = slice_off;
+    }
+
+    f.frame.next_local_off = next_off;
+    const int32_t needed = next_off + 16;
+    if (needed > f.frame.frame_size)
+        f.frame.frame_size = (needed + 15) & ~15;
+    // Frame locations changed, so a result from an out-of-band pre-pass
+    // register allocation cannot be reused safely.
+    f.ra = {};
+    return EmberPreserved::none();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BlockSplittingPass: explicit continuation blocks
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Each original long block is split at most once. Continuations are inserted
+// directly after their prefixes: this retains the emitter's established
+// linear block order and keeps register-only address producer/consumer pairs
+// adjacent in emitted code. Block IDs and every old CFG edge are remapped only
+// after all insertions are complete.
+
+EmberPreserved BlockSplittingPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    constexpr size_t min_instructions = 8;
+    StableRng rng(pass_seed(f, pass_name));
+    const size_t original_block_count = f.blocks.size();
+    bool changed = false;
+
+    // Temporary IDs are outside the original ID domain and unique. The final
+    // canonicalization maps both old CFG edges and these new jumps to vector
+    // indices, as required by thin_emit's block_labels indexing contract.
+    uint32_t next_id = static_cast<uint32_t>(f.blocks.size());
+    size_t block_index = 0;
+    for (size_t original_index = 0;
+         original_index < original_block_count;
+         ++original_index, ++block_index) {
+        ThinBlock& block = f.blocks[block_index];
+        const size_t count = block.instrs.size();
+        if (count <= min_instructions) continue;
+
+        // Every ThinInstr is an IR-level atomic operation, but a few lowering
+        // pairs deliberately rely on immediate producer/consumer adjacency.
+        // Exclude their boundary while selecting a deterministic random point.
+        std::vector<size_t> candidates;
+        candidates.reserve(count - 1);
+        for (size_t split = 1; split < count; ++split) {
+            const ThinInstr& before = block.instrs[split - 1];
+            const ThinInstr& after = block.instrs[split];
+            bool coupled = false;
+
+            if ((before.op == ThinOp::FieldAddr || before.op == ThinOp::IndexAddr) &&
+                before.dst != 0 &&
+                (after.src1 == before.dst || after.src2 == before.dst))
+                coupled = true;
+            if (before.op == ThinOp::DivOverflowCheck &&
+                (after.op == ThinOp::Div || after.op == ThinOp::Mod))
+                coupled = true;
+            if (before.op == ThinOp::CallTargetGuard &&
+                after.op == ThinOp::CallIndirect)
+                coupled = true;
+            if (before.op == ThinOp::DepthCheck &&
+                (after.op == ThinOp::CallNative || after.op == ThinOp::CallScript ||
+                 after.op == ThinOp::CallIndirect ||
+                 after.op == ThinOp::CallCrossModule))
+                coupled = true;
+
+            if (!coupled) candidates.push_back(split);
+        }
+        if (candidates.empty()) continue;
+
+        const size_t split_index = candidates[rng.index(candidates.size())];
+        ThinTerm old_term = block.term;
+        ThinBlock continuation;
+        continuation.id = next_id++;
+        continuation.instrs.insert(
+            continuation.instrs.end(),
+            std::make_move_iterator(block.instrs.begin() +
+                                    static_cast<ptrdiff_t>(split_index)),
+            std::make_move_iterator(block.instrs.end()));
+        block.instrs.erase(block.instrs.begin() +
+                           static_cast<ptrdiff_t>(split_index),
+                           block.instrs.end());
+        continuation.term = old_term;
+
+        block.term = {};
+        block.term.kind = TermKind::Jmp;
+        block.term.target = continuation.id;
+
+        f.blocks.insert(f.blocks.begin() +
+                        static_cast<ptrdiff_t>(block_index + 1),
+                        std::move(continuation));
+        ++block_index; // skip the new continuation; split originals only
+        changed = true;
+    }
+
+    if (!changed) return EmberPreserved::all();
+    canonicalize_block_ids(f);
+    f.ra = {};
+    return EmberPreserved::none();
+}
+
 void register_passes(EmberPassRegistry& reg) {
     reg.add<SubstitutionPass>("subst");
     reg.add<MBAExpansionPass>("mba_expand");
     reg.add<ConstantEncodingPass>("const_encode");
     reg.add<OpaquePredicatesPass>("opaque_pred");
     reg.add<DeadCodeInjectionPass>("deadcode");
+    reg.add<StringEncryptionPass>("str_encrypt");
+    reg.add<BlockSplittingPass>("block_split");
 }
 
 } // namespace ember::ext_obf

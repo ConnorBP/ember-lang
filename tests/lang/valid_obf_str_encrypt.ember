@@ -1,0 +1,18 @@
+// valid_obf_str_encrypt.ember — string encryption pass value preservation.
+// Run with: ember_cli run ../tests/lang/valid_obf_str_encrypt.ember --passes str_encrypt
+// expect: 42
+
+fn main() -> i64 {
+    let short: string = "ember";
+    let repeated_a: string = "same literal";
+    let repeated_b: string = "same literal";
+    let long: string = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+    if (string_length(short) != 5) { return 1; }
+    if (string_char_at(short, 0) != 101) { return 2; }
+    if (!(repeated_a == repeated_b)) { return 3; }
+    if (string_length(long) != 36) { return 4; }
+    if (string_char_at(long, 25) != 122) { return 5; }
+    if (string_char_at(long, 35) != 57) { return 6; }
+    return 42;
+}

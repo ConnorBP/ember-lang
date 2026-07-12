@@ -18,6 +18,10 @@
 // - DeadCodeInjectionPass ("deadcode"): injects a pure computation chain whose
 //   result feeds a same-target branch, making it semantically inert but live to
 //   ordinary dead-code elimination.
+// - StringEncryptionPass ("str_encrypt"): encrypts ConstStringRef rodata bytes
+//   in place and replaces each reference with the first-class StringDecrypt op.
+// - BlockSplittingPass ("block_split"): deterministically splits long basic
+//   blocks and connects each prefix to its continuation with an explicit jump.
 //
 // Design ref: docs/spec/PASS_SYSTEM_DESIGN.md §8 Step 5, §11 (obfuscation pass
 // structure from Pluto).
@@ -55,6 +59,18 @@ struct OpaquePredicatesPass : EmberPassInfoMixin<OpaquePredicatesPass> {
 
 struct DeadCodeInjectionPass : EmberPassInfoMixin<DeadCodeInjectionPass> {
     static constexpr const char* pass_name = "deadcode";
+    static constexpr bool is_required = true;
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+struct StringEncryptionPass : EmberPassInfoMixin<StringEncryptionPass> {
+    static constexpr const char* pass_name = "str_encrypt";
+    static constexpr bool is_required = true;
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+struct BlockSplittingPass : EmberPassInfoMixin<BlockSplittingPass> {
+    static constexpr const char* pass_name = "block_split";
     static constexpr bool is_required = true;
     EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
 };
