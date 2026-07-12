@@ -109,6 +109,12 @@ global s_errmsg  : string = "";
 // the current function's return type (for return-stmt checking). -1 = not in a fn.
 global s_cur_ret : i64 = 0;
 
+// Logical scope-mark depth and current loop nesting. The backing arrays cannot
+// shrink, so live stack depth must be tracked independently of physical size.
+global s_mark_len  : i64 = 0;
+global s_scope_len : i64 = 0;
+global s_loop_depth: i64 = 0;
+
 // -----------------------------------------------------------------------------
 // init — allocate the symbol tables + canonical types. Called once at sema()
 // entry (and safe to call repeatedly: it resets every table). The canonical
@@ -127,6 +133,9 @@ fn s_init() -> i64 {
     s_errcol = 0;
     s_errmsg = string_from_slice("");
     s_cur_ret = -1;
+    s_mark_len = 0;
+    s_scope_len = 0;
+    s_loop_depth = 0;
 
     // canonical primitive types: three Type nodes appended to g_nodes.
     TY_I64 = alloc_node(NK::Type as i64);
@@ -168,6 +177,28 @@ fn unsupported(code: i64, feature: string, node: i64) -> i64 {
         s_errmsg = string_from_slice("unsupported by self-hosted subset: ") + feature;
     }
     return TY_VOID;
+}
+
+// Stage 2 currently consumes annotations without attaching them to AST nodes.
+// Reject their preserved lexer tokens here so semantic contracts are never
+// silently erased before the self-hosted compiler supports annotation metadata.
+fn reject_annotations() -> i64 {
+    let n: i64 = tok_count(s_toks);
+    let mut i: i64 = 0;
+    while (i < n) {
+        if (tok_kind(s_toks, i) == (Tok::At as i64)) {
+            if (s_err == 0) {
+                s_err = 1;
+                s_errcode = -318;
+                s_errline = tok_line(s_toks, i);
+                s_errcol = tok_col(s_toks, i);
+                s_errmsg = string_from_slice("unsupported by self-hosted subset: annotation");
+            }
+            return -318;
+        }
+        i = i + 1;
+    }
+    return 0;
 }
 
 // a node's position (line/col) from its `tok` token, for error messages. Falls
@@ -491,34 +522,27 @@ fn register_global(gd: i64) -> i64 {
 
 // -----------------------------------------------------------------------------
 // scope management (local variables). The scope is a flat array of
-// (name_tok, type) pairs; g_marks records the array length at each push_scope
-// so pop_scope can truncate back to it. declare() adds to the current (top)
-// scope; lookup_local() scans the whole stack (innermost-last wins because we
-// scan from the end).
+// (name_tok, type) pairs; g_marks records the logical symbol length at each
+// push. Neither backing array can shrink, so s_mark_len and s_scope_len are
+// the authoritative live lengths. declare() adds to the current (top) scope;
+// lookup_local() scans the whole live stack from innermost to outermost.
 // -----------------------------------------------------------------------------
 fn push_scope() -> i64 {
-    array_push_i64(g_marks, array_length(g_scope) / SCOPE_STRIDE);
+    if (array_length(g_marks) < s_mark_len + 1) {
+        array_resize(g_marks, s_mark_len + 1);
+    }
+    array_set_i64(g_marks, s_mark_len, s_scope_len / SCOPE_STRIDE);
+    s_mark_len = s_mark_len + 1;
     return 0;
 }
 
 fn pop_scope() -> i64 {
-    let n: i64 = array_length(g_marks);
-    if (n == 0) { return 0; }
-    let mark: i64 = array_get_i64(g_marks, n - 1);
-    // truncate g_scope back to `mark` entries. ember's array extension has no
-    // truncate, so we rewrite the slot count via repeated... no: we instead
-    // keep a separate "logical length" s_scope_len and only read up to it.
-    // See s_scope_len below. (We still pop the mark.)
-    array_set_i64(g_marks, n - 1, 0);   // clear (not a real pop; g_marks grows
-    // unbounded across many push/pop, but a fn body has a bounded number of
-    // scopes, so this is fine for v1.)
+    if (s_mark_len == 0) { return 0; }
+    s_mark_len = s_mark_len - 1;
+    let mark: i64 = array_get_i64(g_marks, s_mark_len);
     s_scope_len = mark * SCOPE_STRIDE;
     return 0;
 }
-
-// the logical length of g_scope (so pop_scope can "truncate" without a real
-// array-truncate op). Reads/writes use this as the bound.
-global s_scope_len : i64 = 0;
 
 // declare a local in the current (top) scope. Reports a redeclaration error if
 // the same name is already in the TOP scope (shadowing an enclosing scope is
@@ -526,10 +550,9 @@ global s_scope_len : i64 = 0;
 fn declare(name_tok: i64, t: i64) -> i64 {
     let nm: string = tok_name(name_tok);
     // dedup against the current top scope: scan from the last mark to the end.
-    let nmarks: i64 = array_length(g_marks);
     let mut top_mark: i64 = 0;
-    if (nmarks > 0) {
-        top_mark = array_get_i64(g_marks, nmarks - 1) * SCOPE_STRIDE;
+    if (s_mark_len > 0) {
+        top_mark = array_get_i64(g_marks, s_mark_len - 1) * SCOPE_STRIDE;
     }
     let mut i: i64 = top_mark;
     while (i < s_scope_len) {
@@ -958,7 +981,9 @@ fn check_stmt(s: i64) -> i64 {
             serr(string_from_slice("while condition must be bool"), node_line(cond), node_col(cond));
             return 0;
         }
+        s_loop_depth = s_loop_depth + 1;
         check_block(nk_b(s));
+        s_loop_depth = s_loop_depth - 1;
         return 0;
     }
     if (k == (NK::ReturnStmt as i64)) {
@@ -972,8 +997,17 @@ fn check_stmt(s: i64) -> i64 {
         check_block(s);
         return 0;
     }
-    if (k == (NK::BreakStmt as i64) || k == (NK::ContinueStmt as i64)) {
-        return 0;   // v1: no loop-depth tracking (the canonical test doesn't use these)
+    if (k == (NK::BreakStmt as i64)) {
+        if (s_loop_depth == 0) {
+            serr(string_from_slice("break outside a loop"), node_line(s), node_col(s));
+        }
+        return 0;
+    }
+    if (k == (NK::ContinueStmt as i64)) {
+        if (s_loop_depth == 0) {
+            serr(string_from_slice("continue outside a loop"), node_line(s), node_col(s));
+        }
+        return 0;
     }
     if (k == (NK::ForStmt as i64)) {
         return check_for(s);
@@ -1072,7 +1106,8 @@ fn check_return(s: i64) -> i64 {
 }
 
 // check a C-style for (init; cond; step) body. init is a let or expr stmt;
-// cond must be bool; step is an expr. v1 does not track loop depth.
+// cond must be bool; step is an expr. The init scope encloses the body, while
+// check_block adds the body's nested lexical scope.
 fn check_for(s: i64) -> i64 {
     push_scope();
     if (nk_a(s) >= 0) { check_stmt(nk_a(s)); }    // init
@@ -1087,7 +1122,9 @@ fn check_for(s: i64) -> i64 {
     }
     if (nk_c(s) >= 0) { check_expr(nk_c(s)); }    // step
     if (s_err != 0) { pop_scope(); return 0; }
+    s_loop_depth = s_loop_depth + 1;
     check_block(nk_e(s));                          // body
+    s_loop_depth = s_loop_depth - 1;
     pop_scope();
     return 0;
 }
@@ -1205,6 +1242,8 @@ fn sema(source: string) -> i64 {
         return 2;
     }
     s_init();
+    let ar: i64 = reject_annotations();
+    if (ar != 0) { return ar; }
     return check_program(prog);
 }
 

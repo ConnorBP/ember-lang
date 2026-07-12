@@ -149,6 +149,24 @@ fn test_bitwise_not() -> i64 {
     return 0;
 }
 
+// Test 13 — repeated and nested blocks preserve enclosing locals, permit
+// shadowing, and restore the enclosing binding after each inner scope pops.
+fn test_scope_chain() -> i64 {
+    let r: i64 = sema("fn f() -> i64 { let mut x: i64 = 1; { let x: i64 = 10; } if (true) { x = x + 1; } { { x = x + 40; } } return x; }");
+    if (r != 0) { return 13000 + r; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// Test 14 — break/continue are valid while checking a loop body, including a
+// nested if block whose lexical scope must not hide the loop context.
+fn test_loop_control() -> i64 {
+    let r: i64 = sema("fn f() -> i64 { let mut i: i64 = 0; while (i < 2) { i = i + 1; if (i == 1) { continue; } break; } for (let mut j: i64 = 0; j < 1; j = j + 1) { break; } return i; }");
+    if (r != 0) { return 14000 + r; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Negative tests — the sema should REJECT these (sema_failed() returns 1).
 // Each checks that sema flags an error (we do not check the exact message, only
@@ -238,6 +256,24 @@ fn test_neg_logical_int() -> i64 {
     return 0;
 }
 
+// N11 — a block-local declaration must not leak into its enclosing scope.
+fn test_neg_block_local_escape() -> i64 {
+    let r: i64 = sema("fn f() -> i64 { { let x: i64 = 42; } return x; }");
+    let r2: i64 = ck(r, 1, 30011); if (r2 != 0) { return r2; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
+// N12/N13 — loop-control statements require an enclosing loop.
+fn test_neg_loop_control() -> i64 {
+    let r1: i64 = sema("fn f() -> i64 { break; return 0; }");
+    let c1: i64 = ck(r1, 1, 30021); if (c1 != 0) { return c1; }
+    let r2: i64 = sema("fn f() -> i64 { continue; return 0; }");
+    let c2: i64 = ck(r2, 1, 30022); if (c2 != 0) { return c2; }
+    g_pass = g_pass + 1;
+    return 0;
+}
+
 // Out-of-subset syntax must return its stable -3xx code. These are sema
 // rejections (not parser failures), proving unsupported AST nodes cannot
 // silently flow into codegen.
@@ -263,6 +299,7 @@ fn test_unsupported_features() -> i64 {
     r = reject("fn f() -> i64 { let s = \"nope\"; return 0; }", -309, 31081); if (r != 0) { return r; }
     r = reject("fn f() -> i64 { let a = [1, 2]; return 0; }", -310, 31091); if (r != 0) { return r; }
     r = reject("fn f(a: i64[]) -> i64 { return 0; }", -310, 31101); if (r != 0) { return r; }
+    r = reject("@realtime fn f() -> i64 { return 0; }", -318, 31111); if (r != 0) { return r; }
     return 0;
 }
 
@@ -285,6 +322,8 @@ fn main() -> i64 {
     r = test_for_loop();            if (r != 0) { return r; }
     r = test_global();              if (r != 0) { return r; }
     r = test_bitwise_not();         if (r != 0) { return r; }
+    r = test_scope_chain();         if (r != 0) { return r; }
+    r = test_loop_control();        if (r != 0) { return r; }
 
     // negative
     r = test_neg_if_cond();         if (r != 0) { return r; }
@@ -297,6 +336,8 @@ fn main() -> i64 {
     r = test_neg_unknown_fn();      if (r != 0) { return r; }
     r = test_neg_arith_bool();      if (r != 0) { return r; }
     r = test_neg_logical_int();     if (r != 0) { return r; }
+    r = test_neg_block_local_escape(); if (r != 0) { return r; }
+    r = test_neg_loop_control();    if (r != 0) { return r; }
     r = test_unsupported_features(); if (r != 0) { return r; }
 
     // every check passed
