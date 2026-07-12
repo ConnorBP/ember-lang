@@ -1629,6 +1629,17 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
         return { LoweredValue::Scalar, res, 0, lt };
     }
     if (auto* h = dynamic_cast<const FnHandleExpr*>(&ex)) {
+        if (h->is_cross_module) {
+            // ThinIR has no cross-module indirect-dispatch representation or
+            // bit-63-aware call-target guard. Never turn the sema sentinel
+            // h->slot == -1 into executable IR; force compile_func to use the
+            // tree backend, which emits and validates the full tagged handle.
+            non_serializable = true;
+            non_serializable_reason =
+                "cross-module function handle requires tree-walker dispatch";
+            return { LoweredValue::Scalar, 0, 0,
+                     ex.ty ? ex.ty : &type_i64() };
+        }
         VReg v = new_vreg(ex.ty ? ex.ty : &type_i64());
         ThinInstr& in = emit(ThinOp::ConstInt, v, 0, 0, loc);
         in.imm.i = int64_t(h->slot); in.meta.type = ex.ty ? ex.ty : &type_i64();

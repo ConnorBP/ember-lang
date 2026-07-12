@@ -54,7 +54,7 @@ private:
     void startHotReload();
     void stopHotReload() noexcept;
     void watchScript();
-    EmberModule* activatePendingModule() noexcept;
+    std::shared_ptr<EmberModule> activatePendingModule() noexcept;
     void reclaimRetiredModule();
     void refreshLatencyAndTail() noexcept;
     void bypass(Steinberg::Vst::ProcessData& data) const noexcept;
@@ -65,14 +65,12 @@ private:
     static constexpr std::size_t kMaxStateBytes = 16 * 1024 * 1024;
 
     // A ProcessPlan (EmberModule) owns its immutable JIT code, globals, and
-    // private dispatch table. The watcher only writes pending_; the audio
-    // thread swaps it into current_ at a block boundary. audio_readers_ is a
-    // lock-free grace period: the watcher may destroy retired_ only while no
-    // process() call can still hold the old plan.
-    std::atomic<EmberModule*> current_ {nullptr};
-    std::atomic<EmberModule*> pending_ {nullptr};
-    std::atomic<EmberModule*> retired_ {nullptr};
-    std::atomic<std::uint32_t> audio_readers_ {0};
+    // private dispatch table. Access these shared_ptrs only through the C++11
+    // atomic shared_ptr free functions. Every caller takes an owning snapshot,
+    // so a watcher can retire a module without racing an audio-thread crossfade.
+    std::shared_ptr<EmberModule> current_;
+    std::shared_ptr<EmberModule> pending_;
+    std::shared_ptr<EmberModule> retired_;
 
     std::thread watcher_;
     std::atomic<bool> stop_watcher_ {false};
@@ -85,7 +83,8 @@ private:
     std::vector<float> crossfade_storage_;
     std::array<float*, 2> crossfade_channels_ {{nullptr, nullptr}};
 
-    // Kept until the implementation switches initial ownership into current_.
+    // Legacy compatibility owner; normal module ownership lives in the atomic
+    // shared_ptr snapshots above.
     std::unique_ptr<EmberModule> module_;
     std::array<float, kParameterCount> parameter_values_ {{1.0f, 0.0f, 0.0f}};
     std::array<float, kParameterCount> parameter_minimums_ {{0.0f, 0.0f, 0.0f}};

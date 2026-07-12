@@ -409,7 +409,9 @@ bool EmberProcessor::loadEmberScript() {
         std::fprintf(stderr, "[Ember VST3] %s: %s\n", script_path_.c_str(), error.c_str());
         return false;
     }
-    current_.store(candidate.release(), std::memory_order_release);
+    std::atomic_store_explicit(&current_,
+                               std::shared_ptr<EmberModule>(std::move(candidate)),
+                               std::memory_order_release);
     return true;
 }
 
@@ -442,8 +444,8 @@ void EmberProcessor::watchScript() {
         // Keep one immutable candidate and one retired plan at most. This
         // bounds memory while the DAW is stopped or an unusually long block is
         // in flight; the latest file contents are picked up on the next poll.
-        if (pending_.load(std::memory_order_acquire) ||
-            retired_.load(std::memory_order_acquire))
+        if (std::atomic_load_explicit(&pending_, std::memory_order_acquire) ||
+            std::atomic_load_explicit(&retired_, std::memory_order_acquire))
             continue;
 
         const std::string source = readTextFile(script_path_);
@@ -462,7 +464,9 @@ void EmberProcessor::watchScript() {
             continue;
         }
 
-        pending_.store(candidate.release(), std::memory_order_release);
+        std::atomic_store_explicit(&pending_,
+                                   std::shared_ptr<EmberModule>(std::move(candidate)),
+                                   std::memory_order_release);
         std::fprintf(stderr,
                      "[Ember VST3] compiled update for %s; awaiting block boundary\n",
                      script_path_.c_str());
@@ -470,11 +474,12 @@ void EmberProcessor::watchScript() {
     reclaimRetiredModule();
 }
 
-EmberModule* EmberProcessor::activatePendingModule() noexcept {
-    EmberModule* candidate = pending_.exchange(nullptr, std::memory_order_acq_rel);
-    if (!candidate) return nullptr;
+std::shared_ptr<EmberModule> EmberProcessor::activatePendingModule() noexcept {
+    auto candidate = std::atomic_exchange_explicit(
+        &pending_, std::shared_ptr<EmberModule>{}, std::memory_order_acq_rel);
+    if (!candidate) return {};
 
-    EmberModule* old = current_.load(std::memory_order_acquire);
+    auto old = std::atomic_load_explicit(&current_, std::memory_order_acquire);
     int64_t statePointer = 0;
     int64_t stateLength = 0;
     if (old && old->save_state) {
@@ -488,7 +493,7 @@ EmberModule* EmberProcessor::activatePendingModule() noexcept {
     if (candidate->load_state)
         candidate->load_state(statePointer, stateLength);
 
-    current_.store(candidate, std::memory_order_release);
+    std::atomic_store_explicit(&current_, candidate, std::memory_order_release);
     const auto boundedReport = [](ReportSamplesFn callback) -> uint32 {
         if (!callback) return 0;
         const int64_t value = callback();
@@ -496,26 +501,28 @@ EmberModule* EmberProcessor::activatePendingModule() noexcept {
     };
     latency_samples_.store(boundedReport(candidate->get_latency), std::memory_order_release);
     tail_samples_.store(boundedReport(candidate->get_tail), std::memory_order_release);
-    if (old) retired_.store(old, std::memory_order_release);
+    if (old)
+        std::atomic_store_explicit(&retired_, old, std::memory_order_release);
     return old;
 }
 
 void EmberProcessor::reclaimRetiredModule() {
-    // The watcher is the sole reclaimer. acquire observes process() reader
-    // enrollment/exit; zero is the grace period for the old immutable plan.
-    if (audio_readers_.load(std::memory_order_acquire) != 0) return;
-    delete retired_.exchange(nullptr, std::memory_order_acq_rel);
+    // Dropping this owner cannot destroy a module still held by process(),
+    // canProcessSampleSize(), state I/O, or a crossfade's `old` snapshot.
+    std::atomic_store_explicit(&retired_, std::shared_ptr<EmberModule>{},
+                               std::memory_order_release);
 }
 
 tresult PLUGIN_API EmberProcessor::terminate() {
     active_ = false;
     stopHotReload();
 
-    delete pending_.exchange(nullptr, std::memory_order_acq_rel);
-    while (audio_readers_.load(std::memory_order_acquire) != 0)
-        std::this_thread::yield();
-    delete retired_.exchange(nullptr, std::memory_order_acq_rel);
-    delete current_.exchange(nullptr, std::memory_order_acq_rel);
+    std::atomic_store_explicit(&pending_, std::shared_ptr<EmberModule>{},
+                               std::memory_order_release);
+    std::atomic_store_explicit(&retired_, std::shared_ptr<EmberModule>{},
+                               std::memory_order_release);
+    std::atomic_store_explicit(&current_, std::shared_ptr<EmberModule>{},
+                               std::memory_order_release);
     module_.reset();
     return SingleComponentEffect::terminate();
 }
@@ -567,12 +574,12 @@ tresult PLUGIN_API EmberProcessor::setBusArrangements(
 tresult PLUGIN_API EmberProcessor::canProcessSampleSize(int32 sampleSize) {
     if (sampleSize == kSample32) return kResultTrue;
     if (sampleSize != kSample64) return kResultFalse;
-    EmberModule* current = current_.load(std::memory_order_acquire);
+    auto current = std::atomic_load_explicit(&current_, std::memory_order_acquire);
     return current && current->process_f64 ? kResultTrue : kResultFalse;
 }
 
 void EmberProcessor::refreshLatencyAndTail() noexcept {
-    EmberModule* current = current_.load(std::memory_order_acquire);
+    auto current = std::atomic_load_explicit(&current_, std::memory_order_acquire);
     const auto boundedReport = [](ReportSamplesFn callback) -> uint32 {
         if (!callback) return 0;
         const int64_t value = callback();
@@ -715,7 +722,7 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
     }
 
     if (data.numSamples <= 0) return kResultOk;
-    EmberModule* blockModule = current_.load(std::memory_order_acquire);
+    auto blockModule = std::atomic_load_explicit(&current_, std::memory_order_acquire);
     const bool sample64 = data.symbolicSampleSize == kSample64;
     const bool sample32 = data.symbolicSampleSize == kSample32;
     if (!active_ || !blockModule || (!sample32 && !sample64) ||
@@ -780,12 +787,11 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
     context.output_event_capacity = static_cast<int64_t>(output_events_.size());
     context.output_events_ptr = reinterpret_cast<int64_t>(output_events_.data());
 
-    // Lock-free reader enrollment pins the old module through publication,
-    // state migration, the optional crossfade render, and the DSP call.
-    audio_readers_.fetch_add(1, std::memory_order_acq_rel);
+    // Owning snapshots pin both plans through publication, state migration,
+    // the optional crossfade render, and the DSP call.
     {
-        EmberModule* old = activatePendingModule();
-        EmberModule* current = current_.load(std::memory_order_acquire);
+        auto old = activatePendingModule();
+        auto current = std::atomic_load_explicit(&current_, std::memory_order_acquire);
 
         const std::size_t fadeFrames = !sample64 && old && old->process_f32 &&
             crossfade_channels_[0]
@@ -808,7 +814,6 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
             : (current ? current->process_f32 : nullptr);
         if (!current || !selectedProcess) {
             bypass(data);
-            audio_readers_.fetch_sub(1, std::memory_order_release);
             return kResultOk;
         }
         selectedProcess(reinterpret_cast<int64_t>(&context), data.numSamples);
@@ -826,7 +831,6 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
             }
         }
     }
-    audio_readers_.fetch_sub(1, std::memory_order_release);
     if (changeCount > 0) {
         for (std::size_t index = 0; index < changeCount; ++index) {
             const auto id = parameter_changes_[index].param_id;
@@ -906,7 +910,7 @@ tresult PLUGIN_API EmberProcessor::setState(IBStream* state) {
     const float span = parameter_maximums_[0] - parameter_minimums_[0];
     setParamNormalized(kGainParamId, span > 0.0f
         ? (parameter_values_[0] - parameter_minimums_[0]) / span : 0.0f);
-    EmberModule* current = current_.load(std::memory_order_acquire);
+    auto current = std::atomic_load_explicit(&current_, std::memory_order_acquire);
     if (current && current->load_state) {
         current->load_state(reinterpret_cast<int64_t>(scriptState.data()), scriptSize);
     }
@@ -918,7 +922,7 @@ tresult PLUGIN_API EmberProcessor::getState(IBStream* state) {
 
     const uint8_t* scriptBytes = nullptr;
     int64 scriptSize = 0;
-    EmberModule* current = current_.load(std::memory_order_acquire);
+    auto current = std::atomic_load_explicit(&current_, std::memory_order_acquire);
     if (current && current->save_state) {
         const auto* saved = reinterpret_cast<const ScriptStateBuffer*>(current->save_state());
         if (saved && saved->data && saved->size > 0 &&

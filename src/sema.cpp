@@ -326,7 +326,11 @@ struct Checker {
         // double-dereferences on read and stores-through on write. A by-ref
         // capture is also mutable (is_const=false) so the body can mutate the
         // original through the pointer.
-        bool is_env_capture = false; int32_t env_offset = 0; bool env_capture_by_ref = false; };
+        bool is_env_capture = false; int32_t env_offset = 0; bool env_capture_by_ref = false;
+        // Escape provenance for lambda locals. Type alone cannot encode capture
+        // mode (all lambdas with the same signature share a compatible Type),
+        // so preserve whether this binding may carry a by-ref capture.
+        bool lambda_has_by_ref_capture = false; };
     std::vector<std::vector<Var>> scopes;
 
     // #20 nested-lambda capture: a snapshot of the ENCLOSING scope chain at
@@ -897,7 +901,8 @@ struct Checker {
     void pop_scope()  { scopes.pop_back(); }
     void declare(const std::string& n, const Type* t, bool is_const,
                  bool local_array_view = false, Loc loc = {0, 0},
-                 const Type* array_elem_ty = nullptr) {
+                 const Type* array_elem_ty = nullptr,
+                 bool lambda_has_by_ref_capture = false) {
         if (scopes.empty()) return;
         for (const auto& v : scopes.back()) {
             if (v.name == n) {
@@ -905,7 +910,34 @@ struct Checker {
                 return;
             }
         }
-        scopes.back().push_back({n, t, is_const, local_array_view, array_elem_ty});
+        scopes.back().push_back({n, t, is_const, local_array_view, array_elem_ty,
+                                 false, 0, false, lambda_has_by_ref_capture});
+    }
+
+    // A by-reference lambda env contains pointers into its creating frame.
+    // Track direct lambdas and aliases so escape sites can reject them while
+    // still allowing synchronous by-value lambda arguments.
+    bool is_by_ref_capturing_lambda(const Expr& e) const {
+        if (auto* le = dynamic_cast<const LambdaExpr*>(&e)) {
+            return !le->ref_capture_names.empty() ||
+                   std::any_of(le->capture_by_ref.begin(), le->capture_by_ref.end(),
+                               [](bool v) { return v; });
+        }
+        if (auto* id = dynamic_cast<const Ident*>(&e)) {
+            const Var* v = lookup_local_var(id->name);
+            return v && v->ty && v->ty->is_lambda && v->lambda_has_by_ref_capture;
+        }
+        if (auto* cast = dynamic_cast<const CastExpr*>(&e))
+            return is_by_ref_capturing_lambda(*cast->operand);
+        if (auto* t = dynamic_cast<const TernaryExpr*>(&e))
+            return is_by_ref_capturing_lambda(*t->then_e) ||
+                   is_by_ref_capturing_lambda(*t->else_e);
+        return false;
+    }
+    void reject_by_ref_lambda_escape(const Expr& e) {
+        if (e.ty && e.ty->is_lambda && is_by_ref_capturing_lambda(e))
+            err("by-ref capture escapes creating frame — use by-value capture or GC env",
+                e.loc.line, e.loc.col);
     }
 
     // iterable() hook (Tier 1, array case): infer the element type of an
@@ -1345,6 +1377,7 @@ struct Checker {
                 "may retain the pointer past the frame. Materialize it to a "
                 "`string` handle or a rodata/global-backed slice first.",
                 arg.loc.line, arg.loc.col);
+        reject_by_ref_lambda_escape(arg);
     }
 
     static bool is_lvalue(const Expr& e) {
@@ -1716,7 +1749,10 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                 }
                 e.ty = intern(*tt->recorded_ret);
             } else {
-                for (auto& a : c->args) check_expr(*a);
+                for (auto& a : c->args) {
+                    check_expr(*a);
+                    reject_by_ref_lambda_escape(*a);
+                }
                 e.ty = intern(type_i64());   // default ret for a bare-`fn` call
             }
             return e.ty;
@@ -1920,6 +1956,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                     if (!types_compatible(want, got))
                         err("lambda argument type mismatch (expected " + want->to_string() +
                             ", got " + got->to_string() + ")", a->loc.line, a->loc.col);
+                    reject_by_ref_lambda_escape(*a);
                 }
                 e.ty = intern(*v->ty->recorded_ret);
                 c->name.clear();
@@ -1967,7 +2004,10 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                     }
                     e.ty = intern(*tt->recorded_ret);
                 } else {
-                    for (auto& a : c->args) check_expr(*a);
+                    for (auto& a : c->args) {
+                        check_expr(*a);
+                        reject_by_ref_lambda_escape(*a);
+                    }
                     e.ty = intern(type_i64());
                 }
                 return e.ty;
@@ -2017,6 +2057,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                             "Materialize it to a `string` handle or a rodata/global-"
                             "backed slice first.",
                             c->receiver->loc.line, c->receiver->loc.col);
+                    reject_by_ref_lambda_escape(*c->receiver);
                     off = 1;
                 }
                 for (size_t i = 0; i < c->args.size(); ++i) {
@@ -2046,6 +2087,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                             "the frame. Materialize it to a `string` handle or a "
                             "rodata/global-backed slice first.",
                             c->args[i]->loc.line, c->args[i]->loc.col);
+                    reject_by_ref_lambda_escape(*c->args[i]);
                 }
                 // Compile-time assertion folding (efficiency ask, part 2):
                 // when BOTH arguments to an assert_eq_* call are compile-time
@@ -2173,6 +2215,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                                 "outlive the frame. Materialize it to a `string` handle or "
                                 "a rodata/global-backed slice first.",
                                 c->args[i]->loc.line, c->args[i]->loc.col);
+                        reject_by_ref_lambda_escape(*c->args[i]);
                     }
                 }
                 params = nullptr;
@@ -2391,6 +2434,8 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                 a->loc.line, a->loc.col);
         if (auto* tid = dynamic_cast<Ident*>(a->target.get())) {
             const bool local_view = rt && rt->is_slice && is_local_array_view(*a->value);
+            const bool by_ref_lambda = rt && rt->is_lambda &&
+                                       is_by_ref_capturing_lambda(*a->value);
             if (Var* v = lookup_local_var(tid->name)) {
                 // Until full provenance escape analysis exists, slice aliases
                 // carry the conservative local-array-view bit through every
@@ -2398,11 +2443,16 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                 // well as longer local alias chains.
                 if (!a->compound && v->ty && v->ty->is_slice)
                     v->local_array_view = v->local_array_view || local_view;
+                if (!a->compound && v->ty && v->ty->is_lambda)
+                    v->lambda_has_by_ref_capture =
+                        v->lambda_has_by_ref_capture || by_ref_lambda;
             } else {
                 auto gi = globals.find(tid->name);
                 if (gi != globals.end() && local_view)
                     err("cannot store a slice/view derived from a stack local in a global",
                         a->loc.line, a->loc.col);
+                if (gi != globals.end() && by_ref_lambda)
+                    reject_by_ref_lambda_escape(*a->value);
             }
         } else if (rt && rt->is_slice && is_local_array_view(*a->value)) {
             // C2b: the target is a FieldExpr (gs.data = s;) or IndexExpr
@@ -2804,7 +2854,9 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
                 if (const Var* v = lookup_local_var(id->name)) arr_elem = v->array_elem_ty;
             }
         }
-        declare(ls->name, decl_ty, ls->is_const, is_local_array_view(*ls->init), ls->loc, arr_elem);
+        declare(ls->name, decl_ty, ls->is_const, is_local_array_view(*ls->init), ls->loc,
+                arr_elem, decl_ty && decl_ty->is_lambda &&
+                          is_by_ref_capturing_lambda(*ls->init));
         return;
     }
     if (auto* sa = dynamic_cast<StaticAssertStmt*>(&s)) {
@@ -2822,6 +2874,7 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
             if (vt && vt->is_slice && is_local_array_view(*rs->value))
                 err("cannot return a slice/view derived from a stack local",
                     rs->loc.line, rs->loc.col);
+            reject_by_ref_lambda_escape(*rs->value);
             // A struct-returning function's `return` value may be (a) a bare
             // local (codegen copies its bytes through the hidden return
             // pointer), (b) a call to a function with the SAME struct return
@@ -4771,6 +4824,7 @@ SemaResult sema(Program& prog,
         c.aggregate_cast_init = g.init.get();
         const Type* got = c.check_value(g.init, want);
         c.aggregate_cast_init = saved_aggregate_cast_init;
+        c.reject_by_ref_lambda_escape(*g.init);
         if (!Checker::types_compatible(want, got))
             c.err("global initializer type mismatch (" + want->to_string() + " = " +
                   got->to_string() + ")", g.loc.line, g.loc.col);

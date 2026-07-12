@@ -680,11 +680,22 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err,
                 if (err) *err = "thin_ir_ser: validate: CallScript slot out of range";
                 return false;
             }
-            // P3 fix: CallCrossModule mod_id < registry_size.
-            if (in.op == ThinOp::CallCrossModule && registry_size > 0 &&
-                uint32_t(in.meta.mod_id) >= registry_size) {
-                if (err) *err = "thin_ir_ser: validate: CallCrossModule mod_id out of range";
-                return false;
+            // A cross-module call indexes a target dispatch table directly in
+            // thin_emit. Validate both attacker-controlled indices before any
+            // executable page is emitted. Per-module slot counts are not part
+            // of this API yet, so use a conservative serialized-IR ceiling;
+            // negative values and displacement-overflow values are never valid.
+            constexpr int32_t MAX_CROSS_MODULE_SLOT = 10000;
+            if (in.op == ThinOp::CallCrossModule) {
+                if (registry_size == 0 || in.meta.mod_id < 0 ||
+                    uint32_t(in.meta.mod_id) >= registry_size) {
+                    if (err) *err = "thin_ir_ser: validate: CallCrossModule mod_id out of range";
+                    return false;
+                }
+                if (in.meta.slot < 0 || in.meta.slot >= MAX_CROSS_MODULE_SLOT) {
+                    if (err) *err = "thin_ir_ser: validate: CallCrossModule slot out of range";
+                    return false;
+                }
             }
             // P4 fix: Cmp predicate in [0,5] (Eq..Ge).
             if (in.op == ThinOp::Cmp && in.meta.cmp > 5) {

@@ -650,18 +650,33 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
     // ---- Family A: `ember bench` — microbenchmark the entry fn ----
     if (opts.bench_mode) {
         for (int w = 0; w < opts.bench_warmup; ++w) {
-            if (__builtin_setjmp(ectx.checkpoint)) { std::fprintf(stderr, "ember: bench warmup trap: %s\n", ectx.last_error.c_str()); ectx.has_checkpoint = false; do_cleanup(); return {70}; }
+            // In-context threads share ectx's checkpoint. Hold call_mutex for
+            // every outer call so thread_join can hand it to a worker safely.
+            // Raw lock/unlock is intentional: a trap longjmp skips destructors.
+            ectx.call_mutex.lock();
+            if (__builtin_setjmp(ectx.checkpoint)) {
+                ectx.call_mutex.unlock();
+                std::fprintf(stderr, "ember: bench warmup trap: %s\n", ectx.last_error.c_str());
+                ectx.has_checkpoint = false; do_cleanup(); return {70};
+            }
             if (!returns_void) entry_ret = ember::ember_call_void(entry, &ectx);
             else              ember::ember_call_void(entry, &ectx);
+            ectx.call_mutex.unlock();
         }
         std::vector<double> ns; ns.reserve(size_t(opts.bench_iters));
         bool bench_trapped = false;
         for (int it = 0; it < opts.bench_iters; ++it) {
-            if (__builtin_setjmp(ectx.checkpoint)) { std::fprintf(stderr, "ember: bench iter %d trap: %s\n", it, ectx.last_error.c_str()); bench_trapped = true; break; }
+            ectx.call_mutex.lock();
+            if (__builtin_setjmp(ectx.checkpoint)) {
+                ectx.call_mutex.unlock();
+                std::fprintf(stderr, "ember: bench iter %d trap: %s\n", it, ectx.last_error.c_str());
+                bench_trapped = true; break;
+            }
             auto t0 = std::chrono::steady_clock::now();
             if (!returns_void) entry_ret = ember::ember_call_void(entry, &ectx);
             else              (void)ember::ember_call_void(entry, &ectx);
             auto t1 = std::chrono::steady_clock::now();
+            ectx.call_mutex.unlock();
             ns.push_back(double(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
         }
         if (bench_trapped) { ectx.has_checkpoint = false; do_cleanup(); return {70}; }
@@ -702,13 +717,20 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
         return {0};
     }
 
+    // The host's outer call participates in the same mutex protocol as
+    // spawned workers. This prevents a worker from replacing ectx.checkpoint
+    // while the main thread is executing and potentially trapping.
+    ectx.call_mutex.lock();
     if (__builtin_setjmp(ectx.checkpoint)) {
+        ectx.call_mutex.unlock();
         std::fprintf(stderr, "ember: RUNTIME TRAP: %s (%s)\n",
                      ectx.last_error.c_str(), ember::trap_reason_str(ectx.last_trap));
         exit_code = 70;
-    } else if (!returns_void) {
+    } else {
         entry_ret = ember::ember_call_void(entry, &ectx);
-        exit_code = int(uint64_t(entry_ret) & 0x7fffffff);
+        ectx.call_mutex.unlock();
+        if (!returns_void)
+            exit_code = int(uint64_t(entry_ret) & 0x7fffffff);
     }
     ectx.has_checkpoint = false;
 
@@ -730,11 +752,17 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
             std::atomic<bool> tick_trapped{false};
             std::thread tick_thread([&]() {
                 context_t tick_ctx; tick_ctx.max_call_depth = 512; tick_ctx.budget_remaining = 100000000;
+                // Tick callbacks are outer calls too. Point thread_spawn at
+                // this context and use its call_mutex/checkpoint as one unit.
+                ember::ext_thread::thread_init(&tick_ctx, table.base(), int64_t(slots.size()));
                 while (!stop.load(std::memory_order_relaxed)) {
                     if (opts.tick_max > 0 && tick_count.load(std::memory_order_relaxed) >= (uint64_t)opts.tick_max) { stop.store(true); break; }
                     tick_ctx.call_depth = 0;
                     tick_ctx.has_checkpoint = true;
+                    tick_ctx.call_mutex.lock();
                     if (__builtin_setjmp(tick_ctx.checkpoint)) {
+                        tick_ctx.call_mutex.unlock();
+                        tick_ctx.has_checkpoint = false;
                         tick_trapped.store(true); stop.store(true); break;
                     }
                     for (auto& af : ticks) {
@@ -750,6 +778,7 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
                         }
                     }
                     tick_ctx.has_checkpoint = false;
+                    tick_ctx.call_mutex.unlock();
                     tick_count.fetch_add(1, std::memory_order_relaxed);
                     std::this_thread::sleep_for(std::chrono::milliseconds(opts.tick_interval_ms));
                 }
