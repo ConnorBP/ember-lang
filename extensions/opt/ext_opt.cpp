@@ -133,32 +133,59 @@ std::unordered_set<VReg> compute_used_vregs(const ThinFunction& f) {
     return used;
 }
 
+// A struct-by-value call argument is encoded as a v0 sentinel plus its source
+// frame offset. Calls read that storage even though no explicit LoadFrame is
+// present in the IR. Struct Type nodes do not carry their layout byte size, so
+// conservatively treat stores from the struct base toward rbp as reads. This
+// may retain an unrelated earlier local store, but cannot remove a live one.
+// args[0] of a struct-returning call is the hidden return DESTINATION and must
+// not be treated as an input.
+bool call_reads_frame_off(const ThinInstr& in, int32_t off) {
+    switch (in.op) {
+    case ThinOp::CallNative: case ThinOp::CallScript:
+    case ThinOp::CallIndirect: case ThinOp::CallCrossModule:
+        break;
+    default:
+        return false;
+    }
+    const size_t first = in.ret_type && !in.ret_type->struct_name.empty() ? 1 : 0;
+    for (size_t i = first; i < in.args.size(); ++i) {
+        const int32_t arg_off = i < in.arg_frame_offs.size() ? in.arg_frame_offs[i] : -1;
+        const Type* arg_ty = i < in.arg_types.size() ? in.arg_types[i] : nullptr;
+        if (in.args[i] == 0 && arg_off != -1 && arg_ty &&
+            !arg_ty->struct_name.empty() && off >= arg_off)
+            return true;
+    }
+    return false;
+}
+
 // Compute the set of frame_off values that are READ by any LoadFrame,
-// CopyBytes, or FieldAddr in the function. For CopyBytes, the SOURCE offset is
-// meta.field_off (when the source is frame-relative) and the dest offset is
-// meta.frame_off (when the dest is frame-relative, i.e. in.dst == 0). Both must
-// be tracked so DCE does not remove the StoreFrame that feeds the CopyBytes
-// source. We conservatively add both offsets — a false positive only keeps a
-// dead store alive (a missed optimization), never removes a needed one.
+// CopyBytes, FieldAddr, or struct-by-value call argument. CopyBytes reads a byte
+// range, and packed struct fields can begin at non-word-aligned offsets (for
+// example three i32 fields at base, base+4, base+8). Test the actual StoreFrame
+// offsets against that range rather than stepping through it eight bytes at a
+// time; the old word-stepping logic missed packed fields and let constprop/DCE
+// delete their initializers before a struct return copy.
 std::unordered_set<int32_t> compute_read_slots(const ThinFunction& f) {
+    std::unordered_set<int32_t> stored;
+    for (const auto& blk : f.blocks)
+        for (const auto& in : blk.instrs)
+            if (in.op == ThinOp::StoreFrame) stored.insert(in.meta.frame_off);
+
     std::unordered_set<int32_t> read;
     for (const auto& blk : f.blocks) {
         for (const auto& in : blk.instrs) {
             if (in.op == ThinOp::LoadFrame || in.op == ThinOp::CopyBytes ||
                 in.op == ThinOp::FieldAddr)
                 read.insert(in.meta.frame_off);
-            // CopyBytes reads a byte RANGE from the source (meta.field_off ..
-            // meta.field_off + meta.len). A StoreFrame anywhere in that range
-            // feeds the copy and must not be removed. Add every 8-byte-aligned
-            // offset in the range (StoreFrame targets are word-aligned). Also add
-            // meta.frame_off (the dest, when in.dst == 0 — already added above)
-            // so a subsequent frame->frame copy's dest is tracked too.
             if (in.op == ThinOp::CopyBytes && in.meta.len > 0) {
-                int32_t start = in.meta.field_off;
-                int32_t end = start + in.meta.len;
-                for (int32_t off = start; off < end; off += 8)
-                    read.insert(off);
+                const int32_t start = in.meta.field_off;
+                const int32_t end = start + in.meta.len;
+                for (int32_t off : stored)
+                    if (off >= start && off < end) read.insert(off);
             }
+            for (int32_t off : stored)
+                if (call_reads_frame_off(in, off)) read.insert(off);
         }
     }
     return read;
@@ -168,19 +195,8 @@ std::unordered_set<int32_t> compute_read_slots(const ThinFunction& f) {
 // scan to kill a pending dead store when a reader appears between two
 // StoreFrames to the same slot. Mirrors compute_read_slots's conservative
 // reader set: LoadFrame reads meta.frame_off; CopyBytes reads its SOURCE
-// range [meta.field_off, meta.field_off + meta.len) AND (conservatively)
-// meta.frame_off (the dest, when frame-relative — treating the dest as a
-// read is a false positive that only keeps a dead store alive, never
-// removes a needed one); FieldAddr reads meta.frame_off (the struct base).
-// StoreFrame to a DIFFERENT offset does NOT read `off` (frame slots don't
-// overlap in v1 — each local gets its own non-overlapping region, per the
-// StoreToLoadForward comment), so a store to another slot is not a reader.
-//
-// The CopyBytes case is the one DSE previously MISSED (it only killed on
-// LoadFrame), which let DSE remove a StoreFrame that fed a subsequent
-// CopyBytes source — a value-preservation bug (hand-built IR repro: two
-// StoreFrames to slot X with a CopyBytes reading X between them; DSE
-// removed the first store, so the copy read an uninitialized slot).
+// range; a struct-by-value call reads its source slot; and FieldAddr reads
+// meta.frame_off (the struct base).
 bool instr_reads_off(const ThinInstr& in, int32_t off) {
     if (in.op == ThinOp::LoadFrame)
         return in.meta.frame_off == off;
@@ -188,7 +204,7 @@ bool instr_reads_off(const ThinInstr& in, int32_t off) {
         return in.meta.frame_off == off;
     if (in.op == ThinOp::CopyBytes) {
         // conservative: dest (meta.frame_off, when frame-relative) counts as a read
-               if (in.meta.frame_off == off) return true;
+        if (in.meta.frame_off == off) return true;
         // source range [field_off, field_off + len): any StoreFrame whose slot
         // lies in this range feeds the copy.
         if (in.meta.len > 0 && off >= in.meta.field_off &&
@@ -196,7 +212,7 @@ bool instr_reads_off(const ThinInstr& in, int32_t off) {
             return true;
         return false;
     }
-    return false;
+    return call_reads_frame_off(in, off);
 }
 
 // Does `in` WRITE frame offset `off` (other than via StoreFrame, which the

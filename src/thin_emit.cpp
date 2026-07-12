@@ -1158,6 +1158,12 @@ struct EmitCtx {
                 normalize_rax(ty);
                 if (in.src2 != 0) {
                     e.store_rax_elem(Reg::r10, in.meta.frame_off, in.meta.width);
+                } else if (in.meta.field_off != 0) {
+                    // Aggregate fields are packed. Honor their exact width so
+                    // an i32 field cannot overwrite the following field (or an
+                    // adjacent hidden return pointer). Ordinary scalar locals
+                    // retain the established eight-byte frame-slot store.
+                    e.store_rax_elem(Reg::rbp, in.meta.frame_off, in.meta.width);
                 } else {
                     store_rax_to_rbp(e, in.meta.frame_off);
                 }

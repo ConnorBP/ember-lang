@@ -778,7 +778,8 @@ struct ThinLowerer {
     }
 
     // Store a scalar/float/slice value (described by lv) into a local slot at off.
-    void store_scalar_local(const LoweredValue& lv, int32_t off, Loc loc) {
+    void store_scalar_local(const LoweredValue& lv, int32_t off, Loc loc,
+                            bool exact_width = false) {
         const Type* t = lv.ty;
         if (lv.kind == LoweredValue::Slice) {
             ThinInstr& p = emit(ThinOp::StoreFrame, 0, lv.vreg, 0, loc);
@@ -790,6 +791,10 @@ struct ThinLowerer {
         ThinInstr& in = emit(ThinOp::StoreFrame, 0, lv.vreg, 0, loc);
         in.meta.frame_off = off; in.meta.type = t;
         in.meta.width = value_bytes(t, ctx.structs);
+        // Scalar locals use eight-byte frame slots, but aggregate fields are
+        // packed and must be written at their exact type width. field_off is
+        // otherwise unused by StoreFrame and records that distinction.
+        if (exact_width) in.meta.field_off = 1;
         if (t && t->is_float()) in.meta.is_f32 = (t->prim == Prim::F32) ? 1 : 0;
     }
     // Store a scalar/float value to a global slot at byte offset goff.
@@ -1274,7 +1279,7 @@ void ThinLowerer::store_value_to_frame(const Expr& value, const Type* t, int32_t
         ThinInstr& l = emit(ThinOp::StoreFrame, 0, lv.vreg + 1, 0, loc);
         l.meta.frame_off = dst_off + 8; l.meta.type = &type_i64(); l.meta.width = 8;
     } else {
-        store_scalar_local(lv, dst_off, loc);
+        store_scalar_local(lv, dst_off, loc, true);
     }
 }
 

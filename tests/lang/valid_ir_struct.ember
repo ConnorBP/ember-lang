@@ -1,0 +1,26 @@
+// expect: 123
+// IR-backend regression coverage for packed struct fields, by-value arguments,
+// and hidden-pointer struct returns. Run with --passes constprop (or dce).
+struct P { a: i32; b: i32; c: i32; }
+
+fn mkp(a: i32, b: i32, c: i32) -> P {
+    let p: P = P { a: a, b: b, c: c };
+    return p;
+}
+
+fn sump(p: P) -> i64 {
+    return (p.a as i64) + (p.b as i64) + (p.c as i64);
+}
+
+fn main() -> i64 {
+    let local: P = P { a: 10, b: 20, c: 30 };
+    if ((local.a as i64) + (local.b as i64) + (local.c as i64) != 60) { return 201; }
+
+    let returned: P = mkp(4, 5, 6);
+    if ((returned.a as i64) + (returned.b as i64) + (returned.c as i64) != 15) { return 202; }
+
+    let argument: P = P { a: 7, b: 8, c: 9 };
+    if (sump(argument) != 24) { return 203; }
+    if (sump(mkp(1, 2, 3)) != 6) { return 204; }
+    return 123;
+}
