@@ -1,0 +1,21 @@
+// valid_threads.ember — in-context threads test (thread_spawn + thread_join).
+// A simple program that spawns a thread to compute a value + joins it.
+// The thread extension is linked into ember_cli, so ember test/run can exercise it.
+fn worker(n: i64) -> i64 {
+    let mut sum: i64 = 0;
+    let mut i: i64 = 0;
+    while (i < n) {
+        sum = sum + i;
+        i = i + 1;
+    }
+    return sum;
+}
+fn main() -> i64 {
+    // thread_spawn takes a fn handle (&worker) + arg, returns a thread_id
+    // thread_join takes a thread_id, returns the fn's i64 result
+    let tid: i64 = thread_spawn(&worker, 100);
+    let result: i64 = thread_join(tid);
+    // sum(0..99) = 4950
+    if (result == 4950) { return 0; }
+    return result;
+}

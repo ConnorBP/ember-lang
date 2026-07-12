@@ -523,7 +523,7 @@ target_link_libraries(ember_cli PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_opt ember_ext_obf ember_ext_map
-    ember_ext_io ember_ext_coroutine ember_ext_call_raw)
+    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_thread)
 
 # ---- standalone exe bundler (docs/planning/plan_STANDALONE_BUNDLER.md) ----
 # The stub: a pre-built runtime that links ember + ember_frontend + the

@@ -67,6 +67,7 @@
 #include "ext_opt.hpp"        // Stage C: register_passes (IR optimization passes)
 #include "ext_obf.hpp"         // Stage C Step 5: register_passes (IR obfuscation passes)
 #include "ext_io.hpp"          // OS I/O (console + file + path), core subset
+#include "ext_thread.hpp"      // Tier 4: in-context threads (thread_spawn/join + atomics)
 #include "ext_coroutine.hpp"     // #21 coroutines with yield (Windows fibers)
 #include "ext_call_raw.hpp"     // self-hosting Stage 4 gap: call_raw(fn_ptr,arg)->i64
 #include "../src/ember_pass.hpp"       // Stage C: EmberPassManager
@@ -141,6 +142,7 @@ static void register_standard_bindings(
     ember::ext_io::register_natives(natives);
     ember::ext_coroutine::register_natives(natives);
     ember::ext_call_raw::register_natives(natives);
+    ember::ext_thread::register_natives(natives);
     OpOverloadTable overloads;
     ext_vec::register_overloads(overloads); ext_quat::register_overloads(overloads);
     ext_mat::register_overloads(overloads); ext_string::register_overloads(overloads);
@@ -317,6 +319,7 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
         ember::ext_lifecycle::reset();
         ember::ext_io::reset();
         ember::ext_coroutine::coroutine_reset();
+        ember::ext_thread::thread_reset();
         ember::ext_call_raw::reset();  // stateless (no-op), for symmetry
         // ext_math is stateless (no reset()).
     };
@@ -521,6 +524,7 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
     // target). Only in the JIT run path (emit-em is a pre-compile, no run).
     if (opts.emit_em_path.empty()) {
         ember::ext_coroutine::coroutine_init(&ectx, table.base(), int64_t(slots.size()));
+        ember::ext_thread::thread_init(&ectx, table.base(), int64_t(slots.size()));
     }
 
     // Stage C: --passes <spec>
