@@ -13,6 +13,13 @@ struct P {
     std::vector<std::string> errs;
     std::vector<ParseErrorEntry> err_entries;  // same errors as `errs`, individually positioned
     int lambda_counter = 0;  // #20: unique suffix for synthetic __lambda_N fns
+    int expr_depth = 0;  // recursion depth guard (DoS prevention — audit HIGH finding)
+    static constexpr int MAX_EXPR_DEPTH = 256;  // generous for legit code, small enough to prevent stack overflow
+    struct DepthGuard {
+        int& d; const int max; const Token& tok;
+        DepthGuard(int& d_, int max_, const Token& t) : d(d_), max(max_), tok(t) { if (++d > max) { --d; throw ParseError("recursion depth exceeded (nesting too deep)", t.line, t.col); } }
+        ~DepthGuard() { --d; }
+    };
 
     const Token& peek() const { return toks[i]; }
     const Token& peek(int off) const { return toks[std::min(size_t(i + off), toks.size() - 1)]; }
@@ -416,7 +423,10 @@ struct P {
     }
 
     // --- expressions (precedence climbing) ---
-    ExprPtr parse_expr() { return parse_assign(); }
+    ExprPtr parse_expr() {
+        DepthGuard dg(expr_depth, MAX_EXPR_DEPTH, peek());
+        return parse_assign();
+    }
 
     ExprPtr parse_assign() {
         ExprPtr lhs = parse_ternary();
@@ -968,6 +978,7 @@ struct P {
     }
 
     StmtPtr parse_stmt() {
+        DepthGuard dg(expr_depth, MAX_EXPR_DEPTH, peek());
         const Token& t = peek();
         switch (t.kind) {
         case Tk::Kw_let: case Tk::Kw_auto: case Tk::Kw_const:

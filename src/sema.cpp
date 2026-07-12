@@ -339,6 +339,8 @@ struct Checker {
     std::unordered_map<std::string, GlobalVar> globals;
     int loop_depth = 0;
     int switch_depth = 0;
+    int check_depth = 0;  // recursion depth guard (DoS prevention — audit HIGH finding)
+    static constexpr int MAX_CHECK_DEPTH = 3000;  // allows 2000-term flat expr chains; prevents 100k-level stack overflow
     const Expr* aggregate_cast_init = nullptr;
 
     // Tier 1 enums (docs/planning/plan_ENUMS.md Section 4): (enum_name -> (variant -> i32 value)),
@@ -1475,6 +1477,11 @@ struct Checker {
 };
 
 const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct_ret_call) {
+    if (++check_depth > MAX_CHECK_DEPTH) {
+        --check_depth;
+        throw SemaError{"recursion depth exceeded (expression too deeply nested)", e.loc.line, e.loc.col};
+    }
+    struct DepthRestore { int& d; ~DepthRestore() { --d; } } dr{check_depth};
     // default: literals get expected type via adaptation where applicable
     if (auto* lit = dynamic_cast<IntLit*>(&e)) {
         if (expected) adapt_int_lit(*lit, expected);
@@ -2692,6 +2699,11 @@ void Checker::check_static_assert(StaticAssertStmt& sa) {
 }
 
 void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
+    if (++check_depth > MAX_CHECK_DEPTH) {
+        --check_depth;
+        throw SemaError{"recursion depth exceeded (statement too deeply nested)", s.loc.line, s.loc.col};
+    }
+    struct DepthRestore { int& d; ~DepthRestore() { --d; } } dr{check_depth};
     if (auto* ls = dynamic_cast<LetStmt*>(&s)) {
         // `auto` is deprecated: it's a redundant spelling of `let x = expr;`
         // inference (both share the is_auto path; `let x = expr;` is the
@@ -3119,6 +3131,12 @@ void Checker::check_stmt(Stmt& s, const Type* ret_ty, bool& returns) {
 }
 
 void Checker::check_block(Block& b, const Type* ret_ty, bool& returns) {
+    if (++check_depth > MAX_CHECK_DEPTH) {
+        --check_depth;
+        uint32_t line = b.stmts.empty() ? 0 : b.stmts[0]->loc.line;
+        throw SemaError{"recursion depth exceeded (block too deeply nested)", line, 0};
+    }
+    struct DepthRestore { int& d; ~DepthRestore() { --d; } } dr{check_depth};
     returns = false;
     push_scope();
     bool reported_unreachable = false;
@@ -4462,6 +4480,7 @@ SemaResult sema(Program& prog,
     // (the fn whose body holds the LambdaExpr). Checking lambda fns after all
     // their enclosing fns ensures lf->lambda_captures is populated before
     // check_lambda_func binds them.
+    try {
     for (auto& f : prog.funcs) {
         if (!f.is_lambda) c.check_func(f);
     }
@@ -4493,6 +4512,9 @@ SemaResult sema(Program& prog,
     }
     for (size_t i = 0; i < prog.funcs.size(); ++i) {
         if (prog.funcs[i].is_lambda && !done[i]) c.check_func(prog.funcs[i]);
+    }
+    } catch (const SemaError& se) {
+        c.err(se.msg, se.line, se.col);
     }
 
     // Tier 1 static_assert: check top-level assertions (in-body ones are
