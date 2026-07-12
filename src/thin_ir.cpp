@@ -73,6 +73,7 @@ const char* op_name(ThinOp op) {
     case ThinOp::DepthCheck:      return "DepthCheck";
     case ThinOp::BudgetCheck:     return "BudgetCheck";
     case ThinOp::CallTargetGuard: return "CallTargetGuard";
+    case ThinOp::StoreAddr:       return "StoreAddr";
     }
     return "?ThinOp";
 }

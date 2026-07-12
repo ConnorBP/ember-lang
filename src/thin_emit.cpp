@@ -1077,47 +1077,50 @@ struct EmitCtx {
             break;
         }
         case ThinOp::LoadFrame: {
-            // dst = [base + meta.frame_off], where base is:
-            //   - rbp (the usual frame load) when src1 == 0, OR
-            //   - a computed address VReg (an IndexAddr/FieldAddr result) when
-            //     src1 != 0 (the element/field load path: load from [addr + off]).
+            // dst = [base + displacement], where base is rbp for an ordinary
+            // frame load or a computed IndexAddr/FieldAddr VReg when src1 != 0.
+            // For computed loads, field_off is the within-base displacement and
+            // frame_off is a separate spill slot for the loaded result.
             const Type* ty = in.meta.type;
             Reg base_reg = Reg::rbp;
+            const int32_t load_off = in.src1 != 0 ? in.meta.field_off : in.meta.frame_off;
             if (in.src1 != 0) {
-                // materialize the computed address into r11 (use r11, not rax, so
-                // the load destination rax is independent of the base materialization)
                 load_int_vreg(in.src1);
                 e.mov_reg_reg(Reg::r11, Reg::rax);
                 base_reg = Reg::r11;
             }
             if (ty && ty->is_float()) {
-                // load from frame to xmm0
                 if (base_reg == Reg::rbp) {
-                    if (ty->prim == Prim::F32) e.movss_xmm_mem(Xmm::xmm0, Reg::rbp, in.meta.frame_off);
-                    else e.movsd_xmm_mem(Xmm::xmm0, Reg::rbp, in.meta.frame_off);
+                    if (ty->prim == Prim::F32) e.movss_xmm_mem(Xmm::xmm0, Reg::rbp, load_off);
+                    else e.movsd_xmm_mem(Xmm::xmm0, Reg::rbp, load_off);
                 } else {
-                    // load from [r11 + off] (computed address)
-                    if (ty->prim == Prim::F32) { e.byte(0xF3); e.byte(0x41); e.byte(0x0F); e.byte(0x10); e.byte(0x43); e.imm32(in.meta.frame_off); }
-                    else { e.byte(0xF2); e.byte(0x41); e.byte(0x0F); e.byte(0x10); e.byte(0x43); e.imm32(in.meta.frame_off); }
+                    if (ty->prim == Prim::F32) { e.byte(0xF3); e.byte(0x41); e.byte(0x0F); e.byte(0x10); e.byte(0x43); e.imm32(load_off); }
+                    else { e.byte(0xF2); e.byte(0x41); e.byte(0x0F); e.byte(0x10); e.byte(0x43); e.imm32(load_off); }
                 }
                 record_dst_rax(in.dst, ty);
+                if (in.src1 != 0 && in.meta.frame_off != 0) {
+                    store_xmm0_to_rbp(e, in.meta.frame_off, ty);
+                    vregs[in.dst].frame_off = in.meta.frame_off;
+                }
             } else if (ty && ty->is_slice) {
-                e.load_reg_mem(Reg::rax, base_reg, in.meta.frame_off);
-                e.load_reg_mem(Reg::rdx, base_reg, in.meta.frame_off + 8);
+                e.load_reg_mem(Reg::rax, base_reg, load_off);
+                e.load_reg_mem(Reg::rdx, base_reg, load_off + 8);
                 record_dst_rax(in.dst, ty);
-            } else {
-                if (base_reg == Reg::rbp) {
-                    load_rbp_to_rax(e, in.meta.frame_off);
-                } else {
-                    // mov rax, [r11 + off]: REX.W 8B /r mod=10 reg=rax(0) rm=r11(3)-> 49 8B 83 <disp32>
-                    e.byte(0x49); e.byte(0x8B); e.byte(0x83); e.imm32(in.meta.frame_off);
+                if (in.src1 != 0 && in.meta.frame_off != 0) {
+                    e.store_reg_mem(Reg::rbp, in.meta.frame_off, Reg::rax);
+                    e.store_reg_mem(Reg::rbp, in.meta.frame_off + 8, Reg::rdx);
+                    vregs[in.dst].frame_off = in.meta.frame_off;
+                    vregs[in.dst + 1].frame_off = in.meta.frame_off + 8;
+                    vregs[in.dst + 1].type = ty;
                 }
+            } else {
+                if (base_reg == Reg::rbp) load_rbp_to_rax(e, load_off);
+                else e.load_elem_to_rax(base_reg, load_off, in.meta.width,
+                                        ty && ty->is_int() && !ty->is_uint());
                 normalize_rax(ty);
                 record_dst_rax(in.dst, ty);
+                if (in.src1 != 0) pin_int_dst(in.dst, in.meta, ty);
             }
-            // record the dst's frame slot ONLY for the rbp-base case (a load from
-            // a computed address is NOT frame-backed at meta.frame_off — that
-            // offset is within the slice/struct, not the function frame)
             if (in.dst != 0 && in.src1 == 0) {
                 vregs[in.dst].frame_off = in.meta.frame_off;
                 vregs[in.dst].type = ty;
@@ -1129,28 +1132,67 @@ struct EmitCtx {
             break;
         }
         case ThinOp::StoreFrame: {
-            // [rbp + meta.frame_off] = src1 (with width normalization)
+            // Store to rbp-relative memory, or to a computed address in src2.
+            // Materialize the address first because loading the value uses rax.
             const Type* ty = in.meta.type ? in.meta.type : vreg_type(in.src1);
+            Reg base_reg = Reg::rbp;
+            if (in.src2 != 0) {
+                load_int_vreg(in.src2);
+                e.mov_reg_reg(Reg::r10, Reg::rax);
+            }
             if (ty && ty->is_float()) {
                 load_float_vreg(in.src1);
-                store_xmm0_to_rbp(e, in.meta.frame_off, ty);
+                if (in.src2 != 0) {
+                    if (ty->prim == Prim::F64) e.movsd_mem_xmm(Reg::r10, in.meta.frame_off, Xmm::xmm0);
+                    else e.movss_mem_xmm(Reg::r10, in.meta.frame_off, Xmm::xmm0);
+                } else {
+                    store_xmm0_to_rbp(e, in.meta.frame_off, ty);
+                }
             } else if (ty && ty->is_slice) {
                 load_slice_vreg(in.src1);
-                e.store_reg_mem(Reg::rbp, in.meta.frame_off, Reg::rax);
-                e.store_reg_mem(Reg::rbp, in.meta.frame_off + 8, Reg::rdx);
+                if (in.src2 != 0) base_reg = Reg::r10;
+                e.store_reg_mem(base_reg, in.meta.frame_off, Reg::rax);
+                e.store_reg_mem(base_reg, in.meta.frame_off + 8, Reg::rdx);
             } else {
                 load_int_vreg(in.src1);
                 normalize_rax(ty);
-                store_rax_to_rbp(e, in.meta.frame_off);
+                if (in.src2 != 0) {
+                    e.store_rax_elem(Reg::r10, in.meta.frame_off, in.meta.width);
+                } else {
+                    store_rax_to_rbp(e, in.meta.frame_off);
+                }
             }
-            // record the src VReg as frame-backed at this offset
-            if (in.src1 != 0) {
+            // Only a regular frame store gives src1 a durable frame backing.
+            // A computed-address store writes the array/slice element instead.
+            if (in.src1 != 0 && in.src2 == 0) {
                 vregs[in.src1].frame_off = in.meta.frame_off;
                 vregs[in.src1].type = ty;
                 if (ty && ty->is_slice) {
                     vregs[in.src1 + 1].frame_off = in.meta.frame_off + 8;
                     vregs[in.src1 + 1].type = ty;
                 }
+            }
+            break;
+        }
+        case ThinOp::StoreAddr: {
+            // [computed address in src2 + frame_off] = src1. Keep this as a
+            // distinct side-effecting op so optimization passes cannot mistake
+            // an element write for a removable frame spill.
+            const Type* ty = in.meta.type ? in.meta.type : vreg_type(in.src1);
+            load_int_vreg(in.src2);
+            e.mov_reg_reg(Reg::r10, Reg::rax);
+            if (ty && ty->is_float()) {
+                load_float_vreg(in.src1);
+                if (ty->prim == Prim::F64) e.movsd_mem_xmm(Reg::r10, in.meta.frame_off, Xmm::xmm0);
+                else e.movss_mem_xmm(Reg::r10, in.meta.frame_off, Xmm::xmm0);
+            } else if (ty && ty->is_slice) {
+                load_slice_vreg(in.src1);
+                e.store_reg_mem(Reg::r10, in.meta.frame_off, Reg::rax);
+                e.store_reg_mem(Reg::r10, in.meta.frame_off + 8, Reg::rdx);
+            } else {
+                load_int_vreg(in.src1);
+                normalize_rax(ty);
+                e.store_rax_elem(Reg::r10, in.meta.frame_off, in.meta.width);
             }
             break;
         }
@@ -1381,11 +1423,15 @@ struct EmitCtx {
             }
             e.add_reg_reg(Reg::r11, Reg::rcx);  // r11 = base + index*width
             e.mov_reg_reg(Reg::rax, Reg::r11);  // rax = element address
-            record_dst_rax(in.dst, in.meta.type);
-            if (in.meta.frame_off != 0 && in.dst != 0) {
-                store_rax_to_rbp(e, in.meta.frame_off);
-                vregs[in.dst].frame_off = in.meta.frame_off;
-            }
+            // meta.frame_off identifies a local fixed-array BASE; it is not a
+            // spill slot for the address result. Record as i64 and pin via a
+            // temporary meta (frame_off=0) so regalloc can spill to ra_frame_off
+            // without overwriting the array base. Without pin_int_dst, regalloc
+            // may assign addr to a pool register that load_int_vreg reads before
+            // checking rax_vreg, loading an uninitialized register.
+            record_dst_rax(in.dst, &type_i64());
+            { ThinMeta home{}; home.type = &type_i64(); home.width = 8;
+              pin_int_dst(in.dst, home, &type_i64()); }
             break;
         }
         case ThinOp::BoundsCheck: {
@@ -1397,8 +1443,11 @@ struct EmitCtx {
                 e.mov_reg_reg(Reg::r9, Reg::rax);  // r9 = len
                 emit_bounds_check_reg(Reg::rcx, Reg::r9);
             } else {
-                emit_bounds_check_imm(Reg::rcx, int64_t(in.meta.len));
+                emit_bounds_check_imm(Reg::rcx, in.imm.i);
             }
+            // Loading a vreg length into rax (and a taken trap call) means rax
+            // no longer reliably contains the previously tracked value.
+            rax_vreg = 0;
             break;
         }
         case ThinOp::DivOverflowCheck: {

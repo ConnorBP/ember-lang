@@ -27,6 +27,7 @@ bool is_side_effecting(ThinOp op) {
     case ThinOp::CallIndirect:
     case ThinOp::CallCrossModule:
     case ThinOp::StoreGlobal:
+    case ThinOp::StoreAddr:
     case ThinOp::CopyBytes:
     case ThinOp::StructLitInit:
     case ThinOp::ArrayLitInit:

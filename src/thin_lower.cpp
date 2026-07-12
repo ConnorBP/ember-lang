@@ -1184,6 +1184,12 @@ struct ThinLowerer {
                 // exclude slice-typed results (rare for these ops, but guard):
                 if (in.meta.type && in.meta.type->is_slice) return false;
                 return true;
+            case ThinOp::LoadFrame:
+                // computed-address loads (src1 != 0, e.g. array element reads)
+                // need a spill slot for the result so regalloc doesn't lose it.
+                // Ordinary frame loads (src1 == 0) already have meta.frame_off.
+                if (in.src1 != 0 && !(in.meta.type && in.meta.type->is_slice)) return true;
+                return false;
             case ThinOp::CallNative: case ThinOp::CallScript:
             case ThinOp::CallIndirect: case ThinOp::CallCrossModule:
                 // only scalar/float returns (not slice/struct/void)
@@ -2180,14 +2186,14 @@ void ThinLowerer::store_to_target(const Expr& target, const LoweredValue& lv, Lo
         if (is_slice_base) emit_bounds_check(idx.vreg, base_len, 0, loc);
         else if (!ixt->index_is_const) emit_bounds_check(idx.vreg, 0, int64_t(bt->array_len), loc);
         VReg addr = new_vreg(&type_i64());
-        ThinInstr& ia = emit(ThinOp::IndexAddr, addr, idx.vreg, 0, loc);
+        ThinInstr& ia = emit(ThinOp::IndexAddr, addr, 0, idx.vreg, loc);
         ia.meta.width = width; ia.meta.type = elem;
-        if (is_slice_base) { ia.src2 = base_ptr; ia.meta.frame_off = 0; }
+        if (is_slice_base) { ia.src1 = base_ptr; ia.meta.frame_off = 0; }
         else if (is_global_base) { ia.meta.base_kind = AbsFixup::GlobalsBase; ia.meta.addend = uint32_t(base_off); }
         else { ia.meta.frame_off = base_off; }
         // store element to [addr+0]
-        ThinInstr& st = emit(ThinOp::StoreFrame, 0, lv.vreg, 0, loc);
-        st.src2 = addr; st.meta.frame_off = 0; st.meta.type = lv.ty;
+        ThinInstr& st = emit(ThinOp::StoreAddr, 0, lv.vreg, addr, loc);
+        st.meta.frame_off = 0; st.meta.type = lv.ty;
         st.meta.width = (lv.ty && lv.ty->is_float()) ? value_bytes(lv.ty, ctx.structs) : width;
         if (lv.ty && lv.ty->is_float()) st.meta.is_f32 = (lv.ty->prim == Prim::F32) ? 1 : 0;
         return;

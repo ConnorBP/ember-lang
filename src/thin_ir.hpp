@@ -152,6 +152,9 @@ enum class ThinOp : uint16_t {
     // corresponding CodeGenCtx flag; absent when off (byte-identical to the
     // tree-walker with flags off, the Stage-A gate).
     DepthCheck, BudgetCheck, CallTargetGuard,
+    // Indirect memory store: [src2 + meta.frame_off] = src1. Appended to keep
+    // the serialized ThinOp IDs above stable.
+    StoreAddr,
 };
 
 // Immediate payload. ConstInt uses i; ConstFloat uses f (with meta.is_f32 for
