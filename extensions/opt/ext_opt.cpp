@@ -1743,6 +1743,324 @@ EmberPreserved BoundsCheckElimPass::run(ThinFunction& f,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// LoopUnrollPass: conservative full unrolling of canonical constant loops
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Thin lowering emits a simple while/for loop as
+//
+//   preheader -> header -> body -> continuation -> header
+//                        \-> exit
+//
+// where continuation is the budget-check latch for while, and the step plus
+// budget-check block for for. This pass accepts only that four-edge shape. It
+// proves `i` starts at zero, the header tests `i < N` with an immediate N, and
+// the loop contains exactly one non-aliasing `i = i + 1` store. The body and
+// continuation instructions are then concatenated N times in the body block,
+// whose terminator is changed to the exit. Keeping the first header test is
+// harmless and preserves the original zero-iteration control edge; its truth
+// is already established by the proof for positive N.
+//
+// Reusing VReg numbers in the copies is intentional: Thin IR is explicitly
+// non-SSA, and each copied definition precedes its copied uses. Mutable source
+// values continue to flow through their frame slots, including the induction
+// value, so each copy observes the value stored by the preceding copy.
+
+EmberPreserved LoopUnrollPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    if (f.blocks.size() < 5) return EmberPreserved::all();
+
+    bool changed = false;
+
+    // Transform one loop at a time and rebuild graph facts. Besides allowing
+    // several disjoint loops in one function, this prevents stale predecessor
+    // information after a body is redirected around its old latch.
+    for (;;) {
+        const size_t block_count = f.blocks.size();
+        std::unordered_map<uint32_t, size_t> id_to_index;
+        id_to_index.reserve(block_count);
+        bool valid_ids = true;
+        for (size_t i = 0; i < block_count; ++i) {
+            if (!id_to_index.emplace(f.blocks[i].id, i).second) {
+                valid_ids = false;
+                break;
+            }
+        }
+        if (!valid_ids) break;
+
+        std::vector<std::vector<size_t>> preds(block_count);
+        auto add_pred = [&](size_t source, uint32_t target) -> bool {
+            auto found = id_to_index.find(target);
+            if (found == id_to_index.end()) return false;
+            preds[found->second].push_back(source);
+            return true;
+        };
+        for (size_t i = 0; i < block_count && valid_ids; ++i) {
+            const ThinTerm& term = f.blocks[i].term;
+            if (term.kind == TermKind::Jmp) {
+                valid_ids = add_pred(i, term.target);
+            } else if (term.kind == TermKind::Branch) {
+                valid_ids = add_pred(i, term.target) &&
+                            add_pred(i, term.false_target);
+            }
+        }
+        if (!valid_ids) break;
+
+        bool transformed = false;
+        for (size_t hi = 0; hi < block_count && !transformed; ++hi) {
+            const ThinBlock& header = f.blocks[hi];
+            if (header.term.kind != TermKind::Branch || preds[hi].size() != 2)
+                continue;
+
+            // Recover the lowering's boolean wrapper:
+            //   inner = i < N; wrapped = inner == 0;
+            //   branch wrapped ? exit : body.
+            size_t wrapper_index = 0;
+            const ThinInstr* wrapper = last_def_before(
+                header, header.term.cond, header.instrs.size(), &wrapper_index);
+            if (!wrapper || wrapper->op != ThinOp::Cmp ||
+                wrapper->meta.cmp != 0)
+                continue;
+
+            VReg inner_vreg = 0;
+            int64_t zero = 1;
+            if (const_before(header, wrapper->src1, wrapper_index, &zero) &&
+                zero == 0)
+                inner_vreg = wrapper->src2;
+            else if (const_before(header, wrapper->src2, wrapper_index, &zero) &&
+                     zero == 0)
+                inner_vreg = wrapper->src1;
+            if (inner_vreg == 0) continue;
+
+            size_t compare_index = 0;
+            const ThinInstr* compare = last_def_before(
+                header, inner_vreg, wrapper_index, &compare_index);
+            if (!compare || compare->op != ThinOp::Cmp ||
+                compare->meta.cmp != 2)
+                continue; // exactly i < N
+
+            const ThinInstr* iv_load = last_def_before(
+                header, compare->src1, compare_index);
+            if (!iv_load || iv_load->op != ThinOp::LoadFrame ||
+                iv_load->src1 != 0 || iv_load->meta.frame_off == 0)
+                continue;
+            const int32_t iv_slot = iv_load->meta.frame_off;
+
+            // Require the bound in the compare's immediate form. This is the
+            // unambiguous representation emitted for a source constant and
+            // avoids treating a mutable frame load as compile-time constant.
+            if (compare->src2 != 0) continue;
+            const int64_t trip_count = compare->imm.i;
+            if (trip_count <= 0 || trip_count > 8 ||
+                !bound_fits_compare(trip_count, compare->meta.width,
+                                    compare->meta.is_unsigned != 0))
+                continue;
+
+            // Header evaluation is removed after the first successful test.
+            // Admit only the lowerer's exact, side-effect-free condition
+            // vocabulary and only one frame read, the induction-slot load.
+            // This excludes calls, trapping arithmetic, and conditions whose
+            // repeated evaluation is observably significant.
+            unsigned header_cmps = 0;
+            unsigned header_loads = 0;
+            bool unsafe_header = false;
+            for (const ThinInstr& in : header.instrs) {
+                switch (in.op) {
+                case ThinOp::ConstInt:
+                case ThinOp::ConstBool:
+                case ThinOp::Move:
+                    break;
+                case ThinOp::Cmp:
+                    ++header_cmps;
+                    break;
+                case ThinOp::LoadFrame:
+                    ++header_loads;
+                    if (in.src1 != 0 || in.meta.frame_off != iv_slot)
+                        unsafe_header = true;
+                    break;
+                default:
+                    unsafe_header = true;
+                    break;
+                }
+            }
+            if (unsafe_header || header_cmps != 2 || header_loads != 1)
+                continue;
+
+            auto body_found = id_to_index.find(header.term.false_target);
+            auto exit_found = id_to_index.find(header.term.target);
+            if (body_found == id_to_index.end() ||
+                exit_found == id_to_index.end())
+                continue;
+            const size_t bi = body_found->second;
+            const size_t ei = exit_found->second;
+            if (bi == hi || ei == hi || bi == ei ||
+                preds[bi].size() != 1 || preds[bi][0] != hi)
+                continue;
+            const ThinBlock& body = f.blocks[bi];
+            if (body.term.kind != TermKind::Jmp) continue;
+
+            auto continuation_found = id_to_index.find(body.term.target);
+            if (continuation_found == id_to_index.end()) continue;
+            const size_t ci = continuation_found->second;
+            if (ci == hi || ci == bi || ci == ei || ci <= hi ||
+                preds[ci].size() != 1 || preds[ci][0] != bi)
+                continue;
+            const ThinBlock& continuation = f.blocks[ci];
+            if (continuation.term.kind != TermKind::Jmp ||
+                continuation.term.target != header.id)
+                continue; // the required earlier-block backedge
+
+            // The second header predecessor is the unique preheader. Requiring
+            // it to occur before the header excludes alternate entries and
+            // irreducible arrangements that merely resemble lowering output.
+            size_t pi = block_count;
+            for (size_t pred : preds[hi]) {
+                if (pred == ci) continue;
+                if (pi != block_count) {
+                    pi = block_count;
+                    break;
+                }
+                pi = pred;
+            }
+            if (pi == block_count || pi >= hi) continue;
+            const ThinBlock& preheader = f.blocks[pi];
+            if (preheader.term.kind != TermKind::Jmp ||
+                preheader.term.target != header.id)
+                continue;
+
+            // Prove the reaching initializer is exactly zero. Reject every
+            // possible write/alias after it, rather than guessing whether a
+            // call or aggregate operation can touch the induction home.
+            size_t init_index = preheader.instrs.size();
+            for (size_t i = preheader.instrs.size(); i-- > 0;) {
+                const ThinInstr& in = preheader.instrs[i];
+                if (in.op == ThinOp::StoreFrame && in.src2 == 0 &&
+                    in.meta.frame_off == iv_slot) {
+                    init_index = i;
+                    break;
+                }
+            }
+            if (init_index == preheader.instrs.size()) continue;
+            int64_t initial = 1;
+            if (!const_before(preheader, preheader.instrs[init_index].src1,
+                              init_index, &initial) || initial != 0)
+                continue;
+
+            bool unsafe = false;
+            for (size_t i = init_index + 1; i < preheader.instrs.size(); ++i) {
+                const ThinInstr& in = preheader.instrs[i];
+                if (instr_writes_off(in, iv_slot) ||
+                    in.op == ThinOp::CallNative ||
+                    in.op == ThinOp::CallScript ||
+                    in.op == ThinOp::CallIndirect ||
+                    in.op == ThinOp::CallCrossModule ||
+                    in.op == ThinOp::CopyBytes ||
+                    in.op == ThinOp::StructLitInit ||
+                    in.op == ThinOp::ArrayLitInit ||
+                    in.op == ThinOp::StringDecrypt ||
+                    in.op == ThinOp::StoreAddr) {
+                    unsafe = true;
+                    break;
+                }
+            }
+            if (unsafe) continue;
+
+            // Find and prove the loop's sole induction-slot write. Unknown
+            // aliases and calls are rejected even when they do not visibly
+            // name the slot: without alias analysis they could change `i`.
+            const ThinInstr* update_store = nullptr;
+            const ThinBlock* update_block = nullptr;
+            size_t update_index = 0;
+            unsigned iv_writes = 0;
+            auto inspect_loop_block = [&](const ThinBlock& blk) {
+                for (size_t i = 0; i < blk.instrs.size(); ++i) {
+                    const ThinInstr& in = blk.instrs[i];
+                    if (instr_writes_off(in, iv_slot)) {
+                        ++iv_writes;
+                        if (in.op == ThinOp::StoreFrame && in.src2 == 0 &&
+                            in.meta.frame_off == iv_slot) {
+                            update_store = &in;
+                            update_block = &blk;
+                            update_index = i;
+                        } else {
+                            unsafe = true;
+                        }
+                    }
+                    if (in.op == ThinOp::CallNative ||
+                        in.op == ThinOp::CallScript ||
+                        in.op == ThinOp::CallIndirect ||
+                        in.op == ThinOp::CallCrossModule ||
+                        in.op == ThinOp::CopyBytes ||
+                        in.op == ThinOp::StructLitInit ||
+                        in.op == ThinOp::ArrayLitInit ||
+                        in.op == ThinOp::StringDecrypt ||
+                        in.op == ThinOp::StoreAddr)
+                        unsafe = true;
+                }
+            };
+            inspect_loop_block(body);
+            inspect_loop_block(continuation);
+            if (unsafe || iv_writes != 1 || !update_store || !update_block)
+                continue;
+
+            size_t add_index = 0;
+            const ThinInstr* add = last_def_before(
+                *update_block, update_store->src1, update_index, &add_index);
+            if (!add || add->op != ThinOp::Add ||
+                add->meta.width != compare->meta.width ||
+                add->meta.is_unsigned != compare->meta.is_unsigned)
+                continue;
+
+            bool unit_increment = false;
+            if (load_of_slot_before(*update_block, add->src1, add_index,
+                                    iv_slot)) {
+                if (add->src2 == 0)
+                    unit_increment = add->imm.i == 1;
+                else {
+                    int64_t step = 0;
+                    unit_increment = const_before(*update_block, add->src2,
+                                                  add_index, &step) && step == 1;
+                }
+            } else if (load_of_slot_before(*update_block, add->src2, add_index,
+                                           iv_slot)) {
+                int64_t step = 0;
+                unit_increment = const_before(*update_block, add->src1,
+                                              add_index, &step) && step == 1;
+            }
+            if (!unit_increment) continue;
+
+            // Full unroll. Copy both blocks for every iteration so the for-loop
+            // step and every original BudgetCheck retain their exact count and
+            // ordering relative to body side effects.
+            std::vector<ThinInstr> iteration;
+            iteration.reserve(body.instrs.size() + continuation.instrs.size());
+            iteration.insert(iteration.end(), body.instrs.begin(),
+                             body.instrs.end());
+            iteration.insert(iteration.end(), continuation.instrs.begin(),
+                             continuation.instrs.end());
+
+            std::vector<ThinInstr> unrolled;
+            unrolled.reserve(iteration.size() * static_cast<size_t>(trip_count));
+            for (int64_t iteration_number = 0;
+                 iteration_number < trip_count; ++iteration_number)
+                unrolled.insert(unrolled.end(), iteration.begin(), iteration.end());
+
+            ThinBlock& mutable_body = f.blocks[bi];
+            mutable_body.instrs = std::move(unrolled);
+            ThinTerm exit_jump;
+            exit_jump.kind = TermKind::Jmp;
+            exit_jump.target = f.blocks[ei].id;
+            mutable_body.term = exit_jump;
+
+            changed = true;
+            transformed = true;
+        }
+
+        if (!transformed) break;
+    }
+
+    return changed ? EmberPreserved::none() : EmberPreserved::all();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // SCCPPass: sparse conditional constant propagation across blocks
 // ═══════════════════════════════════════════════════════════════════════
 // Unlike ConstProp (per-block), SCCP tracks constants globally across
@@ -1868,6 +2186,7 @@ void register_passes(EmberPassRegistry& reg) {
     reg.add<DeadStoreElimPass>("dse");
     reg.add<BoundsCheckElimPass>("bounds-elim");
     reg.add<SCCPPass>("sccp");
+    reg.add<LoopUnrollPass>("unroll");
 }
 
 } // namespace ember::ext_opt

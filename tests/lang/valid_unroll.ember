@@ -1,0 +1,47 @@
+// valid_unroll.ember — conservative constant-trip-count loop unrolling.
+// Run with: ember_cli run ../tests/lang/valid_unroll.ember --passes unroll
+// expect: 56
+
+fn dynamic_loop(n: i64) -> i64 {
+    let mut i: i64 = 0;
+    let mut sum: i64 = 0;
+    // The bound is not compile-time constant, so unroll must leave this loop.
+    while (i < n) {
+        sum = sum + i;
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn main() -> i64 {
+    let mut result: i64 = 0;
+
+    // Canonical while loop: four iterations using i = 0, 1, 2, 3.
+    let mut i: i64 = 0;
+    while (i < 4) {
+        result = result + i;
+        i = i + 1;
+    }
+
+    // Canonical for loop: the step block must be duplicated with the body.
+    for (let mut j: i64 = 0; j < 3; j = j + 1) {
+        result = result + j * 10;
+    }
+
+    // The inclusive maximum accepted trip count.
+    let mut k: i64 = 0;
+    while (k < 8) {
+        result = result + 1;
+        k = k + 1;
+    }
+
+    // Nine is over the pass limit and must remain a loop.
+    let mut large: i64 = 0;
+    while (large < 9) {
+        result = result + 1;
+        large = large + 1;
+    }
+
+    // Dynamic trip count is also deliberately not unrolled: 0 + 1 + 2 = 3.
+    return result + dynamic_loop(3);
+}

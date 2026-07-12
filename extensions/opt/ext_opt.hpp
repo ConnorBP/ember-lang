@@ -1,6 +1,6 @@
 // ext_opt.hpp — Stage C: the IR optimization passes extension.
 //
-// Ten IR→IR optimization passes over ThinFunction, registered by name via
+// Twelve IR→IR optimization passes over ThinFunction, registered by name via
 // register_passes (the extension-style discovery pattern, mirroring
 // register_natives). The host wires it:
 //   EmberPassRegistry reg;
@@ -51,8 +51,13 @@
 //   the preheader proves i starts nonnegative, and the sole loop update is
 //   the non-wrapping i = i + 1 after the access. Ambiguous CFG, aliases,
 //   dynamic lengths, and non-canonical loops are conservatively unchanged.
+// - LoopUnrollPass ("unroll"): fully unrolls canonical while/for loops whose
+//   induction slot is provably initialized to zero, compared with a positive
+//   compile-time constant using i < N, and updated exactly once by i = i + 1.
+//   Only trip counts up to eight are accepted; aliases, alternate entries,
+//   early exits, and non-canonical CFG are left unchanged.
 //
-// All ten are VALUE-PRESERVING: after the pass, emit_x64 produces the same
+// All twelve are VALUE-PRESERVING: after the pass, emit_x64 produces the same
 // i64 result. They return EmberPreserved::none() if they changed the IR,
 // Preserved::all() if they did nothing.
 #pragma once
@@ -115,6 +120,11 @@ struct BoundsCheckElimPass : EmberPassInfoMixin<BoundsCheckElimPass> {
 
 struct SCCPPass : EmberPassInfoMixin<SCCPPass> {
     static constexpr const char* pass_name = "sccp";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+struct LoopUnrollPass : EmberPassInfoMixin<LoopUnrollPass> {
+    static constexpr const char* pass_name = "unroll";
     EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
 };
 
