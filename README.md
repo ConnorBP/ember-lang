@@ -33,7 +33,7 @@ tight loops.
   simplifycfg, bounds-elim, sccp
 - Obfuscation: subst (MBA), opaque_pred, deadcode, mba_expand, const_encode
 
-String encryption and block splitting obfuscation passes are in development.
+String encryption (str_encrypt) and block splitting (block_split) obfuscation passes shipped.
 
 Full SSA construction (phi nodes, SSA renaming) remains the future upgrade;
 the shipped regalloc is the linear-scan-over-thin-IR subset (assigns scalar
@@ -290,12 +290,12 @@ Write your own IR passes — optimization or obfuscation:
 # Run built-in passes
 ember run my_script.ember --passes constprop,forward,copyprop,instcombine,dce,licm,dse,simplifycfg,bounds-elim,sccp
 # Obfuscation passes
-ember run my_script.ember --passes opaque_pred,deadcode,mba_expand,const_encode
+ember run my_script.ember --passes opaque_pred,deadcode,mba_expand,const_encode,str_encrypt,block_split
 ```
 
-**16 passes shipped** (11 optimization + 5 obfuscation):
+**18 passes shipped (11 optimization + 7 obfuscation)):
 - Optimization: ConstProp, DCE, CSE, LICM, Forward, CopyProp, InstCombine, DSE, SimplifyCFG, bounds-elim, SCCP
-- Obfuscation: SubstitutionPass (MBA), opaque_pred, deadcode, mba_expand, const_encode
+- Obfuscation: SubstitutionPass (MBA), opaque_pred, deadcode, mba_expand, const_encode, str_encrypt, block_split
 
 String encryption (`str_encrypt`) and block splitting (`block_split`) obfuscation
 passes are in development — string encryption transforms `ConstStringRef` IR
