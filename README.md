@@ -5,28 +5,40 @@
 **A native-JIT embedded scripting language.** Ember compiles scripts to x86-64
 machine code at runtime — no interpreter dispatch loop, no bytecode VM. A hot
 loop runs as real native instructions, not a switch-on-opcode interpreter, so
-it posts **5-9× over a bytecode interpreter** on hot loops (measured against
-AngelScript: `fib`, `tight_loop`, `nested_calls`) and ties `g++ -O2` at **~1.0×**
-on straight-line integer arithmetic. Around that core it ships a real sandbox
-(per-frame byte budget, stack-depth guard, recoverable traps — a fault unwinds
-to your host, it doesn't kill the process), **hot-reload** of live modules with
-stable dispatch slots, **`.em` module bundling** (signed, native-code bundles
-with a relocation contract, plus a v5 IR-on-disk variant that is re-emitted to
-x64 at load time), and a Rust-like syntax built for game-engine /
-modding embedding. The **default codegen path is a baseline JIT** —
-correctness-first, tree-walking, stack-spilling, no inlining or loop opts —
-so it will *not* match an optimizing compiler everywhere (five of six codegen
-paths are 5-9× slower than `g++ -O2`); closing that gap is benchmark-gated work.
-A thin three-address IR backend, `.em` v5 IR serialization, **sixteen IR
-optimization + obfuscation passes** (constprop/dce/cse/licm/forward/copyprop/instcombine/dse/simplifycfg/bounds-elim
-+ MBA substitution/opaque_pred/deadcode/mba_expand/const_encode), and a **linear-scan register allocator** over the
-thin IR have shipped behind flags (`enable_ir_backend`, `enable_regalloc`,
-`--passes`) as the staged path toward that goal — default-off, so the default
-path is the unchanged baseline tree-walker. Full SSA construction (phi nodes,
-SSA renaming) remains the future upgrade; the shipped regalloc is the
-linear-scan-over-thin-IR subset (assigns scalar int/bool VRegs to Win64
-callee-saved registers, spills to frame slots under pressure, promotes hot
-loop-carried frame slots to registers). Current version: **v1.1**.
+it posts **6-7x faster than AngelScript's bytecode interpreter** on compute-
+heavy workloads (`fib`, `tight_loop`, `nested_calls`) and **within 1.04x of
+g++-O2** on integer division (the one path where ember's tree-walker codegen
+is already near-optimal). Around that core it ships a real sandbox (per-frame
+byte budget, stack-depth guard, recoverable traps — a fault unwinds to your
+host, it doesn't kill the process), **hot-reload** of live modules with stable
+dispatch slots, **`.em` module bundling** (signed, native-code bundles with a
+relocation contract, plus a v5 IR-on-disk variant that is re-emitted to x64 at
+load time), a **VST3 audio plugin wrapper** (write VST plugins fully in ember
+with hot-reload DSP), and a Rust-like syntax built for game-engine /
+modding embedding.
+
+The **default codegen path is a baseline JIT** — correctness-first, tree-
+walking, stack-spilling — which is 5-8x slower than `g++ -O2` on most paths
+(loop_overhead 5.1x, call_overhead 5.1x, dce_dead_store 7.2x). Closing that gap
+is the purpose of the **IR backend + optimization passes + register allocator**,
+which ship behind the `--passes` flag (default-off, so the default path is the
+unchanged baseline tree-walker). With `--passes`, the optimization passes
+provide targeted speedups: **constprop 1.34x**, **int_div 1.31x** (closing to
+within 1.30x of g++-O2). The linear-scan register allocator promotes hot
+loop-carried frame slots to callee-saved registers, reducing memory traffic in
+tight loops.
+
+**18 IR passes shipped** (11 optimization + 7 obfuscation):
+- Optimization: constprop, dce, cse, licm, forward, copyprop, instcombine, dse,
+  simplifycfg, bounds-elim, sccp
+- Obfuscation: subst (MBA), opaque_pred, deadcode, mba_expand, const_encode,
+  str_encrypt, block_split
+
+Full SSA construction (phi nodes, SSA renaming) remains the future upgrade;
+the shipped regalloc is the linear-scan-over-thin-IR subset (assigns scalar
+int/bool VRegs to Win64 callee-saved registers, spills to frame slots under
+pressure, promotes hot loop-carried frame slots to registers). Current
+version: **v1.2**.
 
 ## What it looks like
 
@@ -125,7 +137,7 @@ cd ember
 mkdir buildt && cd buildt
 cmake -G Ninja -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe ..
 cmake --build .          # or: ninja
-ctest                    # 61 tests (59 excluding benchmarks)
+ctest                    # 65 tests (63 excluding benchmarks + soak)
 ```
 
 Run and bench a script (`ember` = `buildt/ember_cli.exe`):
@@ -275,14 +287,14 @@ Write your own IR passes — optimization or obfuscation:
 
 ```bash
 # Run built-in passes
-ember run my_script.ember --passes constprop,forward,copyprop,instcombine,dce,licm,dse,simplifycfg,bounds-elim
+ember run my_script.ember --passes constprop,forward,copyprop,instcombine,dce,licm,dse,simplifycfg,bounds-elim,sccp
 # Obfuscation passes
-ember run my_script.ember --passes opaque_pred,deadcode,mba_expand,const_encode
+ember run my_script.ember --passes opaque_pred,deadcode,mba_expand,const_encode,str_encrypt,block_split
 ```
 
-**16 passes shipped** (11 optimization + 5 obfuscation):
-- Optimization: ConstProp, DCE, CSE, LICM, Forward, CopyProp, InstCombine, DSE, SimplifyCFG, bounds-elim
-- Obfuscation: SubstitutionPass (MBA), opaque_pred, deadcode, mba_expand, const_encode
+**18 passes shipped** (11 optimization + 7 obfuscation):
+- Optimization: ConstProp, DCE, CSE, LICM, Forward, CopyProp, InstCombine, DSE, SimplifyCFG, bounds-elim, SCCP
+- Obfuscation: SubstitutionPass (MBA), opaque_pred, deadcode, mba_expand, const_encode, str_encrypt, block_split
 
 - **Pass system:** `docs/spec/PASS_SYSTEM_DESIGN.md` — architecture, registration, lifecycle
 - **Pass authoring guide:** `docs/PASS_AUTHORING.md` — how to write a custom pass
