@@ -1,6 +1,6 @@
 // ext_opt.hpp — Stage C: the IR optimization passes extension.
 //
-// Nine IR→IR optimization passes over ThinFunction, registered by name via
+// Ten IR→IR optimization passes over ThinFunction, registered by name via
 // register_passes (the extension-style discovery pattern, mirroring
 // register_natives). The host wires it:
 //   EmberPassRegistry reg;
@@ -46,8 +46,13 @@
 //   second StoreFrame to the same frame_off appears with NO intervening
 //   LoadFrame of that off, the FIRST StoreFrame was overwritten before being
 //   read → remove it. Iterates to fixpoint within each block.
+// - BoundsCheckElimPass ("bounds-elim"): removes fixed-array BoundsCheck ops
+//   in a canonical while loop only when the controlling edge proves i < N,
+//   the preheader proves i starts nonnegative, and the sole loop update is
+//   the non-wrapping i = i + 1 after the access. Ambiguous CFG, aliases,
+//   dynamic lengths, and non-canonical loops are conservatively unchanged.
 //
-// All nine are VALUE-PRESERVING: after the pass, emit_x64 produces the same
+// All ten are VALUE-PRESERVING: after the pass, emit_x64 produces the same
 // i64 result. They return EmberPreserved::none() if they changed the IR,
 // Preserved::all() if they did nothing.
 #pragma once
@@ -100,6 +105,11 @@ struct InstCombinePass : EmberPassInfoMixin<InstCombinePass> {
 
 struct DeadStoreElimPass : EmberPassInfoMixin<DeadStoreElimPass> {
     static constexpr const char* pass_name = "dse";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+struct BoundsCheckElimPass : EmberPassInfoMixin<BoundsCheckElimPass> {
+    static constexpr const char* pass_name = "bounds-elim";
     EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
 };
 

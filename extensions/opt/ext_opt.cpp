@@ -1327,6 +1327,373 @@ EmberPreserved DeadStoreElimPass::run(ThinFunction& f, EmberAnalysisManager&) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// BoundsCheckElimPass: canonical fixed-array loop bounds-check elimination
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// This intentionally recognizes only the simple loop shape emitted for
+//
+//   i = 0; while (i < N) { ... a[i] ...; i = i + 1; }
+//
+// The pass removes a fixed-array BoundsCheck only after proving all of:
+//   * the header's controlling comparison is the signed/unsigned i < N;
+//   * i is loaded from one frame slot initialized to zero in the preheader;
+//   * the body has one non-wrapping +1 update to that slot, after the access;
+//   * the CFG is a single body and latch with no alternate entries/exits;
+//   * no call, unknown copy, or indirect write can change the induction slot;
+//   * the check length is the same immediate N and its IndexAddr is fixed-base.
+//
+// This narrow proof is deliberate: a missed optimization costs performance,
+// while a false positive turns a recoverable bounds trap into memory unsafety.
+
+namespace {
+
+const ThinInstr* last_def_before(const ThinBlock& blk, VReg v, size_t before,
+                                 size_t* index = nullptr) {
+    if (v == 0) return nullptr;
+    before = std::min(before, blk.instrs.size());
+    for (size_t i = before; i-- > 0;) {
+        if (blk.instrs[i].dst == v) {
+            if (index) *index = i;
+            return &blk.instrs[i];
+        }
+    }
+    return nullptr;
+}
+
+bool const_before(const ThinBlock& blk, VReg v, size_t before, int64_t* value) {
+    // Follow only local Move chains. Thin IR is not SSA, so each lookup is
+    // relative to the use and therefore observes the last reaching local def.
+    for (unsigned depth = 0; depth < 8 && v != 0; ++depth) {
+        size_t def_index = 0;
+        const ThinInstr* def = last_def_before(blk, v, before, &def_index);
+        if (!def) return false;
+        if (def->op == ThinOp::ConstInt || def->op == ThinOp::ConstBool) {
+            *value = def->imm.i;
+            return true;
+        }
+        if (def->op != ThinOp::Move || def->src1 == 0) return false;
+        v = def->src1;
+        before = def_index;
+    }
+    return false;
+}
+
+bool load_of_slot_before(const ThinBlock& blk, VReg v, size_t before,
+                         int32_t slot, size_t* load_index = nullptr) {
+    size_t def_index = 0;
+    const ThinInstr* def = last_def_before(blk, v, before, &def_index);
+    if (!def || def->op != ThinOp::LoadFrame || def->src1 != 0 ||
+        def->meta.frame_off != slot)
+        return false;
+    if (load_index) *load_index = def_index;
+    return true;
+}
+
+bool intervals_overlap(int64_t a_begin, int64_t a_size,
+                       int64_t b_begin, int64_t b_size) {
+    if (a_size <= 0 || b_size <= 0) return true;
+    const int64_t a_end = a_begin + a_size;
+    const int64_t b_end = b_begin + b_size;
+    return a_begin < b_end && b_begin < a_end;
+}
+
+int64_t frame_store_bytes(const ThinInstr& in) {
+    if (in.meta.type && in.meta.type->is_slice) return 16;
+    // Ordinary scalar locals occupy eight-byte homes. field_off is the
+    // lowerer's marker for an exact-width packed aggregate-field write.
+    return in.meta.field_off != 0 ? std::max<int32_t>(1, in.meta.width) : 8;
+}
+
+bool bound_fits_compare(int64_t bound, int32_t width, bool is_unsigned) {
+    if (bound <= 0 || (width != 1 && width != 2 && width != 4 && width != 8))
+        return false;
+    if (width == 8) return true; // positive int64 fits either i64 or u64
+    const unsigned bits = static_cast<unsigned>(width * 8);
+    const uint64_t max = is_unsigned
+        ? ((uint64_t{1} << bits) - 1)
+        : ((uint64_t{1} << (bits - 1)) - 1);
+    return static_cast<uint64_t>(bound) <= max;
+}
+
+} // namespace
+
+EmberPreserved BoundsCheckElimPass::run(ThinFunction& f,
+                                         EmberAnalysisManager&) {
+    if (f.blocks.size() < 4) return EmberPreserved::all();
+
+    std::unordered_map<uint32_t, size_t> id_to_index;
+    id_to_index.reserve(f.blocks.size());
+    for (size_t i = 0; i < f.blocks.size(); ++i) {
+        if (!id_to_index.emplace(f.blocks[i].id, i).second)
+            return EmberPreserved::all(); // malformed/ambiguous CFG: no transform
+    }
+
+    std::vector<std::vector<size_t>> preds(f.blocks.size());
+    auto add_pred = [&](size_t source, uint32_t target) -> bool {
+        auto found = id_to_index.find(target);
+        if (found == id_to_index.end()) return false;
+        preds[found->second].push_back(source);
+        return true;
+    };
+    for (size_t i = 0; i < f.blocks.size(); ++i) {
+        const ThinTerm& term = f.blocks[i].term;
+        if (term.kind == TermKind::Jmp) {
+            if (!add_pred(i, term.target)) return EmberPreserved::all();
+        } else if (term.kind == TermKind::Branch) {
+            if (!add_pred(i, term.target) || !add_pred(i, term.false_target))
+                return EmberPreserved::all();
+        }
+    }
+
+    bool changed = false;
+
+    for (size_t hi = 0; hi < f.blocks.size(); ++hi) {
+        ThinBlock& header = f.blocks[hi];
+        if (header.term.kind != TermKind::Branch || preds[hi].size() != 2)
+            continue;
+
+        // Recover lowering's boolean wrapper:
+        //   inner = (i < N); wrapped = (inner == 0);
+        //   branch wrapped ? exit : body.
+        size_t wrapper_index = 0;
+        const ThinInstr* wrapper = last_def_before(
+            header, header.term.cond, header.instrs.size(), &wrapper_index);
+        if (!wrapper || wrapper->op != ThinOp::Cmp || wrapper->meta.cmp != 0)
+            continue;
+
+        VReg inner_vreg = 0;
+        int64_t zero = 1;
+        if (const_before(header, wrapper->src1, wrapper_index, &zero) && zero == 0)
+            inner_vreg = wrapper->src2;
+        else if (const_before(header, wrapper->src2, wrapper_index, &zero) && zero == 0)
+            inner_vreg = wrapper->src1;
+        if (inner_vreg == 0) continue;
+
+        size_t compare_index = 0;
+        const ThinInstr* compare = last_def_before(
+            header, inner_vreg, wrapper_index, &compare_index);
+        if (!compare || compare->op != ThinOp::Cmp || compare->meta.cmp != 2)
+            continue; // v1 accepts exactly i < N
+
+        const ThinInstr* iv_load = last_def_before(
+            header, compare->src1, compare_index);
+        if (!iv_load || iv_load->op != ThinOp::LoadFrame || iv_load->src1 != 0)
+            continue;
+        const int32_t iv_slot = iv_load->meta.frame_off;
+        if (iv_slot == 0) continue;
+
+        int64_t bound = 0;
+        const bool constant_bound = compare->src2 == 0
+            ? (bound = compare->imm.i, true)
+            : const_before(header, compare->src2, compare_index, &bound);
+        if (!constant_bound ||
+            !bound_fits_compare(bound, compare->meta.width,
+                                compare->meta.is_unsigned != 0))
+            continue;
+
+        auto body_found = id_to_index.find(header.term.false_target);
+        auto exit_found = id_to_index.find(header.term.target);
+        if (body_found == id_to_index.end() || exit_found == id_to_index.end())
+            continue;
+        const size_t bi = body_found->second;
+        if (bi == hi || preds[bi].size() != 1 || preds[bi][0] != hi)
+            continue;
+        ThinBlock& body = f.blocks[bi];
+        if (body.term.kind != TermKind::Jmp) continue;
+
+        auto latch_found = id_to_index.find(body.term.target);
+        if (latch_found == id_to_index.end()) continue;
+        const size_t li = latch_found->second;
+        if (li == hi || li == bi || preds[li].size() != 1 || preds[li][0] != bi)
+            continue;
+        const ThinBlock& latch = f.blocks[li];
+        if (latch.term.kind != TermKind::Jmp || latch.term.target != header.id)
+            continue;
+
+        // The other header predecessor must be a unique preheader that jumps
+        // directly to the header. This excludes alternate loop entries.
+        size_t pi = f.blocks.size();
+        for (size_t pred : preds[hi]) {
+            if (pred == li) continue;
+            if (pi != f.blocks.size()) { pi = f.blocks.size(); break; }
+            pi = pred;
+        }
+        if (pi == f.blocks.size()) continue;
+        const ThinBlock& preheader = f.blocks[pi];
+        if (preheader.term.kind != TermKind::Jmp ||
+            preheader.term.target != header.id)
+            continue;
+
+        // Require a reaching `StoreFrame slot, 0` in the preheader. The last
+        // exact store is the one that reaches the loop; reject unknown writes
+        // after it rather than attempting alias analysis here.
+        size_t init_index = preheader.instrs.size();
+        for (size_t i = preheader.instrs.size(); i-- > 0;) {
+            const ThinInstr& in = preheader.instrs[i];
+            if (in.op == ThinOp::StoreFrame && in.src2 == 0 &&
+                in.meta.frame_off == iv_slot) {
+                init_index = i;
+                break;
+            }
+        }
+        if (init_index == preheader.instrs.size()) continue;
+        int64_t initial = 1;
+        if (!const_before(preheader, preheader.instrs[init_index].src1,
+                          init_index, &initial) || initial != 0)
+            continue;
+        bool unsafe_after_init = false;
+        for (size_t i = init_index + 1; i < preheader.instrs.size(); ++i) {
+            const ThinInstr& in = preheader.instrs[i];
+            if ((in.op == ThinOp::StoreFrame &&
+                 intervals_overlap(in.meta.frame_off, frame_store_bytes(in),
+                                   iv_slot, 8)) ||
+                in.op == ThinOp::CopyBytes || in.op == ThinOp::StructLitInit ||
+                in.op == ThinOp::ArrayLitInit || in.op == ThinOp::StringDecrypt ||
+                in.op == ThinOp::CallNative || in.op == ThinOp::CallScript ||
+                in.op == ThinOp::CallIndirect || in.op == ThinOp::CallCrossModule ||
+                in.op == ThinOp::StoreAddr) {
+                unsafe_after_init = true;
+                break;
+            }
+        }
+        if (unsafe_after_init) continue;
+
+        // Find the sole IV update and prove it is `slot = load(slot) + 1`.
+        size_t update_index = body.instrs.size();
+        unsigned iv_stores = 0;
+        bool unsafe_loop_write = false;
+        auto inspect_writes = [&](const ThinBlock& blk, bool is_body) {
+            for (size_t i = 0; i < blk.instrs.size(); ++i) {
+                const ThinInstr& in = blk.instrs[i];
+                if (in.op == ThinOp::StoreFrame) {
+                    if (in.src2 != 0) { unsafe_loop_write = true; continue; }
+                    if (intervals_overlap(in.meta.frame_off, frame_store_bytes(in),
+                                          iv_slot, 8)) {
+                        ++iv_stores;
+                        if (is_body && in.meta.frame_off == iv_slot)
+                            update_index = i;
+                        else
+                            unsafe_loop_write = true;
+                    }
+                } else if (in.op == ThinOp::StoreAddr) {
+                    // Body stores are checked below against their IndexAddr
+                    // provenance. A header/latch indirect store has no such
+                    // canonical proof and may alias the induction slot.
+                    if (!is_body) unsafe_loop_write = true;
+                } else if (in.op == ThinOp::CopyBytes ||
+                           in.op == ThinOp::StructLitInit ||
+                           in.op == ThinOp::ArrayLitInit ||
+                           in.op == ThinOp::StringDecrypt ||
+                           in.op == ThinOp::CallNative ||
+                           in.op == ThinOp::CallScript ||
+                           in.op == ThinOp::CallIndirect ||
+                           in.op == ThinOp::CallCrossModule) {
+                    unsafe_loop_write = true;
+                }
+            }
+        };
+        inspect_writes(header, false);
+        inspect_writes(body, true);
+        inspect_writes(latch, false);
+        if (unsafe_loop_write || iv_stores != 1 ||
+            update_index == body.instrs.size())
+            continue;
+
+        const ThinInstr& update_store = body.instrs[update_index];
+        size_t add_index = 0;
+        const ThinInstr* add = last_def_before(
+            body, update_store.src1, update_index, &add_index);
+        if (!add || add->op != ThinOp::Add || add->meta.width != compare->meta.width)
+            continue;
+        bool update_ok = false;
+        if (load_of_slot_before(body, add->src1, add_index, iv_slot)) {
+            if (add->src2 == 0)
+                update_ok = add->imm.i == 1;
+            else {
+                int64_t step = 0;
+                update_ok = const_before(body, add->src2, add_index, &step) && step == 1;
+            }
+        } else if (load_of_slot_before(body, add->src2, add_index, iv_slot)) {
+            int64_t step = 0;
+            update_ok = const_before(body, add->src1, add_index, &step) && step == 1;
+        }
+        if (!update_ok) continue;
+
+        // Prove every indirect store in the loop targets a fixed-base indexed
+        // range disjoint from the IV slot. This permits the common a[i]=...
+        // loop while rejecting arbitrary pointers and slice stores.
+        for (size_t i = 0; i < body.instrs.size() && !unsafe_loop_write; ++i) {
+            const ThinInstr& store = body.instrs[i];
+            if (store.op != ThinOp::StoreAddr) continue;
+            // The proof ranges i over [0, bound). After the update i may equal
+            // bound, so reject indirect stores at/after the update even when a
+            // later retained check would make source-lowered code safe.
+            if (i >= update_index) {
+                unsafe_loop_write = true;
+                break;
+            }
+            size_t addr_index = 0;
+            const ThinInstr* addr = last_def_before(body, store.src2, i, &addr_index);
+            if (!addr || addr->op != ThinOp::IndexAddr || addr->src1 != 0 ||
+                addr->meta.width <= 0 ||
+                !load_of_slot_before(body, addr->src2, addr_index, iv_slot)) {
+                unsafe_loop_write = true;
+                break;
+            }
+            if (addr->meta.base_kind == AbsFixup::GlobalsBase) continue;
+
+            const int64_t first = int64_t(addr->meta.frame_off) +
+                                  int64_t(store.meta.frame_off);
+            const int64_t write_width = std::max<int32_t>(1, store.meta.width);
+            const uint64_t iterations = static_cast<uint64_t>(bound - 1);
+            const uint64_t elem_width = static_cast<uint64_t>(addr->meta.width);
+            const uint64_t max_span = static_cast<uint64_t>(INT64_MAX - write_width);
+            if (iterations > max_span / elem_width) {
+                unsafe_loop_write = true;
+                break;
+            }
+            const int64_t span = static_cast<int64_t>(iterations * elem_width) +
+                                 write_width;
+            if (first > INT64_MAX - span ||
+                intervals_overlap(first, span, iv_slot, 8))
+                unsafe_loop_write = true;
+        }
+        if (unsafe_loop_write) continue;
+
+        // Select only checks before the update, with the same immediate bound,
+        // whose index is a fresh load of the IV slot and feeds a fixed-base
+        // IndexAddr later in this block.
+        std::vector<size_t> remove;
+        for (size_t i = 0; i < update_index; ++i) {
+            const ThinInstr& check = body.instrs[i];
+            if (check.op != ThinOp::BoundsCheck || check.src2 != 0 ||
+                check.imm.i != bound ||
+                !load_of_slot_before(body, check.src1, i, iv_slot))
+                continue;
+
+            bool matching_index = false;
+            for (size_t j = i + 1; j < update_index; ++j) {
+                const ThinInstr& candidate = body.instrs[j];
+                if (candidate.dst == check.src1) break; // index value redefined
+                if (candidate.op == ThinOp::IndexAddr && candidate.src1 == 0 &&
+                    candidate.src2 == check.src1 && candidate.meta.width > 0) {
+                    matching_index = true;
+                    break;
+                }
+            }
+            if (matching_index) remove.push_back(i);
+        }
+        if (remove.empty()) continue;
+
+        for (auto it = remove.rbegin(); it != remove.rend(); ++it)
+            body.instrs.erase(body.instrs.begin() + static_cast<ptrdiff_t>(*it));
+        changed = true;
+    }
+
+    return changed ? EmberPreserved::none() : EmberPreserved::all();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // register_passes
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1340,6 +1707,7 @@ void register_passes(EmberPassRegistry& reg) {
     reg.add<CopyPropPass>("copyprop");
     reg.add<InstCombinePass>("instcombine");
     reg.add<DeadStoreElimPass>("dse");
+    reg.add<BoundsCheckElimPass>("bounds-elim");
 }
 
 } // namespace ember::ext_opt
