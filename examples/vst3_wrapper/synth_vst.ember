@@ -1,0 +1,67 @@
+// synth_vst.ember - monophonic sine synthesizer demonstrating VST3 Phase 6.
+// Event kinds: 0 = note on, 1 = note off, 2 = note expression, 3 = controller.
+global oscillator_phase: f64 = 0.0;
+global oscillator_frequency: f64 = 440.0;
+global envelope_level: f64 = 0.0;
+global envelope_stage: i64 = 0; // 0 idle, 1 attack, 2 decay, 3 sustain, 4 release
+global active_note: i64 = -1;
+
+fn process_f32(ctx: i64, frames: i64) -> void {
+    let sample_rate: f64 = audio_get_sample_rate(ctx) as f64;
+    let event_count: i64 = audio_get_event_count(ctx);
+    let output_channels: i64 = audio_get_num_output_channels(ctx);
+    let mut event_index: i64 = 0;
+    let mut frame: i64 = 0;
+
+    while (frame < frames) {
+        while (event_index < event_count && audio_get_event_offset(ctx, event_index) <= frame) {
+            let event_type: i64 = audio_get_event_type(ctx, event_index);
+            let note: i64 = audio_get_event_note(ctx, event_index);
+            if (event_type == 0 && audio_get_event_velocity(ctx, event_index) > 0) {
+                active_note = note;
+                oscillator_frequency = 440.0 * pow_f64(2.0, (note as f64 - 69.0) / 12.0);
+                envelope_stage = 1;
+            } else if (event_type == 1 && note == active_note) {
+                envelope_stage = 4;
+            }
+            event_index = event_index + 1;
+        }
+
+        // 10 ms attack, 80 ms decay to 70% sustain, 250 ms release.
+        if (envelope_stage == 1) {
+            envelope_level = envelope_level + 1.0 / (sample_rate * 0.010);
+            if (envelope_level >= 1.0) {
+                envelope_level = 1.0;
+                envelope_stage = 2;
+            }
+        } else if (envelope_stage == 2) {
+            envelope_level = envelope_level - 0.3 / (sample_rate * 0.080);
+            if (envelope_level <= 0.7) {
+                envelope_level = 0.7;
+                envelope_stage = 3;
+            }
+        } else if (envelope_stage == 4) {
+            envelope_level = envelope_level - 1.0 / (sample_rate * 0.250);
+            if (envelope_level <= 0.0) {
+                envelope_level = 0.0;
+                envelope_stage = 0;
+                active_note = -1;
+            }
+        }
+
+        let sample: f32 = (sin_f64(oscillator_phase) * envelope_level * 0.20) as f32;
+        let mut channel: i64 = 0;
+        while (channel < output_channels) {
+            audio_store_sample(ctx, channel, frame, sample);
+            channel = channel + 1;
+        }
+        oscillator_phase = oscillator_phase + 6.283185307179586 * oscillator_frequency / sample_rate;
+        if (oscillator_phase >= 6.283185307179586) {
+            oscillator_phase = oscillator_phase - 6.283185307179586;
+        }
+        frame = frame + 1;
+    }
+}
+
+fn get_latency() -> i64 { return 0; }
+fn get_tail() -> i64 { return 12000; } // 250 ms at the common 48 kHz rate

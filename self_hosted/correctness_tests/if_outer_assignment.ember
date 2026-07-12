@@ -1,0 +1,7 @@
+// Differential audit: enclosing locals remain visible in an if body.
+// expect: 42
+fn main() -> i64 {
+    let mut x: i64 = 1;
+    if (true) { x = 42; }
+    return x;
+}

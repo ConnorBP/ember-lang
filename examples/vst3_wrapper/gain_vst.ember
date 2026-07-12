@@ -1,5 +1,5 @@
 @realtime
-fn process(ctx: i64, frames: i64) -> void {
+fn process_f32(ctx: i64, frames: i64) -> void {
     let mut gain: f32 = audio_get_parameter(ctx, 0);
     let channels: i64 = audio_get_num_input_channels(ctx);
     let changes: i64 = audio_get_param_change_count(ctx);
@@ -21,3 +21,21 @@ fn process(ctx: i64, frames: i64) -> void {
         i = i + 1;
     }
 }
+
+fn process_f64(ctx: i64, frames: i64) -> void {
+    let gain: f64 = audio_get_parameter(ctx, 0) as f64;
+    let channels: i64 = audio_get_num_input_channels(ctx);
+    let mut ch: i64 = 0;
+    while (ch < channels) {
+        let mut i: i64 = 0;
+        while (i < frames) {
+            let sample: f64 = audio_load_sample_f64(ctx, ch, i);
+            audio_store_sample_f64(ctx, ch, i, sample * gain);
+            i = i + 1;
+        }
+        ch = ch + 1;
+    }
+}
+
+fn get_latency() -> i64 { return 0; }
+fn get_tail() -> i64 { return 0; }

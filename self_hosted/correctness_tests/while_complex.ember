@@ -1,0 +1,14 @@
+// Differential audit: while with a compound bool condition and mutation.
+// expect: 16
+fn main() -> i64 {
+    let mut i: i64 = 0;
+    let mut sum: i64 = 0;
+    let mut live: bool = true;
+    while (live && i < 10 && sum < 30) {
+        i = i + 1;
+        if ((i & 1) == 0) { sum = sum + i; }
+        else { sum = sum + 1; }
+        if (i >= 7) { live = false; }
+    }
+    return sum;
+}

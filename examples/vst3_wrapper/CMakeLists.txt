@@ -46,12 +46,14 @@ target_include_directories(ember_gain PRIVATE
     ${EMBER_VST3_SDK_ROOT}
     ${public_sdk_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/extensions/audio)
+    ${CMAKE_SOURCE_DIR}/extensions/audio
+    ${CMAKE_SOURCE_DIR}/extensions/math)
 target_link_libraries(ember_gain PRIVATE
     sdk
     ember
     ember_frontend
-    ember_ext_audio)
+    ember_ext_audio
+    ember_ext_math)
 
-smtg_target_add_plugin_resources(ember_gain RESOURCES gain_vst.ember)
+smtg_target_add_plugin_resources(ember_gain RESOURCES gain_vst.ember synth_vst.ember)
 set_target_properties(ember_gain PROPERTIES OUTPUT_NAME "ember_gain")

@@ -1,0 +1,3 @@
+// Boundary rejection: break outside a loop must not be silently accepted.
+// selfhost-reject: negative
+fn main() -> i64 { break; return 42; }

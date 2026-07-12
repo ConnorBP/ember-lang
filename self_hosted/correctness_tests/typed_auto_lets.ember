@@ -1,0 +1,11 @@
+// Differential audit: typed and inferred lets for i64 and bool.
+// expect: 42
+fn main() -> i64 {
+    let typed: i64 = 20;
+    let inferred = 21;
+    let yes = true;
+    let no: bool = false;
+    let mut r: i64 = typed + inferred;
+    if (yes && !no) { r = r + 1; }
+    return r;
+}

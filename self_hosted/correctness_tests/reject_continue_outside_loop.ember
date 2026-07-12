@@ -1,0 +1,3 @@
+// Boundary rejection: continue outside a loop must not be silently accepted.
+// selfhost-reject: negative
+fn main() -> i64 { continue; return 42; }

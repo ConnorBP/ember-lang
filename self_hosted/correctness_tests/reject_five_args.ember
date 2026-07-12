@@ -1,0 +1,4 @@
+// Boundary rejection: self-hosted ABI supports at most four call arguments.
+// selfhost-reject: negative
+fn sum5(a:i64,b:i64,c:i64,d:i64,e:i64)->i64{return a+b+c+d+e;}
+fn main()->i64{return sum5(1,2,3,4,5);}

@@ -1,0 +1,11 @@
+// Differential audit: RHS side effects must be skipped by && and ||.
+// expect: 33
+fn bump(x: i64) -> i64 { return x + 1; }
+fn main() -> i64 {
+    let mut x: i64 = 0;
+    if (false && ((x = bump(x)) == 1)) { x = 99; }
+    if (true || ((x = bump(x)) == 1)) { x = x + 1; }
+    if (true && ((x = bump(x)) == 2)) { x = x + 10; }
+    if (false || ((x = bump(x)) == 13)) { x = x + 20; }
+    return x;
+}

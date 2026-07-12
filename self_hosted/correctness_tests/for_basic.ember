@@ -1,0 +1,7 @@
+// Differential audit: basic C-style for without nested lexical scopes.
+// expect: 10
+fn main() -> i64 {
+    let mut sum: i64 = 0;
+    for (let mut i: i64 = 0; i < 5; i = i + 1) { sum = sum + i; }
+    return sum;
+}

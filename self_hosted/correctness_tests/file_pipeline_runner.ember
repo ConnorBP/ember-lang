@@ -1,0 +1,8 @@
+// Silent file-to-self-hosted-pipeline adapter used by run_correctness_audit.ps1.
+// The runner supplies one repository-relative ASCII path on stdin.
+import "../emberc.ember";
+
+fn run_file() -> i64 {
+    let path: string = read_line();
+    return compile_file_and_run(path);
+}

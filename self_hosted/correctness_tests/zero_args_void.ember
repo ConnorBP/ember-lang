@@ -1,0 +1,10 @@
+// Differential audit: zero-argument calls and void return/fallthrough.
+// expect: 42
+fn noop() -> void { return; }
+fn fallthrough() -> void { let x: i64 = 1; }
+fn answer() -> i64 { return 42; }
+fn main() -> i64 {
+    noop();
+    fallthrough();
+    return answer();
+}

@@ -1,0 +1,13 @@
+// Boundary audit: many function labels/fixups and a long call chain.
+// expect: 40
+fn f00(x:i64)->i64{return f01(x)+1;} fn f01(x:i64)->i64{return f02(x)+1;}
+fn f02(x:i64)->i64{return f03(x)+1;} fn f03(x:i64)->i64{return f04(x)+1;}
+fn f04(x:i64)->i64{return f05(x)+1;} fn f05(x:i64)->i64{return f06(x)+1;}
+fn f06(x:i64)->i64{return f07(x)+1;} fn f07(x:i64)->i64{return f08(x)+1;}
+fn f08(x:i64)->i64{return f09(x)+1;} fn f09(x:i64)->i64{return f10(x)+1;}
+fn f10(x:i64)->i64{return f11(x)+1;} fn f11(x:i64)->i64{return f12(x)+1;}
+fn f12(x:i64)->i64{return f13(x)+1;} fn f13(x:i64)->i64{return f14(x)+1;}
+fn f14(x:i64)->i64{return f15(x)+1;} fn f15(x:i64)->i64{return f16(x)+1;}
+fn f16(x:i64)->i64{return f17(x)+1;} fn f17(x:i64)->i64{return f18(x)+1;}
+fn f18(x:i64)->i64{return f19(x)+1;} fn f19(x:i64)->i64{return x+1;}
+fn main()->i64{return f00(20);}

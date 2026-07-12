@@ -1,0 +1,18 @@
+// Differential audit: lexical shadowing must restore the enclosing binding.
+// expect: 130
+fn main() -> i64 {
+    let x: i64 = 10;
+    let mut r: i64 = x;
+    {
+        let x: i64 = 20;
+        r = r + x;
+        {
+            let x: i64 = 30;
+            r = r + x;
+        }
+        r = r + x;
+    }
+    r = r + x;
+    if (true) { let x: i64 = 40; r = r + x; }
+    return r;
+}

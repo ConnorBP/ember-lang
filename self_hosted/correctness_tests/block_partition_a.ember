@@ -1,0 +1,9 @@
+// Block-partition pair A: flat spelling. Must equal block_partition_b.
+// expect: 42
+fn main() -> i64 {
+    let mut x: i64 = 1;
+    x = x + 2;
+    x = x * 3;
+    if (x == 9) { x = x + 33; }
+    return x;
+}

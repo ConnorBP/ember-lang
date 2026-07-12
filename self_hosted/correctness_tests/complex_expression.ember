@@ -1,0 +1,10 @@
+// Differential audit: precedence and a deeply composed expression.
+// expect: 65
+fn main() -> i64 {
+    let a: i64 = 7;
+    let b: i64 = 8;
+    let c: i64 = 9;
+    let d: i64 = 20;
+    let e: i64 = 5;
+    return a + b * c - d / e - (3 << 1) + (15 & 7) - (9 ^ 2);
+}

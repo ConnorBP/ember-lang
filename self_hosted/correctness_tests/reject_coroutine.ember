@@ -1,0 +1,4 @@
+// Native-valid, self-hosted out-of-subset rejection expected: -308.
+// selfhost-reject: -308
+fn producer() -> i64 { yield 42; return 0; }
+fn main() -> i64 { return 42; }

@@ -1,0 +1,15 @@
+// Boundary audit: many frame locals and a long straight-line body.
+// expect: 1275
+fn main() -> i64 {
+    let v01: i64 = 1; let v02: i64 = 2; let v03: i64 = 3; let v04: i64 = 4; let v05: i64 = 5;
+    let v06: i64 = 6; let v07: i64 = 7; let v08: i64 = 8; let v09: i64 = 9; let v10: i64 = 10;
+    let v11: i64 = 11; let v12: i64 = 12; let v13: i64 = 13; let v14: i64 = 14; let v15: i64 = 15;
+    let v16: i64 = 16; let v17: i64 = 17; let v18: i64 = 18; let v19: i64 = 19; let v20: i64 = 20;
+    let v21: i64 = 21; let v22: i64 = 22; let v23: i64 = 23; let v24: i64 = 24; let v25: i64 = 25;
+    let v26: i64 = 26; let v27: i64 = 27; let v28: i64 = 28; let v29: i64 = 29; let v30: i64 = 30;
+    let v31: i64 = 31; let v32: i64 = 32; let v33: i64 = 33; let v34: i64 = 34; let v35: i64 = 35;
+    let v36: i64 = 36; let v37: i64 = 37; let v38: i64 = 38; let v39: i64 = 39; let v40: i64 = 40;
+    let v41: i64 = 41; let v42: i64 = 42; let v43: i64 = 43; let v44: i64 = 44; let v45: i64 = 45;
+    let v46: i64 = 46; let v47: i64 = 47; let v48: i64 = 48; let v49: i64 = 49; let v50: i64 = 50;
+    return v01+v02+v03+v04+v05+v06+v07+v08+v09+v10+v11+v12+v13+v14+v15+v16+v17+v18+v19+v20+v21+v22+v23+v24+v25+v26+v27+v28+v29+v30+v31+v32+v33+v34+v35+v36+v37+v38+v39+v40+v41+v42+v43+v44+v45+v46+v47+v48+v49+v50;
+}

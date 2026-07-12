@@ -1,0 +1,5 @@
+// Differential audit: a standalone nested block with block-local computation.
+// expect: 42
+fn main() -> i64 {
+    { let x: i64 = 42; return x; }
+}

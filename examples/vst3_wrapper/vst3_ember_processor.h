@@ -44,6 +44,8 @@ public:
         Steinberg::Vst::SpeakerArrangement* inputs, Steinberg::int32 numInputs,
         Steinberg::Vst::SpeakerArrangement* outputs, Steinberg::int32 numOutputs) override;
     Steinberg::tresult PLUGIN_API canProcessSampleSize(Steinberg::int32 sampleSize) override;
+    Steinberg::uint32 PLUGIN_API getLatencySamples() override;
+    Steinberg::uint32 PLUGIN_API getTailSamples() override;
     Steinberg::tresult PLUGIN_API process(Steinberg::Vst::ProcessData& data) override;
     Steinberg::tresult PLUGIN_API setState(Steinberg::IBStream* state) override;
     Steinberg::tresult PLUGIN_API getState(Steinberg::IBStream* state) override;
@@ -55,10 +57,13 @@ private:
     void watchScript();
     EmberModule* activatePendingModule(ember::HotReloadDomain::ExecutionGuard&) noexcept;
     void reclaimRetiredModule();
+    void refreshLatencyAndTail() noexcept;
     void bypass(Steinberg::Vst::ProcessData& data) const noexcept;
 
     static constexpr std::size_t kParameterCount = 1;
     static constexpr std::size_t kMaxParameterChanges = 4096;
+    static constexpr std::size_t kMaxEvents = 4096;
+    static constexpr std::size_t kMaxStateBytes = 16 * 1024 * 1024;
 
     // process_dispatch_ is the one stable publication point used by the audio
     // thread. A ProcessPlan (EmberModule) owns its immutable JIT code, globals,
@@ -85,6 +90,10 @@ private:
     std::unique_ptr<EmberModule> module_;
     std::array<float, kParameterCount> parameter_values_ {{1.0f}};
     std::array<ember::ext_audio::ParameterChange, kMaxParameterChanges> parameter_changes_ {};
+    std::array<ember::ext_audio::AudioEvent, kMaxEvents> input_events_ {};
+    std::array<ember::ext_audio::AudioEvent, kMaxEvents> output_events_ {};
+    std::atomic<Steinberg::uint32> latency_samples_ {0};
+    std::atomic<Steinberg::uint32> tail_samples_ {0};
     bool active_ {false};
 };
 

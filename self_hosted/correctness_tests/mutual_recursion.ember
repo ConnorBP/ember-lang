@@ -1,0 +1,14 @@
+// Differential audit: mutual recursion with forward and backward calls.
+// expect: 42
+fn is_even(n: i64) -> bool {
+    if (n == 0) { return true; }
+    return is_odd(n - 1);
+}
+fn is_odd(n: i64) -> bool {
+    if (n == 0) { return false; }
+    return is_even(n - 1);
+}
+fn main() -> i64 {
+    if (is_even(30) && is_odd(31)) { return 42; }
+    return 0;
+}

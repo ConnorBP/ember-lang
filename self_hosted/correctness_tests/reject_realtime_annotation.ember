@@ -1,0 +1,4 @@
+// Boundary rejection: annotations are not in the advertised self-hosted subset.
+// selfhost-reject: negative
+@realtime
+fn main() -> i64 { return 42; }

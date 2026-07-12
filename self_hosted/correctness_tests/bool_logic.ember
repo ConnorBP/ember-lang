@@ -1,0 +1,11 @@
+// Differential audit: bool literals, logical operators, and normalization.
+// expect: 11
+fn main() -> i64 {
+    let t: bool = true;
+    let f: bool = false;
+    let mut r: i64 = 0;
+    if (t && !f) { r = r + 1; }
+    if (f || t) { r = r + 2; }
+    if (!(t && f)) { r = r + 8; }
+    return r;
+}

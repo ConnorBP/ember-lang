@@ -1,0 +1,3 @@
+// Native-valid, self-hosted out-of-subset rejection expected: -306.
+// selfhost-reject: -306
+fn main() -> i64 { try { throw 42; } catch (e) { return e; } }

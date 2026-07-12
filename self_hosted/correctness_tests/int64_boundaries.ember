@@ -1,0 +1,13 @@
+// Differential audit: INT64_MAX, INT64_MIN, and defined two's-complement wrap.
+// expect: 1
+fn main() -> i64 {
+    let max: i64 = 9223372036854775807;
+    let min: i64 = -9223372036854775807 - 1;
+    let wrapped_min: i64 = max + 1;
+    let wrapped_max: i64 = min - 1;
+    let mut ok: i64 = 0;
+    if (wrapped_min == min) { ok = ok + 1; }
+    if (wrapped_max == max) { ok = ok + 2; }
+    if (-1 >> 1 == -1) { ok = ok + 4; }
+    return ok & 1;
+}

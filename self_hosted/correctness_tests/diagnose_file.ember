@@ -1,0 +1,18 @@
+// Audit utility: print self-hosted parser/sema diagnostics for one ASCII file.
+// Not a differential fixture (the runner excludes this utility by name).
+import "../emberc.ember";
+
+fn diagnose() -> i64 {
+    let path: string = read_line();
+    let bytes: i64 = file_read_bytes(path);
+    if (bytes == 0) { println("read failed"); return 1; }
+    let source: string = bytes_to_source(bytes);
+    let r: i64 = sema(source);
+    print("sema result: "); print_i64(r); println("");
+    if (r != 0) {
+        print("line "); print_i64(sema_err_line());
+        print(":"); print_i64(sema_err_col());
+        print(": "); println(sema_err_msg());
+    }
+    return 0;
+}

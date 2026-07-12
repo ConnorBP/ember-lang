@@ -1,0 +1,14 @@
+// Differential audit: ascending, descending, omitted-init, and break/continue for loops.
+// expect: 72
+fn main() -> i64 {
+    let mut sum: i64 = 0;
+    for (let mut i: i64 = 0; i < 10; i = i + 2) { sum = sum + i; }
+    for (let mut j: i64 = 5; j > 0; j = j - 1) { sum = sum + j; }
+    let mut k: i64 = 0;
+    for (; k < 8; k = k + 1) {
+        if (k == 2) { continue; }
+        if (k == 6) { break; }
+        sum = sum + k;
+    }
+    return sum + 24;
+}

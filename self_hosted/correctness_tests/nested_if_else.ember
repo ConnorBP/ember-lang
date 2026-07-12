@@ -1,0 +1,15 @@
+// Differential audit: deeply nested if/else selection.
+// expect: 42
+fn main() -> i64 {
+    let x: i64 = 7;
+    if (x > 0) {
+        if (x < 10) {
+            if (x != 5) {
+                if (x >= 7) {
+                    if (x <= 7) { return 42; }
+                    else { return 41; }
+                } else { return 40; }
+            } else { return 39; }
+        } else { return 38; }
+    } else { return 37; }
+}

@@ -1,0 +1,15 @@
+// Differential audit: all arithmetic/bitwise/shift operators and precedence.
+// expect: 163
+fn main() -> i64 {
+    let a: i64 = 20 + 7;
+    let b: i64 = 20 - 7;
+    let c: i64 = 6 * 7;
+    let d: i64 = 100 / 9;
+    let e: i64 = 100 % 9;
+    let f: i64 = 12 & 10;
+    let g: i64 = 12 | 3;
+    let h: i64 = 12 ^ 10;
+    let i: i64 = 3 << 4;
+    let j: i64 = -64 >> 3;
+    return a + b + c + d + e + f + g + h + i + j;
+}

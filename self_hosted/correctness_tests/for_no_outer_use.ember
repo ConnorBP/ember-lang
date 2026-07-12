@@ -1,0 +1,9 @@
+// Differential audit: for loop whose result is returned inside the loop.
+// This isolates whether for itself works when no enclosing local is read in its body.
+// expect: 4
+fn main() -> i64 {
+    for (let mut i: i64 = 0; i < 5; i = i + 1) {
+        if (i == 4) { return i; }
+    }
+    return 0;
+}
