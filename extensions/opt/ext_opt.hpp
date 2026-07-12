@@ -19,9 +19,10 @@
 //   removes blocks unreachable from entry, compacts block IDs/targets, and
 //   merges single-predecessor unconditional-jump chains outside loops. Loop
 //   headers and loop members are deliberately never merged.
-// - CSEPass ("cse"): local common-subexpression elimination within a block.
-//   Coalesces redundant pure instrs (same op + operands + meta) by remapping
-//   uses of the second's dst to the first's dst, then removing the second.
+// - CSEPass ("cse"): value-numbering common-subexpression elimination within
+//   each block. Equivalent operands share value numbers, so expressions remain
+//   recognizable through copies. Frame stores invalidate aliasing LoadFrame
+//   entries and calls invalidate every memory-derived entry.
 // - LICMPass ("licm"): loop-invariant code motion. Detects natural loops via
 //   back-edges, finds the pre-header, and hoists invariant pure instrs
 //   (ConstInt/ConstBool/ConstFloat, pure binops with invariant operands,
@@ -56,8 +57,16 @@
 //   compile-time constant using i < N, and updated exactly once by i = i + 1.
 //   Only trip counts up to eight are accepted; aliases, alternate entries,
 //   early exits, and non-canonical CFG are left unchanged.
+// - DeadSpillElimPass ("spill_elim"): removes regular StoreFrame instructions
+//   whose slots have no observable reader when their source is still in the
+//   immediately preceding result register (or a regalloc register). It also
+//   clears redundant producer spill homes immediately materialized by a
+//   following StoreFrame.
+// - PeepholePass ("peephole"): removes genuinely storage-free Move(v,v)
+//   instructions. Arithmetic identities and constant branches remain handled
+//   by instcombine and simplifycfg respectively.
 //
-// All twelve are VALUE-PRESERVING: after the pass, emit_x64 produces the same
+// All fourteen are VALUE-PRESERVING: after the pass, emit_x64 produces the same
 // i64 result. They return EmberPreserved::none() if they changed the IR,
 // Preserved::all() if they did nothing.
 #pragma once
@@ -125,6 +134,16 @@ struct SCCPPass : EmberPassInfoMixin<SCCPPass> {
 
 struct LoopUnrollPass : EmberPassInfoMixin<LoopUnrollPass> {
     static constexpr const char* pass_name = "unroll";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+struct DeadSpillElimPass : EmberPassInfoMixin<DeadSpillElimPass> {
+    static constexpr const char* pass_name = "spill_elim";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+struct PeepholePass : EmberPassInfoMixin<PeepholePass> {
+    static constexpr const char* pass_name = "peephole";
     EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
 };
 

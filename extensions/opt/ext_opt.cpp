@@ -718,28 +718,29 @@ EmberPreserved SimplifyCFGPass::run(ThinFunction& f, EmberAnalysisManager&) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// CSEPass: local common-subexpression elimination within a block
+// CSEPass: local global-value-numbering CSE within each basic block
 // ═══════════════════════════════════════════════════════════════════════════
 
 EmberPreserved CSEPass::run(ThinFunction& f, EmberAnalysisManager&) {
     bool changed = false;
 
+    // Thin IR is not SSA, so value numbering is deliberately reset at each
+    // block and a VReg redefinition receives a fresh number. This still finds
+    // equivalent expressions through Move chains without requiring dominance
+    // or phi construction.
+    const auto read_slots = compute_read_slots(f);
     for (auto& blk : f.blocks) {
-        // Include every field that can change instruction semantics. The old
-        // key collapsed signed/unsigned shifts and compares, f32/f64 values,
-        // different float immediates, types, and aggregate lengths into one
-        // expression, allowing CSE to substitute a value with different bits.
-        struct CSEKey {
+        struct GVNKey {
             uint16_t op;
-            VReg src1, src2;
+            uint64_t lhs, rhs;
             int64_t imm_i;
             uint64_t imm_f_bits;
             int32_t width, frame_off, len, slot, mod_id, field_off, data_temp_off;
             uint8_t cmp, base_kind, is_unsigned, is_f32, trap_reason;
             uint32_t addend;
             const Type* type;
-            bool operator==(const CSEKey& o) const {
-                return op == o.op && src1 == o.src1 && src2 == o.src2 &&
+            bool operator==(const GVNKey& o) const {
+                return op == o.op && lhs == o.lhs && rhs == o.rhs &&
                        imm_i == o.imm_i && imm_f_bits == o.imm_f_bits &&
                        width == o.width && frame_off == o.frame_off &&
                        len == o.len && slot == o.slot && mod_id == o.mod_id &&
@@ -750,11 +751,14 @@ EmberPreserved CSEPass::run(ThinFunction& f, EmberAnalysisManager&) {
                        type == o.type;
             }
         };
-        struct CSEKeyHash {
-            size_t operator()(const CSEKey& k) const {
+        struct GVNKeyHash {
+            size_t operator()(const GVNKey& k) const {
                 size_t h = k.op;
-                auto mix = [&h](size_t value) { h ^= value + 0x9e3779b9u + (h << 6) + (h >> 2); };
-                mix(k.src1); mix(k.src2);
+                auto mix = [&h](size_t value) {
+                    h ^= value + 0x9e3779b9u + (h << 6) + (h >> 2);
+                };
+                mix(std::hash<uint64_t>()(k.lhs));
+                mix(std::hash<uint64_t>()(k.rhs));
                 mix(std::hash<int64_t>()(k.imm_i));
                 mix(std::hash<uint64_t>()(k.imm_f_bits));
                 mix(uint32_t(k.width)); mix(uint32_t(k.frame_off)); mix(uint32_t(k.len));
@@ -765,89 +769,185 @@ EmberPreserved CSEPass::run(ThinFunction& f, EmberAnalysisManager&) {
                 return h;
             }
         };
+        struct Available { uint64_t value_number; VReg representative; };
 
-        std::unordered_map<CSEKey, VReg, CSEKeyHash> table;
-        std::unordered_set<VReg> killed;  // VRegs redefined after their first use
+        std::unordered_map<VReg, uint64_t> vreg_number;
+        std::unordered_map<GVNKey, Available, GVNKeyHash> expressions;
+        std::unordered_map<uint64_t, VReg> representative;
+        uint64_t next_number = 1;
 
-        for (auto it = blk.instrs.begin(); it != blk.instrs.end(); ) {
-            ThinInstr& in = *it;
+        auto number_of = [&](VReg v) -> uint64_t {
+            if (v == 0) return 0;
+            auto found = vreg_number.find(v);
+            if (found != vreg_number.end()) return found->second;
+            // A live-in has a stable identity number for this block.
+            const uint64_t number = next_number++;
+            vreg_number[v] = number;
+            representative[number] = v;
+            return number;
+        };
+        auto erase_memory_entries = [&](int32_t off, bool all) {
+            for (auto it = expressions.begin(); it != expressions.end(); ) {
+                const bool memory =
+                    it->first.op == static_cast<uint16_t>(ThinOp::LoadFrame) ||
+                    it->first.op == static_cast<uint16_t>(ThinOp::LoadGlobal);
+                if (memory && (all || it->first.op != static_cast<uint16_t>(ThinOp::LoadFrame) ||
+                               it->first.frame_off == off))
+                    it = expressions.erase(it);
+                else
+                    ++it;
+            }
+        };
+        auto replace_uses = [&](size_t from, VReg old_vreg, VReg new_vreg) {
+            for (size_t i = from; i < blk.instrs.size(); ++i) {
+                ThinInstr& use = blk.instrs[i];
+                // Stop before either name changes meaning in this non-SSA IR.
+                if (use.dst == old_vreg || use.dst == new_vreg) break;
+                if (use.src1 == old_vreg) use.src1 = new_vreg;
+                if (use.src2 == old_vreg) use.src2 = new_vreg;
+                for (VReg& arg : use.args)
+                    if (arg == old_vreg) arg = new_vreg;
+            }
+        };
 
-            // Kill rule: if this instr redefines a VReg, remove table entries
-            // that use it as a source, and remove its old entry as a result.
+        for (size_t i = 0; i < blk.instrs.size(); ) {
+            ThinInstr& in = blk.instrs[i];
+
+            // An available expression cannot keep a VReg as its physical
+            // representative after this instruction redefines that name.
             if (in.dst != 0) {
-                for (auto t_it = table.begin(); t_it != table.end(); ) {
-                    if (t_it->second == in.dst ||
-                        t_it->first.src1 == in.dst ||
-                        t_it->first.src2 == in.dst)
-                        t_it = table.erase(t_it);
+                for (auto it = expressions.begin(); it != expressions.end(); ) {
+                    if (it->second.representative == in.dst)
+                        it = expressions.erase(it);
                     else
-                        ++t_it;
+                        ++it;
                 }
             }
 
-            // StoreFrame kills any CSE entry for the same slot (the value changed).
-            if (in.op == ThinOp::StoreFrame) {
-                for (auto t_it = table.begin(); t_it != table.end(); ) {
-                    if (t_it->first.op == static_cast<uint16_t>(ThinOp::LoadFrame) &&
-                        t_it->first.frame_off == in.meta.frame_off)
-                        t_it = table.erase(t_it);
-                    else
-                        ++t_it;
-                }
-                ++it;
-                continue;
-            }
+            // Calls may mutate memory reachable through arguments or globals.
+            if (in.op == ThinOp::CallNative || in.op == ThinOp::CallScript ||
+                in.op == ThinOp::CallIndirect || in.op == ThinOp::CallCrossModule)
+                erase_memory_entries(0, true);
+            else if (in.op == ThinOp::StoreFrame)
+                erase_memory_entries(in.meta.frame_off, false);
+            else if (in.op == ThinOp::StoreGlobal || in.op == ThinOp::StoreAddr ||
+                     in.op == ThinOp::CopyBytes || in.op == ThinOp::StructLitInit ||
+                     in.op == ThinOp::ArrayLitInit || in.op == ThinOp::StringDecrypt)
+                erase_memory_entries(0, true);
 
-            // Only CSE pure instrs with a dst.
             if (!is_pure(in.op) || in.dst == 0) {
-                ++it;
+                if (in.dst != 0) {
+                    const uint64_t fresh = next_number++;
+                    vreg_number[in.dst] = fresh;
+                    representative[fresh] = in.dst;
+                }
+                ++i;
                 continue;
             }
 
-            uint64_t floatBits = 0;
-            static_assert(sizeof(floatBits) == sizeof(in.imm.f));
-            std::memcpy(&floatBits, &in.imm.f, sizeof(floatBits));
-            CSEKey key{
-                static_cast<uint16_t>(in.op), in.src1, in.src2,
-                in.imm.i, floatBits, in.meta.width, in.meta.frame_off,
+            // Moves carry the source's value number and need no expression key.
+            if (in.op == ThinOp::Move && in.src1 != 0) {
+                const uint64_t number = number_of(in.src1);
+                vreg_number[in.dst] = number;
+                auto rep = representative.find(number);
+                if (rep == representative.end()) representative[number] = in.dst;
+                ++i;
+                continue;
+            }
+
+            uint64_t float_bits = 0;
+            static_assert(sizeof(float_bits) == sizeof(in.imm.f));
+            std::memcpy(&float_bits, &in.imm.f, sizeof(float_bits));
+            uint64_t lhs_number = number_of(in.src1);
+            uint64_t rhs_number = number_of(in.src2);
+            switch (in.op) {
+            case ThinOp::Add: case ThinOp::Mul: case ThinOp::And:
+            case ThinOp::Or: case ThinOp::Xor:
+                if (rhs_number != 0 && rhs_number < lhs_number)
+                    std::swap(lhs_number, rhs_number);
+                break;
+            default:
+                break;
+            }
+            // For ordinary value producers frame_off is only the destination
+            // spill home, not part of the computed value. Ignore it when that
+            // home has no explicit IR reader; retain address/load offsets.
+            int32_t value_frame_off = in.meta.frame_off;
+            switch (in.op) {
+            case ThinOp::ConstInt: case ThinOp::ConstFloat: case ThinOp::ConstBool:
+            case ThinOp::Add: case ThinOp::Sub: case ThinOp::Mul:
+            case ThinOp::Div: case ThinOp::Mod: case ThinOp::And:
+            case ThinOp::Or: case ThinOp::Xor: case ThinOp::Shl: case ThinOp::Shr:
+            case ThinOp::Neg: case ThinOp::Not: case ThinOp::BitNot:
+            case ThinOp::FAdd: case ThinOp::FSub: case ThinOp::FMul:
+            case ThinOp::FDiv: case ThinOp::FMod: case ThinOp::Cmp:
+            case ThinOp::LAnd: case ThinOp::LOr: case ThinOp::Cast:
+                if (!read_slots.count(in.meta.frame_off)) value_frame_off = 0;
+                break;
+            case ThinOp::LoadFrame:
+                // A computed-address LoadFrame uses field_off as its source;
+                // frame_off is only its result spill home.
+                if (in.src1 != 0 && !read_slots.count(in.meta.frame_off))
+                    value_frame_off = 0;
+                break;
+            default:
+                break;
+            }
+            GVNKey key{
+                static_cast<uint16_t>(in.op), lhs_number, rhs_number,
+                in.imm.i, float_bits, in.meta.width, value_frame_off,
                 in.meta.len, in.meta.slot, in.meta.mod_id, in.meta.field_off,
                 in.meta.data_temp_off, in.meta.cmp,
                 static_cast<uint8_t>(in.meta.base_kind), in.meta.is_unsigned,
                 in.meta.is_f32, in.meta.trap_reason, in.meta.addend, in.meta.type
             };
 
-            auto found = table.find(key);
-            if (found != table.end()) {
-                // Redundant: remap uses of in.dst to found->second (the first's
-                // dst), for all instrs AFTER this one in the block. Then remove
-                // this instr.
-                VReg old_dst = in.dst;
-                VReg new_dst = found->second;
-                // Remap: for every instr after this one, replace old_dst with
-                // new_dst in src1/src2/args. Stop if new_dst is redefined.
-                bool new_dst_redefined = false;
-                for (auto after = std::next(it); after != blk.instrs.end(); ++after) {
-                    if (after->dst == new_dst) { new_dst_redefined = true; break; }
-                    if (after->src1 == old_dst) after->src1 = new_dst;
-                    if (after->src2 == old_dst) after->src2 = new_dst;
-                    for (VReg& a : after->args) if (a == old_dst) a = new_dst;
-                }
-                // If new_dst was NOT redefined before the end, the remap is
-                // complete and we can safely remove the redundant instr.
-                if (!new_dst_redefined) {
-                    it = blk.instrs.erase(it);
-                    changed = true;
-                    continue;
-                }
-                // If new_dst WAS redefined, the remap only covers part of the
-                // range. This is still value-preserving (we remapped up to the
-                // redefinition), but we can't remove the instr (its dst still
-                // has uses after the redefinition point). Leave it.
-            } else {
-                // New entry.
-                table[key] = in.dst;
+            auto found = expressions.find(key);
+            if (found == expressions.end()) {
+                const uint64_t number = next_number++;
+                expressions.emplace(key, Available{number, in.dst});
+                vreg_number[in.dst] = number;
+                representative[number] = in.dst;
+                ++i;
+                continue;
             }
-            ++it;
+
+            // The representative must keep its meaning through every remapped
+            // use. If it is redefined later, retain this expression rather than
+            // perform a partial substitution in non-SSA IR.
+            bool representative_redefined = false;
+            for (size_t j = i + 1; j < blk.instrs.size(); ++j) {
+                if (blk.instrs[j].dst == found->second.representative) {
+                    representative_redefined = true;
+                    break;
+                }
+            }
+            if (representative_redefined) {
+                const uint64_t number = next_number++;
+                vreg_number[in.dst] = number;
+                representative[number] = in.dst;
+                expressions[key] = {number, in.dst};
+                ++i;
+                continue;
+            }
+
+            const VReg old_dst = in.dst;
+            const VReg new_dst = found->second.representative;
+            bool old_dst_redefined = false;
+            for (size_t j = i + 1; j < blk.instrs.size(); ++j) {
+                if (blk.instrs[j].dst == old_dst) {
+                    old_dst_redefined = true;
+                    break;
+                }
+            }
+            replace_uses(i + 1, old_dst, new_dst);
+            if (!old_dst_redefined && blk.term.cond == old_dst)
+                blk.term.cond = new_dst;
+            if (!old_dst_redefined && blk.term.ret == old_dst)
+                blk.term.ret = new_dst;
+            vreg_number[old_dst] = found->second.value_number;
+            blk.instrs.erase(blk.instrs.begin() + static_cast<ptrdiff_t>(i));
+            changed = true;
         }
     }
 
@@ -2171,6 +2271,87 @@ EmberPreserved SCCPPass::run(ThinFunction& f, EmberAnalysisManager&) {
     return changed ? EmberPreserved::none() : EmberPreserved::all();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// DeadSpillElimPass: remove provably unobservable frame spills
+// ═══════════════════════════════════════════════════════════════════════════
+
+EmberPreserved DeadSpillElimPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    bool changed = false;
+
+    // Explicit StoreFrame instructions can be removed only when their target
+    // has no observable reader anywhere in the function. This includes the
+    // aggregate and by-value readers recognized by DCE, not just LoadFrame.
+    const auto read_slots = compute_read_slots(f);
+    for (auto& blk : f.blocks) {
+        for (size_t i = 0; i < blk.instrs.size(); ) {
+            ThinInstr& store = blk.instrs[i];
+            if (store.op != ThinOp::StoreFrame || store.src1 == 0 ||
+                store.src2 != 0 || store.meta.field_off != 0 ||
+                read_slots.count(store.meta.frame_off)) {
+                ++i;
+                continue;
+            }
+
+            // A plain source-local store is semantically dead once its slot is
+            // unread. Require the value to be available without this store as
+            // well: either regalloc assigned it a register, or the immediately
+            // preceding instruction produced it in rax/xmm0. No instruction is
+            // allowed between producer and store because it may clobber that
+            // result register.
+            bool available = false;
+            auto assignment = f.ra.map.find(store.src1);
+            if (f.ra.enabled && assignment != f.ra.map.end() &&
+                assignment->second.in_reg)
+                available = true;
+            if (!available && i > 0) {
+                const ThinInstr& producer = blk.instrs[i - 1];
+                available = producer.dst == store.src1;
+            }
+            if (!available) {
+                ++i;
+                continue;
+            }
+
+            // If the preceding producer's own spill home is exactly this dead
+            // slot, clear it too. Otherwise emit_x64 would recreate the same
+            // store through pin_int_dst even after StoreFrame is erased.
+            if (i > 0) {
+                ThinInstr& producer = blk.instrs[i - 1];
+                if (producer.dst == store.src1 &&
+                    producer.meta.frame_off == store.meta.frame_off)
+                    producer.meta.frame_off = 0;
+            }
+            blk.instrs.erase(blk.instrs.begin() + static_cast<ptrdiff_t>(i));
+            changed = true;
+        }
+    }
+
+    return changed ? EmberPreserved::none() : EmberPreserved::all();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PeepholePass: small canonical no-op removal
+// ═══════════════════════════════════════════════════════════════════════════
+
+EmberPreserved PeepholePass::run(ThinFunction& f, EmberAnalysisManager&) {
+    bool changed = false;
+    for (auto& blk : f.blocks) {
+        auto& instrs = blk.instrs;
+        for (auto it = instrs.begin(); it != instrs.end(); ) {
+            // A frame-backed self-move still performs an observable spill and
+            // therefore is not a no-op. Remove only a storage-free Move(v,v).
+            if (it->op == ThinOp::Move && it->dst != 0 &&
+                it->dst == it->src1 && it->meta.frame_off == 0) {
+                it = instrs.erase(it);
+                changed = true;
+            } else {
+                ++it;
+            }
+        }
+    }
+    return changed ? EmberPreserved::none() : EmberPreserved::all();
+}
+
 // register_passes
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -2187,6 +2368,8 @@ void register_passes(EmberPassRegistry& reg) {
     reg.add<BoundsCheckElimPass>("bounds-elim");
     reg.add<SCCPPass>("sccp");
     reg.add<LoopUnrollPass>("unroll");
+    reg.add<DeadSpillElimPass>("spill_elim");
+    reg.add<PeepholePass>("peephole");
 }
 
 } // namespace ember::ext_opt
