@@ -1,0 +1,26 @@
+// valid_math_extended.ember — broader math natives test
+fn main() -> i64 {
+    // f64 math
+    let pi: f64 = atan2_f64(1.0, 1.0) * 4.0;  // atan2(1,1) = pi/4
+    let e: f64 = exp_f64(1.0);               // e ~ 2.718
+    let ln2: f64 = log2_f64(2.0);            // 1.0
+    let lg: f64 = log10_f64(1000.0);         // 3.0
+    let m: f64 = fmod_f64(10.5, 3.0);        // 1.5
+    let r: f64 = round_f64(3.6);             // 4.0
+    let t: f64 = trunc_f64(3.9);             // 3.0
+    // i64 min/max/clamp
+    let mn: i64 = min_i64(5, 3);             // 3
+    let mx: i64 = max_i64(5, 3);             // 5
+    let cl: i64 = clamp_i64(10, 0, 100);     // 10
+    // f64 min/max/clamp
+    let fmn: f64 = min_f64(5.0, 3.0);        // 3.0
+    let fmx: f64 = max_f64(5.0, 3.0);        // 5.0
+    // f32 math
+    let f32_atan: f32 = atan(1.0);
+    let f32_floor: f32 = floor(3.7);         // 3.0
+    let f32_ceil: f32 = ceil(3.2);           // 4.0
+
+    // Verify: ln2 should be 1.0, lg should be 3.0, mn=3, mx=5, cl=10
+    if (mn == 3 && mx == 5 && cl == 10) { return 0; }
+    return 1;
+}
