@@ -96,3 +96,32 @@ Each entry:
   - Parent submodule bump **skipped**: the parent repo (`hyper_workspace`, branch `main`) has extensive unrelated uncommitted work (modified `CLAUDE.md`, `VULN_DRIVER_SEARCH_STATUS.md`, 16 `prism_loader/*` files, plus 30+ untracked research docs / python scripts / new sources) — a major active live work session. The parent's `ember` submodule pointer records `ab49898` but ember's HEAD is now `2223b3a` (this commit advanced it). Per the prime directive (do not interrupt ongoing work) and the conservative-skip guidance, the parent commit was skipped rather than pushing a submodule-bump commit onto `origin/main` mid-session. `git add ember && git commit -m "Update ember submodule: hourly audit" && git push origin main` is the sanctioned scoped action (stages only the submodule gitlink) and can be run later by the parent session owner when the tree is clean. The parent is not broken — `ab49898` is a valid green commit.
   - Follow-up note: `git add -A` also surfaced three untracked files from concurrent activity (`docs/LLVM_ADDITIONAL_PASSES_RESEARCH.md`, a 568-line research doc; and `results_codegen_paths.csv` / `results_codegen_paths.md` at the repo root — transient bench artifacts, machine-specific, regenerated each run, only partially covered by `.gitignore` which ignores `bench/results_codegen_paths.*` but not the root copies). These were **unstaged and left untracked** — not part of this maintenance pass. A future pass may want to extend `.gitignore` with `/results_codegen_paths.*` to cover the root-location bench artifacts.
 - **Commit:** see git log (this run)
+
+## 2026-07-12 03:49 (EDT)
+- **Tree state:** dirty (read-only audit) at HEAD `2341ea0ff82a7de1c30f5fb9b136db968fd4aca4`; initial pre-existing paths: modified `src/regalloc.cpp`, `src/thin_emit.cpp`, `src/thin_ir.hpp`; untracked `bench_after_loadframe.txt`; no staged changes. Per the prime directive, no source/doc fixes, staging, cleanup, commit, or push were attempted (this required log append is the only intentional edit).
+- **Build:** PASS (`cmake --build buildt -j 8`: no work, no warnings; `ctest --output-on-failure -E bench`: 54/54 tests on the confirming full run)
+- **Findings:**
+  - [NONE] No compiler warnings were emitted by the build.
+  - [DEFERRED] The first full CTest run reported transient launch failures for `em_v5_ir` and `ember_pass`, plus an interrupted/failing `regalloc` run; an immediate targeted retry passed 3/3 and the confirming full run passed 54/54. No source diagnosis or fix was attempted because the initial tree was dirty.
+  - [DEFERRED] The test run created an untracked repository-root path `NUL` (absent from the initial status). It was left untouched under the no-clean/no-edit directive.
+  - [DEFERRED] Previously recorded larger audit/refactor items remain outside the constrained dirty-tree audit scope.
+- **Commit:** none (initial tree dirty; commit/push prohibited)
+
+## 2026-07-12 04:05 (EDT)
+- **Tree state:** dirty (read-only audit) at HEAD `58c0bda1587c16e25ec52302a083fa2885a37c48`; c1's initial inventory and the final pre-append check contain only the pre-existing modification to `docs/MAINTENANCE_LOG.md`, with no staged or untracked files. Per the prime directive, c5 made no maintenance changes and this appended entry is the sole tracked edit permitted by this audit.
+- **Build:** PASS (c2 read-only baseline: `cmake --build buildt -j 8`; `ctest --output-on-failure -E bench --timeout 60`: 54/54 non-benchmark tests passed)
+- **Findings:**
+  - [NONE] No Ember-owned compiler warnings were emitted; no fixes were made on this dirty run.
+  - [DEFERRED] Confirmed small maintenance candidates, identified without modification: v5 empty-IR raw-x86 policy bypass (`src/em_loader.cpp` and its mixed-v5 test); unchecked frame-plan offsets (`src/thin_ir_ser.cpp` and validation tests); catch-stack overflow beyond `MAX_CATCH_DEPTH` (`src/codegen.cpp` and try/catch test); missing raw/f-string literal size limits (`src/lexer.cpp` and lexer test); and bundle-footer arithmetic overflow (`examples/ember_stub_main.cpp` and bundler test).
+  - [DEFERRED] Larger security/design work remains outside the constrained audit: broader v5 semantic validation, coroutine checkpoint ownership, safe-call/default-policy APIs, allowlist behavior, and comprehensive frame budgeting.
+  - [DEFERRED] Documentation inaccuracies remain for a future clean-tree pass, including stale test totals, CLI exit-code/options, `.em` version/policy and extension/status claims, broken cross-references, and the incorrect no-bounds-check claims in `docs/guide/10-language/30-statements.md` and `docs/guide/10-language/40-expressions-operators.md`.
+- **Commit:** none (initial tree dirty; staging, commit, pull, and push prohibited)
+
+## 2026-07-12 04:10 (EDT)
+- **Tree state:** dirty (read-only audit) at HEAD `58c0bda1587c16e25ec52302a083fa2885a37c48`; the exact initial inventory was modified `docs/MAINTENANCE_LOG.md`, with no staged or untracked paths. `tmp_edit/` is gitignored and excluded by rule. No source or documentation maintenance fixes were made; this required log append is the only action exempted from read-only auditing.
+- **Build:** PASS (`cmake --build buildt -j 8`; `ctest --test-dir buildt --output-on-failure -E bench`: 54/54 non-benchmark tests passed)
+- **Findings:**
+  - [NONE] No compiler warnings were emitted and all non-benchmark tests passed.
+  - [DEFERRED] All source/doc maintenance remains deferred because the initial tree was dirty.
+  - [NOTE] The required maintenance-log append is exempt from the clean-tree success criterion on a dirty run. A log-only commit was not made because the dirty-run rule explicitly prohibits staging, commit, and push; the pre-existing live-work path remains uncommitted and untouched except for this required append.
+- **Commit:** none (initial tree dirty; staging, commit, and push prohibited)
