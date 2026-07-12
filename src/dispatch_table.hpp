@@ -19,6 +19,8 @@ struct DispatchTable {
     }
 
     void set(size_t slot, void* fn) {
+        if (slot >= slots.size())
+            throw std::out_of_range("DispatchTable::set: slot out of range");
         // A null dispatch entry would be dereferenced by the generated
         // `call [base + slot*8]` and fault with 0xC0000005 outside Ember's
         // trap model. Reject it at publication time as a host-API misuse so
@@ -31,6 +33,7 @@ struct DispatchTable {
     }
 
     void* get(size_t slot) const {
+        if (slot >= slots.size()) return nullptr;
         return slots[slot].load(std::memory_order_acquire);
     }
 

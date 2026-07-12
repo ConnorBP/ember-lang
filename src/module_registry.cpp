@@ -35,6 +35,14 @@ uint32_t ModuleRegistry::register_module(const std::string& name,
                                          std::string* err,
                                          void* allowlist_base,
                                          int64_t slot_count) {
+    if (!dispatch_table_base) {
+        if (err) *err = "ModuleRegistry: null dispatch table base";
+        return UINT32_MAX;
+    }
+    if (slot_count < 0 || (slot_count > 0 && !allowlist_base)) {
+        if (err) *err = "ModuleRegistry: invalid function-handle allowlist registration";
+        return UINT32_MAX;
+    }
     // Reload (Section 4): same name -> update the existing entry's table pointer,
     // keep the id. Callers that cached (module_id, slot) pick up the new table
     // on the next call.

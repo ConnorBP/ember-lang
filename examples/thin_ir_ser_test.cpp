@@ -97,6 +97,16 @@ static ThinFunction build_hand_thinfn() {
     add.meta.width = 8;
     blk0.instrs.push_back(add);
 
+    // StoreAddr is the append-only final ThinOp. Keep it in the hand-built
+    // round-trip so the deserializer's ordinal ceiling cannot accidentally
+    // remain stuck at the older CallTargetGuard value.
+    ThinInstr store_addr;
+    store_addr.op = ThinOp::StoreAddr;
+    store_addr.src1 = 2;
+    store_addr.src2 = 1;
+    store_addr.meta.width = 8;
+    blk0.instrs.push_back(store_addr);
+
     blk0.term.kind = TermKind::Return;
     blk0.term.ret = 3;
     thf.blocks.push_back(std::move(blk0));

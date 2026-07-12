@@ -99,11 +99,12 @@ is not recoverable.
   saturates at `INT32_MAX` via `cost_add`; a large legal function can never
   truncate into a negative or small `imm32` charge.
   ```
-  sub  [budget_ptr], coarse_cost_imm32
-  jg   .continue            ; budget_remaining > 0, keep going
-  call [ember_trap_budget_slot]   ; does not return (checkpoint unwind, Section 2)
-  .continue:
+  load budget_remaining
+  if budget_remaining <= 0 or budget_remaining <= coarse_cost_imm32: trap
+  budget_remaining -= coarse_cost_imm32
   ```
+  The compare-before-subtract form prevents an already-negative counter near
+  `INT64_MIN` from wrapping positive and bypassing exhaustion.
   The recursive estimator and encoding saturate at `INT32_MAX`; a large
   legal function can never truncate into a negative or small `imm32` charge.
   In B1 mode the counter is addressed through the per-call `r14` context.
@@ -123,7 +124,7 @@ is not recoverable.
 - **No budget set (default)**: `budget_remaining` starts at
   `INT64_MAX` (or budget checks are simply compiled out entirely if
   the module was compiled with budgeting disabled - a module-level
-  compile flag, since baking the checks in costs a `sub`+`jg` at entry
+  compile flag, since baking the checks in costs a compare/subtract at entry
   and per loop iteration; hosts that don't need budgets
   at all, e.g. a fully-trusted internal tool script, can compile
   without the checks for zero overhead - explicit opt-in cost). The entry
@@ -159,18 +160,18 @@ is not recoverable.
   In **B1 mode** (`use_context_reg = true`) the max is loaded **per-context**
   from `[r14 + context_offsets::max_depth()]` at each check, so two contexts
   sharing one compiled body observe different runtime depth limits. The
-  emitted sequence is `inc dword [r14+off_depth]`; `mov eax, [r14+off_max_depth]`;
-  `cmp [r14+off_depth], eax`; `jge .trap`. The compile-time
+  emitted sequence loads `call_depth` and `max_call_depth`, rejects a negative
+  depth or `depth >= max-1`, then increments/stores only on the valid path.
+  This preserves the historical `++depth < max` boundary while preventing
+  `INT32_MAX` from wrapping negative. The compile-time
   `CodeGenCtx::max_call_depth` is retained **only** for the legacy baked
   (non-context-reg) branch, where `max` is an `imm32` baked at compile time.
   ```
-  inc  [call_depth_ptr]
-  ; B1:  mov eax, [r14+off_max_depth]  ; load per-context max
-  ;       cmp  [r14+off_depth], eax
-  ; baked: cmp  [call_depth_ptr], max_call_depth_imm
-  jge  .depth_trap          ; does not return
+  load depth, max
+  if depth < 0 or depth >= max - 1: trap
+  depth += 1
   call ...
-  dec  [call_depth_ptr]
+  depth -= 1
   ```
   Combined with Section 3, the shipped model is **coarse function-entry plus
   loop-back-edge budget + combined script/native active-call depth**.

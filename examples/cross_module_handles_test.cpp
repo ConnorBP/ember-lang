@@ -222,6 +222,21 @@ int main() {
     setvbuf(stdout, NULL, _IONBF, 0);
     std::printf("=== v1.0 Tier 2 cross-module function handles ===\n");
 
+    // Host registration rejects null dispatch bases and malformed published
+    // handle surfaces before generated cross-module code can dereference them.
+    {
+        ModuleRegistry reg(2);
+        std::string err;
+        uint32_t id = reg.register_module("null", nullptr, &err);
+        check(id == UINT32_MAX && reg.count() == 0,
+              "registry rejects a null dispatch-table base");
+        int dummy = 0;
+        err.clear();
+        id = reg.register_module("bad_allowlist", &dummy, &err, nullptr, 1);
+        check(id == UINT32_MAX && reg.count() == 0,
+              "registry rejects slot_count without an allowlist base");
+    }
+
     // The target module source (lib). double + add1, both exported.
     const std::string lib_src =
         "fn double(x: i64) -> i64 { return x * 2; }\n"

@@ -389,11 +389,9 @@ struct CG {
     // v0.4/M4 instruction budget (docs/spec/SAFETY_AND_SANDBOX.md §3). Emitted at
     // function entry and preserved at loop back-edges, gated by
     // ctx.emit_budget_checks + ctx.budget_ptr. Zero emitted when off.
-    //   mov rax, budget_ptr
-    //   sub qword [rax], body_cost   ; coarse entry/per-iteration cost
-    //   jg  .continue                ; budget_remaining > 0, keep executing
-    //   emit_trap(BudgetExceeded)   ; else trap (longjmp to checkpoint)
-    //   .continue:
+    //   load budget; require budget > 0 and budget > body_cost
+    //   subtract/store on the sufficient path; otherwise trap
+    // This pre-check form cannot wrap a negative counter positive.
     // body_cost is a coarse recursive statement count (the spec's "how much
     // work happened" proxy — not cycle-accurate). A bare block floors at 1.
     // x64 `sub r/m64, imm32` sign-extends its immediate, so never cast a large
@@ -405,18 +403,30 @@ struct CG {
         if (!ctx.use_context_reg && !ctx.budget_ptr) return;  // baked mode needs a ptr
         if (!ctx.use_context_reg && non_serializable_reason.empty())
             non_serializable_reason = "instruction-budget storage is process-local";
+        // A plain signed sub can wrap INT64_MIN..INT64_MAX and make an
+        // exhausted negative budget appear positive. Compare first, then
+        // subtract only on the sufficient-budget path. `budget > cost` keeps
+        // the documented strict-positive post-charge rule (budget == cost
+        // traps rather than continuing at zero).
         if (ctx.use_context_reg) {
-            // B1: sub qword [r14 + off_budget], imm32. r14 = context_t*, budget_remaining is a field.
-            // sub r/m,imm32 = opcode 81 /5 (modrm.reg=5). rm=r14 (low3=6, REX.B).
-            // REX.WB (49: W=64, B=r14) + 81 + modrm(10,reg=101,rm=110)=0xAE + disp32 + imm32.
-            e.byte(0x49); e.byte(0x81); e.byte(0xAE); e.imm32(context_offsets::budget()); e.imm32(encoded_cost);
+            e.load_reg_mem(Reg::r10, Reg::r14, context_offsets::budget());
         } else {
-            e.mov_reg_imm64(Reg::rax, int64_t(ctx.budget_ptr));
-            // sub qword ptr [rax], imm32 : REX.W (48) + opcode 81 /5 + imm32
-            e.byte(0x48); e.byte(0x81); e.byte(0x28); e.imm32(encoded_cost);
+            e.mov_reg_imm64(Reg::r11, int64_t(ctx.budget_ptr));
+            e.load_reg_mem(Reg::r10, Reg::r11, 0);
         }
+        e.cmp_reg_imm32(Reg::r10, 0);
         Label cont = e.alloc_label();
-        e.jcc(Cond::g, cont);              // budget_remaining > 0 -> continue
+        Label trap = e.alloc_label();
+        e.jcc(Cond::le, trap);
+        e.cmp_reg_imm32(Reg::r10, encoded_cost);
+        e.jcc(Cond::be, trap);              // unsigned <= after positivity check
+        e.sub_reg_imm32(Reg::r10, encoded_cost);
+        if (ctx.use_context_reg)
+            e.store_reg_mem(Reg::r14, context_offsets::budget(), Reg::r10);
+        else
+            e.store_reg_mem(Reg::r11, 0, Reg::r10);
+        e.jmp(cont);
+        e.bind(trap);
         emit_trap(int(TrapReason::BudgetExceeded), detail);
         e.bind(cont);
     }
@@ -436,11 +446,8 @@ struct CG {
     // for every script-issued script or native call. Native re-entry therefore
     // remains nested while the earlier native invocation is active.
     // Zero emitted when off. Pairs with emit_depth_leave() after the call.
-    //   mov rax, depth_ptr
-    //   inc dword [rax]            ; ++call_depth
-    //   cmp dword [rax], max       ; depth reached max?
-    //   jge .trap                  ; yes -> overflow
-    //   .ok:
+    //   load depth/max; require depth >= 0 and depth < max-1
+    //   increment/store only on the valid path; otherwise trap
     //   <the call>
     //   ... emit_depth_leave() after the call returns: dec dword [rax]
     void emit_depth_check() {
@@ -448,30 +455,36 @@ struct CG {
         if (!ctx.use_context_reg && !ctx.depth_ptr) return;
         if (!ctx.use_context_reg && non_serializable_reason.empty())
             non_serializable_reason = "call-depth storage is process-local";
+        // Compare before incrementing so a corrupted INT32_MAX depth cannot
+        // wrap negative and bypass the signed limit check. Require current
+        // depth < max-1, equivalent to the historical ++depth < max rule.
         if (ctx.use_context_reg) {
-            // B1: inc dword [r14+off_depth]; then compare call_depth to the
-            // PER-CONTEXT max_call_depth loaded from [r14+off_max_depth] (NOT
-            // the compile-time ctx.max_call_depth baked as imm32). This lets two
-            // contexts share one compiled body and observe different runtime
-            // depth limits. Compile-time ctx.max_call_depth is retained only for
-            // the legacy baked branch below.
-            // inc r/m = FF /0 (modrm.reg=0). rm=r14(low3=6, REX.B). modrm(10,000,110)=0x86.
-            e.byte(0x41); e.byte(0xFF); e.byte(0x86); e.imm32(context_offsets::depth());
-            // mov eax, dword [r14+off_max_depth]: 8B /r(eax=0), rm=r14(REX.B).
-            // modrm(10,000,110)=0x86.
-            e.byte(0x41); e.byte(0x8B); e.byte(0x86); e.imm32(context_offsets::max_depth());
-            // cmp dword [r14+off_depth], eax: 39 /r(eax=0), rm=r14(REX.B).
-            // modrm(10,000,110)=0x86.
-            e.byte(0x41); e.byte(0x39); e.byte(0x86); e.imm32(context_offsets::depth());
+            e.load_reg_mem32(Reg::r10, Reg::r14, context_offsets::depth());
+            e.load_reg_mem32(Reg::rax, Reg::r14, context_offsets::max_depth());
         } else {
-            e.mov_reg_imm64(Reg::rax, int64_t(ctx.depth_ptr));
-            e.byte(0xFF); e.byte(0x00);                  // inc dword ptr [rax]
-            e.byte(0x81); e.byte(0x38); e.imm32(int32_t(ctx.max_call_depth)); // cmp dword [rax], imm32
+            e.mov_reg_imm64(Reg::r11, int64_t(ctx.depth_ptr));
+            e.load_reg_mem32(Reg::r10, Reg::r11, 0);
+            e.mov_reg_imm64(Reg::rax, int64_t(ctx.max_call_depth));
         }
+        e.sub_reg_imm32(Reg::rax, 1);
+        e.cmp_reg_imm32(Reg::r10, 0);
         Label ok = e.alloc_label();
-        e.jcc(Cond::l, ok);                          // depth < max -> ok
-        emit_trap(int(TrapReason::StackOverflow), "stack overflow: call depth exceeded");
+        Label trap = e.alloc_label();
+        e.jcc(Cond::l, trap);               // corrupted negative depth
+        e.cmp_reg_reg(Reg::r10, Reg::rax);
+        e.jcc(Cond::l, ok);
+        e.jmp(trap);
         e.bind(ok);
+        e.add_reg_imm32(Reg::r10, 1);
+        if (ctx.use_context_reg)
+            e.store_reg_mem32(Reg::r14, context_offsets::depth(), Reg::r10);
+        else
+            e.store_reg_mem32(Reg::r11, 0, Reg::r10);
+        Label after = e.alloc_label();
+        e.jmp(after);
+        e.bind(trap);
+        emit_trap(int(TrapReason::StackOverflow), "stack overflow: call depth exceeded");
+        e.bind(after);
     }
     void emit_depth_leave() {
         if (!ctx.emit_depth_checks) return;
@@ -1283,8 +1296,21 @@ struct CG {
         Label brk;
         bool is_switch = false;
         size_t cleanup_depth = 0; // lexical cleanup scopes retained by this transfer
+        int32_t catch_depth = 0;  // active try handlers retained by this transfer
     };
     std::vector<LoopCtx> loops;
+    // Lexical count of try bodies currently being emitted. A return, or a
+    // break/continue that exits a try, must pop those runtime handlers before
+    // transferring control or context_t retains a checkpoint into a dead frame.
+    int32_t active_try_depth = 0;
+
+    void emit_catch_unwind_to(int32_t retained_depth) {
+        const int32_t pops = active_try_depth - retained_depth;
+        if (pops <= 0 || !ctx.use_context_reg) return;
+        e.load_reg_mem32(Reg::r10, Reg::r14, context_offsets::catch_depth());
+        e.sub_reg_imm32(Reg::r10, pops);
+        e.store_reg_mem32(Reg::r14, context_offsets::catch_depth(), Reg::r10);
+    }
 
     // Item E ("hot local pinning"): at most one pin active at a time,
     // scoped to a single loop's duration (entered/cleared around a
@@ -4010,6 +4036,7 @@ void CG::exec_stmt(const Stmt& s) {
                 }
             }
             if (has_defers) emit_cleanups_to(0);
+            emit_catch_unwind_to(0);
             // Cleanup calls may clobber rax; the hidden-pointer ABI requires
             // the destination pointer to be returned there as well.
             e.load_reg_mem(Reg::rax, Reg::rbp, struct_ret_ptr_offset);
@@ -4053,6 +4080,7 @@ void CG::exec_stmt(const Stmt& s) {
                 e.add_reg_imm32(Reg::rsp, 16);
             }
         }
+        emit_catch_unwind_to(0);
         emit_epilogue();
         return;
     }
@@ -4099,7 +4127,7 @@ void CG::exec_stmt(const Stmt& s) {
                 set_pin_here = true;
             }
         }
-        loops.push_back({latch, end, false, cleanup_scopes.size()});
+        loops.push_back({latch, end, false, cleanup_scopes.size(), active_try_depth});
         exec_block(ws->body);
         loops.pop_back();
         if (set_pin_here) active_pin.reset();
@@ -4114,7 +4142,7 @@ void CG::exec_stmt(const Stmt& s) {
         // budget is charged only on the taken back edge.
         Label body = e.alloc_label(), cond = e.alloc_label(), end = e.alloc_label();
         e.bind(body);
-        loops.push_back({cond, end, false, cleanup_scopes.size()});
+        loops.push_back({cond, end, false, cleanup_scopes.size(), active_try_depth});
         exec_block(ds->body);
         loops.pop_back();
         e.bind(cond);
@@ -4192,7 +4220,7 @@ void CG::exec_stmt(const Stmt& s) {
             // handles int (normalize_rax + 8-byte mov; scalar slots are 8
             // bytes per local_width_bytes) and f32 (movss_mem_xmm from xmm0).
             store_slot(var_off, elem_ty);
-            loops.push_back({latch, end, false, cleanup_scopes.size()});
+            loops.push_back({latch, end, false, cleanup_scopes.size(), active_try_depth});
             exec_block(fe->body);
             loops.pop_back();
             e.bind(latch);
@@ -4261,7 +4289,7 @@ void CG::exec_stmt(const Stmt& s) {
         e.load_elem_to_rax(Reg::rax, 0, load_width, false);
         // Store to var's slot.
         e.store_rax_elem(Reg::rbp, var_off, load_width);
-        loops.push_back({latch, end, false, cleanup_scopes.size()});
+        loops.push_back({latch, end, false, cleanup_scopes.size(), active_try_depth});
         exec_block(fe->body);
         loops.pop_back();
         e.bind(latch);
@@ -4307,7 +4335,7 @@ void CG::exec_stmt(const Stmt& s) {
                 set_pin_here = true;
             }
         }
-        loops.push_back({step_l, end_l, false, cleanup_scopes.size()});
+        loops.push_back({step_l, end_l, false, cleanup_scopes.size(), active_try_depth});
         exec_block(fs->body);
         loops.pop_back();
         e.bind(step_l);
@@ -4347,7 +4375,7 @@ void CG::exec_stmt(const Stmt& s) {
         e.jmp(default_idx >= 0 ? case_labels[size_t(default_idx)] : end_label);
         for (size_t i = 0; i < sw->cases.size(); ++i) {
             e.bind(case_labels[i]);
-            loops.push_back({Label{0}, end_label, true, cleanup_scopes.size()}); // continue skips switch frames
+            loops.push_back({Label{0}, end_label, true, cleanup_scopes.size(), active_try_depth}); // continue skips switch frames
             exec_block(sw->cases[i].body);
             loops.pop_back();
         }
@@ -4421,7 +4449,7 @@ void CG::exec_stmt(const Stmt& s) {
                         }
                     }
                 }
-                loops.push_back({Label{0}, end_label, true, cleanup_scopes.size()});
+                loops.push_back({Label{0}, end_label, true, cleanup_scopes.size(), active_try_depth});
                 exec_block(ms->arms[i].body);
                 loops.pop_back();
                 e.jmp(end_label);
@@ -4445,7 +4473,7 @@ void CG::exec_stmt(const Stmt& s) {
         e.jmp(wildcard_idx >= 0 ? arm_labels[size_t(wildcard_idx)] : end_label);
         for (size_t i = 0; i < ms->arms.size(); ++i) {
             e.bind(arm_labels[i]);
-            loops.push_back({Label{0}, end_label, true, cleanup_scopes.size()});
+            loops.push_back({Label{0}, end_label, true, cleanup_scopes.size(), active_try_depth});
             exec_block(ms->arms[i].body);
             loops.pop_back();
             e.jmp(end_label);  // no fallthrough — each arm jumps to end
@@ -4487,8 +4515,15 @@ void CG::exec_stmt(const Stmt& s) {
         int32_t cd_off = context_offsets::catch_depth();
         int32_t cb_off = context_offsets::catch_bufs();
         int32_t csd_off = context_offsets::catch_saved_depths();
-        // rax = catch_depth (current, before increment)
-        e.load_reg_mem(Reg::rax, Reg::r14, cd_off);       // mov eax, [r14+cd_off]
+        // rax = catch_depth (current, before increment). Reject a full or
+        // corrupted catch stack before using it as an array index.
+        e.load_reg_mem32(Reg::rax, Reg::r14, cd_off);
+        e.cmp_reg_imm32(Reg::rax, context_t::MAX_CATCH_DEPTH);
+        Label catch_depth_ok = e.alloc_label();
+        e.jcc(Cond::b, catch_depth_ok);                    // unsigned depth < MAX
+        emit_trap(int(TrapReason::StackOverflow),
+                  "try/catch nesting exceeded MAX_CATCH_DEPTH");
+        e.bind(catch_depth_ok);
         // r8 = rax * 64 (buffer stride)
         e.imul_reg_imm32(Reg::r8, Reg::rax, 64);           // imul r8, rax, 64
         // r8 = r14 + catch_bufs_off + r8
@@ -4509,7 +4544,7 @@ void CG::exec_stmt(const Stmt& s) {
         e.store_reg_mem(Reg::r9, 56, Reg::rax);           // [r9+56] = catch_entry_rip
         // save call_depth into catch_saved_call_depths[catch_depth]
         // r10 = catch_depth (reload — rax was clobbered by lea); r10 is volatile
-        e.load_reg_mem(Reg::r10, Reg::r14, cd_off);       // r10 = catch_depth
+        e.load_reg_mem32(Reg::r10, Reg::r14, cd_off);     // r10d = catch_depth
         // r11 = &catch_saved_call_depths[0] + r10*4
         e.mov_reg_reg(Reg::r11, Reg::r14);
         e.add_reg_imm32(Reg::r11, csd_off);
@@ -4518,20 +4553,25 @@ void CG::exec_stmt(const Stmt& s) {
         e.mov_reg_reg(Reg::rax, Reg::r14);
         e.add_reg_imm32(Reg::rax, csd_off);
         e.add_reg_reg(Reg::rax, Reg::r11);
-        // store current call_depth into [rax]
-        e.load_reg_mem(Reg::r11, Reg::r14, context_offsets::depth()); // r11 = call_depth
-        e.store_reg_mem(Reg::rax, 0, Reg::r11);
+        // Store exactly one int32_t. The generic load/store helpers are qword
+        // operations: using them here would read {call_depth,max_call_depth}
+        // together and overwrite two adjacent saved-depth entries (and index
+        // 255 would write four bytes past the array).
+        e.load_reg_mem32(Reg::r11, Reg::r14, context_offsets::depth()); // r11d = call_depth
+        e.store_reg_mem32(Reg::rax, 0, Reg::r11);
         // increment catch_depth
         e.add_reg_imm32(Reg::r10, 1);                      // r10 = catch_depth + 1
-        e.store_reg_mem(Reg::r14, cd_off, Reg::r10);       // [r14+cd_off] = catch_depth+1
+        e.store_reg_mem32(Reg::r14, cd_off, Reg::r10);     // [r14+cd_off] = catch_depth+1
 
         // --- normal path: run the try body ---
+        ++active_try_depth;
         exec_block(tc->try_body);
+        --active_try_depth;
 
         // --- normal try completion: pop the catch handler + jump past catch ---
-        e.load_reg_mem(Reg::rax, Reg::r14, cd_off);       // rax = catch_depth
+        e.load_reg_mem32(Reg::rax, Reg::r14, cd_off);     // eax = catch_depth
         e.sub_reg_imm32(Reg::rax, 1);                      // rax = catch_depth - 1
-        e.store_reg_mem(Reg::r14, cd_off, Reg::rax);       // catch_depth--
+        e.store_reg_mem32(Reg::r14, cd_off, Reg::rax);     // catch_depth--
         e.jmp(end_label);
 
         // --- catch entry: a throw longjmps here with registers restored ---
@@ -4584,22 +4624,24 @@ void CG::exec_stmt(const Stmt& s) {
         // store the thrown value in context_t::thrown_value
         e.store_reg_mem(Reg::r14, context_offsets::thrown_value(), Reg::rax);
         // check catch_depth: if 0, no handler -> trap (UnhandledThrow)
-        e.load_reg_mem(Reg::rax, Reg::r14, context_offsets::catch_depth());
+        e.load_reg_mem32(Reg::rax, Reg::r14, context_offsets::catch_depth());
         e.cmp_reg_imm32(Reg::rax, 0);
         Label no_handler = e.alloc_label();
         e.jcc(Cond::e, no_handler);
         // --- has a handler: longjmp to catch_bufs[catch_depth-1] ---
         // rax = catch_depth - 1 (the handler index)
         e.sub_reg_imm32(Reg::rax, 1);                      // rax = catch_depth - 1
-        e.store_reg_mem(Reg::r14, context_offsets::catch_depth(), Reg::rax); // catch_depth--
+        e.store_reg_mem32(Reg::r14, context_offsets::catch_depth(), Reg::rax); // catch_depth--
         // restore call_depth from catch_saved_call_depths[rax]
         // r11 = r14 + catch_saved_depths_off + rax*4
         e.mov_reg_reg(Reg::r11, Reg::r14);
         e.add_reg_imm32(Reg::r11, context_offsets::catch_saved_depths());
         e.imul_reg_imm32(Reg::r9, Reg::rax, 4);            // r9 = (catch_depth-1)*4
         e.add_reg_reg(Reg::r11, Reg::r9);                  // r11 = &catch_saved_call_depths[cd-1]
-        e.load_reg_mem(Reg::r9, Reg::r11, 0);             // r9 = saved call_depth
-        e.store_reg_mem(Reg::r14, context_offsets::depth(), Reg::r9); // call_depth = saved
+        // Restore exactly call_depth (int32_t). A qword store would also
+        // replace adjacent max_call_depth with the next saved array element.
+        e.load_reg_mem32(Reg::r9, Reg::r11, 0);           // r9d = saved call_depth
+        e.store_reg_mem32(Reg::r14, context_offsets::depth(), Reg::r9); // call_depth = saved
         // r8 = &catch_bufs[catch_depth-1] = r14 + catch_bufs_off + rax*64
         e.imul_reg_imm32(Reg::r8, Reg::rax, 64);           // r8 = (cd-1)*64
         e.mov_reg_reg(Reg::r9, Reg::r14);
@@ -4677,6 +4719,7 @@ void CG::exec_stmt(const Stmt& s) {
     if (dynamic_cast<const BreakStmt*>(&s)) {
         if (!loops.empty()) {
             emit_cleanups_to(loops.back().cleanup_depth);
+            emit_catch_unwind_to(loops.back().catch_depth);
             e.jmp(loops.back().brk);
         }
         return;
@@ -4687,6 +4730,7 @@ void CG::exec_stmt(const Stmt& s) {
         for (int i = int(loops.size()) - 1; i >= 0; --i) {
             if (!loops[size_t(i)].is_switch) {
                 emit_cleanups_to(loops[size_t(i)].cleanup_depth);
+                emit_catch_unwind_to(loops[size_t(i)].catch_depth);
                 e.jmp(loops[size_t(i)].cont);
                 break;
             }

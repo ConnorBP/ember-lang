@@ -157,6 +157,19 @@ int main() {
     setvbuf(stdout, NULL, _IONBF, 0);
     std::printf("=== v1.0 Tier 2 first-class function references ===\n");
 
+    // Host publication rejects null dispatch targets before JIT code can call
+    // through them, and out-of-range host table access fails closed.
+    {
+        DispatchTable dt(1);
+        bool null_rejected=false, range_rejected=false;
+        try { dt.set(0, nullptr); } catch (const std::invalid_argument&) { null_rejected=true; }
+        try { dt.set(1, reinterpret_cast<void*>(uintptr_t(1))); }
+        catch (const std::out_of_range&) { range_rejected=true; }
+        check(null_rejected, "host dispatch publication rejects null function pointers");
+        check(range_rejected && dt.get(1)==nullptr,
+              "host dispatch table rejects out-of-range set/get");
+    }
+
     // ---- A. handle creation is nominal: it cannot escape as a plain i64 ----
     {
         FRModule m;

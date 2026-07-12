@@ -165,7 +165,9 @@ bool read_type(const uint8_t*& cur, const uint8_t* end,
 
 // ─── enum range helpers ───
 
-constexpr uint16_t THIN_OP_LAST = static_cast<uint16_t>(ThinOp::CallTargetGuard);
+// ThinOp is append-only on disk; keep the deserializer ceiling at the actual
+// final enumerator. StoreAddr was appended after CallTargetGuard.
+constexpr uint16_t THIN_OP_LAST = static_cast<uint16_t>(ThinOp::StoreAddr);
 constexpr uint8_t  TERM_KIND_LAST = static_cast<uint8_t>(TermKind::Trap);
 constexpr uint8_t  BASE_KIND_LAST = static_cast<uint8_t>(AbsFixup::FunctionRodataBase);
 

@@ -263,14 +263,24 @@ struct EmitCtx {
         if (!ctx.use_context_reg && !ctx.budget_ptr) return;
         if (!ctx.use_context_reg && non_serializable_reason.empty())
             non_serializable_reason = "instruction-budget storage is process-local";
+        // Compare before subtracting: signed subtraction of a very negative
+        // counter can wrap positive and otherwise bypass exhaustion.
         if (ctx.use_context_reg) {
-            e.byte(0x49); e.byte(0x81); e.byte(0xAE); e.imm32(context_offsets::budget()); e.imm32(encoded_cost);
+            e.load_reg_mem(Reg::r10, Reg::r14, context_offsets::budget());
         } else {
-            e.mov_reg_imm64(Reg::rax, int64_t(ctx.budget_ptr));
-            e.byte(0x48); e.byte(0x81); e.byte(0x28); e.imm32(encoded_cost);
+            e.mov_reg_imm64(Reg::r11, int64_t(ctx.budget_ptr));
+            e.load_reg_mem(Reg::r10, Reg::r11, 0);
         }
-        Label cont = e.alloc_label();
-        e.jcc(Cond::g, cont);
+        e.cmp_reg_imm32(Reg::r10, 0);
+        Label cont = e.alloc_label(), trap = e.alloc_label();
+        e.jcc(Cond::le, trap);
+        e.cmp_reg_imm32(Reg::r10, encoded_cost);
+        e.jcc(Cond::be, trap);  // unsigned <= after positivity check
+        e.sub_reg_imm32(Reg::r10, encoded_cost);
+        if (ctx.use_context_reg) e.store_reg_mem(Reg::r14, context_offsets::budget(), Reg::r10);
+        else                     e.store_reg_mem(Reg::r11, 0, Reg::r10);
+        e.jmp(cont);
+        e.bind(trap);
         emit_trap(int(TrapReason::BudgetExceeded), detail);
         e.bind(cont);
     }
@@ -279,19 +289,32 @@ struct EmitCtx {
         if (!ctx.use_context_reg && !ctx.depth_ptr) return;
         if (!ctx.use_context_reg && non_serializable_reason.empty())
             non_serializable_reason = "call-depth storage is process-local";
+        // Compare before incrementing so INT32_MAX cannot wrap negative and
+        // pass the signed depth check. Preserve the historical ++depth < max
+        // boundary by requiring current depth < max-1.
         if (ctx.use_context_reg) {
-            e.byte(0x41); e.byte(0xFF); e.byte(0x86); e.imm32(context_offsets::depth());
-            e.byte(0x41); e.byte(0x8B); e.byte(0x86); e.imm32(context_offsets::max_depth());
-            e.byte(0x41); e.byte(0x39); e.byte(0x86); e.imm32(context_offsets::depth());
+            e.load_reg_mem32(Reg::r10, Reg::r14, context_offsets::depth());
+            e.load_reg_mem32(Reg::rax, Reg::r14, context_offsets::max_depth());
         } else {
-            e.mov_reg_imm64(Reg::rax, int64_t(ctx.depth_ptr));
-            e.byte(0xFF); e.byte(0x00);
-            e.byte(0x81); e.byte(0x38); e.imm32(int32_t(ctx.max_call_depth));
+            e.mov_reg_imm64(Reg::r11, int64_t(ctx.depth_ptr));
+            e.load_reg_mem32(Reg::r10, Reg::r11, 0);
+            e.mov_reg_imm64(Reg::rax, int64_t(ctx.max_call_depth));
         }
-        Label ok = e.alloc_label();
+        e.sub_reg_imm32(Reg::rax, 1);
+        e.cmp_reg_imm32(Reg::r10, 0);
+        Label ok = e.alloc_label(), trap = e.alloc_label(), after = e.alloc_label();
+        e.jcc(Cond::l, trap);
+        e.cmp_reg_reg(Reg::r10, Reg::rax);
         e.jcc(Cond::l, ok);
-        emit_trap(int(TrapReason::StackOverflow), "stack overflow: call depth exceeded");
+        e.jmp(trap);
         e.bind(ok);
+        e.add_reg_imm32(Reg::r10, 1);
+        if (ctx.use_context_reg) e.store_reg_mem32(Reg::r14, context_offsets::depth(), Reg::r10);
+        else                     e.store_reg_mem32(Reg::r11, 0, Reg::r10);
+        e.jmp(after);
+        e.bind(trap);
+        emit_trap(int(TrapReason::StackOverflow), "stack overflow: call depth exceeded");
+        e.bind(after);
     }
     void emit_depth_leave() {
         if (!ctx.emit_depth_checks) return;
@@ -834,9 +857,17 @@ struct EmitCtx {
         emit_prologue();
         // param spills + VReg map init
         emit_param_spills();
-        // budget check at entry (coarse cost from instr count; budget is off by
-        // default so this emits nothing in the common case)
-        if (ctx.emit_budget_checks) {
+        // A source-lowered function carries its reach-aware entry charge as a
+        // BudgetCheck in block 0. Do not charge it twice. A deserialized or
+        // hand-built IR that omitted the explicit entry op still gets a
+        // fail-safe coarse instruction-count charge here.
+        bool has_explicit_entry_budget = false;
+        if (!thf.blocks.empty()) {
+            for (const ThinInstr& in : thf.blocks[0].instrs) {
+                if (in.op == ThinOp::BudgetCheck) { has_explicit_entry_budget = true; break; }
+            }
+        }
+        if (ctx.emit_budget_checks && !has_explicit_entry_budget) {
             int64_t cost = 0;
             for (const auto& b : thf.blocks) cost += int64_t(b.instrs.size()) + 1;
             emit_budget_check(cost, "budget exceeded at function entry");

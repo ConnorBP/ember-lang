@@ -110,9 +110,9 @@ struct context_t {
     // snapshots call_depth at try-entry so a throw-to-catch that unwinds
     // across frames restores the catching frame's call_depth (the abandoned
     // frames' depth increments are discarded, mirroring reset_for_call).
-    // MAX_CATCH_DEPTH bounds the stack; a try at depth == MAX is a sema
-    // error (or would overflow here) — v1 sets it high enough that a script
-    // can't reasonably hit it.
+    // MAX_CATCH_DEPTH bounds the stack. Tree codegen emits an unsigned runtime
+    // depth < MAX guard before indexing either array, so an over-deep or
+    // corrupted catch stack traps rather than writing out of bounds.
     static constexpr int32_t MAX_CATCH_DEPTH = 256;
     // 8 × int64_t = 64 bytes per entry: [rbx, rbp, r12, r13, r14, r15, rsp, rip]
     int64_t catch_bufs[MAX_CATCH_DEPTH][8]{};

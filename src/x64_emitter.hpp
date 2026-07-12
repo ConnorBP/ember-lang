@@ -248,6 +248,34 @@ public:
         imm32(disp);
     }
 
+    // Explicit 32-bit memory moves. A load into r32 zero-extends the destination
+    // to 64 bits, as required by x86-64. Keep these separate from the qword
+    // helpers above: context_t has adjacent int32_t fields whose high neighbor
+    // must never be read or overwritten as part of a qword access.
+    void load_reg_mem32(Reg dst, Reg base, int32_t disp) {
+        byte(rex(false, is_extended(dst), false, is_extended(base)));
+        byte(0x8B);
+        if ((uint8_t(base) & 7) == 4) {
+            byte(modrm(0b10, dst, Reg(4)));
+            byte(0x24);
+        } else {
+            byte(modrm(0b10, dst, base));
+        }
+        imm32(disp);
+    }
+
+    void store_reg_mem32(Reg base, int32_t disp, Reg src) {
+        byte(rex(false, is_extended(src), false, is_extended(base)));
+        byte(0x89);
+        if ((uint8_t(base) & 7) == 4) {
+            byte(modrm(0b10, src, Reg(4)));
+            byte(0x24);
+        } else {
+            byte(modrm(0b10, src, base));
+        }
+        imm32(disp);
+    }
+
     // --- narrow (sub-8-byte) element load/store, always via rax (array/slice
     // element access with element width < 8 bytes). Loads zero/sign-extend
     // into the full 64-bit rax - this codegen's convention is that a logical

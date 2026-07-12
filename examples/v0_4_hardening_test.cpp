@@ -132,6 +132,54 @@ static ember::TrapReason run_under_safetrap(const std::string& src, int64_t budg
 // run traps at a tiny combined-depth limit; after longjmp, reset_for_call
 // discards abandoned depth and the same entry completes three sequential native
 // calls with re-entry disabled (which would trap if calls accumulated).
+static bool counter_wrap_guards_test() {
+    const std::string src =
+        "fn leaf() -> i64 { return 7; }\n"
+        "fn main() -> i64 { return leaf(); }\n";
+    auto lr = tokenize(src, "<counter-wrap>"); if (!lr.ok) return false;
+    auto pr = parse(std::move(lr.toks)); if (!pr.ok) return false;
+    std::unordered_map<std::string,int> slots; int si=0;
+    for(auto&fn:pr.program.funcs){slots[fn.name]=si++;fn.slot=slots[fn.name];}
+    std::unordered_map<std::string,ember::NativeSig> natives;
+    ember::OpOverloadTable ov; auto layouts=build_struct_layouts(pr.program);
+    if(!sema(pr.program,natives,slots,0,&ov,&layouts).ok) return false;
+    ember::DispatchTable table(pr.program.funcs.size()); ember::context_t ectx;
+    ember::CodeGenCtx ctx; ctx.dispatch_base=int64_t(table.base());
+    ctx.natives=&natives; ctx.script_slots=&slots; ctx.structs=&layouts;
+    ctx.trap_stub=(void*)&test_trap; ctx.use_context_reg=true;
+    ctx.emit_budget_checks=true; ctx.emit_depth_checks=true;
+    std::vector<ember::CompiledFn> fns;
+    for(auto&fn:pr.program.funcs){auto cf=compile_func(fn,ctx);finalize(cf);table.set(fn.slot,cf.entry);fns.push_back(std::move(cf));}
+    void* main_entry=table.get(slots["main"]);
+
+    // A very negative counter plus an entry charge used to wrap positive under
+    // `sub` and execute. The pre-check must trap without arithmetic overflow.
+    ectx.budget_remaining=INT64_MIN; ectx.max_call_depth=64; ectx.has_checkpoint=true;
+    bool budget_trap=false;
+    if (__builtin_setjmp(ectx.checkpoint)) budget_trap=ectx.last_trap==TrapReason::BudgetExceeded;
+    else (void)ember_call_void(main_entry,&ectx);
+    ectx.has_checkpoint=false;
+
+    // A huge positive budget must remain valid; an imm32-sign-extension style
+    // signed comparison must not falsely reject values above INT64_MAX-cost.
+    ectx.reset_for_call(); ectx.budget_remaining=INT64_MAX; ectx.max_call_depth=64;
+    ectx.has_checkpoint=true; bool huge_budget_ok=false;
+    if (__builtin_setjmp(ectx.checkpoint)) huge_budget_ok=false;
+    else huge_budget_ok=(ember_call_void(main_entry,&ectx)==7);
+    ectx.has_checkpoint=false;
+
+    // INT32_MAX used to wrap to INT32_MIN under `inc`, then pass depth < max.
+    ectx.reset_for_call(); ectx.budget_remaining=1'000'000; ectx.call_depth=INT32_MAX;
+    ectx.max_call_depth=64; ectx.has_checkpoint=true;
+    bool depth_trap=false;
+    if (__builtin_setjmp(ectx.checkpoint)) depth_trap=ectx.last_trap==TrapReason::StackOverflow;
+    else (void)ember_call_void(main_entry,&ectx);
+    ectx.has_checkpoint=false;
+
+    for(auto&fn:fns)if(fn.exec)free_executable(fn.exec);
+    return budget_trap && huge_budget_ok && depth_trap;
+}
+
 static bool native_reentry_depth_test() {
     const std::string src =
         "fn bounce(n: i64) -> i64 { if (n <= 0) { return 0; } return reenter(n - 1); }\n"
@@ -478,6 +526,9 @@ int main() {
 
     check(native_reentry_depth_test(),
           "Combined depth: nested native re-entry traps recoverably and resets");
+
+    check(counter_wrap_guards_test(),
+          "Budget/depth counters: negative/INT_MAX states trap without wraparound bypass");
 
     check(disabled_safety_checks_are_zero_overhead(),
           "Safety compile flags: disabled budget/depth checks add zero code");

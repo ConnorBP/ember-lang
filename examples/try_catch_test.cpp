@@ -273,6 +273,98 @@ int main() {
         cleanup(m);
     }
 
+    // ---- G2. nested normal completion must not corrupt max_call_depth ----
+    // Regression for catch_saved_call_depths width: the saved depths are
+    // int32_t, while load_reg_mem/store_reg_mem are qword operations. The old
+    // save overlapped adjacent array entries, and the old restore overwrote
+    // {call_depth,max_call_depth}. After an inner try completed normally, an
+    // outer throw commonly restored max_call_depth=0, so the next script call
+    // falsely trapped StackOverflow. This sequence pins both the return value
+    // and preservation of the host-configured max.
+    {
+        TCModule m;
+        bool ok = compile_tc(
+            "fn after() -> i64 { return 41; }\n"
+            "fn main() -> i64 {\n"
+            "    let mut caught: i64 = 0;\n"
+            "    try {\n"
+            "        try {\n"
+            "            caught = 1;\n"
+            "        } catch (inner) {\n"
+            "            caught = 999;\n"
+            "        }\n"
+            "        throw 7;\n"
+            "    } catch (outer) {\n"
+            "        caught = caught + outer;\n"
+            "    }\n"
+            "    return after() + caught;\n"
+            "}\n", m);
+        check(ok, "G2: compile inner-normal/outer-throw/call regression");
+        if (ok) {
+            const int32_t configured_max = m.ctx.max_call_depth;
+            bool t=false;
+            int64_t r=run_main(m,&t);
+            check(!t && r==49,
+                  "G2: inner try completes, outer catch runs, subsequent script call succeeds");
+            check(m.ctx.max_call_depth==configured_max,
+                  "G2: throw restoration preserves max_call_depth exactly");
+        }
+        cleanup(m);
+    }
+
+    // ---- G3. return from a try must pop its active catch handler ----
+    // A direct return bypasses the normal-fallthrough catch_depth-- unless
+    // codegen explicitly unwinds try scopes on control transfer. Calling a
+    // returning helper before an uncaught throw detects a stale checkpoint:
+    // the throw must reach the host, never jump into the helper's dead frame.
+    {
+        TCModule m;
+        bool ok = compile_tc(
+            "fn returns_from_try() -> i64 {\n"
+            "    try { return 5; } catch (e) { return 99; }\n"
+            "}\n"
+            "fn main() -> i64 {\n"
+            "    let x = returns_from_try();\n"
+            "    throw x;\n"
+            "}\n", m);
+        check(ok, "G3: compile return-from-try stale-handler regression");
+        if (ok) {
+            bool t=false;
+            run_main(m,&t);
+            check(t && m.ctx.last_trap==TrapReason::UnhandledThrow,
+                  "G3: return pops try handler; later uncaught throw reaches host");
+            check(m.ctx.catch_depth==0 && m.ctx.thrown_value==5,
+                  "G3: no stale catch checkpoint is entered after return-from-try");
+        }
+        cleanup(m);
+    }
+
+    // ---- G4. runtime catch-depth bound traps before an OOB save ----
+    // 257 simultaneously-active try blocks are reachable within the default
+    // call-depth limit. The 257th must trap before indexing catch_bufs[256].
+    {
+        TCModule m;
+        bool ok = compile_tc(
+            "fn nest(n: i64) -> i64 {\n"
+            "    try {\n"
+            "        if (n > 0) { return nest(n - 1); }\n"
+            "        return 0;\n"
+            "    } catch (e) { return e; }\n"
+            "}\n"
+            "fn main() -> i64 { return nest(256); }\n", m);
+        check(ok, "G4: compile 257-active-try catch-depth bound regression");
+        if (ok) {
+            bool t=false;
+            run_main(m,&t);
+            check(t && m.ctx.last_trap==TrapReason::StackOverflow,
+                  "G4: 257th active try traps before catch_bufs OOB access");
+            m.ctx.reset_for_call();
+            check(m.ctx.call_depth==0 && m.ctx.catch_depth==0,
+                  "G4: reset_for_call clears abandoned depth and catch checkpoints");
+        }
+        cleanup(m);
+    }
+
     // ---- H. throw with no try/catch (unhandled -> trap) ----
     {
         TCModule m;

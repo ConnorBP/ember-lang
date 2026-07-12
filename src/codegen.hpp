@@ -100,7 +100,8 @@ struct CodeGenCtx {
     bool emit_budget_checks = false;
 
     // Combined call-stack depth guard (§4): every script-issued invocation,
-    // script or native, does inc [ptr] + cmp max + trap-before-call / dec after
+    // script or native, validates depth before incrementing, traps before the
+    // call on overflow/corruption, and decrements after
     // normal return. This counts simultaneous nesting (including native code
     // that re-enters script), never cumulative sequential calls. Non-local trap
     // recovery must call context_t::reset_for_call() before the next entry.
