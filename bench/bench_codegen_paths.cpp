@@ -441,7 +441,7 @@ static std::vector<PathBench> make_paths() {
             // n=20: a larger inner loop (>=~25) triggers a known struct-by-value-
             // in-loop codegen corruption (see findings note in BENCHMARK_SYSTEM_DESIGN.md);
             // both ember and the baseline use the SAME n so the comparison is fair.
-            "bench_struct_by_value", "hidden-pointer ABI temp copy; struct-by-value arg + return", true, 2000, 50, 0, 20, true, false},
+            "bench_struct_by_value", "hidden-pointer ABI temp copy; struct-by-value arg + return", true, 2000, 50, 0, 20, true, true},
         // ── IR-pass workloads (Stage C): each exercises one optimization pass's ──
         // ── eliminable pattern. These are the workloads the pass system gates on. ──
         {"cse_redundant",
