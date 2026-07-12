@@ -9,6 +9,8 @@
 #include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <cstring>
 #include <algorithm>
 #include <mutex>
 #include <new>
@@ -137,6 +139,59 @@ extern "C" {
         } catch (const std::bad_alloc&) { return 0; }
         catch (const std::length_error&) { return 0; }
     }
+
+    // ---- printf-style format functions (2026-07-11) ----
+    // fmt1(fmt, a) / fmt2(fmt, a, b) / fmt3(fmt, a, b, c) / fmt4(fmt, a, b, c, d)
+    // Format specifiers: %d (decimal i64), %x (hex i64), %c (char from i64),
+    // %f (reinterpret i64 bits as f64), %s (string handle — dereferenced),
+    // %% (literal percent). Returns a string handle.
+    static std::string fmt_one_arg(const std::string& fmt, int64_t args[], int n) {
+        std::string out;
+        int ai = 0;
+        for (size_t i = 0; i < fmt.size(); ++i) {
+            if (fmt[i] != '%') { out.push_back(fmt[i]); continue; }
+            if (i + 1 >= fmt.size()) { out.push_back('%'); break; }
+            char spec = fmt[++i];
+            if (spec == '%') { out.push_back('%'); continue; }
+            if (ai >= n) { out.push_back('%'); out.push_back(spec); continue; }
+            int64_t a = args[ai++];
+            char buf[64];
+            switch (spec) {
+            case 'd': std::snprintf(buf, sizeof buf, "%lld", (long long)a); out += buf; break;
+            case 'x': std::snprintf(buf, sizeof buf, "%llx", (long long)a); out += buf; break;
+            case 'X': std::snprintf(buf, sizeof buf, "%llX", (long long)a); out += buf; break;
+            case 'c': out.push_back(char(uint8_t(a))); break;
+            case 'f': { double d; std::memcpy(&d, &a, 8); std::snprintf(buf, sizeof buf, "%g", d); out += buf; break; }
+            case 's': { auto* s = str_slot(a); if (s) out += *s; break; }
+            default: out.push_back('%'); out.push_back(spec); --ai; break;  // unknown spec: emit as-is, don't consume arg
+            }
+        }
+        return out;
+    }
+    static int64_t n_fmt1(int64_t fmt_h, int64_t a) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
+        auto* f = str_slot(fmt_h); if (!f) return 0;
+        int64_t args[] = {a};
+        try { return str_new(fmt_one_arg(*f, args, 1)); } catch (...) { return 0; }
+    }
+    static int64_t n_fmt2(int64_t fmt_h, int64_t a, int64_t b) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
+        auto* f = str_slot(fmt_h); if (!f) return 0;
+        int64_t args[] = {a, b};
+        try { return str_new(fmt_one_arg(*f, args, 2)); } catch (...) { return 0; }
+    }
+    static int64_t n_fmt3(int64_t fmt_h, int64_t a, int64_t b, int64_t c) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
+        auto* f = str_slot(fmt_h); if (!f) return 0;
+        int64_t args[] = {a, b, c};
+        try { return str_new(fmt_one_arg(*f, args, 3)); } catch (...) { return 0; }
+    }
+    static int64_t n_fmt4(int64_t fmt_h, int64_t a, int64_t b, int64_t c, int64_t d) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
+        auto* f = str_slot(fmt_h); if (!f) return 0;
+        int64_t args[] = {a, b, c, d};
+        try { return str_new(fmt_one_arg(*f, args, 4)); } catch (...) { return 0; }
+    }
 }
 
 const std::string* slot(int64_t handle) {
@@ -173,6 +228,11 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
     b.add("string_identity",   bind_handle("string"), {bind_handle("string")}, (void*)&n_string_identity);
     b.add("string_find",      type_i64(), {bind_handle("string"),bind_handle("string")}, (void*)&n_string_find);
     b.add("string_substr",    bind_handle("string"), {bind_handle("string"),type_i64(),type_i64()}, (void*)&n_string_substr);
+    // printf-style format functions (2026-07-11)
+    b.add("fmt1",  bind_handle("string"), {bind_handle("string"),type_i64()}, (void*)&n_fmt1);
+    b.add("fmt2",  bind_handle("string"), {bind_handle("string"),type_i64(),type_i64()}, (void*)&n_fmt2);
+    b.add("fmt3",  bind_handle("string"), {bind_handle("string"),type_i64(),type_i64(),type_i64()}, (void*)&n_fmt3);
+    b.add("fmt4",  bind_handle("string"), {bind_handle("string"),type_i64(),type_i64(),type_i64(),type_i64()}, (void*)&n_fmt4);
     NativeTable t = b.build();
     for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
     // NOTE: print_string stays in the host (it routes through the host

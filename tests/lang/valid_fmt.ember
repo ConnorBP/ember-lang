@@ -1,0 +1,35 @@
+// valid_fmt.ember — string format natives test (fmt1/fmt2/fmt3/fmt4)
+// Tests printf-style format specifiers: %d, %x, %c, %%
+fn main() -> i64 {
+    // fmt1: %d (decimal i64)
+    let s1: string = fmt1("count = %d", 42);
+    let len1: i64 = string_length(s1);  // "count = 42" = 10 chars
+    if (len1 != 10) { return 1; }
+
+    // fmt1: %x (hex)
+    let s2: string = fmt1("hex = %x", 255);
+    let len2: i64 = string_length(s2);  // "hex = ff" = 8 chars
+    if (len2 != 8) { return 2; }
+
+    // fmt1: %c (char)
+    let s3: string = fmt1("char = %c", 65);  // 'A'
+    let len3: i64 = string_length(s3);  // "char = A" = 8 chars
+    if (len3 != 8) { return 3; }
+
+    // fmt2: two args
+    let s4: string = fmt2("%d + %d = 3", 1, 2);
+    let len4: i64 = string_length(s4);  // "1 + 2 = 3" = 9 chars
+    if (len4 != 9) { return 4; }
+
+    // fmt3: three args
+    let s5: string = fmt3("%d/%d/%d", 2026, 7, 11);
+    let len5: i64 = string_length(s5);  // "2026/7/11" = 9 chars
+    if (len5 != 9) { return 5; }
+
+    // fmt4: four args + %% literal
+    let s6: string = fmt4("%d%% %d%% %d%% %d%%", 25, 50, 75, 100);
+    let len6: i64 = string_length(s6);  // "25% 50% 75% 100%" = 16 chars
+    if (len6 != 16) { return 6; }
+
+    return 0;
+}
