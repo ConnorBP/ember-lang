@@ -70,6 +70,7 @@
 #include "ext_thread.hpp"      // Tier 4: in-context threads (thread_spawn/join + atomics)
 #include "ext_coroutine.hpp"     // #21 coroutines with yield (Windows fibers)
 #include "ext_call_raw.hpp"     // self-hosting Stage 4 gap: call_raw(fn_ptr,arg)->i64
+#include "ext_gc.hpp"          // tracing GC runtime: lambda env heap management (#20)
 #include "../src/ember_pass.hpp"       // Stage C: EmberPassManager
 #include "../src/ember_pass_registry.hpp" // Stage C: EmberPassRegistry
 #include "../src/ember_pass_pipeline.hpp" // Stage C: build_pipeline_from_string
@@ -143,6 +144,7 @@ static void register_standard_bindings(
     ember::ext_coroutine::register_natives(natives);
     ember::ext_call_raw::register_natives(natives);
     ember::ext_thread::register_natives(natives);
+    ember::ext_gc::register_natives(natives);   // __ember_gc_alloc_env/collect/live (lambda env heap)
     OpOverloadTable overloads;
     ext_vec::register_overloads(overloads); ext_quat::register_overloads(overloads);
     ext_mat::register_overloads(overloads); ext_string::register_overloads(overloads);
@@ -297,6 +299,7 @@ struct RunOptions {
     bool ffi_mode = false;
     bool sema_only = false;   // ember test: stop after sema, return 0=OK / 2=fail
     bool parse_only = false;  // ember test: stop after parse, return 0=OK / 2=fail
+    bool gc_env = false;      // --gc-env: allocate lambda envs on the tracing GC heap
 };
 
 struct RunResult {
@@ -321,6 +324,7 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
         ember::ext_coroutine::coroutine_reset();
         ember::ext_thread::thread_reset();
         ember::ext_call_raw::reset();  // stateless (no-op), for symmetry
+        ember::ext_gc::gc_reset();     // clear the GC heap + roots (lambda envs)
         // ext_math is stateless (no reset()).
     };
 
@@ -525,7 +529,13 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
     if (opts.emit_em_path.empty()) {
         ember::ext_coroutine::coroutine_init(&ectx, table.base(), int64_t(slots.size()));
         ember::ext_thread::thread_init(&ectx, table.base(), int64_t(slots.size()));
+        // #20 GC-managed lambda envs: allocate the thread-local GcHeap so
+        // __ember_gc_alloc_env has a heap to allocate on when use_gc_env is
+        // set. Init unconditionally (cheap; idempotent) so the heap is ready
+        // even if only some functions use GC envs.
+        ember::ext_gc::gc_init();
     }
+    ctx.use_gc_env = opts.gc_env;
 
     // Stage C: --passes <spec>
     EmberPassRegistry pass_reg;
@@ -1425,6 +1435,7 @@ int main(int argc, char** argv) {
     int bench_iters = 20;       // --iters N (measured iterations)
     int bench_warmup = 5;       // --warmup N (untimed warmup iterations)
     bool ffi_mode = false;      // --ffi: grant PERM_FFI to sema so I/O natives (print/file/path) are callable
+    bool gc_env = false;        // --gc-env: allocate lambda envs on the tracing GC heap (#20)
     std::string test_dir;        // Family A: `ember test [dir]` (default tests/lang)
     int poll_ms = 500;           // Family C: `ember live` file-content poll interval (default 500ms)
     for (int i = 1; i < argc; ++i) {
@@ -1440,6 +1451,13 @@ int main(int argc, char** argv) {
         } else if (a == "--emit-em") {
             if (++i >= argc) { std::fprintf(stderr, "ember: --emit-em needs a path\n"); return 2; }
             emit_em_path = argv[i];
+        } else if (a == "--gc-env") {
+            // #20: allocate lambda closure envs on the tracing GC heap
+            // (ext_gc) instead of as stack-frame temps, so lambdas can outlive
+            // their creating frame. Off by default (the lang suite + opt gate
+            // use the stack-env path). The gc natives are always registered;
+            // this flag only flips the codegen backend.
+            gc_env = true;
         } else if (a == "--load-em") {
             if (++i >= argc) { std::fprintf(stderr, "ember: --load-em needs a path\n"); return 2; }
             load_em_path = argv[i];
@@ -1542,6 +1560,7 @@ int main(int argc, char** argv) {
     opts.bench_iters = bench_iters;
     opts.bench_warmup = bench_warmup;
     opts.ffi_mode = ffi_mode;
+    opts.gc_env = gc_env;
 
     RunResult result = run_ember_file(file, opts);
     return result.exit_code;

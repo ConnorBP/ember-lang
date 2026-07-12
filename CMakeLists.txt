@@ -162,6 +162,7 @@ ember_add_extension(map      extensions/map/ext_map.cpp)
 ember_add_extension(sync     extensions/sync/ext_sync.cpp)
 ember_add_extension(thread   extensions/thread/ext_thread.cpp)   # Tier 4: in-context threads (thread_spawn/join + call_mutex serialization)
 ember_add_extension(coroutine extensions/coroutine/ext_coroutine.cpp) # #21 coroutines with yield (Windows fibers: coroutine_start/next/done)
+ember_add_extension(gc extensions/gc/ext_gc.cpp)            # tracing GC runtime: wires ember::gc::GcHeap into the engine for lambda env heap management (#20)
 ember_add_extension(lifecycle extensions/lifecycle/ext_lifecycle.cpp)
 ember_add_extension(opt extensions/opt/ext_opt.cpp)         # Stage C: IR optimization passes
 ember_add_extension(obf extensions/obf/ext_obf.cpp)           # Stage C Step 5: IR obfuscation passes
@@ -285,6 +286,23 @@ if(WIN32)
     target_link_libraries(gc_test PRIVATE kernel32)
 endif()
 add_test(NAME gc_core COMMAND gc_test)
+
+# gc_integration_test - the tracing GC WIRED INTO THE ENGINE: ext_gc host API
+# (alloc/pin/unroot/collect, heap-stays-bounded loop, auto-collect threshold)
+# + the codegen use_gc_env path (compile+run capturing/no-capture/nested/
+# lambda-as-arg lambdas + a 2000-lambda loop that triggers auto-collect
+# mid-run, proving pinned envs survive). Links the standard extensions +
+# ember_ext_gc so the __ember_gc_alloc_env native resolves at codegen time.
+add_executable(gc_integration_test examples/gc_integration_test.cpp)
+target_link_libraries(gc_integration_test PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_vec ember_ext_quat ember_ext_mat ember_ext_string
+    ember_ext_array ember_ext_math ember_ext_gc)
+if(WIN32)
+    target_link_libraries(gc_integration_test PRIVATE kernel32)
+endif()
+add_test(NAME gc_integration COMMAND gc_integration_test)
+set_tests_properties(gc_integration PROPERTIES TIMEOUT 60)
 
 # ext_bounds_test: runtime bounds-checking coverage for the array<T> and string
 # host-store extensions (D4+D5 from docs/audit/AUDIT_2026-07-11_DOCS_TESTS.md).
@@ -524,7 +542,7 @@ target_link_libraries(ember_cli PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_opt ember_ext_obf ember_ext_map
-    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_thread)
+    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_thread ember_ext_gc)
 
 # ---- standalone exe bundler (docs/planning/plan_STANDALONE_BUNDLER.md) ----
 # The stub: a pre-built runtime that links ember + ember_frontend + the
@@ -539,7 +557,7 @@ target_link_libraries(ember_stub_main PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_map
-    ember_ext_io ember_ext_coroutine ember_ext_call_raw)
+    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_gc)
 
 # The bundler tool: compiles a .ember -> .em (the emit-em pipeline), copies
 # the stub to <output.exe>, appends the .em + footer. Links the same libs as
@@ -551,7 +569,7 @@ target_link_libraries(ember_bundle PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_map
-    ember_ext_io ember_ext_coroutine ember_ext_call_raw)
+    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_gc)
 
 # End-to-end bundler test: bundle .ember scripts into standalone exes, run
 # them, assert exit codes. Covers simple scripts, multi-function, imports,

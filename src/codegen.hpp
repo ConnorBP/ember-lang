@@ -214,6 +214,19 @@ struct CodeGenCtx {
     //   ctx.pass_manager = &pm;
     EmberPassManager* pass_manager = nullptr;
     EmberAnalysisManager* analysis_manager = nullptr;
+
+    // --- GC-managed lambda environments (#20, ext_gc) ---
+    // When true, the lambda-env codegen path allocates the closure env on the
+    // tracing GC heap (via a call to the __ember_gc_alloc_env native) instead
+    // of as a stack-frame-local temp, so a lambda can outlive its creating
+    // frame (the #20/#21 escape requirement). The env is pinned at alloc by
+    // ext_gc so it survives auto-collects; full JIT'd root tracking (unpin at
+    // the owning frame's epilogue) is the documented follow-up (see
+    // ext_gc.hpp WHAT REMAINS #1). Default false = the existing stack-env
+    // path unchanged (byte-identical to pre-GC; the lang suite + opt gate
+    // hold). The host registers the __ember_gc_* natives + calls gc_init/
+    // gc_reset around runs when this is enabled.
+    bool use_gc_env = false;
 };
 
 // Compile one function. Returns the JIT'd bytes + (after finalize) entry.

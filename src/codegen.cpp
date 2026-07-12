@@ -840,8 +840,12 @@ struct CG {
         if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) count_struct_temps_expr(*kv.second, total); return; }
         // #20: a LambdaExpr allocs a __envtmp$N frame temp of env_size bytes
         // (rounded up to 8). Count it so the frame is sized to hold the env.
+        // GC path (use_gc_env): the env itself lives on the GC heap; the frame
+        // only needs an 8-byte slot to hold the env_ptr returned by
+        // __ember_gc_alloc_env, so count 8 (not env_size).
         if (auto* le = dynamic_cast<const LambdaExpr*>(&ex)) {
-            if (le->env_size > 0) total += int32_t((le->env_size + 7) & ~7);
+            if (le->env_size > 0)
+                total += ctx.use_gc_env ? 8 : int32_t((le->env_size + 7) & ~7);
             return;
         }
         // a nested lambda's body is a separate fn (not in this fn's frame);
@@ -1846,12 +1850,106 @@ void CG::eval(const Expr& ex) {
     // captured values copied from the enclosing scope) + emit the 16-byte
     // lambda value {slot, env_ptr} as rax=slot, rdx=env_ptr (the slice ABI).
     if (auto* le = dynamic_cast<const LambdaExpr*>(&ex)) {
-        // Materialize the env: a compiler-hidden frame temp of env_size bytes.
-        // Each capture (a scalar, 8 bytes) is copied from its enclosing-scope
-        // local into env[capture_offsets[i]]. The env_ptr is the temp's address.
-        // (v1: stack-allocated env — the lambda must not outlive this frame.)
-        int32_t env_off = 0;
-        if (le->env_size > 0) {
+        // Materialize the env + emit the 16-byte lambda value {slot, env_ptr}
+        // as rax=slot, rdx=env_ptr (the slice ABI). Two env backends:
+        //   * stack (default): a compiler-hidden frame temp of env_size bytes
+        //     at [rbp+env_off]; env_ptr = lea [rbp+env_off]. v1 limitation: the
+        //     lambda must not outlive this frame (the env_ptr is a stack addr).
+        //   * GC heap (ctx.use_gc_env): __ember_gc_alloc_env(env_size) returns a
+        //     heap env ptr pinned by ext_gc; captures copy into [ptr+offset];
+        //     env_ptr = the heap ptr (so the lambda CAN outlive this frame).
+        const bool gc_env = ctx.use_gc_env && le->env_size > 0;
+        int32_t env_off = 0;      // stack path: env bytes at [rbp+env_off]
+        int32_t envptr_off = 0;   // gc path: 8-byte slot holding the heap env ptr
+        if (gc_env) {
+            // Reserve an 8-byte frame slot to hold the heap env ptr returned by
+            // __ember_gc_alloc_env (the env itself lives on the GC heap, so the
+            // frame only needs to hold the pointer, not env_size bytes).
+            std::string name = "__envptr$" + std::to_string(temp_counter++);
+            envptr_off = alloc_local(name, &type_i64());
+            // Call __ember_gc_alloc_env(env_size) -> rax = heap env ptr.
+            // Win64: arg 0 in rcx, 32 bytes shadow space (keeps rsp%16==0).
+            // The depth check inside emit_counted_named_native clobbers eax
+            // but NOT rcx, so loading env_size into rcx first is safe.
+            const NativeSig* gsig = native_named("__ember_gc_alloc_env");
+            if (gsig && gsig->fn_ptr) {
+                e.sub_reg_imm32(Reg::rsp, 32);                 // shadow space
+                e.mov_reg_imm64(Reg::rcx, int64_t(le->env_size));  // arg 0 = env size
+                emit_counted_named_native(gsig->fn_ptr, "__ember_gc_alloc_env",
+                                          "gc lambda env alloc");
+                e.add_reg_imm32(Reg::rsp, 32);                 // reclaim shadow space
+            } else {
+                // No binding registered (the host did not call
+                // ext_gc::register_natives) -> trap loudly. A silent zero would
+                // miscompile (the lambda's env_ptr would be null + captures
+                // lost). This is a host-setup error, not a script error.
+                emit_trap(int(TrapReason::IllegalInstruction),
+                          "gc env alloc requires the gc extension to be registered");
+            }
+            // rax = heap env ptr. Spill it to the frame slot immediately (any
+            // further capture load clobbers volatile regs).
+            e.store_reg_mem(Reg::rbp, envptr_off, Reg::rax);
+            // copy each capture from its enclosing scope into [envptr + offset]
+            for (size_t i = 0; i < le->captures.size(); ++i) {
+                int32_t coff = le->capture_offsets[i];
+                const std::string& cname = le->captures[i];
+                const Type* ct = le->capture_types[i].get();
+                auto cit = locals.find(cname);
+                if (cit == locals.end()) {
+                    // #20 nested-lambda transitive capture: the value lives in
+                    // THIS lambda's env (one of its own captures). Load it from
+                    // [enclosing_env_ptr + cap_env_off] (the enclosing env_ptr
+                    // is in [rbp + lambda_env_off]) and store it into the new
+                    // heap env at [new_env_ptr + coff].
+                    auto lcit = compiling_lambda ? lambda_captures.find(cname)
+                                                 : lambda_captures.end();
+                    if (lcit != lambda_captures.end()) {
+                        int32_t cap_env_off = lcit->second.first;
+                        // new env ptr -> rcx (the store base)
+                        e.load_reg_mem(Reg::rcx, Reg::rbp, envptr_off);
+                        // enclosing env ptr -> rax
+                        e.load_reg_mem(Reg::rax, Reg::rbp, lambda_env_off);
+                        if (ct && ct->is_float()) {
+                            if (ct->prim == Prim::F64)
+                                e.movsd_xmm_mem(Xmm::xmm0, Reg::rax, cap_env_off);
+                            else
+                                e.movss_xmm_mem(Xmm::xmm0, Reg::rax, cap_env_off);
+                            if (ct->prim == Prim::F64)
+                                e.movsd_mem_xmm(Reg::rcx, coff, Xmm::xmm0);
+                            else
+                                e.movss_mem_xmm(Reg::rcx, coff, Xmm::xmm0);
+                        } else {
+                            e.load_reg_mem(Reg::rax, Reg::rax, cap_env_off);
+                            normalize_rax(ct);
+                            e.store_rax_elem(Reg::rcx, coff, 8);
+                        }
+                        continue;
+                    }
+                    // unresolvable capture: zero-fill the heap env slot.
+                    e.load_reg_mem(Reg::rcx, Reg::rbp, envptr_off);
+                    e.mov_reg_imm64(Reg::rax, 0);
+                    e.store_rax_elem(Reg::rcx, coff, 8);
+                    continue;
+                }
+                // capture is an enclosing-scope local: load value into rax
+                // (int) / xmm0 (float), then store to [envptr + coff] (envptr
+                // reloaded into rcx as the store base; rcx is volatile and not
+                // clobbered by the value load, which uses rax/xmm0 + rbp).
+                if (ct && ct->is_float()) {
+                    if (ct->prim == Prim::F64) e.movsd_xmm_mem(Xmm::xmm0, Reg::rbp, cit->second);
+                    else e.movss_xmm_mem(Xmm::xmm0, Reg::rbp, cit->second);
+                    e.load_reg_mem(Reg::rcx, Reg::rbp, envptr_off);
+                    if (ct->prim == Prim::F64) e.movsd_mem_xmm(Reg::rcx, coff, Xmm::xmm0);
+                    else { e.movss_mem_xmm(Reg::rcx, coff, Xmm::xmm0); }
+                } else {
+                    e.load_reg_mem(Reg::rax, Reg::rbp, cit->second);
+                    normalize_rax(ct);
+                    e.load_reg_mem(Reg::rcx, Reg::rbp, envptr_off);
+                    e.store_rax_elem(Reg::rcx, coff, 8);
+                }
+            }
+        } else if (le->env_size > 0) {
+            // ---- stack-env backend (default; unchanged) ----
             // alloc a frame temp sized to env_size (rounded up to a local slot)
             std::string name = "__envtmp$" + std::to_string(temp_counter++);
             // use a fixed-array-of-u8 backing type to reserve env_size bytes
@@ -1922,8 +2020,11 @@ void CG::eval(const Expr& ex) {
         }
         // rax = slot (the synthetic fn's dispatch slot)
         e.mov_reg_imm64(Reg::rax, int64_t(le->slot));
-        // rdx = env_ptr = lea [rbp + env_off] (0 if no env)
-        if (le->env_size > 0) {
+        // rdx = env_ptr. GC heap path: load the heap ptr from its frame slot.
+        // Stack path: lea [rbp + env_off]. 0 if no env.
+        if (gc_env) {
+            e.load_reg_mem(Reg::rdx, Reg::rbp, envptr_off);
+        } else if (le->env_size > 0) {
             // lea rdx, [rbp + env_off]  (env_off is negative)
             e.mov_reg_reg(Reg::rdx, Reg::rbp);
             e.add_reg_imm32(Reg::rdx, env_off);
@@ -1931,7 +2032,9 @@ void CG::eval(const Expr& ex) {
             e.mov_reg_imm64(Reg::rdx, 0);
         }
         if (non_serializable_reason.empty())
-            non_serializable_reason = "lambda env is a stack-frame-local allocation";
+            non_serializable_reason = gc_env
+                ? "lambda env is a GC heap allocation (process-local pin)"
+                : "lambda env is a stack-frame-local allocation";
         return;
     }
     if (auto* lit = dynamic_cast<const FloatLit*>(&ex)) {
