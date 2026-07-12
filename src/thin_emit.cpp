@@ -986,14 +986,16 @@ struct EmitCtx {
         }
         case ThinOp::StringDecrypt: {
             // inline XOR decrypt into a temp frame slot, then yield {rax=ptr, rdx=len}
-            const int32_t slot_off = in.meta.frame_off;
+            // data_temp_off = decrypted-data buffer; frame_off = slice result slot
+            const int32_t data_off = in.meta.data_temp_off != 0 ? in.meta.data_temp_off : in.meta.frame_off;
+            const int32_t slice_off = in.meta.frame_off;  // 0 if not frame-backed
             const int64_t len = in.meta.len;
             const uint8_t key = uint8_t(in.imm.i);
             // r11 = enc source (rodata base + addend)
             e.mov_reg_imm64_external(Reg::r11, AbsFixup::FunctionRodataBase, in.meta.addend);
-            // r10 = rbp - slot_off (frame slot address; slot_off is negative)
+            // r10 = rbp - data_off (frame slot address; data_off is negative)
             e.mov_reg_reg(Reg::r10, Reg::rbp);
-            e.sub_reg_imm32(Reg::r10, -slot_off);
+            e.sub_reg_imm32(Reg::r10, -data_off);
             // inline byte XOR (unrolled for len <= 256, loop for longer)
             if (len <= 256) {
                 for (int64_t i = 0; i < len; ++i) {
@@ -1028,18 +1030,19 @@ struct EmitCtx {
                 e.bind(done);
                 // re-derive slot base from rbp (r10 was incremented past the slot)
                 e.mov_reg_reg(Reg::rax, Reg::rbp);
-                e.sub_reg_imm32(Reg::rax, -slot_off);
+                e.sub_reg_imm32(Reg::rax, -data_off);
             }
             e.mov_reg_imm64(Reg::rdx, len);
             record_dst_rax(in.dst, in.meta.type);
             if (in.dst != 0) {
                 vregs[in.dst].type = in.meta.type;
-                // slice result is in {rax,rdx}; if frame-backed, store
-                if (in.meta.frame_off != 0) {
-                    e.store_reg_mem(Reg::rbp, in.meta.frame_off, Reg::rax);
-                    e.store_reg_mem(Reg::rbp, in.meta.frame_off + 8, Reg::rdx);
-                    vregs[in.dst].frame_off = in.meta.frame_off;
-                    vregs[in.dst + 1].frame_off = in.meta.frame_off + 8;
+                // slice result is in {rax,rdx}; if frame-backed, store to slice_off
+                // (NOT data_off — that's the decrypted data buffer)
+                if (slice_off != 0) {
+                    e.store_reg_mem(Reg::rbp, slice_off, Reg::rax);
+                    e.store_reg_mem(Reg::rbp, slice_off + 8, Reg::rdx);
+                    vregs[in.dst].frame_off = slice_off;
+                    vregs[in.dst + 1].frame_off = slice_off + 8;
                 }
             }
             break;
@@ -1499,6 +1502,10 @@ struct EmitCtx {
         // ── guards (safety) ──
         case ThinOp::DepthCheck:
             emit_depth_check();
+            // DepthCheck clobbers rax (loads max_depth/depth_ptr into eax/rax).
+            // Clear rax_vreg so a subsequent load_int_vreg does not take the
+            // stale-rax shortcut (the value that was in rax is now lost).
+            rax_vreg = 0;
             break;
         case ThinOp::BudgetCheck:
             emit_budget_check(int64_t(in.imm.i), "budget exceeded");

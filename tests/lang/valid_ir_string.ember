@@ -1,0 +1,13 @@
+// Tests string literals through the IR backend (--passes path).
+// The string literal → string_from_slice → string_length chain must produce
+// correct results when the IR backend + optimization passes are enabled.
+// expect: 24
+
+fn main() -> i64 {
+    let a: i64 = string_length("hello world!");
+    let b: i64 = string_length("ember");
+    let h: string = "testing";
+    let c: i64 = string_length(h);
+    // 12 + 5 + 7 = 24
+    return a + b + c;
+}

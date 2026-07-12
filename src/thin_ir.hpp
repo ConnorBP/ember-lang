@@ -168,6 +168,8 @@ struct ThinMeta {
     int32_t frame_off = 0;      // rbp-relative ABSOLUTE offset (negative) for
                                 // LoadFrame/StoreFrame/CopyBytes/FieldAddr and
                                 // for struct-by-value arg frame slots.
+                                // For StringDecrypt: the slice RESULT slot
+                                // ({ptr,len}); data temp uses data_temp_off.
     int32_t width = 8;          // operand byte width (1/2/4/8) for int
                                 // normalize + narrow element stores/loads
                                 // (matches value_bytes / normalize_rax).
@@ -199,6 +201,9 @@ struct ThinMeta {
                                 // FAdd..FMod / Cast / float Cmp).
     uint8_t trap_reason = 0;    // Trap-site reason (TrapReason ordinal) for
                                 // guards / BoundsCheck / DivOverflowCheck.
+    int32_t data_temp_off = 0;  // StringDecrypt: rbp-relative offset (negative)
+                                // for the decrypted-data temp buffer (separate
+                                // from frame_off which is the slice result slot).
 };
 
 // One three-address instruction: `dst = op src1 src2` (+ imm + meta + args).

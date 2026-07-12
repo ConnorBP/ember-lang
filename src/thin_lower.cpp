@@ -1301,11 +1301,25 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
     if (auto* lit = dynamic_cast<const StringLit*>(&ex)) {
         const uint32_t string_off = append_rodata(lit->baked_ptr, size_t(lit->baked_len));
         VReg ptr, len;
+        // The slice {ptr,len} from ConstStringRef/StringDecrypt must always be
+        // frame-backed: the ConstInt(len) that follows clobbers rax (where ptr
+        // lives), so any subsequent load_int_vreg(ptr) or load_slice_vreg(ptr)
+        // needs a frame slot to reload from. Without this, string literals
+        // through the IR backend produce garbage ptr values.
+        int32_t slice_slot;
+        {
+            // Allocate 16 contiguous bytes for {ptr, len}.
+            next_local_off += 16;
+            slice_slot = -next_local_off;
+            locals["__strslice$" + std::to_string(str_temp_counter)] = slice_slot;
+            local_types["__strslice$" + std::to_string(str_temp_counter)] = &type_i64();
+        }
         if (lit->encrypted && lit->baked_key != 0) {
-            const int32_t slot_off = alloc_str_temp(lit->baked_len);
+            const int32_t data_off = alloc_str_temp(lit->baked_len);
             ptr = new_slice_vregs(ex.ty); len = ptr + 1;
             ThinInstr& dec = emit(ThinOp::StringDecrypt, ptr, 0, 0, loc);
-            dec.meta.frame_off = slot_off;
+            dec.meta.data_temp_off = data_off;  // decrypted-data buffer
+            dec.meta.frame_off = slice_slot;     // slice result slot
             dec.meta.addend = string_off;
             dec.meta.base_kind = AbsFixup::FunctionRodataBase;
             dec.meta.len = int32_t(lit->baked_len);
@@ -1313,18 +1327,25 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
             dec.meta.type = ex.ty;
             ThinInstr& l = emit(ThinOp::ConstInt, len, 0, 0, loc);
             l.imm.i = lit->baked_len; l.meta.type = &type_i64(); l.meta.width = 8;
+            l.meta.frame_off = slice_slot + 8;  // frame-back len
         } else {
             ptr = new_slice_vregs(ex.ty); len = ptr + 1;
             ThinInstr& p = emit(ThinOp::ConstStringRef, ptr, 0, 0, loc);
             p.meta.addend = string_off; p.meta.base_kind = AbsFixup::FunctionRodataBase;
             p.meta.len = int32_t(lit->baked_len); p.meta.type = ex.ty;
+            p.meta.frame_off = slice_slot;  // frame-back the slice result
             ThinInstr& l = emit(ThinOp::ConstInt, len, 0, 0, loc);
             l.imm.i = lit->baked_len; l.meta.type = &type_i64(); l.meta.width = 8;
+            l.meta.frame_off = slice_slot + 8;  // frame-back len
         }
         // implicit conversion to a `string` handle: chained CallNative(ptr, len) -> i64.
         if (lit->implicit_to_string && lit->to_string_native_fn) {
             const Type* ret_ty = ex.ty ? ex.ty : &type_i64();
             VReg res = new_vreg(ret_ty);
+            // Frame-back the string handle result: a DepthCheck is emitted before
+            // the next call (string_length etc.), which clobbers rax. Without a
+            // frame slot, the handle is lost (load_int_vreg takes stale-rax).
+            int32_t handle_slot = alloc_local("__strhdl$" + std::to_string(str_temp_counter++), &type_i64());
             ThinInstr in;
             in.op = ThinOp::CallNative;
             in.loc = loc;
@@ -1339,6 +1360,7 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
             in.native_fn = lit->to_string_native_fn;
             in.ret_type = ret_ty;
             in.meta.type = ret_ty; in.meta.width = value_bytes(ret_ty, ctx.structs);
+            in.meta.frame_off = handle_slot;  // pin_int_dst stores rax here
             emit_depth_check(loc);
             cur_block().instrs.push_back(std::move(in));
             return { LoweredValue::Scalar, res, 0, ret_ty };

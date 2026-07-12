@@ -432,7 +432,7 @@ static std::vector<PathBench> make_paths() {
             "bench_slice_bounds", "indexing w/ bounds check (always on); C++ unchecked", false, 200, 20, 0, 1000000, true, false},
         {"string_decrypt",
             "fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; while (i < %N) { s = s + string_length(\"hello world!\"); i = i + 1; } return s; }\n",
-            "bench_string_decrypt", "inline-stack-XOR decrypt per use (string_xor!=0)", true, 2000, 50, 0xA5, 100000, false, false},
+            "bench_string_decrypt", "inline-stack-XOR decrypt per use (string_xor!=0)", true, 2000, 50, 0xA5, 100000, false, true},
         {"struct_by_value",
             "struct P { a: i32; b: i32; c: i32; }\n"
             "fn mkp(a: i32, b: i32, c: i32) -> P { let p: P = P { a: a, b: b, c: c }; return p; }\n"
