@@ -47,7 +47,7 @@ A modular damage calculator that exercises type inference, enums, structs,
 for-each over slices, pattern matching, operator overloads, and native calls —
 with comments marking where ember's unique properties show:
 
-```rust
+```rs
 // Enums are C-style named constants. The untyped form (`enum E { ... }`)
 // has i32 variants auto-incrementing from 0; an explicit `= N` sets the next
 // base. The typed form `enum E : T` (e.g. `enum Color : i32`) makes the enum
