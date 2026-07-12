@@ -131,12 +131,16 @@ struct CG {
     std::vector<uint8_t> rodata;
     std::string non_serializable_reason;
     // #20 lambda capture map (set when compiling a synthetic lambda fn):
-    // capture name -> (byte offset within env, type). The env_ptr is the
-    // __env param (params[0]), whose frame slot is in `locals["__env"]`.
+    // capture name -> (byte offset within env, type, by_ref). The env_ptr is
+    // the __env param (params[0]), whose frame slot is in `locals["__env"]`.
     // The Ident eval loads a capture as: load env_ptr from [rbp+__env_off],
-    // then load the value at [env_ptr + offset].
+    // then load the value at [env_ptr + offset]. A by_ref capture's env slot
+    // holds a POINTER to the captured variable's storage (not a copy), so the
+    // read is a DOUBLE dereference (load ptr from [env_ptr+offset], then load
+    // value from [ptr]) and a write stores THROUGH the pointer.
     bool compiling_lambda = false;
-    std::unordered_map<std::string, std::pair<int32_t, const Type*>> lambda_captures;
+    struct CaptureInfo { int32_t offset; const Type* ty; bool by_ref; };
+    std::unordered_map<std::string, CaptureInfo> lambda_captures;
     int32_t lambda_env_off = 0;  // frame slot offset of the __env param
     struct PendingNative {
         CompiledNativeBinding binding;
@@ -1904,24 +1908,59 @@ void CG::eval(const Expr& ex) {
                     auto lcit = compiling_lambda ? lambda_captures.find(cname)
                                                  : lambda_captures.end();
                     if (lcit != lambda_captures.end()) {
-                        int32_t cap_env_off = lcit->second.first;
+                        int32_t cap_env_off = lcit->second.offset;
+                        bool outer_by_ref = lcit->second.by_ref;
+                        bool inner_by_ref = i < le->capture_by_ref.size() && le->capture_by_ref[i];
                         // new env ptr -> rcx (the store base)
                         e.load_reg_mem(Reg::rcx, Reg::rbp, envptr_off);
                         // enclosing env ptr -> rax
                         e.load_reg_mem(Reg::rax, Reg::rbp, lambda_env_off);
-                        if (ct && ct->is_float()) {
-                            if (ct->prim == Prim::F64)
-                                e.movsd_xmm_mem(Xmm::xmm0, Reg::rax, cap_env_off);
-                            else
-                                e.movss_xmm_mem(Xmm::xmm0, Reg::rax, cap_env_off);
-                            if (ct->prim == Prim::F64)
-                                e.movsd_mem_xmm(Reg::rcx, coff, Xmm::xmm0);
-                            else
-                                e.movss_mem_xmm(Reg::rcx, coff, Xmm::xmm0);
-                        } else {
+                        // #20 by-ref transitive capture. The enclosing env slot
+                        // at cap_env_off holds either a VALUE (outer by-value)
+                        // or a POINTER (outer by-ref). The new env slot at coff
+                        // should hold a POINTER (inner by-ref) or a VALUE (inner
+                        // by-value). Four combinations:
+                        //   inner-ref  + outer-ref : copy the POINTER (1 deref)
+                        //   inner-ref  + outer-val : degrade — store the value
+                        //     (the original's storage isn't reachable through a
+                        //     by-value outer capture; v1 degrades inner to
+                        //     by-value rather than pointing into the outer env)
+                        //   inner-val  + outer-ref : store the VALUE (2 derefs)
+                        //   inner-val  + outer-val : store the VALUE (1 deref)
+                        // Floats are only meaningful for the VALUE cases (a
+                        // pointer is always an i64); a by-ref float capture is
+                        // degraded to by-value here too (the inner reads the
+                        // float value, not a pointer).
+                        bool store_ptr = inner_by_ref && outer_by_ref && !(ct && ct->is_float());
+                        if (store_ptr) {
+                            // load the pointer from [rax + cap_env_off] -> rax
                             e.load_reg_mem(Reg::rax, Reg::rax, cap_env_off);
-                            normalize_rax(ct);
                             e.store_rax_elem(Reg::rcx, coff, 8);
+                        } else if (outer_by_ref) {
+                            // load ptr from [rax + cap_env_off], then value at [ptr]
+                            e.load_reg_mem(Reg::rax, Reg::rax, cap_env_off);
+                            if (ct && ct->is_float()) {
+                                if (ct->prim == Prim::F64) e.movsd_xmm_mem(Xmm::xmm0, Reg::rax, 0);
+                                else e.movss_xmm_mem(Xmm::xmm0, Reg::rax, 0);
+                                if (ct->prim == Prim::F64) e.movsd_mem_xmm(Reg::rcx, coff, Xmm::xmm0);
+                                else e.movss_mem_xmm(Reg::rcx, coff, Xmm::xmm0);
+                            } else {
+                                e.load_reg_mem(Reg::rax, Reg::rax, 0);
+                                normalize_rax(ct);
+                                e.store_rax_elem(Reg::rcx, coff, 8);
+                            }
+                        } else {
+                            // outer by-value: load the value from [rax + cap_env_off]
+                            if (ct && ct->is_float()) {
+                                if (ct->prim == Prim::F64) e.movsd_xmm_mem(Xmm::xmm0, Reg::rax, cap_env_off);
+                                else e.movss_xmm_mem(Xmm::xmm0, Reg::rax, cap_env_off);
+                                if (ct->prim == Prim::F64) e.movsd_mem_xmm(Reg::rcx, coff, Xmm::xmm0);
+                                else e.movss_mem_xmm(Reg::rcx, coff, Xmm::xmm0);
+                            } else {
+                                e.load_reg_mem(Reg::rax, Reg::rax, cap_env_off);
+                                normalize_rax(ct);
+                                e.store_rax_elem(Reg::rcx, coff, 8);
+                            }
                         }
                         continue;
                     }
@@ -1935,7 +1974,19 @@ void CG::eval(const Expr& ex) {
                 // (int) / xmm0 (float), then store to [envptr + coff] (envptr
                 // reloaded into rcx as the store base; rcx is volatile and not
                 // clobbered by the value load, which uses rax/xmm0 + rbp).
-                if (ct && ct->is_float()) {
+                // #20 by-ref: instead of copying the VALUE, store the ADDRESS of
+                // the frame slot (lea rbp + off) — the env slot holds a POINTER
+                // to the variable's storage, so post-capture mutations are
+                // visible + body writes mutate the original. The pointer is an
+                // i64 regardless of the capture's scalar type.
+                const bool by_ref = i < le->capture_by_ref.size() && le->capture_by_ref[i];
+                if (by_ref) {
+                    e.load_reg_mem(Reg::rcx, Reg::rbp, envptr_off);
+                    // lea rax, [rbp + cit->second]  (cit->second is negative)
+                    e.mov_reg_reg(Reg::rax, Reg::rbp);
+                    e.add_reg_imm32(Reg::rax, cit->second);
+                    e.store_rax_elem(Reg::rcx, coff, 8);
+                } else if (ct && ct->is_float()) {
                     if (ct->prim == Prim::F64) e.movsd_xmm_mem(Xmm::xmm0, Reg::rbp, cit->second);
                     else e.movss_xmm_mem(Xmm::xmm0, Reg::rbp, cit->second);
                     e.load_reg_mem(Reg::rcx, Reg::rbp, envptr_off);
@@ -1978,22 +2029,50 @@ void CG::eval(const Expr& ex) {
                     auto lcit = compiling_lambda ? lambda_captures.find(cname)
                                                  : lambda_captures.end();
                     if (lcit != lambda_captures.end()) {
-                        int32_t cap_env_off = lcit->second.first;
+                        int32_t cap_env_off = lcit->second.offset;
+                        bool outer_by_ref = lcit->second.by_ref;
+                        bool inner_by_ref = i < le->capture_by_ref.size() && le->capture_by_ref[i];
                         // load env_ptr from [rbp + lambda_env_off] into rax
                         e.load_reg_mem(Reg::rax, Reg::rbp, lambda_env_off);
-                        if (ct && ct->is_float()) {
-                            if (ct->prim == Prim::F64)
-                                e.movsd_xmm_mem(Xmm::xmm0, Reg::rax, cap_env_off);
-                            else
-                                e.movss_xmm_mem(Xmm::xmm0, Reg::rax, cap_env_off);
-                            if (ct->prim == Prim::F64)
-                                e.movsd_mem_xmm(Reg::rbp, dst, Xmm::xmm0);
-                            else
-                                e.movss_mem_xmm(Reg::rbp, dst, Xmm::xmm0);
-                        } else {
+                        // #20 by-ref transitive capture (stack env). Same 4-way
+                        // logic as the GC path, but the destination is the stack
+                        // env slot at [rbp + dst]. See the GC-path block for the
+                        // full by-ref/outer/inner matrix explanation.
+                        bool store_ptr = inner_by_ref && outer_by_ref && !(ct && ct->is_float());
+                        if (store_ptr) {
                             e.load_reg_mem(Reg::rax, Reg::rax, cap_env_off);
-                            normalize_rax(ct);
                             e.store_rax_elem(Reg::rbp, dst, 8);
+                        } else if (outer_by_ref) {
+                            e.load_reg_mem(Reg::rax, Reg::rax, cap_env_off);
+                            if (ct && ct->is_float()) {
+                                if (ct->prim == Prim::F64)
+                                    e.movsd_xmm_mem(Xmm::xmm0, Reg::rax, 0);
+                                else
+                                    e.movss_xmm_mem(Xmm::xmm0, Reg::rax, 0);
+                                if (ct->prim == Prim::F64)
+                                    e.movsd_mem_xmm(Reg::rbp, dst, Xmm::xmm0);
+                                else
+                                    e.movss_mem_xmm(Reg::rbp, dst, Xmm::xmm0);
+                            } else {
+                                e.load_reg_mem(Reg::rax, Reg::rax, 0);
+                                normalize_rax(ct);
+                                e.store_rax_elem(Reg::rbp, dst, 8);
+                            }
+                        } else {
+                            if (ct && ct->is_float()) {
+                                if (ct->prim == Prim::F64)
+                                    e.movsd_xmm_mem(Xmm::xmm0, Reg::rax, cap_env_off);
+                                else
+                                    e.movss_xmm_mem(Xmm::xmm0, Reg::rax, cap_env_off);
+                                if (ct->prim == Prim::F64)
+                                    e.movsd_mem_xmm(Reg::rbp, dst, Xmm::xmm0);
+                                else
+                                    e.movss_mem_xmm(Reg::rbp, dst, Xmm::xmm0);
+                            } else {
+                                e.load_reg_mem(Reg::rax, Reg::rax, cap_env_off);
+                                normalize_rax(ct);
+                                e.store_rax_elem(Reg::rbp, dst, 8);
+                            }
                         }
                         continue;
                     }
@@ -2003,7 +2082,16 @@ void CG::eval(const Expr& ex) {
                     e.store_rax_elem(Reg::rbp, dst, 8);
                     continue;
                 }
-                if (ct && ct->is_float()) {
+                // #20 by-ref (stack env): store the ADDRESS of the frame slot
+                // (lea rbp + off) into the env slot — the env holds a POINTER
+                // to the variable's storage. Same as the GC path; the pointer is
+                // an i64 regardless of scalar type.
+                const bool by_ref = i < le->capture_by_ref.size() && le->capture_by_ref[i];
+                if (by_ref) {
+                    e.mov_reg_reg(Reg::rax, Reg::rbp);
+                    e.add_reg_imm32(Reg::rax, cit->second);
+                    e.store_rax_elem(Reg::rbp, dst, 8);
+                } else if (ct && ct->is_float()) {
                     if (ct->prim == Prim::F64) e.movsd_xmm_mem(Xmm::xmm0, Reg::rbp, cit->second);
                     else e.movss_xmm_mem(Xmm::xmm0, Reg::rbp, cit->second);
                     // store xmm0 to env slot (as an 8-byte slot — f64 fills it;
@@ -2061,17 +2149,33 @@ void CG::eval(const Expr& ex) {
         if (compiling_lambda) {
             auto cit = lambda_captures.find(id->name);
             if (cit != lambda_captures.end()) {
-                int32_t env_off = cit->second.first;
-                const Type* ct = cit->second.second;
+                int32_t env_off = cit->second.offset;
+                const Type* ct = cit->second.ty;
+                bool by_ref = cit->second.by_ref;
                 // load env_ptr from [rbp + lambda_env_off] into rax
                 e.load_reg_mem(Reg::rax, Reg::rbp, lambda_env_off);
-                // load the value at [rax + env_off]
-                if (ct && ct->is_float()) {
-                    if (ct->prim == Prim::F64) e.movsd_xmm_mem(Xmm::xmm0, Reg::rax, env_off);
-                    else e.movss_xmm_mem(Xmm::xmm0, Reg::rax, env_off);
+                // #20 by-ref: the env slot holds a POINTER to the captured
+                // variable's storage, so load the pointer from [rax + env_off]
+                // and THEN load the value from [ptr] (double dereference).
+                // by-value: the env slot holds the value directly (single deref).
+                if (by_ref) {
+                    e.load_reg_mem(Reg::rax, Reg::rax, env_off);  // rax = ptr to storage
+                    if (ct && ct->is_float()) {
+                        if (ct->prim == Prim::F64) e.movsd_xmm_mem(Xmm::xmm0, Reg::rax, 0);
+                        else e.movss_xmm_mem(Xmm::xmm0, Reg::rax, 0);
+                    } else {
+                        e.load_reg_mem(Reg::rax, Reg::rax, 0);
+                        normalize_rax(ct);
+                    }
                 } else {
-                    e.load_reg_mem(Reg::rax, Reg::rax, env_off);
-                    normalize_rax(ct);
+                    // load the value at [rax + env_off]
+                    if (ct && ct->is_float()) {
+                        if (ct->prim == Prim::F64) e.movsd_xmm_mem(Xmm::xmm0, Reg::rax, env_off);
+                        else e.movss_xmm_mem(Xmm::xmm0, Reg::rax, env_off);
+                    } else {
+                        e.load_reg_mem(Reg::rax, Reg::rax, env_off);
+                        normalize_rax(ct);
+                    }
                 }
                 return;
             }
@@ -2647,6 +2751,63 @@ void CG::eval(const Expr& ex) {
         }
         // store rax (or xmm0, or rax/rdx for a slice) to target
         if (auto* id = dynamic_cast<Ident*>(a->target.get())) {
+            // #20 lambda capture write: if this name is a capture (lives in the
+            // env, not a frame slot), store through the env. by-ref: the env
+            // slot holds a POINTER to the captured storage, so load the ptr then
+            // store the value through it (mutates the original). by-value: store
+            // into the env slot directly (a by-value capture is const at sema, so
+            // this path is only reached for a by-ref capture; the by-value case
+            // is defensive). The value is in rax (int) / xmm0 (float).
+            if (compiling_lambda) {
+                auto cit = lambda_captures.find(id->name);
+                if (cit != lambda_captures.end()) {
+                    int32_t env_off = cit->second.offset;
+                    const Type* ct = cit->second.ty;
+                    bool by_ref = cit->second.by_ref;
+                    if (by_ref) {
+                        // The value to store is in rax (int) / xmm0 (float).
+                        // Compute the pointer to the captured storage WITHOUT
+                        // clobbering the value: for the int case the value is
+                        // in rax, so load the pointer into r9 (volatile, free at
+                        // the store point); for the float case the value is in
+                        // xmm0, so rax is free to hold the pointer.
+                        if (ct && ct->is_float()) {
+                            e.load_reg_mem(Reg::rax, Reg::rbp, lambda_env_off);
+                            e.load_reg_mem(Reg::rax, Reg::rax, env_off);  // rax = ptr
+                            if (ct->prim == Prim::F64) e.movsd_mem_xmm(Reg::rax, 0, Xmm::xmm0);
+                            else e.movss_mem_xmm(Reg::rax, 0, Xmm::xmm0);
+                        } else {
+                            // r9 = env_ptr; r9 = ptr (from env slot); store rax through r9
+                            e.load_reg_mem(Reg::r9, Reg::rbp, lambda_env_off);
+                            e.load_reg_mem(Reg::r9, Reg::r9, env_off);
+                            normalize_rax(ct);
+                            e.store_rax_elem(Reg::r9, 0, 8);
+                        }
+                    } else {
+                        // by-value: store into the env slot directly. rax/xmm0
+                        // holds the value; need env_ptr in a base reg. Use r9
+                        // (volatile, not rax) as the base to avoid clobbering
+                        // the value already in rax.
+                        e.load_reg_mem(Reg::r9, Reg::rbp, lambda_env_off);
+                        if (ct && ct->is_float()) {
+                            if (ct->prim == Prim::F64) e.movsd_mem_xmm(Reg::r9, env_off, Xmm::xmm0);
+                            else e.movss_mem_xmm(Reg::r9, env_off, Xmm::xmm0);
+                        } else {
+                            normalize_rax(ct);
+                            e.store_rax_elem(Reg::r9, env_off, 8);
+                        }
+                    }
+                    // postfix ++/-- saved the pre-update value; restore it now
+                    // (mirrors the locals branch's responsibility below).
+                    if (a->postfix) {
+                        if (a->target->ty && a->target->ty->is_float()) {
+                            bool f64=a->target->ty->prim==Prim::F64;
+                            if(f64)e.movsd_xmm_xmm(Xmm::xmm0,Xmm::xmm2);else e.movss_xmm_xmm(Xmm::xmm0,Xmm::xmm2);
+                        } else { e.pop(Reg::rax); }
+                    }
+                    return;
+                }
+            }
             auto it = locals.find(id->name);
             if (it != locals.end()) {
                 const Type* t = local_types[id->name];
@@ -4772,7 +4933,8 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
         for (size_t i = 0; i < f.lambda_captures.size(); ++i) {
             cg.lambda_captures[f.lambda_captures[i]] = {
                 f.lambda_capture_offsets[i],
-                f.lambda_capture_types[i].get()
+                f.lambda_capture_types[i].get(),
+                i < f.lambda_capture_by_ref.size() && f.lambda_capture_by_ref[i]
             };
         }
     }

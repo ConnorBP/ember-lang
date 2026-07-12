@@ -890,6 +890,32 @@ struct P {
             // synthetic fn's body directly).
             uint32_t l = t.line, c = t.col;
             adv();  // 'fn'
+            // #20 by-reference capture: an optional capture list `[&x, &y, z]`
+            // between the `fn` keyword and the param `(`. A `&` prefix marks a
+            // by-ref capture (the env slot holds a POINTER to the variable's
+            // storage, so post-capture mutations are visible + body writes
+            // mutate the original); a bare name is an explicit by-value
+            // capture (redundant with the implicit by-value walk, but allowed
+            // for clarity). Absent the list, ALL captures are implicit by-value
+            // (the pre-existing behavior, byte-identical). The list ONLY names
+            // by-ref captures here (ref_capture_names); bare by-value names are
+            // accepted syntactically but not recorded (the implicit walk finds
+            // them). This keeps the grammar unambiguous: a `[` here can ONLY be
+            // a capture list (an array literal `[` never follows the `fn`
+            // keyword), and a `fn` type (`fn(i64)->i64`) is parsed in
+            // parse_type, not here, so the list never interferes with types.
+            std::vector<std::string> ref_caps;
+            if (at(Tk::LBracket)) {
+                adv();  // '['
+                if (!at(Tk::RBracket)) {
+                    do {
+                        bool by_ref = accept(Tk::Amp);  // optional '&'
+                        std::string cname = expect(Tk::Ident, "capture name in lambda capture list").text;
+                        if (by_ref) ref_caps.push_back(cname);
+                    } while (accept(Tk::Comma));
+                }
+                expect(Tk::RBracket, "']' to close lambda capture list");
+            }
             expect(Tk::LParen, "'(' after 'fn'");
             std::vector<Param> params;
             if (!at(Tk::RParen)) {
@@ -921,6 +947,7 @@ struct P {
             le->params = params;       // declared params (sans env)
             le->ret = ret;
             le->synthetic_fn_name = name;
+            le->ref_capture_names = std::move(ref_caps);  // #20 by-ref capture
             // The body lives on the synthetic FuncDecl (prog.funcs.back());
             // sema walks it there for the capture scan + body check.
             return le;

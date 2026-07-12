@@ -62,6 +62,22 @@
 //   __ember_gc_collect()            -> i64 freed run a collection cycle
 //   __ember_gc_live()               -> i64 count live object count
 //
+//   --- script-visible new/delete (full GC integration) ---
+//   gc_new(i64 size)     -> i64 ptr   allocate + pin a raw GC heap object
+//   gc_delete(i64 ptr)   -> i64 ok    unroot (mark collectable); 1 if was pinned
+//   gc_collect()         -> i64 freed run a collection cycle (alias of the above)
+//   gc_live()            -> i64 count live object count (alias of the above)
+//
+// The __ember_* natives are engine-internal (codegen's lambda-env path calls
+// __ember_gc_alloc_env when CodeGenCtx::use_gc_env is set). The gc_* natives
+// are the USER-FACING surface: a script can allocate raw GC heap objects
+// (gc_new), release them for collection (gc_delete), and observe the heap
+// (gc_collect/gc_live). This is the v1 new/delete — a raw i64 handle the
+// script holds + releases, with the tracing GC reclaiming unreachable
+// (unpinned) objects. `new Type{...}` syntax with typed field access needs a
+// pointer-type system (ember structs are value types today); these natives
+// are the heap-management substrate that follow-up would build on.
+//
 // codegen's lambda-env case (src/codegen.cpp) calls __ember_gc_alloc_env when
 // CodeGenCtx::use_gc_env is set, instead of stack-allocating the env. The
 // natives receive/return the env pointer as an i64 (Win64: a pointer is an
@@ -77,17 +93,43 @@
 //
 // === WHAT REMAINS (beyond this v1 wiring) =================================
 //
+// 0. DONE (full GC integration session): by-reference capture + new/delete.
+//    * By-ref capture: `fn[&x, &y]` capture-list syntax (parser + sema +
+//      codegen). A by-ref capture's env slot holds a POINTER to the captured
+//      variable's storage (not a copy), so post-capture mutations are visible
+//      + body writes mutate the original. Works on BOTH the GC heap env path
+//      (use_gc_env) and the default stack-env path. Nested/transitive by-ref
+//      captures copy the pointer through the enclosing env. See
+//      tests/lang/valid_gc_by_ref{,_write}.ember + gc_full_test Part (a).
+//    * new/delete: script-visible gc_new(size)/gc_delete(ptr)/gc_collect()/
+//      gc_live() natives. gc_new alloc+pins; gc_delete unroots (collectable);
+//      gc_collect reaps unreachable; gc_live reports. See gc_full_test Parts
+//      (b)/(c). `new Type{...}` syntax with typed field access needs a pointer
+//      type system (ember structs are value types today) — the natives are the
+//      heap-management substrate that follow-up would build on.
+//    * Root scanning (v1): the existing pin layer IS the root mechanism —
+//      collect() traces from the registered root slots (every gc_alloc_env /
+//      gc_new pins). This is the task's allowed v1 approach (explicit root
+//      registration). The precise frame-layout approach is item 1 below.
+//
 // 1. JIT'd root tracking: emit __ember_gc_unroot_env calls at the owning
 //    frame's epilogue for frame-local envs, so they are reaped automatically
 //    on frame return (today they stay pinned until gc_reset). Escaping envs
-//    (a lambda returned/stored to a global) must stay pinned -- the codegen
+//      (a lambda returned/stored to a global) must stay pinned -- the codegen
 //    needs an escape analysis to distinguish the two. This is the step that
 //    makes the GC fully automatic for the JIT'd path.
-// 2. RefMap precision: today a lambda env's captures are scalars (i64/f64),
-//    so the env has no outgoing GC pointers (refmap_none). When a capture can
-//    itself be a GC object (a captured lambda/coroutine), the env's RefMap
-//    must list those capture byte offsets so the tracer follows them. Sema
-//    knows each capture's type; codegen would build the RefMap at alloc time.
+// 2. RefMap precision: today a lambda env's captures are scalars (i64/f64)
+//    OR pointers to frame slots (by-ref captures). A by-ref capture's env
+//    slot holds a pointer to a STACK frame slot, NOT a GC object, so it is
+//    correctly NOT in the RefMap (the tracer would find is_live()==false and
+//    skip it; a dangling frame-slot pointer after the frame dies is safe
+//    because refmap_none means the tracer never follows it). When a capture
+//    can itself be a GC OBJECT (a captured lambda/coroutine whose env is on
+//    this heap), the env's RefMap must list those capture byte offsets so the
+//    tracer follows them. Sema knows each capture's type; codegen would build
+//    the RefMap at alloc time. (By-ref of a GC object would point into the
+//    heap — that WOULD be a RefMap entry; today by-ref is scalar-frame-slot
+//    only, so refmap_none stays correct.)
 // 3. Coroutine suspended frames (#21): a suspended coroutine's frame holds
 //    live locals (possibly GC pointers); wiring those onto this heap (with the
 //    frame rooted while suspended) is the coroutine half of this task. The

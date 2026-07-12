@@ -321,7 +321,12 @@ struct Checker {
         // lambda's env struct (not a frame slot). env_offset is the byte offset
         // within env. Sema declares captures this way in the synthetic fn's
         // scope; codegen loads them from [env_ptr + env_offset].
-        bool is_env_capture = false; int32_t env_offset = 0; };
+        // env_capture_by_ref: a by-REF capture's env slot holds a POINTER to
+        // the captured variable's storage (not a copy), so codegen
+        // double-dereferences on read and stores-through on write. A by-ref
+        // capture is also mutable (is_const=false) so the body can mutate the
+        // original through the pointer.
+        bool is_env_capture = false; int32_t env_offset = 0; bool env_capture_by_ref = false; };
     std::vector<std::vector<Var>> scopes;
 
     // #20 nested-lambda capture: a snapshot of the ENCLOSING scope chain at
@@ -3438,6 +3443,7 @@ const Type* Checker::check_lambda(LambdaExpr& le) {
     // capture via GC is the follow-up.)
     std::vector<std::shared_ptr<Type>> cap_types;
     std::vector<int32_t> cap_offsets;
+    std::vector<bool> cap_by_ref;  // #20: per-capture by-ref flag (parallel to caps)
     int32_t env_off = 0;
     for (const auto& name : caps) {
         const Type* vt = lookup_var(name);
@@ -3447,7 +3453,9 @@ const Type* Checker::check_lambda(LambdaExpr& le) {
             continue;
         }
         // v1: captures must be scalars (fit in 8 bytes, no GC needed). Reject
-        // slices/structs/arrays (by-value copy of those is a follow-up).
+        // slices/structs/arrays (by-value copy of those is a follow-up). A
+        // by-ref capture stores a POINTER (8 bytes) to the scalar's storage,
+        // so the scalar-only restriction still holds (the pointer is 8 bytes).
         if (vt->is_slice || vt->array_len > 0 ||
             (!vt->struct_name.empty() && is_registered_struct(vt))) {
             err("lambda capture '" + name + "' has type " + vt->to_string() +
@@ -3455,9 +3463,19 @@ const Type* Checker::check_lambda(LambdaExpr& le) {
                 "capture is a follow-up)", le.loc.line, le.loc.col);
             // still record it so the body resolves (use the type as-is)
         }
+        // #20 by-ref: a name explicitly marked `&` in the capture list is a
+        // by-ref capture (the env slot holds a pointer to the variable's
+        // storage). Default (no capture list, or bare name in the list) is
+        // by-value (the env slot holds a copy). by-ref captures are MUTABLE
+        // inside the body (a write mutates the original); by-value captures
+        // stay immutable (bound is_const below).
+        bool by_ref = (std::find(le.ref_capture_names.begin(),
+                                le.ref_capture_names.end(), name)
+                       != le.ref_capture_names.end());
         cap_types.push_back(std::make_shared<Type>(*vt));
         cap_offsets.push_back(env_off);
-        env_off += 8;  // every capture occupies one 8-byte slot (v1 scalars)
+        cap_by_ref.push_back(by_ref);
+        env_off += 8;  // every capture occupies one 8-byte slot (value OR ptr)
     }
     int32_t env_size = env_off;
     // Record capture metadata on BOTH the LambdaExpr (creation-site codegen)
@@ -3465,10 +3483,12 @@ const Type* Checker::check_lambda(LambdaExpr& le) {
     le.captures = caps;
     le.capture_types = cap_types;
     le.capture_offsets = cap_offsets;
+    le.capture_by_ref = cap_by_ref;
     le.env_size = env_size;
     lf->lambda_captures = caps;
     lf->lambda_capture_types = cap_types;
     lf->lambda_capture_offsets = cap_offsets;
+    lf->lambda_capture_by_ref = cap_by_ref;
     lf->env_size = env_size;
     // Prepend the hidden __env i64 param to the synthetic fn (params[0]).
     // The body's captures are NOT params — they're env-capture vars bound in
@@ -3535,14 +3555,20 @@ void Checker::check_lambda_func(FuncDecl& f) {
     declare(f.params[0].name, intern(*f.params[0].ty), false, false, f.params[0].loc);
     // Bind the captures as env-capture vars (is_env_capture=true + offset).
     // These resolve capture Idents in the body to env loads (not frame slots).
+    // #20 by-ref: a by-ref capture is MUTABLE (is_const=false) so a write in
+    // the body mutates the original through the pointer; a by-value capture
+    // stays immutable (is_const=true). env_capture_by_ref tells codegen to
+    // double-dereference on read + store-through on write.
     for (size_t i = 0; i < f.lambda_captures.size(); ++i) {
+        bool by_ref = i < f.lambda_capture_by_ref.size() && f.lambda_capture_by_ref[i];
         Var v;
         v.name = f.lambda_captures[i];
         v.ty = intern(*f.lambda_capture_types[i]);
-        v.is_const = true;            // captures are by-value copies (immutable)
+        v.is_const = !by_ref;          // by-ref captures are mutable; by-value immutable
         v.local_array_view = false;
         v.is_env_capture = true;
         v.env_offset = f.lambda_capture_offsets[i];
+        v.env_capture_by_ref = by_ref;
         scopes.back().push_back(std::move(v));
     }
     // Bind the declared params (params[1..]) normally.

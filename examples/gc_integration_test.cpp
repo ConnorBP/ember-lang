@@ -372,6 +372,144 @@ static int run_part_b() {
         check(r==2001000,"B5b: 2000-lambda loop returns 2001000 (envs survive auto-collect)");
     }
 
+    // [B6] by-reference capture (read): a lambda captures x by ref (`fn[&x]`),
+    //      x is modified AFTER the lambda is created, the lambda sees the NEW
+    //      value. The env slot holds a POINTER to x's storage (not a copy), so
+    //      the post-capture mutation (x = 99) is visible inside the body. This
+    //      is the core by-ref semantics + the GC env is on the heap (use_gc_env).
+    {
+        bool ok;
+        const char* src =
+            "fn main() -> i64 {\n"
+            "    let mut x: i64 = 10;\n"
+            "    let f = fn[&x]() -> i64 { return x; };\n"
+            "    x = 99;\n"
+            "    return f();\n"
+            "}\n";
+        int64_t r = run_one(src, &ok);
+        check(ok,   "B6a: by-ref capture (read) compiled + ran (GC env)");
+        check(r==99,"B6b: by-ref capture sees post-capture mutation (returns 99)");
+    }
+
+    // [B7] by-reference capture (write-through) + mixed by-value: a lambda
+    //      captures x by ref AND mutates it inside the body; the mutation is
+    //      visible in the enclosing scope after the call. y is by-value (no &),
+    //      an immutable copy. Mixed `[&x, y]` capture list.
+    {
+        bool ok;
+        const char* src =
+            "fn main() -> i64 {\n"
+            "    let mut x: i64 = 10;\n"
+            "    let mut y: i64 = 20;\n"
+            "    let f = fn[&x, y]() -> i64 { x = x + 5; return x + y; };\n"
+            "    let r = f();\n"
+            "    return r + x;\n"
+            "}\n";
+        int64_t r = run_one(src, &ok);
+        // x -> 15 (mutated through by-ref), r = 15 + 20 = 35, r + x = 50
+        check(ok,   "B7a: by-ref write-through + mixed capture compiled + ran (GC env)");
+        check(r==50,"B7b: by-ref write-through mutates original (returns 50)");
+    }
+
+    // [B8] nested by-ref capture (transitive): outer captures x by ref, inner
+    //      (nested) lambda also captures x by ref; the inner lambda sees the
+    //      post-capture mutation. Exercises the transitive by-ref path (the
+    //      inner env copies the POINTER from the outer env).
+    {
+        bool ok;
+        const char* src =
+            "fn main() -> i64 {\n"
+            "    let mut x: i64 = 10;\n"
+            "    let outer = fn[&x]() -> i64 {\n"
+            "        let inner = fn[&x]() -> i64 { return x; };\n"
+            "        return inner();\n"
+            "    };\n"
+            "    x = 42;\n"
+            "    return outer();\n"
+            "}\n";
+        int64_t r = run_one(src, &ok);
+        check(ok,   "B8a: nested by-ref capture compiled + ran (GC env)");
+        check(r==42,"B8b: nested by-ref sees post-capture mutation (returns 42)");
+    }
+
+    return g_fail;
+}
+
+// ---- PART C: script-visible new/delete (gc_new/gc_delete/gc_collect/gc_live) ----
+// The full GC integration's new/delete surface: a script allocates raw GC
+// heap objects via gc_new (pinned, so they survive auto-collects), releases
+// them via gc_delete (unroot -> collectable), and observes the heap via
+// gc_collect/gc_live. This is the script-level proof of: (b) GC collects
+// unreachable objects (heap stays bounded), and (c) reachable (pinned)
+// objects survive collection. Mirrors Part A's host-API proof but through
+// the full compile+run pipeline with the script calling the natives.
+static int run_part_c() {
+    std::printf("=== PART C: script-visible new/delete (gc_new/gc_delete) ===\n");
+
+    // [C1] new/delete + collect: allocate 100 objects, delete each, collect,
+    //      verify live drops to 0 (all unreachable ones collected).
+    {
+        bool ok;
+        const char* src =
+            "fn main() -> i64 {\n"
+            "    let mut i: i64 = 0;\n"
+            "    while (i < 100) {\n"
+            "        let p = gc_new(16);\n"
+            "        gc_delete(p);\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    gc_collect();\n"
+            "    return gc_live();\n"
+            "}\n";
+        int64_t r = run_one(src, &ok);
+        check(ok,  "C1a: new/delete loop compiled + ran (no trap)");
+        check(r==0,"C1b: after delete+collect, gc_live()==0 (all collected)");
+    }
+
+    // [C2] reachable (pinned) objects survive collection: keep 5 objects
+    //      reachable (do NOT delete them), delete the rest, collect, verify
+    //      live == 5. This is the no-leak proof: reachable objects survive.
+    {
+        bool ok;
+        const char* src =
+            "fn main() -> i64 {\n"
+            "    let mut kept: i64 = 0;\n"
+            "    let mut i: i64 = 0;\n"
+            "    while (i < 200) {\n"
+            "        let p = gc_new(16);\n"
+            "        if (i < 5) { kept = kept + 1; }\n"
+            "        else { gc_delete(p); }\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    gc_collect();\n"
+            "    return gc_live();\n"
+            "}\n";
+        int64_t r = run_one(src, &ok);
+        check(ok,  "C2a: keep-5-delete-rest compiled + ran");
+        check(r==5,"C2b: reachable (pinned) survive collect; gc_live()==5");
+    }
+
+    // [C3] heap stays bounded under many allocs: 5000 allocs + immediate
+    //      delete; the auto-collect threshold (1024) fires mid-run; live must
+    //      stay bounded (well under 5000). Final collect -> 0.
+    {
+        bool ok;
+        const char* src =
+            "fn main() -> i64 {\n"
+            "    let mut i: i64 = 0;\n"
+            "    while (i < 5000) {\n"
+            "        let p = gc_new(32);\n"
+            "        gc_delete(p);\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    gc_collect();\n"
+            "    return gc_live();\n"
+            "}\n";
+        int64_t r = run_one(src, &ok);
+        check(ok,  "C3a: 5000 alloc+delete loop compiled + ran (auto-collect mid-run)");
+        check(r==0,"C3b: heap bounded; after final collect gc_live()==0");
+    }
+
     return g_fail;
 }
 
@@ -379,6 +517,7 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     int a = run_part_a();
     int b = run_part_b();
-    std::printf("\ngc_integration_test: %s\n", (a || b) ? "FAIL" : "PASS");
-    return (a || b) ? 1 : 0;
+    int c = run_part_c();
+    std::printf("\ngc_integration_test: %s\n", (a || b || c) ? "FAIL" : "PASS");
+    return (a || b || c) ? 1 : 0;
 }

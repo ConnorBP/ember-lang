@@ -399,6 +399,18 @@ struct LambdaExpr : Expr {
     std::vector<std::shared_ptr<Type>> capture_types;// capture types (sema)
     std::vector<int32_t> capture_offsets;            // byte offsets within env (sema)
     int32_t env_size = 0;                             // total env bytes (sema)
+    // #20 by-reference capture: names explicitly marked by-ref in an optional
+    // capture list `[&x, &y]` before the `fn` keyword (parser fills this). A
+    // by-ref capture's env slot holds a POINTER to the captured variable's
+    // storage (not a copy of its value), so a mutation of the variable AFTER
+    // the lambda is created is visible inside the body (and a write inside the
+    // body mutates the original). The env is GC-managed (use_gc_env path) so it
+    // outlives the creating frame; the pointed-to storage is a frame slot, so a
+    // by-ref capture is only valid while the creating frame is alive (the same
+    // lifetime constraint as C++ `[&x]` capture of a stack local) — the GC keeps
+    // the env reachable; it does NOT extend the pointed-to local's lifetime.
+    std::vector<std::string> ref_capture_names;       // names marked `&` in the capture list (parser)
+    std::vector<bool> capture_by_ref;                 // per-capture by-ref flag, parallel to `captures` (sema)
 };
 
 struct FuncDecl {
@@ -442,6 +454,11 @@ struct FuncDecl {
     std::vector<std::shared_ptr<Type>> lambda_capture_types;// capture types
     std::vector<int32_t> lambda_capture_offsets;           // byte offsets within env
     int32_t env_size = 0;                                  // total env bytes
+    // #20 by-reference capture: per-capture by-ref flag, parallel to
+    // lambda_captures. A by-ref capture's env slot holds a pointer to the
+    // captured variable's storage; codegen double-dereferences on read and
+    // stores-through on write. Set by sema from the LambdaExpr's ref_capture_names.
+    std::vector<bool> lambda_capture_by_ref;
     // Coroutines / yield (#21): a fn containing `yield` is a coroutine. A
     // coroutine is called via a special path that returns a coroutine handle;
     // next() resumes it. is_coroutine is set by sema when it detects a yield.

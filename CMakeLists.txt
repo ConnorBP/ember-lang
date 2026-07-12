@@ -304,6 +304,23 @@ endif()
 add_test(NAME gc_integration COMMAND gc_integration_test)
 set_tests_properties(gc_integration PROPERTIES TIMEOUT 60)
 
+# gc_full_test - the FULL GC integration end-to-end proof: by-reference
+# lambda capture (fn[&x] capture-list syntax: read post-capture mutation +
+# write-through + nested/transitive) + script-visible new/delete (gc_new/
+# gc_delete/gc_collect/gc_live: heap stays bounded, unreachable reaped,
+# reachable survive). Same harness shape as gc_integration_test (compile+run
+# with use_gc_env=true + the gc extension registered).
+add_executable(gc_full_test examples/gc_full_test.cpp)
+target_link_libraries(gc_full_test PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_vec ember_ext_quat ember_ext_mat ember_ext_string
+    ember_ext_array ember_ext_math ember_ext_gc)
+if(WIN32)
+    target_link_libraries(gc_full_test PRIVATE kernel32)
+endif()
+add_test(NAME gc_full COMMAND gc_full_test)
+set_tests_properties(gc_full PROPERTIES TIMEOUT 60)
+
 # ext_bounds_test: runtime bounds-checking coverage for the array<T> and string
 # host-store extensions (D4+D5 from docs/audit/AUDIT_2026-07-11_DOCS_TESTS.md).
 # D4: array_get_u8/array_set_u8/array_get_i64/array_set_i64 index bounds

@@ -176,6 +176,24 @@ static int64_t n_gc_live() {
     return gc_live_count();
 }
 
+// ---- script-visible new/delete natives (full GC integration task) ----
+// These are the user-facing surface for script-visible heap objects: a script
+// can `gc_new(size)` to allocate a raw GC heap object (pinned, so it survives
+// auto-collects), `gc_delete(ptr)` to unroot it (mark it collectable), and
+// `gc_collect()`/`gc_live()` to run a collection cycle + observe the live
+// count. This is the v1 new/delete: a raw handle (i64) the script can hold +
+// release, with the tracing GC reclaiming unreachable (unpinned) objects.
+// `new Type{...}` syntax with typed field access needs a pointer type system
+// (ember's structs are value types today) — that is the documented follow-up;
+// these natives are the heap-management substrate it would build on.
+static int64_t n_gc_new(int64_t size) {
+    return gc_alloc_env(size);  // alloc + pin (survives auto-collect)
+}
+
+static int64_t n_gc_delete(int64_t ptr) {
+    return gc_unroot_env(ptr) ? 1 : 0;  // unpin -> collectable; 1 if it was pinned
+}
+
 } // extern "C"
 
 // ---- registration ----
@@ -189,6 +207,14 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
     b.add("__ember_gc_alloc_env", T, {T}, (void*)&n_gc_alloc_env);
     b.add("__ember_gc_collect",    T, {}, (void*)&n_gc_collect);
     b.add("__ember_gc_live",       T, {}, (void*)&n_gc_live);
+    // Script-visible new/delete (full GC integration): gc_new(size)->ptr
+    // (alloc+pin), gc_delete(ptr)->i64 (unroot), gc_collect()->freed,
+    // gc_live()->count. User-facing names (no __ember_ prefix) so a script
+    // calls them directly; they share the same host heap as lambda envs.
+    b.add("gc_new",     T, {T},  (void*)&n_gc_new);
+    b.add("gc_delete",  T, {T},  (void*)&n_gc_delete);
+    b.add("gc_collect", T, {},   (void*)&n_gc_collect);
+    b.add("gc_live",    T, {},   (void*)&n_gc_live);
     NativeTable t = b.build();
     for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }
