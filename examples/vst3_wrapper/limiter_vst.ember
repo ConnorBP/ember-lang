@@ -1,0 +1,101 @@
+// limiter_vst.ember — a linked stereo look-ahead brick-wall limiter.
+// Demonstrates delayed audio, fast attack gain smoothing, release smoothing,
+// and a final safety clamp. Parameter 0: Threshold (-20..0 dB).
+// Parameter 1: Release (10-500 ms). The declared latency is 256 samples.
+
+global limiter_delay_left: f32[256] = [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+];
+global limiter_delay_right: f32[256] = [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+];
+global limiter_write_pos: i64 = 0;
+global limiter_gain: f32 = 1.0;
+
+@realtime
+fn process_f32(ctx: i64, frames: i64) -> void {
+    let mut threshold_db: f32 = audio_get_parameter(ctx, 0);
+    let mut release_ms: f32 = audio_get_parameter(ctx, 1);
+    if (threshold_db < (0.0f - 20.0f)) { threshold_db = 0.0f - 20.0f; }
+    if (threshold_db > 0.0) { threshold_db = 0.0; }
+    if (release_ms < 10.0) { release_ms = 10.0; }
+    if (release_ms > 500.0) { release_ms = 500.0; }
+    let threshold: f32 = exp(threshold_db * 0.1151292546497023);
+    let sample_rate: f32 = audio_get_sample_rate(ctx) as f32;
+    let release_step: f32 = 1.0 / (release_ms * 0.001 * sample_rate);
+    let channels: i64 = audio_get_num_input_channels(ctx);
+
+    let mut i: i64 = 0;
+    while (i < frames) {
+        let mut input_left: f32 = 0.0;
+        let mut input_right: f32 = 0.0;
+        if (channels > 0) { input_left = audio_load_sample(ctx, 0, i); }
+        input_right = input_left;
+        if (channels > 1) { input_right = audio_load_sample(ctx, 1, i); }
+        let delayed_left: f32 = limiter_delay_left[limiter_write_pos];
+        let delayed_right: f32 = limiter_delay_right[limiter_write_pos];
+        limiter_delay_left[limiter_write_pos] = input_left;
+        limiter_delay_right[limiter_write_pos] = input_right;
+
+        let mut peak: f32 = input_left;
+        if (peak < 0.0) { peak = -peak; }
+        let mut right_peak: f32 = input_right;
+        if (right_peak < 0.0) { right_peak = -right_peak; }
+        if (right_peak > peak) { peak = right_peak; }
+        let mut target_gain: f32 = 1.0;
+        if (peak > threshold) { target_gain = threshold / peak; }
+        if (target_gain < limiter_gain) {
+            // Fast gain attack is safe because the program audio is delayed.
+            limiter_gain = limiter_gain + (target_gain - limiter_gain) * 0.5;
+        } else {
+            limiter_gain = limiter_gain + release_step;
+            if (limiter_gain > target_gain) { limiter_gain = target_gain; }
+            if (limiter_gain > 1.0) { limiter_gain = 1.0; }
+        }
+
+        let mut output_left: f32 = delayed_left * limiter_gain;
+        let mut output_right: f32 = delayed_right * limiter_gain;
+        if (output_left > threshold) { output_left = threshold; }
+        if (output_left < -threshold) { output_left = -threshold; }
+        if (output_right > threshold) { output_right = threshold; }
+        if (output_right < -threshold) { output_right = -threshold; }
+        if (channels > 0) { audio_store_sample(ctx, 0, i, output_left); }
+        if (channels > 1) { audio_store_sample(ctx, 1, i, output_right); }
+        let mut ch: i64 = 2;
+        while (ch < channels) {
+            let mut limited: f32 = audio_load_sample(ctx, ch, i) * limiter_gain;
+            if (limited > threshold) { limited = threshold; }
+            if (limited < -threshold) { limited = -threshold; }
+            audio_store_sample(ctx, ch, i, limited);
+            ch = ch + 1;
+        }
+        limiter_write_pos = limiter_write_pos + 1;
+        if (limiter_write_pos >= 256) { limiter_write_pos = 0; }
+        i = i + 1;
+    }
+}
+
+fn get_latency() -> i64 { return 256; }
+fn get_tail() -> i64 { return 256; }
+fn save_state() -> i64 { return 0; }
+fn load_state(state: i64) -> void { return; }

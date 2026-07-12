@@ -1,0 +1,42 @@
+// panner_vst.ember — an equal-power stereo panner.
+// Demonstrates stereo-field manipulation. Parameter 0: Pan, where 0.0 is hard
+// left, 0.5 is center, and 1.0 is hard right. Sine/cosine use a seventh-order
+// polynomial, avoiding a math-library call on the audio thread.
+
+@realtime
+fn process_f32(ctx: i64, frames: i64) -> void {
+    let mut pan: f32 = audio_get_parameter(ctx, 0);
+    if (pan < 0.0) { pan = 0.0; }
+    if (pan > 1.0) { pan = 1.0; }
+
+    let angle: f32 = pan * 1.5707963267948966;
+    let x2: f32 = angle * angle;
+    let left_angle: f32 = 1.5707963267948966 - angle;
+    let left_x2: f32 = left_angle * left_angle;
+    // sin(angle) and cos(angle)=sin(pi/2-angle), Taylor-expanded on [0, pi/2].
+    let right_gain: f32 = angle * (1.0 - x2 / 6.0 + x2 * x2 / 120.0 - x2 * x2 * x2 / 5040.0);
+    let left_gain: f32 = left_angle * (1.0 - left_x2 / 6.0 + left_x2 * left_x2 / 120.0 - left_x2 * left_x2 * left_x2 / 5040.0);
+    let inputs: i64 = audio_get_num_input_channels(ctx);
+    let outputs: i64 = audio_get_num_output_channels(ctx);
+
+    let mut i: i64 = 0;
+    while (i < frames) {
+        let mut mono: f32 = 0.0;
+        if (inputs > 0) { mono = audio_load_sample(ctx, 0, i); }
+        if (inputs > 1) { mono = (mono + audio_load_sample(ctx, 1, i)) * 0.5; }
+
+        if (outputs > 0) { audio_store_sample(ctx, 0, i, mono * left_gain); }
+        if (outputs > 1) { audio_store_sample(ctx, 1, i, mono * right_gain); }
+        let mut ch: i64 = 2;
+        while (ch < outputs) {
+            audio_store_sample(ctx, ch, i, 0.0);
+            ch = ch + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn get_latency() -> i64 { return 0; }
+fn get_tail() -> i64 { return 0; }
+fn save_state() -> i64 { return 0; }
+fn load_state(state: i64) -> void { return; }

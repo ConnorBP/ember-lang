@@ -1,0 +1,44 @@
+// tremolo_vst.ember — periodic amplitude modulation with a triangle LFO.
+// Demonstrates an LFO phase accumulator and persistent DSP state.
+// Parameter 0: Rate (0.1-20.0 Hz). Parameter 1: Depth (0.0-1.0).
+
+global tremolo_phase: f32 = 0.0;
+
+@realtime
+fn process_f32(ctx: i64, frames: i64) -> void {
+    let mut rate: f32 = audio_get_parameter(ctx, 0);
+    let mut depth: f32 = audio_get_parameter(ctx, 1);
+    if (rate < 0.1) { rate = 0.1; }
+    if (rate > 20.0) { rate = 20.0; }
+    if (depth < 0.0) { depth = 0.0; }
+    if (depth > 1.0) { depth = 1.0; }
+    let sample_rate: f32 = audio_get_sample_rate(ctx) as f32;
+    let phase_step: f32 = rate / sample_rate;
+    let channels: i64 = audio_get_num_input_channels(ctx);
+
+    let mut i: i64 = 0;
+    while (i < frames) {
+        // Bipolar triangle phase converted to a unipolar 0..1 modulation signal.
+        let mut lfo: f32 = 0.0;
+        if (tremolo_phase < 0.5) {
+            lfo = tremolo_phase * 2.0;
+        } else {
+            lfo = 2.0 - tremolo_phase * 2.0;
+        }
+        let amplitude: f32 = 1.0 - depth + depth * lfo;
+        let mut ch: i64 = 0;
+        while (ch < channels) {
+            let sample: f32 = audio_load_sample(ctx, ch, i);
+            audio_store_sample(ctx, ch, i, sample * amplitude);
+            ch = ch + 1;
+        }
+        tremolo_phase = tremolo_phase + phase_step;
+        if (tremolo_phase >= 1.0) { tremolo_phase = tremolo_phase - 1.0; }
+        i = i + 1;
+    }
+}
+
+fn get_latency() -> i64 { return 0; }
+fn get_tail() -> i64 { return 0; }
+fn save_state() -> i64 { return 0; }
+fn load_state(state: i64) -> void { return; }

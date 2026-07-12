@@ -1,0 +1,61 @@
+// bitcrusher_vst.ember — bit-depth and sample-rate reduction.
+// Demonstrates amplitude quantization and sample-and-hold downsampling.
+// Parameter 0: Bits (1-16). Parameter 1: Sample Rate Reduction (1-64x).
+
+global bitcrusher_counter: i64 = 0;
+global bitcrusher_held_left: f32 = 0.0;
+global bitcrusher_held_right: f32 = 0.0;
+
+@realtime
+fn process_f32(ctx: i64, frames: i64) -> void {
+    let mut bits: i64 = audio_get_parameter(ctx, 0) as i64;
+    let mut reduction: i64 = audio_get_parameter(ctx, 1) as i64;
+    if (bits < 1) { bits = 1; }
+    if (bits > 16) { bits = 16; }
+    if (reduction < 1) { reduction = 1; }
+    if (reduction > 64) { reduction = 64; }
+    let mut levels: f32 = 1.0;
+    let mut bit: i64 = 0;
+    while (bit < bits) {
+        levels = levels * 2.0;
+        bit = bit + 1;
+    }
+    let channels: i64 = audio_get_num_input_channels(ctx);
+
+    let mut i: i64 = 0;
+    while (i < frames) {
+        if (bitcrusher_counter == 0) {
+            if (channels > 0) {
+                let scaled: f32 = audio_load_sample(ctx, 0, i) * levels;
+                let mut rounded: i64 = 0;
+                if (scaled >= 0.0) { rounded = (scaled + 0.5) as i64; }
+                else { rounded = (scaled - 0.5) as i64; }
+                bitcrusher_held_left = rounded as f32 / levels;
+            }
+            if (channels > 1) {
+                let scaled: f32 = audio_load_sample(ctx, 1, i) * levels;
+                let mut rounded: i64 = 0;
+                if (scaled >= 0.0) { rounded = (scaled + 0.5) as i64; }
+                else { rounded = (scaled - 0.5) as i64; }
+                bitcrusher_held_right = rounded as f32 / levels;
+            } else {
+                bitcrusher_held_right = bitcrusher_held_left;
+            }
+        }
+        if (channels > 0) { audio_store_sample(ctx, 0, i, bitcrusher_held_left); }
+        if (channels > 1) { audio_store_sample(ctx, 1, i, bitcrusher_held_right); }
+        let mut ch: i64 = 2;
+        while (ch < channels) {
+            audio_store_sample(ctx, ch, i, (bitcrusher_held_left + bitcrusher_held_right) * 0.5);
+            ch = ch + 1;
+        }
+        bitcrusher_counter = bitcrusher_counter + 1;
+        if (bitcrusher_counter >= reduction) { bitcrusher_counter = 0; }
+        i = i + 1;
+    }
+}
+
+fn get_latency() -> i64 { return 0; }
+fn get_tail() -> i64 { return 0; }
+fn save_state() -> i64 { return 0; }
+fn load_state(state: i64) -> void { return; }

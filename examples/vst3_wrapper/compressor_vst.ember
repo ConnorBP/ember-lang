@@ -1,0 +1,61 @@
+// compressor_vst.ember — a linked-channel feed-forward compressor.
+// Demonstrates a dB-domain gain computer plus attack/release smoothing.
+// Parameter 0: Threshold (-60..0 dB). Parameter 1: Ratio (1:1..20:1).
+// Parameter 2: Mix (0.0 dry .. 1.0 compressed).
+
+global compressor_reduction_db: f32 = 0.0;
+
+@realtime
+fn process_f32(ctx: i64, frames: i64) -> void {
+    let mut threshold: f32 = audio_get_parameter(ctx, 0);
+    let mut ratio: f32 = audio_get_parameter(ctx, 1);
+    let mut mix: f32 = audio_get_parameter(ctx, 2);
+    if (threshold < (0.0f - 60.0f)) { threshold = 0.0f - 60.0f; }
+    if (threshold > 0.0) { threshold = 0.0; }
+    if (ratio < 1.0) { ratio = 1.0; }
+    if (ratio > 20.0) { ratio = 20.0; }
+    if (mix < 0.0) { mix = 0.0; }
+    if (mix > 1.0) { mix = 1.0; }
+
+    let sample_rate: f32 = audio_get_sample_rate(ctx) as f32;
+    // One-pole interpolation amounts: roughly 10 ms attack and 100 ms release.
+    let attack: f32 = 1.0 / (0.010 * sample_rate);
+    let release: f32 = 1.0 / (0.100 * sample_rate);
+    let channels: i64 = audio_get_num_input_channels(ctx);
+    let mut i: i64 = 0;
+    while (i < frames) {
+        let mut peak: f32 = 0.0000001;
+        let mut ch: i64 = 0;
+        while (ch < channels) {
+            let mut magnitude: f32 = audio_load_sample(ctx, ch, i);
+            if (magnitude < 0.0) { magnitude = -magnitude; }
+            if (magnitude > peak) { peak = magnitude; }
+            ch = ch + 1;
+        }
+
+        let input_db: f32 = 20.0 * log(peak) / 2.302585092994046;
+        let mut over: f32 = input_db - threshold;
+        if (over < 0.0) { over = 0.0; }
+        let target_reduction: f32 = over * (1.0 - 1.0 / ratio);
+        if (target_reduction > compressor_reduction_db) {
+            compressor_reduction_db = compressor_reduction_db + (target_reduction - compressor_reduction_db) * attack;
+        } else {
+            compressor_reduction_db = compressor_reduction_db + (target_reduction - compressor_reduction_db) * release;
+        }
+        let gain: f32 = exp(-compressor_reduction_db * 0.1151292546497023);
+
+        ch = 0;
+        while (ch < channels) {
+            let dry: f32 = audio_load_sample(ctx, ch, i);
+            let compressed: f32 = dry * gain;
+            audio_store_sample(ctx, ch, i, dry * (1.0 - mix) + compressed * mix);
+            ch = ch + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn get_latency() -> i64 { return 0; }
+fn get_tail() -> i64 { return 0; }
+fn save_state() -> i64 { return 0; }
+fn load_state(state: i64) -> void { return; }

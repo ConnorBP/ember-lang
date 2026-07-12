@@ -1,0 +1,42 @@
+// distortion_vst.ember — a soft-clipping waveshaper distortion.
+// Demonstrates nonlinear DSP with an allocation-free rational polynomial tanh
+// approximation. Parameter 0: Drive (1.0-10.0). Parameter 1: Mix (0.0-1.0).
+
+@realtime
+fn process_f32(ctx: i64, frames: i64) -> void {
+    let mut drive: f32 = audio_get_parameter(ctx, 0);
+    let mut mix: f32 = audio_get_parameter(ctx, 1);
+    if (drive < 1.0) { drive = 1.0; }
+    if (drive > 10.0) { drive = 10.0; }
+    if (mix < 0.0) { mix = 0.0; }
+    if (mix > 1.0) { mix = 1.0; }
+
+    // tanh(x) ~= x(27+x^2)/(27+9x^2), evaluated only on [-3, 3].
+    // Normalizing by tanh(drive) keeps the output near unity at full scale.
+    let mut norm_x: f32 = drive;
+    if (norm_x > 3.0) { norm_x = 3.0; }
+    let norm_x2: f32 = norm_x * norm_x;
+    let norm: f32 = norm_x * (27.0 + norm_x2) / (27.0 + 9.0 * norm_x2);
+    let channels: i64 = audio_get_num_input_channels(ctx);
+
+    let mut i: i64 = 0;
+    while (i < frames) {
+        let mut ch: i64 = 0;
+        while (ch < channels) {
+            let dry: f32 = audio_load_sample(ctx, ch, i);
+            let mut x: f32 = dry * drive;
+            if (x > 3.0) { x = 3.0; }
+            if (x < (0.0f - 3.0f)) { x = 0.0f - 3.0f; }
+            let x2: f32 = x * x;
+            let shaped: f32 = (x * (27.0 + x2) / (27.0 + 9.0 * x2)) / norm;
+            audio_store_sample(ctx, ch, i, dry * (1.0 - mix) + shaped * mix);
+            ch = ch + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn get_latency() -> i64 { return 0; }
+fn get_tail() -> i64 { return 0; }
+fn save_state() -> i64 { return 0; }
+fn load_state(state: i64) -> void { return; }
