@@ -52,10 +52,12 @@ if [ ! -x "$SEMA" ];  then printf "FATAL: sema_check not found at %s\n" "$SEMA";
 
 # parse-only regression (syntactic errors only - sema_invalid_* parse fine,
 # failing at sema instead).
-for f in tests/lang/valid_*.ember tests/lang/runtime_*.ember tests/lang/sema_valid_*.ember tests/lang/sema_invalid_*.ember; do
+for f in tests/lang/valid_*.ember tests/lang/runtime_*.ember tests/lang/sema_valid_*.ember tests/lang/sema_invalid_*.ember \
+         tests/lang/invalid_realtime_*.ember; do
     run "$PARSE" "$f" ok
 done
 for f in tests/lang/invalid_*.ember; do
+    case "$f" in *invalid_realtime_*) continue;; esac
     run "$PARSE" "$f" err
 done
 
@@ -64,7 +66,7 @@ done
 for f in tests/lang/sema_valid_*.ember tests/lang/runtime_audit_semantics.ember \
          tests/lang/runtime_cast_regressions.ember tests/lang/runtime_division_forms.ember tests/lang/runtime_integer_boundaries.ember \
          tests/lang/runtime_language_features.ember tests/lang/import_test.ember \
-         tests/lang/valid_structs_slices.ember tests/lang/valid_fn_types.ember \
+         tests/lang/valid_structs_slices.ember tests/lang/valid_fn_types.ember tests/lang/valid_realtime.ember \
          tests/lang/runtime_struct_reassign_single.ember tests/lang/runtime_struct_reassign_loop.ember \
          tests/lang/runtime_struct_reassign_multi.ember \
          tests/lang/valid_try_catch.ember tests/lang/valid_throw_nested.ember tests/lang/valid_throw_value.ember \
@@ -72,7 +74,7 @@ for f in tests/lang/sema_valid_*.ember tests/lang/runtime_audit_semantics.ember 
          tests/lang/valid_nested_try_catch.ember tests/lang/runtime_trap_throw_uncaught.ember; do
     run "$SEMA" "$f" ok
 done
-for f in tests/lang/sema_invalid_*.ember; do
+for f in tests/lang/sema_invalid_*.ember tests/lang/invalid_realtime_*.ember; do
     run "$SEMA" "$f" err
 done
 

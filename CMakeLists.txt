@@ -186,6 +186,9 @@ target_link_libraries(ember_ext_io PUBLIC ember_ext_array ember_ext_string)
 # surface — gated the same way ext_io is).
 ember_add_extension(call_raw extensions/call_raw/ext_call_raw.cpp)
 target_link_libraries(ember_ext_call_raw PUBLIC ember_ext_array)
+# ext_audio: allocation-free raw access to host-owned f32/f64/i32 DSP buffers.
+# The six bindings are PERM_FFI-gated because scripts supply raw pointers.
+ember_add_extension(audio extensions/audio/ext_audio.cpp)
 
 # ---- tests: .em pre-compile round-trip + live import cross-module round-trip ----
 # These link only ember + ember_frontend (no prism/prism_script_host) so they
@@ -231,6 +234,16 @@ add_test(NAME ext_runtime COMMAND ext_runtime_test)
 add_executable(call_raw_test examples/call_raw_test.cpp)
 target_link_libraries(call_raw_test PRIVATE ember ember_frontend ember_ext_call_raw)
 add_test(NAME call_raw COMMAND call_raw_test)
+
+# VST3 Phase 2 headless DSP gate: compile the @realtime gain/delay scripts,
+# call them over host-owned stereo f32 buffers through ext_audio, compare to
+# C++ references, and prove block-partition invariance (1024/256/64/1).
+add_executable(vst_dsp_harness examples/vst_dsp_harness.cpp)
+target_link_libraries(vst_dsp_harness PRIVATE ember ember_frontend ember_ext_audio)
+add_test(NAME vst_dsp_harness COMMAND vst_dsp_harness
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples/scripts/gain_plugin.ember
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples/scripts/delay_plugin.ember)
+set_tests_properties(vst_dsp_harness PROPERTIES TIMEOUT 60)
 
 # for_each_array_test: pins the iterable() hook's array<T> case (Tier 1) -
 # `for (x in array_handle)` lowered to array_length(h) + array_get_*(h, i).
@@ -535,7 +548,8 @@ target_link_libraries(ember_check PRIVATE ember ember_frontend ember_import)
 add_executable(sema_check examples/sema_check.cpp)
 target_link_libraries(sema_check PRIVATE
     ember ember_frontend ember_import
-    ember_ext_vec ember_ext_quat ember_ext_mat ember_ext_string ember_ext_array ember_ext_math)
+    ember_ext_vec ember_ext_quat ember_ext_mat ember_ext_string ember_ext_array ember_ext_math
+    ember_ext_io ember_ext_gc)
 
 # The suite: run the lang classifier script, passing the build dir so it finds
 # ember_check.exe / sema_check.exe / ember_cli.exe. bash is required (the script
@@ -559,7 +573,7 @@ target_link_libraries(ember_cli PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_opt ember_ext_obf ember_ext_map
-    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_thread ember_ext_gc)
+    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_audio ember_ext_thread ember_ext_gc)
 
 # Self-hosted compiler stages. Each ember test returns 0 on success and a
 # stage-specific nonzero code on failure. Use absolute source paths so ctest

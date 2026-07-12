@@ -72,6 +72,7 @@
 #include "ext_thread.hpp"      // Tier 4: in-context threads (thread_spawn/join + atomics)
 #include "ext_coroutine.hpp"     // #21 coroutines with yield (Windows fibers)
 #include "ext_call_raw.hpp"     // self-hosting Stage 4 gap: call_raw(fn_ptr,arg)->i64
+#include "ext_audio.hpp"        // realtime-safe raw f32/f64/i32 audio buffer access
 #include "ext_gc.hpp"          // tracing GC runtime: lambda env heap management (#20)
 #include "../src/ember_pass.hpp"       // Stage C: EmberPassManager
 #include "../src/ember_pass_registry.hpp" // Stage C: EmberPassRegistry
@@ -148,6 +149,7 @@ static void register_standard_bindings(
     ember::ext_io::register_natives(natives);
     ember::ext_coroutine::register_natives(natives);
     ember::ext_call_raw::register_natives(natives);
+    ember::ext_audio::register_natives(natives);
     ember::ext_thread::register_natives(natives);
     ember::ext_gc::register_natives(natives);   // __ember_gc_alloc_env/collect/live (lambda env heap)
     OpOverloadTable overloads;
@@ -831,6 +833,10 @@ static TestClassifier classify_test(const fs::path& filepath) {
         TestClassifier tc; tc.kind = TestClassifier::Kind::Run; tc.expected_exit = 70;
         return tc;
     }
+    if (name.rfind("invalid_realtime_", 0) == 0) {
+        TestClassifier tc; tc.kind = TestClassifier::Kind::SemaFail; tc.expected_exit = 2;
+        return tc;
+    }
     if (name.rfind("invalid_", 0) == 0) {
         TestClassifier tc; tc.kind = TestClassifier::Kind::ParseFail; tc.expected_exit = 2;
         return tc;
@@ -839,8 +845,8 @@ static TestClassifier classify_test(const fs::path& filepath) {
         TestClassifier tc; tc.kind = TestClassifier::Kind::SemaFail; tc.expected_exit = 2;
         return tc;
     }
-    // sema_valid_* files: must sema OK (the bash script's hard sema gate).
-    if (name.rfind("sema_valid_", 0) == 0) {
+    // sema_valid_* and the realtime contract positive probe must sema OK.
+    if (name.rfind("sema_valid_", 0) == 0 || name == "valid_realtime.ember") {
         TestClassifier tc; tc.kind = TestClassifier::Kind::SemaOk; tc.expected_exit = 0;
         return tc;
     }

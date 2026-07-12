@@ -25,6 +25,8 @@
 #include "ext_string.hpp"
 #include "ext_array.hpp"
 #include "ext_math.hpp"
+#include "ext_io.hpp"
+#include "ext_gc.hpp"
 
 #include <cstdio>
 #include <filesystem>
@@ -87,6 +89,22 @@ int main(int argc, char** argv) {
     ember::ext_string::register_natives(natives);
     ember::ext_array::register_natives(natives);
     ember::ext_math::register_natives(natives);
+    // Realtime-negative language probes need the real forbidden bindings to
+    // resolve before the post-type-check @realtime validator rejects them.
+    ember::ext_io::register_natives(natives);
+    ember::ext_gc::register_natives(natives);
+
+    // The task's historical spelling predates ext_gc's public `gc_new` name.
+    // Register an equivalent test-only gc_alloc signature so the realtime
+    // diagnostic is tested without changing the extension's public API.
+    {
+        ember::NativeSig s;
+        s.name = "gc_alloc";
+        s.fn_ptr = natives.at("gc_new").fn_ptr;
+        s.ret = ember::type_i64();
+        s.params = {ember::type_i64()};
+        natives[s.name] = std::move(s);
+    }
 
     // Slice-escape safety Stage 2 (C3) test surface: a RETAINING native. No
     // shipped native retains a slice ptr (string_from_slice copies), so C3 is

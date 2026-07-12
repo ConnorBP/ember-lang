@@ -1411,6 +1411,14 @@ struct Checker {
     void check_block(Block& b, const Type* ret_ty, bool& returns);
     void check_stmt(Stmt& s, const Type* ret_ty, bool& returns);
     void check_func(FuncDecl& f);
+
+    // @realtime contract validation runs after ordinary type checking has
+    // resolved every CallExpr. It is intentionally conservative for native
+    // calls: only the explicitly-audited pure/math/buffer surface is allowed.
+    void validate_realtime(FuncDecl& f);
+    void validate_realtime_block(const Block& b);
+    void validate_realtime_stmt(const Stmt& s);
+    void validate_realtime_expr(const Expr& e);
     // Tier 1 static_assert: fold cond + resolve (true -> elided, false ->
     // compile error with msg, non-const -> compile error). Shared by the
     // in-body check_stmt path and the top-level prog.static_asserts pass so
@@ -3186,6 +3194,17 @@ void Checker::check_func(FuncDecl& f) {
         pop_scope();
         return;
     }
+    const bool is_realtime = std::any_of(
+        f.annotations.begin(), f.annotations.end(),
+        [](const Annotation& a) { return a.name == "realtime"; });
+    const size_t realtime_error_start = errs.size();
+    if (is_realtime) {
+        // Walk the source body before ordinary type checking as well, so a
+        // forbidden but unavailable native (for example a host that did not
+        // register gc_alloc) still gets the required realtime diagnostic.
+        validate_realtime(f);
+    }
+
     // Struct-by-value params/returns are supported (shipped; see
     // docs/spec/TYPE_SYSTEM.md §2 struct layout + docs/spec/CODEGEN_SPEC.md
     // for the Win64 word-based param convention and hidden-pointer return
@@ -3198,11 +3217,262 @@ void Checker::check_func(FuncDecl& f) {
     const Type* ret_ty = intern(*f.ret);
     bool returns = false;
     check_block(f.body, ret_ty, returns);
+    if (is_realtime) {
+        // Re-run after type checking to classify resolved natives and indirect
+        // calls. Remove the pre-walk's realtime-only diagnostics first to
+        // avoid duplicates while preserving ordinary type errors it emitted.
+        errs.erase(std::remove_if(errs.begin() + realtime_error_start, errs.end(),
+                                  [](const SemaError& e) {
+                                      return e.msg.compare(0, 20, "@realtime violation:") == 0;
+                                  }),
+                   errs.end());
+        validate_realtime(f);
+    }
     if (!ret_ty->is_void() && !returns) {
         // find end of function for the error loc
         err("function '" + f.name + "' not all paths return a value", f.loc.line, f.loc.col);
     }
     pop_scope();
+}
+
+// ============================================================================
+// @realtime validation
+// ============================================================================
+
+namespace {
+
+bool realtime_name_has_prefix(const std::string& name, const char* prefix) {
+    return name.compare(0, std::strlen(prefix), prefix) == 0;
+}
+
+// Return a user-facing reason for a categorically forbidden call, or nullptr
+// when the name is not on a realtime blocklist. This checks the source name as
+// well as sema's exact native binding name, so an unavailable/unknown native
+// still receives the useful @realtime diagnostic in addition to the ordinary
+// "unknown function" error.
+const char* realtime_forbidden_call_reason(const std::string& name) {
+    if (name == "new" || name == "delete" || name == "gc_alloc" ||
+        name == "gc_collect" || name == "gc_set_threshold" ||
+        realtime_name_has_prefix(name, "gc_") ||
+        realtime_name_has_prefix(name, "__ember_gc_"))
+        return "GC/heap allocation";
+
+    if (name == "print" || name == "println" || name == "print_string" ||
+        name == "print_f32" || name == "print_f64" ||
+        realtime_name_has_prefix(name, "print_") ||
+        realtime_name_has_prefix(name, "file_") ||
+        realtime_name_has_prefix(name, "path_") ||
+        realtime_name_has_prefix(name, "console_") || name == "read_line")
+        return "I/O operation";
+
+    if (name == "thread_create" || name == "thread_join" ||
+        realtime_name_has_prefix(name, "thread_") ||
+        realtime_name_has_prefix(name, "mutex_") ||
+        realtime_name_has_prefix(name, "channel_"))
+        return "thread or synchronization operation";
+
+    if (name == "call_raw" || name == "make_executable" ||
+        name == "free_executable" || name == "free_executable_ptr")
+        return "FFI/executable-memory operation";
+
+    return nullptr;
+}
+
+bool realtime_safe_native(const std::string& name) {
+    static const std::unordered_set<std::string> safe = {
+        // Audio-plane raw buffer access: FFI-gated for capability security,
+        // but allocation-free and explicitly realtime-safe once granted.
+        "load_f32", "store_f32", "load_f64", "store_f64",
+        "load_i32", "store_i32",
+        // Host-provided preallocated DSP state accessors used by the headless
+        // delay reference (same allocation-free contract as audio buffers).
+        "delay_buffer", "delay_size",
+
+        // Audited string observations/conversion named by the realtime
+        // profile. (Other string natives may allocate and are rejected.)
+        "string_from_slice", "string_length",
+
+        // Scalar math extension.
+        "sqrt", "sin", "cos", "tan", "atan", "atan2", "exp", "log",
+        "floor", "ceil", "abs", "round", "sqrt_f64", "sin_f64",
+        "cos_f64", "tan_f64", "floor_f64", "ceil_f64", "abs_f64",
+        "pow_f64", "abs_i64", "atan_f64", "atan2_f64", "exp_f64",
+        "log_f64", "log2_f64", "log10_f64", "fmod_f64", "round_f64",
+        "trunc_f64", "min_f64", "max_f64", "clamp_f64", "min_i64",
+        "max_i64", "clamp_i64"
+    };
+    if (safe.count(name) != 0) return true;
+
+    // The language's vector/matrix/quaternion operations are part of the
+    // explicitly allowed realtime math surface.
+    return realtime_name_has_prefix(name, "vec2_") ||
+           realtime_name_has_prefix(name, "vec3_") ||
+           realtime_name_has_prefix(name, "vec4_") ||
+           realtime_name_has_prefix(name, "quat_") ||
+           realtime_name_has_prefix(name, "mat4_");
+}
+
+} // namespace
+
+void Checker::validate_realtime_expr(const Expr& e) {
+    if (auto* call = dynamic_cast<const CallExpr*>(&e)) {
+        const std::string& binding = call->native_binding_name.empty()
+                                       ? call->name : call->native_binding_name;
+        if (const char* reason = realtime_forbidden_call_reason(binding)) {
+            err(std::string("@realtime violation: ") + reason + " '" + binding +
+                "' (forbidden in realtime functions)", call->loc.line, call->loc.col);
+        } else if (call->is_native && !realtime_safe_native(binding)) {
+            err("@realtime violation: native call '" + binding +
+                "' is not known realtime-safe (forbidden in realtime functions)",
+                call->loc.line, call->loc.col);
+        } else if (call->is_indirect || call->is_lambda_call ||
+                   !call->module_alias.empty()) {
+            err("@realtime violation: indirect or cross-module call cannot be proven realtime-safe "
+                "(forbidden in realtime functions)", call->loc.line, call->loc.col);
+        } else if (!call->is_native && call->script_slot >= 0) {
+            err("@realtime violation: script call '" + call->name +
+                "' cannot be proven realtime-safe (forbidden in realtime functions)",
+                call->loc.line, call->loc.col);
+        }
+        if (call->receiver) validate_realtime_expr(*call->receiver);
+        if (call->indirect_target) validate_realtime_expr(*call->indirect_target);
+        if (call->lambda_target) validate_realtime_expr(*call->lambda_target);
+        for (const auto& arg : call->args) validate_realtime_expr(*arg);
+        return;
+    }
+    if (auto* lambda = dynamic_cast<const LambdaExpr*>(&e)) {
+        const bool by_ref = !lambda->ref_capture_names.empty() ||
+                            std::any_of(lambda->capture_by_ref.begin(),
+                                        lambda->capture_by_ref.end(),
+                                        [](bool v) { return v; });
+        if (by_ref) {
+            err("@realtime violation: lambda with by-reference capture "
+                "(forbidden in realtime functions)", lambda->loc.line, lambda->loc.col);
+        }
+        return; // the synthetic lambda body is checked as its own function
+    }
+    if (auto* b = dynamic_cast<const BinExpr*>(&e)) {
+        validate_realtime_expr(*b->lhs); validate_realtime_expr(*b->rhs); return;
+    }
+    if (auto* u = dynamic_cast<const UnaryExpr*>(&e)) {
+        validate_realtime_expr(*u->operand); return;
+    }
+    if (auto* c = dynamic_cast<const CastExpr*>(&e)) {
+        validate_realtime_expr(*c->operand); return;
+    }
+    if (auto* h = dynamic_cast<const FnHandleExpr*>(&e)) {
+        if (h->operand) validate_realtime_expr(*h->operand);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const IndexExpr*>(&e)) {
+        validate_realtime_expr(*ix->base); validate_realtime_expr(*ix->index); return;
+    }
+    if (auto* fl = dynamic_cast<const FieldExpr*>(&e)) {
+        validate_realtime_expr(*fl->base); return;
+    }
+    if (auto* v = dynamic_cast<const ViewExpr*>(&e)) {
+        validate_realtime_expr(*v->base); return;
+    }
+    if (auto* a = dynamic_cast<const AssignExpr*>(&e)) {
+        validate_realtime_expr(*a->target); validate_realtime_expr(*a->value); return;
+    }
+    if (auto* t = dynamic_cast<const TernaryExpr*>(&e)) {
+        validate_realtime_expr(*t->cond); validate_realtime_expr(*t->then_e);
+        validate_realtime_expr(*t->else_e); return;
+    }
+    if (auto* sl = dynamic_cast<const StructLit*>(&e)) {
+        for (const auto& field : sl->fields) validate_realtime_expr(*field.second);
+        return;
+    }
+    if (auto* al = dynamic_cast<const ArrayLit*>(&e)) {
+        for (const auto& element : al->elements) validate_realtime_expr(*element);
+    }
+}
+
+void Checker::validate_realtime_stmt(const Stmt& s) {
+    if (auto* ls = dynamic_cast<const LetStmt*>(&s)) {
+        if (ls->init) validate_realtime_expr(*ls->init);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ExprStmt*>(&s)) {
+        validate_realtime_expr(*es->expr); return;
+    }
+    if (auto* rs = dynamic_cast<const ReturnStmt*>(&s)) {
+        if (rs->value) validate_realtime_expr(*rs->value);
+        return;
+    }
+    if (auto* sa = dynamic_cast<const StaticAssertStmt*>(&s)) {
+        validate_realtime_expr(*sa->cond); return;
+    }
+    if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
+        validate_realtime_expr(*is->cond); validate_realtime_block(is->then_b);
+        if (is->has_else) validate_realtime_block(is->else_b);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) {
+        validate_realtime_expr(*ws->cond); validate_realtime_block(ws->body); return;
+    }
+    if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
+        if (fs->init) validate_realtime_stmt(*fs->init);
+        if (fs->cond) validate_realtime_expr(*fs->cond);
+        if (fs->step) validate_realtime_expr(*fs->step);
+        validate_realtime_block(fs->body); return;
+    }
+    if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) {
+        validate_realtime_block(ds->body); validate_realtime_expr(*ds->cond); return;
+    }
+    if (auto* fe = dynamic_cast<const ForEachStmt*>(&s)) {
+        validate_realtime_expr(*fe->iter); validate_realtime_block(fe->body); return;
+    }
+    if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) {
+        validate_realtime_expr(*ds->expr); return;
+    }
+    if (auto* bs = dynamic_cast<const BlockStmt*>(&s)) {
+        validate_realtime_block(bs->block); return;
+    }
+    if (auto* sw = dynamic_cast<const SwitchStmt*>(&s)) {
+        validate_realtime_expr(*sw->subject);
+        for (const auto& c : sw->cases) {
+            if (c.value) validate_realtime_expr(*c.value);
+            validate_realtime_block(c.body);
+        }
+        return;
+    }
+    if (auto* ms = dynamic_cast<const MatchStmt*>(&s)) {
+        validate_realtime_expr(*ms->subject);
+        for (const auto& arm : ms->arms) {
+            if (arm.pattern) validate_realtime_expr(*arm.pattern);
+            for (const auto& field : arm.struct_pat.fields)
+                if (field.literal) validate_realtime_expr(*field.literal);
+            if (arm.guard) validate_realtime_expr(*arm.guard);
+            validate_realtime_block(arm.body);
+        }
+        return;
+    }
+    if (auto* tc = dynamic_cast<const TryCatchStmt*>(&s)) {
+        err("@realtime violation: try/catch statement (forbidden in realtime functions)",
+            tc->loc.line, tc->loc.col);
+        validate_realtime_block(tc->try_body);
+        validate_realtime_block(tc->catch_body);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) {
+        err("@realtime violation: throw statement (forbidden in realtime functions)",
+            th->loc.line, th->loc.col);
+        if (th->value) validate_realtime_expr(*th->value);
+        return;
+    }
+    if (auto* ys = dynamic_cast<const YieldStmt*>(&s)) {
+        if (ys->value) validate_realtime_expr(*ys->value);
+    }
+}
+
+void Checker::validate_realtime_block(const Block& b) {
+    for (const auto& stmt : b.stmts) validate_realtime_stmt(*stmt);
+}
+
+void Checker::validate_realtime(FuncDecl& f) {
+    validate_realtime_block(f.body);
 }
 
 // ============================================================================

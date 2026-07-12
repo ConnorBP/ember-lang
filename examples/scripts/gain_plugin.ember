@@ -1,0 +1,10 @@
+// Headless reference gain processor. Buffers are host-owned contiguous f32.
+@realtime
+fn process(in_ptr: i64, out_ptr: i64, frames: i64) -> void {
+    let mut i: i64 = 0;
+    while (i < frames) {
+        let s: f32 = load_f32(in_ptr, i);
+        store_f32(out_ptr, i, s * 0.5);
+        i = i + 1;
+    }
+}
