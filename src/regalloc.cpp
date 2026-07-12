@@ -135,6 +135,7 @@ struct LiveInterval {
 void run_regalloc(ThinFunction& thf, int32_t num_regs) {
     thf.ra.enabled = false;
     thf.ra.map.clear();
+    thf.ra.frame_reg_map.clear();
     thf.ra.used_reg_ids.clear();
     thf.ra.save_offsets.clear();
 
@@ -301,15 +302,78 @@ void run_regalloc(ThinFunction& thf, int32_t num_regs) {
             });
     }
 
-    // ─── 5. Record used pool registers + allocate save slots ───
-    // A pool register is "used" if ANY candidate was assigned to it.
+    // ─── 5. Promote hot scalar frame slots into any still-unused registers ───
+    // The lowering represents mutable locals as LoadFrame/StoreFrame pairs. A
+    // VReg-only allocator cannot remove those loop-carried memory operations:
+    // every iteration creates fresh load/result VRegs and then writes the local
+    // slot back. Promote the most frequently accessed plain scalar slots after
+    // VReg allocation. Callee-saved homes make this valid across calls and CFG
+    // edges; the prologue initializes parameter/local values in memory before
+    // the first promoted LoadFrame lazily seeds the register.
     std::vector<bool> reg_used(pool, false);
     for (const auto& [v, a] : thf.ra.map) {
         if (a.in_reg && a.reg_id >= 0)
-            // find which pool index this reg_id corresponds to
             for (int32_t i = 0; i < pool; ++i)
                 if (int32_t(REG_POOL[i]) == a.reg_id) { reg_used[i] = true; break; }
     }
+
+    std::unordered_map<int32_t, int32_t> frame_accesses;
+    std::unordered_map<int32_t, int32_t> frame_loads;
+    std::unordered_map<int32_t, int32_t> frame_stores;
+    for (const auto& blk : thf.blocks) {
+        for (const auto& in : blk.instrs) {
+            if (in.meta.frame_off == 0 || in.meta.field_off != 0) continue;
+            if (in.op != ThinOp::LoadFrame && in.op != ThinOp::StoreFrame) continue;
+            if (in.op == ThinOp::LoadFrame && in.src1 != 0) continue;
+            if (in.op == ThinOp::StoreFrame && (in.src2 != 0 || in.src1 == 0)) continue;
+            const Type* ty = in.meta.type;
+            if (!ty || ty->is_slice || ty->is_float() || !ty->struct_name.empty() ||
+                ty->is_fn_handle || (!ty->is_int() && ty->prim != Prim::Bool)) continue;
+            ++frame_accesses[in.meta.frame_off];
+            if (in.op == ThinOp::LoadFrame) ++frame_loads[in.meta.frame_off];
+            else ++frame_stores[in.meta.frame_off];
+        }
+    }
+    std::vector<std::pair<int32_t, int32_t>> hot_slots; // {access count, offset}
+    hot_slots.reserve(frame_accesses.size());
+    std::unordered_map<int32_t, bool> loop_carried_slots;
+    for (const auto& blk : thf.blocks) {
+        bool has_backedge = false;
+        if (blk.term.kind == TermKind::Jmp) has_backedge = blk.term.target <= blk.id;
+        else if (blk.term.kind == TermKind::Branch)
+            has_backedge = blk.term.target <= blk.id || blk.term.false_target <= blk.id;
+        if (!has_backedge) continue;
+        for (const auto& in : blk.instrs) {
+            if (in.op == ThinOp::StoreFrame && in.src1 != 0 && in.src2 == 0 &&
+                in.meta.frame_off != 0 && in.meta.field_off == 0)
+                loop_carried_slots[in.meta.frame_off] = true;
+        }
+    }
+    for (const auto& [off, count] : frame_accesses) {
+        // Only loop-carried mutable source slots are worthwhile and safe to
+        // promote. Read-only locals often alias a producing VReg's spill slot;
+        // promoting those would split the value between two register homes.
+        if (frame_loads[off] != 0 && loop_carried_slots[off])
+            hot_slots.push_back({count, off});
+    }
+    std::sort(hot_slots.begin(), hot_slots.end(),
+              [](const auto& a, const auto& b) {
+                  if (a.first != b.first) return a.first > b.first;
+                  return a.second > b.second;
+              });
+    for (const auto& [count, off] : hot_slots) {
+        (void)count;
+        int32_t free_idx = -1;
+        for (int32_t i = 0; i < pool; ++i) {
+            if (!reg_used[i]) { free_idx = i; break; }
+        }
+        if (free_idx < 0) break;
+        thf.ra.frame_reg_map[off] = int32_t(REG_POOL[free_idx]);
+        reg_used[free_idx] = true;
+    }
+
+    // ─── 6. Record used pool registers + allocate save slots ───
+    // A pool register is "used" by either a VReg interval or promoted slot.
 
     // Extend the frame to add save slots for used callee-saved registers.
     // rbx (pool idx 0) is already saved at rbx_save_offset — skip it.

@@ -193,6 +193,13 @@ struct EmitCtx {
         const auto* a = ra_get(v);
         return (a && !a->in_reg) ? a->frame_off : 0;
     }
+    bool ra_promoted_frame(int32_t off) const {
+        return ra && ra->enabled && ra->frame_reg_map.find(off) != ra->frame_reg_map.end();
+    }
+    Reg ra_frame_reg(int32_t off) const {
+        auto it = ra->frame_reg_map.find(off);
+        return it != ra->frame_reg_map.end() ? Reg(it->second) : Reg::rax;
+    }
 
     // ─── normalize rax to a type's int width (mirrors CG::normalize_rax) ───
     void normalize_rax(const Type* t) {
@@ -611,6 +618,18 @@ struct EmitCtx {
                 next_vreg += 1;
             }
             param_word += words_for_type(pt, structs());
+        }
+
+        // Seed promoted frame-slot registers after ABI parameters have been
+        // spilled. Local slots may still be uninitialized here, but every
+        // well-formed source-level read is dominated at runtime by its local's
+        // StoreFrame initialization, which overwrites the promoted register.
+        if (ra && ra->enabled) {
+            for (const auto& [off, reg_id] : ra->frame_reg_map) {
+                load_rbp_to_rax(e, off);
+                e.mov_reg_reg(Reg(reg_id), Reg::rax);
+            }
+            rax_vreg = 0;
         }
     }
 
@@ -1114,9 +1133,14 @@ struct EmitCtx {
                     vregs[in.dst + 1].type = ty;
                 }
             } else {
-                if (base_reg == Reg::rbp) load_rbp_to_rax(e, load_off);
-                else e.load_elem_to_rax(base_reg, load_off, in.meta.width,
-                                        ty && ty->is_int() && !ty->is_uint());
+                if (base_reg == Reg::rbp && ra_promoted_frame(load_off)) {
+                    e.mov_reg_reg(Reg::rax, ra_frame_reg(load_off));
+                } else if (base_reg == Reg::rbp) {
+                    load_rbp_to_rax(e, load_off);
+                } else {
+                    e.load_elem_to_rax(base_reg, load_off, in.meta.width,
+                                       ty && ty->is_int() && !ty->is_uint());
+                }
                 normalize_rax(ty);
                 record_dst_rax(in.dst, ty);
                 if (in.src1 != 0) pin_int_dst(in.dst, in.meta, ty);
@@ -1164,6 +1188,8 @@ struct EmitCtx {
                     // adjacent hidden return pointer). Ordinary scalar locals
                     // retain the established eight-byte frame-slot store.
                     e.store_rax_elem(Reg::rbp, in.meta.frame_off, in.meta.width);
+                } else if (ra_promoted_frame(in.meta.frame_off)) {
+                    e.mov_reg_reg(ra_frame_reg(in.meta.frame_off), Reg::rax);
                 } else {
                     store_rax_to_rbp(e, in.meta.frame_off);
                 }

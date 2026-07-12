@@ -319,6 +319,11 @@ struct RegAllocResult {
         int32_t frame_off = 0;     // the spill frame slot (when !in_reg; the VReg's existing meta.frame_off)
     };
     std::unordered_map<VReg, Assign> map;
+    // Promoted scalar frame slots. Ordinary LoadFrame/StoreFrame operations for
+    // these offsets use the assigned callee-saved register instead of memory.
+    // This keeps mutable loop locals and parameters resident across blocks and
+    // calls while preserving the frame slot as their initial ABI home.
+    std::unordered_map<int32_t, int32_t> frame_reg_map; // frame_off -> Reg enum
     // The pool registers actually used (for prologue save / epilogue restore).
     // Each entry is a Reg enum value. Parallel to save_offsets.
     std::vector<int32_t> used_reg_ids;
