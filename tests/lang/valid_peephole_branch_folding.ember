@@ -1,0 +1,30 @@
+// valid_peephole_branch_folding.ember — value-preservation coverage for the
+// local peephole pass and conservative branch-folding fallback.
+// Run with:
+//   ember_cli run ../tests/lang/valid_peephole_branch_folding.ember --fn main
+//       --passes peephole,branch_folding
+// expect: 177
+
+fn choose_same_path(x: i64, take_first: bool) -> i64 {
+    // Both arms intentionally compute the same value. The frontend may retain
+    // distinct targets; branch_folding must be a safe no-op unless an earlier
+    // CFG transform makes those targets identical.
+    if (take_first) {
+        return x;
+    } else {
+        return x;
+    }
+}
+
+fn main() -> i64 {
+    let x: i64 = 177;
+
+    // These identities are owned by instcombine. Running peephole alone must
+    // leave them correct, and composing both passes must remain correct.
+    let plus_zero: i64 = x + 0;
+    let times_one: i64 = plus_zero * 1;
+    let masked: i64 = (times_one | times_one) & times_one;
+    let cancelled: i64 = times_one ^ times_one;
+
+    return choose_same_path(masked + cancelled, true);
+}

@@ -2330,24 +2330,112 @@ EmberPreserved DeadSpillElimPass::run(ThinFunction& f, EmberAnalysisManager&) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// PeepholePass: small canonical no-op removal
+// PeepholePass: small canonical no-op and adjacent-sequence simplification
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// Arithmetic identities belong to InstCombinePass and are deliberately not
+// duplicated here. This pass handles the remaining local patterns:
+//   * a storage-free Move(v,v) is a no-op;
+//   * Move(a,b); Move(b,a) has a redundant second move, provided both moves
+//     have the same type and the second move does not materialize a spill;
+//   * a Cast whose locally known source type equals its target type is a Move.
+//
+// The frame_off checks matter because Thin IR producers may materialize their
+// result in a frame home as part of the instruction. Erasing such an
+// instruction would erase a storage write even when its VReg value is unchanged.
 
 EmberPreserved PeepholePass::run(ThinFunction& f, EmberAnalysisManager&) {
     bool changed = false;
     for (auto& blk : f.blocks) {
         auto& instrs = blk.instrs;
-        for (auto it = instrs.begin(); it != instrs.end(); ) {
-            // A frame-backed self-move still performs an observable spill and
-            // therefore is not a no-op. Remove only a storage-free Move(v,v).
-            if (it->op == ThinOp::Move && it->dst != 0 &&
-                it->dst == it->src1 && it->meta.frame_off == 0) {
-                it = instrs.erase(it);
-                changed = true;
-            } else {
-                ++it;
+        std::unordered_map<VReg, const Type*> vreg_types;
+
+        auto remember_type = [&](const ThinInstr& in) {
+            if (in.dst == 0 || in.op == ThinOp::CopyBytes) return;
+
+            const Type* type = in.meta.type;
+            if (!type && in.op == ThinOp::Move) {
+                auto source = vreg_types.find(in.src1);
+                if (source != vreg_types.end()) type = source->second;
             }
+            if (!type && (in.op == ThinOp::CallNative ||
+                          in.op == ThinOp::CallScript ||
+                          in.op == ThinOp::CallIndirect ||
+                          in.op == ThinOp::CallCrossModule))
+                type = in.ret_type;
+
+            if (type) vreg_types[in.dst] = type;
+            else vreg_types.erase(in.dst);
+        };
+
+        for (size_t i = 0; i < instrs.size(); ) {
+            ThinInstr& in = instrs[i];
+
+            // Cast(x, same_type) has exactly Move semantics. Restrict the
+            // proof to a source definition seen in this block: Thin IR is not
+            // SSA, so guessing a type across a block boundary or redefinition
+            // would not be safe.
+            if (in.op == ThinOp::Cast && in.src1 != 0 && in.meta.type) {
+                auto source = vreg_types.find(in.src1);
+                if (source != vreg_types.end() && source->second &&
+                    source->second->same(*in.meta.type)) {
+                    in.op = ThinOp::Move;
+                    in.src2 = 0;
+                    changed = true;
+                }
+            }
+
+            // A frame-backed self-move still performs a spill. Remove only a
+            // storage-free Move(v,v), preserving the current type fact for v.
+            if (in.op == ThinOp::Move && in.dst != 0 &&
+                in.dst == in.src1 && in.meta.frame_off == 0) {
+                instrs.erase(instrs.begin() + static_cast<ptrdiff_t>(i));
+                changed = true;
+                continue;
+            }
+
+            // After a=b, the adjacent b=a merely writes b's existing value
+            // back to itself. Require nominally equal explicit types and no
+            // second spill so neither normalization nor storage is lost.
+            if (i > 0 && in.op == ThinOp::Move && in.dst != 0 &&
+                in.src1 != 0 && in.meta.frame_off == 0) {
+                const ThinInstr& previous = instrs[i - 1];
+                if (previous.op == ThinOp::Move &&
+                    previous.dst == in.src1 && previous.src1 == in.dst &&
+                    previous.meta.type && in.meta.type &&
+                    previous.meta.type->same(*in.meta.type) &&
+                    previous.meta.width == in.meta.width &&
+                    previous.meta.is_f32 == in.meta.is_f32) {
+                    instrs.erase(instrs.begin() + static_cast<ptrdiff_t>(i));
+                    changed = true;
+                    continue;
+                }
+            }
+
+            remember_type(in);
+            ++i;
         }
+    }
+    return changed ? EmberPreserved::none() : EmberPreserved::all();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BranchFoldingPass: identical conditional targets become an unconditional Jmp
+// ═══════════════════════════════════════════════════════════════════════════
+
+EmberPreserved BranchFoldingPass::run(ThinFunction& f,
+                                       EmberAnalysisManager&) {
+    bool changed = false;
+    for (auto& blk : f.blocks) {
+        if (blk.term.kind != TermKind::Branch ||
+            blk.term.target != blk.term.false_target)
+            continue;
+
+        ThinTerm jump;
+        jump.kind = TermKind::Jmp;
+        jump.target = blk.term.target;
+        blk.term = jump;
+        changed = true;
     }
     return changed ? EmberPreserved::none() : EmberPreserved::all();
 }
@@ -2370,6 +2458,7 @@ void register_passes(EmberPassRegistry& reg) {
     reg.add<LoopUnrollPass>("unroll");
     reg.add<DeadSpillElimPass>("spill_elim");
     reg.add<PeepholePass>("peephole");
+    reg.add<BranchFoldingPass>("branch_folding");
 }
 
 } // namespace ember::ext_opt

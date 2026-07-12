@@ -1,6 +1,6 @@
 // ext_opt.hpp — Stage C: the IR optimization passes extension.
 //
-// Twelve IR→IR optimization passes over ThinFunction, registered by name via
+// Fifteen IR→IR optimization passes over ThinFunction, registered by name via
 // register_passes (the extension-style discovery pattern, mirroring
 // register_natives). The host wires it:
 //   EmberPassRegistry reg;
@@ -62,11 +62,14 @@
 //   immediately preceding result register (or a regalloc register). It also
 //   clears redundant producer spill homes immediately materialized by a
 //   following StoreFrame.
-// - PeepholePass ("peephole"): removes genuinely storage-free Move(v,v)
-//   instructions. Arithmetic identities and constant branches remain handled
-//   by instcombine and simplifycfg respectively.
+// - PeepholePass ("peephole"): removes genuinely storage-free Move(v,v),
+//   removes a redundant reverse Move in an adjacent same-typed move pair, and
+//   turns same-type Casts into Moves (then removes them when self-targeted and
+//   storage-free). Arithmetic identities remain handled by instcombine.
+// - BranchFoldingPass ("branch_folding"): replaces a conditional Branch whose
+//   true and false targets are identical with an unconditional Jmp.
 //
-// All fourteen are VALUE-PRESERVING: after the pass, emit_x64 produces the same
+// All fifteen are VALUE-PRESERVING: after the pass, emit_x64 produces the same
 // i64 result. They return EmberPreserved::none() if they changed the IR,
 // Preserved::all() if they did nothing.
 #pragma once
@@ -144,6 +147,11 @@ struct DeadSpillElimPass : EmberPassInfoMixin<DeadSpillElimPass> {
 
 struct PeepholePass : EmberPassInfoMixin<PeepholePass> {
     static constexpr const char* pass_name = "peephole";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+struct BranchFoldingPass : EmberPassInfoMixin<BranchFoldingPass> {
+    static constexpr const char* pass_name = "branch_folding";
     EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
 };
 
