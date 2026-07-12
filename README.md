@@ -28,11 +28,12 @@ within 1.30x of g++-O2). The linear-scan register allocator promotes hot
 loop-carried frame slots to callee-saved registers, reducing memory traffic in
 tight loops.
 
-**18 IR passes shipped** (11 optimization + 7 obfuscation):
+**16 IR passes shipped** (11 optimization + 5 obfuscation):
 - Optimization: constprop, dce, cse, licm, forward, copyprop, instcombine, dse,
   simplifycfg, bounds-elim, sccp
-- Obfuscation: subst (MBA), opaque_pred, deadcode, mba_expand, const_encode,
-  str_encrypt, block_split
+- Obfuscation: subst (MBA), opaque_pred, deadcode, mba_expand, const_encode
+
+String encryption and block splitting obfuscation passes are in development.
 
 Full SSA construction (phi nodes, SSA renaming) remains the future upgrade;
 the shipped regalloc is the linear-scan-over-thin-IR subset (assigns scalar
@@ -289,12 +290,17 @@ Write your own IR passes — optimization or obfuscation:
 # Run built-in passes
 ember run my_script.ember --passes constprop,forward,copyprop,instcombine,dce,licm,dse,simplifycfg,bounds-elim,sccp
 # Obfuscation passes
-ember run my_script.ember --passes opaque_pred,deadcode,mba_expand,const_encode,str_encrypt,block_split
+ember run my_script.ember --passes opaque_pred,deadcode,mba_expand,const_encode
 ```
 
-**18 passes shipped** (11 optimization + 7 obfuscation):
+**16 passes shipped** (11 optimization + 5 obfuscation):
 - Optimization: ConstProp, DCE, CSE, LICM, Forward, CopyProp, InstCombine, DSE, SimplifyCFG, bounds-elim, SCCP
-- Obfuscation: SubstitutionPass (MBA), opaque_pred, deadcode, mba_expand, const_encode, str_encrypt, block_split
+- Obfuscation: SubstitutionPass (MBA), opaque_pred, deadcode, mba_expand, const_encode
+
+String encryption (`str_encrypt`) and block splitting (`block_split`) obfuscation
+passes are in development — string encryption transforms `ConstStringRef` IR
+ops into `StringDecrypt` (XOR-decrypt at runtime), matching ember's built-in
+`string_xor_key` feature but as a composable pass.
 
 - **Pass system:** `docs/spec/PASS_SYSTEM_DESIGN.md` — architecture, registration, lifecycle
 - **Pass authoring guide:** `docs/PASS_AUTHORING.md` — how to write a custom pass
