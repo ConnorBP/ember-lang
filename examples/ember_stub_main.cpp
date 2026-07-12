@@ -47,6 +47,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -156,7 +157,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "ember_stub: no embedded module (bad footer magic)\n");
         return 2;
     }
-    if (em_len == 0 || file_size < uint64_t(EM_BUNDLE_FOOTER_SIZE) + em_len) {
+    // Subtraction form is deliberate: `footer_size + em_len` can wrap for a
+    // malicious all-ones u64 footer. file_size is already known >= footer.
+    if (em_len == 0 || em_len > file_size - EM_BUNDLE_FOOTER_SIZE ||
+        em_len > uint64_t(std::numeric_limits<size_t>::max()) ||
+        em_len > uint64_t(std::numeric_limits<std::streamsize>::max())) {
         std::fprintf(stderr, "ember_stub: bad em_length in footer\n");
         return 2;
     }
@@ -193,19 +198,19 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // 5. Find the entry. An optional --fn NAME argument overrides the default
-    //    (@entry slot, else "main"). This mirrors the CLI --load-em path.
-    std::string fn_name = "main";
+    // 5. Find the entry. The bundler persists --fn as mod.entry_slot. A
+    // runtime --fn remains available for diagnostics/manual overrides.
+    std::string fn_name;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--fn" && i + 1 < argc) {
             fn_name = argv[++i];
         }
     }
-    void* entry = mod.entry_by_name(fn_name.c_str());
-    if (!entry) entry = mod.entry();
+    void* entry = fn_name.empty() ? mod.entry() : mod.entry_by_name(fn_name.c_str());
     if (!entry) {
-        std::fprintf(stderr, "ember_stub: entry '%s' not found\n", fn_name.c_str());
+        std::fprintf(stderr, "ember_stub: entry '%s' not found\n",
+                     fn_name.empty() ? "<bundled entry>" : fn_name.c_str());
         return 2;
     }
 
@@ -213,7 +218,7 @@ int main(int argc, char** argv) {
     //    Matches the CLI --load-em contract exactly.
     uint32_t selected_slot = mod.entry_slot;
     for (const auto& item : mod.name_table)
-        if (item.first == fn_name) { selected_slot = item.second; break; }
+        if (!fn_name.empty() && item.first == fn_name) { selected_slot = item.second; break; }
     bool is_void = selected_slot < mod.signatures_by_slot.size() &&
                    mod.signatures_by_slot[selected_slot].ret.is_void();
 

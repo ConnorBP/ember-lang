@@ -1,6 +1,18 @@
 // ember_bundle - standalone exe bundler (docs/planning/plan_STANDALONE_BUNDLER.md).
 //
-// `ember_bundle <input.ember> <output.exe> [--stub <stub.exe>] [--fn NAME]`
+// `ember_bundle <input.ember> <output.exe> [--stub <stub.exe>] [--fn NAME]
+//               [--permissions none|ffi]
+//               [--output-permissions stub|preserve]`
+//
+// This file is also the implementation of the ember_bundler library used by
+// `ember bundle`. CMake compiles it once with EMBER_BUNDLE_LIBRARY_ONLY and
+// links both front-ends to that library; EMBER_BUNDLE_MAIN_ONLY builds the
+// tiny standalone front-end without cloning the implementation.
+
+#ifdef EMBER_BUNDLE_MAIN_ONLY
+namespace ember_bundle { int command(int argc, char** argv); }
+int main(int argc, char** argv) { return ember_bundle::command(argc, argv); }
+#else
 //
 // Compiles a .ember script to a .em blob (the existing emit-em pipeline:
 // read → resolve imports → lex → parse → slot assignment → register bindings
@@ -52,6 +64,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -70,7 +83,7 @@ constexpr uint32_t EM_BUNDLE_FOOTER_SIZE  = 12u;          // u32 magic + u64 em_
 
 // ---- helpers mirrored from ember_cli.cpp (the compile pipeline) ----
 
-static std::string read_file(const char* path) {
+static std::string read_file(const fs::path& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return std::string();
     std::stringstream ss; ss << f.rdbuf();
@@ -186,6 +199,8 @@ static void usage(FILE* out) {
         "ember_bundle - compile a .ember script + the ember runtime into one .exe\n"
         "usage:\n"
         "  ember_bundle <input.ember> <output.exe> [--stub <stub.exe>] [--fn NAME]\n"
+        "               [--permissions none|ffi]\n"
+        "               [--output-permissions stub|preserve]\n"
         "\n"
         "  Compiles <input.ember> to a .em blob, copies the pre-built stub exe\n"
         "  (ember_stub_main.exe) to <output.exe>, and appends the .em + a 12-byte\n"
@@ -194,7 +209,16 @@ static void usage(FILE* out) {
         "\n"
         "  --stub PATH   path to the stub exe (default: ember_stub_main.exe next\n"
         "                to this bundler)\n"
-        "  --fn NAME     the entry function to call at runtime (default: main)\n"
+        "  --fn NAME     entry function baked into the bundle (default: main)\n"
+        "  --permissions POLICY\n"
+        "                source capability policy: 'none' (default) rejects FFI/IO\n"
+        "                natives; 'ffi' permits them. The trusted runtime stub has\n"
+        "                the FFI host bindings needed to load explicitly permitted\n"
+        "                bundles. This option does not alter filesystem ACLs.\n"
+        "  --output-permissions POLICY\n"
+        "                'stub' (default) copies the stub's filesystem mode;\n"
+        "                'preserve' retains an existing output's mode when it is\n"
+        "                overwritten. Windows ACL inheritance remains OS-managed.\n"
     );
 }
 
@@ -203,30 +227,32 @@ static void usage(FILE* out) {
 // the .em without going through the CLI. Returns true + fills `mod` on success;
 // false + prints errors to stderr on failure. `fns_out` receives the JIT'd
 // CompiledFns (so the caller can free their exec pages).
-static bool compile_to_em_module(const std::string& file,
+static bool compile_to_em_module(const fs::path& file,
+                                 const std::string& entry_name,
+                                 uint32_t permissions,
                                  ember::EmModule& mod,
                                  std::vector<ember::CompiledFn>& fns_out,
                                  std::string& err_out) {
     using namespace ember;
 
     if (!fs::exists(file)) {
-        err_out = "ember_bundle: no such file: " + file;
+        err_out = "ember_bundle: no such file: " + file.u8string();
         return false;
     }
 
     // ---- read + resolve imports ----
-    std::string raw = read_file(file.c_str());
+    std::string raw = read_file(file);
     if (raw.empty() && fs::file_size(file) == 0) {
         // empty file — will fail at parse with a clearer message
     } else if (raw.empty()) {
-        err_out = "ember_bundle: cannot read '" + file + "'";
+        err_out = "ember_bundle: cannot read '" + file.u8string() + "'";
         return false;
     }
-    std::string base_dir = fs::path(file).parent_path().string();
+    std::string base_dir = file.parent_path().u8string();
     std::unordered_set<std::string> seen;
     std::string src;
     try {
-        std::string canon = fs::weakly_canonical(fs::path(file)).string();
+        std::string canon = fs::weakly_canonical(file).u8string();
         seen.insert(canon);
         src = resolve_imports(raw, base_dir, seen);
     } catch (const std::exception& e) {
@@ -235,7 +261,8 @@ static bool compile_to_em_module(const std::string& file,
     }
 
     // ---- lex ----
-    auto lr = tokenize(src, file.c_str());
+    const std::string display_file = file.u8string();
+    auto lr = tokenize(src, display_file.c_str());
     if (!lr.ok) {
         err_out = "ember_bundle: lex error (" + std::to_string(lr.err_line) + ":" +
                   std::to_string(lr.err_col) + "): " + lr.error;
@@ -249,7 +276,7 @@ static bool compile_to_em_module(const std::string& file,
         return false;
     }
     if (pr.program.funcs.empty()) {
-        err_out = "ember_bundle: no functions in '" + file + "'";
+        err_out = "ember_bundle: no functions in '" + file.u8string() + "'";
         return false;
     }
 
@@ -257,6 +284,11 @@ static bool compile_to_em_module(const std::string& file,
     std::unordered_map<std::string, int> slots;
     int si = 0;
     for (auto& fn : pr.program.funcs) { slots[fn.name] = si++; fn.slot = slots[fn.name]; }
+    const auto requested_entry = slots.find(entry_name);
+    if (requested_entry == slots.end()) {
+        err_out = "ember_bundle: entry function '" + entry_name + "' not found";
+        return false;
+    }
 
     // ---- register bindings ----
     std::unordered_map<std::string, NativeSig> natives;
@@ -284,7 +316,7 @@ static bool compile_to_em_module(const std::string& file,
             // FIX 3 + Finding B: the bundler is a build tool processing trusted
             // source, so it opts in to raw x86 (v3 artifacts) and grants
             // PERM_FFI (the linked modules may use ext_io natives).
-            ember::EmLoadPolicy em_policy{ember::PERM_FFI, true};
+            ember::EmLoadPolicy em_policy{permissions, true};
             if (!link_em_file(registry, path.c_str(), ld.alias, linked_ems.back(), &lerr, &natives, nullptr, &em_policy)) {
                 err_out = "ember_bundle: link '" + ld.target + "' failed: " + lerr;
                 return false;
@@ -294,7 +326,7 @@ static bool compile_to_em_module(const std::string& file,
         }
     }
 
-    auto sr = sema(pr.program, natives, slots, 0u, &overloads, &struct_layouts, &module_exports);
+    auto sr = sema(pr.program, natives, slots, permissions, &overloads, &struct_layouts, &module_exports);
     if (!sr.ok) {
         std::string msg = "ember_bundle: sema errors (" + std::to_string(sr.errors.size()) + "):";
         for (auto& e : sr.errors) msg += "\n  line " + std::to_string(e.line) + ": " + e.msg;
@@ -388,16 +420,9 @@ static bool compile_to_em_module(const std::string& file,
     }
     mod.globals = gb_store;
 
-    // entry slot: @entry annotation, else "main".
-    uint32_t entry_slot = EM_NO_ENTRY;
-    for (const auto& fn : pr.program.funcs)
-        for (const auto& a : fn.annotations)
-            if (a.name == "entry") { entry_slot = uint32_t(fn.slot); break; }
-    if (entry_slot == EM_NO_ENTRY) {
-        auto sit2 = slots.find("main");
-        if (sit2 != slots.end()) entry_slot = uint32_t(sit2->second);
-    }
-    mod.entry_slot = entry_slot;
+    // `--fn` is a build-time choice: persist it as the module entry slot so
+    // the produced executable runs that function without runtime arguments.
+    mod.entry_slot = uint32_t(requested_entry->second);
 
     mod.name_table.reserve(pr.program.funcs.size());
     for (const auto& fn : pr.program.funcs)
@@ -407,11 +432,15 @@ static bool compile_to_em_module(const std::string& file,
     return true;
 }
 
-int main(int argc, char** argv) {
-    std::string input_file;
-    std::string output_file;
-    std::string stub_path;
+namespace ember_bundle {
+
+int command(int argc, char** argv) {
+    fs::path input_file;
+    fs::path output_file;
+    fs::path stub_path;
     std::string fn_name = "main";
+    uint32_t permissions = 0u;
+    bool preserve_output_permissions = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -421,13 +450,25 @@ int main(int argc, char** argv) {
         } else if (a == "--fn") {
             if (++i >= argc) { std::fprintf(stderr, "ember_bundle: --fn needs a name\n"); return 2; }
             fn_name = argv[i];
+        } else if (a == "--permissions") {
+            if (++i >= argc) { std::fprintf(stderr, "ember_bundle: --permissions needs none or ffi\n"); return 2; }
+            const std::string policy = argv[i];
+            if (policy == "none") permissions = 0u;
+            else if (policy == "ffi") permissions = ember::PERM_FFI;
+            else { std::fprintf(stderr, "ember_bundle: invalid permission policy '%s' (expected none or ffi)\n", policy.c_str()); return 2; }
+        } else if (a == "--output-permissions") {
+            if (++i >= argc) { std::fprintf(stderr, "ember_bundle: --output-permissions needs stub or preserve\n"); return 2; }
+            const std::string policy = argv[i];
+            if (policy == "stub") preserve_output_permissions = false;
+            else if (policy == "preserve") preserve_output_permissions = true;
+            else { std::fprintf(stderr, "ember_bundle: invalid output permission policy '%s' (expected stub or preserve)\n", policy.c_str()); return 2; }
         } else if (a == "--help" || a == "-h") {
             usage(stdout);
             return 0;
         } else if (input_file.empty()) {
-            input_file = a;
+            input_file = fs::u8path(a);
         } else if (output_file.empty()) {
-            output_file = a;
+            output_file = fs::u8path(a);
         } else {
             std::fprintf(stderr, "ember_bundle: unexpected argument: %s\n", a.c_str());
             usage(stderr);
@@ -444,7 +485,7 @@ int main(int argc, char** argv) {
     // ---- resolve the stub path ----
     fs::path stub;
     if (!stub_path.empty()) {
-        stub = fs::path(stub_path);
+        stub = stub_path;
     } else {
         // default: ember_stub_main.exe next to this bundler exe
         fs::path own = get_own_exe_path();
@@ -452,10 +493,14 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "ember_bundle: cannot determine own path; use --stub\n");
             return 2;
         }
+#if defined(_WIN32)
         stub = own.parent_path() / "ember_stub_main.exe";
+#else
+        stub = own.parent_path() / "ember_stub_main";
+#endif
     }
     if (!fs::exists(stub)) {
-        std::fprintf(stderr, "ember_bundle: stub not found: %s\n", stub.string().c_str());
+        std::fprintf(stderr, "ember_bundle: stub not found: %s\n", stub.u8string().c_str());
         std::fprintf(stderr, "  (build ember_stub_main or pass --stub <path>)\n");
         return 2;
     }
@@ -467,7 +512,7 @@ int main(int argc, char** argv) {
     {
         // The compile pipeline JITs each function (allocates exec pages) to
         // produce the code bytes. We free those pages after serialization.
-        if (!compile_to_em_module(input_file, emod, fns, cerr)) {
+        if (!compile_to_em_module(input_file, fn_name, permissions, emod, fns, cerr)) {
             std::fprintf(stderr, "%s\n", cerr.c_str());
             return 2;
         }
@@ -493,18 +538,64 @@ int main(int argc, char** argv) {
     ember::ext_sync::reset(); ember::ext_lifecycle::reset();
     ember::ext_io::reset();
 
-    // ---- copy stub -> output.exe ----
     std::error_code ec;
+    // Validate all sizes before creating/replacing the output. Besides making
+    // streamsize conversions explicit, this proves the final footer equation
+    // cannot overflow: output = stub + em + 12.
+    if (em_bytes.empty() || em_bytes.size() > size_t(std::numeric_limits<std::streamsize>::max())) {
+        std::fprintf(stderr, "ember_bundle: serialized module has an invalid/unsupported size\n");
+        return 2;
+    }
+    ec.clear();
+    const uintmax_t stub_size = fs::file_size(stub, ec);
+    if (ec) {
+        std::fprintf(stderr, "ember_bundle: cannot determine stub size: %s\n", ec.message().c_str());
+        return 2;
+    }
+    constexpr uint64_t U64_MAX_VALUE = std::numeric_limits<uint64_t>::max();
+    if (stub_size > U64_MAX_VALUE - EM_BUNDLE_FOOTER_SIZE ||
+        uint64_t(em_bytes.size()) > U64_MAX_VALUE - EM_BUNDLE_FOOTER_SIZE - uint64_t(stub_size)) {
+        std::fprintf(stderr, "ember_bundle: output size would overflow the bundle footer format\n");
+        return 2;
+    }
+
+    // ---- copy stub -> output.exe ----
+    // Default policy is deterministic: the output receives the prebuilt
+    // stub's portable filesystem permission bits. `preserve` is useful when
+    // replacing an already-deployed path whose owner/group mode was curated.
+    fs::perms output_perms = fs::perms::unknown;
+    if (preserve_output_permissions && fs::exists(output_file, ec) && !ec) {
+        output_perms = fs::status(output_file, ec).permissions();
+        if (ec) {
+            std::fprintf(stderr, "ember_bundle: cannot read existing output permissions: %s\n", ec.message().c_str());
+            return 2;
+        }
+    } else {
+        ec.clear();
+        output_perms = fs::status(stub, ec).permissions();
+        if (ec) {
+            std::fprintf(stderr, "ember_bundle: cannot read stub permissions: %s\n", ec.message().c_str());
+            return 2;
+        }
+    }
+    ec.clear();
     fs::copy_file(stub, output_file, fs::copy_options::overwrite_existing, ec);
     if (ec) {
         std::fprintf(stderr, "ember_bundle: copy stub failed: %s\n", ec.message().c_str());
         return 2;
     }
 
+    fs::permissions(output_file, output_perms, fs::perm_options::replace, ec);
+    if (ec) {
+        std::fprintf(stderr, "ember_bundle: cannot apply output permissions: %s\n", ec.message().c_str());
+        fs::remove(output_file, ec);
+        return 2;
+    }
+
     // ---- append the .em + footer to output.exe ----
     std::ofstream out(output_file, std::ios::binary | std::ios::app);
     if (!out) {
-        std::fprintf(stderr, "ember_bundle: cannot open output for append: %s\n", output_file.c_str());
+        std::fprintf(stderr, "ember_bundle: cannot open output for append: %s\n", output_file.u8string().c_str());
         return 2;
     }
     out.write(reinterpret_cast<const char*>(em_bytes.data()),
@@ -522,8 +613,12 @@ int main(int argc, char** argv) {
     }
     out.close();
 
-    std::printf("ember_bundle: wrote %s (%zu .em bytes, %zu fns, entry slot %u, fn=%s)\n",
-                output_file.c_str(), em_bytes.size(), emod.functions.size(),
-                emod.entry_slot, fn_name.c_str());
+    std::printf("ember_bundle: wrote %s (%zu .em bytes, %zu fns, entry slot %u, fn=%s, permissions=%s, output-permissions=%s)\n",
+                output_file.u8string().c_str(), em_bytes.size(), emod.functions.size(),
+                emod.entry_slot, fn_name.c_str(), permissions ? "ffi" : "none",
+                preserve_output_permissions ? "preserve" : "stub");
     return 0;
 }
+
+} // namespace ember_bundle
+#endif // !EMBER_BUNDLE_MAIN_ONLY

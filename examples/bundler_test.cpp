@@ -8,9 +8,11 @@
 //   3. bundle with imports (imported fn is inlined at bundle time)
 //   4. bundle with globals (global initializer baked into the .em)
 //   5. bundle with natives (io extension: console_write + a math native)
-//   6. malformed bundle (a plain stub with no .em appended -> exit 2)
+//   6. malformed/corrupt footer rejection
+//   7. spaces + Unicode paths, large modules, missing entry, overwrite
+//   8. the `ember bundle` CLI front-end
 //
-// Usage: bundler_test <ember_bundle_exe> <stub_exe>
+// Usage: bundler_test <ember_bundle_exe> <stub_exe> <ember_cli_exe>
 //   ember_bundle_exe : path to ember_bundle.exe (built alongside this test)
 //   stub_exe         : path to ember_stub_main.exe (the pre-built stub)
 //
@@ -24,6 +26,10 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#  include <windows.h>
+#endif
+
 namespace fs = std::filesystem;
 
 // Bundle footer constants (must match ember_stub_main.cpp / ember_bundle.cpp).
@@ -34,7 +40,7 @@ static constexpr uint32_t BUNDLE_MAGIC      = 0x454D4244u;
 static constexpr uint32_t BUNDLE_FOOTER_SIZE = 12u;
 
 // Write a .ember source file to `path`.
-static bool write_source(const std::string& path, const std::string& content) {
+static bool write_source(const fs::path& path, const std::string& content) {
     std::ofstream os(path, std::ios::binary);
     if (!os) return false;
     os << content;
@@ -59,16 +65,47 @@ static std::string quote(const std::string& path) {
 static int bundle(const std::string& bundler_exe,
                   const std::string& stub_exe,
                   const std::string& source,
-                  const std::string& output) {
+                  const std::string& output,
+                  const std::string& extra = std::string()) {
     // ember_bundle <input.ember> <output.exe> --stub <stub.exe>
     std::string cmd = quote(quote(bundler_exe) + " " + quote(source) + " " +
-                            quote(output) + " --stub " + quote(stub_exe));
+                            quote(output) + " --stub " + quote(stub_exe) +
+                            (extra.empty() ? "" : " " + extra));
     return run_command(cmd);
 }
 
 // Run a bundled exe and return its exit code.
 static int run_bundled(const std::string& exe) {
+#if defined(_WIN32)
+    // std::system goes through cmd.exe's active code page and cannot reliably
+    // launch UTF-8 paths. CreateProcessW exercises the bundled executable's
+    // real Unicode self-path handling instead.
+    const std::wstring app = fs::u8path(exe).wstring();
+    std::wstring cmd = L"\"" + app + L"\"";
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(app.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0,
+                        nullptr, nullptr, &si, &pi)) return -1;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = DWORD(-1);
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    return static_cast<int>(code);
+#else
     return run_command(quote(quote(exe)));
+#endif
+}
+
+static std::string read_text(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+static int run_captured(const std::string& executable, const std::string& args,
+                        const fs::path& capture) {
+    const std::string inner = quote(executable) + (args.empty() ? "" : " " + args) +
+                              " > " + quote(capture.string()) + " 2>&1";
+    return run_command(quote(inner));
 }
 
 // ---- individual test cases ----
@@ -97,11 +134,12 @@ static bool test_multiple_functions(const std::string& bundler, const std::strin
     const auto out = (tmp / "multi.exe").string();
     const char* code =
         "fn helper(x: i64) -> i64 { return x * 2; }\n"
-        "fn main() -> i64 { return helper(21); }\n";
+        "fn selected() -> i64 { return helper(21); }\n"
+        "fn main() -> i64 { return 1; }\n";
     if (!write_source(src, code)) {
         std::fprintf(stderr, "  multi: failed to write source\n"); return false;
     }
-    int brc = bundle(bundler, stub, src, out);
+    int brc = bundle(bundler, stub, src, out, "--fn selected");
     if (brc != 0) { std::fprintf(stderr, "  multi: bundle failed (rc=%d)\n", brc); return false; }
     int rrc = run_bundled(out);
     if (rrc != 42) { std::fprintf(stderr, "  multi: expected exit 42, got %d\n", rrc); return false; }
@@ -214,13 +252,116 @@ static bool test_bad_footer(const std::string& bundler, const std::string& stub,
     return true;
 }
 
+// Overflow regression: valid EMBD magic + UINT64_MAX length must be rejected
+// before arithmetic, allocation, seeking, or reading.
+static bool test_footer_length_overflow(const std::string& stub, const fs::path& tmp) {
+    const auto out = tmp / "overflow.exe";
+    std::error_code ec;
+    fs::copy_file(stub, out, fs::copy_options::overwrite_existing, ec);
+    if (ec) return false;
+    std::ofstream app(out, std::ios::binary | std::ios::app);
+    const uint32_t magic = BUNDLE_MAGIC;
+    const uint64_t impossible = UINT64_MAX;
+    app.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+    app.write(reinterpret_cast<const char*>(&impossible), sizeof(impossible));
+    app.close();
+    const int rc = run_bundled(out.string());
+    if (rc != 2) { std::fprintf(stderr, "  overflow: expected exit 2, got %d\n", rc); return false; }
+    std::printf("  overflow: PASS\n");
+    return true;
+}
+
+static bool test_spaces_unicode_and_cli(const std::string& cli, const std::string& stub,
+                                        const fs::path& tmp) {
+    const fs::path dir = tmp / fs::u8path(u8"space dir ünicode");
+    std::error_code ec; fs::create_directories(dir, ec);
+    const fs::path src = dir / fs::u8path(u8"héllo world.ember");
+    const fs::path out = dir / fs::u8path(u8"héllo world.exe");
+    if (!write_source(src, "fn main() -> i64 { return 43; }\n")) return false;
+    const std::string args = "bundle " + quote(src.string()) + " " + quote(out.string()) +
+                             " --stub " + quote(stub);
+    const int brc = run_command(quote(quote(cli) + " " + args));
+    if (brc != 0 || run_bundled(out.string()) != 43) {
+        std::fprintf(stderr, "  unicode: CLI bundle/run failed (rc=%d)\n", brc); return false;
+    }
+    std::printf("  spaces/unicode + ember bundle CLI: PASS\n");
+    return true;
+}
+
+static bool test_large_module(const std::string& bundler, const std::string& stub,
+                              const fs::path& tmp) {
+    const fs::path src = tmp / "large.ember", out = tmp / "large.exe";
+    std::string code;
+    code.reserve(512 * 1024);
+    for (int i = 0; i < 1800; ++i)
+        code += "fn helper_" + std::to_string(i) + "() -> i64 { return " + std::to_string(i % 200) + "; }\n";
+    code += "fn main() -> i64 { return helper_1799(); }\n";
+    if (!write_source(src, code)) return false;
+    const int brc = bundle(bundler, stub, src.string(), out.string());
+    if (brc != 0 || run_bundled(out.string()) != 199) {
+        std::fprintf(stderr, "  large: bundle/run failed (rc=%d)\n", brc); return false;
+    }
+    std::printf("  large module: PASS (%zu source bytes)\n", code.size());
+    return true;
+}
+
+static bool test_missing_entry(const std::string& bundler, const std::string& stub,
+                               const fs::path& tmp) {
+    const fs::path src = tmp / "missing_entry.ember", out = tmp / "missing_entry.exe";
+    const fs::path log = tmp / "missing_entry.log";
+    if (!write_source(src, "fn helper() -> i64 { return 1; }\n")) return false;
+    const std::string args = quote(src.string()) + " " + quote(out.string()) +
+                             " --stub " + quote(stub) + " --fn absent";
+    const int rc = run_captured(bundler, args, log);
+    const std::string msg = read_text(log);
+    if (rc != 2 || msg.find("entry function 'absent' not found") == std::string::npos || fs::exists(out)) {
+        std::fprintf(stderr, "  missing entry: unclear rejection (rc=%d, msg=%s)\n", rc, msg.c_str()); return false;
+    }
+    std::printf("  missing entry: PASS\n");
+    return true;
+}
+
+static bool test_overwrite(const std::string& bundler, const std::string& stub,
+                           const fs::path& tmp) {
+    const fs::path src = tmp / "overwrite.ember", out = tmp / "overwrite.exe";
+    if (!write_source(src, "fn main() -> i64 { return 10; }\n") ||
+        bundle(bundler, stub, src.string(), out.string()) != 0 || run_bundled(out.string()) != 10) return false;
+    if (!write_source(src, "fn main() -> i64 { return 11; }\n") ||
+        bundle(bundler, stub, src.string(), out.string()) != 0 || run_bundled(out.string()) != 11) {
+        std::fprintf(stderr, "  overwrite: second bundle did not replace output\n"); return false;
+    }
+    std::printf("  overwrite existing output: PASS\n");
+    return true;
+}
+
+static bool test_permission_policy(const std::string& bundler, const std::string& stub,
+                                   const fs::path& tmp) {
+    const fs::path src = tmp / "permissions.ember", out = tmp / "permissions.exe";
+    const fs::path log = tmp / "permissions.log";
+    if (!write_source(src, "fn main() -> i64 { print(\"\"); return 0; }\n")) return false;
+    std::string args = quote(src.string()) + " " + quote(out.string()) + " --stub " + quote(stub);
+    int rc = run_captured(bundler, args, log);
+    const std::string denied = read_text(log);
+    if (rc != 2 || (denied.find("PERM_FFI permission") == std::string::npos &&
+                    denied.find("unknown function") == std::string::npos)) {
+        std::fprintf(stderr, "  permissions: default policy did not reject FFI\n"); return false;
+    }
+    rc = bundle(bundler, stub, src.string(), out.string(), "--permissions ffi");
+    if (rc != 0 || run_bundled(out.string()) != 0) {
+        std::fprintf(stderr, "  permissions: explicit ffi policy failed\n"); return false;
+    }
+    std::printf("  permission policy: PASS\n");
+    return true;
+}
+
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        std::fprintf(stderr, "usage: bundler_test <ember_bundle_exe> <stub_exe>\n");
+    if (argc != 4) {
+        std::fprintf(stderr, "usage: bundler_test <ember_bundle_exe> <stub_exe> <ember_cli_exe>\n");
         return 1;
     }
     const std::string bundler = argv[1];
     const std::string stub = argv[2];
+    const std::string cli = argv[3];
 
     if (!fs::exists(bundler)) {
         std::fprintf(stderr, "bundler_test: ember_bundle not found: %s\n", bundler.c_str());
@@ -247,6 +388,12 @@ int main(int argc, char** argv) {
     all_ok &= test_natives(bundler, stub, tmp);
     all_ok &= test_malformed_bundle(bundler, stub, tmp);
     all_ok &= test_bad_footer(bundler, stub, tmp);
+    all_ok &= test_footer_length_overflow(stub, tmp);
+    all_ok &= test_spaces_unicode_and_cli(cli, stub, tmp);
+    all_ok &= test_large_module(bundler, stub, tmp);
+    all_ok &= test_missing_entry(bundler, stub, tmp);
+    all_ok &= test_overwrite(bundler, stub, tmp);
+    all_ok &= test_permission_policy(bundler, stub, tmp);
 
     // cleanup
     fs::remove_all(tmp, ec);

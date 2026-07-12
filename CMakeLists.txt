@@ -576,17 +576,22 @@ target_link_libraries(ember_stub_main PRIVATE
     ember_ext_sync ember_ext_lifecycle ember_ext_map
     ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_gc)
 
-# The bundler tool: compiles a .ember -> .em (the emit-em pipeline), copies
-# the stub to <output.exe>, appends the .em + footer. Links the same libs as
-# ember_cli (it runs the full compile pipeline). The OUTPUT exe (the stub)
-# links only the load path.
-add_executable(ember_bundle examples/ember_bundle.cpp)
-target_link_libraries(ember_bundle PRIVATE
+# Shared bundler implementation. Both `ember bundle` and ember_bundle.exe call
+# this one implementation, so compile/validation/footer policy cannot drift.
+add_library(ember_bundler STATIC examples/ember_bundle.cpp)
+target_compile_definitions(ember_bundler PRIVATE EMBER_BUNDLE_LIBRARY_ONLY)
+target_link_libraries(ember_bundler PUBLIC
     ember ember_frontend ember_import
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_map
     ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_gc)
+target_link_libraries(ember_cli PRIVATE ember_bundler)
+
+# Thin compatibility front-end for scripts that invoke ember_bundle directly.
+add_executable(ember_bundle examples/ember_bundle.cpp)
+target_compile_definitions(ember_bundle PRIVATE EMBER_BUNDLE_MAIN_ONLY)
+target_link_libraries(ember_bundle PRIVATE ember_bundler)
 
 # End-to-end bundler test: bundle .ember scripts into standalone exes, run
 # them, assert exit codes. Covers simple scripts, multi-function, imports,
@@ -594,7 +599,7 @@ target_link_libraries(ember_bundle PRIVATE
 # stub exe paths via $<TARGET_FILE:...>.
 add_executable(bundler_test examples/bundler_test.cpp)
 add_test(NAME bundler_test COMMAND bundler_test
-    $<TARGET_FILE:ember_bundle> $<TARGET_FILE:ember_stub_main>)
+    $<TARGET_FILE:ember_bundle> $<TARGET_FILE:ember_stub_main> $<TARGET_FILE:ember_cli>)
 set_tests_properties(bundler_test PROPERTIES TIMEOUT 60)
 
 # Family A: `ember test` — native test runner (classify + compile + run/sema-check

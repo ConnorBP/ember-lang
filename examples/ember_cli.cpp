@@ -14,6 +14,8 @@
 //   ember run <file.ember> [--fn <name>] [--dump] [--emit-em <output.em>]
 //                           [--tick [--tick-count N] [--tick-interval MS]]
 //   ember emit-em <input.ember> <output.em>
+//   ember bundle <input.ember> <output.exe> [--stub PATH] [--fn NAME]
+//                [--permissions none|ffi] [--output-permissions stub|preserve]
 //   ember run --load-em <file.em> [--fn <name>]
 //
 //   run        compiles <file.ember> and calls the entry function unless
@@ -100,6 +102,9 @@
 
 namespace fs = std::filesystem;
 
+// Shared with ember_bundle.exe via the ember_bundler library.
+namespace ember_bundle { int command(int argc, char** argv); }
+
 static std::string read_file(const char* path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return std::string();
@@ -167,6 +172,9 @@ static void usage(FILE* out) {
         "                          [--tick [--tick-count N] [--tick-interval MS]]\n"
         "                          [--passes SPEC]\n"
         "  ember emit-em <input.ember> <output.em>\n"
+        "  ember bundle <input.ember> <output.exe> [--stub PATH] [--fn NAME]\n"
+        "               [--permissions none|ffi]\n"
+        "               [--output-permissions stub|preserve]\n"
         "  ember run --load-em <input.em> [--fn NAME]\n"
         "  ember bench <input.ember> [--fn NAME] [--iters N] [--warmup N]\n"
         "  ember test [dir]     run every .ember file in <dir> (default tests/lang/)\n"
@@ -176,6 +184,9 @@ static void usage(FILE* out) {
         "\n"
         "  run                 compile and call the entry function\n"
         "  emit-em             compile without running and write <output.em>\n"
+        "  bundle              create a standalone executable using the sibling\n"
+        "                      ember_stub_main executable; source permissions are\n"
+        "                      none by default, or FFI/IO with --permissions ffi\n"
         "  bench               microbenchmark the entry fn: warmup + N timed iters;\n"
         "                      print min/median/mean/p99/stddev + return value +\n"
         "                      machine/compiler metadata (closes the audit's\n"
@@ -1419,6 +1430,12 @@ static int run_live_command(const std::string& file_path,
 
 int main(int argc, char** argv) {
     using namespace ember;
+
+    // The bundler owns its argument grammar. Dispatch before the general CLI
+    // parser so its positional output and --stub/--permissions options are not
+    // reimplemented here. argv[0] becomes "bundle", matching a normal main().
+    if (argc > 1 && std::string(argv[1]) == "bundle")
+        return ember_bundle::command(argc - 1, argv + 1);
 
     // ---- arg parse ----
     std::string action;
