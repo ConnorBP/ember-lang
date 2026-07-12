@@ -1045,10 +1045,45 @@ separate sub-registration functions, still future).
 
 ### Standalone exe bundler — TODO
 
-- **Standalone exe bundler** — **TODO.** Bundle a `.ember` script + the ember
-  runtime + the JIT'd code into a single self-contained `.exe` that runs
-  without a separate ember install. A full 793-line design exists at
-  `docs/planning/plan_STANDALONE_BUNDLER.md` (the embed-the-VM + serialize-
-  the-IR + stub-main approach). Unlocks ember as a distribution format for
-  CLI tools and game mods. Dep: the `.em` v5 IR format (shipped) + a small
-  stub `main` that loads + runs the embedded module.
+- **Standalone exe bundler** — **✓ SHIPPED (v1.0, `ember bundle` CLI in v1.1).**
+  Bundle a `.ember` script + the ember runtime + the JIT'd code into a single
+  self-contained `.exe` that runs without a separate ember install. The
+  `ember bundle <input.ember> <output.exe>` CLI subcommand + hardened
+  `ember_bundle.exe` + `ember_stub_main.exe` runtime stub are shipped and
+  tested (7 ctest tests). Release packaging script at `scripts/package_release.sh`.
+
+### Family D — VST3 audio plugin wrapper (TODO, full plan at `docs/planning/plan_VST3_EMBER_WRAPPER.md`)
+
+A VST3 plugin wrapper that lets users write audio plugins **fully in ember**.
+The C++ wrapper IS the VST3 plugin (loaded by DAWs), delegating DSP to
+precompiled ember functions. Showcases ember's pipelines, hot reload,
+high-throughput f32/f64 data flow, and embedding — while providing a genuinely
+useful starting point for VST plugin development.
+
+**VST3 SDK 3.8.0 (October 2025) — MIT licensed.** No license barriers.
+Vendored as `thirdparty/vst3sdk/`.
+
+Goals: real-world use case showcase, pipeline showcase, hot reload bootstrap
+(iterate on DSP without restarting the DAW), hot reload showcase, high data
+flow stress test (48kHz real-time audio), language/tooling improvement
+revelation, optional visual node graph editor, full VST API exposure.
+
+**Phases:**
+1. Research + SDK pin + architecture document (plan written)
+2. Headless realtime DSP harness + `@realtime` sema checker
+3. Minimal VST3 effect: stereo f32 gain plugin
+4. Typed audio pipeline + sample-accurate parameter automation
+5. Background compilation + atomic hot reload + state migration/crossfade
+6. MIDI/instrument, sidechain, f64, latency/tail, presets
+7. VST3 Validator + pluginval + DAW test matrix + stress suite
+8. Example plugins (gain, delay, filter, synth) + release packaging
+9. Optional visual node graph editor for the pipeline system
+
+**Validation:** headless DSP bit-exactness tests, realtime contract tests
+(zero alloc/lock/GC in process), hot reload soak tests (1000+ reloads),
+VST3 Validator + pluginval + DAW smoke tests, fuzz + soak + differential
+testing.
+
+Dep: f32/f64 support (shipped), hot reload (shipped), native binding (shipped),
+standalone exe bundler (shipped). New: `@realtime` validation, typed audio
+pipeline model, VST3 SDK vendoring.
