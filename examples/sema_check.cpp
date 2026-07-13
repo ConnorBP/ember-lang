@@ -18,6 +18,7 @@
 #include "lexer.hpp"
 #include "parser.hpp"
 #include "sema.hpp"
+#include "safety.hpp"
 
 #include "ext_vec.hpp"
 #include "ext_quat.hpp"
@@ -135,7 +136,16 @@ int main(int argc, char** argv) {
     auto struct_layouts = ember::build_struct_layouts(pr.program);
     pr.program.string_xor_key = 0xA5;
 
-    auto sr = ember::sema(pr.program, natives, slots, 0, &overloads, &struct_layouts);
+    std::remove_cv_t<decltype(ember::sema(pr.program, natives, slots, 0, &overloads, &struct_layouts))> sr;
+    try {
+        sr = ember::sema(pr.program, natives, slots, 0, &overloads, &struct_layouts);
+    } catch (const ember::safety::DepthLimitExceeded& e) {
+        std::fprintf(stderr, "SEMA_ERROR: %s\n", e.what());
+        return 1;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "SEMA_ERROR: %s\n", e.what());
+        return 1;
+    }
     if (!sr.ok) {
         std::fprintf(stderr, "SEMA_ERROR (%zu):\n", sr.errors.size());
         for (auto& e : sr.errors) {

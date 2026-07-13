@@ -7,6 +7,7 @@
 #include "thin_emit.hpp"   // Stage A c3: ThinFunction -> x86-64 emit (the IR-backend path)
 #include "regalloc.hpp"    // Stage 3: linear-scan register allocation (post-pass, pre-emit)
 #include "ember_pass.hpp"  // Stage C: EmberPassManager (run IR optimization passes)
+#include "safety.hpp"
 #include <cassert>
 #include <cstring>
 #include <algorithm>
@@ -51,6 +52,8 @@ struct CG {
     X64Emitter e;
     const CodeGenCtx& ctx;
     const FuncDecl& f;
+    int cg_depth = 0;
+    static constexpr int MAX_COMPILE_DEPTH = 4000;
 
     // frame layout: locals + arg temps, all 8-byte slots, rbp-relative
     // rbx_save_offset (Item E): the FIRST reservation made in every
@@ -689,9 +692,11 @@ struct CG {
 
     // find max arg count + whether any calls (pre-pass over the function body)
     void prescan_block(const Block& b) {
+        safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::prescan_block");
         for (auto& s : b.stmts) prescan_stmt(*s);
     }
     void prescan_stmt(const Stmt& s) {
+        safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::prescan_stmt");
         // static_assert is fully resolved at sema (true -> elided, false /
         // non-const -> compile error) and produces NO runtime code; every
         // statement walker skips it. Mirrors how an elided assert_eq_* call
@@ -747,6 +752,7 @@ struct CG {
         }
     }
     void prescan_expr(const Expr& ex) {
+        safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::prescan_expr");
         if (auto* c = dynamic_cast<const CallExpr*>(&ex)) {
             makes_calls = true;
             max_args = std::max(max_args, int(c->args.size()));
@@ -774,9 +780,11 @@ struct CG {
     // sema before compile_func runs, so the struct size is resolvable here via
     // value_bytes(ex.ty, ctx.structs).
     void count_struct_temps_block(const Block& b, int32_t& total) {
+        safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::count_struct_temps_block");
         for (auto& s : b.stmts) count_struct_temps_stmt(*s, total);
     }
     void count_struct_temps_stmt(const Stmt& s, int32_t& total) {
+        safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::count_struct_temps_stmt");
         if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_struct_temps_expr(*ls->init, total); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_struct_temps_expr(*es->expr, total); return; }
@@ -831,6 +839,7 @@ struct CG {
         return t && !t->struct_name.empty() && ctx.structs && ctx.structs->count(t->struct_name) != 0;
     }
     void count_struct_temps_expr(const Expr& ex, int32_t& total) {
+        safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::count_struct_temps_expr");
         if (auto* c = dynamic_cast<const CallExpr*>(&ex)) {
             if (c->receiver) count_struct_temps_expr(*c->receiver, total);
             for (auto& a : c->args) {
@@ -884,9 +893,11 @@ struct CG {
     // is a safe over-reservation (backings are short-lived but reserved as
     // full frame slots, mirroring struct temps).
     void count_arr_temps_block(const Block& b, int32_t& total) {
+        safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::count_arr_temps_block");
         for (auto& s : b.stmts) count_arr_temps_stmt(*s, total);
     }
     void count_arr_temps_stmt(const Stmt& s, int32_t& total) {
+        safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::count_arr_temps_stmt");
         if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_arr_temps_expr(*ls->init, total); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_arr_temps_expr(*es->expr, total); return; }
@@ -927,6 +938,7 @@ struct CG {
         }
     }
     void count_arr_temps_expr(const Expr& ex, int32_t& total) {
+        safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::count_arr_temps_expr");
         if (auto* al = dynamic_cast<const ArrayLit*>(&ex)) {
             // A slice-typed ArrayLit needs a backing temp (count*elem_size bytes);
             // a fixed-array ArrayLit does not (its elements go into its own
@@ -966,9 +978,11 @@ struct CG {
     // frame slots). baked_len is int64_t but in-tree literals are <256 bytes;
     // cast to int32_t for the total as everywhere else.
     void count_str_temps_block(const Block& b, int32_t& total) {
+        safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::count_str_temps_block");
         for (auto& s : b.stmts) count_str_temps_stmt(*s, total);
     }
     void count_str_temps_stmt(const Stmt& s, int32_t& total) {
+        safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::count_str_temps_stmt");
         if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_str_temps_expr(*ls->init, total); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_str_temps_expr(*es->expr, total); return; }
@@ -1009,6 +1023,7 @@ struct CG {
         }
     }
     void count_str_temps_expr(const Expr& ex, int32_t& total) {
+        safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::count_str_temps_expr");
         if (auto* lit = dynamic_cast<const StringLit*>(&ex)) {
             if (lit->encrypted && lit->baked_key != 0 && lit->baked_len > 0)
                 total += int32_t(lit->baked_len);
@@ -1038,9 +1053,11 @@ struct CG {
     // idiom as prescan_block/prescan_stmt/prescan_expr above, just counting
     // instead of tallying call-argument counts.
     void count_pin_refs_block(const Block& b, std::unordered_map<std::string,int>& counts) {
+        safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::count_pin_refs_block");
         for (auto& s : b.stmts) count_pin_refs_stmt(*s, counts);
     }
     void count_pin_refs_stmt(const Stmt& s, std::unordered_map<std::string,int>& counts) {
+        safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::count_pin_refs_stmt");
         if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_pin_refs_expr(*ls->init, counts); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_pin_refs_expr(*es->expr, counts); return; }
@@ -1081,6 +1098,7 @@ struct CG {
         }
     }
     void count_pin_refs_expr(const Expr& ex, std::unordered_map<std::string,int>& counts) {
+        safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::count_pin_refs_expr");
         if (auto* id = dynamic_cast<const Ident*>(&ex)) { counts[id->name]++; return; }
         if (auto* c = dynamic_cast<const CallExpr*>(&ex)) {
             if (c->receiver) count_pin_refs_expr(*c->receiver, counts);
@@ -1872,6 +1890,7 @@ void store_xmm0_to_global(CG& cg, int64_t /*base*/, int32_t off, const Type* t =
 }
 
 void CG::eval(const Expr& ex) {
+    safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::eval");
     if (auto* lit = dynamic_cast<const IntLit*>(&ex)) {
         e.mov_reg_imm64(Reg::rax, lit->v);
         return;
@@ -3835,6 +3854,7 @@ void CG::eval(const Expr& ex) {
 }
 
 void CG::exec_block(const Block& b) {
+    safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::exec_block");
     // Snapshot bindings so inner-block shadowing restores on exit, and align
     // one runtime cleanup scope exactly with this lexical Block.
     auto saved_locals = locals;
@@ -3862,6 +3882,7 @@ void CG::exec_block(const Block& b) {
 }
 
 void CG::exec_stmt(const Stmt& s) {
+    safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::exec_stmt");
     // static_assert produces NO codegen (sema resolved it: true -> elided,
     // false / non-const -> compile error that never reaches here). Skip it
     // before any dispatch so the tree-walker emits nothing for it.
@@ -4772,6 +4793,7 @@ static int64_t aggregate_copy_cost(const Type* t, const StructLayoutTable* struc
     return n < 1 ? 1 : n;
 }
 int64_t CG::block_cost(const Block& b) {
+    safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::block_cost");
     int64_t n = 0;
     for (auto& s : b.stmts) n = cost_add(n, cost_add(1, stmt_cost(*s)));
     return n < 1 ? 1 : n;  // floor at 1: empty functions/loops still charge
@@ -4780,6 +4802,7 @@ int64_t CG::block_cost(const Block& b) {
 // node ~one lowered instruction; each CallExpr site adds setup+call (+2) plus
 // one per marshalled arg; aggregate by-value args add their byte-copy cost.
 int64_t CG::expr_cost(const Expr& ex) {
+    safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::expr_cost");
     if (auto* li = dynamic_cast<const IntLit*>(&ex))    { (void)li; return 1; }
     if (dynamic_cast<const FloatLit*>(&ex))             return 1;
     if (dynamic_cast<const BoolLit*>(&ex))              return 1;
@@ -4834,6 +4857,7 @@ int64_t CG::expr_cost(const Expr& ex) {
     return 1;  // unknown leaf expression
 }
 int64_t CG::stmt_cost(const Stmt& s) {
+    safety::DepthGuard guard(cg_depth, MAX_COMPILE_DEPTH, "codegen::stmt_cost");
     // static_assert produces no code, so it costs zero (a passing
     // compile-time check adds nothing to the instruction budget).
     if (dynamic_cast<const StaticAssertStmt*>(&s)) return 0;

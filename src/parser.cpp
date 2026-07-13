@@ -14,7 +14,7 @@ struct P {
     std::vector<ParseErrorEntry> err_entries;  // same errors as `errs`, individually positioned
     int lambda_counter = 0;  // #20: unique suffix for synthetic __lambda_N fns
     int expr_depth = 0;  // recursion depth guard (DoS prevention — audit HIGH finding)
-    static constexpr int MAX_EXPR_DEPTH = 256;  // generous for legit code, small enough to prevent stack overflow
+    static constexpr int MAX_EXPR_DEPTH = 512;  // generous for legit code, small enough to prevent stack overflow
     struct DepthGuard {
         int& d; const int max; const Token& tok;
         DepthGuard(int& d_, int max_, const Token& t) : d(d_), max(max_), tok(t) { if (++d > max) { --d; throw ParseError("recursion depth exceeded (nesting too deep)", t.line, t.col); } }
@@ -55,6 +55,7 @@ struct P {
 
     // --- types ---
     std::shared_ptr<Type> parse_type() {
+        DepthGuard dg(expr_depth, MAX_EXPR_DEPTH, peek());
         std::shared_ptr<Type> t = std::make_shared<Type>();
         const Token& tk = peek();
         auto prim = [&](Prim p){ t->prim = p; adv(); };
@@ -429,6 +430,7 @@ struct P {
     }
 
     ExprPtr parse_assign() {
+        DepthGuard dg(expr_depth, MAX_EXPR_DEPTH, peek());
         ExprPtr lhs = parse_ternary();
         Tk k = peek().kind;
         std::optional<BinExpr::Op> cop;
@@ -459,6 +461,7 @@ struct P {
     }
 
     ExprPtr parse_ternary() {
+        DepthGuard dg(expr_depth, MAX_EXPR_DEPTH, peek());
         ExprPtr c = parse_or();
         if (!accept(Tk::Question)) return c;
         ExprPtr t = parse_expr();
@@ -534,6 +537,7 @@ struct P {
     }
 
     ExprPtr parse_unary() {
+        DepthGuard dg(expr_depth, MAX_EXPR_DEPTH, peek());
         Tk k = peek().kind;
         if (k==Tk::Minus || k==Tk::Not || k==Tk::Tilde) {
             adv();

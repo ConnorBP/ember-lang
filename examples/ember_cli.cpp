@@ -448,7 +448,14 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
         }
     }
 
-    auto sr = sema(pr.program, natives, slots, opts.ffi_mode ? PERM_FFI : 0u, &overloads, &struct_layouts, &module_exports);
+    SemaResult sr;
+    try {
+        sr = sema(pr.program, natives, slots, opts.ffi_mode ? PERM_FFI : 0u,
+                  &overloads, &struct_layouts, &module_exports);
+    } catch (const safety::DepthLimitExceeded& e) {
+        std::fprintf(stderr, "ember: fatal: %s\n", e.what());
+        do_cleanup(); return {2};
+    }
     if (!sr.ok) {
         std::fprintf(stderr, "ember: sema errors (%zu):\n", sr.errors.size());
         for (auto& e : sr.errors) std::fprintf(stderr, "  line %u: %s\n", e.line, e.msg.c_str());
@@ -572,14 +579,19 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
 
     // ---- compile + finalize each function ----
     fns.reserve(pr.program.funcs.size());
-    for (auto& fn : pr.program.funcs) {
-        CompiledFn cf = compile_func(fn, ctx);
-        if (!finalize(cf)) {
-            std::fprintf(stderr, "ember: alloc_executable failed for %s\n", fn.name.c_str());
-            do_cleanup(); return {2};
+    try {
+        for (auto& fn : pr.program.funcs) {
+            CompiledFn cf = compile_func(fn, ctx);
+            if (!finalize(cf)) {
+                std::fprintf(stderr, "ember: alloc_executable failed for %s\n", fn.name.c_str());
+                do_cleanup(); return {2};
+            }
+            table.set(fn.slot, cf.entry);
+            fns.push_back(std::move(cf));
         }
-        table.set(fn.slot, cf.entry);
-        fns.push_back(std::move(cf));
+    } catch (const safety::DepthLimitExceeded& e) {
+        std::fprintf(stderr, "ember: fatal: %s\n", e.what());
+        do_cleanup(); return {2};
     }
 
     // ---- v0.5 --emit-em: pre-compile the parsed module to a .em bundle ----
@@ -1041,7 +1053,13 @@ static std::unique_ptr<CompiledScript> compile_script(
         }
     }
 
-    auto sr = sema(cs->prog, natives, slots, 0, &overloads, &cs->struct_layouts, &module_exports);
+    SemaResult sr;
+    try {
+        sr = sema(cs->prog, natives, slots, 0, &overloads, &cs->struct_layouts, &module_exports);
+    } catch (const safety::DepthLimitExceeded& e) {
+        err = std::string("fatal: ") + e.what();
+        return nullptr;
+    }
     if (!sr.ok) {
         err = "sema errors: ";
         for (auto& e : sr.errors) err += "line " + std::to_string(e.line) + ": " + e.msg + "; ";
@@ -1101,12 +1119,17 @@ static std::unique_ptr<CompiledScript> compile_script(
     ctx.fn_slot_count = int64_t(cs->slots.size());
 
     cs->fns.reserve(cs->prog.funcs.size());
-    for (auto& fn : cs->prog.funcs) {
-        CompiledFn cf = compile_func(fn, ctx);
-        if (!finalize(cf)) { err = "alloc_executable failed for " + fn.name; return nullptr; }
-        cs->table->set(fn.slot, cf.entry);
-        cs->entries[fn.name] = cf.entry;
-        cs->fns.push_back(std::move(cf));
+    try {
+        for (auto& fn : cs->prog.funcs) {
+            CompiledFn cf = compile_func(fn, ctx);
+            if (!finalize(cf)) { err = "alloc_executable failed for " + fn.name; return nullptr; }
+            cs->table->set(fn.slot, cf.entry);
+            cs->entries[fn.name] = cf.entry;
+            cs->fns.push_back(std::move(cf));
+        }
+    } catch (const safety::DepthLimitExceeded& e) {
+        err = std::string("fatal: ") + e.what();
+        return nullptr;
     }
     cs->ok = true;
     return cs;

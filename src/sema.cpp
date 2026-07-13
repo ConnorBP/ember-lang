@@ -1,5 +1,6 @@
 #include "sema.hpp"
 #include "binding_builder.hpp"  // PERM_FFI constant (v0.4 sema gating)
+#include "safety.hpp"
 #include <cassert>
 #include <climits>
 #include <cstring>
@@ -10,6 +11,11 @@
 #include <cstdio>
 
 namespace ember {
+
+namespace {
+thread_local int sema_prepass_depth = 0;
+constexpr int MAX_SEMA_PREPASS_DEPTH = 4000;
+}
 
 // Bit-preserving uint64_t -> int64_t conversion (L-§10-3 portability):
 // `int64_t(uint64_t(x))` for an out-of-range x is implementation-defined per
@@ -144,6 +150,7 @@ namespace {
 // independently) compute at runtime for that same expression - so there is
 // no way for this to fold something codegen would compute differently.
 bool try_eval_const_i64(const Expr& e, int64_t& out) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::try_eval_const_i64");
     if (auto* lit = dynamic_cast<const IntLit*>(&e)) { out = lit->v; return true; }
     if (auto* u = dynamic_cast<const UnaryExpr*>(&e)) {
         int64_t v;
@@ -192,6 +199,7 @@ bool try_eval_const_i64(const Expr& e, int64_t& out) {
 // codegen's FloatLit constant-fold exactly (always narrows through f32,
 // per CG::eval's FloatLit case and its BinExpr Float fold comment).
 bool try_eval_const_f32(const Expr& e, float& out) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::try_eval_const_f32");
     if (auto* lit = dynamic_cast<const FloatLit*>(&e)) { out = float(lit->v); return true; }
     if (auto* u = dynamic_cast<const UnaryExpr*>(&e)) {
         float v;
@@ -224,6 +232,7 @@ bool try_eval_const_f32(const Expr& e, float& out) {
 // (the C6 defect). Mirrors try_eval_const_f32's shape; the only difference is
 // the operand type + the absence of the `float(...)` cast on the literal.
 bool try_eval_const_f64(const Expr& e, double& out) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::try_eval_const_f64");
     if (auto* lit = dynamic_cast<const FloatLit*>(&e)) { out = lit->v; return true; }
     if (auto* u = dynamic_cast<const UnaryExpr*>(&e)) {
         double v;
@@ -247,6 +256,7 @@ bool try_eval_const_f64(const Expr& e, double& out) {
 }
 
 bool try_eval_const_bool(const Expr& e, bool& out) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::try_eval_const_bool");
     if (auto* lit = dynamic_cast<const BoolLit*>(&e)) { out = lit->v; return true; }
     if (auto* u = dynamic_cast<const UnaryExpr*>(&e)) {
         if (u->op != UnaryExpr::Op::Not) return false;
@@ -801,6 +811,7 @@ struct Checker {
     // why codegen stays untouched (codegen's eval() has no EnumAccessExpr
     // case and silently emits nothing for one - Section 5 point 3).
     void lower_enum_access_expr(ExprPtr& slot) {
+        safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::lower_enum_access_expr");
         if (!slot) return;
         if (auto* ea = dynamic_cast<EnumAccessExpr*>(slot.get())) {
             // Tier 1 namespaces: Foo::x where Foo is a namespace (not an enum)
@@ -1160,6 +1171,7 @@ struct Checker {
         std::vector<const CallExpr*> script_calls;
     };
     void scan_body_for_escapes(const Block& b, BorrowScan& out) const {
+        safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::scan_body_for_escapes");
         for (const auto& s : b.stmts) {
             if (auto* rs = dynamic_cast<const ReturnStmt*>(s.get())) {
                 if (rs->value) out.return_values.push_back(rs->value.get());
@@ -1230,6 +1242,7 @@ struct Checker {
     // sources), and recurse through compound expressions. AssignExprs are
     // statement-level in practice but the recursion is defensive.
     void scan_expr_for_escapes(const Expr& e, BorrowScan& out) const {
+        safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::scan_expr_for_escapes");
         if (auto* a = dynamic_cast<const AssignExpr*>(&e)) {
             if (assign_target_is_global_rooted(*a->target))
                 out.global_stores.push_back({a->target.get(), a->value.get()});
@@ -3407,6 +3420,7 @@ bool realtime_safe_native(const std::string& name) {
 } // namespace
 
 void Checker::validate_realtime_expr(const Expr& e) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::validate_realtime_expr");
     if (auto* call = dynamic_cast<const CallExpr*>(&e)) {
         const std::string& binding = call->native_binding_name.empty()
                                        ? call->name : call->native_binding_name;
@@ -3482,6 +3496,7 @@ void Checker::validate_realtime_expr(const Expr& e) {
 }
 
 void Checker::validate_realtime_stmt(const Stmt& s) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::validate_realtime_stmt");
     if (auto* ls = dynamic_cast<const LetStmt*>(&s)) {
         if (ls->init) validate_realtime_expr(*ls->init);
         return;
@@ -3560,6 +3575,7 @@ void Checker::validate_realtime_stmt(const Stmt& s) {
 }
 
 void Checker::validate_realtime_block(const Block& b) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::validate_realtime_block");
     for (const auto& stmt : b.stmts) validate_realtime_stmt(*stmt);
 }
 
@@ -3578,6 +3594,7 @@ void Checker::validate_realtime(FuncDecl& f) {
 // field order).
 void Checker::collect_captures_expr(const Expr& e, size_t lambda_scope_start,
                                     std::vector<std::string>& out) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::collect_captures_expr");
     if (auto* id = dynamic_cast<const Ident*>(&e)) {
         // Is this name a local in an ENCLOSING scope (below the lambda's own)?
         for (size_t i = 0; i < lambda_scope_start && i < scopes.size(); ++i) {
@@ -3675,6 +3692,7 @@ void Checker::collect_captures_expr(const Expr& e, size_t lambda_scope_start,
 
 void Checker::collect_captures_stmt(const Stmt& s, size_t lambda_scope_start,
                                     std::vector<std::string>& out) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::collect_captures_stmt");
     if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
     if (auto* ls = dynamic_cast<const LetStmt*>(&s)) {
         if (ls->init) collect_captures_expr(*ls->init, lambda_scope_start, out);
@@ -3755,6 +3773,7 @@ void Checker::collect_captures_stmt(const Stmt& s, size_t lambda_scope_start,
 
 void Checker::collect_captures_block(const Block& b, size_t lambda_scope_start,
                                      std::vector<std::string>& out) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::collect_captures_block");
     for (auto& s : b.stmts) collect_captures_stmt(*s, lambda_scope_start, out);
 }
 
@@ -3967,9 +3986,11 @@ void Checker::upgrade_lambda_param_types() {
     }
 }
 void Checker::upgrade_lambda_params_block(Block& b, std::unordered_set<std::string>& lam_locals) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::upgrade_lambda_params_block");
     for (auto& s : b.stmts) upgrade_lambda_params_stmt(*s, lam_locals);
 }
 void Checker::upgrade_lambda_params_stmt(Stmt& s, std::unordered_set<std::string>& lam_locals) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::upgrade_lambda_params_stmt");
     if (auto* ls = dynamic_cast<LetStmt*>(&s)) {
         if (ls->init) upgrade_lambda_params_expr(*ls->init, lam_locals);
         // track `let X = <LambdaExpr>` so a later `callee(..., X, ...)` upgrades
@@ -4016,6 +4037,7 @@ void Checker::upgrade_lambda_params_stmt(Stmt& s, std::unordered_set<std::string
     if (auto* ys = dynamic_cast<YieldStmt*>(&s)) { if (ys->value) upgrade_lambda_params_expr(*ys->value, lam_locals); return; }
 }
 void Checker::upgrade_lambda_params_expr(Expr& e, const std::unordered_set<std::string>& lam_locals) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::upgrade_lambda_params_expr");
     if (auto* c = dynamic_cast<CallExpr*>(&e)) {
         if (c->receiver) upgrade_lambda_params_expr(*c->receiver, lam_locals);
         if (c->indirect_target) upgrade_lambda_params_expr(*c->indirect_target, lam_locals);
@@ -4475,6 +4497,7 @@ void Checker::try_fold_constexpr_call(ExprPtr& slot) {
 }
 
 void Checker::lower_constexpr_calls_expr(ExprPtr& slot) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::lower_constexpr_calls_expr");
     if (!slot) return;
     // recurse into children first (bottom-up: inner constexpr calls fold
     // before outer ones, so square(square(7)) folds inner→49 then outer→2401)
@@ -4514,6 +4537,7 @@ void Checker::lower_constexpr_calls_expr(ExprPtr& slot) {
 }
 
 void Checker::lower_constexpr_calls_stmt(Stmt& s) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::lower_constexpr_calls_stmt");
     if (auto* ls = dynamic_cast<LetStmt*>(&s)) {
         if (ls->init) lower_constexpr_calls_expr(ls->init);
         return;
@@ -4578,6 +4602,7 @@ void Checker::lower_constexpr_calls_stmt(Stmt& s) {
 }
 
 void Checker::lower_constexpr_calls_block(Block& b) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::lower_constexpr_calls_block");
     for (auto& s : b.stmts) lower_constexpr_calls_stmt(*s);
 }
 
@@ -4591,6 +4616,7 @@ void Checker::lower_constexpr_calls_block(Block& b) {
 // (the plan's headline "codegen untouched" + "no edit to the switch block"
 // claims hold because by the time check_stmt runs, the rewrite is done).
 void Checker::lower_enum_access_stmt(Stmt& s) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::lower_enum_access_stmt");
     if (auto* ls = dynamic_cast<LetStmt*>(&s)) {
         if (ls->init) lower_enum_access_expr(ls->init);
         return;
@@ -4655,6 +4681,7 @@ void Checker::lower_enum_access_stmt(Stmt& s) {
 }
 
 void Checker::lower_enum_access_block(Block& b) {
+    safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::lower_enum_access_block");
     for (auto& s : b.stmts) lower_enum_access_stmt(*s);
 }
 
@@ -4718,6 +4745,7 @@ SemaResult sema(Program& prog,
             for (auto& p : fn.params) if (p.ty) resolve_type(*p.ty);
             // Walk the function body for LetStmt types.
             std::function<void(Block&)> resolve_block = [&](Block& b) {
+                safety::DepthGuard guard(sema_prepass_depth, MAX_SEMA_PREPASS_DEPTH, "sema::resolve_block");
                 for (auto& s : b.stmts) {
                     if (auto* ls = dynamic_cast<LetStmt*>(s.get())) {
                         if (ls->ty) resolve_type(*ls->ty);

@@ -13,6 +13,7 @@
 #include "import.hpp"
 #include "lexer.hpp"
 #include "parser.hpp"
+#include "safety.hpp"
 
 #include <cstdio>
 #include <filesystem>
@@ -53,7 +54,16 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto pr = ember::parse(std::move(lr.toks));
+    ember::ParseResult pr;
+    try {
+        pr = ember::parse(std::move(lr.toks));
+    } catch (const ember::safety::DepthLimitExceeded& e) {
+        std::fprintf(stderr, "PARSE_ERROR: %s\n", e.what());
+        return 1;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "PARSE_ERROR: %s\n", e.what());
+        return 1;
+    }
     if (!pr.ok) {
         std::fprintf(stderr, "PARSE_ERROR:\n%s", pr.error.c_str());
         return 1;

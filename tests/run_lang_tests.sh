@@ -115,7 +115,7 @@ run_import_cli() {
         printf "FAIL  %s (TIMEOUT after %ss — possible runaway)\n" "$f" "$RUN_TIMEOUT"
         fail=$((fail+1)); return
     fi
-    if [ $rc -eq "$exp" ];
+    if [ $rc -eq "$exp" ]; then
         printf "PASS  %s (run main, rc=%d == expected %d)\n" "$f" "$rc" "$exp"; pass=$((pass+1))
     else
         printf "FAIL  %s (run main, rc=%d != expected %d)\n%s\n" "$f" "$rc" "$exp" "$out"; fail=$((fail+1))

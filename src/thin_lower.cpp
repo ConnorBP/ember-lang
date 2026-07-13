@@ -21,6 +21,7 @@
 #include "stmt_walk.hpp"  // walk_if: shared IfStmt traversal for prescan/count passes
 #include "context.hpp"   // TrapReason
 #include "sema.hpp"      // StructLayoutTable, StructLayout, NativeSig
+#include "safety.hpp"
 
 #include <cassert>
 #include <cstring>
@@ -76,6 +77,8 @@ struct ThinLowerer {
     const CodeGenCtx& ctx;
     const FuncDecl& f;
     ThinFunction out;
+    int lower_depth = 0;
+    static constexpr int MAX_COMPILE_DEPTH = 4000;
 
     // --- vreg + block management ---
     VReg next_vreg = 1;     // 0 = invalid/none; allocate from 1
@@ -269,8 +272,12 @@ struct ThinLowerer {
 
     // ─────────────── prescans (mechanical copies of CG) ───────────────
 
-    void prescan_block(const Block& b) { for (auto& s : b.stmts) prescan_stmt(*s); }
+    void prescan_block(const Block& b) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::prescan_block");
+        for (auto& s : b.stmts) prescan_stmt(*s);
+    }
     void prescan_stmt(const Stmt& s) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::prescan_stmt");
         // static_assert is fully resolved at sema and produces NO runtime code;
         // every statement walker skips it (mirrors the elided assert_eq_* path).
         if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
@@ -299,6 +306,7 @@ struct ThinLowerer {
         }
     }
     void prescan_expr(const Expr& ex) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::prescan_expr");
         if (auto* c = dynamic_cast<const CallExpr*>(&ex)) {
             makes_calls = true;
             max_args = std::max(max_args, int(c->args.size()));
@@ -312,8 +320,12 @@ struct ThinLowerer {
         if (auto* a = dynamic_cast<const AssignExpr*>(&ex)) { prescan_expr(*a->value); if (a->target) prescan_expr(*a->target); return; }
     }
 
-    void count_struct_temps_block(const Block& b, int32_t& total) { for (auto& s : b.stmts) count_struct_temps_stmt(*s, total); }
+    void count_struct_temps_block(const Block& b, int32_t& total) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_struct_temps_block");
+        for (auto& s : b.stmts) count_struct_temps_stmt(*s, total);
+    }
     void count_struct_temps_stmt(const Stmt& s, int32_t& total) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_struct_temps_stmt");
         if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_struct_temps_expr(*ls->init, total); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_struct_temps_expr(*es->expr, total); return; }
@@ -347,6 +359,7 @@ struct ThinLowerer {
         }
     }
     void count_struct_temps_expr(const Expr& ex, int32_t& total) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_struct_temps_expr");
         if (auto* c = dynamic_cast<const CallExpr*>(&ex)) {
             if (c->receiver) count_struct_temps_expr(*c->receiver, total);
             for (auto& a : c->args) {
@@ -368,8 +381,12 @@ struct ThinLowerer {
         if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) count_struct_temps_expr(*kv.second, total); return; }
     }
 
-    void count_arr_temps_block(const Block& b, int32_t& total) { for (auto& s : b.stmts) count_arr_temps_stmt(*s, total); }
+    void count_arr_temps_block(const Block& b, int32_t& total) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_arr_temps_block");
+        for (auto& s : b.stmts) count_arr_temps_stmt(*s, total);
+    }
     void count_arr_temps_stmt(const Stmt& s, int32_t& total) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_arr_temps_stmt");
         if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_arr_temps_expr(*ls->init, total); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_arr_temps_expr(*es->expr, total); return; }
@@ -395,6 +412,7 @@ struct ThinLowerer {
         }
     }
     void count_arr_temps_expr(const Expr& ex, int32_t& total) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_arr_temps_expr");
         if (auto* al = dynamic_cast<const ArrayLit*>(&ex)) {
             if (al->ty && al->ty->is_slice && al->ty->elem) {
                 total += int32_t(al->elements.size()) * value_bytes(al->ty->elem.get(), ctx.structs);
@@ -418,8 +436,12 @@ struct ThinLowerer {
         if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) count_arr_temps_expr(*kv.second, total); return; }
     }
 
-    void count_str_temps_block(const Block& b, int32_t& total) { for (auto& s : b.stmts) count_str_temps_stmt(*s, total); }
+    void count_str_temps_block(const Block& b, int32_t& total) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_str_temps_block");
+        for (auto& s : b.stmts) count_str_temps_stmt(*s, total);
+    }
     void count_str_temps_stmt(const Stmt& s, int32_t& total) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_str_temps_stmt");
         if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_str_temps_expr(*ls->init, total); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_str_temps_expr(*es->expr, total); return; }
@@ -445,6 +467,7 @@ struct ThinLowerer {
         }
     }
     void count_str_temps_expr(const Expr& ex, int32_t& total) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_str_temps_expr");
         if (auto* lit = dynamic_cast<const StringLit*>(&ex)) {
             if (lit->encrypted && lit->baked_key != 0 && lit->baked_len > 0)
                 total += int32_t(lit->baked_len);
@@ -472,8 +495,12 @@ struct ThinLowerer {
     // backed; see the logical-temp note in the frame-plan computation). Recurses
     // into every expr/stmt shape that can contain a BinExpr (the same shapes the
     // other count_*_temps walkers cover).
-    void count_logical_temps_block(const Block& b, int32_t& total) { for (auto& s : b.stmts) count_logical_temps_stmt(*s, total); }
+    void count_logical_temps_block(const Block& b, int32_t& total) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_logical_temps_block");
+        for (auto& s : b.stmts) count_logical_temps_stmt(*s, total);
+    }
     void count_logical_temps_stmt(const Stmt& s, int32_t& total) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_logical_temps_stmt");
         if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_logical_temps_expr(*ls->init, total); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_logical_temps_expr(*es->expr, total); return; }
@@ -499,6 +526,7 @@ struct ThinLowerer {
         }
     }
     void count_logical_temps_expr(const Expr& ex, int32_t& total) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_logical_temps_expr");
         if (auto* b = dynamic_cast<const BinExpr*>(&ex)) {
             if (b->op == BinExpr::Op::LAnd || b->op == BinExpr::Op::LOr) total += 8;
             count_logical_temps_expr(*b->lhs, total); count_logical_temps_expr(*b->rhs, total); return;
@@ -537,9 +565,11 @@ struct ThinLowerer {
 
     // Item E pin-candidate selection (mechanical copy of CG::find_pin_candidate).
     void count_pin_refs_block(const Block& b, std::unordered_map<std::string,int>& counts) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_pin_refs_block");
         for (auto& s : b.stmts) count_pin_refs_stmt(*s, counts);
     }
     void count_pin_refs_stmt(const Stmt& s, std::unordered_map<std::string,int>& counts) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_pin_refs_stmt");
         if (dynamic_cast<const StaticAssertStmt*>(&s)) return;
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) { if (ls->init) count_pin_refs_expr(*ls->init, counts); return; }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { count_pin_refs_expr(*es->expr, counts); return; }
@@ -565,6 +595,7 @@ struct ThinLowerer {
         }
     }
     void count_pin_refs_expr(const Expr& ex, std::unordered_map<std::string,int>& counts) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_pin_refs_expr");
         if (auto* id = dynamic_cast<const Ident*>(&ex)) { counts[id->name]++; return; }
         if (auto* c = dynamic_cast<const CallExpr*>(&ex)) {
             if (c->receiver) count_pin_refs_expr(*c->receiver, counts);
@@ -618,11 +649,13 @@ struct ThinLowerer {
         return n < 1 ? 1 : n;
     }
     int64_t block_cost(const Block& b) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::block_cost");
         int64_t n = 0;
         for (auto& s : b.stmts) n = cost_add(n, cost_add(1, stmt_cost(*s)));
         return n < 1 ? 1 : n;
     }
     int64_t expr_cost(const Expr& ex) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::expr_cost");
         if (dynamic_cast<const IntLit*>(&ex))     return 1;
         if (dynamic_cast<const FloatLit*>(&ex))   return 1;
         if (dynamic_cast<const BoolLit*>(&ex))    return 1;
@@ -674,6 +707,7 @@ struct ThinLowerer {
         return 1;
     }
     int64_t stmt_cost(const Stmt& s) {
+        safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::stmt_cost");
         // static_assert produces no code, so it costs zero.
         if (dynamic_cast<const StaticAssertStmt*>(&s)) return 0;
         if (auto* bs = dynamic_cast<const BlockStmt*>(&s))  return block_cost(bs->block);
@@ -1285,6 +1319,7 @@ void ThinLowerer::store_value_to_frame(const Expr& value, const Type* t, int32_t
 
 // ─────────────── lower_expr (mirrors CG::eval) ───────────────
 LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
+    safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::lower_expr");
     const Loc loc = ex.loc;
 
     if (auto* lit = dynamic_cast<const IntLit*>(&ex)) {
@@ -2264,6 +2299,7 @@ void ThinLowerer::store_to_target(const Expr& target, const LoweredValue& lv, Lo
 
 // ─────────────── lower_call (mirrors CG::eval CallExpr + eval_struct_returning_call) ───────────────
 LoweredValue ThinLowerer::lower_call(const CallExpr& c, int32_t hidden_dest_off, VReg hidden_dest_vreg, Loc loc) {
+    safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::lower_call");
     const Type* ret_ty = c.ty;
     bool ret_struct = ret_ty && is_registered_struct_ty(ret_ty);
     bool ret_slice = ret_ty && ret_ty->is_slice;
@@ -2424,6 +2460,7 @@ LoweredValue ThinLowerer::lower_call(const CallExpr& c, int32_t hidden_dest_off,
 
 // ─────────────── lower_block / lower_stmt (mirrors CG::exec_block / exec_stmt) ───────────────
 void ThinLowerer::lower_block(const Block& b) {
+    safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::lower_block");
     auto saved_locals = locals;
     auto saved_types = local_types;
     CleanupScope scope;
@@ -2452,6 +2489,7 @@ void ThinLowerer::lower_block(const Block& b) {
 }
 
 void ThinLowerer::lower_stmt(const Stmt& s) {
+    safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::lower_stmt");
     const Loc loc = s.loc;
 
     // static_assert produces NO codegen (sema resolved it fully: true ->
