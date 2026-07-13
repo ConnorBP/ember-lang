@@ -68,6 +68,13 @@ struct M {
     StructLayoutTable layouts;
     Program prog;
     M() : table(std::make_unique<DispatchTable>(0)) {}
+    ~M() {
+        for (auto& fn : fns) {
+            if (fn.exec) free_executable(fn.exec);
+            fn.exec = nullptr;
+            fn.entry = nullptr;
+        }
+    }
 };
 
 static int g_fail = 0;

@@ -41,6 +41,7 @@
 #include "ember_pass.hpp"     // Stage C: EmberPassManager
 #include "ember_pass_registry.hpp" // Stage C: EmberPassRegistry
 #include "ember_pass_pipeline.hpp" // Stage C: build_pipeline_from_string
+#include "safety.hpp"          // RSS ceiling + per-path wall-clock deadline
 #include "ext_opt.hpp"         // Stage C: register_passes
 
 #include "ext_vec.hpp"
@@ -65,6 +66,9 @@
 #include <random>
 
 using namespace ember;
+
+static constexpr uint64_t kBenchPathTimeoutMs = 60000;
+static constexpr int64_t kBenchInstructionBudget = 10000000000LL;
 
 // ---- machine + compiler provenance (mirrors `ember bench`) ----
 #if defined(__GNUC__)
@@ -128,6 +132,13 @@ struct BenchModule {
     size_t code_bytes = 0;      // total emitted x86 bytes (all fns)
     size_t ir_instr_count = 0;  // total ThinFunction instrs (if enable_ir_backend; 0 otherwise)
     BenchModule(int n) : table(n) {}
+    ~BenchModule() {
+        for (auto& fn : fns) {
+            if (fn.exec) free_executable(fn.exec);
+            fn.exec = nullptr;
+            fn.entry = nullptr;
+        }
+    }
 };
 
 static std::unique_ptr<BenchModule> ember_compile(const std::string& src, bool safety_on, uint8_t string_xor, bool ir_safe = true, bool passes_on = false) {
@@ -233,9 +244,9 @@ static std::unique_ptr<BenchModule> ember_compile(const std::string& src, bool s
         }
     }
     if (safety_on) {
-        // safety-on: budget + depth + trap. budget set huge (INT64_MAX) so we
-        // measure the guard's INSTRUCTION COST (sub+jg per entry/back-edge +
-        // inc/cmp per call), not its trap behavior — no false traps.
+        // safety-on: budget + depth + trap. The 10B budget is deliberately
+        // large enough to measure guard cost without false traps, but finite
+        // so malformed benchmark code cannot execute literally forever.
         ctx.emit_budget_checks = true;
         ctx.emit_depth_checks = true;
         ctx.trap_stub = (void*)&bench_trap;
@@ -262,10 +273,16 @@ static std::unique_ptr<BenchModule> ember_compile(const std::string& src, bool s
 }
 
 // ---- one timed cell: warmup + N iters, fresh checkpoint per iter (safety-on), stats ----
-struct Stats { double min, median, mean, p99, stddev, cv; bool trapped; int64_t result; };
+struct Stats {
+    double min, median, mean, p99, stddev, cv;
+    bool trapped;
+    bool timed_out;
+    int64_t result;
+};
 
-static Stats time_ember(BenchModule& m, context_t& ectx, int iters, int warmup) {
-    Stats s{}; s.trapped = false;
+static Stats time_ember(BenchModule& m, context_t& ectx, int iters, int warmup,
+                        safety::TimePoint path_start) {
+    Stats s{}; s.trapped = false; s.timed_out = false;
     auto sit = m.slots.find("main");
     if (sit == m.slots.end()) { s.trapped = true; return s; }
     void* entry = m.table.get(sit->second);
@@ -273,8 +290,13 @@ static Stats time_ember(BenchModule& m, context_t& ectx, int iters, int warmup) 
 
     // warmup (untimed), each under a fresh checkpoint
     for (int w = 0; w < warmup; ++w) {
+        safety::check_memory_limit();
+        if (safety::deadline_expired(path_start, kBenchPathTimeoutMs)) {
+            s.timed_out = true;
+            return s;
+        }
         ectx.reset_for_call();
-        ectx.budget_remaining = INT64_MAX;
+        ectx.budget_remaining = kBenchInstructionBudget;
         ectx.has_checkpoint = true;
         if (__builtin_setjmp(ectx.checkpoint)) { s.trapped = true; return s; }
         (void)ember_call_void(entry, &ectx);
@@ -285,8 +307,13 @@ static Stats time_ember(BenchModule& m, context_t& ectx, int iters, int warmup) 
     // stops the bench for this cell cleanly, not the process)
     std::vector<double> ns; ns.reserve(size_t(iters));
     for (int it = 0; it < iters; ++it) {
+        safety::check_memory_limit();
+        if (safety::deadline_expired(path_start, kBenchPathTimeoutMs)) {
+            s.timed_out = true;
+            return s;
+        }
         ectx.reset_for_call();
-        ectx.budget_remaining = INT64_MAX;
+        ectx.budget_remaining = kBenchInstructionBudget;
         ectx.has_checkpoint = true;
         if (__builtin_setjmp(ectx.checkpoint)) { s.trapped = true; return s; }
         auto t0 = std::chrono::steady_clock::now();
@@ -295,6 +322,7 @@ static Stats time_ember(BenchModule& m, context_t& ectx, int iters, int warmup) 
         ectx.has_checkpoint = false;
         ns.push_back(double(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
     }
+    if (ns.empty()) { s.timed_out = true; return s; }
     std::sort(ns.begin(), ns.end());
     s.min = ns.front();
     s.mean = 0; for (double v : ns) s.mean += v; s.mean /= double(ns.size());
@@ -316,17 +344,32 @@ using BaselineFn = int64_t (*)(int64_t);
 // bound is unknown at compile time and -O2 keeps the loop (optimizing body).
 static volatile int64_t g_baseline_N = 0;
 
-static Stats time_baseline(BaselineFn fn, int64_t N, int iters, int warmup) {
-    Stats s{}; s.trapped = false;
+static Stats time_baseline(BaselineFn fn, int64_t N, int iters, int warmup,
+                           safety::TimePoint path_start) {
+    Stats s{}; s.trapped = false; s.timed_out = false;
     // warmup
-    for (int w = 0; w < warmup; ++w) { g_baseline_N = N; s.result = fn(g_baseline_N); }
+    for (int w = 0; w < warmup; ++w) {
+        safety::check_memory_limit();
+        if (safety::deadline_expired(path_start, kBenchPathTimeoutMs)) {
+            s.timed_out = true;
+            return s;
+        }
+        g_baseline_N = N;
+        s.result = fn(g_baseline_N);
+    }
     std::vector<double> ns; ns.reserve(size_t(iters));
     for (int it = 0; it < iters; ++it) {
+        safety::check_memory_limit();
+        if (safety::deadline_expired(path_start, kBenchPathTimeoutMs)) {
+            s.timed_out = true;
+            return s;
+        }
         auto t0 = std::chrono::steady_clock::now();
         g_baseline_N = N; s.result = fn(g_baseline_N);
         auto t1 = std::chrono::steady_clock::now();
         ns.push_back(double(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
     }
+    if (ns.empty()) { s.timed_out = true; return s; }
     std::sort(ns.begin(), ns.end());
     s.min = ns.front();
     s.mean = 0; for (double v : ns) s.mean += v; s.mean /= double(ns.size());
@@ -346,16 +389,22 @@ struct PairedStats {
     double ci_lo, ci_hi;     // bootstrap 95% CI on the median ratio
     double mean_ratio;       // mean of per-pair ratios
     int n_pairs;             // number of valid pairs (baseline_ns > 0)
+    bool timed_out;
 };
 
 static PairedStats time_paired(BenchModule& m, context_t& ectx, void* entry,
                                BaselineFn bfn, int64_t N,
-                               int iters, int warmup) {
+                               int iters, int warmup, safety::TimePoint path_start) {
     PairedStats ps{}; ps.median_ratio = 0; ps.ci_lo = 0; ps.ci_hi = 0;
-    ps.mean_ratio = 0; ps.n_pairs = 0;
+    ps.mean_ratio = 0; ps.n_pairs = 0; ps.timed_out = false;
     // warmup both
     for (int w = 0; w < warmup; ++w) {
-        ectx.reset_for_call(); ectx.budget_remaining = INT64_MAX;
+        safety::check_memory_limit();
+        if (safety::deadline_expired(path_start, kBenchPathTimeoutMs)) {
+            ps.timed_out = true;
+            return ps;
+        }
+        ectx.reset_for_call(); ectx.budget_remaining = kBenchInstructionBudget;
         ectx.has_checkpoint = true;
         if (__builtin_setjmp(ectx.checkpoint)) return ps;  // trap
         (void)ember_call_void(entry, &ectx);
@@ -365,8 +414,13 @@ static PairedStats time_paired(BenchModule& m, context_t& ectx, void* entry,
     // interleaved timed iters
     std::vector<double> ratios; ratios.reserve(size_t(iters));
     for (int it = 0; it < iters; ++it) {
+        safety::check_memory_limit();
+        if (safety::deadline_expired(path_start, kBenchPathTimeoutMs)) {
+            ps.timed_out = true;
+            return ps;
+        }
         // ember
-        ectx.reset_for_call(); ectx.budget_remaining = INT64_MAX;
+        ectx.reset_for_call(); ectx.budget_remaining = kBenchInstructionBudget;
         ectx.has_checkpoint = true;
         if (__builtin_setjmp(ectx.checkpoint)) return ps;
         auto te0 = std::chrono::steady_clock::now();
@@ -560,6 +614,9 @@ int main(int argc, char** argv) {
 
     for (auto& p : paths) {
         std::printf("--- path: %s  [%s]\n", p.name, p.note);
+        const safety::TimePoint path_start = safety::now();
+        bool path_timed_out = false;
+        safety::check_memory_limit();
 
         // correctness: the g++ -O2 baseline result is the reference. ember (both
         // modes) should agree. The struct path uses n=20 (a larger inner loop
@@ -573,7 +630,11 @@ int main(int argc, char** argv) {
             any_compile_fail = true;
             continue;
         }
-        Stats bref = time_baseline(bfn, p.inner_n, 1, 0);   // one untimed call for the reference value
+        Stats bref = time_baseline(bfn, p.inner_n, 1, 0, path_start); // reference value
+        if (bref.timed_out) {
+            std::fprintf(stderr, "  SAFETY: path '%s' exceeded 60-second deadline; skipping\n", p.name);
+            continue;
+        }
         int64_t ref = bref.result;
 
         // substitute %N -> inner_n (a source literal) in the ember source
@@ -597,7 +658,12 @@ int main(int argc, char** argv) {
             // time the g++ -O2 baseline once per (path, safety) — it is the
             // same reference for every ember config, so we don't re-time it per
             // config (keeps the passes/nopass comparison against ONE baseline).
-            Stats bs = time_baseline(bfn, p.inner_n, p.iters, p.warmup);
+            Stats bs = time_baseline(bfn, p.inner_n, p.iters, p.warmup, path_start);
+            if (bs.timed_out) {
+                std::fprintf(stderr, "  SAFETY: path '%s' exceeded 60-second deadline; skipping remainder\n", p.name);
+                path_timed_out = true;
+                break;
+            }
             cells.push_back({p.name, mode, "gcc_O2", "baseline", bs, 0, 0, 0});
 
             for (const auto& cfg : cfgs) {
@@ -614,8 +680,13 @@ int main(int argc, char** argv) {
                             mode, cfg.label, m->compile_ns, m->code_bytes, m->ir_instr_count);
                 context_t ectx;
                 ectx.max_call_depth = 8192;       // generous: we measure guard cost, not trap behavior
-                ectx.budget_remaining = INT64_MAX;
-                Stats es = time_ember(*m, ectx, p.iters, p.warmup);
+                ectx.budget_remaining = kBenchInstructionBudget;
+                Stats es = time_ember(*m, ectx, p.iters, p.warmup, path_start);
+                if (es.timed_out) {
+                    std::fprintf(stderr, "  SAFETY: path '%s' exceeded 60-second deadline; skipping remainder\n", p.name);
+                    path_timed_out = true;
+                    break;
+                }
                 if (es.trapped) {
                     std::fprintf(stderr, "  ember TRAP (safety=%s cfg=%s): %s\n",
                                  mode, cfg.label, ectx.last_error.c_str());
@@ -643,14 +714,21 @@ int main(int argc, char** argv) {
                 // Paired/interleaved comparison + bootstrap 95% CI (kills shared-
                 // mode noise — the separate-loop ratio above can drift if system
                 // state changes between the ember and baseline timing windows).
-                context_t pctx; pctx.max_call_depth = 8192; pctx.budget_remaining = INT64_MAX;
+                context_t pctx; pctx.max_call_depth = 8192; pctx.budget_remaining = kBenchInstructionBudget;
                 PairedStats ps = time_paired(*m, pctx, m->table.get(m->slots["main"]),
-                                             bfn, p.inner_n, std::min(p.iters, 200), std::min(p.warmup, 10));
+                                             bfn, p.inner_n, std::min(p.iters, 200),
+                                             std::min(p.warmup, 10), path_start);
+                if (ps.timed_out) {
+                    std::fprintf(stderr, "  SAFETY: path '%s' exceeded 60-second deadline; skipping remainder\n", p.name);
+                    path_timed_out = true;
+                    break;
+                }
                 if (ps.n_pairs > 0) {
                     std::printf("  [paired] safety=%-3s cfg=%-6s paired median ratio=%5.2f  CI=[%.2f, %.2f]  (n=%d)\n",
                                 mode, cfg.label, ps.median_ratio, ps.ci_lo, ps.ci_hi, ps.n_pairs);
                 }
             }
+            if (path_timed_out) break;
         }
     }
     FreeLibrary(hBaseline);

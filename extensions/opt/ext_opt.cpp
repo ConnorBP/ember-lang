@@ -1310,9 +1310,15 @@ EmberPreserved CopyPropPass::run(ThinFunction& f, EmberAnalysisManager&) {
         // Map: VReg → the VReg it's a copy of (from a Move).
         std::unordered_map<VReg, VReg> copy_map;
         auto resolve = [&](VReg v) -> VReg {
-            // Follow copy chains (v → v2 → v3 ...) to the root.
+            // Follow copy chains (v → v2 → v3 ...) to the root. Malformed or
+            // transient cyclic maps must not spin forever.
             VReg cur = v;
-            while (copy_map.count(cur)) cur = copy_map[cur];
+            std::unordered_set<VReg> visited;
+            while (true) {
+                auto it = copy_map.find(cur);
+                if (it == copy_map.end() || !visited.insert(cur).second) break;
+                cur = it->second;
+            }
             return cur;
         };
         for (auto& in : blk.instrs) {
@@ -2597,7 +2603,7 @@ EmberPreserved LoopUnrollPass::run(ThinFunction& f, EmberAnalysisManager&) {
 // This makes it inherently value-preserving.
 
 EmberPreserved SCCPPass::run(ThinFunction& f, EmberAnalysisManager&) {
-    bool changed = false;
+    bool ever_changed = false;
 
     // Global vreg → constant map (persists across blocks)
     struct ConstVal { bool valid; int64_t i; };
@@ -2614,14 +2620,14 @@ EmberPreserved SCCPPass::run(ThinFunction& f, EmberAnalysisManager&) {
         if (it != vreg_const.end() && it->second.valid && it->second.i == val)
             return;  // no change
         vreg_const[v] = {true, val};
-        changed = true;
     };
 
-    // Fixpoint: iterate until no new constants are discovered
+    // Fixpoint: iterate until no new constants are discovered. ever_changed
+    // tracks IR mutations across ALL iterations; the final converged iteration
+    // must not erase the preservation result from an earlier rewrite.
     bool iter_changed = true;
     while (iter_changed) {
         iter_changed = false;
-        changed = false;  // track only this iteration's changes
 
         for (auto& blk : f.blocks) {
             for (auto& in : blk.instrs) {
@@ -2641,6 +2647,7 @@ EmberPreserved SCCPPass::run(ThinFunction& f, EmberAnalysisManager&) {
                         in.src1 = 0;
                         in.src2 = 0;
                         iter_changed = true;
+                        ever_changed = true;
                     } else {
                         vreg_const.erase(in.dst);
                     }
@@ -2665,6 +2672,7 @@ EmberPreserved SCCPPass::run(ThinFunction& f, EmberAnalysisManager&) {
                                 in.src1 = 0;
                                 in.src2 = 0;
                                 iter_changed = true;
+                                ever_changed = true;
                             }
                         } else if (a.valid && in.src2 != 0 &&
                                    a.i >= -0x7FFFFFFFLL && a.i <= 0x7FFFFFFFLL) {
@@ -2682,6 +2690,7 @@ EmberPreserved SCCPPass::run(ThinFunction& f, EmberAnalysisManager&) {
                             in.imm.i = b.i;
                             in.src2 = 0;
                             iter_changed = true;
+                            ever_changed = true;
                         }
 
                         if (in.op != ThinOp::ConstInt)
@@ -2696,7 +2705,7 @@ EmberPreserved SCCPPass::run(ThinFunction& f, EmberAnalysisManager&) {
         }
     }
 
-    return changed ? EmberPreserved::none() : EmberPreserved::all();
+    return ever_changed ? EmberPreserved::none() : EmberPreserved::all();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

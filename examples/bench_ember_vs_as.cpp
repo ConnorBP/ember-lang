@@ -25,6 +25,7 @@
 #include "binding_builder.hpp"
 #include "module_registry.hpp"
 #include "module_linker.hpp"
+#include "safety.hpp"
 
 #include "ext_vec.hpp"
 #include "ext_math.hpp"
@@ -41,6 +42,7 @@
 
 using namespace ember;
 using Clock = std::chrono::steady_clock;
+static constexpr uint64_t kWorkloadTimeoutMs = 60000;
 static double ms_since(Clock::time_point t) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
 }
@@ -54,6 +56,13 @@ struct EmberModule {
     std::vector<uint8_t> gb_store;
     Program prog;
     EmberModule() : table(std::make_unique<DispatchTable>(0)) {}
+    ~EmberModule() {
+        for (auto& fn : fns) {
+            if (fn.exec) free_executable(fn.exec);
+            fn.exec = nullptr;
+            fn.entry = nullptr;
+        }
+    }
 };
 
 static std::unique_ptr<EmberModule> ember_compile(const std::string& src, const std::string& entry) {
@@ -186,15 +195,30 @@ int main() {
     report += "|---|---|---|---|---|\n";
 
     for (auto& w : ws) {
+        const safety::TimePoint workload_start = safety::now();
+        bool workload_timed_out = false;
+        auto check_workload_safety = [&]() {
+            safety::check_memory_limit();
+            if (!safety::deadline_expired(workload_start, kWorkloadTimeoutMs)) return true;
+            if (!workload_timed_out)
+                std::fprintf(stderr, "SAFETY: workload '%s' exceeded 60-second deadline; aborting workload\n", w.name);
+            workload_timed_out = true;
+            return false;
+        };
+
         // compile both
+        if (!check_workload_safety()) { all_ok = false; continue; }
         auto em = ember_compile(w.ember_src, "main");
         if (!em || em->fns.empty()) { std::fprintf(stderr, "ember compile failed for %s\n", w.name); all_ok = false; continue; }
         AsModule as = as_compile(w.as_src, w.as_decl);
         if (!as.ok) { std::fprintf(stderr, "AS compile failed for %s\n", w.name); all_ok = false; continue; }
 
         // warm + verify correctness (ember and AS should agree on the result)
+        if (!check_workload_safety()) { all_ok = false; continue; }
         int64_t e0 = ember_call_void(*em, "main");  // main() calls fib(n) internally, returns result
+        if (!check_workload_safety()) { all_ok = false; continue; }
         int64_t a0 = as_exec(as);  // main() calls fib(n) internally
+        if (!check_workload_safety()) { all_ok = false; continue; }
         if (e0 != a0) {
             std::printf("%-32s  MISMATCH (ember=%lld AS=%lld)\n", w.name, (long long)e0, (long long)a0);
             report += "| " + std::string(w.name) + " | MISMATCH | | | ember=" + std::to_string(e0) + " AS=" + std::to_string(a0) + " |\n";
@@ -204,16 +228,26 @@ int main() {
 
         // time the hot path: N iterations
         auto t0 = Clock::now();
+        int ember_iters = 0;
         for (int i = 0; i < w.iters; ++i) {
+            if (!check_workload_safety()) break;
             ember_call_void(*em, "main");
+            ++ember_iters;
+            if (!check_workload_safety()) break;
         }
-        double em_ms = ms_since(t0) / w.iters;
+        if (workload_timed_out) { all_ok = false; continue; }
+        double em_ms = ms_since(t0) / ember_iters;
 
         t0 = Clock::now();
+        int as_iters = 0;
         for (int i = 0; i < w.iters; ++i) {
+            if (!check_workload_safety()) break;
             as_exec(as);
+            ++as_iters;
+            if (!check_workload_safety()) break;
         }
-        double as_ms = ms_since(t0) / w.iters;
+        if (workload_timed_out) { all_ok = false; continue; }
+        double as_ms = ms_since(t0) / as_iters;
 
         double ratio = em_ms / as_ms;
         const char* verdict = (ratio < 0.2) ? "ember >>AS (native wins big)"

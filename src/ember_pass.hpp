@@ -21,6 +21,7 @@
 
 #include "thin_ir.hpp"       // ThinFunction (the IR passes operate on)
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
@@ -115,6 +116,12 @@ public:
 // PassModel<T>. run() executes passes in order with instrumentation.
 class EmberPassManager {
 public:
+    // Hard failsafes for fixed-point pipelines. Callers may request fewer
+    // rounds, but cannot raise these process-protection ceilings.
+    static constexpr unsigned hard_max_fixpoint_rounds = 32;
+    static constexpr std::size_t hard_max_ir_instructions = 100000;
+    static constexpr std::size_t hard_max_ir_growth_factor = 10;
+
     template <typename PassT>
     void add_pass(PassT p) {
         passes_.push_back(std::make_unique<PassModel<PassT>>(std::move(p)));
@@ -132,8 +139,10 @@ public:
     EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
 
     // Run the whole pipeline repeatedly until no pass changes anything or
-    // max_rounds is reached. Returns the intersection of all preserved sets.
-    // A round is "no change" if every pass returns Preserved::all().
+    // max_rounds is reached. max_rounds is clamped to 32, and the pipeline
+    // stops if IR exceeds 100,000 instructions or 10x its initial size.
+    // Returns the intersection of all preserved sets. A round is "no change"
+    // if every pass returns Preserved::all().
     EmberPreserved run_to_fixpoint(ThinFunction& f, EmberAnalysisManager& am,
                                    unsigned max_rounds = 8);
 
