@@ -1632,7 +1632,7 @@ int main(int argc, char** argv) {
         ember::context_t ectx;
         ectx.budget_remaining = 100000000;  // 100M instruction budget (same as normal run)
         ectx.max_call_depth = 512;
-        ectx.has_checkpoint = (setjmp(ectx.checkpoint) == 0);
+        ectx.has_checkpoint = (__builtin_setjmp(ectx.checkpoint) == 0);
         if (!ectx.has_checkpoint) {
             // We arrived here via a trap longjmp — recoverable exit.
             std::fprintf(stderr, "ember: loaded .em trapped: %s\n", ectx.last_error.c_str());
