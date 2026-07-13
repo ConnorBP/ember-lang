@@ -1595,3 +1595,32 @@ thread/gc). CLI truncation verified from `examples/ember_cli.cpp`: source `run`
   clean parent): `git add ember && git commit -m "Update ember submodule:
   doc-audit accuracy pass" && git push` to advance the parent gitlink to Ember's
   final published `origin/master` HEAD.
+
+### Post-push confirmation (added after the gates + push completed)
+- All four review gates passed from scratch on the committed state:
+  `cmake --build buildt -j 8` -> exit 0 (clean); filtered
+  `ctest -E bench -LE soak` -> 67/67 PASS; full `ctest` -> 70/70 PASS;
+  optimization validation -> exit 177. No regression (docs-only commit;
+  the build was unchanged, so no recompile was needed).
+- Ember pushed to `origin/master` without force: `13f5d08..a0b98e8`
+  (`a0b98e87aed6442b5ec714f6b44dcf91e65cc1d1`, remote had not advanced;
+  no rebase needed). `origin/master == HEAD == a0b98e8` (0 ahead / 0 behind).
+- **The doc-audit accuracy commit is `a0b98e8`** (pushed; `origin/master == HEAD
+  == a0b98e8` as of this write). The parent-gitlink target is **Ember's final
+  published `origin/master` HEAD** — verify with `git -C ember rev-parse
+  origin/master` before staging (this replaces the stale `429c1ec`/`13f5d08`
+  references from the prior cycle).
+- **Parent gitlink publication: BLOCKED (parent workspace not clean).** The
+  parent `E:/DEVELOPER/PROJECTS/sus/hyper_workspace` (branch `main`, HEAD
+  `7b2ddaac0f31e57401a3b302436f8cd813da9b5b`, in sync with `origin/main`)
+  records the `ember` gitlink at `323d18f559409e1afcd4aaa684f15455659b4bd4`,
+  which is now stale (ember is at `a0b98e8`). The parent is NOT clean:
+  `M Testing/Temporary/LastTest.log`, `M ember` (the gitlink drift +
+  ember's permanent `thirdparty/vst3sdk` content dirt), `M hyper-reV`,
+  `M prism-gui/CMakeLists.txt`, plus untracked `InsydeBIOS_Microcode_Updater/`,
+  `LEGION_Y7000Series_Insyde_Advanced_Settings_Tools/`, `NUL`. Per the task
+  rule, the parent `ember` gitlink was NOT staged and NOT pushed. The parent's
+  staging area was left empty. **Next action (for a clean parent):**
+  `git add ember && git commit -m "Update ember submodule: doc-audit accuracy pass" && git push`
+  to advance the parent gitlink from `323d18f` to Ember's `origin/master` HEAD
+  (currently `a0b98e8`; re-verify before staging).
