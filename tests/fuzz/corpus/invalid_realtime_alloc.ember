@@ -1,0 +1,5 @@
+// @realtime must reject GC/heap operations.
+@realtime
+fn process() -> void {
+    gc_alloc(64);
+}

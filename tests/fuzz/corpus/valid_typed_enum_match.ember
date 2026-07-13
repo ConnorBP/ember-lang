@@ -1,0 +1,22 @@
+// valid_typed_enum_match — a typed enum used as a match subject + pattern.
+// The subject c: Color is a typed-enum VARIABLE (not a literal), exercising
+// the match-subject is_int() acceptance (a typed enum IS an integer for
+// match) and the arm patterns Color::Red/Green/Blue (lowered to Color-typed
+// IntLits, same-typed against the subject). The Green arm fires (c = 1).
+// Also exercises enum->int comparison: `if (r != 20)` compares an i64 to an
+// i64 literal (r was assigned 20), and the match itself compares the typed
+// subject against Color-typed patterns at runtime (both normalize to 64-bit).
+// expect: 20
+enum Color : i32 { Red, Green, Blue }
+
+fn main() -> i64 {
+    let c: Color = Color::Green;
+    let mut r: i64 = 0;
+    match (c) {
+        Color::Red => { r = 10; },
+        Color::Green => { r = 20; },
+        Color::Blue => { r = 30; },
+        _ => { r = 99; }
+    }
+    return r;
+}

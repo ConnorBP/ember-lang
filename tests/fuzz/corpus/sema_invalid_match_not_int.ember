@@ -1,0 +1,9 @@
+// sema_invalid_match_not_int — match subject must be an integer or bool.
+fn main() -> i64 {
+    let x: f32 = 1.0f;
+    match (x) {
+        1 => { return 1; },
+        _ => { return 0; }
+    }
+    return 0;
+}

@@ -1,0 +1,15 @@
+// expect: 49
+// constexpr fn (Tier 1): a fn declared `constexpr` CAN be const-evaluated at
+// sema time when called with all-constant args. The call site is rewritten
+// to an IntLit carrying the folded result, so by the time codegen sees it,
+// it's a literal — no call instruction is emitted for the folded call.
+//
+// This is a sema_valid test: it must parse OK AND sema OK. The ctest
+// constexpr_test additionally asserts the runtime result is correct.
+constexpr fn square(n: i64) -> i64 {
+    return n * n;
+}
+
+fn main() -> i64 {
+    return square(7);
+}

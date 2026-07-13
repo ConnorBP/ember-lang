@@ -1,0 +1,20 @@
+// valid_enum_used_in_match — enum variants used as match patterns.
+// The subject is Color::Green (value 1); the match arm whose pattern is
+// Color::Green fires and sets r = 20. This exercises enum-qualified access
+// rewriting to an IntLit at sema, then a runtime match comparison. The
+// expected return (20) is chosen to avoid collision with the CLI's sema-error
+// exit code (2), so a successful run is unambiguous.
+// expect: 20
+enum Color { Red, Green, Blue }
+
+fn main() -> i64 {
+    let c: i64 = Color::Green;
+    let mut r: i64 = 0;
+    match (c) {
+        Color::Red => { r = 10; },
+        Color::Green => { r = 20; },
+        Color::Blue => { r = 30; },
+        _ => { r = 99; }
+    }
+    return r;
+}

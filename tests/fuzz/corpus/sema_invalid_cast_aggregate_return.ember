@@ -1,0 +1,6 @@
+// Aggregate no-op casts are only materialized by direct local initialization.
+// Returning one would otherwise enter generic one-register evaluation.
+fn bad() -> i64[2] {
+    let a: i64[2];
+    return a as i64[2];
+}

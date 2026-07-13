@@ -1,0 +1,16 @@
+// expect: 99
+// By-reference capture (#20 full GC integration): a lambda captures a
+// variable by reference (`fn[&x]` capture-list syntax), the variable is
+// modified AFTER the lambda is created, and the lambda observes the NEW
+// value when called. This is the by-ref semantics: the env slot holds a
+// POINTER to the variable's storage (not a copy), so post-capture mutations
+// are visible. The env is GC-managed when --gc-env is set (it outlives the
+// creating frame); under the default stack-env path the env holds the same
+// pointer into the creating frame (valid here because the lambda is called
+// within that frame).
+fn main() -> i64 {
+    let mut x: i64 = 10;
+    let f = fn[&x]() -> i64 { return x; };
+    x = 99;
+    return f();
+}

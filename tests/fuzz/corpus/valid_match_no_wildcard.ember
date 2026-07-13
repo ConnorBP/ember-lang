@@ -1,0 +1,15 @@
+// valid_match_no_wildcard — match with no wildcard arm.
+// When no pattern matches and there is no '_' default, execution falls
+// through past the match to the statement after it. Subject 99 matches
+// neither 1 nor 2, so r stays 0 and the post-match increment makes it 50.
+// expect: 50
+fn main() -> i64 {
+    let x: i64 = 99;
+    let mut r: i64 = 0;
+    match (x) {
+        1 => { r = 10; },
+        2 => { r = 20; }
+    }
+    r = r + 50;
+    return r;
+}

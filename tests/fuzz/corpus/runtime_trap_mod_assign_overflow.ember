@@ -1,0 +1,1 @@
+fn main() -> i64 { let mut x: i64 = (-9223372036854775807) - 1; let n: i64 = -1; x %= n; return x; }

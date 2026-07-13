@@ -1,0 +1,9 @@
+// @realtime must reject exception machinery.
+@realtime
+fn process() -> void {
+    try {
+        throw 7;
+    } catch (error) {
+        let handled: i64 = error;
+    }
+}

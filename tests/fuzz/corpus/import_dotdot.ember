@@ -1,0 +1,13 @@
+// expect: 101
+// import_dotdot.ember - the driver for the dotdot relative-import case.
+// This file lives in tests/lang/; it imports sub/deep.ember (one level down),
+// which itself imports ../lib2/nested_c.ember (back up to this level, then
+// into lib2/). Validates that relative paths with `..` segments resolve
+// correctly through the recursive resolver (each level's base_dir is the
+// importing file's own directory).
+import "sub/deep.ember";
+
+fn main() -> i64 {
+    // deep_fn() = nested_c_fn()+1 = 100+1 = 101
+    return deep_fn();
+}

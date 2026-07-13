@@ -1,0 +1,7 @@
+// invalid for sema: a logical operator (&&) with non-bool operands. Sema
+// requires both sides of && / || to be bool (no int-as-bool, matching the
+// if/while/for condition rule).
+fn bad(x: i64) -> i64 {
+    let b: bool = x && 6;
+    return b ? 1 : 0;
+}

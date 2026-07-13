@@ -1,0 +1,16 @@
+// expect: 7
+// Tier 4: throw a computed value + verify it's caught correctly. The thrown
+// value is an arbitrary i64 (computed from 6+1), not just a literal. The catch
+// block binds it and returns it, proving the value survives the unwind.
+fn compute_and_throw(v: i64) -> i64 {
+    throw v + 1;
+}
+
+fn main() -> i64 {
+    try {
+        compute_and_throw(6);
+    } catch (caught) {
+        return caught;
+    }
+    return 0;
+}

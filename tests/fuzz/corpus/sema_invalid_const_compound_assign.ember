@@ -1,0 +1,7 @@
+// invalid for sema: compound assignment onto a const target desugars to the
+// same AssignExpr node, so it must be caught the same way (Item B1).
+fn entry() -> i64 {
+    const x: i64 = 5;
+    x += 1;
+    return x;
+}

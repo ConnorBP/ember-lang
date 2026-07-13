@@ -1,0 +1,15 @@
+// sema_invalid_local_slice_scriptfn_transitive_borrow.ember — C5 reject via
+// TRANSITIVE borrow (slice-escape safety Stage 2). The caller's escape is
+// `return outer(a[..])`, where `outer` does NOT directly return its arg — it
+// returns `relay(s)`, and `relay` borrows its arg. The pre-pass fixed-point
+// propagates: relay borrows param 0 -> outer's `return relay(s)` refs param 0
+// (via expr_refs_slice_param's transitive CallExpr case) -> outer borrows
+// param 0. So `return outer(a[..])` is a propagated localview slice, and the
+// C1 return guard fires. This proves the fixed-point converges transitivity.
+fn relay(s: u8[]) -> u8[] { return s; }
+fn outer(s: u8[]) -> u8[] { return relay(s); }
+fn bad() -> u8[] {
+    let a: u8[2];
+    a[0] = 5; a[1] = 6;
+    return outer(a[..]);
+}

@@ -1,0 +1,20 @@
+// valid_for_each_array_break — break inside for-each over an array handle.
+//
+// break exits the desugared while loop early, exactly as it does for the slice
+// for-each. Over [10,20,30,40,50]: 10 + 20 + 30 = 60 (breaks before 40).
+//
+// expect: 60
+fn main() -> i64 {
+    let a: i64 = array_new(8, 5);
+    array_set_i64(a, 0, 10);
+    array_set_i64(a, 1, 20);
+    array_set_i64(a, 2, 30);
+    array_set_i64(a, 3, 40);
+    array_set_i64(a, 4, 50);
+    let mut sum: i64 = 0;
+    for (x in a) {
+        if (x >= 40) { break; }
+        sum = sum + x;
+    }
+    return sum;
+}

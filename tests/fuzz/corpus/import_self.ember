@@ -1,0 +1,9 @@
+// expect: 42
+// import_self.ember - a file that imports ITSELF. The resolver adds the file
+// to the `seen` set BEFORE recursing into its imports, so when the recursive
+// resolve encounters the same file again it's already in `seen` -> idempotent
+// skip (emits nothing). The self-import is a no-op, not an error or infinite
+// loop. main returns 42, same as if the import line weren't there.
+import "import_self.ember";
+
+fn main() -> i64 { return 42; }

@@ -1,0 +1,11 @@
+// expect: 100
+// Tier 4: a return inside the try block completes normally (no throw) and
+// returns the value — the catch block does NOT run. Proves the try/catch
+// machinery doesn't interfere with normal returns from the try body.
+fn main() -> i64 {
+    try {
+        return 100;
+    } catch (e) {
+        return 999;  // should not reach here
+    }
+}

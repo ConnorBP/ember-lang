@@ -1,0 +1,30 @@
+// valid for sema: error-recovery does NOT over-reject. A function with one
+// fault followed by a clean function - the clean function must still sema
+// check OK (sema processes each function independently; one bad fn doesn't
+// poison the whole program's sema for the others). The bad fn is intentionally
+// absent here because sema_check exits non-zero if ANY error exists - instead
+// this file is fully valid and confirms the constructs that USED to be
+// rejected (or mis-accepted) now pass cleanly: const-array-element mutation,
+// let-infer from a literal, default-param call sites, struct-by-value arg.
+struct Point { x: i64; y: i64; }
+
+fn sum_point(p: Point) -> i64 { return p.x + p.y; }
+
+fn greet(name: i64, times: i64 = 1) -> i64 { return times; }
+
+fn entry() -> i64 {
+    // const array, element mutation allowed (documented v1 decision)
+    const arr: i64[4];
+    arr[0] = 5;
+    // let-infer from literals of every primitive kind
+    let i = 10;
+    let s = "hi";
+    let f = 1.5f;
+    let b = true;
+    // default param: call with fewer args (the default fills)
+    let g: i64 = greet(7);
+    // struct-by-value arg, bare-local form (the allowed shape)
+    let p: Point = Point { x: 1, y: 2 };
+    let sp: i64 = sum_point(p);
+    return arr[0] + i + g + sp + (f > 1.0f ? 1 : 0) + (b ? 1 : 0);
+}

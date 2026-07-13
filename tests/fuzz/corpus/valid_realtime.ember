@@ -1,0 +1,5 @@
+// Safe realtime arithmetic and math native use.
+@realtime
+fn process(sample: f32) -> f32 {
+    return sqrt(sample * sample);
+}

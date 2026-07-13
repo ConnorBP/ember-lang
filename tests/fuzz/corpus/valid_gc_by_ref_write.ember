@@ -1,0 +1,13 @@
+// expect: 50
+// By-reference capture write-through (#20 full GC integration): a lambda
+// captures x by reference AND mutates it inside the body (`x = x + 5`); the
+// mutation is visible in the enclosing scope after the call. y is captured
+// by-value (no `&`), so it is an immutable copy. Mixed capture list
+// `[&x, y]`: x by-ref (pointer in env), y by-value (copy in env).
+fn main() -> i64 {
+    let mut x: i64 = 10;
+    let mut y: i64 = 20;
+    let f = fn[&x, y]() -> i64 { x = x + 5; return x + y; };
+    let r = f();       // x -> 15, r = 15 + 20 = 35
+    return r + x;      // 35 + 15 = 50
+}

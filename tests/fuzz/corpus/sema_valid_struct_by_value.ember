@@ -1,0 +1,14 @@
+// invalid for sema: a struct can't be passed by value as a function
+// parameter (no calling convention for it exists - Win64 passes structs
+// >8 bytes by hidden pointer, which codegen doesn't emit). Before this was
+// rejected, sema silently accepted it and codegen miscompiled the call site
+// instead of erroring (calling this returned a stray stack address
+// reinterpreted as an int, not the sum of the fields).
+struct Pair { a: i64; b: i64; }
+fn takes_struct(p: Pair) -> i64 {
+    return p.a + p.b;
+}
+fn main() -> i64 {
+    let x: Pair = Pair { a: 10, b: 20 };
+    return takes_struct(x);
+}

@@ -1,0 +1,8 @@
+// invalid for sema: the `[..]` view on a non-fixed-array type. A view
+// requires a fixed-size array (T[N]); applying it to a scalar i64 errors
+// "'..' view requires a fixed-size array type".
+fn bad() -> i64 {
+    let x: i64 = 5;
+    let v: i64[] = x[..];
+    return 0;
+}

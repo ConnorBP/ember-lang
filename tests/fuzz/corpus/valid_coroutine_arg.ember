@@ -1,0 +1,26 @@
+// expect: 54
+// #21 coroutines / yield — coroutine with arg + computed yields in a loop.
+// squares(n) yields i*i for i=1..n then returns -1 (the done sentinel). main
+// sums every coroutine_next value the loop consumes: the five yields
+// (1+4+9+16+25=55) PLUS the done return (-1), because coroutine_done only
+// flips true AFTER the next() that runs the fn to its return — so a
+// `while (!done) { next }` loop consumes the return value too (1+4+9+16+25-1
+// = 54). This matches the task's generator contract: the fn's return value
+// is the done sentinel, reaching the caller as the final next() value.
+fn squares(n: i64) -> i64 {
+    let mut i: i64 = 1;
+    while (i <= n) {
+        yield i * i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn main() -> i64 {
+    let c = coroutine_start(&squares, 5);
+    let mut sum: i64 = 0;
+    while (!coroutine_done(c)) {
+        sum = sum + coroutine_next(c);
+    }
+    return sum;
+}

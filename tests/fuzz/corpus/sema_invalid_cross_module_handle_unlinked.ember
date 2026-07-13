@@ -1,0 +1,12 @@
+// expect: sema error
+// v1.0 Tier 2 cross-module function handles: `&mod::fn` requires the target
+// module to be linked (registered in the ModuleExportTable) at compile time —
+// unlike a cross-module CALL (`mod::fn()`), which defers an unresolved module
+// to a runtime trap (the module may register later), a HANDLE bakes its
+// (module_id, slot) into the call site at the `&mod::fn` point, so an
+// unresolvable module is a hard sema error, not a deferred trap. This file
+// has no `link` directive, so `nope` is not linked -> sema rejects `&nope::foo`.
+fn main() -> i64 {
+    let h = &nope::foo;
+    return h(1);
+}

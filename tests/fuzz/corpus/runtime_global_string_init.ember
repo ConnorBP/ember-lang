@@ -1,0 +1,53 @@
+// expect: 42
+// runtime_global_string_init.ember — regression for the global string-
+// initializer bug surfaced by demo/compiler. Before the fix, a `string`-typed
+// global with a literal initializer compiled but its handle was never baked
+// at load (eval_global_initializers only folded int/float/bool globals), so
+// the first script read saw a null handle — string_length(g) returned 0 and
+// string_char_at(g, i) returned 0. The fix adds an optional host hook
+// (GlobalInitCtx::string_alloc_fn) that materializes the literal into a live
+// string handle at load. This test asserts both the length and a couple of
+// char-at values so a regression to "null handle" fails loudly (length 0,
+// not the expected 13).
+
+global greeting : string = "hello, world!"; // 13 chars
+global empty_g   : string = "";              // 0 chars (the empty-string edge)
+global long_g    : string = "abcdefghij";    // 10 chars
+
+fn main() -> i64 {
+    // length of a non-empty global string
+    let n1: i64 = string_length(greeting);
+    if (n1 != 13) { return 1; }
+
+    // length of an empty global string (the empty-literal edge — must be 0,
+    // not a garbage handle)
+    let n2: i64 = string_length(empty_g);
+    if (n2 != 0) { return 2; }
+
+    // char-at: 'h'=104, ','=44, '!'=33, 'w'=119
+    let c0: i64 = string_char_at(greeting, 0);
+    if (c0 != 104) { return 3; }
+    let c7: i64 = string_char_at(greeting, 7);
+    if (c7 != 119) { return 4; } // 'w'
+    let c12: i64 = string_char_at(greeting, 12);
+    if (c12 != 33) { return 5; } // '!'
+
+    // a second global string, to make sure multiple string globals each bake
+    // their own handle (not aliased to one)
+    let n3: i64 = string_length(long_g);
+    if (n3 != 10) { return 6; }
+    let c9: i64 = string_char_at(long_g, 9);
+    if (c9 != 106) { return 7; } // 'j'
+
+    // a local string of the same content still works too (no regression to the
+    // local path, which was always fine)
+    let local_s: string = "hello, world!";
+    let n4: i64 = string_length(local_s);
+    if (n4 != 13) { return 8; }
+
+    // equality of content between a global and a local of the same literal
+    // (exercises the string `==` overload through the handle, not just length)
+    if (!(greeting == local_s)) { return 9; }
+
+    return 42;
+}

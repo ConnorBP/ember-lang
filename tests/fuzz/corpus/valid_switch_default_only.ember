@@ -1,0 +1,14 @@
+// valid_switch_default_only — switch with a default clause and no case arms.
+// Any subject value falls into the default body. Subject 99 hits default
+// (r = 77) and breaks.
+// expect: 77
+fn main() -> i64 {
+    let x: i64 = 99;
+    let mut r: i64 = 0;
+    switch (x) {
+    default:
+        r = 77;
+        break;
+    }
+    return r;
+}

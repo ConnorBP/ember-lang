@@ -1,0 +1,11 @@
+// expect: 111
+// import_nested.ember - validates recursive import resolution.
+// main imports nested_a (in lib2/); nested_a imports nested_b (sibling);
+// nested_b imports nested_c (sibling). Each is resolved relative to its OWN
+// directory. main calls nested_a_fn(), which chains through b and c.
+// Result: nested_a_fn() = nested_b_fn()+1 = (nested_c_fn()+10)+1 = (100+10)+1 = 111.
+import "lib2/nested_a.ember";
+
+fn main() -> i64 {
+    return nested_a_fn();
+}

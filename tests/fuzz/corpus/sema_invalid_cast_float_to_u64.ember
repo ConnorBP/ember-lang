@@ -1,0 +1,7 @@
+// Cast matrix regression: float-to-unsigned conversion is not implemented by
+// the v1 x64 backend (signed cvttsd2si is wrong at the u64 boundary).
+fn main() -> i64 {
+    let x: f64 = 9223372036854775808.0;
+    let y: u64 = x as u64;
+    return 0;
+}

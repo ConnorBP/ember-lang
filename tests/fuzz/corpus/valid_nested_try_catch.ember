@@ -1,0 +1,21 @@
+// expect: 44
+// Tier 4: nested try/catch — the inner catch catches its own throw, the outer
+// catch catches a different throw. The inner try throws 11 (caught by inner
+// catch, which sets result=11), then the outer try continues and throws 33
+// (caught by outer catch, which adds 33 to result). result = 11 + 33 = 44.
+// Proves independent handler scoping: the inner catch doesn't interfere with
+// the outer catch, and the outer try body runs after the inner catch completes.
+fn main() -> i64 {
+    let mut result: i64 = 0;
+    try {
+        try {
+            throw 11;
+        } catch (inner) {
+            result = inner;
+        }
+        throw 33;
+    } catch (outer) {
+        result = result + outer;
+    }
+    return result;
+}

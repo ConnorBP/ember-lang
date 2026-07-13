@@ -1,0 +1,9 @@
+// chunk c3: a slice-typed global with an ArrayLit initializer is sema-ok.
+// `global s : i64[] = [1, 2, 3];` - the slice global is accepted in v1 (16-byte
+// {ptr,len} slot + a backing region; ptr is stored as a relative offset within
+// the globals block so the baked bytes round-trip through .em without loader
+// fixup). The index read `s[2]` is type-checked as i64. (Runtime value verified
+// by examples/aggregate_global_test, in-process; .em slice round-trip is a
+// known follow-on if the loader lacks relative-ptr support.)
+global s : i64[] = [1, 2, 3];
+fn main() -> i64 { return s[2]; }

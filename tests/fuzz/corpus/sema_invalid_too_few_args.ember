@@ -1,0 +1,7 @@
+// invalid for sema: calling a function with too FEW arguments (below the
+// required count, no defaults to fill). The "expects N args, got M" lower
+// bound - pairs with sema_invalid_default_too_many_args.ember's upper bound.
+fn add(a: i64, b: i64) -> i64 { return a + b; }
+fn bad() -> i64 {
+    return add(1);
+}

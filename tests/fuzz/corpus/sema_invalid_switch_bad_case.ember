@@ -1,0 +1,9 @@
+// invalid for sema: switch case value must be a literal constant, not a variable
+fn bad(x: i64, y: i64) -> i64 {
+    switch (x) {
+    case y:
+        return 1;
+    default:
+        return 0;
+    }
+}

@@ -1,0 +1,14 @@
+// loop_break_continue.ember - regression for the codegen bug where break/
+// continue were silent no-ops (surfaced by the spectator_list port).
+// count: 0..9, skip 5 (continue), stop at 8 (break) -> sum of 0+1+2+3+4+6+7 = 23
+fn loop_test() -> i64 {
+    let mut sum : i64 = 0;
+    let mut i : i64 = 0;
+    while (i < 10) {
+        if (i == 8) { break; }
+        if (i == 5) { i = i + 1; continue; }
+        sum = sum + i;
+        i = i + 1;
+    }
+    return sum;
+}

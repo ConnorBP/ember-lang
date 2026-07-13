@@ -1,0 +1,10 @@
+// expect: 200
+// Tier 4: a return inside the catch block returns the value. The throw
+// triggers the catch, the catch returns 200.
+fn main() -> i64 {
+    try {
+        throw 1;
+    } catch (e) {
+        return 200;
+    }
+}

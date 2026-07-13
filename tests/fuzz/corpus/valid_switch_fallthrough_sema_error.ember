@@ -1,0 +1,20 @@
+// valid_switch_fallthrough_sema_error — switch with implicit fallthrough.
+// A nonempty case body that does NOT end in break/continue/return is a sema
+// error ("implicit fallthrough is not allowed"). This file is expected to
+// FAIL at sema; ember_cli exits 2 on sema errors.
+// expect: 2
+fn main() -> i64 {
+    let x: i64 = 1;
+    let mut r: i64 = 0;
+    switch (x) {
+    case 1:
+        r = 10;
+    case 2:
+        r = 20;
+        break;
+    default:
+        r = 99;
+        break;
+    }
+    return r;
+}

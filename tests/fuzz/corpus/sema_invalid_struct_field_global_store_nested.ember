@@ -1,0 +1,15 @@
+// sema_invalid_struct_field_global_store_nested.ember — regression for the
+// C2b root-base chase on INTERLEAVED field/index access. go.inner.data = a[..];
+// is FieldExpr(data, FieldExpr(inner, Ident(go))). A two-sequential-loop chase
+// (peel all FieldExprs, then all IndexExprs) would stop at the inner FieldExpr
+// and miss the root; the fix uses a single loop peeling both so the chase
+// reaches the root Ident `go` (a global) and rejects.
+struct Inner { data: u8[]; }
+struct Outer { inner: Inner; }
+global go : Outer = Outer { inner: Inner { data: "" } };
+fn bad() -> i64 {
+    let a: u8[1];
+    a[0] = 65;
+    go.inner.data = a[..];
+    return 0;
+}

@@ -1,0 +1,13 @@
+// valid: casts, ternary, compound assign, logical/bitwise (no shift-assign -
+// <<= is not a v1 token; use d = d << 2)
+fn f(x: i64, y: u32) -> i64 {
+    let a: i64 = x + 1;
+    let b: u64 = y as u64;
+    let c: i64 = (x > 0) ? a : 0;
+    let d: i64 = x;
+    d += 5;
+    d = d << 2;
+    let e: bool = (x > 0) && (y > 0) || (x == 0);
+    let f2: i64 = (x & 255) | (y as i64);
+    return c + d;
+}

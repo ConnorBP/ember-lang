@@ -1,0 +1,2 @@
+global out: u8[] = "";
+fn bad() -> i64 { let a: u8[1]; out = a[..]; return 0; }

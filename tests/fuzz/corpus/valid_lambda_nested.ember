@@ -1,0 +1,14 @@
+// expect: 30
+// Nested lambdas: an outer lambda captures a var and returns an inner lambda
+// that captures the outer's param. The inner lambda sees BOTH captured values
+// when called. (v1 stack-env: the outer lambda is created and called within
+// main's frame, and the inner lambda is created and called within the outer's
+// call frame — both envs are alive for the duration of the calls.)
+fn main() -> i64 {
+    let base: i64 = 10;
+    let outer = fn(a: i64) -> i64 {
+        let inner = fn(b: i64) -> i64 { return base + a + b; };
+        return inner(5);
+    };
+    return outer(15);
+}

@@ -1,0 +1,24 @@
+// expect: 50
+// runtime_struct_reassign_loop — regression for the struct-local
+// REASSIGNMENT codegen bug in a loop (the §8.4 shape). Before the fix, a single
+// `s = step(s);` already segfaulted (the bug is not loop-specific - it's the
+// AssignExpr struct-value path), so this N=50 loop crashed on the first
+// iteration. Now it accumulates 50 increments and returns 50.
+//
+// This also exercises struct-by-value ARG passing (step takes S by value) in
+// a loop AND struct-returning call reassignment in the same statement, so it
+// pins both halves of the struct ABI together.
+//
+// Expected rc: 50 (start v=0, 50x step adds 1 each). Kept < 256 so the lang
+// runner's 8-bit exit-code reading is exact.
+struct S { v: i64; }
+fn step(s: S) -> S { return S { v: s.v + 1 }; }
+fn main() -> i64 {
+    let mut s: S = S { v: 0 };
+    let mut i: u64 = 0;
+    while (i < 50) {
+        s = step(s);
+        i = i + 1;
+    }
+    return s.v;
+}

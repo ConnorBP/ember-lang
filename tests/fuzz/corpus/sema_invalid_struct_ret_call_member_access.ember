@@ -1,0 +1,13 @@
+struct Point { x: i64; y: i64; }
+
+fn make_point(x: i64, y: i64) -> Point {
+    let p: Point = Point { x: x, y: y };
+    return p;
+}
+
+// Field access directly on a struct-returning call result (no intermediate
+// `let`) is also not one of the two allowed shapes.
+fn main() -> i64 {
+    let r: i64 = make_point(1, 2).x;
+    return r;
+}

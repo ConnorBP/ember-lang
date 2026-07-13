@@ -1,0 +1,16 @@
+// expect: 78
+fn main() -> i64 {
+    let a: i64 = -17;
+    let b: i64 = 5;
+    if (a / b != -3) { return 1; }
+    if (a % b != -2) { return 2; }
+    let mut q: i64 = a; q /= b;
+    let mut r: i64 = a; r %= b;
+    if (q != -3 || r != -2) { return 3; }
+    let u: u64 = 17 as u64;
+    if (u / 5 as u64 != 3 as u64 || u % 5 as u64 != 2 as u64) { return 4; }
+    let mut uq: u64 = u; uq /= 5 as u64;
+    let mut ur: u64 = u; ur %= 5 as u64;
+    if (uq != 3 as u64 || ur != 2 as u64) { return 5; }
+    return 78;
+}

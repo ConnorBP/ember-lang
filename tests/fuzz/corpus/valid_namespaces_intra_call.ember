@@ -1,0 +1,14 @@
+// valid_namespaces_intra_call — a fn inside a namespace calls a sibling.
+// expect: 30 (Math::add(10, 5) = 15, Math::double(15) = 30)
+namespace Math {
+    fn add(a: i64, b: i64) -> i64 {
+        return a + b;
+    }
+    fn double(x: i64) -> i64 {
+        return add(x, x);
+    }
+}
+
+fn main() -> i64 {
+    return Math::double(15);
+}

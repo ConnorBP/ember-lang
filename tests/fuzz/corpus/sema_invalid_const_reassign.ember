@@ -1,0 +1,6 @@
+// invalid for sema: reassigning a const-declared local (Item B1).
+fn entry() -> i64 {
+    const x: i64 = 5;
+    x = 6;
+    return x;
+}

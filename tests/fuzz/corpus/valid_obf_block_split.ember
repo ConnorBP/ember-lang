@@ -1,0 +1,23 @@
+// valid_obf_block_split.ember — basic-block splitting value preservation.
+// Run with: ember_cli run ../tests/lang/valid_obf_block_split.ember --passes block_split
+// expect: 42
+
+fn long_block(x: i64) -> i64 {
+    let a: i64 = x + 1;
+    let b: i64 = a * 2;
+    let c: i64 = b + 3;
+    let d: i64 = c * 4;
+    let e: i64 = d - 5;
+    let f: i64 = e + 6;
+    let g: i64 = f - 7;
+    let h: i64 = g + 8;
+    let i: i64 = h / 2;
+    let j: i64 = i + 9;
+    let k: i64 = j - 10;
+    return k;
+}
+
+fn main() -> i64 {
+    // x=8: (((((((((8+1)*2+3)*4-5)+6)-7)+8)/2)+9)-10 = 42
+    return long_block(8);
+}

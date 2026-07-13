@@ -1,0 +1,17 @@
+// sema_invalid_local_slice_scriptfn_return_escape.ember — C5 reject
+// (slice-escape safety Stage 2). A stack-backed slice (a ViewExpr over a
+// fixed array) is passed to a script fn that BORROWS its slice arg into the
+// return value (return_it returns its arg). The call result is itself a
+// stack-backed slice (propagated localview via is_local_array_view's CallExpr
+// case), so when the CALLER returns that result, the existing C1 return guard
+// fires: the slice would escape the caller's frame as a dangling ptr.
+//
+// This is the C5 escape-via-return path. The synchronous read of the same
+// shape (caller reads r[0] instead of returning r) is the allowed
+// return_slice_defer pattern — see sema_valid_return_slice_defer_sync.ember.
+fn return_it(s: u8[]) -> u8[] { return s; }
+fn bad() -> u8[] {
+    let a: u8[2];
+    a[0] = 9; a[1] = 9;
+    return return_it(a[..]);
+}

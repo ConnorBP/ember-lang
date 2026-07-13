@@ -1,0 +1,16 @@
+// valid_enum_from_constexpr — enum-from-constexpr-expr (docs/planning/
+// plan_ENUMS.md §6.2). A variant's explicit value may be a constexpr fn
+// call: resolve_enums folds the call to an IntLit (via lower_constexpr_calls_
+// expr, the same pre-pass that folds constexpr calls in fn bodies/globals)
+// BEFORE the try_eval_const_i64 const-check, so `X = base()` resolves to 42.
+// The constexpr fn remains callable at runtime too (it is a normal fn that
+// CAN be const-evaluated, not one that MUST be). E is i64-backed so the
+// folded 42 range-checks cleanly; `return E::X` from an i64 fn is an exact
+// enum->int (the IntLit adopts the i64 target via adapt_int_lit).
+// expect: 42
+constexpr fn base() -> i64 { return 42; }
+enum E : i64 { X = base() }
+
+fn main() -> i64 {
+    return E::X;
+}

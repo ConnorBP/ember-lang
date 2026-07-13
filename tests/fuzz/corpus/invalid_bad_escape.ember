@@ -1,0 +1,7 @@
+// invalid: unknown escape sequence '\q' in a string literal.
+// The lexer must reject unknown escapes (only \n \t \r \\ \" \0 are valid)
+// rather than silently dropping the backslash and keeping the raw character.
+fn bad() -> i64 {
+    let s = "tab\qhere";
+    return 0;
+}

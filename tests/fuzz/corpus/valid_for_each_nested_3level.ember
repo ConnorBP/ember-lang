@@ -1,0 +1,30 @@
+// valid_for_each_nested_3level — three-level nested for-each.
+// Each level iterates a 2-element i64 slice. The innermost body accumulates
+// a + b + c over all 8 combinations.
+//
+// Sum of a over all 8 combos: (1+2) * 4 = 12
+// Sum of b over all 8 combos: (10+20) * 4 = 120
+// Sum of c over all 8 combos: (100+200) * 4 = 1200
+// Grand total: 1332
+//
+// 1332 exceeds 8 bits, so we verify against the expected value and return
+// 1 for pass, 0 for fail.
+// expect: 1
+fn main() -> i64 {
+    let outer: i64[2] = [1, 2];
+    let os: i64[] = outer[..];
+    let mut count: i64 = 0;
+    for (a in os) {
+        let mid: i64[2] = [10, 20];
+        let ms: i64[] = mid[..];
+        for (b in ms) {
+            let inner: i64[2] = [100, 200];
+            let is: i64[] = inner[..];
+            for (c in is) {
+                count = count + a + b + c;
+            }
+        }
+    }
+    if (count != 1332) { return 0; }
+    return 1;
+}

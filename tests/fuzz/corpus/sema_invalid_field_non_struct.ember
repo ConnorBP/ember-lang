@@ -1,0 +1,7 @@
+// invalid for sema: field access on a non-struct type. `x` is i64; `x.y`
+// requires a struct on the left. Reports "field access requires a struct
+// type" + the cascading return mismatch.
+fn bad() -> i64 {
+    let x: i64 = 5;
+    return x.y;
+}

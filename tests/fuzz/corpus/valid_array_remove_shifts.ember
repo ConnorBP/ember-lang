@@ -1,0 +1,18 @@
+// valid_array_remove_shifts — array_remove shifts subsequent elements down.
+// Build [10, 20, 30, 40] via four pushes, then remove index 1 (value 20).
+// The remaining elements [10, 30, 40] shift left: index 1 now holds 30,
+// index 2 holds 40, and the length drops to 3.
+// expect: 1
+fn main() -> i64 {
+    let a: i64 = array_new(8, 0);
+    array_push_i64(a, 10);
+    array_push_i64(a, 20);
+    array_push_i64(a, 30);
+    array_push_i64(a, 40);
+    array_remove(a, 1);
+    if (array_length(a) != 3) { return 0; }
+    if (array_get_i64(a, 0) != 10) { return 0; }
+    if (array_get_i64(a, 1) != 30) { return 0; }
+    if (array_get_i64(a, 2) != 40) { return 0; }
+    return 1;
+}

@@ -1,0 +1,22 @@
+// expect: 42
+// static_assert(cond, "msg") — Tier 1 compile-time assertion.
+//
+// A passing assertion (cond folds to true at sema time) is ELIDED: it produces
+// no runtime code, so the function body is exactly what it would be without
+// the assertion. This file covers the three passing shapes that must NOT trip
+// a sema error and must NOT affect the emitted code:
+//   [1] a literal-arithmetic comparison at top level: 1 + 1 == 2
+//   [2] a logical compound at top level: (2 == 2) && !(3 == 4)
+//   [3] an in-function assertion (the same folding, but inside a body)
+//
+// sema_valid: must parse OK + sema OK + run main, rc == 42.
+// The assertions are pure compile-time checks; main returns 42 regardless.
+
+static_assert(1 + 1 == 2, "one plus one is two");
+static_assert((2 == 2) && !(3 == 4), "compound boolean logic folds");
+
+fn main() -> i64 {
+    static_assert(2 * 3 == 6, "two times three is six");
+    static_assert(10 >= 5, "ten is at least five");
+    return 42;
+}

@@ -1,0 +1,16 @@
+// sema_invalid_local_slice_scriptfn_return_global_store.ember — C5 reject
+// (slice-escape safety Stage 2). A stack-backed slice is passed to a script fn
+// that BORROWS its arg into the return (return_it returns s). The call result
+// is a propagated localview slice, so when the CALLER stores it to a GLOBAL,
+// the existing C2a global-store guard fires: the slice ptr would dangle in
+// the global once the caller's frame dies. This proves the propagated
+// localview bit reaches the C2a guard (not just the C1 return guard in
+// sema_invalid_local_slice_scriptfn_return_escape.ember).
+global out: u8[] = "";
+fn return_it(s: u8[]) -> u8[] { return s; }
+fn bad() -> i64 {
+    let a: u8[2];
+    a[0] = 1; a[1] = 2;
+    out = return_it(a[..]);
+    return 0;
+}

@@ -1,0 +1,14 @@
+// valid_enum_auto_increment_after_explicit — enum auto-increment continues
+// from the last explicit value. After A = 5, B and C auto-increment to 6
+// and 7; after D = 100, E2 auto-increments to 101.
+// expect: 1
+enum E { A = 5, B, C, D = 100, E2 }
+
+fn main() -> i64 {
+    if (E::A != 5) { return 0; }
+    if (E::B != 6) { return 0; }
+    if (E::C != 7) { return 0; }
+    if (E::D != 100) { return 0; }
+    if (E::E2 != 101) { return 0; }
+    return 1;
+}

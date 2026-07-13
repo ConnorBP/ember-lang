@@ -1,0 +1,12 @@
+// valid_match — Tier 1 match (pattern matching).
+// expect: 20
+fn main() -> i64 {
+    let x: i64 = 2;
+    match (x) {
+        1 => { return 10; },
+        2 => { return 20; },
+        3 => { return 30; },
+        _ => { return 99; }
+    }
+    return 0;
+}

@@ -1,0 +1,94 @@
+// sema_invalid_type_edge — additional type-detection edge cases that must error.
+//
+// A companion to sema_invalid_type_narrow.ember covering the compound-
+// assignment, ternary, shift, and enum-in-binary-op corners of the same-
+// type-required rule (TYPE_SYSTEM.md Section 7 / 11.1 / 11.3). Each case is a
+// standalone function; sema reports all errors and the runner asserts the
+// file fails sema. Parses fine; fails at sema.
+
+// ---- 1. COMPOUND ASSIGNMENT (same-type-required, Section 11.3) ----
+// i32 += i64 is `i32 = i32 + i64` -> mixed-type arithmetic -> compile error.
+fn compound_narrow_i32_plus_i64() -> i64 {
+    let mut x: i32 = 1;
+    let y: i64 = 2;
+    x += y;                  // sema err: operator requires same-type operands (got i32 and i64)
+    return x as i64;
+}
+// u32 += i32 (signedness mix).
+fn compound_sign_u32_plus_i32() -> i64 {
+    let mut x: u32 = 1;
+    let y: i32 = 2;
+    x += y;                  // sema err: operator requires same-type operands (got u32 and i32)
+    return x as i64;
+}
+// f32 += f64 (mixed float widths).
+fn compound_f32_plus_f64() -> i64 {
+    let mut x: f32 = 1.0f;
+    let y: f64 = 2.0;
+    x += y;                  // sema err: operator requires same-type operands (got f32 and f64)
+    return 0;
+}
+
+// ---- 2. TERNARY (both arms same type, Section 11.1) ----
+// i32 and i64 arms -> mixed-type -> compile error (no implicit promotion).
+fn ternary_mixed_i32_i64() -> i64 {
+    let cond: bool = true;
+    let x = cond ? 1 : 2;    // OK (both i64 literal) — kept as a control: must NOT error
+    if (x != 2) { return 0; }
+    let a: i32 = 1; let b: i64 = 2;
+    let y = cond ? a : b;    // sema err: ternary branches must have same type (got i32 and i64)
+    return y;
+}
+// f32 and f64 arms.
+fn ternary_mixed_f32_f64() -> i64 {
+    let cond: bool = true;
+    let a: f32 = 1.0f; let b: f64 = 2.0;
+    let y = cond ? a : b;    // sema err: ternary branches must have same type (got f32 and f64)
+    return 0;
+}
+
+// ---- 3. SHIFT ON NON-INTEGER (Section 7: bitwise is integer-only) ----
+// f32 << i32: shift requires integer operands.
+fn shift_float_lhs() -> i64 {
+    let a: f32 = 1.0f; let b: i32 = 2;
+    let c = a << b;          // sema err: shift requires integer operands (got f32 and i32)
+    return 0;
+}
+// i32 << f32: float shift amount.
+fn shift_float_rhs() -> i64 {
+    let a: i32 = 1; let b: f32 = 2.0f;
+    let c = a << b;          // sema err: shift requires integer operands (got i32 and f32)
+    return 0;
+}
+
+// ---- 4. ENUM + INT BINARY OP (mixed type, no promotion) ----
+// typed enum + int literal: the int literal adapts to i64 (not to the enum,
+// since int->enum is not implicit), so the operands are Color and i64 -> error.
+enum Color : i32 { Red, Green, Blue }
+fn enum_plus_int() -> i64 {
+    let c: Color = Color::Red;
+    let x = c + 1;           // sema err: operator requires same-type operands (got Color and i64)
+    return x as i64;
+}
+// typed enum compound-assign an int.
+fn enum_compound_plus_int() -> i64 {
+    let mut c: Color = Color::Red;
+    c += 1;                  // sema err: assignment type mismatch (Color = i64)
+    return c as i64;
+}
+
+// ---- 5. BITWISE / LOGICAL ON NON-BOOL / NON-INT ----
+// logical && on i32 operands (no int-as-bool).
+fn logical_on_int() -> i64 {
+    let a: i32 = 1; let b: i32 = 2;
+    if (a && b) { return 1; }  // sema err: logical operator requires bool operands
+    return 0;
+}
+// bitwise & on f32 (bitwise is integer-only).
+fn bitwise_on_float() -> i64 {
+    let a: f32 = 1.0f; let b: f32 = 2.0f;
+    let c = a & b;           // sema err: operator requires same-type operands / numeric
+    return 0;
+}
+
+fn main() -> i64 { return 0; }

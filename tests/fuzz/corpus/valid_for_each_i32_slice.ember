@@ -1,0 +1,14 @@
+// valid_for_each_i32_slice — for-each over an i32 slice (4-byte elements).
+// The loop variable x is i32; the slice element stride is 4 bytes, not 8.
+// A local i32 accumulator is used to avoid mixed-width arithmetic; the
+// final result is cast to i64 for the return.
+// expect: 10
+fn main() -> i64 {
+    let a: i32[4] = [1, 2, 3, 4];
+    let s: i32[] = a[..];
+    let mut sum: i32 = 0;
+    for (x in s) {
+        sum = sum + x;
+    }
+    return sum as i64;
+}

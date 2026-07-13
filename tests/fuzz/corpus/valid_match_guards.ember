@@ -1,0 +1,19 @@
+// valid_match_guards — Tier 1 match guards (if expr on a struct destructure arm).
+// expect: 3 (classify(a)=1 + classify(b)=2 + classify(c)=0)
+struct Point { x: i64; y: i64; }
+
+fn classify(p: Point) -> i64 {
+    match (p) {
+        Point{x, y} if x > 0 => { return 1; },
+        Point{x, y} if y > 0 => { return 2; },
+        _ => { return 0; }
+    }
+    return 0;
+}
+
+fn main() -> i64 {
+    let a: Point = Point{x: 5, y: 0};
+    let b: Point = Point{x: 0, y: 3};
+    let c: Point = Point{x: 0, y: 0};
+    return classify(a) + classify(b) + classify(c);
+}

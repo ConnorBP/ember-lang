@@ -1,0 +1,16 @@
+// expect: 99
+// Tier 4: throw in a nested call unwinds through frames to the enclosing
+// catch. deep_throw() throws 99; main's try/catch catches it and returns it.
+// This proves the longjmp crosses the intermediate frame (deep_throw's).
+fn deep_throw() -> i64 {
+    throw 99;
+}
+
+fn main() -> i64 {
+    try {
+        deep_throw();
+    } catch (e) {
+        return e;
+    }
+    return 0;
+}

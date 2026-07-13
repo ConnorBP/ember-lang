@@ -1,0 +1,7 @@
+// invalid for sema: for-loop condition must be bool, not i64
+fn bad() -> i64 {
+    for (let i: i64 = 0; i; i = i + 1) {
+        return i;
+    }
+    return 0;
+}

@@ -1,0 +1,12 @@
+// invalid for sema: unreachable code after an if/else where BOTH branches
+// return. The if/else is an unconditional terminator (one of the two returns
+// always runs), so any following direct child of the block is dead code.
+fn bad(x: i64) -> i64 {
+    if (x > 0) {
+        return 1;
+    } else {
+        return 2;
+    }
+    let y: i64 = 3;
+    return y;
+}

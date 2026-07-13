@@ -1,0 +1,23 @@
+// valid_switch_break_every_case — switch with a break in every case.
+// Each nonempty case body terminates with break; no fallthrough. Subject 2
+// matches case 2 (r = 20) and breaks before case 3.
+// expect: 20
+fn main() -> i64 {
+    let x: i64 = 2;
+    let mut r: i64 = 0;
+    switch (x) {
+    case 1:
+        r = 10;
+        break;
+    case 2:
+        r = 20;
+        break;
+    case 3:
+        r = 30;
+        break;
+    default:
+        r = 99;
+        break;
+    }
+    return r;
+}

@@ -1,0 +1,10 @@
+// import_test.ember - validates the import system: imports two libs that
+// each declare a function + global, and the main file calls both.
+import "lib/import_a.ember";
+import "lib/import_b.ember";
+
+fn main() -> i64 {
+    let a : i64 = import_a_fn();
+    let b : i64 = import_b_fn();
+    return a + b + shared_val;
+}

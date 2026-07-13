@@ -1,0 +1,34 @@
+// expect: 66
+// #21 coroutines / yield — two coroutines interleaved: main alternates
+// coroutine_next between two independent coroutines, proving each has its own
+// suspended stack/frame and they don't interfere. genA yields 1,2,3 (returns
+// 0); genB yields 10,20,30 (returns 0). main pulls A1,B1,A2,B2,A3,B3 then the
+// two done values (0,0): 1+10+2+20+3+30+0+0 = 66.
+fn genA() -> i64 {
+    yield 1;
+    yield 2;
+    yield 3;
+    return 0;
+}
+
+fn genB() -> i64 {
+    yield 10;
+    yield 20;
+    yield 30;
+    return 0;
+}
+
+fn main() -> i64 {
+    let a = coroutine_start(&genA, 0);
+    let b = coroutine_start(&genB, 0);
+    let mut sum: i64 = 0;
+    sum = sum + coroutine_next(a);  // 1
+    sum = sum + coroutine_next(b);  // 10
+    sum = sum + coroutine_next(a);  // 2
+    sum = sum + coroutine_next(b);  // 20
+    sum = sum + coroutine_next(a);  // 3
+    sum = sum + coroutine_next(b);  // 30
+    sum = sum + coroutine_next(a);  // 0 (done)
+    sum = sum + coroutine_next(b);  // 0 (done)
+    return sum;
+}

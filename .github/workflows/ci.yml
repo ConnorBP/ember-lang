@@ -180,3 +180,42 @@ jobs:
         uses: github/codeql-action/analyze@v3
         with:
           category: "/language:cpp"
+
+  # ---- Fuzzing: libFuzzer on the .em loader + lexer (Phase 4) ----
+  # Coverage-guided fuzzing of the untrusted-input surfaces. The .em loader is
+  # the #1 security surface (deserializes untrusted binary). The lexer/parser
+  # process untrusted source text. libFuzzer is Linux-only (unsupported on
+  # Windows/MinGW — see plan_AUDIT_TOOLING.md). Runs for 2 minutes per target.
+  fuzzer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build clang
+      - name: Configure + build fuzzers
+        run: |
+          cmake -G Ninja -DCMAKE_CXX_COMPILER=clang++ \
+            -DENABLE_FUZZERS=ON \
+            -B build_fuzz
+          cmake --build build_fuzz -j $(nproc) --target fuzz_em_loader fuzz_lexer
+      - name: Seed corpus
+        run: |
+          mkdir -p corpus_loader corpus_lexer
+          cp tests/lang/*.ember corpus_lexer/
+          # For the loader, seed with any existing .em files
+          find . -name '*.em' -exec cp {} corpus_loader/ \; 2>/dev/null || true
+      - name: Run .em loader fuzzer (2 min)
+        run: |
+          cd build_fuzz
+          ./fuzz_em_loader -max_total_time=120 -max_len=65536 \
+            ../corpus_loader 2>&1 | tail -20
+      - name: Run lexer fuzzer (2 min)
+        run: |
+          cd build_fuzz
+          ./fuzz_lexer -max_total_time=120 \
+            ../corpus_lexer 2>&1 | tail -20

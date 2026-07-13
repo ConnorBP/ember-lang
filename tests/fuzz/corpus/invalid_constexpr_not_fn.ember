@@ -1,0 +1,10 @@
+// constexpr modifier (Tier 1): `constexpr` is ONLY valid on a function
+// declaration (`constexpr fn`). Applying it to a global (or a let/struct/enum)
+// is a PARSE error, mirroring the `priv` modifier's validation. This pins the
+// modifier's scope so a future grammar widening doesn't silently accept
+// `constexpr global` as a no-op.
+//
+// Classified invalid_*.ember -> must PARSE ERROR (the runner asserts parse
+// fails).
+constexpr global bad : i64 = 5;
+fn main() -> i64 { return bad; }

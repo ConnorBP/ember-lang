@@ -1,0 +1,5 @@
+// invalid: unterminated string
+fn bad() -> i64 {
+    let s = "oops;
+    return 0;
+}

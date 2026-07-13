@@ -1,0 +1,17 @@
+// sema_invalid_local_slice_scriptfn_transitive_retain.ember — C5 reject via
+// TRANSITIVE retain (slice-escape safety Stage 2). `store_to_global` directly
+// retains its slice arg (stores it to global g). `wrapper` does NOT itself
+// store to a global — it just calls `store_to_global(s)`. The pre-pass
+// fixed-point propagates: store_to_global retains param 0 -> wrapper's call
+// `store_to_global(s)` with arg refs param 0 -> wrapper retains param 0. So
+// passing a stack-backed slice to `wrapper` is rejected at the call site
+// (wrapper transitively retains it). This proves retain-transitivity.
+global g: u8[] = "";
+fn store_to_global(s: u8[]) { g = s; }
+fn wrapper(s: u8[]) { store_to_global(s); }
+fn bad() -> i64 {
+    let a: u8[2];
+    a[0] = 1; a[1] = 2;
+    wrapper(a[..]);
+    return 0;
+}

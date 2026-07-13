@@ -1,0 +1,20 @@
+// sema_valid_return_slice_defer_sync.ember — the legitimate synchronous
+// return_slice_defer pattern (slice-escape safety Stage 2). A fn returns its
+// slice arg (borrow_slice borrows param 0 into the return), and the CALLER
+// reads the result synchronously within its own frame (r[0], r[1]) — it does
+// NOT return r or store r to a global. The call result is tagged localview
+// (propagated via is_local_array_view's CallExpr case), but the synchronous
+// reads are NOT escape sites (IndexExpr returns i64, not a slice), so no
+// guard fires. Sema must accept it.
+//
+// This is the canonical pattern from tests/lang/runtime_language_features.ember
+// (return_slice_defer), isolated as a focused sema_valid regression so the
+// borrow-propagation design's headline guarantee — that the synchronous
+// read-after-borrow stays valid — is pinned independently.
+fn borrow_slice(s: i64[]) -> i64[] { return s; }
+fn ok() -> i64 {
+    let a: i64[2];
+    a[0] = 41; a[1] = 42;
+    let r: i64[] = borrow_slice(a[..]);
+    return r[0] + r[1];
+}

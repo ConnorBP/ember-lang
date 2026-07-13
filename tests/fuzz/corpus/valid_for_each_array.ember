@@ -1,0 +1,20 @@
+// valid_for_each_array — Tier 1 for-each over an array<T> handle (i64 array).
+//
+// iterable() hook, array case: `for (x in a)` where `a` is an array<i64>
+// handle (an opaque i64 from array_new, elem_size=8). Sema infers the element
+// type from the array_new elem_size and tags the handle; codegen lowers this
+// to  len = array_length(a); while i < len { x = array_get_i64(a, i); ... }.
+// The loop variable x is i64.
+//
+// expect: 60 (10+20+30)
+fn main() -> i64 {
+    let a: i64 = array_new(8, 3);
+    array_set_i64(a, 0, 10);
+    array_set_i64(a, 1, 20);
+    array_set_i64(a, 2, 30);
+    let mut sum: i64 = 0;
+    for (x in a) {
+        sum = sum + x;
+    }
+    return sum;
+}

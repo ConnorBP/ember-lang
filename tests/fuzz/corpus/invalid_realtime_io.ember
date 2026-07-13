@@ -1,0 +1,5 @@
+// @realtime must reject console/I/O operations.
+@realtime
+fn process() -> void {
+    print("not realtime");
+}

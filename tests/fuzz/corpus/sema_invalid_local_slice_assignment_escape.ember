@@ -1,0 +1,7 @@
+// H11 regression: provenance must survive assignment through a slice alias.
+fn bad() -> u8[] {
+    let a: u8[1];
+    let mut s: u8[] = "";
+    s = a[..];
+    return s;
+}

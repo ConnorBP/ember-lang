@@ -1,0 +1,15 @@
+// valid_string_substr_negative_len_to_end — string_substr with negative len
+// means "to end". "hello world" from start 6 with len -1 yields "world"
+// (length 5). A second call from start 0 with len -1 yields the full string
+// (length 11).
+// expect: 1
+fn main() -> i64 {
+    let h: string = string_from_slice("hello world");
+    let s1: string = string_substr(h, 6, -1);
+    let l1: i64 = string_length(s1);
+    let s2: string = string_substr(h, 0, -1);
+    let l2: i64 = string_length(s2);
+    if (l1 != 5) { return 0; }
+    if (l2 != 11) { return 0; }
+    return 1;
+}

@@ -1,0 +1,5 @@
+// invalid: missing semicolon
+fn bad() -> i64 {
+    let x: i64 = 5
+    return x;
+}

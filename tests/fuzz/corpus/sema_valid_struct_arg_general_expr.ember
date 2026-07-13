@@ -1,0 +1,14 @@
+// sema-valid: a struct-by-value argument may be a struct literal of the
+// matching struct type, not only a bare local. Codegen materializes the
+// literal into a compiler-hidden temp frame slot and copies that temp's
+// bytes into the call's arg stash, reusing the existing arg-copy machinery.
+// (Relaxation of the prior "struct-by-value arg must be a bare local"
+// restriction - the binding_abi_test pins the runtime value.)
+struct Point { x: i64; y: i64; }
+
+fn sum_point(p: Point) -> i64 { return p.x + p.y; }
+
+fn main() -> i64 {
+    let r: i64 = sum_point(Point { x: 1, y: 2 });
+    return r;
+}

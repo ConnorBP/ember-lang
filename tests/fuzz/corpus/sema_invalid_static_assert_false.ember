@@ -1,0 +1,14 @@
+// static_assert with a false condition — a compile-time assertion that folds
+// to FALSE must be a SEMA error carrying the user-supplied message. The
+// condition `1 + 1 == 3` is a compile-time constant (try_eval_const_bool
+// folds the Eq over two literal-folded i64s), so this is NOT a "non-const"
+// error — it is the explicit "static_assert failed: <msg>" diagnostic.
+//
+// Classified sema_invalid_*.ember -> must PARSE ok, must SEMA ERROR. The
+// runner asserts sema_check exits nonzero on this file.
+
+static_assert(1 + 1 == 3, "one plus one is three (deliberately wrong)");
+
+fn main() -> i64 {
+    return 42;
+}

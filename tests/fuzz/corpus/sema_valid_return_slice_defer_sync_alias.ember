@@ -1,0 +1,16 @@
+// sema_valid_return_slice_defer_sync_alias.ember — the legitimate synchronous
+// return_slice_defer pattern through a localview ALIAS (slice-escape safety
+// Stage 2). The stack-backed slice is aliased into `s` (local_array_view=true
+// via the LetStmt propagation), then passed to a borrowing fn, and the result
+// is read synchronously. The call result is tagged localview (propagated), but
+// r[0]/r[1] are reads (not escapes), so no guard fires. Sema must accept it.
+// This mirrors the runtime_language_features.ember return_slice_defer use but
+// routes the arg through an explicit alias first.
+fn borrow_slice(s: i64[]) -> i64[] { return s; }
+fn ok() -> i64 {
+    let a: i64[3];
+    a[0] = 10; a[1] = 20; a[2] = 30;
+    let s: i64[] = a[..];
+    let r: i64[] = borrow_slice(s);
+    return r[0] + r[1] + r[2];
+}

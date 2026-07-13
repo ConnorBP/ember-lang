@@ -1,0 +1,15 @@
+// sema_valid_local_slice_native_copy.ember — C3 allow (slice-escape safety
+// Stage 2). A stack-backed slice (a ViewExpr over a fixed array) is passed to
+// a COPYING native — string_from_slice, which is retains=false (the default;
+// it copies the bytes into a host-owned std::string during the call and
+// returns a handle, never retaining the ptr). The bytes are copied out
+// before the backing frame dies, so this is safe. Sema must accept it.
+//
+// This is the dual of sema_invalid_local_slice_native_retain.ember (a
+// retains=true native rejects the same arg shape).
+fn ok() -> i64 {
+    let a: u8[3];
+    a[0] = 72; a[1] = 73; a[2] = 0;  // "HI"
+    let s: string = string_from_slice(a[..]);
+    return string_length(s);
+}

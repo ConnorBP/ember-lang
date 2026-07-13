@@ -1166,3 +1166,39 @@ set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_a
     thin_ir_ser em_redteam_audit em_v5_ir em_v5_mixed ember_pass ir_passes ext_map ext_bounds
     regalloc
     PROPERTIES TIMEOUT 30)
+
+# ---- Fuzz harnesses (Phase 4 audit tooling) ----
+# libFuzzer harnesses for the untrusted-input surfaces: .em loader (#1 security
+# surface), lexer, parser. On Linux/CI these build with -fsanitize=fuzzer for
+# coverage-guided fuzzing. On Windows (where libFuzzer is unsupported) the
+# fuzz_batch_driver reads corpus files and calls the same entry points.
+# See docs/planning/plan_AUDIT_TOOLING.md + tests/fuzz/.
+
+# Batch driver (Windows + Linux): reads a corpus dir, feeds each file to the
+# fuzz entry points, reports crashes. No coverage guidance — a regression /
+# crash-repro verifier.
+add_executable(fuzz_batch_driver tests/fuzz/fuzz_batch_driver.cpp)
+target_link_libraries(fuzz_batch_driver PRIVATE ember_frontend ember_import ember ember_ed25519)
+if(WIN32)
+    target_link_libraries(fuzz_batch_driver PRIVATE psapi kernel32)
+endif()
+
+# libFuzzer harnesses (Linux only — -fsanitize=fuzzer is unsupported on
+# Windows/MinGW). Enabled with -DENABLE_FUZZERS=ON. The CI sanitizer job
+# builds + runs these on Linux with coverage-guided mutation.
+option(ENABLE_FUZZERS "Build libFuzzer harnesses (Linux, requires -fsanitize=fuzzer support)" OFF)
+if(ENABLE_FUZZERS)
+    add_executable(fuzz_em_loader tests/fuzz/fuzz_em_loader.cpp)
+    target_compile_options(fuzz_em_loader PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+    target_link_options(fuzz_em_loader PRIVATE -fsanitize=fuzzer,address,undefined)
+    target_link_libraries(fuzz_em_loader PRIVATE ember_frontend ember_import ember ember_ed25519)
+
+    add_executable(fuzz_lexer tests/fuzz/fuzz_lexer.cpp)
+    target_compile_options(fuzz_lexer PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+    target_link_options(fuzz_lexer PRIVATE -fsanitize=fuzzer,address,undefined)
+    target_link_libraries(fuzz_lexer PRIVATE ember_frontend ember_import ember ember_ed25519)
+endif()
+
+# ctest: fuzz batch driver — verify no crash on the lang test corpus.
+add_test(NAME fuzz_batch COMMAND fuzz_batch_driver ${CMAKE_CURRENT_SOURCE_DIR}/tests/lang)
+set_tests_properties(fuzz_batch PROPERTIES TIMEOUT 30)

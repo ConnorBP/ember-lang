@@ -1,0 +1,42 @@
+// sema_invalid_fn_type_mismatch — parameterized fn types reject mismatched
+// handles and mismatched call args. The file as a whole must FAIL sema (exit
+// nonzero) even though it parses fine. Every case below is a distinct sema
+// error; sema collects them all and returns !ok.
+//
+// Cases:
+//   M1: passing &add (fn(i64,i64)->i64) to a fn(i64)->i64 param (wrong arity)
+//   M2: passing &id  (fn(i64)->i64)   to a fn(i64,i64)->i64 param (wrong arity)
+//   M3: calling a typed fn param with the wrong arg COUNT
+//   M4: calling a typed fn param with the wrong arg TYPE (bool where i64)
+//   M5: assigning &add to a fn(i64)->i64 local (signature mismatch on let)
+//   M6: returning &add from a fn(i64)->i64 return (signature mismatch on ret)
+
+fn id(x: i64) -> i64 { return x; }
+fn add(a: i64, b: i64) -> i64 { return a + b; }
+
+fn apply_one(f: fn(i64) -> i64) -> i64 { return f(0); }
+fn apply_two(f: fn(i64, i64) -> i64) -> i64 { return f(0, 0); }
+
+// M3: a typed fn param the body calls with the WRONG arg count
+fn wrong_count(f: fn(i64) -> i64) -> i64 { return f(1, 2); }
+
+// M4: a typed fn param the body calls with the WRONG arg type
+fn wrong_type(f: fn(i64) -> i64) -> i64 { return f(true); }
+
+// M6: a fn whose return type is a specific fn sig, returning a mismatched handle
+fn bad_ret() -> fn(i64) -> i64 { return &add; }
+
+fn main() -> i64 {
+    // M1: &add is fn(i64,i64)->i64, but apply_one wants fn(i64)->i64
+    let m1 = apply_one(&add);
+    // M2: &id is fn(i64)->i64, but apply_two wants fn(i64,i64)->i64
+    let m2 = apply_two(&id);
+    // M5: let h: fn(i64)->i64 = &add  (add has two params -> sig mismatch)
+    let h: fn(i64) -> i64 = &add;
+    // M3/M4 exercised by the bodies of wrong_count/wrong_type above
+    let m3 = wrong_count(&id);
+    let m4 = wrong_type(&id);
+    // M6 exercised by bad_ret's body above
+    let m6 = bad_ret();
+    return m1 + m2 + h + m3 + m4 + m6;
+}

@@ -1,0 +1,7 @@
+// expect: 84
+// A lambda with no captures is just a callable fn body; calling it runs the
+// body with only the arguments.
+fn main() -> i64 {
+    let f = fn(x: i64) -> i64 { return x * 2; };
+    return f(42);
+}

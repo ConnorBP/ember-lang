@@ -1,0 +1,21 @@
+// sema_invalid_local_slice_scriptfn_global_retain.ember — C5 reject
+// (slice-escape safety Stage 2). A stack-backed slice (a ViewExpr over a
+// fixed array) is passed to a script fn that RETAINS its slice arg by
+// storing it to a GLOBAL inside its body (store_to_global does `g = s`).
+// The escape is INSIDE the callee (the global outlives the caller's frame),
+// invisible to the caller's own C1/C2 guards (the param s is not localview
+// from the callee's perspective). Sema's pre-pass marks param 0 as
+// retained_params, so the call-site guard rejects a stack-backed slice arg
+// to it — the slice ptr would dangle once the caller's frame dies, while
+// global g still references it.
+//
+// This is the "stored to a global via a fn call" escape path, distinct from
+// the return-via-borrow path (sema_invalid_local_slice_scriptfn_return_escape).
+global g: u8[] = "";
+fn store_to_global(s: u8[]) { g = s; }
+fn bad() -> i64 {
+    let a: u8[2];
+    a[0] = 1; a[1] = 2;
+    store_to_global(a[..]);
+    return 0;
+}

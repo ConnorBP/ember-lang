@@ -1,0 +1,13 @@
+// expect: TRAP
+// Tier 4: throw with no enclosing try/catch unwinds to the host as a runtime
+// trap (TrapReason::UnhandledThrow), not a sema error. This mirrors
+// runtime_error: a script may legitimately throw from a function with no try,
+// expecting a host-level caller to handle it. Here main calls throw_uncaught
+// which throws with no handler — the CLI's trap stub catches it (exit 70).
+fn throw_uncaught() -> i64 {
+    throw 123;
+}
+
+fn main() -> i64 {
+    return throw_uncaught();
+}

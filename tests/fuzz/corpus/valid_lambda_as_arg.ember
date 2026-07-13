@@ -1,0 +1,12 @@
+// expect: 57
+// A lambda passed to a function and called from there. The callee receives a
+// lambda-typed parameter and calls it; the captured value travels with the
+// lambda (by-value env) and is visible inside the body at the call site.
+fn apply(g: fn(i64) -> i64, v: i64) -> i64 {
+    return g(v);
+}
+fn main() -> i64 {
+    let addend: i64 = 15;
+    let f = fn(x: i64) -> i64 { return x + addend; };
+    return apply(f, 42);
+}

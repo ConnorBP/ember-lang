@@ -1,0 +1,16 @@
+// valid_string_find_positions — string_find at various positions.
+// In "abcabc": "abc" first occurs at 0, "bca" at 1, "cab" at 2. A missing
+// substring "xyz" returns -1. Each result is asserted.
+// expect: 1
+fn main() -> i64 {
+    let h: string = string_from_slice("abcabc");
+    let p0: i64 = string_find(h, string_from_slice("abc"));
+    let p1: i64 = string_find(h, string_from_slice("bca"));
+    let p2: i64 = string_find(h, string_from_slice("cab"));
+    let pn: i64 = string_find(h, string_from_slice("xyz"));
+    if (p0 != 0) { return 0; }
+    if (p1 != 1) { return 0; }
+    if (p2 != 2) { return 0; }
+    if (pn != -1) { return 0; }
+    return 1;
+}

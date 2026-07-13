@@ -1,0 +1,7 @@
+// invalid for sema: reference to an undeclared name. The identifier didn't
+// resolve in any scope; sema reports "undefined name" and types the expr as
+// void, which then cascades into a return-type mismatch (the function wants
+// i64 but got void) - so this file produces >=1 sema error.
+fn bad() -> i64 {
+    return undefined_name;
+}

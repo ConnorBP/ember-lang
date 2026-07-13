@@ -1,0 +1,9 @@
+// expect: 42
+// Lambdas with by-value capture (#20): a lambda captures an enclosing-scope
+// variable by value (copied into a closure env) and the captured value is
+// visible inside the body when the lambda is called.
+fn main() -> i64 {
+    let captured_var: i64 = 40;
+    let f = fn(x: i64) -> i64 { return x + captured_var; };
+    return f(2);
+}

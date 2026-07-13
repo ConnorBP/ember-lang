@@ -1,0 +1,11 @@
+// valid_map_get_missing — map_get on a key that was never inserted.
+// The map has key 1 set to 10; querying key 999 (absent) returns 0, the
+// documented missing-key default. Adding 100 isolates the 0 from a possible
+// all-zero pass.
+// expect: 100
+fn main() -> i64 {
+    let m: i64 = map_new();
+    map_set(m, 1, 10);
+    let v: i64 = map_get(m, 999);
+    return v + 100;
+}

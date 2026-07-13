@@ -1,0 +1,15 @@
+// sema_valid_enums.ember - enums that must pass sema (not run end-to-end).
+// Exercises the EnumAccessExpr -> IntLit rewrite path + scope rules.
+// Enums are top-level declarations.
+
+enum Direction { North, East, South, West }
+
+fn turn(d: i64) -> i64 {
+    // qualified access inside a fn body resolves to the top-level enum
+    return Direction::North + d;
+}
+
+fn main() -> i64 {
+    let v: i64 = Direction::South + turn(2);
+    return v;
+}

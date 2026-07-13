@@ -1,0 +1,6 @@
+// invalid for parser: a function whose return arrow has no type (just
+// `-> ;`). A distinct error from the missing-name case: the parser saw the
+// arrow (so it knows this is a non-void function) but the next token isn't a
+// type. Must error; recovery syncs past the bad signature.
+fn bad() -> { return 0; }
+fn good_after() -> i64 { return 1; }

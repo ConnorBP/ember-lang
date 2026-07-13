@@ -1,0 +1,13 @@
+// valid_match_bool_subject — match with a bool subject.
+// The subject is a bool; patterns are bool literals (true/false). The first
+// matching arm wins.
+// expect: 10
+fn main() -> i64 {
+    let b: bool = true;
+    let mut r: i64 = 0;
+    match (b) {
+        true => { r = 10; },
+        false => { r = 20; }
+    }
+    return r;
+}

@@ -1,0 +1,24 @@
+// expect: 49
+// static_assert with a constexpr fn condition — the constexpr-call pre-pass
+// (lower_constexpr_calls_expr) rewrites square(7) to an IntLit (49) BEFORE
+// check_static_assert runs, so try_eval_const_bool sees `49 == 49` and folds
+// it to true. This is the cross-feature interaction the Tier 1 unblock
+// enables: constexpr fn eval (commit 3b8a8d7) feeds static_assert.
+//
+// Also pins that a constexpr fn used in the condition does NOT need to be
+// called at runtime — the assertion is fully resolved at sema time and main's
+// emitted body is just `return 49`.
+//
+// sema_valid: must parse OK + sema OK + run main, rc == 49.
+
+constexpr fn square(n: i64) -> i64 {
+    return n * n;
+}
+
+static_assert(square(7) == 49, "square(7) must be 49");
+static_assert(square(3) + square(4) == 25, "3-4-5 triangle: 9 + 16 == 25");
+
+fn main() -> i64 {
+    static_assert(square(5) == 25, "square(5) must be 25");
+    return square(7);
+}

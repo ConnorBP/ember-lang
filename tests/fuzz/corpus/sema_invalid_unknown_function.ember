@@ -1,0 +1,6 @@
+// invalid for sema: calling a function that was never declared (not a
+// native, not a script fn). Reports "unknown function" + the cascading
+// return-type mismatch.
+fn bad() -> i64 {
+    return no_such_function(1, 2);
+}

@@ -1,0 +1,31 @@
+// valid_simplifycfg.ember — constant branches, dead arms, and loop safety.
+// Run with: ember_cli run ../tests/lang/valid_simplifycfg.ember
+//                         --passes simplifycfg
+// expect: 42
+
+fn main() -> i64 {
+    let mut result: i64 = 0;
+
+    if (true) {
+        result = 30;
+    } else {
+        result = 99;
+    }
+
+    if (false) {
+        result = 1;
+    } else {
+        result = result + 2;
+    }
+
+    // Regression: the body and BudgetCheck latch must remain separate from
+    // the backedge/header. Merging loop members changed iteration semantics in
+    // the reverted implementation.
+    let mut i: i64 = 0;
+    while (i < 5) {
+        result = result + 2;
+        i = i + 1;
+    }
+
+    return result;
+}

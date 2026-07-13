@@ -1,0 +1,8 @@
+// invalid for sema: each element of an array literal must match the declared
+// element type (after the existing int-literal coercion). f32 literals cannot
+// coerce to i64, so `[1.0f, 2.0f, 3.0f]` for an i64[3] is an element-type
+// mismatch. Parses fine; fails at sema.
+fn bad() -> i64 {
+    let arr: i64[3] = [1.0f, 2.0f, 3.0f];
+    return arr[0];
+}

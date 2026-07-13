@@ -1,0 +1,5 @@
+// C4 regression: explicit `as` is not a privileged handle-forging escape.
+fn main() -> i64 {
+    let bad = 999 as vec3;
+    return 0;
+}

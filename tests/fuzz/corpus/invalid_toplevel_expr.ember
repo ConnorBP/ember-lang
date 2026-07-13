@@ -1,0 +1,3 @@
+// invalid: top-level expression where declaration expected
+fn ok() -> i64 { return 1; }
+x + 1;

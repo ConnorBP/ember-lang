@@ -1,0 +1,17 @@
+// sema_valid_borrowed_slice_to_copying_native.ember — a propagated localview
+// slice (a borrowing fn's result) consumed by a COPYING native (slice-escape
+// safety Stage 2). `borrow_slice` returns its slice arg (borrowed), so its
+// result is a propagated localview slice. Passing that result to
+// string_from_slice (retains=false, copies) is a synchronous consume — the
+// bytes are copied into the host store during the call, before the backing
+// frame dies. Sema must accept it. This proves the propagated localview bit
+// does NOT over-reject at a copying-native arg site (C3's retains=false path
+// is allowed even for a propagated-localview arg).
+fn borrow_slice(s: u8[]) -> u8[] { return s; }
+fn ok() -> i64 {
+    let a: u8[2];
+    a[0] = 72; a[1] = 0;  // "H"
+    let r: u8[] = borrow_slice(a[..]);
+    let s: string = string_from_slice(r);
+    return string_length(s);
+}

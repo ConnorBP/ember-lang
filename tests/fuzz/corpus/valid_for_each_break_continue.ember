@@ -1,0 +1,19 @@
+// valid_for_each_break_continue — for-each with break and continue.
+// break exits the loop early; continue skips the current element and
+// advances to the next. Over [10,20,30,40,50]:
+//   10 -> add (sum=10)
+//   20 -> continue (skip)
+//   30 -> add (sum=40)
+//   40 -> break (exit before adding)
+// expect: 40
+fn main() -> i64 {
+    let a: i64[5] = [10, 20, 30, 40, 50];
+    let s: i64[] = a[..];
+    let mut sum: i64 = 0;
+    for (x in s) {
+        if (x >= 40) { break; }
+        if (x == 20) { continue; }
+        sum = sum + x;
+    }
+    return sum;
+}

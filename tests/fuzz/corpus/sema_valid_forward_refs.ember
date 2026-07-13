@@ -1,0 +1,8 @@
+// valid for sema: nested functions calling each other with forward refs
+// (a caller declared before its callee). Sema resolves all script-fn names
+// in one pass before checking bodies, so forward refs work. This locks in
+// that property - a regression to single-pass-ordered resolution would
+// reject caller() (which references callee() declared below it).
+fn caller(x: i64) -> i64 { return callee(x) + 1; }
+fn callee(x: i64) -> i64 { return x * 2; }
+fn entry() -> i64 { return caller(10); }

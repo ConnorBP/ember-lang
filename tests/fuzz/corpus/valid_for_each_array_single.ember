@@ -1,0 +1,16 @@
+// valid_for_each_array_single — for-each over a single-element array handle.
+//
+// The desugared while loop runs exactly once; the sole element is captured
+// into the loop variable. Verifies array_get_* is called for index 0 and the
+// loop exits at index 1 (1 >= len=1).
+//
+// expect: 42
+fn main() -> i64 {
+    let a: i64 = array_new(8, 1);
+    array_set_i64(a, 0, 42);
+    let mut found: i64 = 0;
+    for (x in a) {
+        found = x;
+    }
+    return found;
+}

@@ -1,0 +1,16 @@
+// invalid for parser: MULTIPLE parse errors in one file, exercising the
+// best-effort recovery (sync to next ';' / '}' after each error, keep going).
+// The parser must report BOTH errors (not just the first) and still parse the
+// good function in between. Each bad function has a distinct syntactic fault:
+//   - bad1: a `let` with no name (just the keyword + ';')
+//   - bad2: a `let` with no type and no initializer
+// A regression where recovery stopped at the first error (single-error mode)
+// would only report bad1; a regression where recovery ate the good function
+// would drop it from the parse.
+let;
+fn good_between() -> i64 { return 1; }
+fn bad2() -> i64 {
+    let y;
+    return 0;
+}
+fn good_after() -> i64 { return 2; }

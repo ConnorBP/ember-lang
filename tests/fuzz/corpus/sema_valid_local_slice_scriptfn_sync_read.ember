@@ -1,0 +1,17 @@
+// sema_valid_local_slice_scriptfn_sync_read.ember — C5 allow (slice-escape
+// safety Stage 2). A stack-backed slice (a ViewExpr over a fixed array) is
+// passed to a script fn that READS it synchronously (sum_first indexes s[0]
+// and returns an i64 — it does NOT return or store the slice). The callee
+// neither borrows the slice into its return (borrowed_params) nor stores it
+// to a global (retained_params), so no escape: the backing frame outlives
+// the call. Sema must accept it.
+//
+// This is the C5 synchronous-read allow case: the dual of
+// sema_invalid_local_slice_scriptfn_return_escape.ember (a borrowing fn whose
+// result the caller escapes).
+fn sum_first(s: u8[]) -> i64 { return s[0] as i64; }
+fn ok() -> i64 {
+    let a: u8[2];
+    a[0] = 41; a[1] = 42;
+    return sum_first(a[..]);
+}

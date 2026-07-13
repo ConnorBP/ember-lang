@@ -1,0 +1,1 @@
+fn bad() -> i64 { continue; return 0; }

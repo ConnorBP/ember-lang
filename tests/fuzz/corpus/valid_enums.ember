@@ -1,0 +1,24 @@
+// valid_enums.ember - Tier 1 enums (docs/planning/plan_ENUMS.md Section 3).
+// C-style untyped enums: auto-increment from 0, optional explicit values,
+// E::A qualified access rewrites to an IntLit at sema (no codegen change).
+// Enums are top-level declarations (the parser accepts them at program scope).
+
+enum Color { Red, Green, Blue }
+enum Hue { A = 10, B, C = 100, D }
+
+fn main() -> i64 {
+    if (Color::Red != 0) { return 1; }
+    if (Color::Green != 1) { return 2; }
+    if (Color::Blue != 2) { return 3; }
+
+    if (Hue::A != 10) { return 4; }
+    if (Hue::B != 11) { return 5; }      // auto-increment from last explicit
+    if (Hue::C != 100) { return 6; }
+    if (Hue::D != 101) { return 7; }     // auto-increment from C
+
+    // enums are untyped i64 -- usable anywhere an i64 is.
+    let x: i64 = Color::Blue + Hue::B;
+    if (x != 13) { return 8; }
+
+    return 0;
+}

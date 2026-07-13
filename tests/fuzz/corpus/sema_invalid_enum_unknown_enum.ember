@@ -1,0 +1,5 @@
+// sema_invalid_enum_unknown_enum.ember - qualifying against a name that isn't
+// a declared enum must fail at sema.
+fn main() -> i64 {
+    return NoSuchEnum::A;   // 'NoSuchEnum' is not an enum -> sema error
+}

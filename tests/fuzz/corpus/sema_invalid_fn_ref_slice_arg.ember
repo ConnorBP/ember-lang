@@ -1,0 +1,2 @@
+fn take(x: u8[]) -> i64 { return 0; }
+fn main() -> i64 { let h = &take; return h(1); }

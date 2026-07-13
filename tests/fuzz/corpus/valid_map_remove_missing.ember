@@ -1,0 +1,12 @@
+// valid_map_remove_missing — map_remove on a key that is not present.
+// Removing an absent key is a no-op: the map's length and existing entries
+// are unchanged.
+// expect: 1
+fn main() -> i64 {
+    let m: i64 = map_new();
+    map_set(m, 1, 10);
+    map_remove(m, 999);
+    if (map_length(m) != 1) { return 0; }
+    if (map_get(m, 1) != 10) { return 0; }
+    return 1;
+}

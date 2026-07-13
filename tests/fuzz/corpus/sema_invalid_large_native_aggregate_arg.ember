@@ -1,0 +1,2 @@
+struct Big { a: i64; b: i64; }
+fn bad(x: Big) -> i64 { return array_new(x, 1); }

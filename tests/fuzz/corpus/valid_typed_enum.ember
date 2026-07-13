@@ -1,0 +1,16 @@
+// valid_typed_enum — Tier 1 typed enums (docs/planning/plan_ENUMS.md §6).
+// `enum Color : i32 { ... }` makes Color a REAL type backed by i32. A
+// Color-typed binding accepts Color::Variant values; the enum name resolves
+// to its backing integer prim (i32) for storage/codegen while Type::same
+// distinguishes it from a plain i32 (so `let c: Color = 5` is rejected —
+// see sema_invalid_int_to_enum). enum->int implicit widening lets `return c`
+// from an i64 fn work (a synthesized CastExpr Color->i64, codegen sign-
+// extends the i32 backing value). Untyped enums are unchanged (backward
+// compat — see valid_enums).
+// expect: 0
+enum Color : i32 { Red, Green, Blue }
+
+fn main() -> i64 {
+    let c: Color = Color::Red;
+    return c;
+}

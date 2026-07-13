@@ -1,0 +1,6 @@
+// invalid: `let` with neither a ':TYPE' annotation nor an initializer has
+// nothing to infer the type from (Item A's new error path).
+fn entry() -> i64 {
+    let x;
+    return 0;
+}

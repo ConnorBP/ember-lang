@@ -1,0 +1,8 @@
+// invalid for sema: a struct literal whose field value has the wrong type
+// (f32 where i64 was declared). Pairs with sema_invalid_struct_missing_field
+// (which tests a MISSING field); this tests a PRESENT-but-wrong-type field.
+struct Point { x: i64; y: i64; }
+fn bad() -> i64 {
+    let p: Point = Point { x: 1.5f, y: 2 };
+    return 0;
+}

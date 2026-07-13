@@ -1,0 +1,17 @@
+// valid: globals, consts, annotations, native-ish calls, slices
+const PI : f32 = 3.14f;
+global g_proc : i64 = 0;
+global g_addr : u64 = 0;
+
+@on_tick
+fn render() {
+    let v: u64 = ru64(g_proc, g_addr);
+    let s: u8[] = rs(g_proc, g_addr, 32);
+    draw_text(s, 10.0f, 20.0f, 255, 255, 255, 255, 0, 0, 0, 0, 0, 255, 1.0f);
+}
+
+@entry
+fn main() -> i64 {
+    g_proc = ref_process(1234);
+    return 1;
+}

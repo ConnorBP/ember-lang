@@ -1,0 +1,15 @@
+// expect: 55
+// Tier 4: a throw inside the catch block re-raises (propagates to the next
+// enclosing catch). The inner try/catch catches the first throw (7), then
+// the catch block throws 55 which is caught by the outer try/catch.
+fn main() -> i64 {
+    try {
+        try {
+            throw 7;
+        } catch (inner) {
+            throw 55;  // re-raise to the outer catch
+        }
+    } catch (outer) {
+        return outer;
+    }
+}

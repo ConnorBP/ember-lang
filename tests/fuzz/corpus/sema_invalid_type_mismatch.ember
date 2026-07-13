@@ -1,0 +1,4 @@
+// invalid for sema: mixed-type arithmetic (i64 + f32) with no cast
+fn bad(x: i64, y: f32) -> i64 {
+    return x + y;
+}

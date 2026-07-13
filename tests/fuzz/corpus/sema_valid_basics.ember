@@ -1,0 +1,23 @@
+// expect: 6
+// valid for sema: primitives, calls, operators, control flow (no slices/indices/structs)
+fn classify(n: i64) -> i64 {
+    if (n <= 1) { return n; }
+    else if (n > 100) { return 100; }
+    else {
+        let mut sum: i64 = 0;
+        let mut i: i64 = 0;
+        while (i < n) {
+            sum = sum + i;
+            i = i + 1;
+        }
+        return sum;
+    }
+}
+
+fn main() -> i64 {
+    let x: u64 = 4096;
+    let f: f32 = 0.75f;
+    let c: f32 = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+    let b: bool = (x > 0) && (c > 0.5f);
+    return b ? classify(4) : 0;
+}

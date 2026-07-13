@@ -1,0 +1,317 @@
+// valid_type_stress — comprehensive auto type-detection stress suite.
+//
+// Exercises the FULL usage chain for every integer width/signedness, typed
+// enums, floats, and inference: declaration -> assignment -> binary op ->
+// arg passing -> return -> cast -> array index -> match pattern -> native
+// call. Each block returns a distinct sentinel so a failure pinpoints the
+// exact class that broke (the runner asserts rc == 123). The value sentinels
+// inside (1/0 returned per block) are aggregated into a single 123 on full
+// success — any block that detects a wrong value returns a unique nonzero
+// error code instead, so the runner's exact-rc check localizes the failure.
+//
+// Type rules pinned here (docs/spec/TYPE_SYSTEM.md Section 6/7):
+//  * implicit widening: i8->i16->i32->i64, u8->u16->u32->u64, f32->f64.
+//  * narrowing + signedness change + int<->float: explicit `as` only.
+//  * enum->backing-int implicit widening (same signedness, width <= target).
+//  * mixed-type arithmetic is a compile error (no C-style promotion).
+//  * any integer type (signed or unsigned, any width) is a valid array index.
+//  * match: pattern must be same type as subject, OR both integer.
+//
+// sema_valid + executable: must parse OK + sema OK + run main, rc == 123.
+// expect: 123
+
+// ---- helpers: arg-passing + return probes across the integer matrix ----
+
+// i32 param, widening returns i64 (i32->i64 implicit at return)
+fn widen_ret_i32_to_i64(x: i32) -> i64 { return x; }
+// u32 param, widening returns u64 (u32->u64 implicit at return)
+fn widen_ret_u32_to_u64(x: u32) -> u64 { return x; }
+// i64 param returned as-is (exact)
+fn passthrough_i64(x: i64) -> i64 { return x; }
+// takes an i64, accepts an i32 arg (i32->i64 implicit widening at call site)
+fn takes_i64(x: i64) -> i64 { return x; }
+// takes a u64, accepts a u8 arg (u8->u64 implicit widening at call site)
+fn takes_u64(x: u64) -> i64 { return x as i64; }
+// takes a typed Color, returns its backing value widened to i64
+fn takes_color(c: Color) -> i64 { return c; }
+// constexpr fn returning i32, used where i64 expected (fold + widen)
+constexpr fn cexpr_i32() -> i32 { return 7; }
+// constexpr fn returning a typed enum, used as i64
+constexpr fn cexpr_color() -> Color { return Color::Green; }
+
+enum Color : i32 { Red, Green, Blue }
+enum Big : i64 { X = 1000000000000 }
+enum Small : u8 { A = 200, B = 255 }
+enum Idx : u32 { I0 = 0, I1 = 1, I2 = 2 }
+
+fn main() -> i64 {
+    // ============================================================
+    // BLOCK 1 — INTEGER WIDENING (declaration -> assignment chain)
+    // Same-signedness widening for every pair that the spec allows.
+    // ============================================================
+    {
+        let a: i8 = 5;  let b: i16 = a; let c: i32 = b; let d: i64 = c;
+        if (d != 5) { return 11; }
+        let e: u8 = 7;  let f: u16 = e; let g: u32 = f; let h: u64 = g;
+        if (h != 7) { return 12; }
+        // same-width same-signedness is a no-op (allowed)
+        let p: i32 = 9; let q: i32 = p;
+        if (q != 9) { return 13; }
+        // widening cross-step i16->i64 (skip a width)
+        let r: i16 = 11; let s: i64 = r;
+        if (s != 11) { return 14; }
+        // u16 -> u64 (skip a width)
+        let t: u16 = 13; let u: u64 = t;
+        if (u != 13) { return 15; }
+    }
+
+    // ============================================================
+    // BLOCK 2 — RETURN-TYPE WIDENING
+    // A value of a narrower same-signedness type returned from a fn
+    // declared to return a wider same-signedness type.
+    // ============================================================
+    {
+        if (widen_ret_i32_to_i64(42) != 42) { return 21; }
+        if (widen_ret_u32_to_u64(99) != 99) { return 22; }
+        // enum->int widening at return: takes_color returns i64, c is Color
+        if (takes_color(Color::Blue) != 2) { return 23; }
+    }
+
+    // ============================================================
+    // BLOCK 3 — ARG-PASSING WIDENING
+    // A narrower same-signedness value passed to a wider param.
+    // ============================================================
+    {
+        let a: i32 = 42; if (takes_i64(a) != 42) { return 31; }       // i32->i64
+        let b: u8 = 200; if (takes_u64(b) != 200) { return 32; }      // u8->u64
+        // literal arg adapts to param type (5 fits u8, 300 does not — 300 is sema err, not here)
+        if (takes_u64(5) != 5) { return 33; }
+        // enum variant literal arg widens to i64 (Color::Green -> 1)
+        if (takes_i64(Color::Green) != 1) { return 34; }
+    }
+
+    // ============================================================
+    // BLOCK 4 — BINARY OPS (same-type result + literal adaptation)
+    // Two same-type operands produce that type; a literal operand
+    // adapts to the other operand's type.
+    // ============================================================
+    {
+        let a: i32 = 6; let b: i32 = 7;
+        if (a + b != 13) { return 41; }                  // i32 + i32 = i32
+        let c: u64 = 10; let d: u64 = 3;
+        if (c - d != 7) { return 42; }                   // u64 - u64 = u64
+        // literal adapts to a u64 variable (5 + u64 -> u64)
+        let e: u64 = 100;
+        if (5 + e != 105) { return 43; }
+        if (e + 5 != 105) { return 44; }
+        // literal adapts to an i8 variable
+        let f: i8 = 3;
+        if (f + 4 != 7) { return 45; }
+        // same-type comparison produces bool
+        let g: i64 = 5;
+        if (!(g == 5)) { return 46; }
+        // shift: rhs may be any integer type (signed or unsigned)
+        let h: i32 = 1; let i: u8 = 4;
+        if (h << i != 16) { return 47; }
+        let j: u32 = 256; let k: i64 = 4;
+        if (j >> k != 16) { return 48; }
+    }
+
+    // ============================================================
+    // BLOCK 5 — CAST MATRIX (explicit `as`)
+    // int->int any width/signedness (truncate / sign-extend / zero-extend),
+    // f32<->f64, signed-int<->float. (unsigned<->float is NOT in the v1
+    // matrix — covered by sema_invalid_type_narrow.)
+    // ============================================================
+    {
+        // truncation
+        let x: u8 = 256 as u8;  if (x != 0) { return 51; }    // 256 & 0xFF = 0
+        let y: u8 = (-1) as u8; if (y != 255) { return 52; }  // -1 -> 0xFF
+        // widening cast
+        let a: i32 = 5; let b: i64 = a as i64; if (b != 5) { return 53; }
+        // signedness-change cast
+        let c: u32 = 5; let d: i64 = c as i64; if (d != 5) { return 54; }
+        // narrowing cast
+        let e: i64 = 5; let f: i32 = e as i32; if (f != 5) { return 55; }
+        // float<->float
+        let g: f32 = 1.5f; let hh: f64 = g as f64; if (hh != 1.5) { return 56; }
+        let ii: f64 = 2.25;  let jj: f32 = ii as f32; if (jj != 2.25f) { return 57; }
+        // signed int <-> float
+        let kk: i64 = 5; let ll: f64 = kk as f64; if (ll != 5.0) { return 58; }
+        let mm: f64 = 5.7;  let nn: i64 = mm as i64; if (nn != 5) { return 59; } // truncates toward zero
+        // enum->int explicit cast (narrowing to backing + widening)
+        let o: Color = Color::Green; if (o as i32 != 1) { return 60; }
+        if (o as i64 != 1) { return 61; }
+        // enum->int explicit narrowing cast (allowed via explicit `as`)
+        let pp: Color = Color::Red; if (pp as i16 != 0) { return 62; }
+        if (pp as u8 != 0) { return 63; }
+    }
+
+    // ============================================================
+    // BLOCK 6 — ARRAY INDEX (any integer type as index)
+    // Signed, unsigned, small, wide, and enum-typed indices all work.
+    // ============================================================
+    {
+        let a: i64[4];
+        a[0] = 10; a[1] = 20; a[2] = 30; a[3] = 40;
+        let i_u8: u8 = 1;   if (a[i_u8] != 20) { return 71; }
+        let i_u32: u32 = 2; if (a[i_u32] != 30) { return 72; }
+        let i_i8: i8 = 3;   if (a[i_i8] != 40) { return 73; }
+        let i_i64: i64 = 0; if (a[i_i64] != 10) { return 74; }
+        // enum-typed index (typed enum IS an integer for indexing)
+        let idx: Idx = Idx::I2; if (a[idx] != 30) { return 75; }
+        // enum variant literal as a direct index
+        if (a[Idx::I1] != 20) { return 76; }
+        // literal index (constant, bounds-checked at sema)
+        if (a[3] != 40) { return 77; }
+    }
+
+    // ============================================================
+    // BLOCK 7 — MATCH PATTERN TYPES
+    // Same-type, both-integer, and typed-enum patterns/subjects.
+    // ============================================================
+    {
+        // typed enum subject + typed enum patterns
+        let c: Color = Color::Green;
+        let mut r1: i64 = 0;
+        match (c) {
+            Color::Red => { r1 = 10; },
+            Color::Green => { r1 = 20; },
+            Color::Blue => { r1 = 30; },
+            _ => { r1 = 99; }
+        }
+        if (r1 != 20) { return 81; }
+        // i64 subject + i32 literal pattern (both integer — accepted)
+        let n: i64 = 5;
+        let mut r2: i64 = 0;
+        match (n) {
+            1 => { r2 = 10; },
+            5 => { r2 = 20; },
+            _ => { r2 = 99; }
+        }
+        if (r2 != 20) { return 82; }
+        // u32 subject + u32 literal pattern
+        let u: u32 = 7;
+        let mut r3: i64 = 0;
+        match (u) {
+            7 => { r3 = 20; },
+            _ => { r3 = 99; }
+        }
+        if (r3 != 20) { return 83; }
+        // enum subject + int pattern (both integer)
+        let c2: Color = Color::Blue;
+        let mut r4: i64 = 0;
+        match (c2) {
+            2 => { r4 = 20; },
+            _ => { r4 = 99; }
+        }
+        if (r4 != 20) { return 84; }
+        // int subject + enum pattern (both integer)
+        let m: i32 = 0;
+        let mut r5: i64 = 0;
+        match (m) {
+            Color::Red => { r5 = 20; },
+            _ => { r5 = 99; }
+        }
+        if (r5 != 20) { return 85; }
+    }
+
+    // ============================================================
+    // BLOCK 8 — TYPED ENUM + INTEGER INTERACTIONS
+    // enum->int implicit widening across the chain (the design rule).
+    // ============================================================
+    {
+        // enum:i32 -> i64 (widening)
+        let c: Color = Color::Red; let i: i64 = c; if (i != 0) { return 91; }
+        // enum:i32 -> i32 (backing type, exact)
+        let c2: Color = Color::Green; let i2: i32 = c2; if (i2 != 1) { return 92; }
+        // enum:u8 -> u8 (unsigned backing, exact)
+        let s: Small = Small::A; let v: u8 = s; if (v != 200) { return 93; }
+        // enum:u8 -> i64 (widen + the backing is u8 so -> i64 is widening, same... u8 unsigned, i64 signed -> NOT implicit)
+        //   (that signedness case is a sema error — see sema_invalid_type_narrow; use explicit cast here)
+        let s2: Small = Small::B; let w: i64 = s2 as i64; if (w != 255) { return 94; }
+        // enum:i64 large value
+        let bg: Big = Big::X; let lv: i64 = bg; if (lv != 1000000000000) { return 95; }
+        // enum->int at return (already in BLOCK 2 via takes_color)
+        // enum == int comparison (typed enum vs plain int allowed)
+        let c3: Color = Color::Red;
+        if (!(c3 == 0)) { return 96; }
+        if (!(0 == c3)) { return 97; }
+        // same-enum binary op produces the enum type (Red + Green = 0 + 1 = 1)
+        let a: Color = Color::Red; let b: Color = Color::Green;
+        let sum: Color = a + b; if (sum as i64 != 1) { return 98; }
+        // enum variant as array index (already in BLOCK 6)
+    }
+
+    // ============================================================
+    // BLOCK 9 — CONSTEXPR + TYPE INTERACTIONS
+    // constexpr folds to a literal that then widens at the use site.
+    // ============================================================
+    {
+        // constexpr fn returning i32, let as i64 (fold -> literal -> widen)
+        let x: i64 = cexpr_i32(); if (x != 7) { return 101; }
+        // constexpr fn returning i32, used in an i64 expression
+        let y: i64 = cexpr_i32() + 1; if (y != 8) { return 102; }
+        // constexpr fn returning a typed enum, used as i64 (fold -> enum lit -> widen)
+        let z: i64 = cexpr_color(); if (z != 1) { return 103; }
+        // static_assert with an enum comparison (compile-time, no runtime effect)
+        // (covered structurally: if we got here, the static_asserts below main passed)
+    }
+
+    // ============================================================
+    // BLOCK 10 — FLOAT WIDENING (f32 -> f64 implicit, the fixed rule)
+    // ============================================================
+    {
+        let a: f32 = 1.5f; let b: f64 = a; if (b != 1.5) { return 111; }
+        // f32->f64 as a return value (via a helper is in sema_valid_basics; here direct)
+        let c: f32 = 2.25f; let d: f64 = c; if (d != 2.25) { return 112; }
+        // f32 literal with `f` suffix widening to f64
+        let e: f64 = 3.5f; if (e != 3.5) { return 113; }
+    }
+
+    // ============================================================
+    // BLOCK 11 — INFERENCE (`let x = expr;` picks the expr's type)
+    // ============================================================
+    {
+        let x = 5;          // infers i64
+        if (x != 5) { return 121; }
+        let y = 5.0f;       // infers f32
+        if (!(y == 5.0f)) { return 122; }
+        let z = 5.0;        // infers f64
+        if (!(z == 5.0)) { return 124; }
+        let w = true;       // infers bool
+        if (!w) { return 125; }
+        let c = Color::Red; // infers Color (typed enum)
+        if (c as i64 != 0) { return 126; }
+        let n = -5;         // infers i64 (unary neg of i64 literal)
+        if (n != -5) { return 127; }
+    }
+
+    // ============================================================
+    // BLOCK 12 — NATIVE CALL (abs_i64 over the int matrix)
+    // A real native round-trip: abs_i64 accepts i64 and returns i64.
+    // ============================================================
+    {
+        if (abs_i64(-42) != 42) { return 131; }
+        if (abs_i64(42) != 42) { return 132; }
+        // abs_i64 on an i32 arg (i32->i64 widening at the native call site).
+        // (-7) is an i64-typed unary expr (not an adapting literal), so cast
+        // explicitly to i32 — the widening under test is then i32->i64 at the
+        // abs_i64(i64) call site, which is the implicit path we are pinning.
+        let a: i32 = (-7) as i32;
+        if (abs_i64(a) != 7) { return 133; }
+    }
+
+    return 123;
+}
+
+// Compile-time assertions covering enum + constexpr contexts (if any of
+// these fail, sema rejects the file before main can run).
+static_assert(Color::Red == 0, "Color::Red is zero");
+static_assert(Color::Green == 1, "Color::Green is one");
+static_assert(Color::Blue == 2, "Color::Blue is two");
+static_assert(Big::X == 1000000000000, "Big::X is 10^12");
+static_assert(Small::A == 200, "Small::A is 200");
+static_assert(Small::B == 255, "Small::B is 255");
+static_assert(cexpr_i32() == 7, "constexpr i32 folds to 7");
+static_assert(cexpr_color() == Color::Green, "constexpr color folds to Green");

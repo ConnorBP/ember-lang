@@ -1,0 +1,16 @@
+// sema_invalid_struct_field_global_store_localview.ember — regression for the
+// C2b FieldExpr-target escape hole (local_array_view class). Before the fix,
+// the AssignExpr escape guard opened with `if (auto* tid = dynamic_cast<Ident*>
+// (a->target.get()))` — a FieldExpr target (gs.data = s;) FAILED that dyn_cast
+// and fell through with no local-view check, so a stack-backed slice stored
+// into a global struct's field compiled and returned a dangling ptr (probe read
+// 192, garbage). The fix chases the FieldExpr/IndexExpr target to its root
+// base and rejects if the root is a global.
+struct S { data: u8[]; }
+global gs : S = S { data: "" };
+fn bad() -> i64 {
+    let a: u8[3];
+    a[0] = 88; a[1] = 89; a[2] = 90;
+    gs.data = a[..];
+    return 0;
+}

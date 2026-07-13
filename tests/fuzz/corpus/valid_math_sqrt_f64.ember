@@ -1,0 +1,8 @@
+// valid_math_sqrt_f64 — sqrt_f64(16.0) is approximately 4.0.
+// The f64 result is compared against 4.0; a mismatch returns 0.
+// expect: 1
+fn main() -> i64 {
+    let r: f64 = sqrt_f64(16.0);
+    if (r != 4.0) { return 0; }
+    return 1;
+}

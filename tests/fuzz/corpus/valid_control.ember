@@ -1,0 +1,16 @@
+// valid: control flow
+fn classify(n: i64) -> i64 {
+    if (n <= 1) {
+        return n;
+    } else if (n > 100) {
+        return 100;
+    } else {
+        let sum: i64 = 0;
+        let i: i64 = 0;
+        while (i < n) {
+            sum = sum + i;
+            i = i + 1;
+        }
+        return sum;
+    }
+}

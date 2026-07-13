@@ -1,0 +1,8 @@
+// sema_invalid_for_each_not_slice — for-each iterable must be a slice.
+fn main() -> i64 {
+    let x: i64 = 42;
+    for (y in x) {
+        return y;
+    }
+    return 0;
+}

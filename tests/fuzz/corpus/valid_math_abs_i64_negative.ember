@@ -1,0 +1,10 @@
+// valid_math_abs_i64_negative — abs_i64 on a negative value.
+// abs_i64(-42) returns 42; abs_i64(42) returns 42. Both are asserted.
+// expect: 1
+fn main() -> i64 {
+    let a: i64 = abs_i64(-42);
+    let b: i64 = abs_i64(42);
+    if (a != 42) { return 0; }
+    if (b != 42) { return 0; }
+    return 1;
+}

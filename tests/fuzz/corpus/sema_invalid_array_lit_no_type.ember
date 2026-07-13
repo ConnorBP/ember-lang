@@ -1,0 +1,9 @@
+// invalid for sema: v1 does not infer array types from elements, so a bare
+// `let x = [1, 2, 3];` (no type annotation) has no declared target type to
+// validate against and is rejected. The fix is to annotate the binding
+// (`let x: i64[3] = [1, 2, 3];` or `let x: i64[] = [1, 2, 3];`). Parses fine;
+// fails at sema with "array literal needs an explicit type annotation".
+fn bad() -> i64 {
+    let x = [1, 2, 3];
+    return x[0];
+}
