@@ -295,6 +295,18 @@ static Stats time_ember(BenchModule& m, context_t& ectx, int iters, int warmup,
             s.timed_out = true;
             return s;
         }
+        // Reclaim the append-only string host store between independent bench
+        // iterations. g_strings (extensions/string/ext_string.cpp) only ever
+        // push_back, never evict, so the string_decrypt path's per-iteration
+        // string_length("literal") -> string_from_slice -> str_new would
+        // accumulate iters*inner_n host strings without bound and trip the
+        // 2 GiB RSS failsafe (src/safety.cpp). Each bench iteration is an
+        // independent main() call whose strings are dead once it returns, so
+        // clearing here is safe (no live handle survives the call) and keeps
+        // the measured per-iteration cost identical (each iteration still does
+        // the same allocations; only the cumulative growth is bounded). A
+        // no-op for paths that never allocate strings (the store stays empty).
+        ext_string::reset();
         ectx.reset_for_call();
         ectx.budget_remaining = kBenchInstructionBudget;
         ectx.has_checkpoint = true;
@@ -312,6 +324,7 @@ static Stats time_ember(BenchModule& m, context_t& ectx, int iters, int warmup,
             s.timed_out = true;
             return s;
         }
+        ext_string::reset();  // see warmup loop: bound the append-only string store
         ectx.reset_for_call();
         ectx.budget_remaining = kBenchInstructionBudget;
         ectx.has_checkpoint = true;
@@ -404,6 +417,7 @@ static PairedStats time_paired(BenchModule& m, context_t& ectx, void* entry,
             ps.timed_out = true;
             return ps;
         }
+        ext_string::reset();  // bound the append-only string store (see time_ember)
         ectx.reset_for_call(); ectx.budget_remaining = kBenchInstructionBudget;
         ectx.has_checkpoint = true;
         if (__builtin_setjmp(ectx.checkpoint)) return ps;  // trap
@@ -420,6 +434,7 @@ static PairedStats time_paired(BenchModule& m, context_t& ectx, void* entry,
             return ps;
         }
         // ember
+        ext_string::reset();  // bound the append-only string store (see time_ember)
         ectx.reset_for_call(); ectx.budget_remaining = kBenchInstructionBudget;
         ectx.has_checkpoint = true;
         if (__builtin_setjmp(ectx.checkpoint)) return ps;
