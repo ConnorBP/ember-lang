@@ -1335,3 +1335,28 @@ F6. bench_codegen_paths full-suite failure (pre-existing regression, FIXED).
 - No audit report (docs/audit/) was edited (they are dated historical records;
   audited against, not rewritten).
 - Commit messages contain no @.
+
+
+### Parent gitlink publication status (post-push)
+- Ember pushed to origin/master successfully (323d18f..429c1ec, no force, no
+  rebase needed — remote had not advanced). HEAD 429c1ec == origin/master
+  (0 ahead / 0 behind).
+- Parent Ember gitlink: the parent workspace (hyper_workspace) records ember
+  at 323d18f; ember is now at 429c1ec, so the gitlink is stale. Per the task
+  rule ("update and push the parent Ember gitlink only if the parent workspace
+  is completely clean; otherwise document that parent publication is blocked
+  and do not stage it"), the parent workspace was inspected and is NOT clean:
+    M Testing/Temporary/LastTest.log
+    M prism-gui/CMakeLists.txt
+    M ember                  (the gitlink advance itself, not staged)
+    ?? hyper-reV
+    ?? InsydeBIOS_Microcode_Updater/
+    ?? LEGION_Y7000Series_Insyde_Advanced_Settings_Tools/
+    ?? NUL
+  These are pre-existing/unrelated and were NOT caused by this chunk. The
+  parent's staging area was left empty (git diff --cached empty — the ember
+  gitlink was NOT staged). PARENT PUBLICATION IS BLOCKED: the parent Ember
+  gitlink was NOT updated and NOT pushed. Next action (for whoever next works
+  in a clean parent workspace): `git add ember && git commit -m "Update ember
+  submodule: audit + bench RSS fix + doc accuracy pass" && git push` to
+  advance the parent gitlink from 323d18f to 429c1ec.
