@@ -81,6 +81,12 @@ LexResult tokenize(std::string_view src, const char*) {
     auto adv = [&](size_t n){ i += n; col += uint32_t(n); };
     auto push = [&](Tk k, std::string t){ r.toks.push_back({k, std::move(t), line, col}); };
 
+    // 1 MiB cap on any single string-literal token's decoded/text body
+    // (audit LOW finding: prevent memory-exhaustion DoS from a pathologically
+    // long literal). Enforced uniformly across plain, f-, and raw strings,
+    // including nested quoted text inside f-string interpolations.
+    static constexpr size_t MAX_STRING_LITERAL = 1 << 20;  // 1 MiB
+
     while (i < src.size()) {
         char c = src[i];
         // whitespace
@@ -129,6 +135,11 @@ LexResult tokenize(std::string_view src, const char*) {
             for (;;) {
                 if (i >= src.size()) { r.ok = false; r.error = "unterminated f-string"; r.err_line = sl; r.err_col = sc; return r; }
                 char ch = src[i];
+                if (s.size() >= MAX_STRING_LITERAL) {
+                    r.ok = false;
+                    r.error = "f-string literal exceeds the 1MB maximum (possible memory-exhaustion attempt)";
+                    r.err_line = sl; r.err_col = sc; return r;
+                }
                 if (brace_depth == 0) {
                     if (ch == '"') break; // real terminator
                     if (ch == '{') {
@@ -145,6 +156,11 @@ LexResult tokenize(std::string_view src, const char*) {
                 if (ch == '"') {
                     s.push_back(ch); adv(1);
                     while (i < src.size() && src[i] != '"') {
+                        if (s.size() >= MAX_STRING_LITERAL) {
+                            r.ok = false;
+                            r.error = "f-string literal exceeds the 1MB maximum (possible memory-exhaustion attempt)";
+                            r.err_line = sl; r.err_col = sc; return r;
+                        }
                         if (src[i] == '\\' && i + 1 < src.size()) { s.push_back(src[i]); s.push_back(src[i+1]); adv(2); continue; }
                         s.push_back(src[i]); (src[i] == '\n' ? (++line, col=1) : ++col); ++i;
                     }
@@ -176,6 +192,11 @@ LexResult tokenize(std::string_view src, const char*) {
             std::string s;
             while (i < src.size() &&
                    !(src[i] == '"' && i + 2 < src.size() && src[i+1] == '"' && src[i+2] == '"')) {
+                if (s.size() >= MAX_STRING_LITERAL) {
+                    r.ok = false;
+                    r.error = "raw string literal exceeds the 1MB maximum (possible memory-exhaustion attempt)";
+                    r.err_line = sl; r.err_col = sc; return r;
+                }
                 s.push_back(src[i]); (src[i] == '\n' ? (++line, col=1) : ++col); ++i;
             }
             if (i + 2 >= src.size() || src[i] != '"' || src[i+1] != '"' || src[i+2] != '"') {
@@ -300,7 +321,6 @@ LexResult tokenize(std::string_view src, const char*) {
         if (c == '"') {
             uint32_t sl = line, sc = col; adv(1);
             std::string s;
-            static constexpr size_t MAX_STRING_LITERAL = 1 << 20;  // 1MB cap (audit LOW finding: prevent memory-exhaustion DoS)
             while (i < src.size() && src[i] != '"') {
                 if (s.size() >= MAX_STRING_LITERAL) {
                     r.ok = false;

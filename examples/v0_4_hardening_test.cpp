@@ -448,6 +448,35 @@ static bool fold_i32_sign_normalize_direct_probe() {
     return folded_ok && full_equal;
 }
 
+// --- lexer DoS cap: plain/f-/raw string literals >1 MiB must be REJECTED ---
+// Audit LOW finding: the plain-string scanner capped decoded text at 1 MiB,
+// but the f-string and raw triple-quoted scanners (and nested quoted text
+// inside f-string interpolations) were unbounded, so a pathologically long
+// literal could exhaust memory during lexing. Post-fix all three scanners
+// share the same MAX_STRING_LITERAL (1 MiB) cap. Each over-cap case below
+// would lex with unbounded allocation (or accept an over-limit body) with
+// the fix reverted; each under-cap negative control must still lex OK.
+static bool lexer_string_cap_test() {
+    const size_t CAP = size_t(1) << 20;            // 1 MiB, matches lexer MAX_STRING_LITERAL
+    const std::string big(CAP + 1, 'A');           // body just over the cap
+    const std::string small(CAP - 1, 'A');         // body just under the cap
+    auto lex_ok = [](const std::string& src) -> bool {
+        auto lr = tokenize(src, "<lex-cap>");
+        return lr.ok;
+    };
+    bool ok = true;
+    // over-cap bodies must be REJECTED by the lexer (not allocated unbounded)
+    ok &= !lex_ok("\"" + big + "\"");                                // plain string
+    ok &= !lex_ok("f\"" + big + "\"");                               // f-string literal text
+    ok &= !lex_ok("r\"\"\"" + big + "\"\"\"");                     // raw triple-quoted
+    ok &= !lex_ok("f\"{ \"" + big + "\" }\"");                       // nested quoted text in interpolation
+    // under-cap bodies must still be ACCEPTED (cap didn't break normal lexing)
+    ok &= lex_ok("\"" + small + "\"");
+    ok &= lex_ok("f\"" + small + "\"");
+    ok &= lex_ok("r\"\"\"" + small + "\"\"\"");
+    return ok;
+}
+
 int main() {
     std::printf("=== v0.4 hardening regression (red-team V5 + V6) ===\n");
 
@@ -460,6 +489,14 @@ int main() {
     // --- V6-DoS negative control: a small in-budget array must ACCEPT ---
     check(sema_ok("fn main() -> i64 { let a: u8[100]; return a[0] as i64; }\n"),
           "V6-DoS negative control: u8[100] in-budget sema OK");
+
+    // --- lexer DoS cap: plain/f-/raw string literals >1 MiB are REJECTED ---
+    // Pre-fix only the plain-string scanner enforced a 1 MiB body cap; the
+    // f-string and raw triple-quoted scanners (and nested quoted text inside
+    // f-string interpolations) were unbounded -> memory-exhaustion DoS during
+    // lexing. Post-fix all three share MAX_STRING_LITERAL (1 MiB).
+    check(lexer_string_cap_test(),
+          "Lexer DoS cap: plain/f-/raw/nested string literals >1MB rejected (was unbounded)");
 
     // --- V6-overflow: struct field whose byte_size overflows int32 ---
     // Red-team payload: `struct S { big: i64[1073741824]; }` + `let s: S;`
