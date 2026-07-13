@@ -13,10 +13,10 @@ using namespace ember;  // bind_handle, BindingBuilder, type_* singletons
 namespace ember::ext_math {
 
 extern "C" {
-    static float n_sqrt(float v) { return std::sqrtf(v); }
-    static float n_sin(float v) { return std::sinf(v); }
-    static float n_cos(float v) { return std::cosf(v); }
-    static float n_tan(float v) { return std::tanf(v); }
+    static float n_sqrt(float v) { return std::sqrt(v); }
+    static float n_sin(float v) { return std::sin(v); }
+    static float n_cos(float v) { return std::cos(v); }
+    static float n_tan(float v) { return std::tan(v); }
     // f64 variants (deferred Tier 0 — broader f32/f64 math).
     static double n_sqrt_f64(double v) { return std::sqrt(v); }
     static double n_sin_f64(double v) { return std::sin(v); }
@@ -44,13 +44,13 @@ extern "C" {
     static int64_t n_min_i64(int64_t a, int64_t b) { return a < b ? a : b; }
     static int64_t n_max_i64(int64_t a, int64_t b) { return a > b ? a : b; }
     static int64_t n_clamp_i64(int64_t v, int64_t lo, int64_t hi) { return v < lo ? lo : (v > hi ? hi : v); }
-    static float n_atan(float v) { return std::atanf(v); }
-    static float n_atan2(float y, float x) { return std::atan2f(y, x); }
-    static float n_exp(float v) { return std::expf(v); }
-    static float n_log(float v) { return std::logf(v); }
-    static float n_floor(float v) { return std::floorf(v); }
-    static float n_ceil(float v) { return std::ceilf(v); }
-    static float n_abs(float v) { return std::fabsf(v); }
+    static float n_atan(float v) { return std::atan(v); }
+    static float n_atan2(float y, float x) { return std::atan2(y, x); }
+    static float n_exp(float v) { return std::exp(v); }
+    static float n_log(float v) { return std::log(v); }
+    static float n_floor(float v) { return std::floor(v); }
+    static float n_ceil(float v) { return std::ceil(v); }
+    static float n_abs(float v) { return std::fabs(v); }
     static float n_round(float v) { return std::roundf(v); }
 }
 

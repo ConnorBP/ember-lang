@@ -48,6 +48,7 @@ jobs:
             -DCMAKE_CXX_COMPILER=g++ \
             -DCMAKE_MAKE_PROGRAM=ninja \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DEMBER_BUILD_VST3=OFF \
             -B build
           cmake --build build -j 8
       - shell: msys2 {0}

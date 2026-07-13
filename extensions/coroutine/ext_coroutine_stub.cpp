@@ -7,7 +7,7 @@
 // returns 0 = invalid handle, coroutine_next returns 0, coroutine_done
 // returns true). Scripts using coroutines on non-Windows will get a clean
 // runtime error rather than a link failure.
-#include "../binding_builder.hpp"
+#include "binding_builder.hpp"
 #include "ext_coroutine.hpp"
 
 namespace ember::ext_coroutine {
