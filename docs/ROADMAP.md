@@ -52,7 +52,7 @@ bench targets `bench_codegen_paths` and `bench_ember_vs_as` plus the
 AngelScript SDK is present, so a no-SDK build configures 69). `cd buildt &&
 ctest -E bench -LE soak --timeout 60` → 67/67 pass; the full unfiltered
 suite (including benchmarks + soak) → 70/70 pass.
-The four `plan_*.md` files in `docs/` are historical design
+The ten `plan_*.md` files in `docs/planning/` are historical design
 records; shipped contracts in the main docs take precedence where those plans
 describe earlier states.
 
@@ -150,7 +150,7 @@ path is real: ember can compile + run ember.
 This session landed the self-hosting milestone (above) + a red-team `.em`
 format hardening pass + several fixes. The full commit log (oldest → newest):
 
-- **Plan: self-hosting** (`b07841a`) — `docs/planning/plan_SELF_HOSTING.md`,
+- **Plan: self-hosting** (`b07841a`) — `planning/plan_SELF_HOSTING.md`,
   the 4-stage port path (lex → parse → sema → codegen → bootstrap) with the
   `call_raw` native identified as the Stage 4 execution gap.
 - **Red team: `.em` format security audit** (`6dfd8f8`) —
@@ -690,14 +690,14 @@ here so the decision and its evidence have a tracked home.
   stack-spilling value convention (every value goes through rax/memory, no
   register allocation across expressions). The SSA-lite IR + linear-scan
   regalloc (COMPILER_PIPELINE §5) is the documented target — was EXPLICITLY
-  DEFERRED per `../planning/DESIGN.md` §9 ("no speculative optimization before
+  DEFERRED per `planning/DESIGN.md` §9 ("no speculative optimization before
   the bench proves it matters"), but a benchmark system (`bench/`,
-  `../spec/BENCHMARK_SYSTEM_DESIGN.md`) PROVED the need per path, so the
+  `spec/BENCHMARK_SYSTEM_DESIGN.md`) PROVED the need per path, so the
   optimization is no longer speculative. Stage A (thin-IR backend), Stage B
   (.em v5 IR serialization), and Stage C (16 IR optimization passes + 7
   obfuscation passes) all
   SHIPPED. The full design is
-  `../spec/CODEGEN_OPTIMIZATION_DESIGN.md` (LLVM pass survey × JIT-scripting
+  `spec/CODEGEN_OPTIMIZATION_DESIGN.md` (LLVM pass survey × JIT-scripting
   relevance, per-path waste mapping with line numbers, three architecture
   options, a staged recommendation, pass interface, migration plan). The
   roadmap entries below are gated, not scheduled; each carries its benchmark
@@ -728,7 +728,7 @@ here so the decision and its evidence have a tracked home.
     `mov r10/rax` reg-reg dependency chain + 6 bytes is net slower than the hot-L1
     `push/pop` store-to-load forwarding for the simple `i+1` pattern — the
     microarchitectural finding Stage 2's cost-model regalloc addresses). See
-    `../spec/CODEGEN_OPTIMIZATION_DESIGN.md` §8 for the full table. Gate (the
+    `spec/CODEGEN_OPTIMIZATION_DESIGN.md` §8 for the full table. Gate (the
     5-9x call/loop/slice/string slowdowns are spill-bound): CONFIRMED; Stage 1
     ships the working subset (the loop/call wins; the slice regression motivates
     Stage 2).
@@ -756,7 +756,7 @@ here so the decision and its evidence have a tracked home.
     (full SSA-lite rename with phi nodes) remain the still-future upgrade path,
     gated on Stage
     A's insufficiency or cross-block evidence. See
-    `../spec/CODEGEN_OPTIMIZATION_DESIGN.md` §8 (Stage A status).
+    `spec/CODEGEN_OPTIMIZATION_DESIGN.md` §8 (Stage A status).
   - **Stage 3** — **PARTIALLY SHIPPED.** The linear-scan register allocator
     (`src/regalloc.{hpp,cpp}` — SSA-lite linear-scan over the `ThinFunction`,
     scalar int/bool VRegs → Win64 callee-saved registers, spills to frame slots
@@ -802,7 +802,7 @@ here so the decision and its evidence have a tracked home.
     by the `ember_passes_unroll`/`_lsr`/`_sccp` end-to-end exit-code gates.
     Pinned by `examples/ember_pass_test.cpp` (ctest target `ember_pass`) and
     `examples/ir_passes_test.cpp` (ctest target `ir_passes`). Spec/design:
-    `../spec/PASS_SYSTEM_DESIGN.md`. The still-future upgrade path is the
+    `spec/PASS_SYSTEM_DESIGN.md`. The still-future upgrade path is the
     residual Stage 3 (full SSA-lite rename with phi nodes — the linear-scan
     regalloc subset has shipped; see the Stage 3 entry above) and carrying the
     remaining Stage 1 rewrites over as `ThinPass`es — gated on Stage A's
@@ -833,9 +833,9 @@ here so the decision and its evidence have a tracked home.
      block-local CSE, range propagation (bounds-check elision for induction
      vars), max-simultaneously-live temp sizing. Stage 1-2, lower predicted win.
 
-  See `../spec/CODEGEN_OPTIMIZATION_DESIGN.md` §3 (per-path waste), §4
+  See `spec/CODEGEN_OPTIMIZATION_DESIGN.md` §3 (per-path waste), §4
   (architecture), §5 (full prediction table) for the complete design; see
-  `../spec/BENCHMARK_SYSTEM_DESIGN.md` + `bench/` for the harness + results.
+  `spec/BENCHMARK_SYSTEM_DESIGN.md` + `bench/` for the harness + results.
 
 ## What will never be added (hard non-goals)
 
@@ -1072,7 +1072,7 @@ language feature + a security decision, not just a tool — the re-entry
 trigger was a demo or real use genuinely blocked on output beyond the exit
 code, which fired (the `io` extension is now also listed in the Tier 0
 standard addon set above). See `extensions/io/ext_io.hpp` for the full
-scope/state notes and `docs/planning/plan_OS_IO_EXTENSIONS.md` for the
+scope/state notes and `planning/plan_OS_IO_EXTENSIONS.md` for the
 full-plan extension surface (directory listing + subprocess execution as
 separate sub-registration functions, still future).
 

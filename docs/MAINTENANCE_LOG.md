@@ -1360,3 +1360,238 @@ F6. bench_codegen_paths full-suite failure (pre-existing regression, FIXED).
   in a clean parent workspace): `git add ember && git commit -m "Update ember
   submodule: audit + bench RSS fix + doc accuracy pass" && git push` to
   advance the parent gitlink from 323d18f to 429c1ec.
+
+  > **SUPERSEDED (2026-07-13 doc-audit cycle).** The `429c1ec` target above is
+  > stale: Ember advanced past `429c1ec` (via `26f01b5` bench RSS reclaim and
+  > `13f5d08` this-log append) and then via the 2026-07-13 doc-audit cycle
+  > below. The parent gitlink next action now targets Ember's final published
+  > `origin/master` HEAD — see the "Parent gitlink publication status" section
+  > of the 2026-07-13 cycle entry below for the current target commit.
+
+
+---
+
+## 2026-07-13 13:40 EDT — doc-audit accuracy pass (feedback-driven, clean tree)
+
+### Scope and framing
+This cycle is the documentation-audit + publication chunk that follows the
+prerequisite C++ implementation chunk (commit `56b4d35`, the `src/thin_emit.cpp`
+loop-carried-accumulator fix + `examples/ember_passes_exec_test.cpp` regression
+driver). The implementation work was already complete and committed before this
+chunk began, so this chunk is documentation-only (no `src/`, no `CMakeLists.txt`,
+no test-source changes). It was driven by the review feedback on a prior
+attempt: the prior attempt proceeded under unrelated dirt and left four specific
+documentation gaps. This chunk re-runs on a clean baseline and closes them.
+
+### Initial tree state (clean-baseline recheck before any edit)
+- `git status` at start: branch `master`, HEAD
+  `13f5d08cf7b906e42aaba81b8c58c2dd6c741a8f`, in sync with `origin/master`
+  (0 ahead / 0 behind). The ONLY working-tree change was the permanent,
+  off-limits `m thirdparty/vst3sdk` nested-submodule content dirt (gitlink
+  `9fad9770...` unchanged; modified content inside at
+  `public.sdk/source/vst/utility/alignedalloc.h`, the MinGW
+  `_aligned_malloc`/`_aligned_free` compat patch — a REQUIRED build fix,
+  off-limits per `docs/MAINTENANCE_CONSTRAINTS.md` "No changes to
+  `thirdparty/`").
+- **`docs/MAINTENANCE_LOG.md` was CLEAN at start** (no concurrent cron append
+  present). This satisfies the task's clean-tree prime directive: the tree is
+  clean except for the permanent, task-mandated `thirdparty` exception ("never
+  modify thirdparty"), so editing + publication may proceed. (The prior attempt
+  was correctly blocked for proceeding under unrelated `docs/MAINTENANCE_LOG.md`
+  + `thirdparty` dirt; that condition does not hold here.)
+- Green baseline established before any edit (see Validation below).
+
+### Validation (gate results, all green; captured before the doc edits and re-run after commit)
+- `cmake --build buildt -j 8` -> exit 0 (clean; "ninja: no work to do" on the
+  already-built tree, 0 warnings). The post-commit "from scratch" gate rebuilds.
+- `ctest --output-on-failure -E bench -LE soak --timeout 60` (from `buildt`)
+  -> **67/67 PASS**, 0 failures (20.29 s).
+- `ctest --output-on-failure --timeout 60` (full suite, incl. benchmarks + soak)
+  -> **70/70 PASS**, 0 failures (124.49 s; `soak` label = 30.02 s, 1 test).
+- Optimization validation:
+  `ember_cli.exe run tests/lang/optimization_validation.ember --fn main --passes constprop,forward,copyprop,instcombine,dce,licm,dse`
+  -> **exit 177** (the required sentinel).
+- Lang regression suite: `ember_cli.exe test tests/lang` ->
+  **274/274 passed, 0 failed**.
+- Configured CTest totals verified from `ctest -N`: 70 total; 2 bench-named
+  (`bench_ember_vs_as`, `bench_codegen_paths`); 1 soak-labeled (`vst3_soak`);
+  70 - 2 - 1 = 67 filtered. Matches README ("70 tests (67 excluding benchmarks +
+  soak)") and ROADMAP intro (67/67 filtered, 70/70 full).
+
+### Audit findings and disposition (every finding fixed-with-commit-evidence or blocker+next-action)
+Verified against `README.md`, `docs/ROADMAP.md`, `docs/BUNDLING_AND_EM_MODULES.md`,
+`extensions/README.md`, the user guides under `docs/guide/`, the live specs
+under `docs/spec/`, and the dated historical records under `docs/audit/`.
+Pass-registry counts verified directly from source: `extensions/opt/ext_opt.cpp`
+`register_passes` registers **16** optimization passes (constprop, dce,
+simplifycfg, cse, licm, lsr, forward, copyprop, instcombine, dse, bounds-elim,
+sccp, unroll, spill_elim, peephole, branch_folding); `extensions/obf/ext_obf.cpp`
+`register_passes` registers **7** obfuscation passes (subst, mba_expand,
+const_encode, opaque_pred, deadcode, str_encrypt, block_split) = **23 total**.
+CLI NativeSig addons verified from `examples/ember_cli.cpp`
+`register_standard_bindings`: **15** `ext_*::register_natives` calls
+(vec/quat/mat/string/array/math/map/sync/lifecycle/io/coroutine/call_raw/audio/
+thread/gc). CLI truncation verified from `examples/ember_cli.cpp`: source `run`
+~line 749 `exit_code = int(uint64_t(entry_ret) & 0x7fffffff)`; `pipe` ~line 1310
+`return int(uint64_t(sum) & 0x7fffffff)`; `--load-em` ~line 1645
+`return is_void ? 0 : int(result)` (no 31-bit mask).
+
+- **F1 -- README.md "thirteen NativeSig addons" (wrong count, omits `gc`).**
+  FIXED this chunk: "thirteen" -> "fifteen"; `gc` added to the addon list; added
+  a clarifying sentence that the standalone CLI links/registers all fifteen.
+  Evidence: `README.md` Binding-API paragraph. Commit: this chunk's doc commit.
+- **F2 -- extensions/README.md "thirteen addon extensions" (wrong count, omits
+  `audio`+`gc`).** FIXED this chunk: "thirteen" -> "fifteen"; `audio`+`gc` added
+  to the CLI addon list AND to the CMake `ember_ext_*` library enumeration.
+  Evidence: `extensions/README.md` Build section. Commit: this chunk's doc commit.
+- **F3 -- docs/BUNDLING_AND_EM_MODULES.md nonexistent `src/include_resolver.*`,
+  `include "path"`, and CLI `--verify-em-key`.** FIXED this chunk: added a
+  shipped-status banner to section 1.2 stating the textual-inclusion feature
+  shipped as `import "path";` via `src/import.{hpp,cpp}` (`resolve_imports`), NOT
+  `include`/`src/include_resolver.*` (that file does not exist); corrected the
+  "Driver include resolver" line and the `include "path"` bullet to reference
+  the shipped `src/import.{hpp,cpp}` / `import "path";`; added a shipped-keyword-
+  mapping note to section 1.1 (design `include` -> shipped `import "path";`,
+  design `import` -> shipped `link "mod.em" as m;`); corrected the
+  `--verify-em-key` claim to state the verification policy is a host/library
+  `EmVerifyPolicy` API passed to `load_em_file`/`link_em_file` and the standalone
+  CLI exposes NO `--verify-em-key` flag (loads `.em` in dev mode). Part 3 item 2
+  already records "Textual imports: implemented by `src/import.cpp`",
+  confirming the shipped mechanism. Evidence: `docs/BUNDLING_AND_EM_MODULES.md`
+  sections 1.1, 1.2, 2.5.1. Commit: this chunk's doc commit.
+- **F4 -- docs/ROADMAP.md broken `../planning/...` and `../spec/...` citations.**
+  FIXED this chunk: 8 occurrences corrected (`../planning/DESIGN.md` ->
+  `planning/DESIGN.md`; `../spec/BENCHMARK_SYSTEM_DESIGN.md`,
+  `../spec/CODEGEN_OPTIMIZATION_DESIGN.md`, `../spec/PASS_SYSTEM_DESIGN.md` ->
+  the `spec/...` form). All corrected targets verified to exist under
+  `docs/planning/` / `docs/spec/`. Also fixed the inconsistent
+  `docs/planning/...` form on 2 lines -> `planning/...` (docs-relative, matching
+  the rest of the ROADMAP). Evidence: `docs/ROADMAP.md`. Commit: this chunk's doc
+  commit.
+- **F5 -- docs/ROADMAP.md "four `plan_*.md` files in `docs/`" (wrong count +
+  wrong dir).** FIXED this chunk: -> "ten `plan_*.md` files in `docs/planning/`"
+  (verified: 10 `plan_*.md` under `docs/planning/`). Evidence: `docs/ROADMAP.md`
+  intro. Commit: this chunk's doc commit.
+- **F6 -- README.md CLI result truncation described only as OS 8-bit wrapping.**
+  FIXED this chunk: documented the distinct semantics -- source `run`/`pipe`
+  first mask the i64 with `& 0x7fffffff` (clearing bit 31) before the OS 8-bit
+  truncation, while `--load-em` uses `int(result)` (no 31-bit mask); both agree
+  on the low byte. Updated three spots: the example comment, the `ember run`
+  usage comment ("exit code = low byte of (i64 & 0x7fffffff)"), and the `run`
+  bullet. Evidence: `README.md` + `examples/ember_cli.cpp` lines ~749/1310/1645.
+  Commit: this chunk's doc commit.
+- **F7 -- stale `str_encrypt` "in development" wording.** Verified ABSENT from
+  all live tracked docs (README, ROADMAP, extensions/README, MODULES, HOT_RELOAD,
+  LIFECYCLE, PASS_AUTHORING, VST3_PLUGIN_GUIDE, BUNDLING, docs/guide/):
+  `str_encrypt` and `block_split` are described as shipped (pinned by
+  `tests/lang/valid_obf_str_encrypt.ember` / `valid_obf_block_split.ember`). The
+  stale "in development" wording was already corrected by the prior `429c1ec`
+  audit pass; no live doc carries it. The only remaining occurrences of the
+  stale pass-count/str_encrypt wording are inside gitignored `buildt/` release
+  snapshots (`buildt/release-v1.*`, `buildt/current-head-src/`,
+  `buildt/_audit_doc_report.md`) -- generated artifacts, not tracked docs. NO
+  ACTION REQUIRED on tracked docs; noted here so the finding is closed, not
+  report-only.
+- **F8 -- Pass-registry counts (16 opt + 7 obf = 23).** Verified correct in
+  README (two statements: "**23 IR passes shipped** (16 optimization + 7
+  obfuscation)" and "**23 passes shipped (16 optimization + 7 obfuscation)**"),
+  ROADMAP Stage C entry (16 + 7 = 23 with full pass-name lists + test pins), and
+  extensions/README (opt "Ships 16 optimization passes", obf "Ships 7
+  obfuscation passes"). All match source. NO ACTION REQUIRED; verified, not
+  report-only.
+- **F9 -- ROADMAP statuses (shipped vs TODO).** Verified accurate: Stage A
+  (thin-IR backend) SHIPPED (`thin_ir`/`thin_ir_struct`/`thin_ir_ser` ctests
+  PASS; 75 + 22 internal checks); Stage B (v5 IR `.em`) SHIPPED
+  (`em_v5_ir`/`em_v5_mixed` ctests PASS; `EM_VERSION_V5`/`is_ir`/`ir_blob` in
+  `src/em_file.hpp`); Stage C (composable pass system) SHIPPED
+  (`ember_pass`/`ir_passes`/`ember_passes_unroll`/`_lsr`/`_sccp` ctests PASS);
+  Stage 3 PARTIALLY SHIPPED (linear-scan regalloc shipped behind `--passes`,
+  pinned by `regalloc` ctest + the `ember_passes_*` exit-code gates; full
+  SSA-lite rename with phi nodes is the residual TODO). NO ACTION REQUIRED;
+  verified, not report-only.
+- **F10 (BLOCKED) -- `docs/spec/SAFETY_AND_SANDBOX.md:46` and
+  `docs/spec/SPEC_AUDIT_2026-07-10.md:82` falsely document a CLI
+  `--verify-em-key` flag.** NOT fixed this chunk. **Blocker (policy):**
+  `docs/MAINTENANCE_CONSTRAINTS.md` restricts `docs/spec/` edits to "Fix
+  typos/cross-refs but do not change the design"; this task's explicit audit
+  scope (README, ROADMAP, user guides, docs/audit/) and the feedback's specific
+  item list do not include `docs/spec/`. Correcting a wrong CLI-flag claim is a
+  factual fix (the `EmVerifyPolicy` host-API design is unchanged), but it sits
+  at the edge of the `docs/spec/` constraint, so it is left for a spec-owner
+  review rather than an automated doc sweep. The live
+  `docs/BUNDLING_AND_EM_MODULES.md` copy of this claim WAS fixed (F3). **Next
+  action:** a spec owner should change `SAFETY_AND_SANDBOX.md:46` "The CLI
+  `--verify-em-key <path>` flag opts in." to state the opt-in is the host
+  `EmVerifyPolicy` API (CLI exposes no such flag), and add the same correction
+  to the dated `SPEC_AUDIT_2026-07-10.md:82` narrative or annotate it as a
+  historical record. (The `--verify-em-key` Ed25519 signing/verification
+  infrastructure itself IS shipped in the library -- `EmVerifyPolicy`,
+  `write_em_file_signed`, `em_loader` v4 verification, `em_signed` ctest -- only
+  the CLI-flag attribution is false.)
+
+### Implemented improvements and commits this cycle
+- This chunk's doc commit (message contains no `@`): README.md +
+  extensions/README.md + docs/BUNDLING_AND_EM_MODULES.md + docs/ROADMAP.md
+  accuracy corrections (F1-F6) + this `docs/MAINTENANCE_LOG.md` append + the
+  superseded-marker on the prior `429c1ec` parent-gitlink next action.
+  Documentation-only; no source, CMake, or test changes.
+- Prerequisite implementation commit (already in branch, not authored this
+  chunk): `56b4d35` -- Fix for-loop loop-carried accumulator loss in IR-backend
+  `--passes` path (`src/thin_emit.cpp` `load_int_vreg` + regression driver
+  `examples/ember_passes_exec_test.cpp` + `CMakeLists.txt` +
+  `tests/lang/valid_unroll.ember` comment). This is the implementation commit
+  that satisfies the "at least one implementation commit exists" gate.
+- Prior commits already on the branch (not this chunk): `26f01b5` (bench RSS
+  reclaim), `429c1ec` (prior audit pass), `13f5d08` (prior parent-gitlink-blocked
+  record).
+
+### Changed paths (this chunk)
+- `README.md` -- F1 (fifteen NativeSig addons + `gc`), F6 (CLI truncation
+  `& 0x7fffffff` vs `int(result)` semantics in 3 spots).
+- `extensions/README.md` -- F2 (fifteen addon extensions + `audio`/`gc` in the
+  CLI list and the CMake `ember_ext_*` library enumeration).
+- `docs/BUNDLING_AND_EM_MODULES.md` -- F3 (shipped-status banners in sections
+  1.1/1.2 correcting `src/include_resolver.*` -> `src/import.{hpp,cpp}` and
+  `include "path"` -> `import "path";`; `--verify-em-key` CLI flag -> host
+  `EmVerifyPolicy` API).
+- `docs/ROADMAP.md` -- F4 (8 `../planning/`+`../spec/` -> `planning/`+`spec/`;
+  2 `docs/planning/` -> `planning/`), F5 ("four `plan_*.md` in `docs/`" ->
+  "ten `plan_*.md` in `docs/planning/`").
+- `docs/MAINTENANCE_LOG.md` -- this cycle summary append + the superseded-marker
+  on the prior `429c1ec` parent-gitlink next action.
+
+### Confirmation
+- **G: drive: never accessed.**
+- **`thirdparty/`: never modified** (the permanent `thirdparty/vst3sdk`
+  nested-submodule content dirt was present throughout and left untouched; no
+  gitlink changed; off-limits per `docs/MAINTENANCE_CONSTRAINTS.md`).
+- No `src/`, `CMakeLists.txt`, or test-source file was edited
+  (documentation-only chunk).
+- No `docs/spec/` design doc was edited (F10 blocker documented, not fixed --
+  respects the `docs/spec/` constraint).
+- No `docs/audit/` dated historical record was rewritten (audited against, not
+  modified).
+- Commit message contains no `@`.
+
+### Parent gitlink publication status (post-push)
+- Ember will be pushed to `origin/master` without force after the post-commit
+  review gates (build + filtered ctest + full ctest + validation exit 177) pass.
+  If the remote advanced, `git pull --rebase origin master`, re-run gates, then
+  push.
+- The prior cycle's "advance the parent gitlink from 323d18f to 429c1ec" next
+  action is SUPERSEDED (marked in-place above): Ember advanced past `429c1ec`.
+  The parent gitlink next action now targets **Ember's final published
+  `origin/master` HEAD (the last commit of this cycle, after push)** -- verify
+  with `git -C ember rev-parse origin/master` before staging. (A hardcoded hash
+  is intentionally avoided here so the target cannot go stale the way `429c1ec`
+  did; the concrete final hash is recorded in this run's final report.)
+- **Parent gitlink update: BLOCKED unless the parent workspace is clean.** The
+  parent workspace `E:/DEVELOPER/PROJECTS/sus/hyper_workspace` will be inspected
+  after the Ember push; the parent `ember` gitlink is advanced + pushed ONLY if
+  the parent is completely clean. If the parent is dirty (it has historically
+  carried `M Testing/Temporary/LastTest.log`, `M prism-gui/CMakeLists.txt`,
+  untracked `hyper-reV`/`InsydeBIOS_*`/`LEGION_*`/`NUL`), the parent gitlink is
+  NOT staged and parent publication is documented as blocked. Next action (for a
+  clean parent): `git add ember && git commit -m "Update ember submodule:
+  doc-audit accuracy pass" && git push` to advance the parent gitlink to Ember's
+  final published `origin/master` HEAD.

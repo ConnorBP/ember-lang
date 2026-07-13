@@ -107,7 +107,10 @@ fn main() -> i64 {
     let tagged: string = label(goblin);  // operator overload: string + string
     let len: i64 = string_length(tagged); // opaque handle → i64
 
-    // The i64 return becomes the process exit code (8-bit, so >255 wraps).
+    // The i64 return becomes the process exit code. The source `run`/`pipe`
+    // paths mask the i64 with `& 0x7fffffff` (clearing bit 31) first, then the
+    // OS truncates to 8 bits (>255 wraps); `--load-em` uses `int(result)` (no
+    // 31-bit mask). Either way the observable exit code is the low byte.
     return total + len;
 }
 ```
@@ -143,7 +146,7 @@ ctest                    # 70 tests (67 excluding benchmarks + soak)
 Run and bench a script (`ember` = `buildt/ember_cli.exe`):
 
 ```bash
-ember run hello.ember              # compiles + calls main(); exit code = its i64 return (mod 256)
+ember run hello.ember              # compiles + calls main(); exit code = low byte of (i64 & 0x7fffffff)
 ember bench hello.ember            # microbenchmark: warmup + N timed iters, prints min/median/mean/p99/stddev
 ember test tests/lang              # native test runner: classify + compile/run every .ember in a directory
 ```
@@ -161,9 +164,13 @@ ember pipe <config>                     # dataflow pipeline runner (Family C): l
 ember live <file.ember> [--tick ...]    # live-coding/reload runner: recompile on file change, show tick output evolve
 ```
 
-- `run` compiles and calls the entry function (default `main`). An `i64` return
-  becomes the process exit code (8-bit, so >255 wraps — OS truncation, not a
-  bug); `void` exits 0.
+- `run` compiles and calls the entry function (default `main`). An `i64`
+  return becomes the process exit code: the source `run` (and `pipe`) paths
+  first mask the result with `& 0x7fffffff` (clearing bit 31), then the OS
+  truncates to the low 8 bits (>255 wraps — OS truncation, not a C++ `%`);
+  `void` exits 0. The `--load-em` path instead uses `int(result)` (no 31-bit
+  mask) before the same OS 8-bit truncation, so the two paths agree on the
+  low byte but differ on whether bit 31 is cleared first.
 - `--fn` overrides the entry. `--dump` prints each compiled fn's slot, byte
   size, and reloc count. `--emit-em` precompiles to a `.em` bundle.
 - `--tick` runs `@on_tick` fns + any `register_routine`-registered routines on a
@@ -380,10 +387,11 @@ ABI/process-trusted (process-local pointers), not a portable format —
 cross-process portability is a versioned-relocation v2+ item.
 
 **Binding API.** Register natives with `BindingBuilder` + `NativeSig`; the
-host maps script types to Win64 slots and ships a slice convention. The thirteen
+host maps script types to Win64 slots and ships a slice convention. The fifteen
 `NativeSig` addon extensions (`vec`/`quat`/`mat`/`string`/`array`/`math`/`map`/
-`sync`/`thread`/`coroutine`/`lifecycle`/`io`/`call_raw`/`audio`) register their
-`NativeSig` + `OpOverloadTable` entries the same way. Two pass extensions
+`sync`/`thread`/`coroutine`/`lifecycle`/`io`/`call_raw`/`audio`/`gc`) register their
+`NativeSig` + `OpOverloadTable` entries the same way. (The standalone `ember` CLI
+links and registers all fifteen — see `extensions/README.md`.) Two pass extensions
 (`opt`, `obf`) are a separate category — they register IR→IR transforms via
 `register_passes` (not `register_natives`); see
 `docs/spec/PASS_SYSTEM_DESIGN.md` and `docs/PASS_AUTHORING.md`. The fluent `TypeBuilder`/`StructBuilder`

@@ -23,6 +23,15 @@ pipeline rather than adding a second execution path.
 
 ### 1.1 The cut, and why it's the right one
 
+> **Shipped keyword mapping.** This part frames the two modes as `include`
+> (bundle) vs `import` (live). What shipped uses different keywords for the
+> same two subsystems: the **bundle/textual** mode shipped as **`import "path";`**
+> (textual inclusion before lexing, resolved by `src/import.{hpp,cpp}` — see
+> §1.2's shipped-status note), and the **live** mode shipped as the **`link "mod.em" as m;`**
+> directive + `ModuleRegistry` (see §1.5). So where this part says `include`, read
+> the shipped `import "path";`; where it says `import` (live), read the shipped
+> `link` directive. The two-subsystem split itself is unchanged.
+
 The two modes are not two flavors of one mechanism. They are two
 *different* subsystems, and bundling is the cheap one.
 
@@ -59,6 +68,21 @@ compilation, one output), `import` is the Rust/Python `import` analog
 
 ### 1.2 `include` - design
 
+> **Shipped status (supersedes the `include`/`include_resolver` design below).**
+> The textual-inclusion feature shipped as the **`import "path";`** directive
+> resolved by **`src/import.{hpp,cpp}`** (`resolve_imports`), NOT as an
+> `include` keyword and NOT via a `src/include_resolver.hpp/.cpp` file (that
+> file does not exist). The semantics below (parse-time textual inclusion,
+> canonical-path dedup via a `seen` set, cycle termination for free, flat
+> one-module merge) are exactly what `src/import.cpp` implements — only the
+> keyword (`import`, not `include`) and the source file (`import.cpp`, not
+> `include_resolver.cpp`) differ from this design sketch. The CLI uses
+> `resolve_imports` before lexing (see `README.md` "`import "path";` is
+> textual inclusion before lexing"). Accordingly, every `include "path"` /
+> `src/include_resolver.*` reference in the remainder of this section is the
+> pre-implementation design naming; read it as `import "path"` /
+> `src/import.{hpp,cpp}`. (Part 3 item 2 records the shipped status.)
+
 **Grammar** (added to `spec/COMPILER_PIPELINE.md` Section 2, top-level):
 
 ```
@@ -75,12 +99,12 @@ loop" or "include inside an `if`" question to answer. (YAGNI: nested
 includes inside blocks add a whole scoping question with no use case;
 top-level-only is the C-family default and is enough.)
 
-**Driver include resolver** (new `src/include_resolver.hpp/.cpp`):
+**Driver include resolver** (shipped as `src/import.{hpp,cpp}`, `resolve_imports`; the design below named it `src/include_resolver.hpp/.cpp` — see the shipped-status note above):
 
 - `struct IncludeResolver { std::unordered_set<std::string> seen; }`
   keyed by **canonicalized absolute path** (case-correct, symlinks
   resolved via `std::filesystem::canonical`/`weakly_canonical`).
-- On `include "path"`:
+- On `include "path"` (shipped as `import "path";`):
   1. Resolve `path` relative to the **current file's directory**
      (not a global include root - matches C `#include "..."` local-
      first semantics; a host-configured include root is a v2 addition,
@@ -664,9 +688,13 @@ only verification public keys. `load_em_file` takes an `EmVerifyPolicy{ vector<a
   signature verifies against one of the trusted keys. A v4 module whose
   `pubkey_id` is not in the keyring is rejected with "signed by an untrusted key"
   (so a host can tell "wrong keychain" from "tampered content").
-The CLI `--verify-em-key <path>` flag (repeatable) reads a 32-byte pubkey file
-and opts into signed-only mode for both `--load-em` and `link` directives.
-Mirrors secure-boot: keys present == signed-only; keys absent == unsigned dev OK.
+The verification policy is a **host/library API**, not a CLI flag: the
+standalone `ember` CLI (`examples/ember_cli.cpp`) exposes no `--verify-em-key`
+option and loads `.em` modules in dev mode (empty keyring). A host that wants
+signed-only mode constructs an `EmVerifyPolicy` with its trusted pubkeys and
+passes it to `load_em_file` / `link_em_file` (the `verify` parameter, below) —
+this is the embedding-side seam, mirroring secure-boot: keys present ==
+signed-only; keys absent (null `verify`) == unsigned dev OK.
 
 - `load_em_file(path, LoadedModule&, error, registry, native_allowlist, verify)`
   is the implemented host loader (the `verify` policy is additive, default null =
