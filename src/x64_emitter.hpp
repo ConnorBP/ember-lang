@@ -95,8 +95,8 @@ public:
     // --- low-level byte emission ---
     void byte(uint8_t b) { code.push_back(b); }
     void bytes(std::initializer_list<uint8_t> bs) { for (auto b : bs) code.push_back(b); }
-    void imm32(int32_t v) { for (int i = 0; i < 4; ++i) code.push_back(uint8_t(v >> (8*i))); }
-    void imm64(int64_t v) { for (int i = 0; i < 8; ++i) code.push_back(uint8_t(v >> (8*i))); }
+    void imm32(int32_t v) { uint32_t u = uint32_t(v); for (int i = 0; i < 4; ++i) code.push_back(uint8_t(u >> (8*i))); }
+    void imm64(int64_t v) { uint64_t u = uint64_t(v); for (int i = 0; i < 8; ++i) code.push_back(uint8_t(u >> (8*i))); }
 
     // REX prefix: 0100 W R X B. W=1 for 64-bit operand size.
     static uint8_t rex(bool w, bool r, bool x, bool b) {

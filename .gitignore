@@ -13,3 +13,5 @@ demo/**/*.exe
 # never commit the binary) + results (machine-specific, regenerated each run)
 bench/*.dll
 bench/results_codegen_paths.*
+analysis/
+build_cov/

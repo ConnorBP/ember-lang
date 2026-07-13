@@ -100,33 +100,10 @@ const GcStats& GcHeap::collect() {
         if (!root) continue;
         void* obj = *root;
         if (!obj || !is_live(obj)) continue;
-        Header* hdr = reinterpret_cast<Header*>(static_cast<char*>(obj) - 16);  // placeholder, fixed below
-        // Recover header: the header_bytes field is at user - header_bytes.
-        // But we don't know header_bytes yet. Read it from the 8 bytes before
-        // the user pointer (header_bytes is the 3rd uint32 in the header, at
-        // offset 8 from the header start). The header starts at user - X where
-        // X is unknown. BUT: header_bytes is always >= sizeof(Header) = 16, and
-        // it's stored at header_start + 8. If we read user - 8, we get the last
-        // 2 uint32s of the minimal header (ref_count + pad), NOT header_bytes.
-        // SIMPLER: store header_bytes as the FIRST uint32 the user pointer
-        // can reliably find. Put it RIGHT BEFORE the user bytes (the last 4
-        // bytes of the header region): user - 4 = header_bytes.
-        // Actually, let me just put a back-pointer to the header start right
-        // before the user bytes.
-        // SIMPLEST FIX: read header_bytes from a fixed position. Since
-        // sizeof(Header) = 16, and header_bytes is at offset 8, it's at
-        // user - header_bytes + 8. But we don't know header_bytes.
-        // OK: let me just store the header pointer as a hidden 8 bytes BEFORE
-        // the user bytes (wastes 8 bytes per object but is simple + correct).
-        // Actually, the cleanest: store header_bytes as a uint32 at
-        // (user - 4). That's the LAST 4 bytes before user. So the layout is:
-        // [Header (16B)] [ref_offsets] [header_bytes again (4B)] [user bytes]
-        // No — that's redundant. Let me just read it from the known position.
-        // Since the header is at least 16 bytes, and header_bytes >= 16, I can
-        // read user - 4 as a uint32 to get header_bytes (I'll store it there).
+        // Recover the header: header_bytes is stored as a uint32 at user - 4.
         uint32_t hb;
         std::memcpy(&hb, static_cast<char*>(obj) - 4, 4);
-        hdr = reinterpret_cast<Header*>(static_cast<char*>(obj) - hb);
+        Header* hdr = reinterpret_cast<Header*>(static_cast<char*>(obj) - hb);
         if (hdr->mark) continue;
         hdr->mark = 1;
         worklist.push_back(obj);
