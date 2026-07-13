@@ -173,7 +173,23 @@ bool deserialize_thin_function(const uint8_t*& cur, const uint8_t* end,
 //   - CallCrossModule mod_id < registry_size (if registry_size > 0).
 //   - Cmp predicate in [0,5] (Eq..Ge).
 //   - CallNative has a non-empty native_name (the rebind gate relies on this).
-//   - Frame plan sanity: frame_size in [0, 1MB], rbx_save_offset negative.
+//   - Frame plan sanity: frame_size in [0, 1MB]; every rbp-relative frame-plan
+//     write offset (rbx_save_offset, struct_ret_ptr_offset, params[].off)
+//     keeps its FULL multi-word spill span within [-frame_size, 0) so no
+//     prologue/param-spill can reach saved rbp ([rbp+0]) or the return
+//     address ([rbp+8]) (Finding C, EM_FORMAT_RED_TEAM_2026-07-11).
+//   - Per-instruction rbp-relative full-span validation (Finding C residual):
+//     every instr.meta.frame_off / field_off / data_temp_off rbp-relative
+//     access keeps its FULL read/write span (slice=16, F32=4, F64=8, int=8,
+//     narrow field=width, copy/string=len, StringDecrypt data=len +
+//     result=16) within [-frame_size, 0). Computed-address ops (StoreAddr
+//     [src2+frame_off], StoreFrame with src2!=0, LoadFrame's computed
+//     field_off, IndexAddr/MakeSlice/FieldAddr lea bases) are NOT rbp-
+//     relative and are excluded. ThinInstr::arg_frame_offs entries (!= -1)
+//     — struct-by-value call args (read) and struct-return hidden dest
+//     (write) — are full-span-validated too. frame_off == 0 is skipped
+//     (not frame-backed); frame_size == 0 rejects every non-zero instr
+//     frame_off (Finding A: a leaf with no frame must not carry a slot).
 //
 // `dispatch_size` and `registry_size` are the host's dispatch table size and
 // module registry size (0 = unknown / no check; the loader passes the real

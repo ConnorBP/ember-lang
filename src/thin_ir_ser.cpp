@@ -4,6 +4,7 @@
 
 #include "thin_ir_ser.hpp"
 
+#include <cstdint>  // int64_t for overflow-safe span arithmetic
 #include <cstring>   // memcpy for f64 raw bytes
 #include <limits>
 #include <sstream>   // put_type bridges emit_type(ostream&) -> bytes
@@ -544,6 +545,120 @@ bool deserialize_thin_function(const uint8_t*& cur, const uint8_t* end,
     return true;
 }
 
+// ─── frame-plan full-span validation (Finding C, EM_FORMAT_RED_TEAM 2026-07-11) ───
+//
+// emit_x64's prologue + param-spill write to [rbp + off] using three frame-plan
+// offsets the deserialized ThinFunction carries verbatim:
+//   - frame.rbx_save_offset       (prologue: store rbx; an 8-byte spill)
+//   - frame.struct_ret_ptr_offset  (param-spill: store the hidden return pointer
+//                                   rcx; an 8-byte spill, gated on
+//                                   returns_struct_by_ptr && off != 0)
+//   - frame.params[].off           (param-spill: store the caller-supplied
+//                                   argument registers rcx/rdx/r8/r9; a
+//                                   multi-word spill spanning [off, off+nwords*8))
+// The Finding A fix range-checked instr.meta.frame_off but NOT these frame-plan
+// offsets. A hand-crafted v5 IR module (is_ir=1, accepted in dev mode) can set
+// params[0].off = +8 so emit_param_spills writes rcx (the caller-controlled
+// first argument) to [rbp+8] = the return address — the same return-address-
+// overwrite primitive as Finding A, via a sibling unvalidated offset. This
+// helper closes it by requiring the FULL write span to stay within the stack
+// frame and strictly below rbp.
+//
+// The frame occupies [rbp - frame_size, rbp); in offset terms [-frame_size, 0).
+// [rbp+0] = saved rbp, [rbp+8] = the return address (the prologue always does
+// `push rbp; mov rbp, rsp` regardless of frame_size, so those slots always
+// exist). Any byte of the write span reaching offset >= 0 overwrites saved
+// rbp / the return address. The span [off, off+span) must therefore satisfy:
+//   - off < 0            (a non-negative off is the Finding C exploit: a
+//                         positive off spills an argument register into the
+//                         saved-rbp / return-address slots)
+//   - off + span <= 0    (the FULL multi-word span stays strictly below rbp — a
+//                         base-offset-only check would miss a short-negative
+//                         base whose multi-word extent reaches the return
+//                         address, e.g. a 2-word slice spill at off=-8 spans
+//                         [-8, +8) and overwrites [rbp+0] and [rbp+8])
+//   - off >= -frame_size (the span low end is within the allocated frame — a
+//                         write below the frame is a below-rsp write into
+//                         unallocated stack, a DoS. Applied only when
+//                         frame_size > 0: frame_size == 0 is the hand-crafted
+//                         leaf-with-no-frame case pinned by thin_ir_ser_test
+//                         case A3, where there is no allocated frame to bound
+//                         the low end and only the below-rbp check applies.)
+// All arithmetic is done in int64_t so an attacker-controlled offset/span
+// cannot overflow int32 and bypass the bounds (the MAINTENANCE_LOG's
+// "overflow-safe offset/span helpers" requirement).
+static bool frame_plan_span_ok(int64_t off, int64_t span, int32_t frame_size) {
+    if (off >= 0) return false;            // off must be rbp-negative
+    int64_t end = off + span;              // overflow-safe in int64
+    if (end > 0) return false;             // full span must stay below rbp
+    if (frame_size > 0 && off < -int64_t(frame_size)) return false;  // within frame
+    return true;
+}
+
+// ─── instr-level rbp-relative full-span validation (Finding C residual) ───
+//
+// Finding A range-checked instr.meta.frame_off's BASE offset (off in
+// [-frame_size, 0)) but NOT the actual read/write SPAN emit_x64 performs at
+// [rbp + off]. A producing op with frame_off = -1 writes 8 bytes to
+// [rbp-1, rbp+7) and overwrites saved rbp / the return address even though
+// the base offset -1 is in range. The same short-negative-base primitive
+// applies to every rbp-relative access: slice stores (16 bytes), F32 stores
+// (4 bytes), CopyBytes (len bytes), StringDecrypt's data buffer (len bytes)
+// and slice-result slot (16 bytes), and the struct-by-value call-arg /
+// struct-return-dest frame offsets in ThinInstr::arg_frame_offs.
+//
+// This helper is the instr-level analogue of frame_plan_span_ok with ONE
+// difference: the low-end bound (off >= -frame_size) is ALWAYS applied, even
+// when frame_size == 0. A non-zero instr frame_off with no allocated frame
+// (frame_size == 0) is always malformed — unlike the frame-plan offsets
+// (rbx_save=-8 etc., which every leaf function carries and which case A3
+// pins as legitimate), an instr frame_off is a per-instruction slot that a
+// leaf-with-no-frame must not have. So when frame_size == 0 the low-end bound
+// becomes `off >= 0`, which (combined with `off < 0`) rejects every non-zero
+// off — exactly Finding A's cases A1 (+8) and A2 (-8).
+//
+// Rule: the FULL span [off, off+span) must lie within [-frame_size, 0):
+//   - off < 0            (a non-negative off overwrites saved rbp / return addr)
+//   - off + span <= 0    (the full multi-byte span stays strictly below rbp —
+//                         catches a short-negative base whose extent reaches
+//                         [rbp+0]/[rbp+8], e.g. an 8-byte store at off=-1
+//                         spans [-1, +7); a 16-byte slice store at off=-8
+//                         spans [-8, +8))
+//   - off >= -frame_size (the low end is within the allocated frame — a write
+//                         below the frame is a below-rsp write, DoS. ALWAYS
+//                         applied; when frame_size == 0 this rejects every
+//                         non-zero off.)
+// All arithmetic in int64_t (no int32 overflow on attacker-controlled spans).
+static bool instr_frame_span_ok(int64_t off, int64_t span, int32_t frame_size) {
+    if (off >= 0) return false;            // off must be rbp-negative
+    int64_t end = off + span;              // overflow-safe in int64
+    if (end > 0) return false;             // full span must stay below rbp
+    if (off < -int64_t(frame_size)) return false;  // within frame (always)
+    return true;
+}
+
+// The byte span of a producing op's dst spill / a StoreFrame's stored value /
+// a LoadFrame's loaded value at [rbp + frame_off], derived from the exact
+// emit behavior in src/thin_emit.cpp:
+//   - slice type (ConstStringRef / StringDecrypt result / Move / StoreFrame /
+//     LoadFrame / call slice result): store_reg_mem(rbp, off, rax) +
+//     store_reg_mem(rbp, off+8, rdx) = 16 bytes ({ptr, len}).
+//   - float F32 (is_f32): movss = 4 bytes.
+//   - float F64: movsd = 8 bytes.
+//   - int/bool: store_rax_to_rbp / pin_int_dst = mov [rbp+off], rax = 8 bytes
+//     (a full qword store; narrow int values are normalized then stored as a
+//     full qword, EXCEPT StoreFrame's packed-field path which stores `width`
+//     bytes — handled by the caller via the narrow_field flag).
+// `narrow_field` selects the StoreFrame packed-field span (meta.width bytes)
+// instead of the default 8-byte int store.
+static int64_t dst_spill_span(const Type* ty, uint8_t is_f32, bool narrow_field,
+                              int32_t width) {
+    if (ty && ty->is_slice) return 16;
+    if (ty && ty->is_float()) return (is_f32 != 0) ? 4 : 8;
+    if (narrow_field) return (width > 0 && width <= 8) ? int64_t(width) : 8;
+    return 8;  // int/bool default: full qword store
+}
+
 // ─── semantic validation ───
 
 bool validate_thin_function(const ThinFunction& thf, std::string* err,
@@ -559,14 +674,62 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err,
         if (err) *err = "thin_ir_ser: validate: entry block id != 0";
         return false;
     }
-    // Frame plan sanity (P7): frame_size in a reasonable range, rbx_save negative.
+    // Frame plan sanity (P7) + full-span validation (Finding C,
+    // EM_FORMAT_RED_TEAM_2026-07-11). frame_size in a reasonable range; every
+    // rbp-relative frame-plan write offset's FULL span stays within the frame
+    // and strictly below rbp, so no rbx-save / struct-ret-ptr / param spill
+    // can reach the saved rbp at [rbp+0] or the return address at [rbp+8].
+    // See frame_plan_span_ok above for the threat model + the rule.
     if (thf.frame.frame_size < 0 || thf.frame.frame_size > int32_t(1u << 20)) {
         if (err) *err = "thin_ir_ser: validate: frame_size out of range";
         return false;
     }
-    if (thf.frame.rbx_save_offset >= 0 || thf.frame.rbx_save_offset < -(1 << 20)) {
+    // rbx_save_offset: the prologue unconditionally spills rbx to [rbp+off]
+    // (store_reg_mem rbp, off, rbx) — an 8-byte rbp-relative write. Range-check
+    // its full 8-byte span (subsumes the prior sign-only check) plus the 1MB cap.
+    if (!frame_plan_span_ok(int64_t(thf.frame.rbx_save_offset), 8,
+                            thf.frame.frame_size) ||
+        thf.frame.rbx_save_offset < -(1 << 20)) {
         if (err) *err = "thin_ir_ser: validate: rbx_save_offset out of range";
         return false;
+    }
+    // struct_ret_ptr_offset: emit_param_spills spills the caller-supplied hidden
+    // return pointer (rcx) to [rbp+off] when returns_struct_by_ptr && off != 0
+    // (the spill is gated on off != 0 in the emit, so off == 0 means "no spill"
+    // and is not validated here). A positive off overwrites the return address
+    // with a caller-controlled buffer address — the Finding C primitive.
+    if (thf.frame.returns_struct_by_ptr && thf.frame.struct_ret_ptr_offset != 0) {
+        if (!frame_plan_span_ok(int64_t(thf.frame.struct_ret_ptr_offset), 8,
+                                thf.frame.frame_size)) {
+            if (err) *err = "thin_ir_ser: validate: struct_ret_ptr_offset out of range";
+            return false;
+        }
+    }
+    // params[].off: emit_param_spills spills the caller-supplied argument
+    // registers to [rbp + p.off + byte_pos] across the param's full word span.
+    // A scalar/float param spills 1 word (8 bytes); a slice param spills 2
+    // words (16 bytes, [off, off+16)); a struct param's word count is
+    // words_for_type — BUT struct-by-value params are non_serializable ->
+    // is_ir=0 raw-x86 fallback and never reach this validator at load time, and
+    // the load-time re-emit uses an empty StructLayoutTable so a struct-typed
+    // param in an is_ir=1 function is treated as a 1-word scalar spill. The
+    // live load-time span is therefore 8 bytes unless p.ty is a slice (16).
+    // Validate the FULL span = max(type-derived load-time span, p.nwords*8) —
+    // exact for the load-time attack surface, conservative (defense-in-depth)
+    // against an inflated p.nwords. Skip the __struct_ret_ptr sentinel
+    // (p.ty == nullptr), which is spilled via struct_ret_ptr_offset above.
+    for (size_t i = 0; i < thf.frame.params.size(); ++i) {
+        const auto& p = thf.frame.params[i];
+        if (p.ty == nullptr) continue;  // __struct_ret_ptr sentinel
+        int64_t type_span = (p.ty->is_slice) ? int64_t(16) : int64_t(8);
+        int64_t nwords_span = int64_t(p.nwords) * 8;  // overflow-safe (int32*8)
+        int64_t span = (nwords_span > type_span) ? nwords_span : type_span;
+        if (!frame_plan_span_ok(int64_t(p.off), span, thf.frame.frame_size)) {
+            if (err) *err = "thin_ir_ser: validate: param " + std::to_string(i) +
+                           " offset out of range (off=" + std::to_string(p.off) +
+                           ", span=" + std::to_string(span) + ")";
+            return false;
+        }
     }
 
     // P1 fix: use the DECLARED max_vreg from the blob header (stored in
@@ -648,29 +811,182 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err,
                 if (err) *err = "thin_ir_ser: validate: negative len for BoundsCheck";
                 return false;
             }
-            // Item 12a fix (extended) + Finding A fix (EM_FORMAT_RED_TEAM
-            // 2026-07-11): frame_off must be within the function's frame for
-            // ANY instr that uses it as an rbp-relative displacement. The
-            // original check only covered 7 specific ops, but emit_x64 writes
-            // to [rbp + frame_off] for ~20 producing ops (ConstInt, Add, etc.
-            // via record_dst/store_rax_to_rbp). An attacker-controlled
-            // frame_off on ANY of those can write outside the stack frame
-            // (stack smash / return-address overwrite). frame_off must be
-            // negative (stack grows down) and >= -frame_size. frame_off == 0
-            // means "not frame-backed" and is safe to skip.
+            // Item 12a fix (extended) + Finding A fix + Finding C residual
+            // (EM_FORMAT_RED_TEAM 2026-07-11): every rbp-relative frame access
+            // instr.meta.frame_off makes must keep its FULL read/write span
+            // within [-frame_size, 0). The original Finding A check validated
+            // only the BASE offset (off in [-frame_size, 0)), so a short-
+            // negative base whose multi-byte extent reaches [rbp+0]/[rbp+8]
+            // (e.g. an 8-byte store at off=-1 spans [-1,+7); a 16-byte slice
+            // store at off=-8 spans [-8,+8)) overwrote saved rbp / the return
+            // address. The full-span check (instr_frame_span_ok) closes that.
             //
-            // FINDING A: the prior version gated this check on
-            // `frame_size > 0`, so a hand-crafted IR with frame_size == 0
-            // skipped the check entirely — a producing op with frame_off = +8
-            // overwrote the return address (the prologue always does
-            // `push rbp; mov rbp, rsp` regardless of frame_size, so
-            // [rbp+0] = saved rbp, [rbp+8] = return addr). The fix: ALWAYS
-            // check frame_off regardless of frame_size. When frame_size == 0,
-            // -frame_size == 0, so any non-zero frame_off (positive or
-            // negative) fails the range check and is rejected.
-            if (in.meta.frame_off != 0) {
-                if (in.meta.frame_off >= 0 || in.meta.frame_off < -thf.frame.frame_size) {
+            // Spans are derived from the EXACT emit behavior in thin_emit.cpp:
+            //   - producing ops (ConstInt/Bool, ConstFloat, ConstStringRef,
+            //     Move, Add..BitNot, FAdd..FMod, Cmp, LAnd, LOr, Cast, calls):
+            //     the dst spill via record_dst/pin_int_dst/store_xmm0_to_rbp —
+            //     16 (slice), 4 (F32), 8 (F64/int). See dst_spill_span.
+            //   - StoreFrame (src2==0): the stored value — 16 (slice), 4/8
+            //     (float), `width` (int packed-field when field_off!=0), 8 (int
+            //     default). StoreFrame with src2!=0 writes [src2(computed)+
+            //     frame_off] — frame_off is a computed displacement, NOT rbp-
+            //     relative, so it is EXCLUDED (the computed-address
+            //     distinction the task requires).
+            //   - LoadFrame: frame_off is the rbp-relative read source
+            //     (src1==0) or the spill slot (src1!=0); either way rbp-
+            //     relative, span 16/4/8. When src1!=0 the LOAD displacement is
+            //     meta.field_off (computed) — NOT validated as rbp-relative.
+            //   - CopyBytes: frame_off is the rbp-relative DEST (span = len)
+            //     when dst==0 && base_kind != GlobalsBase; field_off is the
+            //     rbp-relative SOURCE (span = len) when the source side is not
+            //     the globals block. Globals-sided offsets are NOT rbp-relative.
+            //   - StringDecrypt: meta.data_temp_off is the decrypted-data
+            //     buffer (span = len, rbp-relative write); frame_off is the
+            //     slice RESULT slot (span = 16, rbp-relative write).
+            //   - StructLitInit/ArrayLitInit: write at [rbp + frame_off +
+            //     field_off], span = the field element width.
+            //   - FieldAddr: frame_off is the spill of the computed address
+            //     (8 bytes); frame_off+field_off is an address COMPUTATION
+            //     (lea), not an access.
+            //   - StoreAddr, IndexAddr, MakeSlice: frame_off is a COMPUTED
+            //     address base/displacement (lea or [src2+frame_off]), NOT an
+            //     rbp-relative access — EXCLUDED.
+            // arg_frame_offs (struct-by-value call args + struct-return hidden
+            // dest) and data_temp_off are validated separately below.
+            //
+            // frame_off == 0 means "not frame-backed" and is skipped (no
+            // rbp-relative access). When frame_size == 0, instr_frame_span_ok
+            // rejects every non-zero off (Finding A cases A1/A2): a leaf with
+            // no allocated frame must not carry an instr frame slot.
+            {
+                int64_t fo = int64_t(in.meta.frame_off);
+                int32_t fsz = thf.frame.frame_size;
+                bool fo_ok = true;
+                const Type* mt = in.meta.type;
+                switch (in.op) {
+                case ThinOp::StoreAddr:
+                    // [src2(computed) + frame_off]: computed, NOT rbp-relative.
+                    break;
+                case ThinOp::IndexAddr:
+                case ThinOp::MakeSlice:
+                    // frame_off is a lea address base — no memory access.
+                    break;
+                case ThinOp::LoadFrame: {
+                    // frame_off is rbp-relative (read src1==0 / spill src1!=0).
+                    // field_off is the computed displacement when src1!=0 — not
+                    // validated here. Span: slice 16 / float 4|8 / int 8.
+                    if (fo != 0) {
+                        int64_t sp = dst_spill_span(mt, in.meta.is_f32, false, 0);
+                        fo_ok = instr_frame_span_ok(fo, sp, fsz);
+                    }
+                    break;
+                }
+                case ThinOp::StoreFrame: {
+                    if (in.src2 != 0) break;  // computed store — NOT rbp-relative
+                    if (fo != 0) {
+                        // int packed-field store (field_off != 0): width bytes;
+                        // else the default dst_spill_span.
+                        bool narrow = (mt == nullptr || (!mt->is_slice && !mt->is_float()))
+                                      && in.meta.field_off != 0;
+                        int64_t sp = dst_spill_span(mt, in.meta.is_f32, narrow,
+                                                    in.meta.width);
+                        fo_ok = instr_frame_span_ok(fo, sp, fsz);
+                    }
+                    break;
+                }
+                case ThinOp::CopyBytes: {
+                    // frame_off = DEST (span = len) when dst==0 && not globals-dest.
+                    // field_off = SOURCE (span = len) when not globals-src.
+                    bool global = (in.meta.base_kind == AbsFixup::GlobalsBase);
+                    bool dst_is_vreg = (in.dst != 0);
+                    bool dst_is_global = global && !dst_is_vreg && in.src1 != 0;
+                    bool src_is_global = global && (dst_is_vreg || in.src1 == 0);
+                    int64_t len = int64_t(in.meta.len);
+                    if (len < 0) len = 0;  // P2/Item 11 reject negative len elsewhere
+                    if (!dst_is_vreg && !dst_is_global && fo != 0) {
+                        if (!instr_frame_span_ok(fo, len, fsz)) fo_ok = false;
+                    }
+                    if (!src_is_global && in.meta.field_off != 0) {
+                        if (!instr_frame_span_ok(int64_t(in.meta.field_off), len, fsz))
+                            fo_ok = false;
+                    }
+                    break;
+                }
+                case ThinOp::StringDecrypt: {
+                    // data_temp_off: decrypted-data buffer (span = len).
+                    // frame_off: slice result slot (span = 16).
+                    int64_t len = int64_t(in.meta.len);
+                    if (len < 0) len = 0;
+                    int64_t data_off = (in.meta.data_temp_off != 0)
+                                       ? int64_t(in.meta.data_temp_off) : fo;
+                    if (data_off != 0) {
+                        if (!instr_frame_span_ok(data_off, len, fsz)) fo_ok = false;
+                    }
+                    if (fo != 0 && in.meta.data_temp_off != 0) {
+                        // slice result slot distinct from the data buffer
+                        if (!instr_frame_span_ok(fo, 16, fsz)) fo_ok = false;
+                    }
+                    break;
+                }
+                case ThinOp::StructLitInit:
+                case ThinOp::ArrayLitInit: {
+                    // write at [rbp + frame_off + field_off], span = elem width.
+                    int64_t addr = int64_t(in.meta.frame_off) + int64_t(in.meta.field_off);
+                    if (addr != 0) {
+                        int64_t sp = dst_spill_span(mt, in.meta.is_f32, true,
+                                                    in.meta.width);
+                        // slice field is 16 (dst_spill_span covers it); the
+                        // narrow_field path only applies to non-slice/non-float.
+                        if (mt && mt->is_slice) sp = 16;
+                        else if (mt && mt->is_float()) sp = (in.meta.is_f32 ? 4 : 8);
+                        fo_ok = instr_frame_span_ok(addr, sp, fsz);
+                    }
+                    break;
+                }
+                case ThinOp::FieldAddr:
+                    // frame_off is the 8-byte spill of the computed address.
+                    if (fo != 0) fo_ok = instr_frame_span_ok(fo, 8, fsz);
+                    break;
+                default:
+                    // producing ops: ConstInt/Bool/Float/StringRef, Move,
+                    // Add..BitNot, FAdd..FMod, Cmp, LAnd, LOr, Cast, calls.
+                    if (fo != 0) {
+                        const Type* rt = mt;
+                        if (in.op == ThinOp::CallNative || in.op == ThinOp::CallScript ||
+                            in.op == ThinOp::CallIndirect || in.op == ThinOp::CallCrossModule)
+                            rt = in.ret_type;  // call result type drives the spill span
+                        int64_t sp = dst_spill_span(rt, in.meta.is_f32, false, 0);
+                        fo_ok = instr_frame_span_ok(fo, sp, fsz);
+                    }
+                    break;
+                }
+                if (!fo_ok) {
                     if (err) *err = "thin_ir_ser: validate: frame_off out of frame bounds";
+                    return false;
+                }
+            }
+            // StringDecrypt data_temp_off: validated above in the StringDecrypt
+            // case (span = len). For other ops data_temp_off is unused (0).
+            //
+            // ThinInstr::arg_frame_offs (Finding C residual): each entry != -1
+            // is an rbp-relative frame access. emit_call_arg_stash READS a
+            // struct-by-value arg from [rbp + afo] (copy_bytes src = rbp + afo,
+            // span = words_for_type*8 at load time = 8, or 16 for a slice-
+            // tagged entry). For a struct-return call (ret_type is a registered
+            // struct), arg_frame_offs[0] with args[0]==0 is the hidden DEST —
+            // the callee writes the returned struct to [rbp + afo0] (span = 8
+            // at load time). A positive afo reads/writes saved rbp / the return
+            // address (info-leak for the read; return-address overwrite for the
+            // dest). Validate the full span within [-frame_size, 0). -1 entries
+            // (plain vreg args / slice two-vreg args) are skipped.
+            for (size_t ai = 0; ai < in.arg_frame_offs.size(); ++ai) {
+                int32_t afo = in.arg_frame_offs[ai];
+                if (afo == -1 || afo == 0) continue;  // -1 = not a frame arg; 0 = unused
+                const Type* aty = (ai < in.arg_types.size()) ? in.arg_types[ai] : nullptr;
+                int64_t sp = (aty && aty->is_slice) ? 16 : 8;
+                if (!instr_frame_span_ok(int64_t(afo), sp, thf.frame.frame_size)) {
+                    if (err) *err = "thin_ir_ser: validate: arg_frame_off " +
+                                   std::to_string(ai) + " out of frame bounds";
                     return false;
                 }
             }

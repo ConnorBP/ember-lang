@@ -1624,3 +1624,372 @@ thread/gc). CLI truncation verified from `examples/ember_cli.cpp`: source `run`
   `git add ember && git commit -m "Update ember submodule: doc-audit accuracy pass" && git push`
   to advance the parent gitlink from `323d18f` to Ember's `origin/master` HEAD
   (currently `a0b98e8`; re-verify before staging).
+
+---
+
+## 2026-07-13 14:00 EDT — implement deserialized Thin IR frame-plan/full-span validation (Finding C)
+
+### Scope and framing
+This cycle implements the repeatedly-DEFERRED highest-priority live security
+gap: **deserialized Thin IR frame-plan / full-span validation** (Finding C of
+`docs/audit/FINAL_EM_REDTEAM_2026-07-11.md` §4). This is the item the
+maintenance log carried as DEFERRED across many dirty-tree runs (entries at
+lines ~115/134/153/179/199/221/234/266/291 — all "[DEFERRED] ... unchecked
+deserialized frame-plan offsets / incomplete frame-plan/full-span validation").
+The tree is now clean of ember-source dirt (only the permanent, off-limits
+`thirdparty/vst3sdk` nested-submodule content dirt remains — the MinGW
+`_aligned_malloc` build-compat patch, never modified by this cycle), so the
+implementation may proceed per `docs/MAINTENANCE_CONSTRAINTS.md`.
+
+### The gap (confirmed open before this cycle)
+`validate_thin_function` (`src/thin_ir_ser.cpp`) range-checked
+`instr.meta.frame_off` (Finding A, shipped `fd5304d`) but NOT the frame-plan
+offsets that `emit_x64`'s prologue / param-spill ALSO write to `[rbp+off]`:
+  - `frame.rbx_save_offset`      — checked only for sign + a 1 MB cap, NOT for
+    `>= -frame_size`, and NOT for the 8-byte spill span.
+  - `frame.struct_ret_ptr_offset` — NOT checked at all (deserialized, never
+    validated); spilled to `[rbp+off]` when `returns_struct_by_ptr && off != 0`.
+  - `frame.params[].off`          — NOT checked at all; spilled to
+    `[rbp + p.off + byte_pos]` across the param's full word span.
+A hand-crafted v5 IR module (is_ir=1, accepted in dev mode) could set
+`params[0].off = +8` so `emit_param_spills` writes `rcx` (the caller-controlled
+first argument) to `[rbp+8]` = the return address — the same return-address-
+overwrite primitive as Finding A, via a sibling unvalidated offset
+(HIGH→CRITICAL). The MAINTENANCE_LOG line-266 entry named the exact line cites
+(`thin_ir_ser.cpp:562-568,671-675`) and the fix shape (overflow-safe
+offset/span helpers, validate every rbp-relative field, malformed tests).
+
+### Reconciliation of stale completed entries (read-only, against git + source)
+- `docs/audit/PENDING_ACTIONS_2026-07-11.md` §1 P0 lists **Sec-6 (duplicate
+  block IDs) as open**, but the current source (`thin_ir_ser.cpp` ~line 600)
+  HAS the `seen_ids` duplicate-block-id check ("Sec-6 fix"). **Sec-6 is FIXED
+  but still listed open — a stale entry** (the doc was written at `5df97f2`
+  before the fix). Not amended this cycle (dated audit record; the consolidated
+  action list is the `PENDING_ACTIONS` doc's role, not the cron's).
+- The PENDING_ACTIONS §0 S1 line cite (`thin_ir_ser.cpp:648-650`) is stale
+  (the Finding A check is now ~line 671), but the claim (S1 FIXED) is accurate.
+
+### Implementation
+`src/thin_ir_ser.cpp` — added a file-local overflow-safe helper
+`frame_plan_span_ok(int64_t off, int64_t span, int32_t frame_size)` and, in
+`validate_thin_function`, full-span validation of every rbp-relative frame-plan
+write offset BEFORE any `emit_x64` / executable allocation:
+  - **rbx_save_offset**: replaced the sign-only check with the 8-byte full-span
+    check (subsumes `>= 0`; keeps the 1 MB cap). Error keeps the
+    `rbx_save_offset` substring so the existing P7 test still matches.
+  - **struct_ret_ptr_offset**: NEW check — when `returns_struct_by_ptr &&
+    off != 0` (the emit's spill gate), the 8-byte span must fit.
+  - **params[].off**: NEW loop — for each real param (skipping the
+    `__struct_ret_ptr` sentinel, `ty == nullptr`), the FULL span
+    `max(type-derived load-time span, p.nwords*8)` must fit. Slice params use
+    16 bytes (2 words); every other type uses 8 bytes at load time (the
+    load-time re-emit uses an EMPTY `StructLayoutTable`, so a struct-typed
+    param in an is_ir=1 function is treated as a 1-word scalar spill, and
+    struct-by-value params are `non_serializable` → is_ir=0 raw-x86 fallback
+    that never reaches this validator). `max(.., p.nwords*8)` is conservative
+    defense-in-depth against an inflated attacker-controlled `p.nwords`.
+The span rule: `off < 0` (a non-negative off is the exploit), `off + span <= 0`
+(the full multi-word span stays strictly below rbp — catches a short-negative
+base whose extent reaches `[rbp+0]`/`[rbp+8]`), and `off >= -frame_size` when
+`frame_size > 0` (the low end is within the allocated frame). All arithmetic
+in `int64_t` (no int32 overflow on attacker-controlled offsets). The
+`frame_size == 0` lower bound is deliberately skipped to preserve the
+`thin_ir_ser_test` case A3 negative control (a hand-crafted leaf with no
+frame is legitimate when no span reaches rbp); only the below-rbp check
+applies there. `instr.meta.frame_off` (Finding A, shipped) is intentionally
+NOT touched — it is per-instruction, not frame-plan, and its existing tests
+(A1/A2/Item 12a) still pass unchanged.
+
+`examples/thin_ir_ser_test.cpp` — added 7 Finding C cases to
+`validation_edge_cases` (all rejected, plus one negative control that must
+validate clean): `params[0].off=+8` (the PoC), `struct_ret_ptr_offset=+8`
+with `returns_struct_by_ptr`, a 2-word slice at `off=-8` (16-byte span reaches
+`[rbp+8]` — the case that distinguishes full-span from a base-offset-only
+check), `rbx_save_offset=-4` (8-byte span reaches saved rbp), an inflated
+`nwords=1000` scalar (overflow-safe / conservative-span), a below-frame
+`off=-1000000` with `frame_size=16`, and a LEGITIMATE 2-word slice at
+`off=-16`/`frame_size=32` that MUST validate clean (proves no over-rejection).
+The existing A3 and base-positive controls still pass.
+
+### Validation (gates run from scratch, post-commit)
+- `cmake --build buildt -j 8` -> exit 0 (clean; 0 warnings).
+- `ctest --test-dir buildt --output-on-failure --timeout 60` (full unfiltered
+  suite, incl. benchmarks + soak) -> **70/70 PASS, 0 failed** (126.19 s).
+  Validator-dependent targets all green: `thin_ir` (60), `thin_ir_struct` (61),
+  `thin_ir_ser` (62), `em_redteam_audit` (63), `em_v5_ir` (64), `em_v5_mixed`
+  (70), `lang_suite` (32), plus the `ember_passes_*` / `ir_passes` / `regalloc`
+  pass-pipeline gates.
+- `ember_cli.exe run tests/lang/optimization_validation.ember --fn main
+  --passes constprop,forward,copyprop,instcombine,dce,licm,dse` -> **exit 177**
+  (the required sentinel; no regression).
+- `ember_cli.exe test tests/lang` -> exit 0 (lang suite green).
+No regressions vs. the pre-fix baseline (which was also 70/70 + exit 177).
+
+### Changed paths (this cycle)
+- `src/thin_ir_ser.cpp` — `frame_plan_span_ok` helper + full-span validation
+  of `rbx_save_offset` / `struct_ret_ptr_offset` / `params[].off` in
+  `validate_thin_function` (+103 lines, -2).
+- `examples/thin_ir_ser_test.cpp` — 7 Finding C validation cases + the Part 4
+  check-message update (+114 lines, -3).
+- `docs/MAINTENANCE_LOG.md` — this cycle summary append.
+
+### Confirmation
+- **G: drive: never accessed.**
+- **`thirdparty/`: never modified** (the permanent `thirdparty/vst3sdk`
+  nested-submodule content dirt was present throughout and left untouched; no
+  gitlink changed; off-limits per `docs/MAINTENANCE_CONSTRAINTS.md`).
+- No `docs/spec/` design doc was edited (the fix is in `src/` + tests, not spec).
+- No `docs/audit/` dated historical record was rewritten (audited against, not
+  modified).
+- The `ThinOp` enum / `.em` format spec / pass interface were NOT touched
+  (stable serialization boundaries per the constraints).
+- Commit message contains no `@`.
+
+### Parent gitlink publication status
+Ember-side commit only this cycle (the task success criterion is "implemented,
+tested, and committed"). Push to `origin/master` is an available follow-up (the
+remote had not advanced as of the prior cycle's push to `a0b98e8`; a push would
+be non-force, rebase only if the remote advanced). The parent `ember` gitlink
+update remains BLOCKED on a clean parent workspace (see the prior cycle's
+parent-gitlink note; the parent carries `M Testing/Temporary/LastTest.log`,
+`M ember`, `M hyper-reV`, `M prism-gui/CMakeLists.txt`, untracked
+`InsydeBIOS_*`/`LEGION_*`/`NUL`). Next action (for a clean parent): advance
+the `ember` gitlink to Ember's post-commit HEAD and push.
+
+## 2026-07-13 15:30 EDT — implement per-instr frame_off full-span + arg_frame_offs + data_temp_off validation (Finding C residual)
+
+### Scope and framing
+The prior cycle (2026-07-13 14:00 EDT) closed the **frame-plan** half of
+Finding C (`rbx_save_offset` / `struct_ret_ptr_offset` / `params[].off` full-
+span validation, commit `3a2a804`) but explicitly deferred the **per-
+instruction** half as "out of scope ... noted for a future pass" (its Notes:
+"`instr.meta.frame_off` Finding A check validates the base offset but not the
+8-byte store span; `arg_frame_offs[]` unvalidated"). This cycle implements that
+deferred residual — the per-instruction rbp-relative full-span validation the
+original task scope called for ("struct-by-value `ThinInstr::arg_frame_offs`,
+and instruction metadata whose actual rbp-relative read/write span crosses
+either frame boundary"). The tree is clean of ember-source dirt (only the
+permanent, off-limits `thirdparty/vst3sdk` nested-submodule content dirt
+remains, never modified by this cycle).
+
+### The gap (confirmed open before this cycle)
+`validate_thin_function` range-checked `instr.meta.frame_off`'s **base offset**
+(`off in [-frame_size, 0)`, Finding A) but NOT the actual read/write **span**
+`emit_x64` performs at `[rbp + off]`. A producing op with `frame_off = -1`
+writes 8 bytes to `[rbp-1, rbp+7)` and overwrites saved rbp / the return
+address even though the base offset `-1` is in range. The same short-negative-
+base primitive applied to every rbp-relative access: slice stores (16 bytes),
+F32 stores (4 bytes), CopyBytes (len bytes), StringDecrypt's data buffer (len
+bytes) and slice-result slot (16 bytes). Additionally:
+- `ThinInstr::arg_frame_offs` (struct-by-value call args [read] + struct-return
+  hidden dest [write]) were NOT validated at all — a malformed afo can
+  read/write outside the frame (info-leak / return-address overwrite).
+- `ThinMeta::data_temp_off` (StringDecrypt's decrypted-data buffer) was NOT
+  validated.
+- Computed-address ops (`StoreAddr` `[src2+frame_off]`, `StoreFrame` with
+  `src2!=0`, `LoadFrame`'s computed `field_off`) use the offset as a
+  displacement from a RUNTIME pointer, not an rbp-relative frame access — the
+  base-offset check could wrongly reject a legitimate computed displacement.
+
+### Process (RED/GREEN TDD)
+RED first: added `frame_span_arg_validation()` (Part 5) to
+`examples/thin_ir_ser_test.cpp` — 7 full-span malformed cases (ConstInt 8B at
+off=-1, StoreFrame slice 16B at off=-8, ConstFloat F32 4B at off=-1, CopyBytes
+dst/src len at off=-1, StringDecrypt data_temp_off=-1 len=8, StringDecrypt
+slice result at off=-1), 5 legitimate negative controls (ConstInt 8B at -8,
+slice 16B at -16/frame=32, F32 4B at -4, CopyBytes at -8/-16, StringDecrypt
+data at -16 len=16), 3 computed-address distinction cases (StoreAddr
+frame_off=+8, LoadFrame src1!=0 field_off=+8, StoreFrame src2!=0 frame_off=+8
+— all MUST validate), and 4 arg_frame_offs cases (struct-by-value +8 read,
+slice-typed -8 16B span, struct-return dest +8, legitimate -8 control). Built
+`cmake --build buildt -j 8` -> clean; ran `ctest --test-dir buildt -R
+'^thin_ir_ser$' --output-on-failure` -> **Part 5 FAILED** (RED, intended: the
+missing full-span / arg / data_temp validation; Parts 1-4 still green, no
+regression). The first failing case was FS-1 (ConstInt frame_off=-1 accepted by
+the base-offset-only check) — the intended missing validation.
+
+GREEN: implemented the fix in `src/thin_ir_ser.cpp`:
+- `instr_frame_span_ok(off, span, frame_size)`: the instr-level analogue of
+  `frame_plan_span_ok` with the low-end bound ALWAYS applied (frame_size==0
+  rejects every non-zero off — Finding A cases A1/A2 preserved).
+- `dst_spill_span(ty, is_f32, narrow_field, width)`: the byte span of a
+  producing op's dst spill / StoreFrame's value / LoadFrame's load, derived
+  from the exact emit behavior (slice=16, F32=4, F64=8, int=8, narrow
+  field=width).
+- A per-op `switch` in `validate_thin_function` that validates the FULL span of
+  every rbp-relative `frame_off` / `field_off` / `data_temp_off` access:
+  producing ops (16/4/8), StoreFrame src2==0 (16/4/8/width), LoadFrame
+  (16/4/8), CopyBytes dst+src (len), StringDecrypt data (len) + result (16),
+  StructLitInit/ArrayLitInit (frame_off+field_off, elem width), FieldAddr
+  (8-byte addr spill). Computed-address ops (StoreAddr, StoreFrame src2!=0,
+  IndexAddr, MakeSlice) are EXCLUDED. Call result spills use `ret_type`.
+- `arg_frame_offs[]` validation: each entry != -1 && != 0 is full-span-
+  validated (16 for a slice-tagged entry, else 8).
+Rebuilt + reran the focused test -> **GREEN** (all Part 5 cases pass, Parts 1-4
+unchanged).
+
+After GREEN, ran the related loader tests: `thin_ir` / `thin_ir_struct` /
+`thin_ir_ser` / `em_redteam_audit` / `em_v5_ir` / `em_v5_mixed` all green.
+Added a loader-level test to `examples/em_v5_ir_test.cpp` (case f) proving a
+malformed ir_blob (ConstInt frame_off=-1, span crosses rbp) is rejected by the
+loader's `validate_thin_function` BEFORE any executable page is allocated
+(`!ok && bad_lm.pages.empty()`), satisfying the task's "rejected before
+executable allocation" requirement.
+
+### Validation (gates run from scratch)
+- `cmake --build buildt -j 8` -> BUILD_EXIT=0.
+- `ctest --test-dir buildt --output-on-failure --timeout 120` -> **70/70 PASS**,
+  CTEST_EXIT=0 (incl. bench + soak). No regressions vs. the pre-fix baseline.
+- `ember_cli.exe run tests/lang/optimization_validation.ember --fn main
+  --passes constprop,forward,copyprop,instcombine,dce,licm,dse` -> **exit 177**
+  (the required sentinel; no regression).
+
+### Changed paths (this cycle)
+- `src/thin_ir_ser.cpp` — `instr_frame_span_ok` + `dst_spill_span` helpers +
+  per-op full-span validation of `frame_off` / `field_off` / `data_temp_off` +
+  `arg_frame_offs[]` validation in `validate_thin_function` (+238, -21).
+- `src/thin_ir_ser.hpp` — `validate_thin_function` contract comment updated to
+  document the frame-plan full-span (Finding C) + per-instr full-span /
+  arg_frame_offs / data_temp_off / computed-address-distinction validation
+  (comment-only; +14, -1).
+- `examples/thin_ir_ser_test.cpp` — Part 5 `frame_span_arg_validation()`: 19
+  cases (7 full-span malformed + 5 negative controls + 3 computed-address
+  distinction + 4 arg_frame_offs) + the main() call (+416, -0).
+- `examples/em_v5_ir_test.cpp` — case (f) loader-level "rejected before exec
+  page" test for a span-crossing frame_off ir_blob (+33, -0).
+- `docs/MAINTENANCE_LOG.md` — this cycle summary append.
+
+### Confirmation
+- **G: drive: never accessed.**
+- **`thirdparty/`: never modified** (the permanent `thirdparty/vst3sdk`
+  nested-submodule content dirt was present throughout and left untouched; no
+  gitlink changed; off-limits per `docs/MAINTENANCE_CONSTRAINTS.md`).
+- **`src/thin_ir.hpp`'s `ThinOp` enum: NOT modified** (stable serialization
+  boundary).
+- **`src/em_file.hpp` format comments: NOT modified.**
+- No `docs/spec/` design doc edited; no `docs/audit/` dated record rewritten.
+- Overflow-safe arithmetic throughout (`int64_t` for off + span; no int32
+  overflow on attacker-controlled spans/offsets). Offsets/spans outside
+  `[-frame_size, 0)` rejected.
+- Commit message contains no `@`.
+
+### Parent gitlink publication status
+Ember-side commit only this cycle (the task success criterion is "implemented,
+tested, and committed"). Push to `origin/master` is an available follow-up
+(non-force, rebase only if the remote advanced). The parent `ember` gitlink
+update remains BLOCKED on a clean parent workspace (the parent carries
+`M Testing/Temporary/LastTest.log`, `M ember`, `M hyper-reV`,
+`M prism-gui/CMakeLists.txt`, untracked `InsydeBIOS_*`/`LEGION_*`/`NUL`).
+
+---
+
+## 2026-07-13 16:05 EDT — documentation pass: close Finding C in the canonical todo record, ROADMAP, GAP_ANALYSIS, and this log (post-c2)
+
+### Initial tree state (this pass)
+Proceeded only after confirming c2 had a green, tested, committed
+implementation and that no unexpected concurrent changes had appeared:
+- **HEAD:** `235b8a6` ("thin_ir_ser: per-instr frame_off full-span +
+  arg_frame_offs + data_temp_off validation (Finding C residual)") — c2's
+  commit, sitting on top of c1's `3a2a804` (frame-plan half of Finding C).
+- **Working tree:** `git status -s` showed only ` m thirdparty/vst3sdk` —
+  the permanent, documented, off-limits nested-submodule content dirt
+  (`thirdparty/vst3sdk/public.sdk/source/vst/utility/alignedalloc.h`, the
+  MinGW build-compat patch; verified by descending into the nested
+  submodule). No ember-source dirt; no staged changes; no unexpected
+  concurrent writer. Per `docs/MAINTENANCE_CONSTRAINTS.md` and prior-cycle
+  precedent the permanent thirdparty exception is non-blocking; this pass
+  touched only ember doc files, never `thirdparty/`, never `G:`.
+- **c2 commit contents verified:** `git show --stat 235b8a6` = exactly the 5
+  intended files (`src/thin_ir_ser.cpp`, `src/thin_ir_ser.hpp`,
+  `examples/thin_ir_ser_test.cpp`, `examples/em_v5_ir_test.cpp`,
+  `docs/MAINTENANCE_LOG.md`); `src/thin_ir.hpp`, `src/em_file.hpp`, and
+  `thirdparty/` were NOT modified (forbidden boundaries intact).
+- **Baseline gate (before any edit):** `cmake --build buildt -j 8` → exit 0
+  (62/62 targets); `ctest --test-dir buildt -R '^thin_ir_ser$'` → 1/1 PASS.
+  c2's green state independently re-verified.
+
+### The implemented finding (recorded for completeness; implemented by c2)
+This pass documents — it did not re-implement — the **Finding C residual**
+that c2 (`235b8a6`) closed on top of c1 (`3a2a804`). Finding C
+(`docs/audit/FINAL_EM_REDTEAM_2026-07-11.md` §4) is the sibling of Finding
+A: the `fd5304d` fix range-checked `instr.meta.frame_off`'s **base offset**
+but not the actual read/write **span** at `[rbp + off]`, and left the
+frame-plan offsets (`rbx_save_offset` / `struct_ret_ptr_offset` /
+`params[].off`) and `ThinInstr::arg_frame_offs[]` / `ThinMeta::data_temp_off`
+unvalidated — the same return-address-overwrite primitive via sibling
+offsets and short-negative bases (`frame_off = -1` writes 8 bytes to
+`[rbp-1, rbp+7)` even though `-1` is in `[-frame_size, 0)`). c1 closed the
+frame-plan half; c2 closed the per-instruction half (`instr_frame_span_ok` +
+`dst_spill_span`, per-op 1/2/4/8/16-byte widths from exact `thin_emit.cpp`
+behavior; computed-address ops excluded; `arg_frame_offs[]` validated). The
+full RED/GREEN TDD narrative, the per-op switch, and the helper derivations
+are in c2's entry immediately above (2026-07-13 15:30 EDT) and are not
+repeated here.
+
+### RED/GREEN TDD evidence (implemented by c2; cross-referenced)
+- **RED:** `examples/thin_ir_ser_test.cpp` Part 5 `frame_span_arg_validation`
+  (19 cases) was added first and FAILED against the unmodified validator —
+  first failure FS-1 (ConstInt `frame_off = -1` accepted by the
+  base-offset-only check). Parts 1-4 stayed green (no regression).
+- **GREEN:** the `src/thin_ir_ser.cpp` helpers + per-op switch landed next;
+  the focused test went green (all Part 5 cases pass, Parts 1-4 unchanged).
+- **Loader-level proof:** `examples/em_v5_ir_test.cpp` case (f) shows a
+  span-crossing ir_blob is rejected by `validate_thin_function` BEFORE any
+  executable page is allocated (`!ok && pages.empty()`).
+See c2's entry above for the full case-by-case breakdown.
+
+### Changed paths (this documentation pass)
+- `docs/audit/PENDING_ACTIONS_2026-07-11.md` — appended §5 "Post-dating
+  update — 2026-07-13" marking the selected item (Finding C) implemented
+  across `3a2a804` + `235b8a6`, with shipped validation behavior, test
+  coverage, verification status, and the residual limitation. The 2026-07-11
+  historical context (revision `5df97f2`, the S1/Finding-A `d25cc8c` row in
+  §0.2, the prioritized action list) was left intact — append-only, no dated
+  record rewritten.
+- `docs/ROADMAP.md` — added a "`.em` Finding C … CLOSED (2026-07-13,
+  `3a2a804` + `235b8a6`)" sub-bullet in the Session 2026-07-11 security
+  changelog (grouped with the v5 mixed-mode bypass closure), describing the
+  shipped validation behavior, test coverage, verification, and residual
+  limitation. No pre-existing ROADMAP content altered.
+- `docs/planning/GAP_ANALYSIS.md` — appended the Finding C closure (shipped
+  validation behavior, test coverage, verification, residual limitation) to
+  Section 3, next to the v5 mixed-mode bypass closure paragraph. No
+  pre-existing content altered.
+- `docs/MAINTENANCE_LOG.md` — this entry.
+No source/test/`docs/spec/`/`thirdparty/` file was touched by this pass; the
+forbidden boundaries (`src/thin_ir.hpp` `ThinOp` enum, `src/em_file.hpp`
+format comments) were not modified.
+
+### Focused-test results (run after EVERY documentation edit, as required)
+After each of the four doc edits, `cmake --build buildt -j 8` → exit 0
+(ninja: no work to do — doc edits do not affect the build) and
+`ctest --test-dir buildt -R '^thin_ir_ser$' --output-on-failure --timeout 120`
+→ 1/1 PASS (`thin_ir_ser`). No regression introduced by any doc edit.
+
+### Full verification status (final, this pass)
+After the final documentation edit, all related focused tests were rerun:
+- `cmake --build buildt -j 8` → BUILD_EXIT=0.
+- `ctest --test-dir buildt -R 'thin_ir|em_v5_ir|em_v5_mixed|em_redteam_audit'
+  --output-on-failure --timeout 120` → all related focused tests PASS
+  (`thin_ir`, `thin_ir_struct`, `thin_ir_ser`, `em_v5_ir`, `em_v5_mixed`,
+  `em_redteam_audit`).
+- The full-suite 70/70 PASS and the `optimization_validation` exit-177
+  sentinel were established by c2 (HEAD `235b8a6`) and were not re-run in
+  their entirety by this documentation-only pass; the focused related tests
+  above reconfirm no regression was introduced by the doc edits. (Full-suite
+  rerun is available as a follow-up if desired.)
+
+### Commit
+- **Commit:** see git log. The implemented finding was committed by c2 as
+  `235b8a6` (on top of c1's `3a2a804`); this documentation pass's edits are
+  working-tree changes to the four doc files above and are left uncommitted
+  by this pass (no staging, no commit, no push, no amend — "see git log" so
+  no amend is needed). A later commit/push of these doc edits is an
+  available follow-up on a clean tree.
+- **G: drive: never accessed.** **`thirdparty/`: never modified** (the
+  permanent nested-submodule `alignedalloc.h` MinGW patch was present
+  throughout and left untouched). **`ThinOp` enum / `em_file.hpp` format
+  comments: NOT modified.** No `docs/spec/` design doc edited; no pre-existing
+  `docs/audit/` dated record rewritten (PENDING_ACTIONS was append-only).
+- Parent `ember` gitlink publication remains BLOCKED on a clean parent
+  workspace (unchanged from c2's status).

@@ -126,7 +126,30 @@ accepted by default. Mixed/raw v5 artifacts load only under the explicit
 `EmLoadPolicy{allow_raw_x86=true}` compatibility opt-in. The v5 mixed-mode
 raw-x86 secure-default bypass that let a raw-x86-bearing v5 module through the
 secure default is CLOSED (2026-07-12; `em_v5_mixed_test`, `em_v5_ir`,
-`em_redteam_audit`; see `../ROADMAP.md` + `../MAINTENANCE_LOG.md`).
+`em_redteam_audit`; see `../ROADMAP.md` + `../MAINTENANCE_LOG.md`). The
+sibling load-side validation gap — **Finding C**, deserialized Thin IR
+rbp-relative **full-span** validation (`docs/audit/FINAL_EM_REDTEAM_2026-07-11.md`
+§4) — is also CLOSED (2026-07-13, commits `3a2a804` + `235b8a6`): the Finding
+A base-offset fix (`fd5304d`) range-checked `instr.meta.frame_off`'s base
+offset but not the actual read/write span at `[rbp + off]`, and left the
+frame-plan offsets (`rbx_save_offset` / `struct_ret_ptr_offset` /
+`params[].off`) and `arg_frame_offs[]` / `data_temp_off` unvalidated.
+`validate_thin_function` now rejects any deserialized v5 IR blob whose
+frame-plan OR per-instruction rbp-relative offset has a read/write span
+crossing either frame boundary (per-op 1/2/4/8/16-byte widths), BEFORE re-emit
+and BEFORE executable page allocation; computed-address displacements
+(`StoreAddr` / `StoreFrame src2!=0` / `IndexAddr` / `MakeSlice`) are
+distinguished from rbp-relative frame accesses and not wrongly rejected.
+Test coverage: `thin_ir_ser_test` Part 4 (7 frame-plan cases) + Part 5
+`frame_span_arg_validation` (19 cases) + `em_v5_ir` case (f) loader-level
+rejection before exec-page allocation; `ctest --timeout 120` → 70/70 PASS,
+`optimization_validation --passes ...` → exit 177. Residual limitation (not
+claimed broader than implemented): the `StructLitInit`/`ArrayLitInit`
+combined-offset (`frame_off + field_off`) full-span check is included for
+defense-in-depth but those ops only appear in `non_serializable` (`is_ir = 0`)
+functions that never reach the validator at load time under the secure
+default, so that path is not directly test-exercised beyond the existing
+suite. See `../ROADMAP.md` (`.em` Finding C entry) + `../MAINTENANCE_LOG.md`.
 
 ## 4. Honest performance caveat ("MUCH faster than AngelScript")
 

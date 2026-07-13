@@ -313,6 +313,42 @@ int main() {
             if (!pass2) std::printf("       (ok=%d pages=%zu err=%s)\n", ok2, bad_lm2.pages.size(), le2.c_str());
         }
     }
+    // (f) Finding C residual (instr frame_off full-span): a hand-built IR with
+    //     a producing op whose 8-byte store span crosses rbp (frame_off=-1,
+    //     frame_size=16 -> writes [rbp-1, rbp+7)) MUST be rejected by the
+    //     loader's validate_thin_function BEFORE any executable page is
+    //     allocated. The serializer does not validate frame_off (validation is
+    //     the loader's job), so a malformed blob reaches the loader and is
+    //     rejected at validation time. This proves malformed serialized IR is
+    //     rejected before executable allocation (the task's loader-harness
+    //     requirement).
+    {
+        ThinFunction bad_thf;
+        bad_thf.name = "bad_span";
+        bad_thf.slot = 0;
+        bad_thf.frame.frame_size = 16;
+        bad_thf.frame.rbx_save_offset = -8;
+        bad_thf.frame.next_local_off = 8;
+        ThinBlock blk;
+        blk.id = 0;
+        ThinInstr ci;
+        ci.op = ThinOp::ConstInt;
+        ci.dst = 1;
+        ci.imm.i = 0x4141414142424242LL;
+        ci.meta.frame_off = -1;  // 8-byte store spans [-1, +7) -> crosses rbp
+        ci.meta.width = 8;
+        blk.instrs.push_back(ci);
+        blk.term.kind = TermKind::Return;
+        blk.term.ret = 1;
+        bad_thf.blocks.push_back(std::move(blk));
+        std::vector<uint8_t> bad_blob;
+        std::string bse;
+        if (!serialize_thin_function(bad_thf, bad_blob, &bse)) {
+            std::printf("  [SKIP] frame_off span: serializer rejected (%s)\n", bse.c_str());
+        } else {
+            try_load_blob(bad_blob, natives, "instr frame_off span crosses rbp -> rejected, no exec page (Finding C residual)");
+        }
+    }
 
 done:
     std::printf("\n%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);

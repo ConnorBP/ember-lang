@@ -557,7 +557,9 @@ static bool validation_edge_cases() {
     // Case A3 (contrast / negative control): frame_size=0 with NO non-zero
     // frame_off instrs must still validate clean (a leaf function with no
     // frame slots is legitimate — frame_size=0 alone is not malformed, only
-    // frame_size=0 + a non-zero frame_off is).
+    // frame_size=0 + a non-zero frame_off is). The frame-plan offsets
+    // (rbx_save=-8, param off=-16) are negative and their spans stay below
+    // rbp, so the Finding C full-span check accepts them too.
     {
         auto good = base;
         good.frame.frame_size = 0;
@@ -567,11 +569,527 @@ static bool validation_edge_cases() {
         std::string verr;
         if (!validate_thin_function(good, &verr)) return false;
     }
+    // ── Finding C (EM_FORMAT_RED_TEAM 2026-07-11): frame-plan offsets bypass
+    // the Finding A fix. The Finding A fix range-checked instr.meta.frame_off
+    // but NOT the frame-plan offsets (rbx_save_offset, struct_ret_ptr_offset,
+    // params[].off) that emit_x64's prologue/param-spill also write to [rbp+off].
+    // A hand-crafted v5 IR can overwrite the return address via any of them.
+    // These cases pin the full-span validation added to validate_thin_function.
+
+    // Finding C-1: params[0].off = +8 (the audit's PoC). emit_param_spills
+    // writes rcx (the caller-controlled first argument) to [rbp+8] = the
+    // return address. MUST be rejected.
+    {
+        auto bad = base;
+        bad.frame.params[0].off = 8;  // +8 = the return-address slot
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("param") == std::string::npos) return false;
+        if (verr.find("out of range") == std::string::npos) return false;
+    }
+    // Finding C-2: struct_ret_ptr_offset = +8 with returns_struct_by_ptr.
+    // emit_param_spills writes the hidden return pointer (rcx) to [rbp+8] =
+    // the return address. MUST be rejected.
+    {
+        auto bad = base;
+        bad.frame.returns_struct_by_ptr = true;
+        bad.frame.struct_ret_ptr_offset = 8;  // +8 = the return-address slot
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("struct_ret_ptr_offset") == std::string::npos) return false;
+    }
+    // Finding C — full-span: a 2-word slice param at off=-8. A base-offset-
+    // only check (off < 0 && off >= -frame_size) would ACCEPT off=-8 (it is
+    // negative and within the frame), but the 16-byte spill spans [-8, +8)
+    // and overwrites [rbp+0] (saved rbp) and [rbp+8] (return address). The
+    // full-span check (off + span <= 0) MUST reject it. This is the case that
+    // distinguishes full-span validation from a base-offset-only check.
+    {
+        auto bad = base;
+        auto slice_ty = std::make_shared<Type>();
+        slice_ty->is_slice = true;
+        slice_ty->prim = Prim::U8;  // slice<u8>
+        bad.frame.params[0].ty = slice_ty.get();
+        bad.frame.params[0].nwords = 2;  // 2-word slice spill = 16 bytes
+        bad.frame.params[0].off = -8;    // span [-8, +8) reaches the return addr
+        bad.frame.frame_size = 16;       // -8 is within the frame, but the span is not
+        bad.owned_types.push_back(std::move(slice_ty));
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("param") == std::string::npos) return false;
+    }
+    // Finding C — full-span: rbx_save_offset = -4. A sign-only check would
+    // accept -4 (it is negative), but the 8-byte prologue spill spans
+    // [-4, +4) and overwrites [rbp+0] (saved rbp). The full-span check MUST
+    // reject it.
+    {
+        auto bad = base;
+        bad.frame.rbx_save_offset = -4;  // span [-4, +4) reaches saved rbp
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("rbx_save_offset") == std::string::npos) return false;
+    }
+    // Finding C — overflow-safe / inflated nwords: a scalar param with
+    // nwords=1000 and off=-8. The serialized nwords is attacker-controlled;
+    // an int32 span computation (nwords*8) would be fine here (8000) but the
+    // point of the int64 arithmetic is that a near-INT32_MAX nwords must not
+    // wrap. The conservative span = max(8, 8000) = 8000 makes end = -8+8000
+    // = 7992 > 0 -> rejected. Pins that an inflated nwords cannot sneak a
+    // short-negative off past the span bound.
+    {
+        auto bad = base;
+        bad.frame.params[0].nwords = 1000;  // inflated far past the scalar 1 word
+        bad.frame.params[0].off = -8;       // base offset looks innocuous
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("param") == std::string::npos) return false;
+    }
+    // Finding C — below-frame write: a param at off=-1000000 with frame_size=16.
+    // The span [off, off+8) stays below rbp (end = -999992 <= 0) so it is NOT a
+    // return-address overwrite, but the low end is far below the allocated
+    // frame -> a below-rsp write into unallocated stack (DoS). When frame_size
+    // > 0 the low-end bound (off >= -frame_size) MUST reject it. (When
+    // frame_size == 0 this is accepted — the A3 leaf case — so this case uses
+    // frame_size=16.)
+    {
+        auto bad = base;
+        bad.frame.frame_size = 16;
+        bad.frame.params[0].off = -1000000;  // far below the 16-byte frame
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("param") == std::string::npos) return false;
+    }
+    // Finding C — negative control: a LEGITIMATE 2-word slice param at off=-16
+    // (span [-16, 0), within a 32-byte frame) MUST validate clean. This proves
+    // the full-span check does not over-reject well-formed multi-word params.
+    {
+        auto good = base;
+        auto slice_ty = std::make_shared<Type>();
+        slice_ty->is_slice = true;
+        slice_ty->prim = Prim::U8;
+        good.frame.params[0].ty = slice_ty.get();
+        good.frame.params[0].nwords = 2;
+        good.frame.params[0].off = -16;  // span [-16, 0) — fits the frame
+        good.frame.frame_size = 32;      // 32-byte frame holds the 16-byte slice + rbx save
+        good.owned_types.push_back(std::move(slice_ty));
+        std::string verr;
+        if (!validate_thin_function(good, &verr)) return false;
+    }
     // Positive: the base function validates clean (sanity check).
     {
         std::string verr;
         if (!validate_thin_function(base, &verr)) return false;
     }
+    return true;
+}
+
+// ─── Part 5: instr-level frame_off full-span + arg_frame_offs + data_temp_off ───
+//
+// Finding C closed the frame-plan offsets (rbx_save / struct_ret_ptr /
+// params[].off) but the per-INSTRUCTION rbp-relative accesses were only
+// base-offset-checked (Finding A: frame_off in [-frame_size, 0)). The actual
+// emit write/read SPAN was not validated: a producing op with frame_off = -1
+// writes 8 bytes to [rbp-1, rbp+7) and overwrites saved rbp / the return
+// address even though the base offset -1 is in range. Likewise:
+//   - ThinInstr::arg_frame_offs (struct-by-value call args + struct-return
+//     hidden dest) were not validated at all — a malformed afo can read/write
+//     outside the frame (info-leak / DoS / return-address overwrite for the
+//     hidden dest).
+//   - ThinMeta::data_temp_off (StringDecrypt's decrypted-data buffer) was not
+//     validated — a short-negative data_temp_off whose len-byte span reaches
+//     [rbp+0] overwrites saved rbp.
+//   - Computed-address ops (StoreAddr [src2+frame_off], StoreFrame with
+//     src2!=0, LoadFrame's computed field_off) use frame_off/field_off as a
+//     displacement from a RUNTIME pointer, not as an rbp-relative frame
+//     access — they must NOT be rejected by the rbp frame-bounds check.
+//
+// These cases pin the full-span / arg / data_temp / computed-address
+// validation added to validate_thin_function. Each malformed case MUST be
+// rejected; each legitimate boundary control MUST validate clean (no
+// over-rejection). Spans are derived from the exact emit behavior in
+// src/thin_emit.cpp (slice=16, F32=4, F64=8, int=8, narrow=width, copy/
+// string=len, StringDecrypt data=len + result=16).
+static bool frame_span_arg_validation() {
+    auto base = build_hand_thinfn();  // valid 1-block fn, frame_size=16, param@-16
+
+    // ── Full-span: instr.frame_off whose multi-byte span crosses rbp ──
+
+    // FS-1: ConstInt with frame_off=-1, width=8, frame_size=16. The 8-byte
+    // store (store_rax_to_rbp -> mov [rbp-1], rax) spans [-1, +7) and
+    // overwrites [rbp+0] (saved rbp) and part of [rbp+8] (return addr). The
+    // base offset -1 is in [-16, 0), so a base-offset-only check ACCEPTS it;
+    // the full-span check (off + span <= 0) MUST reject it.
+    {
+        auto bad = base;
+        ThinInstr ci;
+        ci.op = ThinOp::ConstInt;
+        ci.dst = 4;
+        ci.imm.i = 0x4141414142424242LL;
+        ci.meta.frame_off = -1;   // base offset in range, but span reaches rbp
+        ci.meta.width = 8;
+        bad.blocks[0].instrs.push_back(ci);
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("frame_off") == std::string::npos) return false;
+    }
+    // FS-2: StoreFrame (slice) with frame_off=-8, frame_size=16. The 16-byte
+    // slice store (ptr to [rbp-8], len to [rbp+0]) spans [-8, +8) and
+    // overwrites saved rbp AND the return address. A base-offset-only check
+    // accepts -8; the full-span check MUST reject it. This is the slice-sized
+    // 16-byte access that distinguishes full-span from base-offset validation.
+    {
+        auto bad = base;
+        auto slice_ty = std::make_shared<Type>();
+        slice_ty->is_slice = true;
+        slice_ty->prim = Prim::U8;
+        ThinInstr sf;
+        sf.op = ThinOp::StoreFrame;
+        sf.src1 = 1;
+        sf.meta.frame_off = -8;   // base offset in range, 16-byte span reaches rbp
+        sf.meta.type = slice_ty.get();
+        sf.meta.width = 8;
+        bad.blocks[0].instrs.push_back(sf);
+        bad.owned_types.push_back(std::move(slice_ty));
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("frame_off") == std::string::npos) return false;
+    }
+    // FS-3: ConstFloat (F32) with frame_off=-1, is_f32=1, frame_size=16. The
+    // 4-byte movss store spans [-1, +3) and overwrites [rbp+0..2] (saved rbp
+    // low bytes). Pins the float-width span (4 for F32).
+    {
+        auto bad = base;
+        auto f32_ty = std::make_shared<Type>();
+        f32_ty->prim = Prim::F32;
+        ThinInstr cf;
+        cf.op = ThinOp::ConstFloat;
+        cf.dst = 4;
+        cf.imm.f = 1.5;
+        cf.meta.frame_off = -1;
+        cf.meta.is_f32 = 1;
+        cf.meta.type = f32_ty.get();
+        bad.blocks[0].instrs.push_back(cf);
+        bad.owned_types.push_back(std::move(f32_ty));
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("frame_off") == std::string::npos) return false;
+    }
+    // FS-4: CopyBytes with frame_off=-1 (dst), len=8, frame_size=16. The
+    // 8-byte copy writes [rbp-1, rbp+7). Pins the copy-length span.
+    {
+        auto bad = base;
+        ThinInstr cb;
+        cb.op = ThinOp::CopyBytes;
+        cb.meta.frame_off = -1;   // dst, rbp-relative (dst==0, base_kind != Globals)
+        cb.meta.field_off = -16; // src, rbp-relative, in range
+        cb.meta.len = 8;
+        bad.blocks[0].instrs.push_back(cb);
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("frame_off") == std::string::npos) return false;
+    }
+    // FS-5: CopyBytes with field_off=-1 (src), len=8, frame_size=16. The
+    // 8-byte copy READS [rbp-1, rbp+7) — an info-leak of saved rbp / return
+    // addr into the dest. Pins that the SOURCE field_off span is validated
+    // too (not just the dest frame_off).
+    {
+        auto bad = base;
+        ThinInstr cb;
+        cb.op = ThinOp::CopyBytes;
+        cb.meta.frame_off = -16;  // dst, rbp-relative, in range
+        cb.meta.field_off = -1;   // src, rbp-relative, 8-byte read reaches rbp
+        cb.meta.len = 8;
+        bad.blocks[0].instrs.push_back(cb);
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("frame_off") == std::string::npos) return false;
+    }
+    // FS-6: StringDecrypt data_temp_off=-1, len=8, frame_size=16. The XOR
+    // loop writes 8 bytes to [rbp-1, rbp+7) (the decrypted-data buffer).
+    // Pins the StringDecrypt data slot span (len bytes).
+    {
+        auto bad = base;
+        bad.rodata.resize(16);
+        ThinInstr sd;
+        sd.op = ThinOp::StringDecrypt;
+        sd.dst = 4;
+        sd.meta.data_temp_off = -1;  // data buffer, 8-byte write reaches rbp
+        sd.meta.frame_off = 0;        // no slice result spill (keep it isolated)
+        sd.meta.addend = 0;
+        sd.meta.len = 8;
+        sd.imm.i = 0x41;
+        bad.blocks[0].instrs.push_back(sd);
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("frame_off") == std::string::npos) return false;
+    }
+    // FS-7: StringDecrypt slice result frame_off=-1 (16-byte slice slot),
+    // len=4, frame_size=16. The slice result store (ptr to [rbp-1], len to
+    // [rbp+7]) spans [-1, +15) and overwrites saved rbp + return addr. Pins
+    // the StringDecrypt result slot span (16 bytes), distinct from the data
+    // buffer span (len).
+    {
+        auto bad = base;
+        auto slice_ty = std::make_shared<Type>();
+        slice_ty->is_slice = true;
+        slice_ty->prim = Prim::U8;
+        bad.rodata.resize(16);
+        ThinInstr sd;
+        sd.op = ThinOp::StringDecrypt;
+        sd.dst = 4;
+        sd.meta.data_temp_off = -16;  // data buffer, in range (len=4 -> [-16,-12))
+        sd.meta.frame_off = -1;       // slice result slot, 16-byte span reaches rbp
+        sd.meta.addend = 0;
+        sd.meta.len = 4;
+        sd.imm.i = 0x41;
+        sd.meta.type = slice_ty.get();
+        bad.blocks[0].instrs.push_back(sd);
+        bad.owned_types.push_back(std::move(slice_ty));
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("frame_off") == std::string::npos) return false;
+    }
+
+    // ── Full-span negative controls (legitimate offsets MUST validate) ──
+
+    // NC-1: ConstInt with frame_off=-8, width=8, frame_size=16. The 8-byte
+    // store spans [-8, 0) — entirely within the frame and strictly below rbp.
+    // MUST validate clean (proves the full-span check does not over-reject a
+    // well-formed 8-byte spill at the frame edge).
+    {
+        auto good = base;
+        ThinInstr ci;
+        ci.op = ThinOp::ConstInt;
+        ci.dst = 4;
+        ci.imm.i = 42;
+        ci.meta.frame_off = -8;   // span [-8, 0) — fits the 16-byte frame
+        ci.meta.width = 8;
+        good.blocks[0].instrs.push_back(ci);
+        std::string verr;
+        if (!validate_thin_function(good, &verr)) return false;
+    }
+    // NC-2: StoreFrame (slice) with frame_off=-16, frame_size=32. The 16-byte
+    // slice store spans [-16, 0) — within the 32-byte frame. MUST validate.
+    {
+        auto good = base;
+        good.frame.frame_size = 32;
+        auto slice_ty = std::make_shared<Type>();
+        slice_ty->is_slice = true;
+        slice_ty->prim = Prim::U8;
+        ThinInstr sf;
+        sf.op = ThinOp::StoreFrame;
+        sf.src1 = 1;
+        sf.meta.frame_off = -16;  // span [-16, 0) — fits the 32-byte frame
+        sf.meta.type = slice_ty.get();
+        sf.meta.width = 8;
+        good.blocks[0].instrs.push_back(sf);
+        good.owned_types.push_back(std::move(slice_ty));
+        std::string verr;
+        if (!validate_thin_function(good, &verr)) return false;
+    }
+    // NC-3: ConstFloat (F32) with frame_off=-4, is_f32=1, frame_size=16. The
+    // 4-byte movss spans [-4, 0). MUST validate.
+    {
+        auto good = base;
+        auto f32_ty = std::make_shared<Type>();
+        f32_ty->prim = Prim::F32;
+        ThinInstr cf;
+        cf.op = ThinOp::ConstFloat;
+        cf.dst = 4;
+        cf.imm.f = 1.5;
+        cf.meta.frame_off = -4;
+        cf.meta.is_f32 = 1;
+        cf.meta.type = f32_ty.get();
+        good.blocks[0].instrs.push_back(cf);
+        good.owned_types.push_back(std::move(f32_ty));
+        std::string verr;
+        if (!validate_thin_function(good, &verr)) return false;
+    }
+    // NC-4: CopyBytes frame_off=-8 (dst), field_off=-16 (src), len=8,
+    // frame_size=16. Both spans [-8,0) and [-16,-8) are within the frame.
+    // MUST validate.
+    {
+        auto good = base;
+        ThinInstr cb;
+        cb.op = ThinOp::CopyBytes;
+        cb.meta.frame_off = -8;
+        cb.meta.field_off = -16;
+        cb.meta.len = 8;
+        good.blocks[0].instrs.push_back(cb);
+        std::string verr;
+        if (!validate_thin_function(good, &verr)) return false;
+    }
+    // NC-5: StringDecrypt data_temp_off=-16 (len=16), frame_off=0,
+    // frame_size=32. The 16-byte data write spans [-16, 0). MUST validate.
+    {
+        auto good = base;
+        good.frame.frame_size = 32;
+        good.rodata.resize(16);
+        ThinInstr sd;
+        sd.op = ThinOp::StringDecrypt;
+        sd.dst = 4;
+        sd.meta.data_temp_off = -16;
+        sd.meta.frame_off = 0;
+        sd.meta.addend = 0;
+        sd.meta.len = 16;
+        sd.imm.i = 0x41;
+        good.blocks[0].instrs.push_back(sd);
+        std::string verr;
+        if (!validate_thin_function(good, &verr)) return false;
+    }
+
+    // ── Computed-address distinction (must NOT be rejected as rbp-relative) ──
+
+    // CA-1: StoreAddr with frame_off=8 (positive), src2=1. StoreAddr writes
+    // [src2(computed addr) + frame_off], NOT [rbp + frame_off]. A positive
+    // frame_off is a legitimate element displacement. The rbp frame-bounds
+    // check MUST NOT reject it. (The lowerer emits StoreAddr with frame_off=0;
+    // a non-zero displacement is unusual but not an rbp-relative access.)
+    {
+        auto good = base;
+        ThinInstr sa;
+        sa.op = ThinOp::StoreAddr;
+        sa.src1 = 2;
+        sa.src2 = 1;          // computed base address in vreg 1
+        sa.meta.frame_off = 8;  // displacement from the computed base (NOT rbp)
+        sa.meta.width = 8;
+        good.blocks[0].instrs.push_back(sa);
+        std::string verr;
+        if (!validate_thin_function(good, &verr)) return false;
+    }
+    // CA-2: LoadFrame with src1=1 (computed base), frame_off=-8 (valid spill
+    // slot), field_off=8 (positive computed load displacement). The LOAD uses
+    // field_off from the computed base (not rbp); frame_off is the spill slot
+    // (rbp-relative, in range). The positive field_off MUST NOT be rejected as
+    // an rbp-relative access. (This is the struct-field-via-computed-base shape
+    // the lowerer produces for array-of-struct element field loads.)
+    {
+        auto good = base;
+        ThinInstr lf;
+        lf.op = ThinOp::LoadFrame;
+        lf.dst = 4;
+        lf.src1 = 1;            // computed base -> load uses field_off, not frame_off
+        lf.meta.frame_off = -8; // spill slot (rbp-relative, in range)
+        lf.meta.field_off = 8;  // computed displacement (positive, NOT rbp)
+        lf.meta.width = 8;
+        good.blocks[0].instrs.push_back(lf);
+        std::string verr;
+        if (!validate_thin_function(good, &verr)) return false;
+    }
+    // CA-3: StoreFrame with src2=1 (computed base), frame_off=8 (positive
+    // displacement). StoreFrame with src2!=0 writes [src2(computed) +
+    // frame_off], NOT [rbp + frame_off]. The positive frame_off MUST NOT be
+    // rejected as rbp-relative. (The lowerer emits computed stores via
+    // StoreAddr, never StoreFrame src2!=0, but the emit supports it and the
+    // validator must distinguish it from a real rbp-relative store.)
+    {
+        auto good = base;
+        ThinInstr sf;
+        sf.op = ThinOp::StoreFrame;
+        sf.src1 = 2;
+        sf.src2 = 1;            // computed base -> frame_off is a displacement
+        sf.meta.frame_off = 8;  // displacement from the computed base (NOT rbp)
+        sf.meta.width = 8;
+        good.blocks[0].instrs.push_back(sf);
+        std::string verr;
+        if (!validate_thin_function(good, &verr)) return false;
+    }
+
+    // ── arg_frame_offs validation (struct-by-value + struct-return dest) ──
+
+    // AFO-1: struct-by-value call arg with arg_frame_offs = +8. The emit
+    // copies struct bytes from [rbp + afo] (copy_bytes src = rbp + afo). A
+    // positive afo reads saved rbp / return address as the struct value
+    // (info-leak). MUST be rejected.
+    {
+        auto bad = base;
+        auto struct_ty = std::make_shared<Type>();
+        struct_ty->struct_name = "Point";
+        ThinInstr call;
+        call.op = ThinOp::CallNative;
+        call.dst = 4;
+        call.meta.native_name = "takes_point";
+        call.ret_type = nullptr;
+        // one struct-by-value arg: args[0]=0 (sentinel) + arg_frame_offs[0]=+8
+        call.args.push_back(0);
+        call.arg_frame_offs.push_back(8);
+        call.arg_types.push_back(struct_ty.get());
+        bad.blocks[0].instrs.push_back(call);
+        bad.owned_types.push_back(std::move(struct_ty));
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("arg_frame_off") == std::string::npos) return false;
+    }
+    // AFO-2: struct-by-value call arg with arg_frame_offs = -1 and a 2-word
+    // (16-byte) struct at load time is impossible (empty StructLayoutTable ->
+    // 1 word), so use a slice-typed arg_frame_offs entry to exercise the
+    // 16-byte span. A slice-typed struct-by-value arg at off=-8 spans [-8,+8)
+    // and the read reaches rbp. (A malformed blob can tag any type on an afo
+    // entry.) MUST be rejected by the full-span check.
+    {
+        auto bad = base;
+        auto slice_ty = std::make_shared<Type>();
+        slice_ty->is_slice = true;
+        slice_ty->prim = Prim::U8;
+        ThinInstr call;
+        call.op = ThinOp::CallNative;
+        call.dst = 4;
+        call.meta.native_name = "takes_slice_agg";
+        call.ret_type = nullptr;
+        call.args.push_back(0);
+        call.arg_frame_offs.push_back(-8);  // 16-byte slice span reaches rbp
+        call.arg_types.push_back(slice_ty.get());
+        bad.blocks[0].instrs.push_back(call);
+        bad.owned_types.push_back(std::move(slice_ty));
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("arg_frame_off") == std::string::npos) return false;
+    }
+    // AFO-3: struct-return hidden dest with arg_frame_offs[0] = +8. The emit
+    // does `lea rax, [rbp + afo0]` and the callee writes the returned struct
+    // there. A positive afo0 makes the callee overwrite saved rbp / the return
+    // address. MUST be rejected. (ret_struct is signaled by a struct ret_type;
+    // args[0]==0 + arg_frame_offs[0]=afo encodes the frame-slot dest.)
+    {
+        auto bad = base;
+        auto struct_ty = std::make_shared<Type>();
+        struct_ty->struct_name = "Point";
+        ThinInstr call;
+        call.op = ThinOp::CallNative;
+        call.dst = 0;  // struct-by-ptr: no VReg result
+        call.meta.native_name = "returns_point";
+        call.ret_type = struct_ty.get();  // struct ret -> ret_struct
+        // hidden dest: args[0]=0 + arg_frame_offs[0]=+8 (the dest frame slot)
+        call.args.push_back(0);
+        call.arg_frame_offs.push_back(8);
+        call.arg_types.push_back(struct_ty.get());
+        bad.blocks[0].instrs.push_back(call);
+        bad.owned_types.push_back(std::move(struct_ty));
+        std::string verr;
+        if (validate_thin_function(bad, &verr)) return false;
+        if (verr.find("arg_frame_off") == std::string::npos) return false;
+    }
+    // AFO-4 (negative control): struct-by-value call arg with arg_frame_offs
+    // = -8, frame_size=16. The 8-byte read spans [-8, 0) — within the frame.
+    // MUST validate clean.
+    {
+        auto good = base;
+        auto struct_ty = std::make_shared<Type>();
+        struct_ty->struct_name = "Point";
+        ThinInstr call;
+        call.op = ThinOp::CallNative;
+        call.dst = 4;
+        call.meta.native_name = "takes_point";
+        call.ret_type = nullptr;
+        call.args.push_back(0);
+        call.arg_frame_offs.push_back(-8);  // 8-byte read, in range
+        call.arg_types.push_back(struct_ty.get());
+        good.blocks[0].instrs.push_back(call);
+        good.owned_types.push_back(std::move(struct_ty));
+        std::string verr;
+        if (!validate_thin_function(good, &verr)) return false;
+    }
+
     return true;
 }
 
@@ -608,8 +1126,14 @@ int main() {
     check(malformed_rejection(), "all malformed blobs rejected (bad magic, truncated, bad ThinOp, bad target, no terminator, empty)");
 
     // Part 4: validation edge cases (the audit-found checks).
-    std::printf("Part 4: validation edge cases (C1/C2/P2/P3/P4/P7)\n");
-    check(validation_edge_cases(), "all validation edge cases rejected (bad block.id, empty native_name, rodata OOB, slot OOB, mod_id OOB, bad cmp, bad frame_size, bad rbx_save_offset, VReg exceeds declared bound, negative len rodata, negative len BoundsCheck, frame_off OOB)");
+    std::printf("Part 4: validation edge cases (C1/C2/P2/P3/P4/P7 + Finding C frame-plan full-span)\n");
+    check(validation_edge_cases(), "all validation edge cases rejected (bad block.id, empty native_name, rodata OOB, slot OOB, mod_id OOB, bad cmp, bad frame_size, bad rbx_save_offset, VReg exceeds declared bound, negative len rodata, negative len BoundsCheck, frame_off OOB, Finding C frame-plan offsets [param.off=+8, struct_ret_ptr=+8, slice span reaches rbp, rbx span reaches rbp, inflated nwords, below-frame off])");
+
+    // Part 5: instr-level frame_off full-span + arg_frame_offs + data_temp_off
+    // + computed-address distinction (the Finding C residual: per-instruction
+    // rbp-relative full-span validation c1 deferred as out-of-scope).
+    std::printf("Part 5: instr frame_off full-span + arg_frame_offs + data_temp_off + computed-address distinction\n");
+    check(frame_span_arg_validation(), "instr full-span / arg_frame_offs / data_temp_off / computed-address validation (slice 16B, F32 4B, int 8B, copy/string len, StringDecrypt data+result, struct-by-value afo, struct-return dest, StoreAddr/LoadFrame/StoreFrame computed distinction, legitimate boundary controls accepted)");
 
     std::printf("\n%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

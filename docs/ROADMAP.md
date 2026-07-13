@@ -196,6 +196,47 @@ format hardening pass + several fixes. The full commit log (oldest → newest):
     raw-x86 functions then load as raw x86 alongside the re-emitted IR
     functions). Pinned by `em_v5_mixed_test` (Parts 2/2b/3) + `em_v5_ir` /
     `em_redteam_audit` (all-IR v5 default-accept preserved).
+  - **`.em` Finding C — deserialized Thin IR rbp-relative full-span validation
+    CLOSED** (2026-07-13, commits `3a2a804` + `235b8a6`): the Finding A fix
+    (`fd5304d`) range-checked `instr.meta.frame_off`'s **base offset** but not
+    the actual read/write **span** `emit_x64` performs at `[rbp + off]`, and
+    left the frame-plan offsets (`rbx_save_offset`, `struct_ret_ptr_offset`,
+    `params[].off`) and `arg_frame_offs[]` / `data_temp_off` unvalidated
+    (Finding C of `docs/audit/FINAL_EM_REDTEAM_2026-07-11.md` §4 — the same
+    return-address-overwrite primitive via sibling offsets and short-negative
+    bases; e.g. `frame_off = -1` writes 8 bytes to `[rbp-1, rbp+7)` even though
+    `-1` is in `[-frame_size, 0)`). Fixed across two focused cycles:
+    (1) `3a2a804` — frame-plan full-span validation (`frame_plan_span_ok`,
+    low-end bound always applied so `frame_size == 0` rejects every non-zero
+    offset, preserving Finding A cases A1/A2); (2) `235b8a6` — per-op
+    full-span validation of every rbp-relative `frame_off` / `field_off` /
+    `data_temp_off` access (`instr_frame_span_ok` + `dst_spill_span`, per-op
+    1/2/4/8/16-byte widths derived from exact `thin_emit.cpp` behavior) +
+    `arg_frame_offs[]` validation; computed-address ops (`StoreAddr`,
+    `StoreFrame src2!=0`, `IndexAddr`, `MakeSlice`) EXCLUDED (displacement
+    from a runtime pointer, not an rbp-relative frame access). **Shipped
+    validation behavior:** `validate_thin_function` rejects any deserialized
+    v5 IR blob whose frame-plan OR per-instruction rbp-relative offset has a
+    read/write span crossing either frame boundary, BEFORE re-emit and BEFORE
+    executable page allocation; computed-address displacements are
+    distinguished and not wrongly rejected. **Test coverage:**
+    `examples/thin_ir_ser_test.cpp` Part 4 (7 frame-plan cases) + Part 5
+    `frame_span_arg_validation` (19 cases: 7 full-span malformed + 5
+    legitimate negative controls + 3 computed-address distinction + 4
+    `arg_frame_offs`); `examples/em_v5_ir_test.cpp` case (f) — loader-level
+    proof a span-crossing `frame_off` ir_blob is rejected BEFORE any
+    executable page is allocated. **Verification:** `cmake --build buildt -j 8`
+    → 0; `ctest --timeout 120` → 70/70 PASS (no regressions);
+    `optimization_validation --passes ...` → exit 177. **Residual
+    limitation (not claimed broader than implemented):** the
+    `StructLitInit`/`ArrayLitInit` combined-offset (`frame_off + field_off`)
+    full-span check is included for defense-in-depth, but those ops only
+    appear in `non_serializable` (`is_ir = 0`) functions that never reach
+    `validate_thin_function` at load time under the secure default, so that
+    combined-offset path is not directly test-exercised beyond the existing
+    suite. The protected `ThinOp` enum / `em_file.hpp` format comments /
+    `thirdparty/` were NOT modified. Commit: see git log (`3a2a804`,
+    `235b8a6`).
 - **Self-hosting Stage 1 — lexer** (`ac7425f`) — `self_hosted/lex.ember`
   (910 lines) + `lex_test.ember`.
 - **Self-hosting Stage 2 — parser** (`0022102` + `bfa1ffe`) —

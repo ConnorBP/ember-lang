@@ -316,3 +316,58 @@ passes — each with a named re-entry trigger that hasn't fired.
 the source files (`src/`, `extensions/`), and the cited audit docs. No source files were edited.
 This document is the consolidated action list; the individual audit docs remain the detailed
 record.*
+
+---
+
+## 5. Post-dating update — 2026-07-13 (Finding C closed; appended, historical context preserved)
+
+**This section is a post-dating append.** Everything above is the 2026-07-11 read-only
+synthesis at revision `5df97f2` and is left intact as the dated historical record. This
+addendum records a later closure so the canonical todo record stays current; it does not
+rewrite any 2026-07-11 content.
+
+### Selected item implemented: Finding C — deserialized Thin IR rbp-relative full-span validation
+
+The 2026-07-11 synthesis above lists **S1 (CRITICAL)** — the v5 IR `frame_off` validation gap
+(return-address overwrite) — as **FIXED** at `d25cc8c` (§0.2), noting the fix "now checks
+`frame_off != 0` for ALL instructions." That fix closed the **base-offset** path of Finding A.
+`docs/audit/FINAL_EM_REDTEAM_2026-07-11.md` §4 then identified the **sibling hole, Finding C
+(HIGH→CRITICAL)**: the frame-plan offsets (`rbx_save_offset`, `struct_ret_ptr_offset`,
+`params[].off`) and the actual read/write **span** (not just the base offset) at `[rbp + off]`
+were still unvalidated — the same return-address-overwrite primitive via sibling offsets and
+short-negative bases (e.g. `frame_off = -1` writes 8 bytes to `[rbp-1, rbp+7)`, overwriting
+saved rbp / the return address even though `-1` is in `[-frame_size, 0)`). Finding C was the
+selected deferred item; it is now **CLOSED** across two focused cycles:
+
+| Half | Commit | Scope |
+|------|--------|-------|
+| Frame-plan full-span | `3a2a804` (2026-07-13 14:00 EDT) | `rbx_save_offset` / `struct_ret_ptr_offset` / `params[].off` full-span validation against `[-frame_size, 0)` (`frame_plan_span_ok` helper); low-end bound always applied so `frame_size == 0` rejects every non-zero offset (Finding A cases A1/A2 preserved). |
+| Per-instruction full-span + args + data_temp | `235b8a6` (2026-07-13 15:30 EDT) | Per-op full-span validation of every rbp-relative `frame_off` / `field_off` / `data_temp_off` access (`instr_frame_span_ok` + `dst_spill_span`, per-op 1/2/4/8/16-byte widths derived from exact `thin_emit.cpp` behavior); `arg_frame_offs[]` validation; computed-address ops (`StoreAddr`, `StoreFrame src2!=0`, `IndexAddr`, `MakeSlice`) EXCLUDED (displacement from a runtime pointer, not an rbp-relative frame access). |
+
+**Shipped validation behavior:** `validate_thin_function` now rejects any deserialized v5 IR
+blob whose rbp-relative frame-plan OR per-instruction offset has a read/write span crossing
+either frame boundary, BEFORE re-emit and BEFORE executable page allocation. Computed-address
+displacements are distinguished from rbp-relative frame accesses and are not wrongly rejected.
+
+**Test coverage shipped:**
+- `examples/thin_ir_ser_test.cpp` — Part 4 (7 Finding C frame-plan cases, c1) + Part 5
+  `frame_span_arg_validation` (19 cases: 7 full-span malformed + 5 legitimate negative
+  controls + 3 computed-address distinction + 4 `arg_frame_offs`, c2). Parts 1-5 all green.
+- `examples/em_v5_ir_test.cpp` — case (f): loader-level proof a span-crossing `frame_off`
+  ir_blob is rejected by `validate_thin_function` BEFORE any executable page is allocated
+  (`!ok && pages.empty()`).
+
+**Full verification status (post-c2, HEAD `235b8a6`):** `cmake --build buildt -j 8` → exit 0;
+`ctest --test-dir buildt --timeout 120` → **70/70 PASS** (incl. bench + soak), no regressions
+vs. the pre-fix baseline; `ember_cli.exe run tests/lang/optimization_validation.ember --fn main
+--passes constprop,forward,copyprop,instcombine,dce,licm,dse` → **exit 177** (the required
+sentinel). Commit: see git log (`3a2a804`, `235b8a6`).
+
+**Residual limitation (not claimed broader than implemented):** the `StructLitInit` /
+`ArrayLitInit` combined-offset (`frame_off + field_off`) full-span check is included for
+defense-in-depth, but those ops only appear in `non_serializable` (`is_ir = 0`) functions
+that never reach `validate_thin_function` at load time under the secure default, so that
+combined-offset path is not directly test-exercised beyond the existing suite. No known gap
+remains in the per-instruction rbp-relative frame-access validation surface itself. The
+protected serialization boundaries (`src/thin_ir.hpp` `ThinOp` enum, `src/em_file.hpp` format
+comments) and `thirdparty/` were NOT modified.
