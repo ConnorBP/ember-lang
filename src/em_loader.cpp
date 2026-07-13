@@ -724,6 +724,23 @@ bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
         // the documented no-op rather than silently changing the IR policy.
         ictx.safe_defaults();
 
+        // X1 redesign (SANDBOX_REVALIDATION_2026-07-12_ROUND2 / EM_FORMAT_RED
+        // _TEAM_2026-07-11): build the per-module dispatch-slot counts ONCE
+        // before the re-emit loop so every validate_thin_function call can
+        // range-check each CallCrossModule's meta.slot against the TARGET
+        // module's actual dispatch-table size (not the prior arbitrary 10000
+        // ceiling, which accepted slots 1..9999 against a one-slot target ->
+        // OOB dispatch read -> wild call). The registry is stable during a load
+        // (no registration happens inside the loop), so the snapshot is valid
+        // for every function. With no registry the vector stays empty and the
+        // validator fails closed on CallCrossModule (registry_size == 0).
+        std::vector<int64_t> cross_module_slot_counts;
+        if (registry) {
+            cross_module_slot_counts.reserve(registry->count());
+            for (uint32_t i = 0; i < registry->count(); ++i)
+                cross_module_slot_counts.push_back(registry->dispatch_slot_count(i));
+        }
+
         for (auto& pf : parsed.functions) {
             if (!pf.is_ir) continue;  // raw-x86 fallback — skip (re-emit IR only)
             ThinFunction thf;
@@ -792,7 +809,8 @@ bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
             // slots can be range-checked against the host's tables.
             std::string verr;
             if (!validate_thin_function(thf, &verr, uint32_t(staged.dispatch.size()),
-                                        registry ? registry->count() : 0u)) {
+                                        registry ? registry->count() : 0u,
+                                        cross_module_slot_counts.data())) {
                 set_error(err, "em_loader: v5 IR: validation failed for \"" +
                                pf.name + "\": " + verr);
                 return false;

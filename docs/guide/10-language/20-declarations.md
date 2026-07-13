@@ -30,20 +30,16 @@ fn add(a: i64, b: i64) -> i64 {
 }
 ```
 
-Parameters are comma-separated `name: type` pairs. There is no by-value struct parameter: structs
-cannot be passed by value across a function call boundary in v1, so a function that logically operates
-on a struct's fields takes those fields as separate scalar parameters instead.
+Parameters are comma-separated `name: type` pairs. Structs **can** be passed by value across a function call boundary (shipped 2026-07-10). A struct ≤8 bytes is passed in one register; a struct >8 bytes uses the Win64 hidden-pointer by-value path. A native by-value arg is rejected only if its registered struct size exceeds 128 bytes. A fn can `return V3 { ... };` directly and pass a struct literal / struct-returning call as a by-value arg. See `docs/spec/TYPE_SYSTEM.md` §12 + `docs/spec/CODEGEN_SPEC.md` §16.
 
 ```ember
-struct Shape {
-    kind: i64;
-    a: f32;
-    b: f32;
+struct Rect {
+    width: f32;
+    height: f32;
 }
 
-// NOT fn area(s: Shape) -> f32 { ... } - takes the fields directly instead.
-fn area(kind: i64, a: f32, b: f32) -> f32 {
-    return a * b;
+fn rect_area(r: Rect) -> f32 {
+    return r.width * r.height;
 }
 ```
 
@@ -86,7 +82,7 @@ struct Name {
 }
 ```
 
-Fields are separated by semicolons, not commas. Struct layout follows MSVC x64 rules. Structs cannot
+Fields are separated by semicolons, not commas. Struct layout follows **Ember's tight-packed layout**: fields are placed in declaration order at consecutive offsets with no alignment padding and no trailing padding (the offset of each field is the sum of the previous fields' Ember sizes; `build_struct_layouts` in `src/sema.cpp`). This is **not** MSVC/C layout; a host that needs a C-layout struct uses an explicit host-mapped struct (`docs/spec/BINDING_API.md`). Structs cannot
 be self-referential (a field whose type is, directly or indirectly, the struct itself is a compile
 error), and an empty struct is legal (size 0, align 1).
 

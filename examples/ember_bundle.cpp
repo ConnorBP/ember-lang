@@ -375,6 +375,10 @@ static bool compile_to_em_module(const fs::path& file,
     std::string reg_err;
     uint32_t self_id = registry.register_module("__main__", table.base(), &reg_err);
     (void)self_id;
+    // X1 redesign: publish __main__'s dispatch-table slot count so a linked
+    // v5 .em that calls back into the bundler's host module via CallCrossModule
+    // range-checks its slot against the REAL host dispatch size at load time.
+    registry.set_dispatch_slot_count(self_id, int64_t(table.slots.size()));
 
     // emit-em path: no trap stub, no context reg, no budget/depth checks.
     // The .em is pre-compiled trusted code; the stub loads it raw.
@@ -559,10 +563,16 @@ int command(int argc, char** argv) {
         return 2;
     }
 
-    // ---- copy stub -> output.exe ----
-    // Default policy is deterministic: the output receives the prebuilt
-    // stub's portable filesystem permission bits. `preserve` is useful when
-    // replacing an already-deployed path whose owner/group mode was curated.
+    // ---- publish: write the full bundle to a same-directory temp file,
+    //      flush/close successfully, then atomically replace the destination ----
+    // The prior implementation copied the stub over output_file FIRST and then
+    // appended the .em + footer in place; an append-open or write failure left
+    // output_file as a truncated stub (a partial replacement) and the original
+    // output was destroyed by the initial overwrite. The atomic temp-then-
+    // rename below preserves an existing output on ANY failure path: the temp
+    // is the only file mutated, and it is renamed over the destination only
+    // after a successful flush+close. RAII removes the temp on every early
+    // return so a crashed/errored bundle never leaves a stale temp behind.
     fs::perms output_perms = fs::perms::unknown;
     if (preserve_output_permissions && fs::exists(output_file, ec) && !ec) {
         output_perms = fs::status(output_file, ec).permissions();
@@ -578,24 +588,35 @@ int command(int argc, char** argv) {
             return 2;
         }
     }
+
+    // Same-directory temp so the final rename is same-volume (atomic).
+    const fs::path temp_file = output_file.string() + ".ember-bundle-tmp";
+    // RAII: remove the temp on scope exit unless release()d after a successful
+    // rename. Uses the non-throwing remove so a cleanup race cannot terminate.
+    struct TempGuard {
+        fs::path path;
+        bool keep = false;
+        ~TempGuard() {
+            if (!keep) { std::error_code r; fs::remove(path, r); }
+        }
+    } temp_guard{temp_file, false};
+    // Belt-and-suspenders: if a previous crashed bundle left a stale temp,
+    // remove it before we reuse the path (ignore failure — we'll catch a real
+    // copy failure next).
+    { std::error_code r; fs::remove(temp_file, r); }
+
     ec.clear();
-    fs::copy_file(stub, output_file, fs::copy_options::overwrite_existing, ec);
+    fs::copy_file(stub, temp_file, fs::copy_options::overwrite_existing, ec);
     if (ec) {
-        std::fprintf(stderr, "ember_bundle: copy stub failed: %s\n", ec.message().c_str());
+        std::fprintf(stderr, "ember_bundle: copy stub to temp failed: %s\n", ec.message().c_str());
         return 2;
     }
 
-    fs::permissions(output_file, output_perms, fs::perm_options::replace, ec);
-    if (ec) {
-        std::fprintf(stderr, "ember_bundle: cannot apply output permissions: %s\n", ec.message().c_str());
-        fs::remove(output_file, ec);
-        return 2;
-    }
-
-    // ---- append the .em + footer to output.exe ----
-    std::ofstream out(output_file, std::ios::binary | std::ios::app);
+    // Append the .em + footer to the temp (open in append mode so the stub
+    // bytes already on disk are preserved; the copy above wrote them).
+    std::ofstream out(temp_file, std::ios::binary | std::ios::app);
     if (!out) {
-        std::fprintf(stderr, "ember_bundle: cannot open output for append: %s\n", output_file.u8string().c_str());
+        std::fprintf(stderr, "ember_bundle: cannot open temp for append: %s\n", temp_file.u8string().c_str());
         return 2;
     }
     out.write(reinterpret_cast<const char*>(em_bytes.data()),
@@ -612,6 +633,31 @@ int command(int argc, char** argv) {
         return 2;
     }
     out.close();
+    if (!out) {  // close can also surface a delayed write error
+        std::fprintf(stderr, "ember_bundle: I/O error closing bundle\n");
+        return 2;
+    }
+
+    // Apply the chosen permission bits to the temp before the rename so the
+    // published destination never appears with the wrong mode.
+    fs::permissions(temp_file, output_perms, fs::perm_options::replace, ec);
+    if (ec) {
+        std::fprintf(stderr, "ember_bundle: cannot apply output permissions: %s\n", ec.message().c_str());
+        return 2;  // temp removed by RAII; original output untouched
+    }
+
+    // Atomically replace the destination with the completed temp. On the
+    // same volume this is a single MoveFileExW(MOVEFILE_REPLACE_EXISTING) /
+    // rename(2) — the destination is replaced in one step or not at all, so a
+    // reader never observes a half-written bundle and an existing output is
+    // preserved on rename failure.
+    ec.clear();
+    fs::rename(temp_file, output_file, ec);
+    if (ec) {
+        std::fprintf(stderr, "ember_bundle: atomic replace failed: %s\n", ec.message().c_str());
+        return 2;  // temp removed by RAII; original output untouched
+    }
+    temp_guard.keep = true;  // rename succeeded — temp is now the destination
 
     std::printf("ember_bundle: wrote %s (%zu .em bytes, %zu fns, entry slot %u, fn=%s, permissions=%s, output-permissions=%s)\n",
                 output_file.u8string().c_str(), em_bytes.size(), emod.functions.size(),

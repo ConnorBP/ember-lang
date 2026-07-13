@@ -414,6 +414,103 @@ static bool validation_edge_cases() {
         if (validate_thin_function(bad, &verr, 0, 1)) return false;  // registry_size=1
         if (verr.find("mod_id out of range") == std::string::npos) return false;
     }
+    // X1 redesign (SANDBOX_REVALIDATION_2026-07-12_ROUND2 / EM_FORMAT_RED_TEAM
+    // 2026-07-11): CallCrossModule::slot indexes the TARGET module's dispatch
+    // table directly, so the real bound is that target's dispatch size — NOT
+    // the prior arbitrary 10000 ceiling. The per-module dispatch-slot counts
+    // arrive via cross_module_slot_counts (length registry_size).
+    // Control: valid mod_id=0, valid slot=0, target publishes 1 dispatch slot
+    // -> ACCEPTED (the prior 10000 ceiling also accepted this; the fix must
+    // not over-reject a legitimate cross-module direct dispatch).
+    {
+        auto good = base;
+        ThinInstr cm;
+        cm.op = ThinOp::CallCrossModule;
+        cm.dst = 4;
+        cm.meta.mod_id = 0;   // valid: registry_size will be 1
+        cm.meta.slot = 0;     // valid: target_slot_count will be 1
+        good.blocks[0].instrs.push_back(cm);
+        std::string verr;
+        int64_t counts[1] = {1};  // module 0 publishes a 1-slot dispatch table
+        if (!validate_thin_function(good, &verr, 0, 1, counts)) return false;
+    }
+    // X1: valid mod_id=0, slot=1 (>= target's 1-slot dispatch size) -> REJECTED.
+    // This is the hole: the prior 10000 ceiling ACCEPTED slot=1 against a
+    // one-slot target, emit_cross_module_call read dispatch[1] OOB -> wild call.
+    {
+        auto bad = base;
+        ThinInstr cm;
+        cm.op = ThinOp::CallCrossModule;
+        cm.dst = 4;
+        cm.meta.mod_id = 0;
+        cm.meta.slot = 1;    // >= target_slot_count (1)
+        bad.blocks[0].instrs.push_back(cm);
+        std::string verr;
+        int64_t counts[1] = {1};
+        if (validate_thin_function(bad, &verr, 0, 1, counts)) return false;
+        if (verr.find("slot out of range") == std::string::npos) return false;
+    }
+    // X1: a large slot (9999) that the prior 10000 ceiling would have ACCEPTED
+    // against a one-slot target -> REJECTED with the per-module count.
+    {
+        auto bad = base;
+        ThinInstr cm;
+        cm.op = ThinOp::CallCrossModule;
+        cm.dst = 4;
+        cm.meta.mod_id = 0;
+        cm.meta.slot = 9999;  // < old 10000 ceiling, >= target's 1-slot size
+        bad.blocks[0].instrs.push_back(cm);
+        std::string verr;
+        int64_t counts[1] = {1};
+        if (validate_thin_function(bad, &verr, 0, 1, counts)) return false;
+        if (verr.find("slot out of range") == std::string::npos) return false;
+    }
+    // X1: a target that published a 0 dispatch size (opted out of being a
+    // cross-module dispatch target) rejects every non-negative slot.
+    {
+        auto bad = base;
+        ThinInstr cm;
+        cm.op = ThinOp::CallCrossModule;
+        cm.dst = 4;
+        cm.meta.mod_id = 0;
+        cm.meta.slot = 0;    // non-negative, but target has 0 slots
+        bad.blocks[0].instrs.push_back(cm);
+        std::string verr;
+        int64_t counts[1] = {0};
+        if (validate_thin_function(bad, &verr, 0, 1, counts)) return false;
+        if (verr.find("slot out of range") == std::string::npos) return false;
+    }
+    // X1: negative slot is never a valid dispatch index.
+    {
+        auto bad = base;
+        ThinInstr cm;
+        cm.op = ThinOp::CallCrossModule;
+        cm.dst = 4;
+        cm.meta.mod_id = 0;
+        cm.meta.slot = -1;
+        bad.blocks[0].instrs.push_back(cm);
+        std::string verr;
+        int64_t counts[1] = {1};
+        if (validate_thin_function(bad, &verr, 0, 1, counts)) return false;
+        if (verr.find("slot out of range") == std::string::npos) return false;
+    }
+    // X1 fail-closed: a valid mod_id + non-negative slot but NO per-module
+    // counts (cross_module_slot_counts == nullptr) -> REJECTED. The slot cannot
+    // be range-checked against the real target, so the validator fails closed
+    // rather than trusting the old arbitrary 10000 ceiling (the ceiling was
+    // the bug — it accepted slots 1..9999 against a one-slot target).
+    {
+        auto bad = base;
+        ThinInstr cm;
+        cm.op = ThinOp::CallCrossModule;
+        cm.dst = 4;
+        cm.meta.mod_id = 0;
+        cm.meta.slot = 0;    // non-negative — would be valid IF the target had >=1 slot
+        bad.blocks[0].instrs.push_back(cm);
+        std::string verr;
+        if (validate_thin_function(bad, &verr, 0, 1)) return false;  // no counts
+        if (verr.find("slot out of range") == std::string::npos) return false;
+    }
     // P4: Cmp predicate out of range (> 5).
     {
         auto bad = base;
@@ -1127,7 +1224,7 @@ int main() {
 
     // Part 4: validation edge cases (the audit-found checks).
     std::printf("Part 4: validation edge cases (C1/C2/P2/P3/P4/P7 + Finding C frame-plan full-span)\n");
-    check(validation_edge_cases(), "all validation edge cases rejected (bad block.id, empty native_name, rodata OOB, slot OOB, mod_id OOB, bad cmp, bad frame_size, bad rbx_save_offset, VReg exceeds declared bound, negative len rodata, negative len BoundsCheck, frame_off OOB, Finding C frame-plan offsets [param.off=+8, struct_ret_ptr=+8, slice span reaches rbp, rbx span reaches rbp, inflated nwords, below-frame off])");
+    check(validation_edge_cases(), "all validation edge cases rejected (bad block.id, empty native_name, rodata OOB, slot OOB, mod_id OOB, bad cmp, bad frame_size, bad rbx_save_offset, VReg exceeds declared bound, negative len rodata, negative len BoundsCheck, frame_off OOB, Finding C frame-plan offsets [param.off=+8, struct_ret_ptr=+8, slice span reaches rbp, rbx span reaches rbp, inflated nwords, below-frame off], X1 CallCrossModule slot vs target dispatch size [valid slot accepted, slot>=target_count rejected, 9999 vs 1-slot rejected, 0-slot target rejected, negative slot rejected, no-counts fail-closed])");
 
     // Part 5: instr-level frame_off full-span + arg_frame_offs + data_temp_off
     // + computed-address distinction (the Finding C residual: per-instruction

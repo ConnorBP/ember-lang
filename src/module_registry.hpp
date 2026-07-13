@@ -166,6 +166,36 @@ public:
     // record (null dispatch / 0 slot_count) for an out-of-range id.
     ModuleHandleRecord handle_record(uint32_t module_id) const;
 
+    // v5 IR CallCrossModule dispatch-slot validation (X1 redesign,
+    // SANDBOX_REVALIDATION_2026-07-12_ROUND2 / EM_FORMAT_RED_TEAM_2026-07-11):
+    // each registered module's ACTUAL dispatch-table slot count, stored
+    // INDEPENDENTLY of the function-handle allowlist (handle_records_.slot_count
+    // above). A v5 IR `CallCrossModule` instr indexes the target module's
+    // dispatch table directly at `meta.slot` (emit_cross_module_call:
+    // `mov r11,[registry+mod_id*8]; mov r11,[r11+slot*8]; call r11`); the prior
+    // validator only range-checked `slot` against an arbitrary 10000 ceiling,
+    // so a one-slot target still accepted slots 1..9999 -> OOB dispatch read
+    // -> wild call. The real bound is the TARGET module's dispatch size, which
+    // the linker publishes here via set_dispatch_slot_count immediately after
+    // register_module (link_em_file sets it from LoadedModule::dispatch.size();
+    // the JIT hosts set it from the DispatchTable slot count). The loader reads
+    // these counts and passes them into validate_thin_function, which rejects
+    // `slot < 0 || slot >= target_slot_count` before any executable page is
+    // allocated.
+    //
+    // A module that did not publish its dispatch size (count == 0) cannot be
+    // the validated target of a CallCrossModule — the validator fails closed
+    // (every slot is OOB against a 0-count target). This is the secure
+    // default; link_em_file and the JIT hosts opt in by publishing the real
+    // count. Returns 0 for an out-of-range id (consistent with handle_record).
+    int64_t dispatch_slot_count(uint32_t module_id) const;
+    // Publish module_id's dispatch-table slot count. Called by the linker /
+    // JIT host AFTER register_module returned the id (the count is the number
+    // of entries in the dispatch table whose base was just registered). A
+    // negative count is rejected (clamped to 0). Out-of-range id is a no-op
+    // (defensive; register_module returned UINT32_MAX on failure).
+    void set_dispatch_slot_count(uint32_t module_id, int64_t count);
+
     // Find a module_id by name (Section 2 `find_by_name`, used by the linker stage
     // Section 5, not the hot call path). Returns UINT32_MAX if not registered.
     uint32_t find_by_name(const std::string& name) const;
@@ -179,6 +209,7 @@ private:
     std::vector<void*>     entries_;                 // entries_[id] = DispatchTable base
     std::vector<std::string> names_;                 // names_[id] = module name
     std::vector<ModuleHandleRecord> handle_records_; // handle_records_[id] = (dispatch, allowlist, slot_count)
+    std::vector<int64_t>        dispatch_slot_counts_;  // dispatch_slot_counts_[id] = target's dispatch size (X1)
     std::unordered_map<std::string, uint32_t> by_name_;  // name -> id (reload keeps id)
     uint32_t next_id_ = 0;                           // == count() while dense
 };

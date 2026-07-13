@@ -171,6 +171,19 @@ bool deserialize_thin_function(const uint8_t*& cur, const uint8_t* end,
 //     rodata.size().
 //   - CallScript slot < dispatch_size (if dispatch_size > 0).
 //   - CallCrossModule mod_id < registry_size (if registry_size > 0).
+//   - CallCrossModule slot < target_dispatch_slot_count (X1 redesign,
+//     SANDBOX_REVALIDATION_2026-07-12_ROUND2 / EM_FORMAT_RED_TEAM_2026-07-11):
+//     `slot` indexes the TARGET module's dispatch table directly, so the real
+//     bound is that target's dispatch size, NOT an arbitrary ceiling. The
+//     per-module dispatch-slot counts arrive via `cross_module_slot_counts`
+//     (length `registry_size`; `cross_module_slot_counts[mod_id]` = the target's
+//     dispatch size). When `cross_module_slot_counts == nullptr` the slot
+//     cannot be range-checked against the real target, so every CallCrossModule
+//     with a non-negative slot is REJECTED (fail-closed — the prior arbitrary
+//     10000 ceiling accepted slots 1..9999 against a one-slot target, an OOB
+//     dispatch read followed by a wild call). A target that published a 0
+//     dispatch size rejects every slot (the module opted out of being a
+//     cross-module dispatch target).
 //   - Cmp predicate in [0,5] (Eq..Ge).
 //   - CallNative has a non-empty native_name (the rebind gate relies on this).
 //   - Frame plan sanity: frame_size in [0, 1MB]; every rbp-relative frame-plan
@@ -194,6 +207,11 @@ bool deserialize_thin_function(const uint8_t*& cur, const uint8_t* end,
 // `dispatch_size` and `registry_size` are the host's dispatch table size and
 // module registry size (0 = unknown / no check; the loader passes the real
 // values so CallScript/CallCrossModule slots can be range-checked).
+// `cross_module_slot_counts` (optional, length `registry_size`) carries each
+// registered module's actual dispatch-table slot count for the
+// CallCrossModule slot range check (X1); `nullptr` = fail-closed on any
+// CallCrossModule slot that is non-negative (see above). The loader builds
+// this array from the ModuleRegistry before the v5 re-emit loop.
 //
 // NOTE: native-name rebinding (looking up meta.native_name in the host table
 // and setting native_fn) is a SEPARATE step the loader performs between
@@ -203,6 +221,7 @@ bool deserialize_thin_function(const uint8_t*& cur, const uint8_t* end,
 // gate (a CallNative with no name is malformed and rejected here).
 bool validate_thin_function(const ThinFunction& thf, std::string* err,
                             uint32_t dispatch_size = 0,
-                            uint32_t registry_size = 0);
+                            uint32_t registry_size = 0,
+                            const int64_t* cross_module_slot_counts = nullptr);
 
 } // namespace ember

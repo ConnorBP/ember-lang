@@ -28,6 +28,13 @@ ModuleRegistry::ModuleRegistry(uint32_t capacity)
     // unregistered id has a null dispatch / 0 slot_count (a cross-module handle
     // into it fails the guard's range or slot_count check and traps).
     handle_records_.assign(static_cast<size_t>(capacity), ModuleHandleRecord{nullptr, nullptr, 0});
+    // X1 redesign: size the per-module dispatch-slot-count array up front too
+    // (same stability invariant — sized at construction, filled by index, never
+    // grown). Zero-filled so an unregistered/unpublished id has a 0 dispatch
+    // size and a CallCrossModule into it fails the validator's slot range
+    // check (the secure default — a module that did not publish its dispatch
+    // size cannot be the validated target of a cross-module direct dispatch).
+    dispatch_slot_counts_.assign(static_cast<size_t>(capacity), 0);
 }
 
 uint32_t ModuleRegistry::register_module(const std::string& name,
@@ -104,6 +111,20 @@ uint32_t ModuleRegistry::handle_records_count() const { return next_id_; }
 ModuleHandleRecord ModuleRegistry::handle_record(uint32_t module_id) const {
     if (module_id >= next_id_) return ModuleHandleRecord{nullptr, nullptr, 0};
     return handle_records_[module_id];
+}
+
+// v5 IR CallCrossModule dispatch-slot validation (X1 redesign). See the header
+// docstring for the threat model. These mirror handle_record's range-checked,
+// zero-on-out-of-range shape so a host can read a count for any id without a
+// separate count() guard.
+int64_t ModuleRegistry::dispatch_slot_count(uint32_t module_id) const {
+    if (module_id >= next_id_) return 0;
+    return dispatch_slot_counts_[module_id];
+}
+
+void ModuleRegistry::set_dispatch_slot_count(uint32_t module_id, int64_t count) {
+    if (module_id >= next_id_) return;  // defensive; register_module failed
+    dispatch_slot_counts_[module_id] = (count > 0) ? count : 0;
 }
 
 } // namespace ember

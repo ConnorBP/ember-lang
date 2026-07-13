@@ -121,6 +121,12 @@ inline bool link_em_file(ModuleRegistry& reg, const char* path, const std::strin
     if (!load_em_file(path, out, err, &reg, natives, verify, load_policy)) return false;
     uint32_t id = reg.register_module(name, out.dispatch.data(), err);
     if (id == UINT32_MAX) return false;
+    // X1 redesign: publish the loaded module's dispatch-table slot count so a
+    // v5 IR CallCrossModule into this module range-checks meta.slot against
+    // its REAL dispatch size at load time (the loader threads
+    // dispatch_slot_count into validate_thin_function). Without this a
+    // cross-module caller could index out of this module's dispatch table.
+    reg.set_dispatch_slot_count(id, int64_t(out.dispatch.size()));
     return true;
 }
 

@@ -187,12 +187,12 @@ let idx: u32 = 2u;
 let v: i32 = values[idx];
 ```
 
-> **WARNING:** Indexing is **not** bounds-checked, at compile time or at runtime. An out-of-range index is undefined behavior: a small stray index silently reads or writes whatever memory happens to sit next to the array on the stack, and a large enough one raises a hardware access violation. There is no compile-time check either, even when both the array's size and the index are constants known at compile time. Double-check index arithmetic yourself; the language will not catch a mistake here for you.
+> Indexing **is bounds-checked**. `arr[i]` compiles to a single unsigned `cmp idx, len; jae .oob_trap` before the address computation, and an out-of-range index (including a negative signed index, which appears as a huge unsigned value under the unsigned compare) traps via `TrapReason::BoundsCheck` — a recoverable non-local unwind to the host, not undefined behavior. A compile-time-constant *literal* index into a fixed array of known size is checked at **compile time** instead (a sema error, zero runtime cost). A `const`-named index (e.g. `const N: u64 = 4; arr[N]`) is not folded by sema and instead traps at runtime — still not UB. Keeping indices in range is still good practice (the trap aborts the call). See `docs/spec/CODEGEN_SPEC.md` §9 + `docs/spec/SAFETY_AND_SANDBOX.md` §5.
 
 ```ember
 const N: u64 = 4;
 let arr: i32[4] = [10, 20, 30, 40];
-let bad: i32 = arr[N];   // compiles without error, despite N == arr's own length - undefined behavior at runtime
+let bad: i32 = arr[N];   // N is a const, not folded -> traps at runtime with TrapReason::BoundsCheck (not UB)
 ```
 
 ## Field Access

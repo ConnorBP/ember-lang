@@ -1135,7 +1135,7 @@ separate sub-registration functions, still future).
   action). Pinned by the same `ember_cli_pipe_live` ctest +
   `tests/features/live_tick.ember`.
 
-### Standalone exe bundler — TODO
+### Standalone exe bundler — SHIPPED
 
 - **Standalone exe bundler** — **✓ SHIPPED (v1.0, `ember bundle` CLI in v1.1).**
   Bundle a `.ember` script + the ember runtime + the JIT'd code into a single

@@ -203,7 +203,7 @@ fn open_and_use() -> i64 {
 
 `defer` is scoped to the block it appears in: a `defer` inside an inner `{ }` block fires when that inner block is exited (including via `return`, `break`, or `continue` out of it), not only when the whole function ends.
 
-> **WARNING:** `defer` does not run on a trap or abort-unwind. If the deferred cleanup is something that must happen even when the script hits a runtime trap (a failed `assert_eq_*`, a divide-by-zero, and so on), do not rely on `defer` alone, this is a deliberate v1 limitation, not an oversight. `defer` only guarantees cleanup on the normal control-flow exits: fallthrough, `return`, `break`, and `continue`. Note that an out-of-bounds array or slice index is not one of the cases that traps at all, indexing is not bounds-checked, so it neither traps nor runs pending `defer`s; it simply reads or writes past the end of the array.
+> **WARNING:** `defer` does not run on a trap or abort-unwind. If the deferred cleanup is something that must happen even when the script hits a runtime trap (a failed `assert_eq_*`, a divide-by-zero, and so on), do not rely on `defer` alone, this is a deliberate v1 limitation, not an oversight. `defer` only guarantees cleanup on the normal control-flow exits: fallthrough, `return`, `break`, and `continue`. Note that an out-of-bounds array or slice index **does** trap (`TrapReason::BoundsCheck`), so it is one of the cases where pending `defer`s do not run — the trap unwinds without running deferred cleanup, exactly like a divide-by-zero or a failed assertion. Indexing is bounds-checked at runtime (and at compile time for literal constant indices); see [40-expressions-operators.md](40-expressions-operators.md) §Indexing.
 
 ## Expression statements
 

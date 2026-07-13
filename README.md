@@ -159,7 +159,7 @@ ember emit-em <file.ember> <out.em>      # precompile without running
 ember bench <file.ember> [--fn NAME] [--iters N] [--warmup N]
 ember test [dir]                        # run every .ember file in <dir> (default tests/lang/)
 ember run --load-em <file.em> [--fn NAME]
-ember bundle <file.ember> <output.exe> [--stub <stub.exe>] [--fn NAME]   # bundle into standalone exe
+ember bundle <file.ember> <output.exe> [--stub <stub.exe>] [--fn NAME] [--permissions none|ffi] [--output-permissions stub|preserve]   # bundle into standalone exe
 ember pipe <config>                     # dataflow pipeline runner (Family C): load N .em modules, wire a stage graph, stream i64s through it
 ember live <file.ember> [--tick ...]    # live-coding/reload runner: recompile on file change, show tick output evolve
 ```
@@ -173,6 +173,12 @@ ember live <file.ember> [--tick ...]    # live-coding/reload runner: recompile o
   low byte but differ on whether bit 31 is cleared first.
 - `--fn` overrides the entry. `--dump` prints each compiled fn's slot, byte
   size, and reloc count. `--emit-em` precompiles to a `.em` bundle.
+- `--ffi` / `--allow-io` grant FFI permission: enable the I/O natives
+  (`print`, `println`, `print_i64`, `print_f64`, file/path natives). Without
+  it, an I/O native call is a compile-time sema error. `--allow-io` is an alias.
+- `--gc-env` allocates lambda closure environments on the tracing-GC heap
+  instead of stack-frame temporaries (off by default); needed for a by-value
+  lambda that escapes its defining scope without a use-after-scope.
 - `--tick` runs `@on_tick` fns + any `register_routine`-registered routines on a
   tick thread (its own `context_t`, isolated from the main thread) at
   `--tick-interval` ms (default 16); `--tick-count N` auto-stops after N ticks.

@@ -45,6 +45,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -159,20 +160,40 @@ int main(int argc, char** argv) {
     }
     // Subtraction form is deliberate: `footer_size + em_len` can wrap for a
     // malicious all-ones u64 footer. file_size is already known >= footer.
+    // The ember::MAX_FILE_SIZE cap is enforced BEFORE the allocation below:
+    // em_len is attacker-controlled (read straight from the appended footer)
+    // and the loader's own parse_file cap would only fire AFTER the stub had
+    // already allocated em_len bytes. Without this gate a malicious footer
+    // whose em_len is below size_t/streamsize max but far above the .em cap
+    // (e.g. 1 GiB vs the 256 MiB cap) drives an allocation-amplification / OOM
+    // DoS before load_em_bytes ever runs. Fail closed before the allocation.
     if (em_len == 0 || em_len > file_size - EM_BUNDLE_FOOTER_SIZE ||
+        em_len > ember::MAX_FILE_SIZE ||
         em_len > uint64_t(std::numeric_limits<size_t>::max()) ||
         em_len > uint64_t(std::numeric_limits<std::streamsize>::max())) {
         std::fprintf(stderr, "ember_stub: bad em_length in footer\n");
         return 2;
     }
 
-    // Read the .em (em_len bytes ending just before the footer).
+    // Read the .em (em_len bytes ending just before the footer). Position the
+    // file cursor at the start of the em blob first, then contain the
+    // allocation: even after the MAX_FILE_SIZE cap a hostile environment (low
+    // virtual memory) can still throw std::bad_alloc from the vector ctor, and
+    // std::length_error is not possible here (em_len <= size_t max is checked
+    // above) but bad_alloc must surface as a clean exit, not terminate.
     f.seekg(static_cast<std::streamoff>(file_size - EM_BUNDLE_FOOTER_SIZE - em_len));
     if (!f) {
         std::fprintf(stderr, "ember_stub: seek to em blob failed\n");
         return 2;
     }
-    std::vector<uint8_t> em_bytes(static_cast<size_t>(em_len));
+    std::vector<uint8_t> em_bytes;
+    try {
+        em_bytes.resize(static_cast<size_t>(em_len));
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "ember_stub: cannot allocate %llu bytes for em blob: %s\n",
+                     static_cast<unsigned long long>(em_len), e.what());
+        return 2;
+    }
     f.read(reinterpret_cast<char*>(em_bytes.data()), static_cast<std::streamsize>(em_len));
     if (!f || static_cast<uint64_t>(f.gcount()) < em_len) {
         std::fprintf(stderr, "ember_stub: short em read\n");

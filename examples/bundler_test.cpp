@@ -334,6 +334,114 @@ static bool test_overwrite(const std::string& bundler, const std::string& stub,
     return true;
 }
 
+// Stub MAX_FILE_SIZE cap regression (ember_stub_main.cpp): a valid EMBD footer
+// whose em_length exceeds ember::MAX_FILE_SIZE (256 MiB) but is below the
+// size_t/streamsize maxima MUST be rejected by the stub BEFORE it allocates
+// em_length bytes. The loader's own parse_file cap would only fire AFTER the
+// stub had already allocated, so a malicious footer with a 1 GiB em_length
+// (below size_t max but far above the .em cap) drove an allocation-amplification
+// / OOM DoS. The stub now checks `em_len <= ember::MAX_FILE_SIZE` before the
+// allocation and contains allocation exceptions.
+//
+// To exercise the MAX_FILE_SIZE gate specifically (not the file-size
+// consistency gate that precedes it), the on-disk file must be large enough
+// that `em_len <= file_size - 12` holds, so the cap clause is the one that
+// fires. We make the file logically MAX_FILE_SIZE+1 bytes with a SPARSE
+// resize_file (instant — no 256 MiB zero write), then append the 12-byte
+// footer; file_size - 12 == em_len == MAX_FILE_SIZE + 1 passes the
+// consistency check, and em_len > MAX_FILE_SIZE rejects on the cap.
+static bool test_stub_cap_rejects_oversized_footer(const std::string& stub,
+                                                   const fs::path& tmp) {
+    const fs::path out = tmp / "stub_cap.exe";
+    std::error_code ec;
+    fs::copy_file(stub, out, fs::copy_options::overwrite_existing, ec);
+    if (ec) { std::fprintf(stderr, "  stub_cap: copy stub failed: %s\n", ec.message().c_str()); return false; }
+    constexpr uint64_t CAP = 256ull * 1024ull * 1024ull;  // ember::MAX_FILE_SIZE
+    const uint64_t over_cap = CAP + 1;
+    // Sparse-extend the on-disk file to over_cap bytes (a hole — no real write).
+    fs::resize_file(out, over_cap, ec);
+    if (ec) { std::fprintf(stderr, "  stub_cap: resize_file failed: %s\n", ec.message().c_str()); return false; }
+    // Append the footer: u32 EMBD magic + u64 em_length = over_cap.
+    std::ofstream app(out, std::ios::binary | std::ios::app);
+    if (!app) { std::fprintf(stderr, "  stub_cap: cannot open for footer\n"); return false; }
+    const uint32_t magic = BUNDLE_MAGIC;
+    app.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+    app.write(reinterpret_cast<const char*>(&over_cap), sizeof(over_cap));
+    app.close();
+    if (!app) { std::fprintf(stderr, "  stub_cap: close failed\n"); return false; }
+    // Consistency: file_size - 12 == over_cap (so the size gate passes) and
+    // over_cap > CAP (so the MAX_FILE_SIZE gate fires).
+    const uint64_t fsize = fs::file_size(out, ec);
+    if (ec || fsize - BUNDLE_FOOTER_SIZE != over_cap) {
+        std::fprintf(stderr, "  stub_cap: bad file size %llu (expected %llu)\n",
+                     static_cast<unsigned long long>(fsize),
+                     static_cast<unsigned long long>(over_cap + BUNDLE_FOOTER_SIZE));
+        return false;
+    }
+    const int rc = run_bundled(out.string());
+    // PASS: the stub rejects with exit 2 BEFORE allocating ~over_cap bytes.
+    // (Without the cap the stub would attempt a ~256 MiB+ allocation + read;
+    // on a constrained host that is an OOM DoS. We assert the clean reject.)
+    if (rc != 2) { std::fprintf(stderr, "  stub_cap: expected exit 2, got %d\n", rc); return false; }
+    std::printf("  stub MAX_FILE_SIZE cap rejects oversized footer: PASS\n");
+    return true;
+}
+
+// Bundle failure-path regression (ember_bundle.cpp): a failed publish MUST
+// preserve an existing output. The bundler now writes the full bundle to a
+// same-directory temp file and atomically renames it over the destination only
+// after a successful flush+close; RAII removes the temp on every failure path.
+// The prior implementation copied the stub over output_file FIRST and then
+// appended in place, so an append-open/write failure left a partial stub and
+// destroyed the original. We inject a publish-step failure by pre-creating the
+// bundler's temp path (output + ".ember-bundle-tmp") as a NON-EMPTY directory:
+// the new code's `copy_file(stub, temp)` fails (cannot copy a file over a non-
+// empty directory) and returns 2, leaving the EXISTING output file untouched. A
+// reverted copy-then-append bundler would instead `copy_file(stub, output)` —
+// overwriting and destroying the existing output's sentinel content.
+static bool test_bundle_failure_preserves_existing_output(const std::string& bundler,
+                                                            const std::string& stub,
+                                                            const fs::path& tmp) {
+    const fs::path src = tmp / "failpub.ember", out = tmp / "failpub.exe";
+    const fs::path temp = fs::path(out.string() + ".ember-bundle-tmp");
+    if (!write_source(src, "fn main() -> i64 { return 42; }\n")) {
+        std::fprintf(stderr, "  failpub: cannot write source\n"); return false;
+    }
+    // 1. Create an EXISTING output with sentinel content.
+    {
+        std::ofstream os(out, std::ios::binary | std::ios::trunc);
+        if (!os) { std::fprintf(stderr, "  failpub: cannot create existing output\n"); return false; }
+        os << "ORIGINAL_OUTPUT_SENTINEL";
+    }
+    // 2. Pre-create the bundler's temp path as a NON-EMPTY directory so the
+    //    publish-step copy_file fails. (A marker file makes the dir non-empty,
+    //    so fs::remove cannot clear it and copy_file cannot overwrite it.)
+    std::error_code ec;
+    fs::create_directories(temp, ec);
+    if (ec) { std::fprintf(stderr, "  failpub: cannot create temp dir: %s\n", ec.message().c_str()); return false; }
+    {
+        std::ofstream mk(temp / "marker.txt", std::ios::binary);
+        mk << "keep";
+    }
+    // 3. Run the bundler. The compile succeeds (valid source); publish fails at
+    //    copy_file(stub, temp=non-empty-dir). Exit code must be 2.
+    const int brc = bundle(bundler, stub, src.string(), out.string());
+    if (brc != 2) {
+        std::fprintf(stderr, "  failpub: expected bundle exit 2 (publish failure), got %d\n", brc);
+        return false;
+    }
+    // 4. The EXISTING output MUST be preserved (sentinel content unchanged).
+    const std::string after = read_text(out);
+    if (after != "ORIGINAL_OUTPUT_SENTINEL") {
+        std::fprintf(stderr, "  failpub: existing output was NOT preserved (got: %s)\n", after.c_str());
+        return false;
+    }
+    std::printf("  bundle failure preserves existing output: PASS\n");
+    // cleanup the pre-created temp dir (the test owns it).
+    fs::remove_all(temp, ec);
+    return true;
+}
+
 static bool test_permission_policy(const std::string& bundler, const std::string& stub,
                                    const fs::path& tmp) {
     const fs::path src = tmp / "permissions.ember", out = tmp / "permissions.exe";
@@ -393,6 +501,8 @@ int main(int argc, char** argv) {
     all_ok &= test_large_module(bundler, stub, tmp);
     all_ok &= test_missing_entry(bundler, stub, tmp);
     all_ok &= test_overwrite(bundler, stub, tmp);
+    all_ok &= test_stub_cap_rejects_oversized_footer(stub, tmp);
+    all_ok &= test_bundle_failure_preserves_existing_output(bundler, stub, tmp);
     all_ok &= test_permission_policy(bundler, stub, tmp);
 
     // cleanup

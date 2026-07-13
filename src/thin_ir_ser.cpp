@@ -663,7 +663,8 @@ static int64_t dst_spill_span(const Type* ty, uint8_t is_f32, bool narrow_field,
 
 bool validate_thin_function(const ThinFunction& thf, std::string* err,
                             uint32_t dispatch_size,
-                            uint32_t registry_size) {
+                            uint32_t registry_size,
+                            const int64_t* cross_module_slot_counts) {
     const uint32_t num_blocks = static_cast<uint32_t>(thf.blocks.size());
     if (num_blocks == 0) {
         if (err) *err = "thin_ir_ser: validate: zero blocks";
@@ -996,20 +997,48 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err,
                 if (err) *err = "thin_ir_ser: validate: CallScript slot out of range";
                 return false;
             }
-            // A cross-module call indexes a target dispatch table directly in
-            // thin_emit. Validate both attacker-controlled indices before any
-            // executable page is emitted. Per-module slot counts are not part
-            // of this API yet, so use a conservative serialized-IR ceiling;
-            // negative values and displacement-overflow values are never valid.
-            constexpr int32_t MAX_CROSS_MODULE_SLOT = 10000;
+            // A cross-module call indexes the TARGET module's dispatch table
+            // directly in thin_emit (emit_cross_module_call: `mov r11,[r11+
+            // slot*8]` after the registry hop). Validate both attacker-
+            // controlled indices against the REAL host tables before any
+            // executable page is emitted.
+            //
+            // X1 redesign (SANDBOX_REVALIDATION_2026-07-12_ROUND2 /
+            // EM_FORMAT_RED_TEAM_2026-07-11): `meta.slot` is an int32 read
+            // straight from the attacker-controlled v5 ir_blob. The prior check
+            // range-checked it only against an arbitrary 10000 ceiling, so a
+            // registry whose target module published a one-slot dispatch table
+            // still accepted slots 1..9999 -> emit_cross_module_call read
+            // dispatch[slot] out of bounds -> wild call. The real bound is the
+            // TARGET module's actual dispatch-table slot count, which the loader
+            // threads in via cross_module_slot_counts (length registry_size;
+            // cross_module_slot_counts[mod_id] = the target's dispatch size).
+            // Fail closed: negative slot never valid; with no per-module counts
+            // the slot cannot be range-checked against the real target, so a
+            // non-negative slot is rejected (the 10000 ceiling was not
+            // conservative — it was the bug); a target that published a 0
+            // dispatch size rejects every slot (it opted out of being a
+            // cross-module dispatch target).
             if (in.op == ThinOp::CallCrossModule) {
                 if (registry_size == 0 || in.meta.mod_id < 0 ||
                     uint32_t(in.meta.mod_id) >= registry_size) {
                     if (err) *err = "thin_ir_ser: validate: CallCrossModule mod_id out of range";
                     return false;
                 }
-                if (in.meta.slot < 0 || in.meta.slot >= MAX_CROSS_MODULE_SLOT) {
+                if (in.meta.slot < 0) {
                     if (err) *err = "thin_ir_ser: validate: CallCrossModule slot out of range";
+                    return false;
+                }
+                if (cross_module_slot_counts == nullptr) {
+                    if (err) *err = "thin_ir_ser: validate: CallCrossModule slot out of range "
+                                   "(no per-module dispatch size to validate against)";
+                    return false;
+                }
+                const int64_t target_slot_count =
+                    cross_module_slot_counts[uint32_t(in.meta.mod_id)];
+                if (in.meta.slot >= target_slot_count) {
+                    if (err) *err = "thin_ir_ser: validate: CallCrossModule slot out of range "
+                                   "(>= target module dispatch size)";
                     return false;
                 }
             }

@@ -349,6 +349,140 @@ int main() {
             try_load_blob(bad_blob, natives, "instr frame_off span crosses rbp -> rejected, no exec page (Finding C residual)");
         }
     }
+    // (g) X1 (SANDBOX_REVALIDATION_2026-07-12_ROUND2 / EM_FORMAT_RED_TEAM_2026-07-11):
+    //     a hand-built v5 IR whose entry function contains a CallCrossModule
+    //     to a VALID registered target (mod_id=0) but with a slot (5) that
+    //     exceeds the target's published dispatch-table size (1) MUST be
+    //     rejected by the loader's validate_thin_function BEFORE any
+    //     executable page is allocated. The prior validator checked slot only
+    //     against an arbitrary 10000 ceiling, so a one-slot target accepted
+    //     slots 1..9999 -> emit_cross_module_call read dispatch[slot] OOB ->
+    //     wild call. The fix range-checks slot against the TARGET module's
+    //     real dispatch size (threaded in from the registry's
+    //     dispatch_slot_count). This is the loader-level fail-closed-before-
+    //     allocation proof.
+    {
+        ThinFunction xmod_thf;
+        xmod_thf.name = "xmod_caller";
+        xmod_thf.slot = 0;
+        xmod_thf.frame.frame_size = 16;
+        xmod_thf.frame.rbx_save_offset = -8;
+        xmod_thf.frame.next_local_off = 8;
+        ThinBlock blk;
+        blk.id = 0;
+        ThinInstr cm;
+        cm.op = ThinOp::CallCrossModule;
+        cm.dst = 1;            // result VReg (unused; < max_vreg=2)
+        cm.meta.mod_id = 0;   // valid: registry will have 1 module (id 0)
+        cm.meta.slot = 5;     // INVALID: target publishes a 1-slot dispatch table
+        cm.meta.base_kind = AbsFixup::ModuleRegistryBase;
+        cm.meta.frame_off = 0;  // no frame spill -> no frame_off check tripped
+        blk.instrs.push_back(cm);
+        blk.term.kind = TermKind::Return;
+        blk.term.ret = 0;     // void return
+        xmod_thf.blocks.push_back(std::move(blk));
+        std::vector<uint8_t> xmod_blob;
+        std::string xse;
+        if (!serialize_thin_function(xmod_thf, xmod_blob, &xse)) {
+            std::printf("  [SKIP] X1 slot OOB: serializer rejected (%s)\n", xse.c_str());
+        } else {
+            // Build a v5 .em whose entry is the cross-module caller.
+            EmModule xmod;
+            EmFunctionRecord rec;
+            rec.name = "xmod_caller";
+            rec.slot_index = 0;
+            rec.ir_blob = xmod_blob;
+            rec.signature.ret = Type{};  // void
+            xmod.functions.push_back(std::move(rec));
+            xmod.globals = {};
+            xmod.entry_slot = 0;
+            xmod.name_table.emplace_back("xmod_caller", 0u);
+            auto xpath = std::filesystem::temp_directory_path() / "em_v5_xmod_slot_oob.em";
+            std::string xwe;
+            if (!write_em_file_v5(xmod, xpath.string().c_str(), &xwe)) {
+                std::printf("  [SKIP] X1 slot OOB: writer rejected (%s)\n", xwe.c_str());
+                std::filesystem::remove(xpath);
+            } else {
+                std::unordered_map<std::string, NativeSig> empty_natives;
+                // Registry with one registered target that published a 1-slot
+                // dispatch table. The loader snapshots dispatch_slot_count(0)=1
+                // into cross_module_slot_counts and the validator rejects
+                // slot=5 >= 1.
+                ModuleRegistry reg(4);
+                std::string rerr;
+                uint32_t target_id = reg.register_module("target",
+                    reinterpret_cast<void*>(uintptr_t(0xCAFE)), &rerr);
+                if (target_id == UINT32_MAX) {
+                    std::printf("  FAIL X1 setup: register_module: %s\n", rerr.c_str());
+                    failures++; std::filesystem::remove(xpath); goto done;
+                }
+                reg.set_dispatch_slot_count(target_id, 1);  // one-slot target
+                LoadedModule bad_lm;
+                std::string le;
+                bool ok = load_em_file(xpath.string().c_str(), bad_lm, &le,
+                                       &reg, &empty_natives, nullptr, nullptr);
+                std::filesystem::remove(xpath);
+                bool pass = !ok && bad_lm.pages.empty();
+                check(pass, "X1: CallCrossModule slot=5 vs 1-slot target -> rejected, no exec page");
+                if (!pass) std::printf("       (ok=%d pages=%zu err=%s)\n", ok, bad_lm.pages.size(), le.c_str());
+            }
+        }
+    }
+    // (h) X1 null-registry fail-closed: the same CallCrossModule loaded with
+    //     NO registry MUST be rejected before any executable page (the validator
+    //     fails closed when registry_size == 0; the emitted ModuleRegistryBase
+    //     reloc would otherwise dereference null AFTER alloc_executable_rw).
+    {
+        ThinFunction xmod_thf;
+        xmod_thf.name = "xmod_caller";
+        xmod_thf.slot = 0;
+        xmod_thf.frame.frame_size = 16;
+        xmod_thf.frame.rbx_save_offset = -8;
+        xmod_thf.frame.next_local_off = 8;
+        ThinBlock blk;
+        blk.id = 0;
+        ThinInstr cm;
+        cm.op = ThinOp::CallCrossModule;
+        cm.dst = 1;
+        cm.meta.mod_id = 0;
+        cm.meta.slot = 0;        // even a benign slot must be rejected with no registry
+        cm.meta.base_kind = AbsFixup::ModuleRegistryBase;
+        cm.meta.frame_off = 0;
+        blk.instrs.push_back(cm);
+        blk.term.kind = TermKind::Return;
+        blk.term.ret = 0;
+        xmod_thf.blocks.push_back(std::move(blk));
+        std::vector<uint8_t> xmod_blob;
+        std::string xse;
+        if (!serialize_thin_function(xmod_thf, xmod_blob, &xse)) {
+            std::printf("  [SKIP] X1 null-registry: serializer rejected (%s)\n", xse.c_str());
+        } else {
+            EmModule xmod;
+            EmFunctionRecord rec;
+            rec.name = "xmod_caller"; rec.slot_index = 0; rec.ir_blob = xmod_blob;
+            rec.signature.ret = Type{};
+            xmod.functions.push_back(std::move(rec));
+            xmod.globals = {}; xmod.entry_slot = 0;
+            xmod.name_table.emplace_back("xmod_caller", 0u);
+            auto xpath = std::filesystem::temp_directory_path() / "em_v5_xmod_no_reg.em";
+            std::string xwe;
+            if (!write_em_file_v5(xmod, xpath.string().c_str(), &xwe)) {
+                std::printf("  [SKIP] X1 null-registry: writer rejected (%s)\n", xwe.c_str());
+                std::filesystem::remove(xpath);
+            } else {
+                std::unordered_map<std::string, NativeSig> empty_natives;
+                LoadedModule bad_lm;
+                std::string le;
+                // registry == nullptr -> registry_size == 0 -> validator rejects.
+                bool ok = load_em_file(xpath.string().c_str(), bad_lm, &le,
+                                       nullptr, &empty_natives, nullptr, nullptr);
+                std::filesystem::remove(xpath);
+                bool pass = !ok && bad_lm.pages.empty();
+                check(pass, "X1: CallCrossModule with no registry -> rejected, no exec page (fail-closed)");
+                if (!pass) std::printf("       (ok=%d pages=%zu err=%s)\n", ok, bad_lm.pages.size(), le.c_str());
+            }
+        }
+    }
 
 done:
     std::printf("\n%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
