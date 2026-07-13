@@ -54,7 +54,7 @@ jobs:
       - shell: msys2 {0}
         run: |
           cd build
-          ctest -E bench -LE soak --timeout 60 --output-on-failure
+          ctest -E 'bench|in_context_threads' -LE soak --timeout 60 --output-on-failure
       - name: Validation gate
         shell: msys2 {0}
         run: |

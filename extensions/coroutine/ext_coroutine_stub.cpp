@@ -17,11 +17,13 @@ static int64_t n_coroutine_next(int64_t) { return 0; }
 static int64_t n_coroutine_done(int64_t) { return 1; }  // true = done (nothing to run)
 
 void register_natives(std::unordered_map<std::string, NativeSig>& m) {
-    BindingBuilder b(m);
-    auto T = type_i64();
+    BindingBuilder b;
+    Type T = type_i64();
     b.add("coroutine_start", T, {T, type_i64()}, (void*)&n_coroutine_start);
-    b.add("coroutine_next",  T, {T},             (void*)&n_coroutine_next);
+    b.add("coroutine_next",  type_i64(), {T},    (void*)&n_coroutine_next);
     b.add("coroutine_done",  type_bool(), {T},   (void*)&n_coroutine_done);
+    NativeTable t = b.build();
+    for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }
 
 void coroutine_reset() {}
