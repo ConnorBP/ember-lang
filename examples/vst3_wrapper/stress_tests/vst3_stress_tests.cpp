@@ -4,6 +4,7 @@
 #include "public.sdk/source/vst/hosting/hostclasses.h"
 #include "public.sdk/source/vst/hosting/parameterchanges.h"
 #include "gc.hpp"
+#include "safety.hpp"
 
 #include <algorithm>
 #include <array>
@@ -38,6 +39,11 @@ namespace {
 
 std::atomic<bool> g_track_allocations {false};
 std::atomic<std::uint64_t> g_allocations {0};
+
+constexpr std::uint64_t kProcessDeadlineMs = 5000;
+constexpr std::uint64_t kRssCheckInterval = 1000;
+constexpr std::uint64_t kMaxAudioProcessCalls = 5000000;
+constexpr std::uint64_t kMaxSoakProcessCalls = 500000;
 
 void noteAllocation() noexcept {
     if (g_track_allocations.load(std::memory_order_relaxed))
@@ -257,9 +263,19 @@ void runHotReloadStress() {
     std::atomic<std::uint64_t> processed {0};
     std::thread audio([&] {
         while (!stop.load(std::memory_order_acquire)) {
+            const std::uint64_t iteration = processed.load(std::memory_order_relaxed);
+            if (iteration >= kMaxAudioProcessCalls)
+                fail("hot-reload audio loop exceeded 5000000 process() calls");
+
             ProcessData data = block.data(64);
+            const auto processStart = ember::safety::now();
             if (fixture.processor.process(data) != kResultOk) fail("hot-reload process failure");
-            processed.fetch_add(1, std::memory_order_relaxed);
+            if (ember::safety::deadline_expired(processStart, kProcessDeadlineMs))
+                fail("hot-reload process() call exceeded 5-second deadline");
+
+            const std::uint64_t completed = processed.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (completed % kRssCheckInterval == 0)
+                ember::safety::check_memory_limit();
         }
     });
     for (int reload = 0; reload < 3; ++reload) {
@@ -365,9 +381,18 @@ void runSoak(int seconds) {
     const auto start = Clock::now();
     std::uint64_t blocks = 0;
     do {
+        if (blocks >= kMaxSoakProcessCalls)
+            fail("soak loop exceeded 500000 process() calls");
+
         ProcessData data = block.data(512);
+        const auto processStart = ember::safety::now();
         check(fixture.processor.process(data) == kResultOk, "soak process failure");
+        if (ember::safety::deadline_expired(processStart, kProcessDeadlineMs))
+            fail("soak process() call exceeded 5-second deadline");
+
         ++blocks;
+        if (blocks % kRssCheckInterval == 0)
+            ember::safety::check_memory_limit();
         std::this_thread::sleep_for(std::chrono::microseconds(10667));
     } while (Clock::now() - start < std::chrono::seconds(seconds));
 

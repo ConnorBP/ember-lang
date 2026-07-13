@@ -18,9 +18,11 @@
 #include "sema.hpp"          // NativeSig, OpOverloadTable, StructLayoutTable
 #include "dispatch_table.hpp"// DispatchTable
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <mutex>
 #include <set>
@@ -37,6 +39,7 @@ class HotReloadDomain {
 public:
     struct PublicationInfo {
         bool ok = false;
+        const char* error = nullptr;
         uint64_t publication_epoch = 0;
         uint64_t retirement_epoch = 0; // zero when there was no old page
         bool old_page_retired = false;
@@ -91,16 +94,26 @@ public:
     ExecutionGuard guard() { return ExecutionGuard(*this); }
 
     // Publish a finalized page and transfer ownership of the replaced page to
-    // this domain. On failure (null/same entry, epoch exhaustion, or inability
-    // to record retirement), the table and epoch remain unchanged and the
-    // caller still owns new_entry.
+    // this domain. On failure (null/same entry, epoch exhaustion, retired-page
+    // cap, or inability to record retirement), the table and epoch remain
+    // unchanged and the caller still owns new_entry.
     PublicationInfo publish(DispatchTable& table, size_t slot, void* new_entry) {
         PublicationInfo info;
-        if (!new_entry || slot >= table.slots.size()) return info;
+        if (!new_entry || slot >= table.slots.size()) {
+            info.error = "invalid entry or dispatch slot";
+            return info;
+        }
 
         std::lock_guard<std::mutex> lock(mu_);
         void* old_entry = table.get(slot);
-        if (old_entry == new_entry || epoch_ == std::numeric_limits<uint64_t>::max()) return info;
+        if (old_entry == new_entry) {
+            info.error = "entry is already published";
+            return info;
+        }
+        if (epoch_ == std::numeric_limits<uint64_t>::max()) {
+            info.error = "publication epoch exhausted";
+            return info;
+        }
 
         // An executable page must be uniquely bound to one (domain, table, slot)
         // for retirement ownership to be sound. If old_entry is still current in
@@ -120,9 +133,21 @@ public:
 
         const uint64_t next_epoch = epoch_ + 1;
         if (old_entry && !old_still_aliased) {
+            // Reclaim everything currently eligible before enforcing the hard
+            // cap. If a hung ExecutionGuard pins all old pages, reject this
+            // publication rather than allowing executable memory to grow
+            // without bound (or unsafely freeing code still in execution).
+            if (retired_.size() >= kMaxRetiredPages) {
+                reclaim_locked(epoch_);
+                if (retired_.size() >= kMaxRetiredPages) {
+                    info.error = "retired executable-page cap reached";
+                    return info;
+                }
+            }
             try {
                 retired_.push_back({old_entry, next_epoch});
             } catch (...) {
+                info.error = "unable to record retired executable page";
                 return info;
             }
         }
@@ -154,16 +179,25 @@ public:
     // Wait until every page retired no later than the epoch observed on entry
     // is eligible, then free those pages. Newer publications are intentionally
     // outside this call's snapshot. In a single-threaded host with no active
-    // guard this completes immediately after publication.
+    // guard this completes immediately after publication. A hung guard cannot
+    // block shutdown forever: after 30 seconds, report the timeout and reclaim
+    // only pages that are actually safe to free.
     size_t quiesce() {
         std::unique_lock<std::mutex> lock(mu_);
         const uint64_t target_epoch = epoch_;
-        cv_.wait(lock, [&] {
+        const bool quiescent = cv_.wait_for(lock, kQuiesceTimeout, [&] {
             for (const auto& page : retired_) {
                 if (page.epoch <= target_epoch && !eligible_locked(page.epoch)) return false;
             }
             return true;
         });
+        if (!quiescent) {
+            std::fprintf(stderr,
+                         "[hot reload] quiesce timed out after 30 seconds; "
+                         "%zu retired executable page(s) remain\n",
+                         retired_.size());
+            std::fflush(stderr);
+        }
         return reclaim_locked(target_epoch);
     }
 
@@ -181,6 +215,9 @@ public:
     }
 
 private:
+    static constexpr size_t kMaxRetiredPages = 64;
+    static constexpr std::chrono::seconds kQuiesceTimeout {30};
+
     struct RetiredPage {
         void* entry = nullptr;
         uint64_t epoch = 0;
@@ -329,6 +366,7 @@ inline ReloadResult reload_function(const std::string& new_fn_source,
         cf.exec = nullptr;
         cf.entry = nullptr;
         r.error = "reload: publication/retirement failed";
+        if (publication.error) r.error += std::string(": ") + publication.error;
         *it = std::move(old_fn);
         return r;
     }
