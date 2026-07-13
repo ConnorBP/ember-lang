@@ -1,10 +1,12 @@
 # ember - roadmap
 
 Every feature not yet shipped, ordered roughly by dependency and value.
-As of 2026-07-11, **all items below are active TODOs** — the trigger-gated
-"deferral" phase is over; we are working through the list. Each item carries
-its **dependency** (what else must exist first) and its **status** (TODO,
-in-progress, or blocked). ember is a **C-style procedural language**: structs
+As of 2026-07-11, the trigger-gated "deferral" phase is over and we are
+working through the list. Each item carries its **dependency** (what else
+must exist first) and its **status** (TODO, in-progress, blocked, or ✓
+shipped — items that shipped carry a ✓ marker at their tier entry and are
+kept here as the record of what landed). ember is a **C-style procedural
+language**: structs
 + free functions, not classes/inheritance/vtables (OOP is a hard non-goal —
 see the bottom). The long-term north star is **self-hosting**: an ember
 compiler written in ember (work started — `demo/compiler/` is a µ-language
@@ -44,10 +46,12 @@ wiring to the B1 model (the `--tick` thread-safety bug, fixed), and a demo
 script (`examples/scripts/dynamic_registration.ember`). See
 `planning/v1.0_INTEGRATION_NOTES.md` §5.
 
-The current tree configures 54 CTest targets total (52 excluding the two
-bench targets `bench_codegen_paths` and `bench_ember_vs_as`; the latter is
-only configured when the AngelScript SDK is present, so a no-SDK build
-configures 53). `cd buildt && ctest -E bench --timeout 30` → 52/52 pass.
+The current tree configures 70 CTest targets total (67 excluding the two
+bench targets `bench_codegen_paths` and `bench_ember_vs_as` plus the
+`vst3_soak` soak test; `bench_ember_vs_as` is only configured when the
+AngelScript SDK is present, so a no-SDK build configures 69). `cd buildt &&
+ctest -E bench -LE soak --timeout 60` → 67/67 pass; the full unfiltered
+suite (including benchmarks + soak) → 70/70 pass.
 The four `plan_*.md` files in `docs/` are historical design
 records; shipped contracts in the main docs take precedence where those plans
 describe earlier states.
@@ -215,9 +219,11 @@ format hardening pass + several fixes. The full commit log (oldest → newest):
   `return <expr>` to 0; the byte-pattern `codegen_test` never executed the
   code so the bug was hidden — the end-to-end pipeline caught it).
 
-**Test count:** the session took ctest from 49 → 54 targets (52 excluding
-the two bench targets). `cd buildt && ctest -E bench --timeout 30` → 52/52
-pass. The five self-hosted stage + pipeline tests run via
+**Test count:** that session took ctest from 49 → 54 targets (52 excluding
+the two bench targets); `cd buildt && ctest -E bench --timeout 30` → 52/52
+passed at the session's end. (The tree has since grown to 70 targets / 67
+excluding bench+soak — see the current count above.) The five self-hosted
+stage + pipeline tests run via
 `./buildt/ember_cli.exe run self_hosted/<stage>_test.ember --fn main` (the
 pipeline test needs `--ffi` for the `call_raw`/`make_executable` natives).
 
@@ -688,7 +694,8 @@ here so the decision and its evidence have a tracked home.
   the bench proves it matters"), but a benchmark system (`bench/`,
   `../spec/BENCHMARK_SYSTEM_DESIGN.md`) PROVED the need per path, so the
   optimization is no longer speculative. Stage A (thin-IR backend), Stage B
-  (.em v5 IR serialization), and Stage C (8 IR optimization passes) all
+  (.em v5 IR serialization), and Stage C (16 IR optimization passes + 7
+  obfuscation passes) all
   SHIPPED. The full design is
   `../spec/CODEGEN_OPTIMIZATION_DESIGN.md` (LLVM pass survey × JIT-scripting
   relevance, per-path waste mapping with line numbers, three architecture
@@ -711,9 +718,9 @@ here so the decision and its evidence have a tracked home.
     peephole pass over the emitted byte buffer + a BinExpr integer-path local
     regalloc using the volatile r10 holding register, gated on an
     `expr_clobbers_r10` check). Ships behind flags (`enable_peephole`/
-    `enable_local_regalloc`, default off → byte-identical to today; the 26/26
-    ctest gate + 268/0/0 lang gate hold with flags off AND on — the optimizations
-    are correctness-preserving). `src/peephole.{hpp,cpp}` ship the SmartImmPass (W4)
+    `enable_local_regalloc`, default off → byte-identical to today; the full
+    ctest suite (70/70) + lang gate (274/274) hold with flags off AND on — the
+    optimizations are correctness-preserving). `src/peephole.{hpp,cpp}` ship the SmartImmPass (W4)
     + the inert SetccMovzxPass (W10) placeholder; `examples/codegen_opt_test.cpp`
     pins each rewrite's value-equivalence. Measured (bench/bench_codegen_paths,
     safety-off median): call_overhead -14% (1225700→1058700 ns), loop_overhead
@@ -732,7 +739,8 @@ here so the decision and its evidence have a tracked home.
     on → value-equivalent, NOT byte-identical). Value-equivalent for scalar
     integer arithmetic + control flow (if/while/for/do-while/switch,
     break/continue) + recursion + division forms, gated by `thin_ir_test` +
-    `thin_ir_struct` (ctest 27/27, lang 268/0/0; the CLI never sets the flag, so
+    `thin_ir_struct` (75 + 22 internal checks, all PASS; lang suite 274/274;
+    the CLI never sets the flag, so
     the default path is the unchanged tree-walker). Composes with
     `enable_peephole`; obf functions fall back to the tree-walker. KNOWN GAPS
     (documented as SKIP in `thin_ir_test`, Stage B/C work): slices (index +
@@ -742,40 +750,63 @@ here so the decision and its evidence have a tracked home.
     `src/thin_lower.{hpp,cpp}` + `src/thin_emit.{hpp,cpp}`. This was the
     foundation for Stage B (`.em` IR serialization — the security property) and
     Stage C (IR optimization passes over the `ThinFunction`). **Stage C has now
-    shipped** — see the Stage C entry below (composable pass system + eight IR
-    optimization passes + one obfuscation pass). The FULL Stage 2 (carrying the
-    Stage 1 peephole/regalloc over as `ThinPass`es) and Stage 3 (full SSA-lite
-    rename + linear-scan) remain the still-future upgrade path, gated on Stage
+    shipped** — see the Stage C entry below (composable pass system + 16 IR
+    optimization passes + 7 obfuscation passes). The FULL Stage 2 (carrying the
+    Stage 1 peephole/regalloc over as `ThinPass`es) and the residual Stage 3
+    (full SSA-lite rename with phi nodes) remain the still-future upgrade path,
+    gated on Stage
     A's insufficiency or cross-block evidence. See
     `../spec/CODEGEN_OPTIMIZATION_DESIGN.md` §8 (Stage A status).
-  - **Stage 3** — **TODO.** Full SSA-lite rename + linear-scan regalloc
-    (COMPILER_PIPELINE §5's target). Dep: Stage 2/Stage A insufficiency on a
+  - **Stage 3** — **PARTIALLY SHIPPED.** The linear-scan register allocator
+    (`src/regalloc.{hpp,cpp}` — SSA-lite linear-scan over the `ThinFunction`,
+    scalar int/bool VRegs → Win64 callee-saved registers, spills to frame slots
+    under pressure, promotes hot loop-carried frame slots to registers) has
+    shipped behind `--passes` (`CodeGenCtx::enable_regalloc = true` with the
+    pass pipeline; runs after the optimization passes, pre-emit). Pinned by the
+    `regalloc` ctest target and the `ember_passes_unroll`/`_lsr`/`_sccp`
+    end-to-end exit-code gates (loop-carried accumulators survive the
+    frame-slot promotion). The residual TODO is the FULL SSA-lite rename with
+    phi nodes (COMPILER_PIPELINE §5's target) — the shipped regalloc computes
+    conservative `[first_def, last_use]` live intervals on the non-SSA IR
+    instead. Dep: Stage 2/Stage A insufficiency on a
     spill-heavy workload (CODEGEN_SPEC §5 acceptance criteria become the test
     surface). The intra-block passes (Stage C, shipped) cover most waste;
-    Stage 3 is the cross-block + register-allocation upgrade.
+    full SSA-lite rename is the cross-block upgrade.
 
-  - **Stage C — SHIPPED (steps 1-5 + 4 additional passes, 2026-07-10/11).** The
+  - **Stage C — SHIPPED (steps 1-5 + subsequent pass batches, 2026-07-10 onward).** The
     composable IR pass system over the `ThinFunction`, wired into `CodeGenCtx`
     and the CLI (`--passes <names>`, `EMBER_IR_PASS` bench env). Steps 1-5
     shipped 2026-07-10: step 1 the pass-system infrastructure + unit test; step
     2 the first three IR optimization passes (ConstProp, DCE, CSE); step 3 the
     pass-manager wiring into `CodeGenCtx` + CLI `--passes` + the `EMBER_IR_PASS`
     bench knob; step 4 LICM (loop-invariant code motion); step 5 the
-    SubstitutionPass (MBA obfuscation, `extensions/obf/`). Four additional IR
-    optimization passes then shipped 2026-07-11: store-to-load forwarding
-    (`forward`), copy propagation (`copyprop`), instruction combining
-    (`instcombine`), and dead-store elimination (`dse`). The tree now carries
-    **eight IR optimization passes** (`constprop`, `dce`, `cse`, `licm`,
-    `forward`, `copyprop`, `instcombine`, `dse` — `extensions/opt/ext_opt.cpp`)
-    + **one obfuscation pass** (`subst` — `extensions/obf/ext_obf.cpp`) = nine
-    total. The pass system infrastructure and all nine passes are shipped (no
-    `partial` status remains — LICM and SubstitutionPass are complete). Pinned
-    by `examples/ember_pass_test.cpp` (ctest target `ember_pass`) and
+    SubstitutionPass (MBA obfuscation, `extensions/obf/`). Subsequent batches
+    expanded both sets: the four 2026-07-11 IR passes (store-to-load forwarding
+    `forward`, copy propagation `copyprop`, instruction combining `instcombine`,
+    dead-store elimination `dse`), then `simplifycfg`, `bounds-elim`, `sccp`,
+    `lsr` (loop strength reduction), `unroll` (constant-trip-count loop
+    unrolling), `spill_elim` (dead spill elimination), `peephole`, and
+    `branch_folding` (the last two carrying the Stage 1 rewrites over as IR
+    passes); and the obfuscation set grew from `subst` to also include
+    `mba_expand`, `const_encode`, `opaque_pred`, `deadcode`, `str_encrypt`, and
+    `block_split`. The tree now carries **16 IR optimization passes** (`constprop`,
+    `dce`, `cse`, `licm`, `forward`, `copyprop`, `instcombine`, `dse`,
+    `simplifycfg`, `bounds-elim`, `sccp`, `lsr`, `unroll`, `spill_elim`,
+    `peephole`, `branch_folding` — `extensions/opt/ext_opt.cpp`) + **7 obfuscation
+    passes** (`subst`, `mba_expand`, `const_encode`, `opaque_pred`, `deadcode`,
+    `str_encrypt`, `block_split` — `extensions/obf/ext_obf.cpp`) = **23 total**.
+    All 23 are registered and shipped; `str_encrypt` and `block_split` are
+    value-preserving (pinned by `tests/lang/valid_obf_str_encrypt.ember` and
+    `valid_obf_block_split.ember`, run with `--passes str_encrypt` /
+    `--passes block_split`); the IR-backend `--passes` execution path is pinned
+    by the `ember_passes_unroll`/`_lsr`/`_sccp` end-to-end exit-code gates.
+    Pinned by `examples/ember_pass_test.cpp` (ctest target `ember_pass`) and
     `examples/ir_passes_test.cpp` (ctest target `ir_passes`). Spec/design:
-    `../spec/PASS_SYSTEM_DESIGN.md`. The still-future upgrade path is Stage 3
-    (full SSA-lite rename + linear-scan) and carrying the Stage 1 peephole/
-    regalloc over as `ThinPass`es — gated on Stage A's insufficiency or
-    cross-block evidence.
+    `../spec/PASS_SYSTEM_DESIGN.md`. The still-future upgrade path is the
+    residual Stage 3 (full SSA-lite rename with phi nodes — the linear-scan
+    regalloc subset has shipped; see the Stage 3 entry above) and carrying the
+    remaining Stage 1 rewrites over as `ThinPass`es — gated on Stage A's
+    insufficiency or cross-block evidence.
 
   **Ordered optimization entries (research prediction, confirmed/reordered by
   the benchmark; build first):**

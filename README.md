@@ -28,12 +28,11 @@ within 1.30x of g++-O2). The linear-scan register allocator promotes hot
 loop-carried frame slots to callee-saved registers, reducing memory traffic in
 tight loops.
 
-**16 IR passes shipped** (11 optimization + 5 obfuscation):
+**23 IR passes shipped** (16 optimization + 7 obfuscation):
 - Optimization: constprop, dce, cse, licm, forward, copyprop, instcombine, dse,
-  simplifycfg, bounds-elim, sccp
-- Obfuscation: subst (MBA), opaque_pred, deadcode, mba_expand, const_encode
-
-String encryption (str_encrypt) and block splitting (block_split) obfuscation passes shipped.
+  simplifycfg, bounds-elim, sccp, lsr, unroll, spill_elim, peephole, branch_folding
+- Obfuscation: subst (MBA), mba_expand, const_encode, opaque_pred, deadcode,
+  str_encrypt, block_split
 
 Full SSA construction (phi nodes, SSA renaming) remains the future upgrade;
 the shipped regalloc is the linear-scan-over-thin-IR subset (assigns scalar
@@ -138,7 +137,7 @@ cd ember
 mkdir buildt && cd buildt
 cmake -G Ninja -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe ..
 cmake --build .          # or: ninja
-ctest                    # 65 tests (63 excluding benchmarks + soak)
+ctest                    # 70 tests (67 excluding benchmarks + soak)
 ```
 
 Run and bench a script (`ember` = `buildt/ember_cli.exe`):
@@ -293,14 +292,17 @@ ember run my_script.ember --passes constprop,forward,copyprop,instcombine,dce,li
 ember run my_script.ember --passes opaque_pred,deadcode,mba_expand,const_encode,str_encrypt,block_split
 ```
 
-**18 passes shipped (11 optimization + 7 obfuscation)):
-- Optimization: ConstProp, DCE, CSE, LICM, Forward, CopyProp, InstCombine, DSE, SimplifyCFG, bounds-elim, SCCP
-- Obfuscation: SubstitutionPass (MBA), opaque_pred, deadcode, mba_expand, const_encode, str_encrypt, block_split
+**23 passes shipped (16 optimization + 7 obfuscation):**
+- Optimization: ConstProp, DCE, CSE, LICM, Forward, CopyProp, InstCombine, DSE, SimplifyCFG, bounds-elim, SCCP, LSR, Unroll, SpillElim, Peephole, BranchFolding
+- Obfuscation: SubstitutionPass (MBA), mba_expand, const_encode, opaque_pred, deadcode, str_encrypt, block_split
 
-String encryption (`str_encrypt`) and block splitting (`block_split`) obfuscation
-passes are in development — string encryption transforms `ConstStringRef` IR
+String encryption (`str_encrypt`) and block splitting (`block_split`) are
+shipped obfuscation passes: string encryption transforms `ConstStringRef` IR
 ops into `StringDecrypt` (XOR-decrypt at runtime), matching ember's built-in
-`string_xor_key` feature but as a composable pass.
+`string_xor_key` feature but as a composable pass; block splitting
+deterministically splits long basic blocks. Both are value-preserving (pinned
+by `tests/lang/valid_obf_str_encrypt.ember` and `valid_obf_block_split.ember`,
+run with `--passes str_encrypt` / `--passes block_split`).
 
 - **Pass system:** `docs/spec/PASS_SYSTEM_DESIGN.md` — architecture, registration, lifecycle
 - **Pass authoring guide:** `docs/PASS_AUTHORING.md` — how to write a custom pass

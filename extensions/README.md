@@ -48,16 +48,20 @@ The general-purpose extensions relocated out of prism, matching the
 | `lifecycle/` | `ember_ext_lifecycle` | dynamic routine registration: `register_routine(fn h, i64 data) -> id` / `unregister_routine(id)` — the Tier 2 fn-refs feature's host-native half. The `fn` param is typed (`is_fn_handle`) so sema rejects a forged plain i64; the host calls a stored routine via the dispatch table (the SAME call mechanism as the static `@on_tick` path, just discovered by the script at runtime). No operator overloads. | new (v1.0 follow-on); no prism origin — added once Tier 2 fn-refs shipped (`../docs/LIFECYCLE.md` §2) |
 | `map/` | `ember_ext_map` | `map<K,V>` host-store type — opaque i64 handle backed by a host-side `unordered_map<i64,i64>` + `map_new`/`map_set`/`map_get`/`map_contains`/`map_length`/`map_remove`/`map_clear` (K and V are i64 in v1; typed keys/values are v2). No operator overloads. | new (v1.0); no prism origin — added for the Tier 0 standard addon set (`../docs/ROADMAP.md` Tier 0) |
 | `io/` | `ember_ext_io` | OS I/O core subset — console (`print`/`println`/`print_i64`/`print_f64`/`read_line`), file (`file_read_bytes`/`file_write_bytes`/`file_exists`), path (`path_exists`/`path_basename`/`path_dirname`). Stateless (no host slot vector); text natives take/return `string` handles, byte natives use `array<u8>` handles. **ALL `PERM_FFI`-gated** (sema rejects every call site without the FFI bit — zero runtime cost); two layers of defense (registration: host chooses whether to register at all; permission: `PERM_FFI` gating). See `../docs/planning/plan_OS_IO_EXTENSIONS.md`. No operator overloads. | new (v1.0); no prism origin — the ROADMAP "Family B" re-entry trigger fired (a script blocked on output beyond the exit code) |
-| `opt/` | `ember_ext_opt` | **PASS EXTENSION** (not a `NativeSig` addon) — registers IR→IR transforms over `ThinFunction` via `register_passes(EmberPassRegistry&)` (not `register_natives`). Ships eight passes: `ConstPropPass` ("constprop"), `DeadCodeElimPass` ("dce"), `CSEPass` ("cse"), `LICMPass` ("licm"), `StoreToLoadForwardPass` ("forward"), `CopyPropPass` ("copyprop"), `InstCombinePass` ("instcombine"), `DeadStoreElimPass` ("dse"). See `../docs/spec/PASS_SYSTEM_DESIGN.md` §8. | new (v1.0); no prism origin — the IR optimization pass set |
-| `obf/` | `ember_ext_obf` | **PASS EXTENSION** (not a `NativeSig` addon) — registers IR→IR transforms over `ThinFunction` via `register_passes(EmberPassRegistry&)` (not `register_natives`). Ships `SubstitutionPass` ("subst", MBA mutation — `is_required = true`, bypasses skip gates). See `../docs/spec/PASS_SYSTEM_DESIGN.md` §8. | new (v1.0); no prism origin — the obfuscation pass set |
+| `opt/` | `ember_ext_opt` | **PASS EXTENSION** (not a `NativeSig` addon) — registers IR→IR transforms over `ThinFunction` via `register_passes(EmberPassRegistry&)` (not `register_natives`). Ships 16 optimization passes: `ConstPropPass` ("constprop"), `DeadCodeElimPass` ("dce"), `CSEPass` ("cse"), `LICMPass` ("licm"), `StoreToLoadForwardPass` ("forward"), `CopyPropPass` ("copyprop"), `InstCombinePass` ("instcombine"), `DeadStoreElimPass` ("dse"), `SimplifyCFGPass` ("simplifycfg"), `BoundsCheckElimPass` ("bounds-elim"), `SCCPPass` ("sccp"), `LoopStrengthReductionPass` ("lsr"), `LoopUnrollPass` ("unroll"), `DeadSpillElimPass` ("spill_elim"), `PeepholePass` ("peephole"), `BranchFoldingPass` ("branch_folding"). See `../docs/spec/PASS_SYSTEM_DESIGN.md` §8. | new (v1.0); no prism origin — the IR optimization pass set |
+| `obf/` | `ember_ext_obf` | **PASS EXTENSION** (not a `NativeSig` addon) — registers IR→IR transforms over `ThinFunction` via `register_passes(EmberPassRegistry&)` (not `register_natives`). Ships 7 obfuscation passes (all `is_required = true`, bypassing skip gates): `SubstitutionPass` ("subst", MBA), `MBAExpansionPass` ("mba_expand"), `ConstantEncodingPass` ("const_encode"), `OpaquePredicatesPass` ("opaque_pred"), `DeadCodeInjectionPass` ("deadcode"), `StringEncryptionPass` ("str_encrypt"), `BlockSplittingPass` ("block_split"). See `../docs/spec/PASS_SYSTEM_DESIGN.md` §8. | new (v1.0); no prism origin — the obfuscation pass set |
 
 **Pass extensions (a separate category).** `extensions/opt/` (`ember_ext_opt`) and
 `extensions/obf/` (`ember_ext_obf`) are NOT `NativeSig` addons — they register
 IR→IR transforms over `ThinFunction` via `register_passes(EmberPassRegistry&)`
-(not `register_natives`). `opt` ships eight passes: `ConstPropPass`/
+(not `register_natives`). `opt` ships 16 optimization passes (`ConstPropPass`/
 `DeadCodeElimPass`/`CSEPass`/`LICMPass`/`StoreToLoadForwardPass`/
-`CopyPropPass`/`InstCombinePass`/`DeadStoreElimPass`; `obf` ships
-`SubstitutionPass` (`is_required = true`).
+`CopyPropPass`/`InstCombinePass`/`DeadStoreElimPass`/`SimplifyCFGPass`/
+`BoundsCheckElimPass`/`SCCPPass`/`LoopStrengthReductionPass`/`LoopUnrollPass`/
+`DeadSpillElimPass`/`PeepholePass`/`BranchFoldingPass`); `obf` ships 7
+obfuscation passes (`SubstitutionPass`/`MBAExpansionPass`/
+`ConstantEncodingPass`/`OpaquePredicatesPass`/`DeadCodeInjectionPass`/
+`StringEncryptionPass`/`BlockSplittingPass`, all `is_required = true`).
 See `../docs/spec/PASS_SYSTEM_DESIGN.md` §8. They do not fit the "what an
 extension is" definition above (they are not host-side natives); they are
 listed here for completeness.
@@ -216,7 +220,6 @@ plus the `opt`/`obf` pass extensions).
 `ember/extensions/` follows the same language-purity rule as
 `ember/src/`: no references to specific cheat products, hosts, or
 research objects by name in code, comments, or docs. The forbidden
-vocabulary is the same set `../docs/planning/RESTRUCTURE_PLAN.md` Section 2 defines
-for the whole `ember/` tree (the named-product list there); an
-extension is a generic, reusable addon, so a grep for that vocabulary
+vocabulary is the named-product list scoped to the whole `ember/` tree;
+an extension is a generic, reusable addon, so a grep for that vocabulary
 against `ember/extensions/` returns zero hits.

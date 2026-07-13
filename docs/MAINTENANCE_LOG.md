@@ -1114,3 +1114,224 @@ HEAD-consistency note: the prerequisite baseline evidence (c1/c2/c3) and the mos
 - Failures: Test #44 bench_ember_vs_as (Failed, 5.61 sec); Test #45 bench_codegen_paths (Failed, 1.62 sec).
 - Both failures are bench tests. bench_codegen_paths is the known unbounded-memory-leak test (documented earlier in this log as "fix 4 INVALID + reverted": the string host store in extensions/string/ext_string.cpp grows without bound, so the bench aborts at the RSS cap at the string_decrypt path for any cap; no finite cap fixes it; the proposed 4 GiB cap was reverted as invalid). bench_ember_vs_as is the other bench test, also failing.
 - Gate-context note: the release gate (scripts/prepare_release.sh) runs ctest -E bench --timeout 60, which excludes both bench tests by name match; under that filtered invocation the non-bench 65 tests pass (65/65, 0 failed). The task's literal criterion "every CTest test passes" is evaluated against the complete (unfiltered) run above, where 2 of 67 fail.
+
+
+---
+
+## Cycle summary — 2026-07-13 audit + documentation + publication pass
+
+Agent: worker sub-agent (audit/documentation/publication chunk). Scope: audit
+the current implementation and configured tests against README.md,
+docs/ROADMAP.md, the user guides, and the docs/audit/ reports; correct stale
+test totals, pass counts, exit-code semantics, shipped-versus-TODO claims, and
+broken links; run the review gates from scratch; publish to origin/master.
+Worked only in ember/; never accessed G:; never modified thirdparty/.
+
+### Initial tree state (start of this chunk)
+- HEAD at handoff: 56b4d35 (the prerequisite C++ implementation chunk's fix for
+  for-loop loop-carried accumulator loss in the IR-backend --passes path,
+  src/thin_emit.cpp load_int_vreg). Branch was 5 ahead of origin/master.
+- Working-tree dirt at handoff (pre-explained by the delegating context, both
+  treated as non-blocking):
+  1. M docs/MAINTENANCE_LOG.md — a concurrent cron/audit process appended a
+     STALE read-only release-gate snapshot made at HEAD 573062c (4 commits
+     behind this chunk's HEAD). It described src/codegen.cpp/src/regalloc.cpp
+     as having "live uncommitted source edits" (those were the impl chunk's
+     temporary debug edits, already reverted in the committed state) and
+     reported the full CTest as 67 total / 65 passed / 2 failed (the 2 bench
+     failures). It was NOT this chunk's work and was inaccurate about the
+     current tree. It was discarded (git checkout) before this chunk's own
+     accurate append; a future cron re-run regenerates an accurate snapshot.
+  2. m thirdparty/vst3sdk — the permanent, off-limits thirdparty submodule
+     content dirt (root cause thirdparty/vst3sdk/public.sdk/source/vst/utility/
+     alignedalloc.h, mtime 2026-07-12, pre-existing). Never touched.
+- No other dirt. No G: access at any point.
+
+### Build / CTest / validation results (gates run from scratch, at final HEAD 26f01b5)
+- cmake --build buildt -j 8 -> PASS, 0 warnings (ninja "no work to do" after
+  the bench fix was already built; the doc edits do not trigger rebuilds).
+- ctest --output-on-failure -E bench -LE soak --timeout 60 (filtered, from
+  buildt) -> 67/67 PASS, 0 failed (13.7 sec).
+- ctest --output-on-failure --timeout 60 (FULL unfiltered suite, including
+  benchmarks + soak, from buildt) -> 70/70 PASS, 0 failed (127 sec). Soak
+  label = 1 test (vst3_soak, 30.01 sec).
+- Optimization validation:
+  ember_cli.exe run tests/lang/optimization_validation.ember --fn main
+  --passes constprop,forward,copyprop,instcombine,dce,licm,dse -> exit 177
+  (the gate's value-preserving success sentinel). Confirmed.
+- Lang suite: ember_cli.exe test tests/lang -> 274/274 passed, 0 failed;
+  bash tests/run_lang_tests.sh buildt -> 471 passed, 0 failed, 0 skipped.
+
+### Audit findings and resolution (every finding acted on, none left report-only)
+
+F1. README.md pass-count contradiction + stale str_encrypt wording.
+  - README had TWO contradictory pass-count sections: line ~31 "16 IR passes
+    shipped (11 optimization + 5 obfuscation)" and line ~296 "18 passes shipped
+    (11 optimization + 7 obfuscation))" (also a stray )) typo). The actual
+    pass registry (extensions/opt/ext_opt.cpp register_passes +
+    extensions/obf/ext_obf.cpp register_passes) registers 16 optimization
+    (constprop, dce, simplifycfg, cse, licm, lsr, forward, copyprop,
+    instcombine, dse, bounds-elim, sccp, unroll, spill_elim, peephole,
+    branch_folding) + 7 obfuscation (subst, mba_expand, const_encode,
+    opaque_pred, deadcode, str_encrypt, block_split) = 23 total. Both README
+    sections omitted the post-2026-07-11 passes (lsr/unroll/spill_elim/
+    peephole/branch_folding for opt; mba_expand/const_encode/opaque_pred/
+    deadcode/str_encrypt/block_split for obf). Line ~301 said str_encrypt +
+    block_split "are in development" — STALE: both are shipped (registered,
+    functional, value-preserving; verified ember_cli run
+    valid_obf_str_encrypt.ember --passes str_encrypt -> exit 42 and
+    valid_obf_block_split.ember --passes block_split -> exit 42).
+  - FIX: both README sections now read "23 passes shipped (16 optimization + 7
+    obfuscation)" with the full pass lists; the "in development" wording is
+    replaced with accurate "shipped" wording citing the value-preservation
+    test pins. Status: FIXED (this chunk's doc commit).
+
+F2. ROADMAP.md stale test totals.
+  - Line ~47 said "54 CTest targets total (52 excluding bench)... 52/52 pass";
+    line ~218 (session note) said "49 -> 54 targets... 52/52 pass"; Stage 1
+    section said "26/26 ctest gate + 268/0/0 lang gate"; Stage 2 section said
+    "ctest 27/27, lang 268/0/0". All stale: the tree now configures 70 CTest
+    targets (67 excluding the 2 bench + vst3_soak; 69 in a no-AngelScript-SDK
+    build), filtered suite 67/67, full suite 70/70; lang suite 274/274;
+    thin_ir_test has 75 internal checks, thin_ir_struct 22.
+  - FIX: current-state line updated to 70/67 with the exact filtered + full
+    pass counts and the no-SDK note; session note rephrased as a historical
+    endpoint with a pointer to the current count; Stage 1/Stage 2 counts
+    updated to 70/70 + 274/274 and 75+22 checks. Status: FIXED (doc commit).
+
+F3. ROADMAP.md stale pass-registry counts and Stage C/Stage 3 shipped-vs-TODO.
+  - Line ~695 "Stage C (8 IR optimization passes)"; Stage C entry "eight IR
+    optimization passes + one obfuscation pass = nine total"; Stage 3 entry
+    "TODO. Full SSA-lite rename + linear-scan regalloc". All contradicted by
+    current code: 16 opt + 7 obf = 23 are registered; the linear-scan
+    register allocator (src/regalloc.{hpp,cpp}) IS shipped behind --passes
+    (CodeGenCtx::enable_regalloc = true with the pass pipeline; runs post-pass,
+    pre-emit), pinned by the regalloc ctest target and the
+    ember_passes_unroll/_lsr/_sccp end-to-end exit-code gates. Only the FULL
+    SSA-lite rename with phi nodes remains TODO (the shipped regalloc uses
+    conservative [first_def, last_use] live intervals on the non-SSA IR).
+  - FIX: Stage C counts updated to 16 opt + 7 obf = 23 with the full pass
+    lists and the str_encrypt/block_split test pins; Stage 3 changed from
+    "TODO" to "PARTIALLY SHIPPED" describing the shipped linear-scan subset and
+    the residual SSA-lite-rename TODO; the Stage 2 forward-reference and the
+    Stage C future-path note updated to match. ROADMAP intro "all items below
+    are active TODOs" reframed to acknowledge shipped items carry a checkmark
+    marker. Status: FIXED (doc commit).
+
+F4. extensions/README.md stale pass counts + a broken link.
+  - The opt/ and obf/ table rows and the prose summary said opt "ships eight
+    passes" and obf "ships SubstitutionPass" — stale (16 + 7).
+  - extensions/README.md line ~223 referenced ../docs/planning/RESTRUCTURE_PLAN.md
+    Section 2 for the forbidden-vocabulary list; that file no longer exists
+    anywhere in the tree (real broken cross-reference, not a backtick prose
+    citation — it named a specific section of a deleted file).
+  - FIX: opt/obf rows and prose updated to 16 + 7 with the full pass-name
+    lists; the broken RESTRUCTURE_PLAN reference rewritten as a self-contained
+    statement of the purity rule (the grep-returns-zero claim stands on its
+    own). Status: FIXED (doc commit).
+  - Note: a scan of markdown link syntax [text](path) across README.md,
+    docs/ROADMAP.md, extensions/README.md found ZERO broken links; the
+    ../spec/X.md / ../planning/X.md tokens in ROADMAP are prose citations
+    in backticks (a consistent house style), not markdown links, and were left
+    unchanged (mass-changing them would be a style-only refactor outside this
+    audit's intent).
+
+F5. CLI result truncation description (verified accurate, no change needed).
+  - README says the i64 return becomes the process exit code "8-bit, so >255
+    wraps — OS truncation, not a bug". Verified empirically: return 300 ->
+    process exit 44 (300 mod 256), return 1000 -> 232 (1000 mod 256),
+    return 177 -> 177. The CLI internally masks with 0x7fffffff
+    (examples/ember_cli.cpp: exit_code = int(uint64_t(entry_ret) & 0x7fffffff))
+    to keep main's int return non-negative, and the OS then takes the low 8
+    bits on process exit. The README's "8-bit / mod 256" description of the
+    OBSERVABLE process exit code is accurate. Status: NO CHANGE (already
+    correct); recorded here as a verified finding.
+
+F6. bench_codegen_paths full-suite failure (pre-existing regression, FIXED).
+  - The full unfiltered CTest had 1 failure: bench_codegen_paths hit the 2 GiB
+    RSS failsafe at the string_decrypt path (process RSS 2100184 KB > limit
+    2097152 KB). Root cause: the string_decrypt path runs 2000 timed iters x
+    100000 inner-loop calls of string_length("hello world!"); the literal's
+    implicit conversion to a string handle calls string_from_slice -> str_new,
+    which push_backs into the append-only g_strings host store
+    (extensions/string/ext_string.cpp) with no eviction; across 2000x100000
+    iterations the store grew without bound and tripped the failsafe. The
+    failure was introduced when the RSS cap was added (eb2e4fe) and was
+    documented as a blocker in 573062c with the next action "add reclamation to
+    the string host store"; the proposed 4 GiB cap was correctly reverted as
+    invalid (no finite cap fixes unbounded growth).
+  - FIX (commit 26f01b5, bench-harness only): call ext_string::reset() at the
+    top of each timed and warmup iteration in time_ember and time_paired,
+    clearing the host store before each independent main() call. Each bench
+    iteration is an independent call whose strings are dead once it returns, so
+    clearing between iterations is safe (no live handle survives the call) and
+    the measured per-iteration cost is unchanged (each iteration still performs
+    the same allocations; only the cumulative growth is bounded); a no-op for
+    paths that never allocate strings. With this the full unfiltered CTest
+    passes 70/70 (was 69/70). The string_decrypt path now completes with real
+    measurements (ratio ~5.97x safety-off / 6.07x safety-on, consistent with
+    BENCHMARK_SYSTEM_DESIGN.md's documented 5.4-6.3x range). Status: FIXED
+    (commit 26f01b5). The bench-harness reclamation is a targeted fix; the
+    underlying append-only store still leaks for long-running real hosts,
+    which remains a separate, larger item (see Remaining blockers B1).
+
+### Remaining justified blockers / next actions
+- B1 (not blocking publication): the string host store
+  (extensions/string/ext_string.cpp g_strings) is append-only — it push_backs
+  on every string construction and only clears on ext_string::reset(). A
+  long-running real host that constructs strings in a loop will grow RSS
+  without bound (the bench now reclaims between iterations, but production
+  hosts do not). Next action: add reclamation/compaction to the string host
+  store (or handle reuse) without breaking handle stability — an architecture
+  change to the string store, appropriately a separate task (MAINTENANCE_
+  CONSTRAINTS scopes architecture changes out of automated maintenance). This
+  is the same next action recorded in 573062c; the bench-harness fix above
+  addresses the test gate, not the production leak.
+- B2 (not blocking publication): the spec design docs docs/spec/PASS_SYSTEM_
+  DESIGN.md (status line + section 8) and docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md
+  (Stage C section) still say "eight IR optimization passes + SubstitutionPass
+  = nine total" — contradicted by the 16 opt + 7 obf = 23 registry. These are
+  docs/spec/ design docs; per MAINTENANCE_CONSTRAINTS the cron must not change
+  docs/spec/ design content, and this audit chunk's correction targets were
+  README.md / docs/ROADMAP.md / user guides / docs/audit/ (NOT docs/spec/), so
+  they were intentionally left unchanged here. Next action: a separate spec-doc
+  revision pass should update those two spec docs' pass counts to 16 + 7 = 23
+  (an accuracy update, not a design change). The user-facing live docs
+  (README, ROADMAP, extensions/README) are now correct.
+
+### Implemented improvements and commits this cycle
+- 26f01b5 — bench: reclaim append-only string host store between iterations
+  to keep RSS under the failsafe cap (bench/bench_codegen_paths.cpp only;
+  +15 lines). Fixes the full-suite bench_codegen_paths failure (F6).
+- 56b4d35 — (prerequisite impl chunk, already in the branch) Fix for-loop
+  loop-carried accumulator loss in IR-backend --passes path
+  (src/thin_emit.cpp load_int_vreg + examples/ember_passes_exec_test.cpp +
+  CMakeLists.txt + tests/lang/valid_unroll.ember comment). Not authored by
+  this chunk; carried as the implementation commit that satisfies the
+  "at least one implementation commit exists" gate.
+- Doc commit (this chunk): README.md + docs/ROADMAP.md + extensions/README.md
+  accuracy corrections (F1-F4) + this MAINTENANCE_LOG.md append. Commit message
+  contains no @.
+
+### Changed paths (this chunk)
+- bench/bench_codegen_paths.cpp — ext_string::reset() between bench iterations
+  (commit 26f01b5).
+- README.md — pass-count sections (23 = 16 + 7), str_encrypt/block_split
+  shipped wording, ctest total (70 / 67 excl bench+soak) (doc commit).
+- docs/ROADMAP.md — ctest totals (70/67, 67/67 filtered, 70/70 full), lang
+  suite (274/274), thin_ir_test/thin_ir_struct check counts (75+22), Stage C
+  pass counts (16 opt + 7 obf = 23) with full lists + test pins, Stage 3
+  PARTIALLY SHIPPED (linear-scan regalloc shipped; SSA-lite rename TODO),
+  intro framing (doc commit).
+- extensions/README.md — opt/obf pass counts (16 + 7) with full pass-name
+  lists, broken RESTRUCTURE_PLAN.md cross-reference rewritten (doc commit).
+- docs/MAINTENANCE_LOG.md — this cycle summary append (doc commit).
+
+### Confirmation
+- G: drive: never accessed.
+- thirdparty/: never modified (the permanent thirdparty/vst3sdk submodule
+  content dirt was present throughout and left untouched; no gitlink changed).
+- No spec design doc (docs/spec/) was edited (intentional — see B2).
+- No audit report (docs/audit/) was edited (they are dated historical records;
+  audited against, not rewritten).
+- Commit messages contain no @.
