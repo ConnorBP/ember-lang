@@ -58,6 +58,17 @@ static std::filesystem::path temp_path(const char* tag) {
            (std::string("ember_em_redteam_") + tag + ".em");
 }
 
+// Best-effort temp-file cleanup. Uses the non-throwing std::error_code
+// overload of std::filesystem::remove so a cleanup race (file already gone,
+// held open, or permission flipped between create and cleanup) cannot throw
+// and terminate the whole test harness. The error code is intentionally
+// ignored: these are throwaway files in the temp directory, and a failed
+// remove of an already-absent path is the benign common case.
+static void remove_quiet(const std::filesystem::path& p) {
+    std::error_code ec;
+    std::filesystem::remove(p, ec);
+}
+
 // ─── FIX 2: PERM_FFI load-side enforcement ───
 //
 // Build a v3 .em with a native binding to a PERM_FFI-gated native, then:
@@ -92,7 +103,7 @@ static bool test_perm_ffi_raw_x86() {
     std::string werr;
     if (!write_em_file(mod, path.string().c_str(), &werr)) {
         std::printf("  FAIL: write_em_file: %s\n", werr.c_str());
-        std::filesystem::remove(path);
+        remove_quiet(path);
         return false;
     }
 
@@ -133,7 +144,7 @@ static bool test_perm_ffi_raw_x86() {
             std::printf("    err: %s\n", lerr.c_str());
     }
 
-    std::filesystem::remove(path);
+    remove_quiet(path);
     return true;
 }
 
@@ -212,7 +223,7 @@ static bool test_perm_ffi_v5_ir() {
     std::string werr;
     if (!write_em_file_v5(mod, path.string().c_str(), &werr)) {
         std::printf("  FAIL: write_em_file_v5: %s\n", werr.c_str());
-        std::filesystem::remove(path);
+        remove_quiet(path);
         return false;
     }
 
@@ -244,7 +255,7 @@ static bool test_perm_ffi_v5_ir() {
             std::printf("    err: %s\n", lerr.c_str());
     }
 
-    std::filesystem::remove(path);
+    remove_quiet(path);
     return true;
 }
 
@@ -277,7 +288,7 @@ static bool test_raw_x86_rejection() {
     std::string werr;
     if (!write_em_file(mod, path.string().c_str(), &werr)) {
         std::printf("  FAIL: write_em_file: %s\n", werr.c_str());
-        std::filesystem::remove(path);
+        remove_quiet(path);
         return false;
     }
 
@@ -322,7 +333,7 @@ static bool test_raw_x86_rejection() {
         check(rejected, "(c) v3 .em rejected with allow_raw_x86=false (explicit)");
     }
 
-    std::filesystem::remove(path);
+    remove_quiet(path);
 
     // (d) v5 .em with NO policy -> ACCEPTED (v5 is the default-accepted format).
     // Build a minimal v5 IR module: one IR function.
@@ -369,7 +380,7 @@ static bool test_raw_x86_rejection() {
         std::string vwerr;
         if (!write_em_file_v5(v5mod, v5path.string().c_str(), &vwerr)) {
             check(false, "(d) write_em_file_v5");
-            std::filesystem::remove(v5path);
+            remove_quiet(v5path);
             return false;
         }
 
@@ -382,7 +393,7 @@ static bool test_raw_x86_rejection() {
         check(accepted, "(d) v5 .em accepted by default (no EmLoadPolicy needed)");
         if (!accepted)
             std::printf("    err: %s\n", lerr.c_str());
-        std::filesystem::remove(v5path);
+        remove_quiet(v5path);
     }
 
     return true;
