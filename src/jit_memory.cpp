@@ -1,10 +1,16 @@
 #include "jit_memory.hpp"
 #include "platform.hpp"
+#include "safety.hpp"
 #include <cstring>
 
 namespace ember {
 
 void* alloc_executable(const std::vector<uint8_t>& code) {
+    // SAFETY FAILSAFE: check process RSS before allocating another executable
+    // page. Repeated compilation (hot reload, benchmarks, pass tests) can
+    // accumulate executable + retained-byte memory; this stops unbounded JIT
+    // memory growth before it exhausts host RAM.
+    safety::check_memory_limit();
     void* mem = alloc_executable_rw(code);
     if (!mem) return nullptr;
     if (!seal_executable(mem, code.size())) {

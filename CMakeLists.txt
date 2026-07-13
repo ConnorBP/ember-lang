@@ -99,9 +99,14 @@ add_library(ember STATIC
     # via em_type_codec (emit_type/parse_type) + ThinFunction public members.
     src/thin_ir_ser.cpp
     src/gc.cpp              # GC: tracing mark-sweep core (foundational infra for lambdas/coroutines)
+    src/safety.cpp          # process-wide failsafes: RSS memory cap, recursion depth guard, deadline
 )
 target_include_directories(ember PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ember PUBLIC ember_ed25519)  # F2 .em content authentication
+# safety.cpp uses GetProcessMemoryInfo (psapi) on Windows for RSS measurement.
+if(WIN32)
+    target_link_libraries(ember PUBLIC psapi)
+endif()
 
 # ---- frontend lib: lexer, types, parser, sema, codegen ----
 add_library(ember_frontend STATIC

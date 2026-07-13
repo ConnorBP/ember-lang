@@ -50,6 +50,7 @@
 #include "../src/lifecycle.hpp"    // v0.6 get_annotated_functions (@on_tick discovery)
 #include "../src/globals.hpp"      // v1.0 eval_global_initializers (seed const globals at load)
 #include "../src/context.hpp"     // context_t, TrapStub, TrapReason (v0.4 safe execution)
+#include "../src/safety.hpp"      // process-wide failsafes: RSS memory cap, deadline (incident post-mortem)
 #include "../src/module_registry.hpp" // v0.5 live modules (ModuleRegistry)
 #include "../src/module_linker.hpp"  // v0.5 live modules (link_em_file, build_*_exports)
 #include "../src/hot_reload.hpp"    // Family C: `ember live` (HotReloadDomain + ExecutionGuard)
@@ -1595,7 +1596,30 @@ int main(int argc, char** argv) {
         uint32_t selected_slot=loaded.entry_slot;
         for(const auto& item:loaded.name_table)if(item.first==fn_name){selected_slot=item.second;break;}
         bool is_void=selected_slot<loaded.signatures_by_slot.size()&&loaded.signatures_by_slot[selected_slot].ret.is_void();
-        int64_t result=call_i64_i64(entry); return is_void?0:int(result);
+        // SAFETY FAILSAFE: --load-em previously called the loaded entry via the
+        // raw call_i64_i64() with NO context, NO instruction budget, NO call-
+        // depth limit, NO trap checkpoint, and NO memory ceiling. A loaded .em
+        // with an infinite loop or unbounded allocation would run forever and
+        // freeze the host. Now we route through the context-aware call path
+        // with a finite budget + checkpoint + depth limit, so safety-on .em
+        // code traps on budget/depth exhaustion instead of running forever.
+        // The GC/JIT RSS failsafe (safety::check_memory_limit) catches the
+        // unbounded-allocation case regardless of whether the .em has budget
+        // checks baked in.
+        ember::context_t ectx;
+        ectx.budget_remaining = 100000000;  // 100M instruction budget (same as normal run)
+        ectx.max_call_depth = 512;
+        ectx.has_checkpoint = (setjmp(ectx.checkpoint) == 0);
+        if (!ectx.has_checkpoint) {
+            // We arrived here via a trap longjmp — recoverable exit.
+            std::fprintf(stderr, "ember: loaded .em trapped: %s\n", ectx.last_error.c_str());
+            return 70;
+        }
+        safety::check_memory_limit();  // pre-flight RSS check before executing untrusted .em
+        int64_t result = is_void
+            ? ember::ember_call_void(entry, &ectx)
+            : ember::ember_call_i64(entry, &ectx, 0);
+        return is_void ? 0 : int(result);
     }
 
     // ---- compile + run via the shared helper (extracted from main) ----

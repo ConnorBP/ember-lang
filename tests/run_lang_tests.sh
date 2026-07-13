@@ -31,10 +31,21 @@ CLI="${BUILD}/ember_cli.exe"
 
 pass=0; fail=0; skip=0
 
+# SAFETY FAILSAFE: every child invocation runs under a hard per-process timeout
+# so a runaway program (infinite loop / unbounded output) is killed BEFORE it
+# can freeze the host. `timeout` sends SIGTERM (rc=124) on overrun. Without this
+# a looping child that prints forever would grow the captured `out` buffer
+# without limit and exhaust RAM — the incident root cause for the test path.
+RUN_TIMEOUT=120   # seconds per child process
+
 run() {
     local tool="$1" file="$2" expect="$3"
     local out rc
-    out=$("$tool" "$file" 2>&1); rc=$?
+    out=$(timeout "$RUN_TIMEOUT" "$tool" "$file" 2>&1); rc=$?
+    if [ $rc -eq 124 ]; then
+        printf "FAIL  %s (TIMEOUT after %ss — possible runaway/infinite loop)\n" "$file" "$RUN_TIMEOUT"
+        fail=$((fail+1)); return
+    fi
     if [ "$expect" = "ok" ] && [ $rc -eq 0 ]; then
         printf "PASS  %s\n" "$file"; pass=$((pass+1))
     elif [ "$expect" = "err" ] && [ $rc -ne 0 ]; then
@@ -99,8 +110,12 @@ exp_nested=111; exp_diamond=211; exp_double=100; exp_dotdot=101; exp_self=42
 run_import_cli() {
     local f="$1" exp="$2"
     local out rc
-    out=$("$CLI" run "$f" 2>&1); rc=$?
-    if [ $rc -eq "$exp" ]; then
+    out=$(timeout "$RUN_TIMEOUT" "$CLI" run "$f" 2>&1); rc=$?
+    if [ $rc -eq 124 ]; then
+        printf "FAIL  %s (TIMEOUT after %ss — possible runaway)\n" "$f" "$RUN_TIMEOUT"
+        fail=$((fail+1)); return
+    fi
+    if [ $rc -eq "$exp" ];
         printf "PASS  %s (run main, rc=%d == expected %d)\n" "$f" "$rc" "$exp"; pass=$((pass+1))
     else
         printf "FAIL  %s (run main, rc=%d != expected %d)\n%s\n" "$f" "$rc" "$exp" "$out"; fail=$((fail+1))
@@ -141,12 +156,14 @@ for spec in "runtime_audit_semantics.ember:77" "runtime_cast_regressions.ember:4
             "valid_catch_return.ember:200" \
             "valid_throw_in_catch.ember:55" \
             "valid_nested_try_catch.ember:44"; do
-    f=${spec%%:*}; exp=${spec##*:}; out=$("$CLI" run "tests/lang/$f" 2>&1); rc=$?
+    f=${spec%%:*}; exp=${spec##*:}; out=$(timeout "$RUN_TIMEOUT" "$CLI" run "tests/lang/$f" 2>&1); rc=$?
+    if [ $rc -eq 124 ]; then printf "FAIL  %s (TIMEOUT after %ss)\n" "$f" "$RUN_TIMEOUT"; fail=$((fail+1)); continue; fi
     if [ $rc -eq "$exp" ]; then printf "PASS  %s (explicit expected rc=%d)\n" "$f" "$rc"; pass=$((pass+1))
     else printf "FAIL  %s (rc=%d, expected %d)\n%s\n" "$f" "$rc" "$exp" "$out"; fail=$((fail+1)); fi
 done
 for f in tests/lang/runtime_trap_*.ember; do
-    out=$("$CLI" run "$f" 2>&1); rc=$?
+    out=$(timeout "$RUN_TIMEOUT" "$CLI" run "$f" 2>&1); rc=$?
+    if [ $rc -eq 124 ]; then printf "FAIL  %s (TIMEOUT after %ss)\n" "$f" "$RUN_TIMEOUT"; fail=$((fail+1)); continue; fi
     if [ $rc -eq 70 ] && printf "%s" "$out" | grep -q "RUNTIME TRAP"; then
         printf "PASS  %s (recoverable trap)\n" "$f"; pass=$((pass+1))
     else
@@ -176,13 +193,15 @@ done
 #  2. lifecycle_tick_trap_exit: a tick-time trap must exit 70 (the recoverable-
 #     trap code), not @entry's positive stay-loaded return, so a harness can
 #     detect a tick-time assertion failure. Assert: rc==70 + "a tick trapped".
-out=$("$CLI" run tests/lang/lifecycle_entry_unload.ember --tick --tick-count 5 --tick-interval 1 2>&1); rc=$?
+out=$(timeout "$RUN_TIMEOUT" "$CLI" run tests/lang/lifecycle_entry_unload.ember --tick --tick-count 5 --tick-interval 1 2>&1); rc=$?
+if [ $rc -eq 124 ]; then printf "FAIL  lifecycle_entry_unload.ember (TIMEOUT after %ss)\n" "$RUN_TIMEOUT"; fail=$((fail+1)); fi
 if printf '%s' "$out" | grep -q 'module unloaded (no tick)' && ! printf '%s' "$out" | grep -q 'stopped after'; then
     printf "PASS  lifecycle_entry_unload.ember (negative @entry did not start tick)\n"; pass=$((pass+1))
 else
     printf "FAIL  lifecycle_entry_unload.ember (negative @entry should NOT tick)\n%s\n" "$out"; fail=$((fail+1))
 fi
-out=$("$CLI" run tests/lang/lifecycle_tick_trap_exit.ember --tick --tick-count 10 --tick-interval 1 2>&1); rc=$?
+out=$(timeout "$RUN_TIMEOUT" "$CLI" run tests/lang/lifecycle_tick_trap_exit.ember --tick --tick-count 10 --tick-interval 1 2>&1); rc=$?
+if [ $rc -eq 124 ]; then printf "FAIL  lifecycle_tick_trap_exit.ember (TIMEOUT after %ss)\n" "$RUN_TIMEOUT"; fail=$((fail+1)); fi
 if [ $rc -eq 70 ] && printf '%s' "$out" | grep -q 'a tick trapped'; then
     printf "PASS  lifecycle_tick_trap_exit.ember (tick trap -> exit 70)\n"; pass=$((pass+1))
 else

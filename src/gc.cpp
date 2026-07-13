@@ -1,5 +1,6 @@
 // gc.cpp — tracing mark-sweep garbage collector core implementation.
 #include "gc.hpp"
+#include "safety.hpp"
 
 #include <cstring>
 #include <cstdlib>
@@ -34,6 +35,14 @@ GcHeap::GcHeap() {}
 GcHeap::~GcHeap() { clear(); }
 
 void* GcHeap::alloc(size_t size, const RefMap& rm) {
+    // SAFETY FAILSAFE: throttled RSS check. If an unbounded allocation loop is
+    // filling the heap faster than collection reclaims it, this aborts the
+    // process before host RAM is exhausted (the incident root cause). Throttled
+    // to every ~64 MiB of live-byte growth so it stays out of the hot path.
+    if (m_stats.live_bytes >= m_last_rss_check_bytes + (64ull * 1024 * 1024)) {
+        safety::check_memory_limit();
+        m_last_rss_check_bytes = m_stats.live_bytes;
+    }
     size_t ref_bytes = rm.ptr_byte_offsets.size() * sizeof(uint32_t);
     size_t hdr_total = sizeof(Header) + ref_bytes + 4;  // +4 for the header_bytes trailer at user-4
     size_t total = hdr_total + size;

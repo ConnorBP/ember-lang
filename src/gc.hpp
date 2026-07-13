@@ -42,6 +42,13 @@ public:
     // Allocate `size` user bytes with reference layout `rm`. Returns pointer to
     // USER bytes (a hidden header precedes it). nullptr on bad_alloc. Object is
     // unmarked; the next collect() frees it unless a root reaches it.
+    //
+    // SAFETY: every allocation checks process RSS against the global memory
+    // limit (safety::check_memory_limit, throttled to every ~64 MiB of live-
+    // byte growth). If RSS exceeds the limit, the process instant-fails
+    // (abort) — this is the failsafe that stops an unbounded allocation loop
+    // from freezing the host machine. nullptr is still possible on malloc
+    // failure below the RSS limit.
     void* alloc(size_t size, const RefMap& rm);
 
     // Precise root registration: `addr` is the address of a slot (void**) that
@@ -69,6 +76,10 @@ private:
     std::unordered_set<void*> m_live;  // user-byte pointers
     std::vector<void**> m_roots;
     GcStats m_stats;
+    // RSS-check throttle: only call safety::check_memory_limit() when live_bytes
+    // has grown by >= 64 MiB since the last check. Keeps the ~1us syscall out of
+    // the per-alloc hot path while still catching runaway growth within ~64 MiB.
+    size_t m_last_rss_check_bytes = 0;
 };
 
 } // namespace ember::gc
