@@ -574,3 +574,451 @@ The run cannot commit even this log append because the tree is already dirty: (a
 Every command this run was read-only: `git rev-parse`, `git status`, `git diff` (`--stat`, `--cached`, `--numstat`, `--check`, `--submodule`), `git log`, `git show`, `git reflog`, `git tag`, `git describe`, `git stash list`, `git submodule status`, `git ls-files`, `ctest -N`, `cmake --build buildt`, `ctest --output-on-failure` (×2 full + 3 isolation), `./buildt/ember_cli.exe run`, `grep`, `wc`, `tail`, `stat`, `date`. HEAD unchanged at `44affbb`; porcelain status unchanged (` M docs/MAINTENANCE_LOG.md` / ` m thirdparty/vst3sdk`); reflog HEAD@{0} unchanged (owner's commit); tags unchanged (`v1.1.0`, `v1.2.0`); stash list unchanged (2 pre-existing). The build+ctest+validation invocations wrote ONLY to gitignored/generated `buildt/` and `Testing/Temporary/` (both gitignored; 0 tracked files under `Testing/`). **No file under `tmp_edit/` was created, written, or modified this run** (correcting the prior attempt's `tmp_edit/audit_*` violation — this run wrote nothing to `tmp_edit/`). **The `G:` drive was not accessed.** The sole intentional edit this run is this `docs/MAINTENANCE_LOG.md` append, left uncommitted per the dirty-tree rule.
 
 - **Commit:** none (DIRTY-READ-ONLY inventory + read-only re-run; sole intentional edit is this uncommitted `docs/MAINTENANCE_LOG.md` append. No source/test/doc fix, no staging/commit/push/pull/stash/revert, no `tmp_edit/` or `thirdparty/` change, no `G:` access. Ember remains at `44affbb`, 1 ahead of `origin/master`, unpushed.)
+
+
+---
+
+## 2026-07-13 11:12 (EDT)
+- **Tree state:** dirty (DIRTY-READ-ONLY — read-only audit; sole sanctioned edit is this uncommitted log append)
+- **Build:** PASS (cmake --build buildt -j 8 -> exit 0, "ninja: no work to do", 0 warnings/errors emitted)
+- **CTest:** PASS (64/64 selected tests passed, 0 failed, exit 0; 15.70 sec)
+- **Validation:** PASS (exit 177)
+- **Findings:**
+  - [BLOCKED] F1 -- bench_codegen_paths RSS failsafe abort (excluded by -E bench this run; defect persists)
+  - [BLOCKED] F2 -- libc setjmp paired with __builtin_longjmp (UB) + 2x -Wclobbered
+  - [BLOCKED] F3 -- IR backend miscompiles valid_unroll.ember: 56->26 under any --passes
+  - [BLOCKED] F4 -- missing 1 MiB raw/f-string literal caps (lexer)
+  - [BLOCKED] F5 -- deserialized frame-plan / full-span validation (LARGE)
+  - [BLOCKED] F6 -- ThinMeta::data_temp_off serialization + IR_BLOB_VERSION 1->2 (LARGE)
+  - [BLOCKED] F7 -- em_redteam_audit intermittent flake via throwing std::filesystem::remove (passed this run; root cause present)
+  - [BLOCKED] F8 -- valid_lsr/valid_sccp/valid_unroll not run with --passes in ctest (coverage gap)
+  - [BLOCKED] F9 -- README.md doc inaccuracies (pass count, mod 256, stale "in development")
+  - [NONE] No fixes applied this run -- DIRTY-READ-ONLY forbids source/test/doc edits, staging, commit, push.
+- **Commit:** none (DIRTY-READ-ONLY; this log append left uncommitted; repairs/publication blocked by pre-existing thirdparty/vst3sdk nested modification; parent Ember gitlink update blocked because parent workspace is dirty)
+
+### 1. Immutable initial tree state (recorded before any gate ran)
+
+- **HEAD:** `c39ab89079fe7a9e486be413ebdfc32592c1ac4e` (short `c39ab89`; commit message "VST3 stress deadline + active RSS check + hot-reload retired-page cap").
+- **Divergence vs origin/master:** `0 0` (in sync; not ahead, not behind).
+- **`git status --porcelain=v1 --untracked-files=all`:** exactly ` M thirdparty/vst3sdk` -- one dirty path, no `??` entries, no other `M`. This is a nested-submodule working-tree modification (lowercase `m` content in `git status --short` = modified content inside the submodule; gitlink SHA unchanged).
+- **`git ls-files --others --exclude-standard`:** empty (no untracked non-ignored files).
+- **`git check-ignore buildt`:** `buildt` (gitignored via `.gitignore:6:/buildt`). All build/test artifacts live in gitignored `buildt/`.
+- **Nested-submodule dirty inventory (immutable, three levels deep, not altered this run):**
+  1. ember top level: ` M thirdparty/vst3sdk` -- gitlink `9fad9770f2ae8542ab1a548a68c1ad1ac690abe0` (unchanged; `git diff --submodule=log` = "Submodule thirdparty/vst3sdk contains modified content").
+  2. `thirdparty/vst3sdk`: ` M public.sdk` -- gitlink `a3911a4615dabbfdfd9d181ee26b05c70c289a95` (unchanged; "Submodule public.sdk contains modified content").
+  3. `thirdparty/vst3sdk/public.sdk`: ` M source/vst/utility/alignedalloc.h` -- **the actual modified file**. `git diff --stat` = "1 file changed, 5 insertions(+), 1 deletion(-)". The diff adds `__MINGW32__`/`__MINGW64__` branches to `aligned_alloc`/`aligned_free` using `_aligned_malloc`/`_aligned_free` plus `#include <malloc.h>` (MinGW compat patch -- a required build fix for MinGW g++ which lacks `std::aligned_alloc`). This file is in `thirdparty/` -> permanently off-limits per `docs/MAINTENANCE_CONSTRAINTS.md` ("No changes to thirdparty/"). A human must decide whether to commit or revert this inside the submodules before any fix+commit cycle can run.
+- **`git diff --check`:** exit 0 (no whitespace errors, no conflict markers) at all three levels (ember, vst3sdk, public.sdk).
+- **Stashes:** `stash@{0}: On master: active-dev-src-changes`, `stash@{1}: WIP on master: f7afc35 ...` -- both pre-existing, untouched.
+- **Tags:** `v1.1.0`, `v1.2.0` -- none created this run.
+- **Reflog HEAD@{0}:** `c39ab89 HEAD@{0}: commit: VST3 stress deadline + active RSS check + hot-reload retired-page cap` -- owner's commit; no audit-authored reflog entries.
+- **`docs/MAINTENANCE_LOG.md` at initial state:** clean (committed; no diff). The prior run's uncommitted appends were committed in `95239c4` and subsequent commits. The tree advanced from `44affbb` (prior log entry's HEAD) to `c39ab89` (current HEAD) via commits `eb2e4fe`, `cafa1d4`, `8a70f82`, `c39ab89`.
+- **Classification:** DIRTY-READ-ONLY. The sole dirty path is the off-limits nested `thirdparty/vst3sdk` submodule. Per `docs/MAINTENANCE_CONSTRAINTS.md` prime directive, a dirty working tree implies read-only audit only. Per the task rules, the `thirdparty/vst3sdk` nested dirt alone is sufficient to block and must never be altered. The only sanctioned edit is this `docs/MAINTENANCE_LOG.md` append, left uncommitted.
+
+### 2. Concurrent-work recheck (required before acting)
+
+Rechecked HEAD and full recursive status before running gates: HEAD `c39ab89` unchanged, porcelain still exactly ` M thirdparty/vst3sdk`, no `??` entries. **No concurrent git-tracked work appeared** (the git tree is byte-for-byte identical to c1's observation). However, during the first CTest run a **concurrent build process** was detected in gitignored `buildt/`: `cmake.exe --build buildt --clean-first -j 8` (PID 98888) with two `ninja.exe -j 8` instances (PIDs 102620, 106092) and many `g++.exe`/`cc1plus.exe` processes. The `--clean-first` flag was actively cleaning and rebuilding `buildt/`, causing test executables to appear and disappear -- the first CTest run returned exit 8 with 61/64 "Not Run" (executables missing mid-clean). This concurrent build is NOT git-tracked concurrent work (it modifies only gitignored `buildt/`, not tracked files; git status remained ` M thirdparty/vst3sdk` throughout). The audit waited for the concurrent build to finish (~5 min), then re-ran all gates cleanly on the stable tree. The concurrent build did not change HEAD, the git tree, or any tracked file. No action was taken against the concurrent build (it was not interrupted, cleaned, or altered).
+
+### 3. Build + warning classification
+
+- **Build gate:** `cmake --build buildt -j 8` -> **exit 0**, output: `ninja: no work to do.` (incremental; the concurrent clean build had already built all targets; nothing to rebuild). Writes only to gitignored `buildt/`.
+- **Compiler warnings emitted this run:** **NONE**. The build performed no compilation ("no work to do"), so no warnings were emitted.
+- **Known warning classification (carried forward, NOT emitted this run because ember_cli.cpp was not recompiled):** **F2** -- `examples/ember_cli.cpp:1635` uses libc `setjmp(ectx.checkpoint)` paired with `__builtin_longjmp` at `:134` (the trap handler). This is the ONLY libc `setjmp` site; all other 8 checkpoint sites (lines 673, 686, 740, 779, 1294, 1378, 1419, 1461) use `__builtin_setjmp`. The comment at `:130-134` explicitly requires the builtin pair ("__builtin_longjmp (not std::longjmp): restores saved rsp/rbp/ip"). Targeted recompile emits `-Wclobbered` for `entry` (`:1617`) and `is_void` (`:1621`) -- 2 warnings. Introduced by `eb2e4fe` (safety failsafes). Classified as **BLOCKED** (see section 6 F2) -- would restore the 0-warning baseline. Not fixed this run (DIRTY-READ-ONLY).
+- **`git diff --check`:** exit 0 (no whitespace/conflict markers). Re-verified at final state.
+
+### 4. CTest -- configured/selected totals and failures
+
+- **Command (from `buildt/`):** `ctest --output-on-failure -E bench -LE soak --timeout 60`
+- **Configured total:** 67 tests (`ctest -N` -> "Total Tests: 67").
+- **Excluded by `-E bench` (regex `bench`):** 2 tests -- #44 `bench_ember_vs_as`, #45 `bench_codegen_paths`.
+- **Excluded by `-LE soak` (label `soak`):** 1 test -- #11 `vst3_soak` (labeled `soak`).
+- **No overlap** between the two exclusion sets.
+- **Selected total:** 67 minus 2 minus 1 = **64 tests selected**.
+- **Result:** **100% tests passed, 0 tests failed out of 64**, exit code **0**, Total Test time **15.70 sec**. No "Not Run" or "Failed" entries. Every selected test (#1-#65 excluding #11/#44/#45) passed.
+- **First CTest run (during concurrent build -- unreliable, NOT the recorded result):** exit 8, 61/64 "Not Run" because the concurrent `--clean-first` build had deleted test executables. This is an environmental artifact of the concurrent build, not a code defect. After the concurrent build finished, the clean re-run passed 64/64.
+- **Note on bench exclusion:** `bench_codegen_paths` (#45) is excluded by `-E bench` this run. It is known to fail deterministically on the 2 GiB RSS failsafe (F1, see section 6). The task's gate command explicitly excludes bench, so this does not affect the gate result. F1 is documented as BLOCKED.
+
+### 5. Validation sentinel (exit 177 required)
+
+- **Command (from `buildt/`):** `./ember_cli.exe run ../tests/lang/optimization_validation.ember --fn main --passes constprop,forward,copyprop,instcombine,dce,licm,dse`
+- **Result:** **exit code 177** (stdout empty; success signaled by exit code as documented at `tests/lang/optimization_validation.ember:20,25` -- "expect: 177" / "Both MUST exit 177", computation `231 - 54 = 177`). Confirmed at HEAD `c39ab89`. Exactly 177 as required.
+
+### 6. Findings -- all BLOCKED (DIRTY-READ-ONLY) or carried-forward TODO
+
+Every finding below is marked FIXED, TODO, BLOCKED (with exact reason), or NONE. No finding was fixed this run (DIRTY-READ-ONLY forbids source/test/doc edits). Findings already fixed+committed in prior commits are noted as such.
+
+**Already FIXED+committed (prior work, not this run -- no action needed):**
+- GC `H2` by-ref escape -- FIXED (`src/sema.cpp` `env_capture_by_ref`/`lambda_has_by_ref_capture`).
+- `N1` ThinIR cross-module handle miscompilation -- FIXED (`src/thin_lower.cpp:1631-1638` `non_serializable` for `is_cross_module`).
+- `X1` v5 `CallCrossModule` slot-validation -- FIXED (`src/thin_ir_ser.cpp:689-696`).
+- `C3` opt-pass DCE/ConstProp frame-write erasure -- FIXED (`extensions/opt/ext_opt.cpp` `call_reads_frame_off` + reader-set; commit `8235347`).
+- HIGH recursion-depth stack-overflow -- FIXED (`src/parser.cpp:16` `expr_depth` + `DepthGuard`).
+- v5 mixed-mode raw-x86 secure-default -- FIXED (commit `44affbb`, now behind `c39ab89`).
+
+**BLOCKED this run (DIRTY-READ-ONLY -- exact reason for each):**
+
+  - **[BLOCKED] F1 -- `bench_codegen_paths` aborts on the 2 GiB RSS failsafe.** Affected: `bench/bench_codegen_paths.cpp` (7 `safety::check_memory_limit()` calls: lines 293, 310, 352, 362, 402, 417, 619) vs `src/safety.cpp:46` (`g_memory_limit_kb{2ull*1024*1024}` 2 GiB default). Impact: deterministic ctest failure -- `ctest -R '^bench_codegen_paths$'` aborts "process RSS ~2100200 KB exceeds limit 2097152 KB" (~2.05 GiB legit working set vs 2 GiB cap). Introduced by `eb2e4fe` (failsafe) + `8a70f82` (added calls into bench loops; validation used `-E bench` so it slipped past). `set_memory_limit_kb` defined (`src/safety.cpp:48`/`src/safety.hpp:43`) but called nowhere. Proposed fix: at top of `main()` in `bench/bench_codegen_paths.cpp`, call `safety::set_memory_limit_kb(4ull*1024*1024);` (opts the heavy bench into 4 GiB ceiling without weakening the global 2 GiB default; ~2 lines, 1 file). **Blocked reason:** DIRTY-READ-ONLY -- the working tree is dirty (` M thirdparty/vst3sdk`), so per the prime directive no source file may be edited. Excluded by `-E bench` this run so it does not affect the gate, but the defect persists.
+
+  - **[BLOCKED] F2 -- `--load-em` uses libc `setjmp` paired with `__builtin_longjmp` (UB) + 2x `-Wclobbered`.** Affected: `examples/ember_cli.cpp:1635` (`setjmp(ectx.checkpoint) == 0`). Impact: the only libc `setjmp` site; trap handler at `:134` uses `__builtin_longjmp(ctx->checkpoint, 1)` with a comment requiring the builtin pair. Targeted recompile emits `-Wclobbered` for `entry` (`:1617`) and `is_void` (`:1621`) -- 2 warnings (the only warnings in the codebase; introduced by `eb2e4fe`). Proposed fix: `setjmp(ectx.checkpoint) == 0` -> `__builtin_setjmp(ectx.checkpoint) == 0` (1 line, 1 file; matches existing precedent at 8 other sites). **Blocked reason:** DIRTY-READ-ONLY -- no source file may be edited. This is the only finding that would restore the 0-warning baseline.
+
+  - **[BLOCKED] F3 -- IR backend miscompiles `valid_unroll.ember`: 56 -> 26 under any `--passes` (LARGE -- correctness).** Affected: IR-backend path `src/thin_lower.cpp` / `src/regalloc.cpp` / `src/thin_emit.cpp` (prime suspect: `src/regalloc.cpp:305+` loop-carried frame-slot-to-register promotion introduced by `58c0bda`). Re-confirmed at `c39ab89`: `valid_unroll.ember --fn main` -> 56 (correct: `0+1+2+3` + `0+10+20` + 8 + 9 + 3); `--passes dce` -> 26 = 56 minus 30 (exactly the `for(j=0;j<3;j=j+1){result=result+j*10;}` body's accumulator store dropped). Tested across all 10 single passes -- every one returns 26, proving the bug is in the IR-backend path itself (lower->regalloc->emit), not any specific pass (`--passes` only forces `ctx.enable_ir_backend = true`). `optimization_validation.ember` (same path family) still returns 177, so the bug is shape-specific to `valid_unroll`'s loop-carried accumulator. Proposed fix: focused debugging of lower->regalloc->emit for `valid_unroll`'s `for(j...)` loop -- likely a missing store-back of the promoted accumulator slot across the loop back-edge, or a dead-store elimination incorrectly dropping the accumulator store. **Blocked reason:** DIRTY-READ-ONLY + exceeds hourly-maintenance limits (root-cause debugging across multiple IR-backend files, likely >3 files / >50 lines; needs focused investigation and a reviewed change on a clean tree, not a narrow automated fix).
+
+  - **[BLOCKED] F4 -- missing 1 MiB raw/f-string literal caps (lexer).** Affected: `src/lexer.cpp:303-309` (caps only plain strings via `MAX_STRING_LITERAL = 1<<20`); f-string accumulation `:122-160` and raw-string accumulation `:176-185` are unbounded. Impact: memory-exhaustion DoS vector via unbounded raw/f-string literals. Proposed fix: share the same 1 MiB cap in all three scanners (plain/f/raw) + add lexer regression tests asserting >1 MiB raw and f-string literals are rejected (~1 file + 1 test). **Blocked reason:** DIRTY-READ-ONLY -- no source/test file may be edited.
+
+  - **[BLOCKED] F5 -- deserialized frame-plan / full-span validation (LARGE).** Affected: `src/thin_ir_ser.cpp` (validation at `:562-568,663-675` -- checks only frame size, `rbx_save_offset`, and first byte of nonzero `frame_off`); unsafe consumers `src/thin_emit.cpp:440,458,594,676,966,1031,1117,1161,1210,1254,1977,2042` (consumes `frame_off+8`, `struct_ret_ptr_offset`, `ThinParam::off`/`off+8`, `arg_frame_offs[]`). Impact: malformed/untrusted `.em` v5 IR blobs with out-of-frame rbp-relative offsets/spans are not rejected before emit -- `frame_off=-8` with `frame_size=8` passes the current check but `[rbp+0]` overwrites saved rbp. Proposed fix: add overflow-safe offset/span helpers; validate every rbp-relative field before emit, accounting for per-op 1/2/4/8-byte write widths (not a blanket +8). **Blocked reason:** DIRTY-READ-ONLY + exceeds hourly limits (>3 files / >50 lines; the per-op-width span check is subtle and touches the validation boundary adjacent to the protected `src/thin_ir.hpp` `ThinOp` enum which must not be edited; needs a clean tree + reviewed change).
+
+  - **[BLOCKED] F6 -- `ThinMeta::data_temp_off` serialization + `IR_BLOB_VERSION` 1->2 bump (LARGE).** Affected: `src/thin_ir.hpp:207` (`ThinMeta::data_temp_off`, set `src/thin_lower.cpp:1332`, consumed `src/thin_emit.cpp:1040` where `data_temp_off != 0 ? data_temp_off : frame_off` falls back); not in the serialization path (`src/thin_ir_ser.cpp`). Impact: `data_temp_off` is not persisted/validated across `.em` v5 round-trip -- a deserialized blob silently falls back to `frame_off`, which can overlap other slots if the original `data_temp_off` was nonzero. Proposed fix: serialize `data_temp_off` + bump `IR_BLOB_VERSION` 1->2 with backward-compatible v1 loading + v2 validation. **Blocked reason:** DIRTY-READ-ONLY + exceeds hourly limits (touches the serialization/version boundary -- a stable serialization boundary per `docs/MAINTENANCE_CONSTRAINTS.md` "No changes to the .em format spec"; needs a clean tree + reviewed change with round-trip regression tests).
+
+  - **[BLOCKED] F7 -- `em_redteam_audit` intermittent flake via throwing `std::filesystem::remove`.** Affected: `examples/em_redteam_audit_test.cpp` cleanup sites (lines 95, 136, 215, 247, 280, 325, 372, 385). Impact: under full-suite contention a concurrent `%TEMP%` cleaner can delete the temp `.em` file before cleanup; MinGW libstdc++'s throwing `remove` raises `std::filesystem::filesystem_error` -> `std::terminate` after both assertions passed. **Passed this run** (64/64, `em_redteam_audit` #58 Passed 0.01 sec) -- the flake is intermittent and did not reproduce, but the root cause (throwing `remove` overload) is still present. Proposed fix: at each cleanup site replace the throwing overload with `std::error_code ec; std::filesystem::remove(path, ec);` (narrow test-source edit). **Blocked reason:** DIRTY-READ-ONLY -- no test-source file may be edited.
+
+  - **[BLOCKED] F8 -- `valid_lsr`/`valid_sccp`/`valid_unroll` not run with `--passes` in ctest (coverage gap).** Affected: `tests/lang/valid_lsr.ember`, `tests/lang/valid_sccp.ember`, `tests/lang/valid_unroll.ember` (each carries a "Run with: ember_cli run ... --passes ..." comment) vs `CMakeLists.txt:587` (`lang_suite` runs `tests/run_lang_tests.sh` which does parse/sema classification only, never `--passes` execution). Impact: the IR-backend path is never exercised on these files in ctest, so the F3 miscompilation is completely uncaught. Re-verified at `c39ab89`: `valid_lsr` 60 == `--passes lsr` 60; `valid_sccp` 42 == `--passes sccp` 42; `valid_unroll` 56 (correct) vs `--passes <any>` 26. Proposed fix: add `--passes` ctest invocations for `valid_lsr` (expect 60) and `valid_sccp` (expect 42) now -- these pass and are safe coverage. Defer the `valid_unroll --passes` coverage until F3 is fixed (currently returns 26 vs expected 56). **Blocked reason:** DIRTY-READ-ONLY -- no `CMakeLists.txt` edit may be made. The `valid_unroll` portion is additionally gated on F3.
+
+  - **[BLOCKED] F9 -- README.md doc inaccuracies.** Affected: `README.md:31` ("**16 IR passes shipped** (11 optimization + 5 obfuscation)"); `README.md:147` ("exit code = its i64 return (mod 256)"); `README.md:296` ("**18 passes shipped (11 optimization + 7 obfuscation))**" -- stale count + double `)`); `README.md:300-301` ("str_encrypt ... in development"). Impact: (a) pass count stated two different ways (16 and 18) -- both contradict the actual **23** (16 optimization: constprop, dce, simplifycfg, cse, licm, lsr, forward, copyprop, instcombine, dse, bounds-elim, sccp, unroll, spill_elim, peephole, branch_folding; + 7 obfuscation: subst, mba_expand, const_encode, opaque_pred, deadcode, str_encrypt, block_split -- verified from `extensions/opt/ext_opt.cpp:2883-2899` and `extensions/obf/ext_obf.cpp:800-807`); (b) "mod 256" is inaccurate for negative i64 returns (C++ `%` truncates toward zero, e.g. `-1 % 256 == -1`, whereas actual behavior is low-8-bit truncation = 255) -- `README.md:111` and `:166` already correctly say "8-bit, so >255 wraps / OS truncation, not a [mod]"; (c) "in development" is stale -- `:36` says "shipped" and `:293` uses `str_encrypt` in a runnable `--passes` example; (d) double-paren typo on `:296`. Proposed fix: reconcile pass count to 23 (single correct statement); change `:147` "(mod 256)" -> "8-bit (low byte; OS truncation, not C++ `%`)"; change `:300-301` "in development" -> shipped; fix the `:296` double paren. **Blocked reason:** DIRTY-READ-ONLY -- no doc file may be edited. (Doc-only, 1 file, narrow; would be a CLEAN-MAY-FIX candidate.)
+
+**Findings carried forward from prior log entries (still OPEN at `c39ab89`, all BLOCKED this run for the same DIRTY-READ-ONLY reason):**
+  - S1/S2/S4/S5/S6/C1/C2 (SANDBOX_REVALIDATION): per-frame byte budget + stack-depth guards off by default; lambda env_ptr escape residual; coroutine SwitchToFiber checkpoint non-restore; trap = process death; call-target guard silent no-op; sandbox guards stripped on v5 re-emit / CLI --emit-em. All OPEN, BLOCKED.
+  - GC M1/M2/M4/M5/L1 (GC_RAW_THREADS_SECURITY_AUDIT): GC/thread natives not permission-gated; thread budget/depth bypass; GC alloc exception safety + pin-failure UAF; GC thread-local heap vs cross-thread handles. OPEN pending verification, BLOCKED.
+  - ATTACK_SURFACE F-2/F-3/F-4/F-5/F-6: GC exception-boundary throw-and-terminate; uncaught bad_alloc/length_error across native boundary; generationless free-list stale-handle ABA; raw-pointer-after-mutex-release; ext_map entries unbounded. OPEN pending verification, BLOCKED.
+  - SECURITY_AUDIT_20COMMITS F1 (HIGH): hot-reload audio_readers_ grace-period TOCTOU UAF. OPEN pending verification, BLOCKED.
+  - OPTIMIZATION_PASSES_READ_ONLY C1/C2a/C2b/C4/C5a-c/C6/C7/C8a-c/C9/C10: ten opt-pass correctness defects (C3 confirmed closed). OPEN pending per-finding verification, BLOCKED.
+  - SELF_HOSTED_CORRECTNESS P0/P1: logical scope-mark stack handling; loop-control validation; annotation rejection; four-argument ceiling; stage error-code disambiguation; wire corpus into CTest. OPEN, BLOCKED.
+  - Performance TODOs: tree-walker 5-8x slower than g++-O2; constprop_fold computed at runtime; pass runtime impact not benchmarked. OPEN, BLOCKED.
+  - Completeness TODOs: GC core not wired into engine/codegen; in-context threads not linked into ember_cli; lambdas + coroutines not in lang_suite RUN list. OPEN, BLOCKED.
+  - Platform TODOs: Linux x64 / macOS / 32-bit / ARM64 ports. OPEN, BLOCKED.
+  - Docs-drift: residual stale ROADMAP Tier entries. OPEN, BLOCKED.
+
+**Uniform blocked reason for every still-open finding:** DIRTY-READ-ONLY. The working tree is dirty -- nested submodule `thirdparty/vst3sdk/public.sdk/source/vst/utility/alignedalloc.h` is modified (off-limits MinGW compat patch) -- so per `docs/MAINTENANCE_CONSTRAINTS.md` prime directive the cron must NOT edit any source/test/doc file, commit, push, stash, or revert; only this `docs/MAINTENANCE_LOG.md` append is permitted. Therefore none of the findings can be fixed+committed this run; each is documented here as blocked with its concrete reason, satisfying "audit findings either fixed+committed or documented as blocked with clear reason."
+
+### 7. Audit-report dispositions -- no report left without action
+
+All 35 reports in `docs/audit/` retain the dispositions recorded in the prior log entry (section 7 of the 2026-07-12 entry). No new audit report was created this run. Every report either has its findings closed by committed work (noted in section 6 above) or has its still-open findings listed in section 6 and documented as BLOCKED with the concrete DIRTY-READ-ONLY reason. No report is left without a disposition.
+
+### 8. Changed paths
+
+- **`docs/MAINTENANCE_LOG.md`** -- this append (the sole sanctioned edit; left uncommitted per DIRTY-READ-ONLY).
+- No other tracked file was created, modified, staged, committed, or deleted. No source/test/doc/thirdparty file was touched. No `tmp_edit/` file was created. No `G:` access occurred. The build/ctest/validation invocations wrote only to gitignored `buildt/` and `Testing/Temporary/` (both gitignored). The concurrent `--clean-first` build modified only gitignored `buildt/` (not a tracked-file change).
+
+### 9. Publication status -- BLOCKED
+
+- **Repairs/publication are BLOCKED** by the pre-existing nested `thirdparty/vst3sdk` modification. The dirty working tree (` M thirdparty/vst3sdk`) triggers the `docs/MAINTENANCE_CONSTRAINTS.md` prime directive: read-only audit only -- no source/test/doc edits, no staging, no commit, no push, no stash, no revert. The `thirdparty/vst3sdk` nested dirt (the MinGW compat patch in `public.sdk/source/vst/utility/alignedalloc.h`) must never be altered by the cron; a human must decide whether to commit or revert it inside the submodules before any fix+commit cycle can run.
+- **This log append is left UNCOMMITTED.** No staging, no commit, no push, no pull, no rebase, no force-push, no clean-artifacts, no touch of the dirty nested submodule.
+- **Parent Ember gitlink update: BLOCKED.** The parent workspace `E:/DEVELOPER/PROJECTS/sus/hyper_workspace` is dirty (` M Testing/Temporary/LastTest.log`, ` M ember` [gitlink shows `c39ab89-dirty`], ` M hyper-reV`, ` M prism-gui/CMakeLists.txt`, plus untracked `InsydeBIOS_Microcode_Updater/`, `LEGION_Y7000Series_Insyde_Advanced_Settings_Tools/`, `NUL`). Per the task rule, the parent Ember gitlink may be updated only if the parent tree is clean. It is NOT clean, so the parent gitlink update is **documented as blocked without staging it**. The parent HEAD remains `17dc795ace4ef3b10c52a2f0a4b692f954eaf6b8`.
+- **`G:` drive:** not accessed, not modified.
+
+### 10. Read-only invariant (re-verified)
+
+Every command this run was read-only or wrote only to gitignored paths: `git rev-parse`, `git status` (porcelain v1, `--untracked-files=all`, `--ignore-submodules=none`), `git diff` (`--check`, `--submodule=log`, `--stat`, `--numstat`, `--name-only`), `git log`, `git reflog`, `git tag`, `git stash list`, `git ls-tree`, `git ls-files`, `git check-ignore`, `git submodule summary`, `ctest -N`, `cmake --build buildt -j 8`, `ctest --output-on-failure -E bench -LE soak --timeout 60`, `./ember_cli.exe run` (validation + F3 spot-checks), `grep`, `wc`, `ls`, `find`, `date`, `tasklist`, `wmic`. HEAD unchanged at `c39ab89079fe7a9e486be413ebdfc32592c1ac4e`; porcelain status after this append: ` M thirdparty/vst3sdk` + ` M docs/MAINTENANCE_LOG.md` (this append); reflog HEAD@{0} unchanged (owner's commit); tags unchanged (`v1.1.0`, `v1.2.0`); stash list unchanged (2 pre-existing). The sole intentional edit is this `docs/MAINTENANCE_LOG.md` append, left uncommitted per the dirty-tree rule. No audit report was created. **The `G:` drive was not accessed.**
+
+
+---
+
+## 2026-07-13 (inventory + classification chunk — DIRTY-READ-ONLY)
+
+This entry is the sole sanctioned write of this chunk (read-only audit per `docs/MAINTENANCE_CONSTRAINTS.md` prime directive; dirty mode reserves only this final `docs/MAINTENANCE_LOG.md` append). No source/test/doc fix, no staging, no commit, no push, no pull, no rebase, no stash, no revert, no `tmp_edit/` change, no `thirdparty/` change, no new audit report, no `G:` access. The inventory below is recorded for dependent chunks.
+
+### Immutable initial tree state (captured before any action)
+
+- **HEAD:** `323d18f559409e1afcd4aaa684f15455659b4bd4` (short `323d18f`; "Add AI skills folder with ember-language skill"). Reflog HEAD@{0} = this commit (owner's commit); HEAD@{1} = `c39ab89` ("VST3 stress deadline + active RSS check + hot-reload retired-page cap"), which IS an ancestor of HEAD.
+- **origin/master:** `323d18f559409e1afcd4aaa684f15455659b4bd4` (== HEAD).
+- **Divergence:** `git rev-list --left-right --count origin/master...HEAD` = `0	0`; `branch.ab +0 -0`. In sync — not ahead, not behind. Nothing to push/pull.
+- **`git status --porcelain=v2 --branch --untracked-files=all` (exact):**
+  ```
+  # branch.oid 323d18f559409e1afcd4aaa684f15455659b4bd4
+  # branch.head master
+  # branch.upstream origin/master
+  # branch.ab +0 -0
+  1 .M N... 100644 100644 100644 25d5356b6b3aad1da0e6deb72deda6f803392933 25d5356b6b3aad1da0e6deb72deda6f803392933 docs/MAINTENANCE_LOG.md
+  1 .M S.M. 160000 160000 160000 9fad9770f2ae8542ab1a548a68c1ad1ac690abe0 9fad9770f2ae8542ab1a548a68c1ad1ac690abe0 thirdparty/vst3sdk
+  ```
+  No `?`/untracked entries. Two dirty paths only.
+- **Staged diff (`git diff --cached`):** EMPTY — nothing staged.
+- **Unstaged diff (`git diff --numstat`):** `133 0 docs/MAINTENANCE_LOG.md` and `0 0 thirdparty/vst3sdk` (submodule dirty flag, not a content diff). Full unstaged diff: MAINTENANCE_LOG.md +133 lines (the prior 2026-07-13 11:12 audit append, which is STALE — it records HEAD `c39ab89`, but actual HEAD is now `323d18f` because the owner committed `323d18f` "Add AI skills folder..." without staging that log append); plus `thirdparty/vst3sdk` gitlink shown as `9fad9770...-dirty`.
+- **`git diff --check`:** exit 0 (no whitespace errors, no conflict markers) at all three levels.
+- **`git ls-files --others --exclude-standard`:** EMPTY (no untracked non-ignored files at ember top level).
+- **Documented-ignored build outputs (excluded from dirty classification):** `git check-ignore` confirms `buildt`, `Testing`, `Testing/Temporary`, `tmp_edit` are gitignored (`.gitignore`: `/buildt`, `/Testing`, `/tmp_edit`, etc.). Any changes there do not count as dirty work.
+- **Recursive submodule status (`git submodule status --recursive`):**
+  - `9fad9770... thirdparty/vst3sdk (v3.7.3_build_20-15-g9fad977)` — gitlink unchanged; contains modified content (`-dirty` per `git diff`).
+  - `3d2e82f... base`, `de6e54e... cmake`, `6d4737c... doc`, `31d6eeb... pluginterfaces`, `a3911a4... public.sdk`, `33b73df... tutorials`, `76823bdb... vstgui4` — nested submodules of vst3sdk; only `public.sdk` is dirty (see below).
+- **Nested-submodule dirty inventory (read-only, three levels deep, NOT altered this chunk):**
+  1. **ember (L0):** ` M thirdparty/vst3sdk` — gitlink `9fad9770f2ae8542ab1a548a68c1ad1ac690abe0` unchanged; `S.M.` = modified content inside, no untracked content. `.gitmodules` records `thirdparty/vst3sdk` -> `https://github.com/steinbergmedia/vst3sdk.git`.
+  2. **thirdparty/vst3sdk (L1, detached @ 9fad9770):** ` M public.sdk` — gitlink `a3911a4615dabbfdfd9d181ee26b05c70c289a95` unchanged; `S.M.` = modified content inside public.sdk, no untracked content. Other nested submodules (base/cmake/doc/pluginterfaces/tutorials/vstgui4) clean.
+  3. **thirdparty/vst3sdk/public.sdk (L2, detached @ a3911a46):** ` M source/vst/utility/alignedalloc.h` — the actual modified file. `git diff --stat` = "1 file changed, 5 insertions(+), 1 deletion(-)". Diff adds `__MINGW32__`/`__MINGW64__` branches to `aligned_alloc` (`_aligned_malloc` + `#include <malloc.h>`) and `aligned_free` (`_aligned_free`) — a MinGW compat patch (required build fix for MinGW g++ which lacks `std::aligned_alloc`). **This file is under `thirdparty/` -> permanently off-limits** per `docs/MAINTENANCE_CONSTRAINTS.md` ("No changes to thirdparty/"). Never altered, cleaned, reset, staged, stashed, or committed this chunk.
+- **Stashes:** `stash@{0}: On master: active-dev-src-changes`, `stash@{1}: WIP on master: f7afc35 ...` — 2 pre-existing, untouched.
+- **Tags:** `v1.1.0`, `v1.2.0` — none created/removed this chunk.
+- **Verification that known modifications remain:** YES — both `docs/MAINTENANCE_LOG.md` (unstaged +133 lines) and `thirdparty/vst3sdk` (nested submodule modified content reaching `public.sdk/source/vst/utility/alignedalloc.h`, +5/-1) remain present in the worktree, unchanged from the start of this chunk.
+
+### Classification: DIRTY-READ-ONLY
+
+Dirty work exists that is NOT excluded as a documented ignored build output:
+1. Tracked file `docs/MAINTENANCE_LOG.md` has uncommitted modifications (+133 lines) — a tracked, non-thirdparty, non-ignored file. => dirty.
+2. Nested submodule `thirdparty/vst3sdk` has modified content (`S.M.`), reaching down to `thirdparty/vst3sdk/public.sdk/source/vst/utility/alignedalloc.h` (+5/-1). => nested-submodule work, dirty, and off-limits.
+
+Per `docs/MAINTENANCE_CONSTRAINTS.md` prime directive, a dirty working tree mandates **read-only audit only** — no source/test/doc edits, no commit, no push. Per the task, dirty mode prohibits every source/test/doc fix and every commit/push; the only reserved write is this `docs/MAINTENANCE_LOG.md` append. No `CLEAN-MAY-FIX` path is available.
+
+### Disposition for the overall goal's success criteria
+
+- **ctest / validation 177 / audit fixes:** NOT executed this chunk (this chunk is the inventory+classification gate for dependent chunks). In DIRTY-READ-ONLY mode any fix+commit is prohibited, so audit findings cannot be fixed+committed here; they remain **documented as blocked with clear reason: dirty tree (tracked `docs/MAINTENANCE_LOG.md` uncommitted append + off-limits nested `thirdparty/vst3sdk` modification) -> prime directive -> read-only -> no edits/commits permitted.** Dependent chunks that need to fix+commit require a clean tree (the `thirdparty/vst3sdk` nested MinGW patch must be resolved by a human first; the stale `docs/MAINTENANCE_LOG.md` append must also be reconciled).
+- **No new audit report was created** (per task). No `docs/audit/` file written.
+
+### Read-only invariant
+
+Every command this chunk was read-only or wrote only to gitignored paths, except the single sanctioned `>> docs/MAINTENANCE_LOG.md` append below: `git status` (porcelain v2 + v1), `git diff` (`--cached`, `--stat`, `--numstat`, `--name-only`, `--check`), `git rev-parse`, `git rev-list`, `git log`, `git reflog`, `git tag`, `git stash list`, `git ls-files`, `git check-ignore`, `git submodule status --recursive`, `git -C thirdparty/vst3sdk ...` / `git -C thirdparty/vst3sdk/public.sdk ...` (read-only status/diff only), `cat .gitmodules`/`.gitignore`, `wc`, `tail`, `pwd`. HEAD unchanged at `323d18f`; origin/master unchanged (== HEAD, `0 0`); reflog/tags/stash list unchanged; nested `thirdparty/` dirt unchanged and untouched. **The `G:` drive was not accessed.** No file under `thirdparty/` was altered, cleaned, reset, staged, stashed, or committed. The sole intentional edit is this `docs/MAINTENANCE_LOG.md` append, left uncommitted per the dirty-tree rule.
+
+---
+
+## 2026-07-13 12:46 (EDT) — DIRTY-READ-ONLY re-verification + fresh gate run + finding reproduction
+
+Re-verification chunk at the same HEAD as the inventory chunk above (`323d18f`). The tree is **still dirty** (both predicted sources persist), so per `docs/MAINTENANCE_CONSTRAINTS.md` prime directive this chunk is **read-only audit only**. The only sanctioned write is this `docs/MAINTENANCE_LOG.md` append. No source/test/doc fix, no staging, no commit, no push, no pull, no rebase, no stash, no revert, no `tmp_edit/` change, no `thirdparty/` change, no new audit report, no `G:` access. Implementation chunks remain **blocked** until the owner (a) resolves the off-limits nested `thirdparty/vst3sdk/public.sdk/source/vst/utility/alignedalloc.h` MinGW patch (commit-or-revert decision inside the submodules) and (b) reconciles the stale uncommitted `docs/MAINTENANCE_LOG.md` appends.
+
+### Pre-action tree state (re-captured)
+
+- **HEAD:** `323d18f` (unchanged from inventory chunk; owner's "Add AI skills folder with ember-language skill" commit, 2026-07-13 11:33:40 -0400). **origin/master:** `323d18f` (== HEAD). **Divergence:** `git rev-list --left-right --count @{u}...HEAD` = `0	0` (in sync).
+- **`git status --short --branch`:** `## master...origin/master` / ` M docs/MAINTENANCE_LOG.md` / ` m thirdparty/vst3sdk`. **`git status --porcelain=v1 --untracked-files=all`:** ` M docs/MAINTENANCE_LOG.md`, ` M thirdparty/vst3sdk`. No `??` entries. Two dirty paths only — identical to the inventory chunk's observation (byte-for-byte same dirt; no concurrent git-tracked work appeared).
+- **Recursive submodule status:** all gitlinks unchanged; `thirdparty/vst3sdk` and (one level down) `thirdparty/vst3sdk/public.sdk` carry modified content. The actual modified file is `thirdparty/vst3sdk/public.sdk/source/vst/utility/alignedalloc.h` (`+5/-1`: MinGW `_aligned_malloc`/`_aligned_free` + `#include <malloc.h>` compat patch). Off-limits per `docs/MAINTENANCE_CONSTRAINTS.md` ("No changes to thirdparty/"); never touched this chunk.
+- **`git diff --numstat` (unstaged):** `188 0 docs/MAINTENANCE_LOG.md` (the 11:12 audit append +133 and the inventory chunk append +55, both still uncommitted) and `0 0 thirdparty/vst3sdk` (submodule content flag). Nothing staged.
+- **Stashes:** 2 pre-existing (`active-dev-src-changes`, `WIP on master: f7afc35 ...`), untouched. **Tags:** `v1.1.0`, `v1.2.0`, unchanged.
+- **Parent workspace:** `## main...origin/main`; dirty (` M Testing/Temporary/LastTest.log`, ` m ember`, ` M hyper-reV`, ` M prism-gui/CMakeLists.txt`, untracked `InsydeBIOS_Microcode_Updater/`, `LEGION_Y7000Series_Insyde_Advanced_Settings_Tools/`, `NUL`). Parent gitlink update for `ember` is therefore also blocked.
+- **Classification:** DIRTY-READ-ONLY. Tracked-file dirt (`docs/MAINTENANCE_LOG.md`) + nested-submodule dirt (`thirdparty/vst3sdk` -> `public.sdk` -> `alignedalloc.h`) -> prime directive -> read-only -> no edits/commits permitted.
+
+### Gate results (fresh, at `323d18f`, after waiting out a concurrent ctest run)
+
+A concurrent `ctest` (PIDs 86635 @12:44:13, 86755 @12:44:41) was observed and waited out (each finished in ~26 s); it was ctest-only (no `--clean-first` build), so it did not delete test executables. Gates were run on the stable tree after the concurrent ctest drained.
+
+1. **Build gate** `cmake --build buildt -j 8` -> **exit 0**, `ninja: no work to do.` (incremental; no compilation -> no warnings emitted this run). Writes only to gitignored `buildt/`.
+2. **CTest gate** (from `buildt/`) `ctest --output-on-failure -E bench -LE soak --timeout 60` -> **100% tests passed, 0 failed out of 64**, exit **0**, 14.52 sec. Configured total 67 (`ctest -N`); excluded 2 by `-E bench` (#44 `bench_ember_vs_as`, #45 `bench_codegen_paths`) + 1 by `-LE soak` (#11 `vst3_soak`); no overlap -> 64 selected. Every selected test passed (incl. `lang_suite` #32 10.81 s, `vst3_stress` #8 1.10 s, `em_redteam_audit` #58 0.01 s — the F7 flake did NOT reproduce this run, root cause still present).
+3. **Validation gate** (from `buildt/`) `./ember_cli.exe run ../tests/lang/optimization_validation.ember --fn main --passes constprop,forward,copyprop,instcombine,dce,licm,dse` -> **exit 177** (stdout empty; success per `optimization_validation.ember:20,25,415` `231 - 54 = 177`).
+
+### Findings — reproduced/confirmed read-only at `323d18f`
+
+All nine carried-forward findings re-confirmed; current line numbers verified. None fixed this chunk (DIRTY-READ-ONLY). Priority per `docs/MAINTENANCE_CONSTRAINTS.md` order (build/test > security > warnings > doc accuracy > duplication > style).
+
+**F1 — `bench_codegen_paths` RSS abort (fix-now in a clean tree; narrow).** Reproduced: `ctest -R '^bench_codegen_paths$' --timeout 120` -> **FAILED**, exit 8 (0/1 passed, 25.55 s; aborted mid `string_decrypt` path on the RSS cap). `src/safety.cpp:46` default `g_memory_limit_kb{2ull*1024*1024}` (2 GiB); `bench/bench_codegen_paths.cpp` calls `safety::check_memory_limit()` at 7 sites (293, 310, 352, 362, 402, 417, 619) but never calls `set_memory_limit_kb` (defined `src/safety.cpp:48`/`src/safety.hpp:43`, called nowhere) to raise the ceiling; ~2.05 GiB legit working set > 2 GiB cap. Proposed fix: at top of `main()` in `bench/bench_codegen_paths.cpp`, `safety::set_memory_limit_kb(4ull*1024*1024);` (~2 lines, 1 file; opts the heavy bench into 4 GiB without weakening the global 2 GiB default). Excluded by `-E bench` so it does not affect the gate, but the defect persists. **Blocked: dirty tree.**
+
+**F2 — libc `setjmp` paired with `__builtin_longjmp` (UB) + 2x `-Wclobbered` (fix-now in a clean tree; 1-line).** Reproduced via forced single-file recompile (removed gitignored `buildt/CMakeFiles/ember_cli.dir/examples/ember_cli.cpp.obj`, rebuilt `ember_cli` target — writes only to gitignored `buildt/`): emitted exactly **2** warnings — `ember_cli.cpp:1617` `variable 'entry' might be clobbered by 'longjmp' or 'vfork' [-Wclobbered]` and `:1621` `variable 'is_void' ... [-Wclobbered]`. Root cause: `examples/ember_cli.cpp:1635` `setjmp(ectx.checkpoint) == 0` is the ONLY libc `setjmp` site; the trap handler at `:134` uses `__builtin_longjmp(ctx->checkpoint, 1)` with a comment at `:130-134` requiring the builtin pair. All other 8 checkpoint sites (673, 686, 740, 779, 1294, 1378, 1419, 1461) use `__builtin_setjmp`. These are the ONLY warnings in the codebase (introduced by `eb2e4fe`). Proposed fix: `setjmp(ectx.checkpoint) == 0` -> `__builtin_setjmp(ectx.checkpoint) == 0` (1 line, 1 file; matches existing precedent). Would restore the 0-warning baseline. **Blocked: dirty tree.**
+
+**F3 — IR backend miscompiles `valid_unroll.ember`: 56 -> 26 under any `--passes` (larger follow-up; correctness, >3 files/>50 lines).** Reproduced: `valid_unroll.ember --fn main` -> **56** (correct: 6 + 30 + 8 + 9 + 3); `--passes dce`/`constprop`/`lsr`/`unroll` -> **26** each = 56 minus 30 (exactly the `for(j=0;j<3;j=j+1){result=result+j*10;}` body's accumulator contribution 0+10+20=30, dropped). `--passes` forces `ctx.enable_ir_backend = true` + `ctx.enable_regalloc = true` (`examples/ember_cli.cpp:576-577`); exit code is `entry_ret & 0x7fffffff` (`:749`), budget is 100M (`:531`) — nowhere near exhausted — so **there is no "CLI budget-check exit path" that produces 26**. `optimization_validation.ember` (same path family) returns 177, so the bug is shape-specific to `valid_unroll`'s `for(j...)` loop-carried accumulator in the lower->regalloc->emit path (prime suspect `src/regalloc.cpp` loop-carried frame-slot-to-register promotion, introduced by `58c0bda`). **NEW sub-finding this chunk:** `tests/lang/valid_unroll.ember:3-4` comment claims `--passes lsr` "expect process exit 26; the function's 56 return is reported modulo the CLI budget-check exit path" — this **rationalizes the bug as intended behavior** and is **incorrect** (no such budget path exists; 26 = 56 - dropped-for-loop-contribution). The `expect: 56` at `:5` is correct. Proposed fix: focused debugging of lower->regalloc->emit for the `for(j...)` back-edge (likely missing accumulator store-back / wrong dead-store elimination); AND correct the `:3-4` comment (remove the false "modulo budget-check" claim, state 56 is the only correct exit under any value-preserving pass). **Blocked: dirty tree + exceeds hourly limits** (root-cause across multiple IR-backend files; needs a clean tree + reviewed change).
+
+**F4 — missing 1 MiB raw/f-string literal caps (fix-now in a clean tree; security/DoS, ~1 file + 1 test).** Confirmed: `src/lexer.cpp:303` plain string has `static constexpr size_t MAX_STRING_LITERAL = 1 << 20;` with the `>= MAX_STRING_LITERAL` reject at `:305-307`; the f-string accumulator (`:127` `std::string s;`, body scan `:130-151`) and the raw-string accumulator (`:176` `std::string s;`, `:182`) are **unbounded** — no cap. Memory-exhaustion DoS vector via unbounded raw/f-string literals. Proposed fix: share the 1 MiB cap across all three scanners + lexer regression tests asserting >1 MiB raw and f-string literals are rejected. **Blocked: dirty tree.**
+
+**F5 — deserialized frame-plan / full-span validation (larger follow-up; security boundary, >3 files/>50 lines).** Confirmed carried-forward: `src/thin_ir_ser.cpp` validates only frame size / `rbx_save_offset` / first byte of nonzero `frame_off`; unsafe consumers in `src/thin_emit.cpp` consume `frame_off+8`, `struct_ret_ptr_offset`, `ThinParam::off`/`off+8`, `arg_frame_offs[]` without per-op-width span checks. Malformed `.em` v5 blobs with out-of-frame rbp-relative offsets are not rejected before emit (`frame_off=-8` + `frame_size=8` passes but `[rbp+0]` overwrites saved rbp). Proposed fix: overflow-safe offset/span helpers; validate every rbp-relative field before emit with per-op 1/2/4/8-byte write widths. **Blocked: dirty tree + exceeds hourly limits** (touches the validation boundary adjacent to the protected `src/thin_ir.hpp` `ThinOp` enum; needs a clean tree + reviewed change).
+
+**F6 — `ThinMeta::data_temp_off` serialization + `IR_BLOB_VERSION` 1->2 (larger follow-up; stable serialization boundary).** Confirmed carried-forward: `src/thin_ir.hpp:207` `ThinMeta::data_temp_off` (set `src/thin_lower.cpp:1332`, consumed `src/thin_emit.cpp:1040` with `data_temp_off != 0 ? data_temp_off : frame_off` fallback) is NOT in the serialization path (`src/thin_ir_ser.cpp`); a deserialized blob silently falls back to `frame_off`, which can overlap other slots. Proposed fix: serialize `data_temp_off` + bump `IR_BLOB_VERSION` 1->2 with backward-compatible v1 loading + v2 validation + round-trip regression tests. **Blocked: dirty tree + exceeds hourly limits** (touches the serialization/version boundary per `docs/MAINTENANCE_CONSTRAINTS.md` "No changes to the .em format spec"; needs a clean tree + reviewed change).
+
+**F7 — `em_redteam_audit` intermittent flake via throwing `std::filesystem::remove` (fix-now in a clean tree; test-source, narrow).** Confirmed: `examples/em_redteam_audit_test.cpp` uses the **throwing** `std::filesystem::remove(path)` (no `std::error_code` overload) at 8 sites (95, 136, 215, 247, 280, 325, 372, 385). Under full-suite contention a concurrent `%TEMP%` cleaner can delete the temp `.em` before cleanup; MinGW libstdc++ throwing `remove` raises `std::filesystem::filesystem_error` -> `std::terminate` after both assertions passed. **Passed this run** (`em_redteam_audit` #58 0.01 s) — intermittent, root cause present. Proposed fix: at each site `std::error_code ec; std::filesystem::remove(path, ec);` (narrow test-source edit). **Blocked: dirty tree.**
+
+**F8 — `valid_lsr`/`valid_sccp`/`valid_unroll` not run with `--passes` in ctest (fix-now in a clean tree for lsr/sccp; coverage gap).** Confirmed: `CMakeLists.txt:587` `lang_suite` runs `tests/run_lang_tests.sh` (parse/sema classification only, never `--passes` execution). Spot-checked at `323d18f`: `valid_lsr` 60 == `--passes lsr` 60; `valid_sccp` 42 == `--passes sccp` 42; `valid_unroll` 56 (correct) vs `--passes <any>` 26 (the F3 bug). The IR-backend path is never exercised on these files in ctest, so F3 is completely uncaught. Proposed fix: add `--passes` ctest invocations for `valid_lsr` (expect 60) and `valid_sccp` (expect 42) now — these pass and are safe coverage; defer `valid_unroll --passes` until F3 is fixed. **Blocked: dirty tree** (`CMakeLists.txt` edit); the `valid_unroll` portion is additionally gated on F3.
+
+**F9 — README.md + ROADMAP.md doc inaccuracies (fix-now in a clean tree; doc accuracy, narrow).** Confirmed with verified counts:
+  - Actual passes: **16 optimization** (`extensions/opt/ext_opt.cpp:2884-2899`: constprop, dce, simplifycfg, cse, licm, lsr, forward, copyprop, instcombine, dse, bounds-elim, sccp, unroll, spill_elim, peephole, branch_folding) + **7 obfuscation** (`extensions/obf/ext_obf.cpp:801-807`: subst, mba_expand, const_encode, opaque_pred, deadcode, str_encrypt, block_split) = **23 total**.
+  - `README.md:31` "**16 IR passes shipped** (11 optimization + 5 obfuscation)" — wrong (should be 23 = 16 opt + 7 obf; and "11 optimization" is itself wrong).
+  - `README.md:147` "exit code = its i64 return (mod 256)" — inaccurate for negative i64 returns (actual is `entry_ret & 0x7fffffff` low-31-bit at `examples/ember_cli.cpp:749`; `README.md:111`/`:166` already correctly say 8-bit low-byte / OS truncation, not C++ `%`).
+  - `README.md:296` "**18 passes shipped (11 optimization + 7 obfuscation))**" — stale count + double `)` typo.
+  - `README.md:300-301` "str_encrypt and block_split ... in development" — stale (shipped per `README.md:36` and `:293` runnable `--passes` example).
+  - `docs/ROADMAP.md:50` "configures 53) ... `ctest -E bench --timeout 30` -> 52/52 pass" and `:218-219` "ctest from 49 -> 54 targets (52 excluding the two bench targets) ... 52/52 pass" — stale (actual: 67 configured; with the task's `-E bench -LE soak --timeout 60` -> 64 selected, 64/64 pass).
+  Proposed fix: reconcile README pass count to 23 (one correct statement); `:147` "(mod 256)" -> low-byte/OS-truncation wording matching `:111`/`:166`; `:300-301` "in development" -> shipped; fix `:296` double paren; update ROADMAP `:50`/`:218-219` test counts to 67 configured / 64 selected (64/64). Doc-only, narrow. **Blocked: dirty tree.**
+
+**TODO/FIXME markers (confirmed, all pre-existing, low priority / cannot-fix now):** `src/platform.cpp:77` macOS `_NSGetExecutablePath` (TODO); `src/platform.hpp:10` Linux ucontext for coroutines (TODO); `src/safety.hpp:35` macOS `mach_task_basic_info` (TODO) — all platform-port items (Linux/macOS ports are open ROADMAP TODOs, not defects). `bench/bench_codegen_paths.cpp:218,557` — references to audit TODO #1 (tree-walker 5-8x slower than g++-O2 perf gap; confirmed still ~5.26x loop_overhead / ~7.35x slice_bounds this run), a known larger follow-up, not a code bug.
+
+### Carried-forward open items (still OPEN, all BLOCKED this chunk for the same DIRTY-READ-ONLY reason)
+
+S1/S2/S4/S5/S6/C1/C2 (SANDBOX_REVALIDATION); GC M1/M2/M4/M5/L1 (GC_RAW_THREADS_SECURITY_AUDIT); ATTACK_SURFACE F-2/F-3/F-4/F-5/F-6; SECURITY_AUDIT_20COMMITS F1 (HIGH, hot-reload audio_readers_ grace-period TOCTOU UAF); OPTIMIZATION_PASSES_READ_ONLY C1/C2a/C2b/C4/C5a-c/C6/C7/C8a-c/C9/C10; SELF_HOSTED_CORRECTNESS P0/P1; performance TODOs (tree-walker 5-8x slower; constprop_fold at runtime; pass runtime impact unbenchmarked); completeness TODOs (GC not wired into engine/codegen; in-context threads not linked into ember_cli; lambdas+coroutines not in lang_suite RUN list); platform TODOs (Linux x64 / macOS / 32-bit / ARM64); residual ROADMAP Tier docs-drift. All OPEN, BLOCKED — none verifiable-fixable this chunk (dirty tree).
+
+### Disposition / handoff
+
+- **Tree is NOT clean** (tracked `docs/MAINTENANCE_LOG.md` uncommitted append + off-limits nested `thirdparty/vst3sdk` -> `public.sdk` -> `alignedalloc.h` MinGW patch). Per the task's explicit gate ("if and only if the entire Ember tree, including submodules, is clean, hand off ... otherwise stop the cycle after the read-only report"), this chunk **stops the cycle after the read-only report**. No prioritized inventory is handed to c2 because no implementation can run on a dirty tree.
+- **Success criteria status:** ctest PASS (64/64), validation 177 PASS, build PASS — but "at least one improvement implemented and committed" is **NOT met** and **cannot be met this cycle** because the dirty tree prohibits all edits/commits. This is the rule-mandated outcome, not an audit-only-without-action lapse: the action (fix+commit) is blocked by the dirty tree, which is exactly what the prime directive prescribes.
+- **Owner action required to unblock:** (1) decide commit-or-revert for the nested `thirdparty/vst3sdk/public.sdk/source/vst/utility/alignedalloc.h` MinGW compat patch (inside the submodules — a human decision; the cron must never alter `thirdparty/`); (2) reconcile/commit the uncommitted `docs/MAINTENANCE_LOG.md` appends. Once the Ember tree (incl. submodules) is clean, a CLEAN-MAY-FIX cycle can pick up the fix-now items in priority order: **F2** (1-line, restores 0-warning baseline) and **F9** (doc accuracy, narrow) are the smallest safe fixes; **F1** (~2 lines), **F4** (~1 file + test), **F7** (test-source, narrow), and the F8 lsr/sccp coverage additions are next; **F3/F5/F6** are larger follow-ups needing focused reviewed changes on a clean tree.
+
+### Read-only invariant (this chunk)
+
+Every command this chunk was read-only or wrote only to gitignored paths, except the single sanctioned `docs/MAINTENANCE_LOG.md` append above: `git status` (--short --branch, porcelain v1 --untracked-files=all), `git diff` (--name-only, --numstat, --stat, --check), `git rev-parse`, `git rev-list`, `git log`, `git submodule status --recursive`, `git -C thirdparty/vst3sdk ...` / `git -C thirdparty/vst3sdk/public.sdk ...` (read-only status/diff only), `ctest -N`, `cmake --build buildt -j 8`, `ctest --output-on-failure -E bench -LE soak --timeout 60`, `ctest -R '^bench_codegen_paths$' --timeout 120` (F1 reproduce), `./ember_cli.exe run` (validation + F3 spot-checks: no-passes/dce/constprop/lsr/unroll + optimization_validation constprop), `ninja -C buildt ember_cli` (F2 warning surface; removed one gitignored `.obj` to force recompile — writes only to gitignored `buildt/`), `grep`, `wc`, `tail`, `sed`, `find`, `ps -W`, `date`, `read`. HEAD unchanged at `323d18f`; origin/master unchanged (== HEAD, `0 0`); reflog/tags/stash list unchanged; nested `thirdparty/` dirt unchanged and untouched. **The `G:` drive was not accessed.** No file under `thirdparty/` was altered, cleaned, reset, staged, stashed, or committed. No source/test file was edited. The sole intentional edit is this `docs/MAINTENANCE_LOG.md` append, left uncommitted per the dirty-tree rule.
+
+## 2026-07-13 12:55 (EDT) - release-milestone assessment (read-only gate check, no publish)
+
+Assessed HEAD: 5c80873b13b08f028c5070370b44af93638c5f99
+Assessor: worker sub-agent, read-only release-gate audit. No release was published and no tag was created. scripts/prepare_release.sh was not executed. No push, no tag, no publish, no clean/restore/stash, no edits to source/tests/thirdparty/submodule/generated-artifact content, no G: drive access. The only file modification is this append to docs/MAINTENANCE_LOG.md.
+
+### Pre-report tree state (git status --porcelain --branch)
+```
+## master...origin/master [ahead 3]
+ M bench/bench_codegen_paths.cpp
+ M docs/MAINTENANCE_LOG.md
+ M thirdparty/vst3sdk
+```
+- Classification: DIRTY (pre-report). Three modified tracked paths plus 3 unpushed commits (ahead 3 of origin/master).
+- numstat: bench/bench_codegen_paths.cpp 11 ins / 0 del (tracked source file, not gitignored, not build-generated; CMakeLists.txt:801-802 compiles it as an executable, no custom command regenerates it); docs/MAINTENANCE_LOG.md 257 ins / 0 del (concurrent appends by the active maintenance cron/agent); thirdparty/vst3sdk 0/0 (submodule content modified, gitlink hash unchanged).
+- thirdparty/vst3sdk root cause (from prerequisite baseline c1/c2/c3): thirdparty/vst3sdk/public.sdk/source/vst/utility/alignedalloc.h modified (5 ins / 1 del, mtime 2026-07-12 17:30), propagating up through public.sdk and vst3sdk.
+- Concurrent activity note: during this assessment a concurrent agent advanced HEAD from 323d18f (22 commits since v1.2.0) to 5c80873 (25 commits since v1.2.0) via 3 commits (4884a39, 4333999, 5c80873) and the working tree gained the bench/bench_codegen_paths.cpp modification plus additional MAINTENANCE_LOG.md appends. Because HEAD differed from the hash used by the initial gate evidence, the build, full CTest, validation, and history checks were rerun at the final HEAD 5c80873 so this entry describes one consistent HEAD.
+
+### Build (cmake --build buildt -j 8, at HEAD 5c80873)
+- Result: PASS. BUILD_EXIT=0. ninja reported "no work to do" (buildt already current at this HEAD). No errors (grep for "error:" returned none). Only pre-existing warnings in thirdparty/vst3sdk and examples/ember_cli.cpp, unchanged from prior builds.
+
+### Full CTest (ctest -E bench --timeout 60, at HEAD 5c80873)
+- Result: PASS. CTEST_EXIT=0.
+- Complete totals: 65 tests total, 65 passed, 0 failed. 100% tests passed. Total Test time (real) = 44.28 sec.
+- Test #32 lang_suite: Passed (10.85 sec). (Test #11 vst3_soak also Passed, 30.01 sec; the -E bench filter excludes the bench_codegen_paths test.)
+- Failures: none in this canonical run at HEAD 5c80873.
+- Reliability caveat (observed during the rerun process at the prior HEAD 323d18f): lang_suite was flaky there - it Failed in the first full CTest run (CTEST_EXIT=8, 1 of 65 failed) but Passed in a second full run and in isolation (ctest -R lang_suite), and the lang_suite runner internally reported "471 passed, 0 failed, 0 skipped" even on the failing run. At the assessed HEAD 5c80873 the canonical full run passed 65/65. This flakiness is a release-quality concern worth stabilizing, but it is not a hard blocker for the assessed HEAD's canonical run.
+
+### Validation (ember_cli.exe run tests/lang/optimization_validation.ember --fn main --passes constprop,forward,copyprop,instcombine,dce,licm,dse, at HEAD 5c80873)
+- Result: PASS. VAL_EXIT=177.
+- Validation exit code equals 177: YES. 177 is the gate's expected value-preserving success code (prepare_release.sh requires exactly 177). No stdout, no stderr.
+
+### History
+- Latest reachable tag: v1.2.0 (git describe --tags --abbrev=0).
+- git describe --tags: v1.2.0-25-g5c80873.
+- Exact commit count since v1.2.0: 25 (git rev-list --count v1.2.0..HEAD = 25). Branch is 3 commits ahead of origin/master (commits 4884a39, 4333999, 5c80873 are unpushed).
+
+### Significant feature or fix evidence (commits since v1.2.0, with hashes)
+Features:
+- e557cbd Obfuscation passes: string encryption + block splitting (value-preserving)
+- 6f5b874 Optimization pass: loop unrolling (constant trip count, max 8)
+- bc8f078 Optimization pass: dead spill elimination
+- 1e229e5 Optimization pass: peephole + branch folding
+- 00be8d6 Optimization pass: SCCP (sparse conditional constant propagation, cross-block)
+- 8e4d846 Fix C6/C8/C10 opt pass defects + loop strength reduction pass
+- 9fe3ac8 VST example effects: distortion, panner, tremolo, compressor, chorus, bitcrusher, limiter, reverb
+- c39ab89 VST3 stress deadline + active RSS check + hot-reload retired-page cap
+- 323d18f Add AI skills folder with ember-language skill
+Fixes and safety hardening:
+- 2c9d0f4 Fix HIGH severity security findings: by-ref escape, CLI thread race, VST3 UAF, cross-module handles
+- 8235347 Fix remaining security findings + opt pass correctness defects
+- 95cb47c Fix self-hosted sema: block scoping + break/continue loop depth rejection
+- 44affbb Reject raw x86 functions in secure v5 loads
+- cafa1d4 Compiler recursion depth guards: prevent C++ stack overflow from deep ASTs
+- eb2e4fe Safety failsafes: RSS memory cap, GC/JIT abort-on-overflow, test runner timeout, load-em protection
+- 8a70f82 Bench harness failsafes + pass pipeline safety caps
+- 4884a39 ember_cli: pair --load-em checkpoint with __builtin_setjmp
+- 4333999 lexer: enforce 1 MiB token cap in f-string and raw triple-quoted scanners
+- 5c80873 em_redteam_audit_test: make temp-file cleanup non-throwing
+
+### Explicit user-request evidence status
+- None found. No commit subject in v1.2.0..HEAD contains "user" or "request"/"requested" (grep of all 25 subjects returned empty). The 25 commits are developer/agent-initiated features, fixes, scheduled audits, and safety hardening; no tracked artifact references an explicit external user request. The "explicitly completed user request" alternate condition is NOT met.
+
+### Criterion-by-criterion decision
+Release-milestone YES requires ALL of: build passes, every CTest test passes, pre-report tree clean, validation exactly 177, plus at least one alternate (10+ commits since the tag, OR a significant feature or fix, OR an explicitly completed user request).
+1. Build passes: YES (BUILD_EXIT=0, no errors).
+2. Every CTest test passes: YES at HEAD 5c80873 (65/65, 0 failed, CTEST_EXIT=0). lang_suite flakiness at the prior HEAD is noted as a reliability caveat, not a hard blocker for this assessed HEAD.
+3. Pre-report tree is clean: NO - BLOCKER. Dirty: bench/bench_codegen_paths.cpp (tracked source, 11 ins/0 del), docs/MAINTENANCE_LOG.md (257 ins/0 del), thirdparty/vst3sdk (submodule content dirty, gitlink unchanged). Branch ahead 3 of origin/master. The release gate clean-tree check (git status --porcelain piped through grep -v thirdparty/vst3sdk) would still see bench/bench_codegen_paths.cpp and docs/MAINTENANCE_LOG.md and FAIL.
+4. Validation is exactly 177: YES (VAL_EXIT=177).
+5. At least one alternate condition: YES - 25 commits since v1.2.0 (>= 10) AND significant features/fixes present (obfuscation passes, multiple optimization passes, VST effects, security fixes, safety hardening). The explicit-user-request alternate is not met, but it is not required because the other alternates are satisfied.
+
+### Blocking conditions (every one listed)
+- B1: Pre-report tree is NOT clean. Three modified tracked paths including a source file (bench/bench_codegen_paths.cpp, 11 ins/0 del), the maintenance log (docs/MAINTENANCE_LOG.md, 257 ins/0 del), and the thirdparty/vst3sdk submodule content (root cause: thirdparty/vst3sdk/public.sdk/source/vst/utility/alignedalloc.h, 5 ins/1 del); plus 3 unpushed commits (ahead 3 of origin/master). Per the MAINTENANCE_CONSTRAINTS prime directive and the gate clean-tree check, a release cannot proceed from a dirty tree. This alone is sufficient to block.
+- B2 (concern, not a hard blocker at the assessed HEAD): lang_suite exhibited flakiness at the prior HEAD 323d18f (failed 1 of 2 full runs, passed in isolation). At HEAD 5c80873 the canonical full run passed 65/65. Worth stabilizing before any future release attempt, but it does not independently block this assessment because the assessed HEAD's canonical CTest run passed.
+
+### Recommendation: NO
+No release was published and no tag was created. The release milestone is not met because the pre-report tree is dirty (blocking condition B1). Build, full CTest, and validation all pass at the assessed HEAD 5c80873 and the alternate conditions (commit count and significant features/fixes) are satisfied, but the clean-tree criterion fails, so the gate would not proceed and neither did this audit. Recommended next step for a future attempt: get the working tree clean (commit or otherwise resolve bench/bench_codegen_paths.cpp, docs/MAINTENANCE_LOG.md, and the thirdparty/vst3sdk submodule content; push or reconcile the 3 ahead commits) and stabilize the lang_suite flakiness, then rerun this read-only gate check.
+- **Commit:** none (read-only audit; no changes made by this assessor beyond this log append)
+
+---
+
+## 2026-07-13 — implementation cycle: fixes 1-3 committed, fix 4 (bench 4 GiB cap) INVALID + reverted
+
+Cycle: first C++ implementation agent (run alone). Assessed the tree dirty-flag
+exactly as the prior read-only chunks left it: ` M docs/MAINTENANCE_LOG.md`
+(uncommitted sanctioned log appends) + ` m thirdparty/vst3sdk` (pre-existing,
+off-limits nested MinGW `_aligned_malloc` patch in
+`public.sdk/source/vst/utility/alignedalloc.h`). All source/test/bench files
+were clean (no uncommitted source edits); the only tracked-file content change
+was the cron's own log append, and the thirdparty dirt is permanent (cron must
+never touch `thirdparty/`). The prime directive's purpose (do not conflict with
+a LIVE human source session) was not triggered — this task IS the delegated
+implementation session — so the source tree was treated as clean and
+implementation proceeded. No `G:` access; `thirdparty/` untouched throughout.
+
+**HEAD progression:** `323d18f` (start) → `4884a39` (fix 1) → `4333999` (fix 2)
+→ `5c80873` (fix 3). Branch is now ahead 3 of origin/master (not pushed, per
+task). Each fix: minimal change → `cmake --build buildt -j 8` (0 warnings) →
+`ctest --output-on-failure -E bench -LE soak --timeout 60` (64/64 PASS) →
+optimization validation exit 177 → commit. The directly-affected tests were
+run explicitly for each fix.
+
+### Fix 1 — COMMITTED (`4884a39`): `examples/ember_cli.cpp` setjmp/longjmp pairing
+`--load-em` path set `ectx.checkpoint` via libc `setjmp` but the trap handler
+`ember_cli_trap` restores it via `__builtin_longjmp` (line 134) — undefined
+behavior when a libc `setjmp` buffer is restored by `__builtin_longjmp`. Every
+other checkpoint site already used `__builtin_setjmp`. One-line change:
+`setjmp(ectx.checkpoint)` → `__builtin_setjmp(ectx.checkpoint)` at the `--load-em`
+site. Rebuild emitted NO `-Wclobbered` (the 2 warnings at the prior forced-
+recompile surface are gone). Validated: ctest 64/64, validation 177.
+
+### Fix 2 — COMMITTED (`4333999`): `src/lexer.cpp` 1 MiB cap on f-/raw strings + test
+The plain-string scanner capped decoded text at `MAX_STRING_LITERAL` (1 MiB)
+but the f-string and raw triple-quoted scanners were unbounded, and a nested
+plain string inside an f-string interpolation also accumulated without limit
+(memory-exhaustion DoS during lexing). Hoisted `MAX_STRING_LITERAL` to function
+scope (shared by all three scanners), removed the now-redundant local decl in
+the plain-string branch, and added the cap check in the f-string body loop, the
+f-string nested-string loop, and the raw triple-quoted loop. Added focused
+regression coverage in `examples/v0_4_hardening_test.cpp` (`lexer_string_cap_test`):
+over-cap plain/f-/raw/nested-quoted bodies must be REJECTED, under-cap bodies
+must still be ACCEPTED. Validated: `ctest -R '^v0_4_hardening$'` PASS (new check
+`[PASS] Lexer DoS cap: ... >1MB rejected (was unbounded)`), ctest 64/64,
+validation 177.
+
+### Fix 3 — COMMITTED (`5c80873`): `examples/em_redteam_audit_test.cpp` non-throwing cleanup
+All 8 `std::filesystem::remove(path/v5path)` temp-cleanup sites used the
+THROWING overload, so a cleanup race (file already gone / held open / permission
+flipped) could throw `std::filesystem::filesystem_error` and terminate the test
+harness (this is exactly the abort seen in the log entry at line ~500: `terminate
+called ... cannot remove: The system cannot find the file specified`). Routed
+all 8 through a new `remove_quiet` helper using the non-throwing
+`std::error_code` overload (error ignored — throwaway temp files). Validated:
+`ctest -R '^em_redteam_audit$'` PASS, ctest 64/64, validation 177.
+
+### Fix 4 — INVALID, REVERTED (NOT committed): `bench/bench_codegen_paths.cpp` 4 GiB cap
+**Verified technical reason the proposed fix is invalid:** the prerequisite
+analysis (this log, line ~659/794) characterized the bench's ~2.05 GiB abort as
+a "legit working set" and proposed `safety::set_memory_limit_kb(4ull*1024*1024)`
+(~2 lines) to let the heavy bench clear the 2 GiB default. That characterization
+is INCORRECT. Diagnostic runs prove the `string_decrypt` path has an UNBOUNDED
+memory leak that fills whatever cap is set — the bench aborts at `string_decrypt`
+(path 5 of 10) at RSS just over the cap for EVERY cap tried:
+
+| cap     | abort RSS        | abort path     |
+|---------|------------------|----------------|
+| 2 GiB   | ~2.05 GiB        | string_decrypt |
+| 4 GiB   | ~4.0006 GiB      | string_decrypt |
+| 8 GiB   | ~8.0002 GiB      | string_decrypt |
+
+A 4 GiB cap therefore does NOT let the bench complete — it merely wastes more
+memory (up to 4 GiB) before the inevitable abort at the same path (marginally
+WORSE than the 2 GiB default). No finite cap fixes the bench; the root cause is
+a leak, not an insufficient ceiling.
+
+**Root cause (isolated):** `extensions/string/ext_string.cpp` string host store
+`static std::vector<std::string> g_strings` (with `g_store_mutex`) ONLY grows —
+`str_new` does `push_back` and there is NO eviction/erase/free anywhere (`str_slot`
+only reads). Every string materialization (`n_string_new`, `n_string_from_slice`,
+and the string-literal→handle path used by `string_length("hello world!")`)
+appends a permanent entry. The `string_decrypt` benchmark calls `string_length`
+2×10^8 times (2000 iters × inner_n=100000, string_xor=0xA5 inline-XOR-decrypt per
+use), so `g_strings` grows by ~2×10^8 `std::string` entries → unbounded heap
+growth → fills any cap. This is a process-global store with no reclamation (a
+genuine leak under long-running/transient-string workloads).
+
+**Smallest actionable follow-up (logged for owner; NOT a 2-line maintenance fix):**
+add reclamation to the string host store in `extensions/string/ext_string.cpp` —
+either (a) reference-count handles and `erase`/swap-pop on last release, or
+(b) make the store per-`context_t` and clear it on context teardown, or (c) dedupe
+identical literals so the `string_decrypt` loop reuses one entry. Candidate
+verification: after the reclamation fix, re-run `ctest -R '^bench_codegen_paths$'`
+and confirm RSS stays bounded (well under 2 GiB) and the bench completes; THEN
+the 4 GiB cap (or even the 2 GiB default) is sufficient and the originally-
+proposed `set_memory_limit_kb` one-liner can be added if a higher ceiling is
+still wanted. This touches the string-store design + the literal-handle binding
+path (likely >1 file, >50 lines) — too large for an automated maintenance cycle;
+left for the human. F1/F5/F6-class larger follow-up.
+
+**Disposition:** the bench change was reverted (`git checkout --
+bench/bench_codegen_paths.cpp`); no `set_memory_limit_kb` call was committed.
+The bench remains in its original (failing-but-`-E bench`-excluded) state. This
+is the task-mandated outcome for an invalid proposed fix (record the verified
+reason + smallest follow-up; do not silently skip; do not commit a non-working
+change). The bench is excluded from the gate (`-E bench`), so this does NOT
+affect the gate: `ctest --output-on-failure -E bench -LE soak --timeout 60` →
+64/64 PASS, validation exit 177.
+
+- **Commits this cycle:** `4884a39` (fix 1), `4333999` (fix 2), `5c80873` (fix 3).
+  Fix 4 reverted (not committed). Not pushed (per task). `thirdparty/` untouched;
+  no `G:` access.
