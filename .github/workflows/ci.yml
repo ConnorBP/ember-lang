@@ -1,12 +1,16 @@
-# ember CI — build, test, static analysis, and sanitizer checks on every push/PR.
+# ember CI — build, test, static analysis, sanitizer, and fuzzing on every push/PR.
 #
 # Jobs:
-#   build-test   — Windows + MinGW g++ 15.2.0 + Ninja (the supported path): build + ctest
-#   sanitizer    — Windows + clang++ with ASAN+UBSAN (catches UAF/OOB/UB/leaks)
-#   cppcheck     — static analysis (cross-platform, runs on Linux for speed)
-#   clang-tidy   — static bug-finding (needs compile_commands.json)
-#   codeql       — GitHub-native code scanning for C++ security issues
+#   build-test   — Windows + MinGW g++ + Ninja (the supported path): build + ctest
+#   sanitizer    — Linux + g++ ASAN+UBSAN (catches UAF/OOB/UB/leaks; ASAN is
+#                  unreliable on Windows/MinGW so this runs on Linux)
+#   cppcheck     — static analysis (Linux for speed)
+#   clang-tidy   — static bug-finding via compile_commands.json (Linux)
+#   codeql       — GitHub-native C++ security scanning
+#   fuzzer       — libFuzzer on .em loader + lexer (Linux; libFuzzer is Windows-unsupported)
 #
+# VST3 SDK is Windows-only (smtg_setup_platform_toolset fails on Linux), so all
+# Linux jobs pass -DEMBER_BUILD_VST3=OFF.
 # See docs/planning/plan_AUDIT_TOOLING.md for the full tooling rationale.
 name: ci
 
@@ -16,7 +20,6 @@ on:
   pull_request:
     branches: [master, main]
 
-# Cancel in-progress runs on the same branch when a new push lands.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -40,8 +43,10 @@ jobs:
             mingw-w64-x86_64-cmake
       - shell: msys2 {0}
         run: |
+          # Use PATH-resolved g++ (the msys2 action adds mingw64/bin to PATH).
           cmake -G Ninja \
-            -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_MAKE_PROGRAM=ninja \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -B build
           cmake --build build -j 8
@@ -57,11 +62,7 @@ jobs:
             --passes constprop,forward,copyprop,instcombine,dce,licm,dse,simplifycfg,bounds-elim,sccp,unroll,spill_elim,peephole,lsr
           echo "validation exit: $?"
 
-  # ---- Sanitizer build: g++ ASAN + UBSAN on Linux ----
-  # ASAN/UBSAN on Windows/MinGW is experimental — the sanitizer runtimes do not
-  # intercept reliably on that target (see docs/planning/plan_AUDIT_TOOLING.md,
-  # "KEY FINDING: MinGW GCC does NOT support sanitizers on Windows").  We run the
-  # sanitizer build on Linux where the ASAN/UBSAN runtimes are first-class.
+  # ---- Sanitizer build: ASAN + UBSAN (Linux — ASAN on Windows is experimental) ----
   sanitizer:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -69,30 +70,32 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - name: Install cmake + ninja + g++
+      - name: Install build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build g++
-      - name: Configure (ASAN + UBSAN)
+      - name: Configure sanitizer build
         run: |
           cmake -G Ninja \
             -DCMAKE_CXX_COMPILER=g++ \
-            -DCMAKE_CXX_FLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -fno-common" \
+            -DCMAKE_CXX_FLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+            -DEMBER_BUILD_VST3=OFF \
             -B build_asan
-      - name: Build ember_cli
-        run: cmake --build build_asan -j 8 --target ember_cli
-      - name: Run tests under ASAN + UBSAN
+      - name: Build
+        run: cmake --build build_asan -j $(nproc) --target ember_cli
+      - name: Run tests under ASAN+UBSAN
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:print_stacktrace=1
-          UBSAN_OPTIONS: print_stacktrace=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: |
           cd build_asan
-          # Run the lang test suite under ASAN+UBSAN — any memory error aborts.
           ./ember_cli test ../tests/lang 2>&1 | tail -5
-          ./ember_cli run ../tests/lang/optimization_validation.ember --fn main 2>&1 | tail -3
+          ./ember_cli run ../tests/lang/optimization_validation.ember --fn main \
+            --passes constprop,forward,copyprop,instcombine,dce,licm,dse,simplifycfg,bounds-elim,sccp,unroll,spill_elim,peephole,lsr 2>&1 | tail -3
+          echo "validation exit: $?"
 
-  # ---- Static analysis: cppcheck (runs on Linux for speed) ----
+  # ---- Static analysis: cppcheck (Linux) ----
   cppcheck:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -121,7 +124,7 @@ jobs:
             exit 1
           fi
 
-  # ---- Static analysis: clang-tidy (needs compile_commands.json) ----
+  # ---- Static analysis: clang-tidy (Linux) ----
   clang-tidy:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -133,12 +136,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang clang-tidy cmake ninja-build
-      - name: Configure (export compile commands)
+      - name: Configure (export compile commands, skip VST3)
         run: |
-          # We only need compile_commands.json, not a full build.
-          # Use clang to generate the compile DB (the flags are GCC-compatible).
           cmake -G Ninja -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -B build_ci
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DEMBER_BUILD_VST3=OFF \
+            -B build_ci
       - name: Run clang-tidy
         run: |
           clang-tidy -p build_ci \
@@ -170,22 +173,18 @@ jobs:
         uses: github/codeql-action/init@v3
         with:
           languages: cpp
-          # Use the security-extended query suite for deeper analysis
           queries: security-extended
-      - name: Build for CodeQL
+      - name: Build for CodeQL (skip VST3 — Windows-only)
         run: |
-          cmake -G Ninja -DCMAKE_CXX_COMPILER=g++ -B build_codeql
-          cmake --build build_codeql -j $(nproc) --target ember_cli 2>/dev/null || true
+          cmake -G Ninja -DCMAKE_CXX_COMPILER=g++ \
+            -DEMBER_BUILD_VST3=OFF -B build_codeql
+          cmake --build build_codeql -j $(nproc) --target ember_cli
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
         with:
           category: "/language:cpp"
 
-  # ---- Fuzzing: libFuzzer on the .em loader + lexer (Phase 4) ----
-  # Coverage-guided fuzzing of the untrusted-input surfaces. The .em loader is
-  # the #1 security surface (deserializes untrusted binary). The lexer/parser
-  # process untrusted source text. libFuzzer is Linux-only (unsupported on
-  # Windows/MinGW — see plan_AUDIT_TOOLING.md). Runs for 2 minutes per target.
+  # ---- Fuzzing: libFuzzer on the .em loader + lexer (Linux only) ----
   fuzzer:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -197,17 +196,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build clang
-      - name: Configure + build fuzzers
+      - name: Configure + build fuzzers (skip VST3)
         run: |
           cmake -G Ninja -DCMAKE_CXX_COMPILER=clang++ \
             -DENABLE_FUZZERS=ON \
+            -DEMBER_BUILD_VST3=OFF \
             -B build_fuzz
           cmake --build build_fuzz -j $(nproc) --target fuzz_em_loader fuzz_lexer
       - name: Seed corpus
         run: |
           mkdir -p corpus_loader corpus_lexer
           cp tests/lang/*.ember corpus_lexer/
-          # For the loader, seed with any existing .em files
           find . -name '*.em' -exec cp {} corpus_loader/ \; 2>/dev/null || true
       - name: Run .em loader fuzzer (2 min)
         run: |

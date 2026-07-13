@@ -166,7 +166,16 @@ ember_add_extension(math     extensions/math/ext_math.cpp)
 ember_add_extension(map      extensions/map/ext_map.cpp)
 ember_add_extension(sync     extensions/sync/ext_sync.cpp)
 ember_add_extension(thread   extensions/thread/ext_thread.cpp)   # Tier 4: in-context threads (thread_spawn/join + call_mutex serialization)
-ember_add_extension(coroutine extensions/coroutine/ext_coroutine.cpp) # #21 coroutines with yield (Windows fibers: coroutine_start/next/done)
+# coroutine extension is Windows-only (uses CreateFiber/SwitchToFiber). On
+# non-Windows we create an empty stub so link targets that reference
+# ember_ext_coroutine still resolve. A ucontext port is a TODO (ROADMAP).
+if(WIN32)
+    ember_add_extension(coroutine extensions/coroutine/ext_coroutine.cpp) # #21 coroutines with yield (Windows fibers)
+else()
+    add_library(ember_ext_coroutine STATIC extensions/coroutine/ext_coroutine_stub.cpp)
+    target_include_directories(ember_ext_coroutine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/extensions/coroutine)
+    target_link_libraries(ember_ext_coroutine PUBLIC ember_frontend)
+endif()
 ember_add_extension(gc extensions/gc/ext_gc.cpp)            # tracing GC runtime: wires ember::gc::GcHeap into the engine for lambda env heap management (#20)
 ember_add_extension(lifecycle extensions/lifecycle/ext_lifecycle.cpp)
 ember_add_extension(opt extensions/opt/ext_opt.cpp)         # Stage C: IR optimization passes
