@@ -405,7 +405,17 @@ struct EmitCtx {
         }
         if (off == 0 && it != vregs.end()) off = it->second.frame_off;
         if (off != 0) {
-            load_rbp_to_rax(e, off);
+            // Stage 3 promotion: if this VReg's frame slot has been promoted to
+            // a callee-saved register (ra.frame_reg_map), the canonical value
+            // lives in that register — every StoreFrame to the slot wrote the
+            // register and every LoadFrame read it. Reading the frame slot here
+            // would bypass the promotion and return a stale value (the slot is
+            // never updated while promoted). Read the promoted register instead.
+            if (ra_promoted_frame(off)) {
+                e.mov_reg_reg(Reg::rax, ra_frame_reg(off));
+            } else {
+                load_rbp_to_rax(e, off);
+            }
             normalize_rax(it != vregs.end() ? it->second.type : vreg_type(v));
             rax_vreg = v;
         } else if (v != 0 && v == rax_vreg) {

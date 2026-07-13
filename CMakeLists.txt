@@ -705,6 +705,28 @@ target_link_libraries(em_cli_emit_test PRIVATE ember)
 add_test(NAME em_cli_emit COMMAND em_cli_emit_test $<TARGET_FILE:ember_cli>)
 set_tests_properties(em_cli_emit PROPERTIES TIMEOUT 30)
 
+# ---- IR-backend (--passes) end-to-end execution gate ----
+# Reusable driver that shells out to the real ember_cli.exe `run --passes` path
+# and compares the process exit code to an expected value. Pins the
+# loop-carried accumulator fix in src/thin_emit.cpp (load_int_vreg must reload a
+# promoted VReg from its promoted callee-saved register, not its stale frame
+# slot) so a regression (e.g. valid_unroll --passes dce returning 26 instead of
+# 56, or a runtime-trap exit 70 from an infinite for-loop) is a CTest failure.
+# Driver args: <ember_cli> <source.ember> <expected_exit> <passes_spec>.
+add_executable(ember_passes_exec_test examples/ember_passes_exec_test.cpp)
+target_link_libraries(ember_passes_exec_test PRIVATE ember)
+add_test(NAME ember_passes_unroll
+    COMMAND ember_passes_exec_test $<TARGET_FILE:ember_cli>
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/lang/valid_unroll.ember 56 dce)
+add_test(NAME ember_passes_lsr
+    COMMAND ember_passes_exec_test $<TARGET_FILE:ember_cli>
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/lang/valid_lsr.ember 60 lsr)
+add_test(NAME ember_passes_sccp
+    COMMAND ember_passes_exec_test $<TARGET_FILE:ember_cli>
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/lang/valid_sccp.ember 42 sccp)
+set_tests_properties(ember_passes_unroll ember_passes_lsr ember_passes_sccp
+    PROPERTIES TIMEOUT 30)
+
 # ---- Family C: ember pipe + ember live CLI regression ----
 # End-to-end test harness for the two Family C CLI subcommands (docs/ROADMAP.md
 # Family C) added in examples/ember_cli.cpp. Invokes the real ember_cli.exe as

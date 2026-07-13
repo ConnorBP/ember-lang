@@ -1022,3 +1022,95 @@ affect the gate: `ctest --output-on-failure -E bench -LE soak --timeout 60` →
 - **Commits this cycle:** `4884a39` (fix 1), `4333999` (fix 2), `5c80873` (fix 3).
   Fix 4 reverted (not committed). Not pushed (per task). `thirdparty/` untouched;
   no `G:` access.
+
+## 2026-07-13 (EDT) — implementation cycle: for-loop loop-carried accumulator defect in IR-backend --passes path (FIXED + regression-tested)
+
+**Defect reproduced:** `buildt/ember_cli.exe run tests/lang/valid_unroll.ember --fn
+main --passes dce` returned **26** (expected **56**). The no-passes path returned
+56 (tree-walker, correct). Root cause isolated to the IR-backend `--passes` path
+(`enable_ir_backend = enable_regalloc = true`), not to any single optimization
+pass: every pass spec (dce/constprop/cse/licm/subst/sccp/lsr/unroll, and combos)
+miscomputed the same way, and a minimal standalone for-loop under any pass either
+ran forever (budget-trap exit 70) or ran zero iterations depending on preceding
+code — both manifestations of a lost loop-carried value across the back edge.
+
+**Fault location (determined by ThinIR inspection + byte disassembly, NOT a
+test-specific workaround):** `src/thin_emit.cpp`, `EmitCtx::load_int_vreg`. The
+IR itself (`thin_lower.cpp` for-loop lowering: cond_top → body → step → back
+edge) and the optimization passes were semantically correct (pre-pass == post-
+pass IR; the back edge reloads the loop variable from its frame slot, increments,
+stores). `src/regalloc.cpp` Step-5 frame-slot promotion was also structurally
+correct: it maps a hot loop-carried frame slot to a callee-saved register (e.g.
+the for-loop variable `j` at off=-24 → rbx), and `LoadFrame`/`StoreFrame` of that
+slot redirect to the register. The bug was in the **reuse** of a VReg produced by
+a promoted `LoadFrame`: `LoadFrame` correctly did `mov rax, rbx` but then recorded
+`vregs[dst].frame_off = meta.frame_off` (the promoted slot's offset). The next
+instruction reusing that VReg (e.g. the cond `Cmp j<3`) called `load_int_vreg`,
+resolved `off = vregs[v].frame_off` (the promoted offset), and emitted
+`mov rax, [rbp-0x18]` — a **frame load that bypassed the promotion**. The frame
+slot is never written while promoted (every store goes to rbx), so the cond read
+a stale/seeded value forever → infinite loop (stale < 3) or zero iterations
+(stale ≥ 3). Disassembly confirmed the double load at the cond:
+`mov rax,rbx ; mov rax,[rbp-0x18] ; cmp rax,0x3`.
+
+**Minimal semantic fix (`src/thin_emit.cpp`, `load_int_vreg`, +10 lines):** when
+the resolved `off` is a promoted slot (`ra_promoted_frame(off)`), reload the VReg
+from its promoted callee-saved register (`mov rax, ra_frame_reg(off)`) instead of
+the stale frame slot. This is value-equivalent and safe: the promoted register is
+the canonical home (every store wrote it, every load read it), so any VReg whose
+recorded frame_off is a promoted slot holds the register's current value. Loop-
+carried frame values and stores now survive back edges both WITH and WITHOUT
+register allocation (the no-regalloc path is unchanged — `ra_promoted_frame`
+returns false when `ra` is disabled).
+
+**Regression coverage added (reusable CMake test driver):**
+`examples/ember_passes_exec_test.cpp` — shells out to the real
+`ember_cli.exe run <file> --fn main --passes <spec>` and compares the process
+exit code to an expected value; a wrong exit (incl. a trap-70 infinite loop or a
+wrong computed value) is a CTest failure. Registered in `CMakeLists.txt` as three
+tests: `ember_passes_unroll` (valid_unroll.ember --passes dce → 56),
+`ember_passes_lsr` (valid_lsr.ember --passes lsr → 60), `ember_passes_sccp`
+(valid_sccp.ember --passes sccp → 42). Verified the gate is real: with the fix
+temporarily reverted, `ember_passes_unroll` failed with exactly "expected exit
+56, got 26"; restored, all three pass. Also corrected the misleading
+`// expect process exit 26` comment in `tests/lang/valid_unroll.ember` that had
+normalized the bug.
+
+**Validation:** `cmake --build buildt -j 8` clean (0 warnings);
+`ctest --output-on-failure -E bench -LE soak --timeout 60` → **67/67 PASS**
+(was 64; +3 new tests); optimization validation
+(`optimization_validation.ember --passes constprop,forward,copyprop,instcombine,dce,licm,dse`)
+→ **exit 177**. Not pushed (per task). `thirdparty/` untouched; no `G:` access.
+No `@` in the commit message.
+
+## 2026-07-13 13:04 (EDT, UTC-04:00) — Release-milestone assessment (READ-ONLY gate check, no publish)
+
+Assessed HEAD: 573062c08ed5576f0eb99c3a42c1e1fa49f85eff
+Assessor: worker sub-agent, read-only release-gate audit. No release was published and no tag was created. scripts/prepare_release.sh was not executed. No push, no tag, no publish, no clean/restore/stash, no staging/commit, no edits to source/tests/thirdparty/submodule/generated-artifact content, no G: drive access. The only file modification is this append to docs/MAINTENANCE_LOG.md. No temporary or scratch file was created for this append (the entry was appended directly); the only untracked file that appeared in the working tree during the assessment is the CTest byproduct ember_emit_bytes.bin (see pre-report tree state), which was left untouched.
+
+HEAD-consistency note: the prerequisite baseline evidence (c1/c2/c3) and the most recent prior gate entry in this log (2026-07-13 12:55 EDT, assessed HEAD 5c80873) both used a different HEAD than the current one. The prerequisite baseline used 323d18f (22 commits since v1.2.0); the current HEAD is 573062c (26 commits since v1.2.0). Because HEAD differed from the hashes used by the gate/history evidence, the build, full CTest, validation, and history checks were rerun at the final HEAD 573062c so this entry describes one consistent HEAD.
+### Pre-report tree state (git status --porcelain=v2 --branch --untracked-files=all, final snapshot at 13:03 -0400, before this append)
+```
+# branch.oid 573062c08ed5576f0eb99c3a42c1e1fa49f85eff
+# branch.head master
+# branch.upstream origin/master
+# branch.ab +4 -0
+1 .M N... 100644 100644 100644 ec6a75f1861c7777af83d862a693c65615364ea1 ec6a75f1861c7777af83d862a693c65615364ea1 src/codegen.cpp
+1 .M N... 100644 100644 100644 892fbebdfbec9b2140380f75cbb5f2161ed58de4 892fbebdfbec9b2140380f75cbb5f2161ed58de4 src/regalloc.cpp
+1 .M S.M. 160000 160000 160000 9fad9770f2ae8542ab1a548a68c1ad1ac690abe0 9fad9770f2ae8542ab1a548a68c1ad1ac690abe0 thirdparty/vst3sdk
+? ember_emit_bytes.bin
+```
+- Classification: DIRTY (pre-report). Three modified tracked paths plus one untracked file, plus 4 unpushed commits (ahead +4 of origin/master).
+- Staged: none (git diff --cached empty). Untracked: ember_emit_bytes.bin (511 bytes, mtime 2026-07-13 13:03:15 -0400, NOT covered by .gitignore — a CTest byproduct written by the em_cli_emit test, #41, during this assessment's full CTest rerun; left untouched, not cleaned/deleted).
+- numstat (git diff --numstat, default core.autocrlf): src/codegen.cpp 15 ins / 0 del; src/regalloc.cpp 10 ins / 6 del; thirdparty/vst3sdk 0/0 (submodule content modified, gitlink hash unchanged). With core.autocrlf=false, src/codegen.cpp shows 5376 ins / 5356 del — that large delta is a CRLF/LF line-ending rewrite of the whole file (the working copy's line endings differ from the index), not real content; the real content delta is the 15/0 from the normalized default view. src/regalloc.cpp agrees at 10/6 under both configs (a non-mutating "LF will be replaced by CRLF" warning is present).
+- src/codegen.cpp and src/regalloc.cpp mtimes: 2026-07-13 13:03:06 and 13:02:38 -0400 respectively — i.e., these uncommitted source edits appeared DURING this assessment's build/CTest/validation rerun (the first recheck, before the rerun, showed only thirdparty/vst3sdk). They were NOT caused by this assessor's commands (cmake --build reported "no work to do" and does not edit source; ctest runs test binaries; the validation runs ember_cli.exe). A concurrent process (the active maintenance cron/agent) is editing source files in real time. Per the MAINTENANCE_CONSTRAINTS prime directive, uncommitted modifications to tracked source files mean someone is actively working: read-only audit only, append findings, stop.
+- thirdparty/vst3sdk root cause (recursive trace, all gitlinks intact — content-only dirty, not moved gitlinks): thirdparty/vst3sdk (detached HEAD 9fad9770f2ae8542ab1a548a68c1ad1ac690abe0, gitlink unchanged) -> public.sdk (detached HEAD a3911a4615dabbfdfd9d181ee26b05c70c289a95, gitlink unchanged) -> source/vst/utility/alignedalloc.h modified, default numstat 5 ins / 1 del (core.autocrlf=false shows 85/81, a CRLF artifact), mtime 2026-07-12 17:30:42 -0400 (yesterday; static, pre-existing, not from this run). This is the permanent off-limits thirdparty patch; MAINTENANCE_CONSTRAINTS forbids any change to thirdparty/.
+### Build (cmake --build buildt -j 8, at HEAD 573062c)
+- Result: PASS. BUILD_EXIT=0. ninja reported "no work to do" (buildt already current at this HEAD; HEAD 573062c is a maintenance-log-only commit, no source change). No errors.
+
+### Full CTest (ctest --output-on-failure --timeout 60, at HEAD 573062c; NO exclusions — complete suite)
+- Result: FAIL (2 tests failed). CTEST_EXIT=8.
+- Complete totals: 67 tests total, 65 passed, 2 failed. 97% tests passed. Total Test time (real) = 51.03 sec.
+- Failures: Test #44 bench_ember_vs_as (Failed, 5.61 sec); Test #45 bench_codegen_paths (Failed, 1.62 sec).
+- Both failures are bench tests. bench_codegen_paths is the known unbounded-memory-leak test (documented earlier in this log as "fix 4 INVALID + reverted": the string host store in extensions/string/ext_string.cpp grows without bound, so the bench aborts at the RSS cap at the string_decrypt path for any cap; no finite cap fixes it; the proposed 4 GiB cap was reverted as invalid). bench_ember_vs_as is the other bench test, also failing.
+- Gate-context note: the release gate (scripts/prepare_release.sh) runs ctest -E bench --timeout 60, which excludes both bench tests by name match; under that filtered invocation the non-bench 65 tests pass (65/65, 0 failed). The task's literal criterion "every CTest test passes" is evaluated against the complete (unfiltered) run above, where 2 of 67 fail.
