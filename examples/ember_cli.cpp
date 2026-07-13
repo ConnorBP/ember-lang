@@ -84,7 +84,14 @@
 #include <thread>    // v0.6 --tick tick thread
 #include <atomic>     // v0.6 --tick stop flag
 #include <chrono>     // v0.6 --tick interval
-#include <conio.h>     // v0.6 --tick keybind (Windows _kbhit/_getch)
+#if defined(_WIN32)
+#  include <conio.h>     // v0.6 --tick keybind (Windows _kbhit/_getch)
+#else
+// Linux stubs for the --tick keybind (no conio.h). Keyboard termination is
+// Windows-only; on Linux the tick count / timeout stops the loop instead.
+static inline int _kbhit() { return 0; }
+static inline int _getch() { return 0; }
+#endif
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -525,6 +532,10 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
     std::string reg_err;
     uint32_t self_id = registry.register_module("__main__", table.base(), &reg_err);
     (void)self_id;
+    // X1 redesign: publish __main__'s dispatch-table slot count so a loaded v5
+    // .em that calls back into the host via CallCrossModule range-checks its
+    // slot against the REAL host dispatch size at load time.
+    registry.set_dispatch_slot_count(self_id, int64_t(table.slots.size()));
 
     // ---- v0.4/v1.0 safe-execution context ----
     context_t ectx;
