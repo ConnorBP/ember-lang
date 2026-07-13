@@ -1,0 +1,182 @@
+# ember CI — build, test, static analysis, and sanitizer checks on every push/PR.
+#
+# Jobs:
+#   build-test   — Windows + MinGW g++ 15.2.0 + Ninja (the supported path): build + ctest
+#   sanitizer    — Windows + clang++ with ASAN+UBSAN (catches UAF/OOB/UB/leaks)
+#   cppcheck     — static analysis (cross-platform, runs on Linux for speed)
+#   clang-tidy   — static bug-finding (needs compile_commands.json)
+#   codeql       — GitHub-native code scanning for C++ security issues
+#
+# See docs/planning/plan_AUDIT_TOOLING.md for the full tooling rationale.
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+# Cancel in-progress runs on the same branch when a new push lands.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---- Core: build + test on the supported Windows/MinGW path ----
+  build-test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-cmake
+      - shell: msys2 {0}
+        run: |
+          cmake -G Ninja \
+            -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -B build
+          cmake --build build -j 8
+      - shell: msys2 {0}
+        run: |
+          cd build
+          ctest -E bench -LE soak --timeout 60 --output-on-failure
+      - name: Validation gate
+        shell: msys2 {0}
+        run: |
+          cd build
+          ./ember_cli.exe run ../tests/lang/optimization_validation.ember --fn main \
+            --passes constprop,forward,copyprop,instcombine,dce,licm,dse,simplifycfg,bounds-elim,sccp,unroll,spill_elim,peephole,lsr
+          echo "validation exit: $?"
+
+  # ---- Sanitizer build: g++ ASAN + UBSAN on Linux ----
+  # ASAN/UBSAN on Windows/MinGW is experimental — the sanitizer runtimes do not
+  # intercept reliably on that target (see docs/planning/plan_AUDIT_TOOLING.md,
+  # "KEY FINDING: MinGW GCC does NOT support sanitizers on Windows").  We run the
+  # sanitizer build on Linux where the ASAN/UBSAN runtimes are first-class.
+  sanitizer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install cmake + ninja + g++
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+      - name: Configure (ASAN + UBSAN)
+        run: |
+          cmake -G Ninja \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_CXX_FLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -fno-common" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+            -B build_asan
+      - name: Build ember_cli
+        run: cmake --build build_asan -j 8 --target ember_cli
+      - name: Run tests under ASAN + UBSAN
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:print_stacktrace=1
+          UBSAN_OPTIONS: print_stacktrace=1:abort_on_error=1
+        run: |
+          cd build_asan
+          # Run the lang test suite under ASAN+UBSAN — any memory error aborts.
+          ./ember_cli test ../tests/lang 2>&1 | tail -5
+          ./ember_cli run ../tests/lang/optimization_validation.ember --fn main 2>&1 | tail -3
+
+  # ---- Static analysis: cppcheck (runs on Linux for speed) ----
+  cppcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y cppcheck
+      - name: Run cppcheck
+        run: |
+          cppcheck --enable=warning,performance,portability,style \
+            --suppress=missingIncludeSystem --suppress=unusedFunction \
+            --suppress=duplInheritedMember \
+            --inline-suppr --check-level=exhaustive \
+            -I src -I include --force -j $(nproc) \
+            src/ extensions/ 2>&1 \
+            | grep -E 'warning:|error:|portability:|performance:' \
+            | grep -v 'normalCheckLevelMaxBranches' \
+            > cppcheck_findings.txt
+          echo "Findings: $(wc -l < cppcheck_findings.txt)"
+          cat cppcheck_findings.txt
+          # Fail on errors and portability issues (warnings are advisory)
+          if grep -qE 'error:|portability:' cppcheck_findings.txt; then
+            echo "::error::cppcheck found errors or portability issues"
+            exit 1
+          fi
+
+  # ---- Static analysis: clang-tidy (needs compile_commands.json) ----
+  clang-tidy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install clang + cmake + ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang clang-tidy cmake ninja-build
+      - name: Configure (export compile commands)
+        run: |
+          # We only need compile_commands.json, not a full build.
+          # Use clang to generate the compile DB (the flags are GCC-compatible).
+          cmake -G Ninja -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -B build_ci
+      - name: Run clang-tidy
+        run: |
+          clang-tidy -p build_ci \
+            --checks='-*,bugprone-*,clang-analyzer-*,cert-err33-c,cert-err34-c' \
+            $(find src -name '*.cpp') 2>&1 \
+            | grep -E 'warning:|error:' \
+            | grep -v 'pointer arithmetic\|multi-level-implicit\|easily-swappable' \
+            > clang_tidy_findings.txt || true
+          echo "Findings: $(wc -l < clang_tidy_findings.txt)"
+          cat clang_tidy_findings.txt
+
+  # ---- GitHub CodeQL: security code scanning (C++) ----
+  codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: cpp
+          # Use the security-extended query suite for deeper analysis
+          queries: security-extended
+      - name: Build for CodeQL
+        run: |
+          cmake -G Ninja -DCMAKE_CXX_COMPILER=g++ -B build_codeql
+          cmake --build build_codeql -j $(nproc) --target ember_cli 2>/dev/null || true
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:cpp"
