@@ -866,6 +866,16 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/bench_codegen_paths.cpp)
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 endif()
 
+# bench_codegen_paths_selftest — focused CTest for the F-irsafe-contradiction
+# contract: make_paths() must mark the 3 Stage A IR-backend gap paths
+# (slice_bounds, string_decrypt, struct_by_value) ir_safe=false and the 7
+# scalar/CF paths ir_safe=true. Runs bench_codegen_paths --selftest, which
+# calls make_paths() and asserts the flags WITHOUT loading the baseline DLL
+# or timing anything — sub-second, independent of the 60-second harness and
+# the g++ -O2 baseline DLL. Reuses the same executable (no new target).
+add_test(NAME bench_codegen_paths_selftest COMMAND bench_codegen_paths --selftest)
+set_tests_properties(bench_codegen_paths_selftest PROPERTIES TIMEOUT 30)
+
 # bench_output_names_test — focused coverage for the benchmark results-artifact
 # naming fix (bench/bench_output_names.hpp). A manual --passes run and the
 # CTest-registered no-passes run previously clobbered each other's CWD-relative

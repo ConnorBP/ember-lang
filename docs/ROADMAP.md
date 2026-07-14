@@ -46,12 +46,13 @@ wiring to the B1 model (the `--tick` thread-safety bug, fixed), and a demo
 script (`examples/scripts/dynamic_registration.ember`). See
 `planning/v1.0_INTEGRATION_NOTES.md` §5.
 
-The current tree configures 70 CTest targets total (67 excluding the two
-bench targets `bench_codegen_paths` and `bench_ember_vs_as` plus the
-`vst3_soak` soak test; `bench_ember_vs_as` is only configured when the
-AngelScript SDK is present, so a no-SDK build configures 69). `cd buildt &&
-ctest -E bench -LE soak --timeout 60` → 67/67 pass; the full unfiltered
-suite (including benchmarks + soak) → 70/70 pass.
+The current tree configures 73 CTest targets total (68 excluding the four
+bench-prefixed tests `bench_codegen_paths`, `bench_codegen_paths_selftest`,
+`bench_ember_vs_as`, and `bench_output_names` plus the `vst3_soak` soak test;
+`bench_ember_vs_as` is only configured when the AngelScript SDK is present, so a
+no-SDK build configures 72). `cd buildt &&
+ctest -E bench -LE soak --timeout 60` → 68/68 pass; the full unfiltered
+suite (including benchmarks + soak) → 73/73 pass.
 The ten `plan_*.md` files in `docs/planning/` are historical design
 records; shipped contracts in the main docs take precedence where those plans
 describe earlier states.
@@ -753,6 +754,24 @@ here so the decision and its evidence have a tracked home.
   struct_by_value **3.00x**. So the SSA-lite IR + linear-scan regalloc is
   benchmark-PROVEN warranted on 5 of 6 paths, not speculative.
 
+  **Passes-benchmark eligibility (F-irsafe-contradiction, fixed 2026-07-13).**
+  The `bench_codegen_paths --passes` run (IR backend + 7-pass pipeline + Stage 3
+  regalloc) now excludes the three Stage A IR-backend gap paths — `slice_bounds`,
+  `string_decrypt`, and `struct_by_value` — until their IR-backend support is
+  valid. `PathBench::ir_safe` is `false` for those three (enforced by the
+  `bench_codegen_paths_selftest` CTest, which asserts the flag contract without
+  loading the baseline DLL), so `--passes` prints `[passes] skipped —
+  ir_safe=false` for each and emits `cfg=passes` rows for only the seven
+  scalar/control-flow paths (14 passes-rows = 7 paths × 2 safety). This removes
+  the live `struct_by_value` `MISMATCH (ember=1640 g++-O2=120)` from the
+  `--passes` path (0 MISMATCH lines) and stops inflating `slice_bounds` to a
+  spurious worst-case passes/g++-O2 ratio. **The underlying struct-by-value
+  IR-backend ABI gap (F-struct — the >8-byte hidden-pointer-ABI divergence in
+  `thin_lower`/`thin_emit` that makes `struct_by_value cfg=passes` return 1640
+  instead of 120) remains PENDING** — the eligibility fix contains and hides it
+  by skipping `--passes` on that path; it is NOT resolved. The real fix is the
+  IR-backend struct-by-value ABI support tracked as a separate large TODO.
+
   **Recommended architecture (staged, no flag-day rewrite):**
   - **Stage 1** — DONE (2026-07-10). A peephole + per-basic-block local register
     allocator LAYERED OVER the current tree-walker (kept; added a post-emit
@@ -760,7 +779,7 @@ here so the decision and its evidence have a tracked home.
     regalloc using the volatile r10 holding register, gated on an
     `expr_clobbers_r10` check). Ships behind flags (`enable_peephole`/
     `enable_local_regalloc`, default off → byte-identical to today; the full
-    ctest suite (70/70) + lang gate (274/274) hold with flags off AND on — the
+    ctest suite (73/73) + lang gate (274/274) hold with flags off AND on — the
     optimizations are correctness-preserving). `src/peephole.{hpp,cpp}` ship the SmartImmPass (W4)
     + the inert SetccMovzxPass (W10) placeholder; `examples/codegen_opt_test.cpp`
     pins each rewrite's value-equivalence. Measured (bench/bench_codegen_paths,

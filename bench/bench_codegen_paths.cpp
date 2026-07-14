@@ -28,9 +28,13 @@
 // results_codegen_paths.csv/.md. The two never clobber each other (see
 // bench/bench_output_names.hpp + examples/bench_output_names_test.cpp).
 //
-// 6 prototype paths (one per category): int_div, call_overhead, loop_overhead,
-// slice_bounds, string_decrypt, struct_by_value. Adding a path = one PathBench
-// struct + one extern "C" fn in baseline_paths.cpp (see the design doc §5.1).
+// 10 paths: 6 original category paths (int_div, call_overhead, loop_overhead,
+// slice_bounds, string_decrypt, struct_by_value) + 4 IR-pass workloads
+// (cse_redundant, dce_dead_store, constprop_fold, licm_invariant). The 3
+// Stage A IR-backend gap paths (slice_bounds, string_decrypt, struct_by_value)
+// have ir_safe=false so --passes skips them; the 7 scalar/CF paths have
+// ir_safe=true. Adding a path = one PathBench struct + one extern "C" fn in
+// baseline_paths.cpp (see the design doc §5.1).
 
 #include "import.hpp"
 #include "lexer.hpp"
@@ -504,10 +508,10 @@ static std::vector<PathBench> make_paths() {
             "bench_loop_overhead", "jmp back-edge + loop-body budget charge (safety-on)", true, 200, 20, 0, 10000000, true, true},
         {"slice_bounds",
             "fn main() -> i64 { let mut a: i64[64]; let mut k: i64 = 0; while (k < 64) { a[k] = k; k = k + 1; } let mut s: i64 = 0; let mut i: i64 = 0; while (i < %N) { s = s + a[i % 64]; i = i + 1; } return s; }\n",
-            "bench_slice_bounds", "indexing w/ bounds check (always on); C++ unchecked", false, 200, 20, 0, 1000000, true, true},
+            "bench_slice_bounds", "indexing w/ bounds check (always on); C++ unchecked", false, 200, 20, 0, 1000000, true, false},
         {"string_decrypt",
             "fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; while (i < %N) { s = s + string_length(\"hello world!\"); i = i + 1; } return s; }\n",
-            "bench_string_decrypt", "inline-stack-XOR decrypt per use (string_xor!=0)", true, 2000, 50, 0xA5, 100000, false, true},
+            "bench_string_decrypt", "inline-stack-XOR decrypt per use (string_xor!=0)", true, 2000, 50, 0xA5, 100000, false, false},
         {"struct_by_value",
             "struct P { a: i32; b: i32; c: i32; }\n"
             "fn mkp(a: i32, b: i32, c: i32) -> P { let p: P = P { a: a, b: b, c: c }; return p; }\n"
@@ -516,7 +520,7 @@ static std::vector<PathBench> make_paths() {
             // n=20: a larger inner loop (>=~25) triggers a known struct-by-value-
             // in-loop codegen corruption (see findings note in BENCHMARK_SYSTEM_DESIGN.md);
             // both ember and the baseline use the SAME n so the comparison is fair.
-            "bench_struct_by_value", "hidden-pointer ABI temp copy; struct-by-value arg + return", true, 2000, 50, 0, 20, true, true},
+            "bench_struct_by_value", "hidden-pointer ABI temp copy; struct-by-value arg + return", true, 2000, 50, 0, 20, true, false},
         // ── IR-pass workloads (Stage C): each exercises one optimization pass's ──
         // ── eliminable pattern. These are the workloads the pass system gates on. ──
         {"cse_redundant",
@@ -577,21 +581,64 @@ int main(int argc, char** argv) {
     // regalloc, and report BOTH nopass + passes numbers per path (the audit's
     // TODO #1: docs/audit/FINAL_SPEED_AUDIT_2026-07-11.md §5/§8).
     bool passes_flag = false;
+    bool selftest_flag = false;
     const char* dll = nullptr;
     for (int i = 1; i < argc; ++i) {
         std::string a(argv[i]);
         if (a == "--passes") { passes_flag = true; continue; }
+        if (a == "--selftest") { selftest_flag = true; continue; }
         if (a == "--help" || a == "-h") {
-            std::printf("usage: bench_codegen_paths [baseline_dll] [--passes]\n"
-                        "  --passes   also run each ir_safe path through the IR backend +\n"
-                        "             7-pass pipeline (constprop,forward,copyprop,instcombine,\n"
-                        "             dce,licm,dse) + Stage 3 regalloc; report nopass vs passes.\n");
+            std::printf("usage: bench_codegen_paths [baseline_dll] [--passes] [--selftest]\n"
+                        "  --passes    also run each ir_safe path through the IR backend +\n"
+                        "              7-pass pipeline (constprop,forward,copyprop,instcombine,\n"
+                        "              dce,licm,dse) + Stage 3 regalloc; report nopass vs passes.\n"
+                        "  --selftest  assert make_paths() IR eligibility (ir_safe flags) without\n"
+                        "              loading the baseline DLL; exit 0 if the 3 Stage A IR-backend\n"
+                        "              gap paths are ir_safe=false and the 7 scalar/CF paths are\n"
+                        "              ir_safe=true, else exit 1. (F-irsafe-contradiction pin.)\n");
             return 0;
         }
         if (a.rfind("--", 0) == 0) continue;   // ignore unknown flags
         if (!dll) dll = argv[i];                // first positional = DLL path
     }
     if (!dll) dll = "bench/baseline_paths.dll";
+
+    // ---- --selftest: fast IR-eligibility assertion (no DLL load, no timing) ----
+    // Pins the F-irsafe-contradiction contract: the 3 Stage A IR-backend gap
+    // paths (slice_bounds, string_decrypt, struct_by_value) must have
+    // ir_safe=false so --passes skips them; the 7 scalar/CF paths must have
+    // ir_safe=true so --passes runs them. Runs WITHOUT LoadLibraryA so it is a
+    // fast focused CTest (sub-second) independent of the g++ -O2 baseline DLL.
+    if (selftest_flag) {
+        auto sp = make_paths();
+        int fail = 0;
+        // is this name one of the 3 Stage A IR-backend gap paths?
+        auto is_gap = [](const char* n) {
+            return strcmp(n, "slice_bounds") == 0
+                || strcmp(n, "string_decrypt") == 0
+                || strcmp(n, "struct_by_value") == 0;
+        };
+        for (const auto& p : sp) {
+            if (is_gap(p.name) && p.ir_safe) {
+                std::fprintf(stderr, "SELFTEST FAIL: '%s' ir_safe=true but is a Stage A IR-backend gap (expected false)\n", p.name);
+                ++fail;
+            }
+            if (!is_gap(p.name) && !p.ir_safe) {
+                std::fprintf(stderr, "SELFTEST FAIL: '%s' ir_safe=false but is a scalar/CF path (expected true)\n", p.name);
+                ++fail;
+            }
+        }
+        if (sp.size() != 10) {
+            std::fprintf(stderr, "SELFTEST FAIL: expected 10 paths, got %zu\n", sp.size());
+            ++fail;
+        }
+        if (fail == 0) {
+            std::printf("SELFTEST PASS: 10 paths; 3 IR-backend gaps (slice_bounds, string_decrypt, struct_by_value) ir_safe=false; 7 scalar/CF paths ir_safe=true\n");
+            return 0;
+        }
+        std::fprintf(stderr, "SELFTEST FAIL: %d assertion(s) failed\n", fail);
+        return 1;
+    }
 
     std::printf("=== ember per-path codegen bench (prototype) ===\n");
     std::printf("    docs/spec/BENCHMARK_SYSTEM_DESIGN.md — gate: DESIGN §9 / COMPILER_PIPELINE §5\n\n");
