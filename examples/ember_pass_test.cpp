@@ -10,17 +10,63 @@
 // (6) pipeline string parser: "a,b,c" → manager with 3 passes
 // (7) run_to_fixpoint: converges when no pass changes anything
 //
+// Phase 1 (plan_POLYMORPHIC_CODE_ENGINE.md §9.3 Red 1): configured/collision-
+// aware registry factories.
+// (8)  legacy add-and-run still works through add<T> returning a status
+// (9)  configured factory captures immutable constructor options
+// (10) two create() calls yield distinct fresh PassConcept instances
+// (11) duplicate add_factory/add<T> rejection with original registration retained
+// (12) empty name + null/empty std::function factory rejection
+// (13) names() is deterministic (sorted lexicographically)
+//
+// Phase 1 (plan_POLYMORPHIC_CODE_ENGINE.md §9.3 Red 2): strict transactional
+// pipeline construction.
+// (14) transactional append: an unknown middle token leaves a preloaded
+//      manager's pass count, runnable behavior, and instrumentation untouched
+// (15) empty elements (middle / leading / trailing / whitespace-only) rejected
+// (16) unsupported parentheses rejected
+// (17) trailing junk / unconsumed text rejected
+// (18) a registered factory that returns nullptr is rejected
+// (19) successful atomic append preserves preload + instrumentation
+// (20) atomic replace mode: success replaces passes, failure preserves both
+//      passes and instrumentation; instrumentation is never moved/cleared
+//
+// Phase 2 (plan_POLYMORPHIC_CODE_ENGINE.md §9.3 Red 3): seed derivation.
+// Golden vectors pin the canonical byte encoding documented in
+// src/seed_derivation.hpp. Expected bytes are HARD-CODED literals computed by
+// a separate reference script; the production algorithm is never duplicated
+// inside this test to recompute them.
+// (21) empty/root-level derivation golden bytes + identity
+// (22) function-level derivation golden bytes + identity
+// (23) site (block + instruction ordinal) derivation golden bytes + identity
+// (24) distinct purposes yield distinct output (golden bytes for both)
+// (25) fixed seed 0 golden bytes
+// (26) fixed seed UINT64_MAX golden bytes (and distinct from seed 0)
+// (27) initial StableRng outputs (next() x4, bounded() x5) golden values
+// (28) order independence: the same request set derived forward and reverse
+//      yields identical per-request results (no shared advancing state)
+// (29) parallel: one const deriver shared across worker threads, every result
+//      equal to serial derivation (immutable / thread-safe)
+// (30) structured errors: a failing SeedDeriver returns an ExtensionError, not
+//      a printed diagnostic; the fixed-root deriver always succeeds
+//
 // Links the core `ember` lib (ember_pass.cpp lives in ember_frontend, but the
 // test links both). Modeled on thin_ir_struct_test (the hand-built struct pin).
 
 #include "../src/ember_pass.hpp"
 #include "../src/ember_pass_registry.hpp"
 #include "../src/ember_pass_pipeline.hpp"
+#include "../src/extension_registry.hpp"
+#include "../src/seed_derivation.hpp"
 #include "../src/thin_ir.hpp"
 
+#include <array>
+#include <atomic>
 #include <cstdio>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace ember;
@@ -76,6 +122,23 @@ struct ConvergingPass : EmberPassInfoMixin<ConvergingPass> {
         ++*round_;
         if (*round_ < 3) return EmberPreserved::none();  // changed
         return EmberPreserved::all();  // converged
+    }
+};
+
+// A pass carrying a captured constructor option, used to verify configured
+// factories. On run() it writes its `tag` value through the `sink` pointer so
+// the test can observe exactly which options the factory captured. Two
+// distinct fresh instances are distinguishable by address and by independent
+// sink writes.
+struct TaggedPass : EmberPassInfoMixin<TaggedPass> {
+    static constexpr const char* pass_name = "tagged";
+    int tag = 0;
+    int* sink = nullptr;
+    TaggedPass() = default;
+    TaggedPass(int t, int* s) : tag(t), sink(s) {}
+    EmberPreserved run(ThinFunction&, EmberAnalysisManager&) {
+        if (sink) *sink = tag;
+        return EmberPreserved::none();
     }
 };
 
@@ -190,11 +253,32 @@ int main() {
         EmberPassManager pm2;
         check(build_pipeline_from_string("", reg, pm2, &err), "empty spec succeeds");
         check(pm2.empty(), "empty spec = no passes");
-        // Unknown name = error.
+        // Unknown name = error. The pipeline is transactional: even though
+        // "noop" resolves first, the manager must NOT receive it on failure.
+        // This failure case preloads the destination manager with one runnable
+        // pass and a real instrumentation callback bundle, then asserts the
+        // failed parse left the pass count, runnable behavior, and the
+        // instrumentation callback pointer completely unchanged.
         EmberPassManager pm3;
+        int pre_ran3 = 0, after_count3 = 0;
+        PassInstrumentationCallbacks cb3;
+        pm3.add_pass(CountingPass(&pre_ran3));
+        cb3.after_pass = [&](const char*, const ThinFunction&, EmberPreserved) {
+            ++after_count3;
+        };
+        pm3.instrumentation.callbacks = &cb3;
+        const PassInstrumentationCallbacks* cb3_ptr = pm3.instrumentation.callbacks;
         bool ok2 = build_pipeline_from_string("noop,nonexistent", reg, pm3, &err);
         check(!ok2, "unknown pass name -> parse fails");
         check(err.find("unknown pass") != std::string::npos, "error mentions 'unknown pass'");
+        check(pm3.size() == 1, "transactional: pass count unchanged on unknown-name failure");
+        check(pm3.instrumentation.callbacks == cb3_ptr,
+              "transactional: instrumentation pointer unchanged on unknown-name failure");
+        pre_ran3 = 0; after_count3 = 0;
+        EmberPreserved p3 = pm3.run(thf, am);
+        check(pre_ran3 == 1, "transactional: preloaded pass still runs after unknown-name failure");
+        check(after_count3 == 1, "transactional: instrumentation still fires after unknown-name failure");
+        check(!p3.all_preserved(), "transactional: preloaded CountingPass still returns none()");
         // Whitespace trimming.
         EmberPassManager pm4;
         bool ok3 = build_pipeline_from_string(" noop , counting ", reg, pm4, &err);
@@ -221,6 +305,854 @@ int main() {
         pm.add_pass(ConvergingPass(&round));
         pm.run_to_fixpoint(thf, am, 8);
         check(round == 3, "ConvergingPass ran 3 rounds (2 changed + 1 converged)");
+    }
+
+    // (8) Legacy add-and-run still works now that add<T> returns a status the
+    // caller may ignore. Registers via add<T>, builds a pipeline, runs it, and
+    // confirms the pass executed (the default-constructed CountingPass returns
+    // Preserved::none(), proving run() was invoked).
+    std::printf("(8) Legacy add-and-run (add<T> returns ignorable status)\n");
+    {
+        EmberPassRegistry reg;
+        ExtensionStatus st = reg.add<CountingPass>("counting");
+        check(bool(st), "add<T> returns success status");
+        check(reg.has("counting"), "add<T> still registers the name");
+        EmberPassManager pm;
+        std::string err;
+        check(build_pipeline_from_string("counting", reg, pm, &err),
+              "pipeline builds from add<T>-registered name");
+        check(pm.size() == 1, "pipeline has 1 pass");
+        EmberPreserved p = pm.run(thf, am);
+        check(!p.all_preserved(),
+              "legacy add-and-run pass executed (returned Preserved::none)");
+    }
+
+    // (9) Configured factory captures immutable constructor options. The
+    // factory captures `tag` by value; create() + run() must observe exactly
+    // the captured value, proving the options traveled into the pass.
+    std::printf("(9) Configured factory captures immutable options\n");
+    {
+        int sink = 0;
+        const int captured_tag = 1337;
+        EmberPassRegistry reg;
+        ExtensionStatus st = reg.add_factory(
+            "tagged",
+            [captured_tag, &sink]() -> std::unique_ptr<PassConcept> {
+                return make_pass_concept(TaggedPass{captured_tag, &sink});
+            });
+        check(bool(st), "add_factory captured-options registration succeeds");
+        auto p = reg.create("tagged");
+        check(p != nullptr, "create() returns a configured pass");
+        if (p) {
+            EmberPassManager pm;
+            pm.add_pass_concept(std::move(p));
+            pm.run(thf, am);
+        }
+        check(sink == captured_tag,
+              "configured pass observed the captured immutable option");
+    }
+
+    // (10) Two create() calls yield distinct fresh PassConcept instances. A
+    // configured factory must construct a new pass on every create(), never
+    // hand out a shared/cached object.
+    std::printf("(10) Configured factory creates fresh instances per create()\n");
+    {
+        int sink_a = -1, sink_b = -1;
+        EmberPassRegistry reg;
+        reg.add_factory("tagged", [&]() -> std::unique_ptr<PassConcept> {
+            // Each call binds a distinct sink so the two instances are
+            // independently observable as well as address-distinct.
+            static int which = 0;
+            int* sink = (which++ == 0) ? &sink_a : &sink_b;
+            return make_pass_concept(TaggedPass{7, sink});
+        });
+        auto a = reg.create("tagged");
+        auto b = reg.create("tagged");
+        check(a != nullptr && b != nullptr, "both create() calls return a pass");
+        check(a.get() != b.get(), "two create() calls yield distinct instances");
+        // Independent runs write to independent sinks, confirming freshness.
+        if (a && b) {
+            EmberPassManager pm;
+            pm.add_pass_concept(std::move(a));
+            pm.run(thf, am);
+            EmberPassManager pm2;
+            pm2.add_pass_concept(std::move(b));
+            pm2.run(thf, am);
+        }
+        check(sink_a == 7 && sink_b == 7, "both fresh instances run independently");
+    }
+
+    // (11) Duplicate registration is rejected and the ORIGINAL registration is
+    // retained (not replaced). Verified for both add_factory and add<T> by
+    // checking the retained factory still produces the original pass name.
+    std::printf("(11) Duplicate rejection retains original registration\n");
+    {
+        EmberPassRegistry reg;
+        ExtensionStatus s1 = reg.add_factory(
+            "dup", []() -> std::unique_ptr<PassConcept> {
+                return make_pass_concept(NoOpPass{});
+            });
+        check(bool(s1), "first add_factory(\"dup\") succeeds");
+        ExtensionStatus s2 = reg.add_factory(
+            "dup", []() -> std::unique_ptr<PassConcept> {
+                return make_pass_concept(CountingPass{});
+            });
+        check(!bool(s2), "duplicate add_factory(\"dup\") is rejected");
+        check(reg.has("dup"), "name still present after duplicate rejection");
+        auto p = reg.create("dup");
+        check(p != nullptr, "create(\"dup\") still works after rejected duplicate");
+        check(p != nullptr && std::string(p->name()) == "noop",
+              "original (NoOpPass) registration retained, not replaced");
+    }
+    {
+        EmberPassRegistry reg;
+        ExtensionStatus a1 = reg.add<NoOpPass>("dupT");
+        check(bool(a1), "first add<T>(\"dupT\") succeeds");
+        ExtensionStatus a2 = reg.add<CountingPass>("dupT");
+        check(!bool(a2), "duplicate add<T>(\"dupT\") is rejected");
+        auto p = reg.create("dupT");
+        check(p != nullptr && std::string(p->name()) == "noop",
+              "original add<T> registration retained, not replaced");
+    }
+
+    // (12) Empty name and null/empty std::function factories are rejected and
+    // not stored.
+    std::printf("(12) Empty name / null factory rejection\n");
+    {
+        EmberPassRegistry reg;
+        ExtensionStatus sn = reg.add_factory("nully", PassFactory{});
+        check(!bool(sn), "null std::function factory is rejected");
+        check(!reg.has("nully"), "null factory is not stored");
+        ExtensionStatus se = reg.add_factory(
+            "", []() -> std::unique_ptr<PassConcept> {
+                return make_pass_concept(NoOpPass{});
+            });
+        check(!bool(se), "empty name is rejected");
+        check(!reg.has(""), "empty name is not stored");
+        // add<T> empty name is rejected too.
+        ExtensionStatus te = reg.add<NoOpPass>("");
+        check(!bool(te), "add<T> with empty name is rejected");
+    }
+
+    // (13) names() is deterministic: sorted lexicographically, regardless of
+    // insertion order and regardless of add<T> vs add_factory mixing.
+    std::printf("(13) Deterministic (sorted) names()\n");
+    {
+        EmberPassRegistry reg;
+        check(bool(reg.add_factory("zebra", []() -> std::unique_ptr<PassConcept> {
+                  return make_pass_concept(NoOpPass{});
+              })),
+              "add_factory zebra ok");
+        check(bool(reg.add<NoOpPass>("banana")), "add<T> banana ok");
+        check(bool(reg.add_factory("mike", []() -> std::unique_ptr<PassConcept> {
+                  return make_pass_concept(NoOpPass{});
+              })),
+              "add_factory mike ok");
+        check(bool(reg.add_factory("alpha", []() -> std::unique_ptr<PassConcept> {
+                  return make_pass_concept(NoOpPass{});
+              })),
+              "add_factory alpha ok");
+        std::vector<std::string> names = reg.names();
+        std::vector<std::string> expected = {"alpha", "banana", "mike", "zebra"};
+        check(names.size() == 4, "names() lists all four registrations");
+        check(names == expected, "names() is sorted lexicographically");
+    }
+
+    // ─── Red 2: strict transactional pipeline construction ───
+    //
+    // The accepted initial grammar is exactly `name (',' name)*` with
+    // surrounding spaces/tabs permitted; an entirely empty spec is a
+    // successful no-op. Every failure case below preloads the destination
+    // manager with one runnable pass and a real instrumentation callback
+    // bundle, then asserts the failed parse left the pass count, runnable
+    // behavior, and instrumentation callback pointer completely unchanged.
+    //
+    // A helper registry is reused: noop, counting, and a configured factory
+    // "nully" that returns nullptr (to exercise the null-factory-result path
+    // through the pipeline parser, distinct from the null-std::function
+    // rejection already covered in (12)).
+    auto make_tx_registry = []() {
+        EmberPassRegistry reg;
+        reg.add<NoOpPass>("noop");
+        reg.add<CountingPass>("counting");
+        // A registered factory whose operator() returns nullptr. The pipeline
+        // parser must treat a null factory result as a hard failure.
+        reg.add_factory("nully", []() -> std::unique_ptr<PassConcept> {
+            return nullptr;
+        });
+        return reg;
+    };
+
+    // A helper that preloads a manager with one CountingPass wired to `ran`,
+    // installs a real instrumentation callback bundle at `cb`, and returns the
+    // manager. Used by every failure case so the "unchanged" assertions are
+    // meaningful (the manager is non-empty and instrumented before the parse).
+    auto preload_manager = [&](EmberPassManager& pm, int& ran,
+                               PassInstrumentationCallbacks& cb,
+                               int& after_count) {
+        pm.add_pass(CountingPass(&ran));
+        after_count = 0;
+        cb.after_pass = [&](const char*, const ThinFunction&, EmberPreserved) {
+            ++after_count;
+        };
+        pm.instrumentation.callbacks = &cb;
+    };
+
+    // (14) Transactional append: an unknown middle token must not leave any
+    // earlier-resolved pass appended. "noop,unknown,counting" resolves noop
+    // first, then fails on "unknown"; the manager must keep exactly its one
+    // preloaded pass, still run it, and keep its instrumentation pointer.
+    std::printf("(14) Transactional append: unknown middle token leaves manager unchanged\n");
+    {
+        auto reg = make_tx_registry();
+        EmberPassManager pm;
+        int ran = 0, after_count = 0;
+        PassInstrumentationCallbacks cb;
+        preload_manager(pm, ran, cb, after_count);
+        const PassInstrumentationCallbacks* cb_ptr = pm.instrumentation.callbacks;
+        std::string err;
+        bool ok = build_pipeline_from_string("noop,unknown,counting", reg, pm, &err);
+        check(!ok, "parse with unknown middle token fails");
+        check(err.find("unknown pass") != std::string::npos,
+              "error mentions 'unknown pass' for middle token");
+        check(pm.size() == 1, "manager pass count unchanged (1 preloaded, 0 appended)");
+        check(pm.instrumentation.callbacks == cb_ptr,
+              "instrumentation callback pointer unchanged on failure");
+        // Runnable behavior: the preloaded pass still runs exactly once and
+        // the instrumentation still fires.
+        ran = 0; after_count = 0;
+        EmberPreserved p = pm.run(thf, am);
+        check(ran == 1, "preloaded pass still runs after failed append");
+        check(after_count == 1, "instrumentation still fires after failed append");
+        check(!p.all_preserved(), "preloaded CountingPass still returns none()");
+    }
+
+    // (15) Empty elements are rejected: middle ("noop,,counting"), leading
+    // (",counting"), trailing ("noop,"), and whitespace-only ("noop,   ,counting").
+    // Each must fail and leave a preloaded manager untouched.
+    std::printf("(15) Empty elements rejected (middle/leading/trailing/whitespace-only)\n");
+    {
+        auto reg = make_tx_registry();
+        struct Case { const char* spec; const char* label; };
+        Case cases[] = {
+            {"noop,,counting",    "middle empty element"},
+            {",counting",         "leading empty element"},
+            {"noop,",             "trailing empty element"},
+            {"noop,   ,counting", "whitespace-only element"},
+            {"   ,counting",      "leading whitespace-only element"},
+            {"noop,   ",          "trailing whitespace-only element"},
+        };
+        for (const auto& c : cases) {
+            EmberPassManager pm;
+            int ran = 0, after_count = 0;
+            PassInstrumentationCallbacks cb;
+            preload_manager(pm, ran, cb, after_count);
+            const PassInstrumentationCallbacks* cb_ptr = pm.instrumentation.callbacks;
+            std::string err;
+            bool ok = build_pipeline_from_string(c.spec, reg, pm, &err);
+            check(!ok, c.label);
+            check(pm.size() == 1, "pass count unchanged for empty-element case");
+            check(pm.instrumentation.callbacks == cb_ptr,
+                  "instrumentation unchanged for empty-element case");
+            ran = 0; pm.run(thf, am);
+            check(ran == 1, "preloaded pass still runs for empty-element case");
+        }
+    }
+
+    // (16) Unsupported parentheses are rejected. The initial grammar has no
+    // parenthesized sub-pipelines, so any '(' or ')' is a hard error.
+    std::printf("(16) Unsupported parentheses rejected\n");
+    {
+        auto reg = make_tx_registry();
+        struct Case { const char* spec; const char* label; };
+        Case cases[] = {
+            {"noop,(counting)",   "parenthesized single name"},
+            {"noop,counting)",    "trailing close paren"},
+            {"(noop,counting",    "leading open paren"},
+            {"flatten(subst,mba)", "nested sub-pipeline syntax"},
+            {"noop()",            "empty paren group after name"},
+        };
+        for (const auto& c : cases) {
+            EmberPassManager pm;
+            int ran = 0, after_count = 0;
+            PassInstrumentationCallbacks cb;
+            preload_manager(pm, ran, cb, after_count);
+            const PassInstrumentationCallbacks* cb_ptr = pm.instrumentation.callbacks;
+            std::string err;
+            bool ok = build_pipeline_from_string(c.spec, reg, pm, &err);
+            check(!ok, c.label);
+            check(pm.size() == 1, "pass count unchanged for paren case");
+            check(pm.instrumentation.callbacks == cb_ptr,
+                  "instrumentation unchanged for paren case");
+            ran = 0; pm.run(thf, am);
+            check(ran == 1, "preloaded pass still runs for paren case");
+        }
+    }
+
+    // (17) Trailing junk / unconsumed text is rejected. A name must be a bare
+    // token; any character that is not part of a name (after trimming) makes
+    // the whole token invalid so nothing partially appends.
+    std::printf("(17) Trailing junk / unconsumed text rejected\n");
+    {
+        auto reg = make_tx_registry();
+        struct Case { const char* spec; const char* label; };
+        Case cases[] = {
+            {"noop,counting!",     "trailing '!' junk"},
+            {"noop,counting extra", "trailing space-separated junk"},
+            {"noop,counting;x",    "trailing ';x' junk"},
+            {"noop;counting",      "';' is not a separator"},
+            {"noop count",         "space inside a token is not allowed"},
+        };
+        for (const auto& c : cases) {
+            EmberPassManager pm;
+            int ran = 0, after_count = 0;
+            PassInstrumentationCallbacks cb;
+            preload_manager(pm, ran, cb, after_count);
+            const PassInstrumentationCallbacks* cb_ptr = pm.instrumentation.callbacks;
+            std::string err;
+            bool ok = build_pipeline_from_string(c.spec, reg, pm, &err);
+            check(!ok, c.label);
+            check(pm.size() == 1, "pass count unchanged for trailing-junk case");
+            check(pm.instrumentation.callbacks == cb_ptr,
+                  "instrumentation unchanged for trailing-junk case");
+            ran = 0; pm.run(thf, am);
+            check(ran == 1, "preloaded pass still runs for trailing-junk case");
+        }
+    }
+
+    // (18) A registered factory that returns nullptr is rejected. Unlike the
+    // null std::function rejection in (12), here the factory is callable but
+    // yields no pass; the parser must treat the missing pass as a failure and
+    // leave the preloaded manager unchanged.
+    std::printf("(18) Registered factory returning nullptr is rejected\n");
+    {
+        auto reg = make_tx_registry();
+        EmberPassManager pm;
+        int ran = 0, after_count = 0;
+        PassInstrumentationCallbacks cb;
+        preload_manager(pm, ran, cb, after_count);
+        const PassInstrumentationCallbacks* cb_ptr = pm.instrumentation.callbacks;
+        std::string err;
+        bool ok = build_pipeline_from_string("nully", reg, pm, &err);
+        check(!ok, "null factory result -> parse fails");
+        // A null factory result must be distinguished from a truly unknown
+        // name: the diagnostic must name a factory/null failure (the word
+        // "factory" is unambiguous and does not appear in the pass name) and
+        // must NOT collapse to the generic "unknown pass" wording.
+        check(err.find("factory") != std::string::npos,
+              "error mentions 'factory' for a null factory result");
+        check(err.find("unknown pass") == std::string::npos,
+              "null factory result is NOT reported as 'unknown pass'");
+        check(pm.size() == 1, "pass count unchanged after null factory result");
+        check(pm.instrumentation.callbacks == cb_ptr,
+              "instrumentation unchanged after null factory result");
+        ran = 0; pm.run(thf, am);
+        check(ran == 1, "preloaded pass still runs after null factory result");
+        // A null factory result buried after a valid name must also roll back.
+        // As above, the failure is a null factory result (the name IS
+        // registered), so the diagnostic must name the null/factory failure,
+        // not "unknown pass", and the preloaded manager's passes AND
+        // instrumentation must be left completely unchanged.
+        EmberPassManager pm2;
+        int ran2 = 0, after2 = 0;
+        PassInstrumentationCallbacks cb2;
+        preload_manager(pm2, ran2, cb2, after2);
+        const PassInstrumentationCallbacks* cb2_ptr = pm2.instrumentation.callbacks;
+        std::string err2;
+        bool ok2 = build_pipeline_from_string("noop,nully,counting", reg, pm2, &err2);
+        check(!ok2, "null factory result in the middle -> parse fails");
+        check(err2.find("factory") != std::string::npos,
+              "mid-list null factory result mentions 'factory'");
+        check(err2.find("unknown pass") == std::string::npos,
+              "mid-list null factory result is NOT reported as 'unknown pass'");
+        check(pm2.size() == 1, "nothing appended before null factory result");
+        check(pm2.instrumentation.callbacks == cb2_ptr,
+              "instrumentation unchanged after mid-list null factory result");
+        ran2 = 0; pm2.run(thf, am);
+        check(ran2 == 1, "preloaded pass still runs after mid-list null factory");
+    }
+
+    // (19) Successful atomic append on a preloaded manager: the existing
+    // build_pipeline_from_string append behavior adds the resolved passes to
+    // the preloaded ones, preserves instrumentation, and every pass runs.
+    std::printf("(19) Successful atomic append preserves preload + instrumentation\n");
+    {
+        auto reg = make_tx_registry();
+        EmberPassManager pm;
+        int pre_ran = 0, after_count = 0;
+        PassInstrumentationCallbacks cb;
+        preload_manager(pm, pre_ran, cb, after_count);
+        const PassInstrumentationCallbacks* cb_ptr = pm.instrumentation.callbacks;
+        std::string err;
+        bool ok = build_pipeline_from_string("noop,counting", reg, pm, &err);
+        check(ok, "append parse succeeds");
+        check(pm.size() == 3, "1 preloaded + 2 appended = 3 passes");
+        check(pm.instrumentation.callbacks == cb_ptr,
+              "instrumentation preserved on successful append");
+        // Running fires instrumentation for all three passes (after_pass is
+        // called once per pass). The preloaded CountingPass increments pre_ran.
+        pre_ran = 0; after_count = 0;
+        pm.run(thf, am);
+        check(pre_ran == 1, "preloaded pass ran during successful append run");
+        check(after_count == 3, "instrumentation fired for all 3 passes");
+        // An entirely empty spec is still a successful no-op and appends nothing.
+        EmberPassManager pm2;
+        int pre2 = 0, after2 = 0;
+        PassInstrumentationCallbacks cb2;
+        preload_manager(pm2, pre2, cb2, after2);
+        std::string err2;
+        bool ok2 = build_pipeline_from_string("", reg, pm2, &err2);
+        check(ok2, "empty spec is a successful no-op");
+        check(pm2.size() == 1, "empty spec appends nothing to preloaded manager");
+        check(pm2.instrumentation.callbacks == &cb2,
+              "instrumentation preserved on empty-spec no-op");
+    }
+
+    // (20) Atomic replace mode: replace_pipeline_from_string resolves every
+    // token into temporary ownership and, only on complete success, replaces
+    // the manager's passes WITHOUT moving or clearing its instrumentation.
+    // On failure both the passes and instrumentation are preserved.
+    std::printf("(20) Atomic replace mode preserves instrumentation\n");
+    {
+        auto reg = make_tx_registry();
+        // Success: preloaded pass is replaced by the two resolved passes.
+        {
+            EmberPassManager pm;
+            int pre_ran = 0, after_count = 0;
+            PassInstrumentationCallbacks cb;
+            preload_manager(pm, pre_ran, cb, after_count);
+            const PassInstrumentationCallbacks* cb_ptr = pm.instrumentation.callbacks;
+            std::string err;
+            bool ok = replace_pipeline_from_string("noop,counting", reg, pm, &err);
+            check(ok, "replace parse succeeds");
+            check(pm.size() == 2, "replace swaps in exactly the resolved passes");
+            check(pm.instrumentation.callbacks == cb_ptr,
+                  "instrumentation preserved on successful replace");
+            pre_ran = 0; after_count = 0;
+            pm.run(thf, am);
+            check(pre_ran == 0, "preloaded pass was replaced (did not run)");
+            check(after_count == 2, "instrumentation fired for the 2 replaced passes");
+        }
+        // Failure: unknown name -> preloaded pass AND instrumentation kept.
+        {
+            EmberPassManager pm;
+            int pre_ran = 0, after_count = 0;
+            PassInstrumentationCallbacks cb;
+            preload_manager(pm, pre_ran, cb, after_count);
+            const PassInstrumentationCallbacks* cb_ptr = pm.instrumentation.callbacks;
+            std::string err;
+            bool ok = replace_pipeline_from_string("noop,unknown", reg, pm, &err);
+            check(!ok, "replace with unknown name fails");
+            check(pm.size() == 1, "replace failure keeps preloaded pass");
+            check(pm.instrumentation.callbacks == cb_ptr,
+                  "instrumentation preserved on failed replace");
+            pre_ran = 0; pm.run(thf, am);
+            check(pre_ran == 1, "preloaded pass still runs after failed replace");
+        }
+        // Failure: empty spec is a successful no-op for replace too (resolves
+        // to zero passes), replacing the preload with nothing while keeping
+        // instrumentation. This pins that replace-of-empty is a legitimate
+        // "replace with the empty pipeline," not an error.
+        {
+            EmberPassManager pm;
+            int pre_ran = 0, after_count = 0;
+            PassInstrumentationCallbacks cb;
+            preload_manager(pm, pre_ran, cb, after_count);
+            const PassInstrumentationCallbacks* cb_ptr = pm.instrumentation.callbacks;
+            std::string err;
+            bool ok = replace_pipeline_from_string("", reg, pm, &err);
+            check(ok, "empty spec replace is a successful no-op");
+            check(pm.size() == 0, "empty spec replace clears passes");
+            check(pm.instrumentation.callbacks == cb_ptr,
+                  "instrumentation preserved on empty-spec replace");
+            pre_ran = 0; pm.run(thf, am);
+            check(pre_ran == 0, "no passes run after empty-spec replace");
+        }
+    }
+
+    // ─── Red 3: seed derivation vectors ───
+    //
+    // The golden bytes below are HARD-CODED literals produced by a separate
+    // reference implementation of the canonical algorithm documented in
+    // src/seed_derivation.hpp. The production algorithm is NOT duplicated here
+    // to recompute expected values; the test only compares against literals.
+    // During the RED phase the stub returns zeros, so every non-zero golden
+    // equality and every inequality assertion fails at runtime.
+
+    // Helper: compare a derived 32-byte result to a hard-coded golden literal.
+    auto eq32 = [](const std::array<uint8_t, 32>& a,
+                   const std::array<uint8_t, 32>& b) -> bool {
+        return a == b;
+    };
+    // Helper: build a SeedRequest from explicit fields.
+    auto mkreq = [](std::string_view engine_version,
+                    std::string_view module_id,
+                    std::string_view build_profile_id,
+                    std::string_view pass_name,
+                    uint32_t pass_algorithm_version,
+                    std::string_view function_name,
+                    uint32_t logical_slot,
+                    uint32_t block_id,
+                    uint32_t instruction_ordinal,
+                    std::string_view purpose) -> SeedRequest {
+        SeedRequest r;
+        r.engine_version         = engine_version;
+        r.module_id              = module_id;
+        r.build_profile_id       = build_profile_id;
+        r.pass_name              = pass_name;
+        r.pass_algorithm_version = pass_algorithm_version;
+        r.function_name          = function_name;
+        r.logical_slot           = logical_slot;
+        r.block_id               = block_id;
+        r.instruction_ordinal    = instruction_ordinal;
+        r.purpose                = purpose;
+        return r;
+    };
+
+    // (21) Empty / root-level derivation. Every string is empty except the
+    // purpose and every integer is zero: the minimal (root-level) request.
+    // Root = u64_to_root(0). The expected bytes are the pinned golden literal.
+    std::printf("(21) Empty / root-level derivation golden + identity\n");
+    {
+        auto root0 = u64_to_root(0);
+        // Pin the root adapter output too (independent golden literal).
+        const std::array<uint8_t, 32> golden_root0 = {
+            0x48,0xb9,0x7b,0xfb,0xa7,0x9d,0xb3,0x0d,
+            0xb6,0xb1,0x90,0x33,0xf6,0x2d,0x34,0xf9,
+            0xeb,0xce,0x93,0x52,0x4c,0xe3,0x64,0x27,
+            0x7c,0x5c,0xe0,0xd8,0x15,0x31,0xbf,0xee,
+        };
+        check(eq32(root0, golden_root0), "u64_to_root(0) golden root");
+
+        FixedRootSeedDeriver deriver(root0);
+        auto req = mkreq("", "", "", "", 0, "", 0, 0, 0, "select");
+        auto r1 = deriver.derive(req);
+        check(bool(r1), "root-level derive succeeds (structured result ok)");
+        const std::array<uint8_t, 32> golden_root_level = {
+            0x1d,0x97,0x09,0xda,0xbb,0x24,0x6b,0xbc,
+            0xcf,0x5d,0xa8,0x66,0x4c,0x62,0x03,0x0f,
+            0xd8,0x90,0xab,0x15,0xfe,0xc4,0xa1,0x9a,
+            0xda,0x48,0x77,0x99,0x71,0xd6,0xbd,0x7d,
+        };
+        check(r1.value && eq32(*r1.value, golden_root_level),
+              "root-level derive golden bytes");
+        // Identity: deriving the same request twice yields identical bytes.
+        auto r2 = deriver.derive(req);
+        check(r1.value && r2.value && eq32(*r1.value, *r2.value),
+              "root-level derive is identity (same request -> same bytes)");
+    }
+
+    // (22) Function-level derivation: a request carrying engine/module/
+    // profile/pass/function identities and a logical slot, site fields zero.
+    std::printf("(22) Function-level derivation golden + identity\n");
+    {
+        FixedRootSeedDeriver deriver(u64_to_root(0));
+        auto req = mkreq("ember-1", "mod-a", "light", "mba_expand", 1,
+                         "compute", 3, 0, 0, "select");
+        auto r1 = deriver.derive(req);
+        check(bool(r1), "function-level derive succeeds");
+        const std::array<uint8_t, 32> golden_fn = {
+            0xc3,0xc5,0x24,0x4e,0x90,0x5a,0xe7,0xb5,
+            0x6d,0xe0,0xaf,0xa1,0x3f,0x0c,0x0b,0x0e,
+            0xc1,0x3f,0x2a,0xd7,0x36,0xf5,0xca,0x94,
+            0x7d,0x35,0xaf,0x7f,0xfd,0xab,0xb5,0xc1,
+        };
+        check(r1.value && eq32(*r1.value, golden_fn),
+              "function-level derive golden bytes");
+        auto r2 = deriver.derive(req);
+        check(r1.value && r2.value && eq32(*r1.value, *r2.value),
+              "function-level derive is identity");
+    }
+
+    // (23) Site identity: a request pinning block_id + instruction_ordinal, a
+    // different purpose, and a different root (u64_to_root(0xdeadbeef)).
+    std::printf("(23) Site (block + ordinal) derivation golden + identity\n");
+    {
+        FixedRootSeedDeriver deriver(u64_to_root(0xdeadbeef));
+        auto req = mkreq("ember-1", "mod-a", "light", "mba_expand", 1,
+                         "compute", 3, 5, 42, "variant");
+        auto r1 = deriver.derive(req);
+        check(bool(r1), "site derive succeeds");
+        const std::array<uint8_t, 32> golden_site = {
+            0x86,0x57,0x25,0x38,0xc4,0x0d,0x21,0x70,
+            0x36,0xaa,0x3e,0x45,0x6b,0x0e,0xd0,0xf0,
+            0x1f,0x2d,0xee,0x0e,0xce,0xf2,0xf7,0x53,
+            0xf3,0xda,0x3c,0x7d,0x23,0xba,0x62,0x7d,
+        };
+        check(r1.value && eq32(*r1.value, golden_site),
+              "site derive golden bytes");
+        auto r2 = deriver.derive(req);
+        check(r1.value && r2.value && eq32(*r1.value, *r2.value),
+              "site derive is identity");
+    }
+
+    // (24) Distinct purposes yield distinct output. Two requests differing
+    // ONLY in purpose (select vs constant) must produce different bytes, and
+    // each is pinned to a golden literal.
+    std::printf("(24) Distinct purposes yield distinct output\n");
+    {
+        FixedRootSeedDeriver deriver(u64_to_root(0));
+        auto reqA = mkreq("ember-1", "mod-a", "light", "const_encode", 1,
+                          "compute", 3, 5, 42, "select");
+        auto reqB = mkreq("ember-1", "mod-a", "light", "const_encode", 1,
+                          "compute", 3, 5, 42, "constant");
+        auto rA = deriver.derive(reqA);
+        auto rB = deriver.derive(reqB);
+        check(bool(rA) && bool(rB), "both purpose derivations succeed");
+        const std::array<uint8_t, 32> golden_purpA = {
+            0x93,0x86,0x3e,0xcb,0xd1,0xb8,0xfd,0x32,
+            0xc9,0x08,0xe0,0xc9,0x3b,0x97,0x99,0x33,
+            0xd8,0x30,0x6d,0x37,0xc2,0x4d,0x5c,0xeb,
+            0x30,0x59,0xd6,0x5b,0x31,0x64,0xb7,0x85,
+        };
+        const std::array<uint8_t, 32> golden_purpB = {
+            0x74,0x77,0x33,0xae,0x5a,0x86,0xc7,0x35,
+            0xb3,0x90,0x6c,0x8d,0x2b,0xc3,0x4e,0x69,
+            0x8d,0xb5,0x1c,0x77,0xce,0x9d,0x76,0xab,
+            0xe4,0x79,0xac,0xe7,0xdd,0x7c,0xe6,0xfd,
+        };
+        check(rA.value && eq32(*rA.value, golden_purpA),
+              "purpose=select golden bytes");
+        check(rB.value && eq32(*rB.value, golden_purpB),
+              "purpose=constant golden bytes");
+        check(rA.value && rB.value && !eq32(*rA.value, *rB.value),
+              "distinct purposes produce distinct output");
+    }
+
+    // (25) Fixed seed 0: a request derived under u64_to_root(0), pinned golden.
+    std::printf("(25) Fixed seed 0 golden bytes\n");
+    {
+        FixedRootSeedDeriver deriver(u64_to_root(0));
+        auto req = mkreq("ember-1", "mod-a", "balanced", "opaque_pred", 2,
+                         "guard", 1, 2, 9, "truth");
+        auto r = deriver.derive(req);
+        check(bool(r), "fixed-seed-0 derive succeeds");
+        const std::array<uint8_t, 32> golden_seed0 = {
+            0xd9,0xb1,0xcf,0x01,0xe9,0xb8,0x66,0xc6,
+            0x22,0x02,0x00,0xc8,0x22,0xba,0x5b,0x3f,
+            0x45,0x51,0xe7,0xb2,0x9a,0x91,0xa6,0x47,
+            0xcd,0x6d,0x88,0xa9,0x8c,0x89,0x73,0x74,
+        };
+        check(r.value && eq32(*r.value, golden_seed0),
+              "fixed seed 0 golden bytes");
+    }
+
+    // (26) Fixed seed UINT64_MAX: the same request under u64_to_root(UINT64_MAX),
+    // pinned golden, and distinct from seed 0 (exercises the edge seed).
+    std::printf("(26) Fixed seed UINT64_MAX golden bytes (distinct from seed 0)\n");
+    {
+        const std::array<uint8_t, 32> golden_root_max = {
+            0x1f,0x79,0x62,0xe1,0x8c,0xb2,0x1f,0x59,
+            0xa6,0x23,0xd9,0x79,0x8c,0xbe,0x45,0x13,
+            0x19,0xf3,0x19,0x38,0x0f,0x7a,0xbc,0xdb,
+            0x39,0xca,0x99,0xe7,0x0e,0xf2,0x04,0x1c,
+        };
+        auto rootMax = u64_to_root(UINT64_MAX);
+        check(eq32(rootMax, golden_root_max), "u64_to_root(UINT64_MAX) golden root");
+        FixedRootSeedDeriver deriver(rootMax);
+        auto req = mkreq("ember-1", "mod-a", "balanced", "opaque_pred", 2,
+                         "guard", 1, 2, 9, "truth");
+        auto r = deriver.derive(req);
+        check(bool(r), "fixed-seed-UINT64_MAX derive succeeds");
+        const std::array<uint8_t, 32> golden_seed_max = {
+            0x46,0xb5,0x22,0x17,0x9b,0x83,0x3f,0x61,
+            0xe8,0xe1,0xf6,0x43,0x43,0xd7,0x9b,0xf4,
+            0x60,0x5a,0x7c,0x6c,0xbe,0xb8,0x37,0xb1,
+            0x2e,0x35,0x38,0xf1,0x7d,0x29,0x50,0x63,
+        };
+        check(r.value && eq32(*r.value, golden_seed_max),
+              "fixed seed UINT64_MAX golden bytes");
+        // Distinct from the seed-0 result of the same request (25).
+        FixedRootSeedDeriver deriver0(u64_to_root(0));
+        auto r0 = deriver0.derive(req);
+        check(r.value && r0.value && !eq32(*r.value, *r0.value),
+              "seed 0 and seed UINT64_MAX produce distinct output for same request");
+    }
+
+    // (27) Initial StableRng outputs. StableRng(0).next() x4 and bounded() x5
+    // (bounded(7) x3 then bounded(1000003) x2) are pinned to golden u64 values.
+    std::printf("(27) Initial StableRng outputs (next + bounded)\n");
+    {
+        StableRng rng(0);
+        const uint64_t golden_next[4] = {
+            0xe220a8397b1dcdafULL,
+            0x6e789e6aa1b965f4ULL,
+            0x06c45d188009454fULL,
+            0xf88bb8a8724c81ecULL,
+        };
+        for (int i = 0; i < 4; ++i) {
+            uint64_t v = rng.next();
+            char buf[80];
+            std::snprintf(buf, sizeof(buf),
+                          "StableRng(0).next()[%d] golden 0x%016llx",
+                          i, (unsigned long long)golden_next[i]);
+            check(v == golden_next[i], buf);
+        }
+        // bounded() with rejection sampling: 7 does not divide 2^64.
+        StableRng rng_b7(0);
+        const uint64_t golden_b7[3] = {2, 1, 2};
+        for (int i = 0; i < 3; ++i) {
+            uint64_t v = rng_b7.bounded(7);
+            char buf[80];
+            std::snprintf(buf, sizeof(buf),
+                          "StableRng(0).bounded(7)[%d] golden %llu",
+                          i, (unsigned long long)golden_b7[i]);
+            check(v == golden_b7[i], buf);
+            check(v < 7, "bounded(7) result in range [0,7)");
+        }
+        // A prime modulus well away from a power of two: heavy rejection.
+        StableRng rng_bp(0);
+        const uint64_t golden_bp[2] = {4995, 431482};
+        for (int i = 0; i < 2; ++i) {
+            uint64_t v = rng_bp.bounded(1000003);
+            char buf[80];
+            std::snprintf(buf, sizeof(buf),
+                          "StableRng(0).bounded(1000003)[%d] golden %llu",
+                          i, (unsigned long long)golden_bp[i]);
+            check(v == golden_bp[i], buf);
+            check(v < 1000003, "bounded(1000003) result in range [0,1000003)");
+        }
+        // Power-of-two bound: no rejection. A fresh rng's first bounded(256)
+        // draw must equal a separate fresh rng's first next() % 256, proving
+        // bounded took exactly one draw (no rejection loop) and reduced mod n.
+        StableRng rng_b256(0);
+        uint64_t b = rng_b256.bounded(256);
+        StableRng rng_raw(0);
+        uint64_t raw = rng_raw.next();
+        check(b == raw % 256, "bounded(256) == next() % 256 (one draw, no rejection)");
+        check(b < 256, "bounded(256) result in range [0,256)");
+        // n == 0 is degenerate and returns 0.
+        StableRng rng0(0);
+        check(rng0.bounded(0) == 0, "bounded(0) returns 0");
+    }
+
+    // (28) Order independence: derive the same request set in forward and
+    // reverse order. Because the deriver holds no shared advancing state,
+    // every request's result must be identical regardless of derivation order.
+    // (This is the property that makes compile order irrelevant: a per-site
+    // StableRng seeded from an independent lane would likewise be unaffected
+    // by peer-site draw order.)
+    std::printf("(28) Order independence (forward vs reverse)\n");
+    {
+        FixedRootSeedDeriver deriver(u64_to_root(0));
+        const std::array<uint8_t, 32> roots[] = { u64_to_root(0) };
+        (void)roots;
+        SeedRequest reqs[] = {
+            mkreq("ember-1", "mod-a", "light", "mba_expand", 1, "compute", 3, 0, 0, "select"),
+            mkreq("ember-1", "mod-a", "light", "mba_expand", 1, "compute", 3, 5, 42, "variant"),
+            mkreq("ember-1", "mod-a", "light", "const_encode", 1, "compute", 3, 5, 42, "constant"),
+            mkreq("ember-1", "mod-a", "balanced", "opaque_pred", 2, "guard", 1, 2, 9, "truth"),
+            mkreq("", "", "", "", 0, "", 0, 0, 0, "select"),
+        };
+        constexpr size_t N = sizeof(reqs) / sizeof(reqs[0]);
+        std::array<std::array<uint8_t, 32>, N> fwd{}, rev{};
+        for (size_t i = 0; i < N; ++i) {
+            auto r = deriver.derive(reqs[i]);
+            check(bool(r), "forward derive ok");
+            if (r.value) fwd[i] = *r.value;
+        }
+        for (size_t i = 0; i < N; ++i) {
+            size_t j = N - 1 - i;
+            auto r = deriver.derive(reqs[j]);
+            check(bool(r), "reverse derive ok");
+            if (r.value) rev[j] = *r.value;
+        }
+        bool same = true;
+        for (size_t i = 0; i < N; ++i)
+            if (!eq32(fwd[i], rev[i])) same = false;
+        check(same, "forward and reverse derivation produce identical per-request results");
+    }
+
+    // (29) Parallel: one const deriver shared across worker threads, every
+    // result equal to serial derivation. Pins immutability / thread safety:
+    // derive() is const and mutates nothing, so concurrent reads of one
+    // shared object are safe and race-free.
+    std::printf("(29) Parallel: one const deriver shared across workers\n");
+    {
+        const FixedRootSeedDeriver deriver(u64_to_root(0));
+        SeedRequest reqs[] = {
+            mkreq("ember-1", "mod-a", "light", "mba_expand", 1, "compute", 3, 0, 0, "select"),
+            mkreq("ember-1", "mod-a", "light", "mba_expand", 1, "compute", 3, 5, 42, "variant"),
+            mkreq("ember-1", "mod-a", "light", "const_encode", 1, "compute", 3, 5, 42, "constant"),
+            mkreq("ember-1", "mod-a", "balanced", "opaque_pred", 2, "guard", 1, 2, 9, "truth"),
+            mkreq("", "", "", "", 0, "", 0, 0, 0, "select"),
+            mkreq("ember-1", "mod-a", "light", "deadcode", 1, "inject", 7, 11, 3, "junk-count"),
+            mkreq("ember-1", "mod-a", "light", "block_split", 1, "split", 2, 4, 6, "select"),
+            mkreq("ember-1", "mod-a", "light", "str_encrypt", 1, "enc", 9, 1, 0, "string-key"),
+        };
+        constexpr size_t N = sizeof(reqs) / sizeof(reqs[0]);
+
+        // Serial reference results.
+        std::array<std::array<uint8_t, 32>, N> serial{};
+        for (size_t i = 0; i < N; ++i) {
+            auto r = deriver.derive(reqs[i]);
+            check(bool(r), "parallel: serial reference derive ok");
+            if (r.value) serial[i] = *r.value;
+        }
+
+        // Worker results, shared deriver, all right with no synchronization
+        // beyond the per-slot flag writes.
+        std::array<std::array<uint8_t, 32>, N> para{};
+        std::atomic<unsigned> mismatches{0};
+        std::atomic<unsigned> done{0};
+        auto worker = [&](size_t base) {
+            for (size_t k = 0; k < N; ++k) {
+                size_t i = (base + k) % N;  // different start offset per worker
+                auto r = deriver.derive(reqs[i]);
+                if (!r.value) { ++mismatches; continue; }
+                para[i] = *r.value;
+                if (!eq32(*r.value, serial[i])) ++mismatches;
+            }
+            ++done;
+        };
+        const unsigned nworkers = 4;
+        std::vector<std::thread> threads;
+        threads.reserve(nworkers);
+        for (unsigned w = 0; w < nworkers; ++w)
+            threads.emplace_back(worker, w);
+        for (auto& t : threads) t.join();
+
+        check(done.load() == nworkers, "all worker threads completed");
+        check(mismatches.load() == 0,
+              "every parallel result equals serial derivation (no races)");
+        // Final per-slot equality against the serial reference.
+        bool allsame = true;
+        for (size_t i = 0; i < N; ++i)
+            if (!eq32(para[i], serial[i])) allsame = false;
+        check(allsame, "parallel per-slot results identical to serial");
+    }
+
+    // (30) Structured errors, no printing. A host-supplied SeedDeriver may
+    // fail; the failure must come back as an ExtensionError (registry ==
+    // "ember-seed-deriver"), never as a printed diagnostic or a thrown
+    // exception. The fixed-root deriver always succeeds. There is no
+    // mutable/global stream: the only state is the immutable root.
+    std::printf("(30) Structured errors (no printing, no global stream)\n");
+    {
+        // A deliberately-failing deriver used to pin the error contract.
+        struct FailingDeriver : SeedDeriver {
+            ExtensionResult<std::array<uint8_t, 32>>
+            derive(const SeedRequest&) const override {
+                return make_extension_result_error<std::array<uint8_t, 32>>(
+                    kSeedDeriverRegistryId, "",
+                    "external seed material unavailable");
+            }
+        };
+        FailingDeriver fd;
+        auto r = fd.derive(mkreq("", "", "", "", 0, "", 0, 0, 0, "select"));
+        check(!bool(r), "failing deriver returns a failure result");
+        check(!r.value.has_value(), "failure result carries no value");
+        check(r.error.has_value(), "failure result carries a structured error");
+        if (r.error) {
+            check(r.error->registry == std::string(kSeedDeriverRegistryId),
+                  "error.registry == \"ember-seed-deriver\"");
+            check(!r.error->message.empty(), "error carries a diagnostic message");
+        }
+        // The fixed-root deriver always succeeds (no failure path).
+        const FixedRootSeedDeriver ok_deriver(u64_to_root(0));
+        auto okr = ok_deriver.derive(mkreq("", "", "", "", 0, "", 0, 0, 0, "select"));
+        check(bool(okr) && okr.value.has_value() && !okr.error.has_value(),
+              "fixed-root deriver always succeeds (structured ok)");
     }
 
     std::printf("\n%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);

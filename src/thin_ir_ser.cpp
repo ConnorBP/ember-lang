@@ -4,6 +4,8 @@
 
 #include "thin_ir_ser.hpp"
 
+#include "thin_ir_mutation.hpp"   // compute_central_max_vreg (single source of truth)
+
 #include <cstdint>  // int64_t for overflow-safe span arithmetic
 #include <cstring>   // memcpy for f64 raw bytes
 #include <limits>
@@ -194,22 +196,14 @@ void ser_type(std::vector<uint8_t>& o, const Type* t) {
     put_type(o, t);
 }
 
-// Compute max_vreg by scanning the function (the highest VReg+1 referenced).
-// The serializer declares this up front so the deserializer can check every
-// VReg reference in O(1) without a pre-scan.
-uint32_t compute_max_vreg(const ThinFunction& thf) {
-    uint32_t max = 1;  // VRegs are 1-indexed; 0 = invalid/none
-    auto bump = [&](uint32_t v) { if (v >= max) max = v + 1; };
-    for (const auto& blk : thf.blocks) {
-        for (const auto& in : blk.instrs) {
-            bump(in.dst); bump(in.src1); bump(in.src2);
-            for (uint32_t a : in.args) bump(a);
-        }
-        bump(blk.term.cond);
-        bump(blk.term.ret);
-    }
-    return max;
-}
+// Compute max_vreg via the CENTRAL enumeration (compute_central_max_vreg in
+// thin_ir_mutation.cpp), which includes implicit dst+1 slice/lambda pair
+// results, call args, and terminator cond/ret. The serializer declares this
+// up front so the deserializer can check every VReg reference in O(1) without
+// a pre-scan. The central enumeration is the single source of truth shared
+// with ThinIRMutation (fresh-VReg allocation) — the serializer no longer
+// carries a private explicit-field-only scanner.
+// (Forward-declared via thin_ir_mutation.hpp; defined here as a thin alias.)
 
 } // namespace
 
@@ -223,7 +217,7 @@ bool serialize_thin_function(const ThinFunction& thf, std::vector<uint8_t>& out,
     put_u32(out, IR_BLOB_MAGIC);
     put_u16(out, IR_BLOB_VERSION);
     put_i32(out, thf.slot);
-    uint32_t max_vreg = compute_max_vreg(thf);
+    uint32_t max_vreg = compute_central_max_vreg(thf);
     if (max_vreg > IR_MAX_VREGS) {
         if (err) *err = "thin_ir_ser: limit: max_vreg exceeds IR_MAX_VREGS";
         return false;
@@ -742,7 +736,7 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err,
     // fall back to the recomputed value.
     uint32_t max_vreg = thf.declared_max_vreg != 0
                         ? thf.declared_max_vreg
-                        : compute_max_vreg(thf);
+                        : compute_central_max_vreg(thf);
 
     auto check_vreg = [&](uint32_t v, const char* field) -> bool {
         if (v != 0 && v >= max_vreg) {
@@ -782,6 +776,26 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err,
             if (!check_vreg(in.src2, "instr src2")) return false;
             for (uint32_t a : in.args)
                 if (!check_vreg(a, "instr args")) return false;
+            // Implicit dst+1 for slice/lambda pair results: the second word
+            // (len / env_ptr) occupies dst+1 even when no explicit instruction
+            // references it. The central enumeration (compute_central_max_vreg)
+            // counts this; the validator must check it too so a malformed
+            // declared_max_vreg that is too small for the implicit pair word
+            // is rejected (e.g. a slice with dst = N-1 has implicit dst+1 = N
+            // which is NOT < N). This consumes the same central enumeration /
+            // implicit-use logic the serializer uses for the ir_blob header.
+            if (in.dst != 0 && in.meta.type &&
+                (in.meta.type->is_slice || in.meta.type->is_lambda)) {
+                if (!check_vreg(in.dst + 1, "implicit slice/lambda dst+1"))
+                    return false;
+            }
+            // A call returning a slice also occupies dst+1 implicitly (the
+            // emitter stores the len word at frame_off+8 and records dst+1).
+            if (in.dst != 0 && in.ret_type &&
+                (in.ret_type->is_slice || in.ret_type->is_lambda)) {
+                if (!check_vreg(in.dst + 1, "implicit call slice/lambda dst+1"))
+                    return false;
+            }
             // C2 fix: CallNative must have a non-empty native_name (the rebind
             // gate relies on this; an empty name bypasses the rebind and
             // produces a null call target).

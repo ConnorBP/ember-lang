@@ -98,6 +98,16 @@ add_library(ember STATIC
     # per-function record carries) and back. Self-contained: touches Type only
     # via em_type_codec (emit_type/parse_type) + ThinFunction public members.
     src/thin_ir_ser.cpp
+    # Phase 2 (plan_POLYMORPHIC_CODE_ENGINE.md §6.1/§6.2): the shared
+    # IR-authoring foundation. thin_effects.{hpp,cpp} is the public exhaustive
+    # operation-effect model (replaces the private side-effect switch in
+    # ext_opt.cpp); thin_ir_mutation.{hpp,cpp} is the checked, transactional
+    # mutation helper (central VReg enumeration, frame allocation, CFG edits,
+    # regalloc invalidation). Both are self-contained: they touch Type only
+    # via public data members + the Prim enum, so they stay in the core lib
+    # with no ember_frontend dependency (one-way link direction).
+    src/thin_effects.cpp
+    src/thin_ir_mutation.cpp
     src/gc.cpp              # GC: tracing mark-sweep core (foundational infra for lambdas/coroutines)
     src/safety.cpp          # process-wide failsafes: RSS memory cap, recursion depth guard, deadline
 )
@@ -132,6 +142,14 @@ add_library(ember_frontend STATIC
     # ThinFunction (core) but the pass system is a frontend concern (passes run
     # at compile time over the IR produced by lower_function).
     src/ember_pass.cpp
+    # Phase 2 (plan_POLYMORPHIC_CODE_ENGINE.md §5, §9.3 Red 3): the shared,
+    # versioned, stable seed-derivation service. SeedRequest + the immutable /
+    # thread-safe SeedDeriver interface, the fixed-root implementation, the
+    # u64→256-bit root adapter, and the pinned SplitMix64 StableRng helper.
+    # Lives in ember_frontend alongside ember_pass.cpp (a compile-time pass
+    # concern) and depends only on extension_registry.hpp (header-only) + the
+    # C++ standard library.
+    src/seed_derivation.cpp
 )
 target_include_directories(ember_frontend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ember_frontend PUBLIC ember)

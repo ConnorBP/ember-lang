@@ -4,6 +4,8 @@
 
 #include "ext_obf.hpp"
 
+#include "../src/thin_ir_mutation.hpp"   // ThinIRMutation (shared mutation helper)
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -169,17 +171,20 @@ void canonicalize_block_ids(ThinFunction& f) {
 // Skips side-effecting ops, calls, guards, etc.
 
 EmberPreserved SubstitutionPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    // Migrated to ThinIRMutation (plan_POLYMORPHIC_CODE_ENGINE.md §7.2): the
+    // hand-rolled fresh-VReg / frame-growth path is replaced by the shared
+    // transactional helper, which updates declared_max_vreg and clears stale
+    // regalloc on commit. The MBA identity and pipeline name ("subst") are
+    // preserved exactly.
+    //
+    // Per §6.1 + the Red 4 feedback fix: each site is atomically prefighted
+    // via reserve_site BEFORE any resource is consumed. This prevents an
+    // orphan partial-site allocation where a later limit failure (e.g. the
+    // 2nd of 3 VRegs) commits earlier VRegs/frame slots while the site is
+    // only partially built. If reserve_site passes, the 3 subsequent
+    // allocate_scalar calls are guaranteed to succeed.
+    ThinIRMutation mut(f, PassGrowthLimits{});
     bool changed = false;
-    uint32_t next_vreg = compute_max_vreg(f);
-
-    // Allocate frame slots for new VRegs. The frame grows down from
-    // next_local_off; each new VReg needs an 8-byte slot.
-    int32_t next_off = f.frame.next_local_off;
-    auto alloc_frame_slot = [&]() -> int32_t {
-        next_off += 8;
-        int32_t off = -next_off;
-        return off;
-    };
 
     for (auto& blk : f.blocks) {
         auto& instrs = blk.instrs;
@@ -191,19 +196,30 @@ EmberPreserved SubstitutionPass::run(ThinFunction& f, EmberAnalysisManager&) {
             if (in.src1 == 0 || in.src2 == 0) continue;  // need two real VRegs
             if (in.meta.width == 0) continue;  // skip if width unspecified
 
-            // MBA: a + b = (a ^ b) + 2*(a & b)
-            uint32_t v_xor = next_vreg++;
-            uint32_t v_and = next_vreg++;
-            uint32_t v_shl = next_vreg++;
+            // Atomic per-site preflight: 3 VRegs + 24 frame bytes (3×8) + 3
+            // instructions. If any limit would be exceeded, stop before this
+            // site (§6.1 soft-ceiling semantics) and commit what we have.
+            auto rs = mut.reserve_site(3, 24, 3, 0);
+            if (!rs.ok()) goto subst_done;
 
-            // Allocate frame slots for the new intermediate VRegs.
-            int32_t off_xor = alloc_frame_slot();
-            int32_t off_and = alloc_frame_slot();
-            int32_t off_shl = alloc_frame_slot();
+            // MBA: a + b = (a ^ b) + 2*(a & b). Allocate three fresh scalars
+            // via the shared helper (guaranteed to succeed after preflight).
+            auto r_xor = mut.allocate_scalar(in.meta.type, in.meta.width);
+            if (!r_xor.ok()) goto subst_done;
+            auto r_and = mut.allocate_scalar(in.meta.type, in.meta.width);
+            if (!r_and.ok()) goto subst_done;
+            auto r_shl = mut.allocate_scalar(in.meta.type, in.meta.width);
+            if (!r_shl.ok()) goto subst_done;
 
-            VReg src_a = in.src1;
-            VReg src_b = in.src2;
-            int32_t width = in.meta.width;
+            const VReg v_xor = r_xor.get().vreg;
+            const VReg v_and = r_and.get().vreg;
+            const VReg v_shl = r_shl.get().vreg;
+            const int32_t off_xor = r_xor.get().frame_off;
+            const int32_t off_and = r_and.get().frame_off;
+            const int32_t off_shl = r_shl.get().frame_off;
+            const VReg src_a = in.src1;
+            const VReg src_b = in.src2;
+            const int32_t width = in.meta.width;
             const Type* ty = in.meta.type;
 
             // 1. v_xor = a ^ b
@@ -255,21 +271,24 @@ EmberPreserved SubstitutionPass::run(ThinFunction& f, EmberAnalysisManager&) {
             it = instrs.insert(it, std::move(i_shl));
             ++it;
 
+            // Record the 3 added instructions for growth-ratio accounting.
+            mut.record_added_instructions(3);
+
             changed = true;
         }
     }
-
-    // Update the frame plan: the new VRegs' slots extend the frame.
-    if (changed) {
-        f.frame.next_local_off = next_off;
-        // Update frame_size to fit the new slots (round up to 16).
-        int32_t needed = next_off + 8;  // +8 for the rbx save slot
-        if (needed > f.frame.frame_size) {
-            f.frame.frame_size = (needed + 15) & ~15;
-        }
+subst_done:
+    if (!changed) {
+        // No site was rewritten: abandon the mutation (restores the snapshot,
+        // though nothing was staged) and report all-preserved.
+        return EmberPreserved::all();
     }
-
-    return changed ? EmberPreserved::none() : EmberPreserved::all();
+    auto rc = mut.commit();
+    // commit() only fails if the aligned frame_size would exceed the hard
+    // ceiling; on that failure the snapshot is restored and the function is
+    // unchanged, so report all-preserved.
+    if (!rc.ok()) return EmberPreserved::all();
+    return EmberPreserved::none();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

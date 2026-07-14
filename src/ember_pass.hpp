@@ -133,6 +133,25 @@ public:
         passes_.push_back(std::move(p));
     }
 
+    // Atomically append a fully-resolved sequence of passes. Used by the
+    // transactional pipeline parser: every name/factory is resolved into
+    // temporary ownership first, and only on complete success is the whole
+    // sequence moved into the manager. The caller's PassInstrumentation is
+    // never touched (neither moved, cleared, nor replaced).
+    void append_passes(std::vector<std::unique_ptr<PassConcept>> ps) {
+        passes_.reserve(passes_.size() + ps.size());
+        for (auto& p : ps) passes_.push_back(std::move(p));
+    }
+
+    // Atomically replace the pass sequence with a fully-resolved one. Used by
+    // the transactional replace-pipeline parser: on complete success the old
+    // passes are swapped out for the new sequence. The caller's
+    // PassInstrumentation is never touched (neither moved, cleared, nor
+    // replaced) — only the pass vector is exchanged.
+    void replace_passes(std::vector<std::unique_ptr<PassConcept>> ps) {
+        passes_ = std::move(ps);
+    }
+
     // Run all passes once, in order. Returns the intersection of all preserved
     // sets. Consults instrumentation before/after each pass; a before_pass
     // callback returning false skips the pass (unless is_required).

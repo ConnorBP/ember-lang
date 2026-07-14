@@ -4,6 +4,8 @@
 
 #include "ext_opt.hpp"
 
+#include "../src/thin_effects.hpp"   // shared effect classification
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -17,31 +19,35 @@ namespace ember::ext_opt {
 namespace {
 
 // ─── Side-effect classification ───
+// The authoritative model lives in src/thin_effects.{hpp,cpp}
+// (classify_thin_effects / removable_if_result_dead). These helpers are the
+// op-level face the DCE/CSE passes consult: they classify a canonical minimal
+// instruction for `op` (no frame_off spill, no args) so the result reflects the
+// op's intrinsic side effects, NOT any per-instruction spill. The passes'
+// own context-sensitive logic (compute_read_slots, compute_used_vregs, the
+// frame-home read-slot protections) stays on top of this op-level gate, so
+// optimization-count and value-preservation behavior is unchanged.
+//
 // A pure instr's dst VReg may be removed by DCE if unused, and the instr may
 // be CSE'd. A side-effecting instr must never be removed by DCE or coalesced
 // by CSE, even if its dst is unused.
 
+bool op_has_side_effect(ThinOp op) {
+    ThinInstr probe;
+    probe.op = op;
+    // dst=1 (a valid vreg) so producers are classified as producers; no
+    // frame_off so no implicit spill write is attributed (the op-level gate
+    // must NOT depend on per-instruction spill slots — those are handled by
+    // the passes' read-slot logic).
+    probe.dst = 1;
+    probe.meta.width = 8;
+    ThinEffectDescriptor d = classify_thin_effects(probe);
+    return d.flags.any() || d.aliases_unknown_memory ||
+           !d.reads.empty() || !d.writes.empty();
+}
+
 bool is_side_effecting(ThinOp op) {
-    switch (op) {
-    case ThinOp::CallNative:
-    case ThinOp::CallScript:
-    case ThinOp::CallIndirect:
-    case ThinOp::CallCrossModule:
-    case ThinOp::StoreGlobal:
-    case ThinOp::StoreAddr:
-    case ThinOp::CopyBytes:
-    case ThinOp::StructLitInit:
-    case ThinOp::ArrayLitInit:
-    case ThinOp::StringDecrypt:
-    case ThinOp::BoundsCheck:
-    case ThinOp::DivOverflowCheck:
-    case ThinOp::DepthCheck:
-    case ThinOp::BudgetCheck:
-    case ThinOp::CallTargetGuard:
-        return true;
-    default:
-        return false;
-    }
+    return op_has_side_effect(op);
 }
 
 bool is_pure(ThinOp op) {
