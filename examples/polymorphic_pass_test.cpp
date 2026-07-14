@@ -589,7 +589,7 @@ extern "C" void red9_trap(context_t* ctx, int reason, const char* detail) {
     if (ctx) {
         ctx->last_trap = static_cast<TrapReason>(reason);
         ctx->last_error = detail ? detail : "<no detail>";
-        if (ctx->has_checkpoint) __builtin_longjmp(ctx->checkpoint, 1);
+        if (ctx->has_checkpoint) longjmp(ctx->checkpoint, 1);
     }
     std::fprintf(stderr, "red9: unhandled trap: %s\n", detail ? detail : "?");
     std::abort();
@@ -682,7 +682,7 @@ static int red9_isolated_exec(const std::string& tag) {
         red9_ctx.budget_remaining = INT64_MAX; red9_ctx.call_depth = 0;
         red9_ctx.last_trap = TrapReason::None; red9_ctx.catch_depth = 0;
         red9_ctx.has_checkpoint = true;
-        if (__builtin_setjmp(red9_ctx.checkpoint)) {
+        if (setjmp(red9_ctx.checkpoint)) {
             // trapped (e.g. budget or an illegal longjmp state) -> report it
             std::printf("TRAPPED %d\n", int(red9_ctx.last_trap));
             red9_ctx.has_checkpoint = false;
@@ -2246,7 +2246,7 @@ int main(int argc, char** argv) {
                     red9_ctx.last_trap = TrapReason::None; red9_ctx.last_error.clear();
                     red9_ctx.has_checkpoint = true;
                     bool trapped = false;
-                    if (__builtin_setjmp(red9_ctx.checkpoint)) {
+                    if (setjmp(red9_ctx.checkpoint)) {
                         trapped = true;
                     } else {
                         ember_call_void(cr.compiled.entry, &red9_ctx);

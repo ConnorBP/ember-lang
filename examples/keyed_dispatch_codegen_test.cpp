@@ -482,7 +482,7 @@ extern "C" void kt6_trap(ember::context_t* ctx, int reason, const char* detail) 
     if (ctx) {
         ctx->last_trap = static_cast<ember::TrapReason>(reason);
         ctx->last_error = detail ? detail : "";
-        if (ctx->has_checkpoint) __builtin_longjmp(ctx->checkpoint, 1);
+        if (ctx->has_checkpoint) longjmp(ctx->checkpoint, 1);
     }
     std::abort();
 }
@@ -585,7 +585,7 @@ static RunResult run_keyed(KeyedModule& km, const std::string& entry_name,
     context_t ctx; ctx.budget_remaining = 1'000'000'000LL; ctx.max_call_depth = 64;
     if (use_checkpoint && km.compiled) {
         ctx.has_checkpoint = true;
-        if (__builtin_setjmp(ctx.checkpoint)) {
+        if (setjmp(ctx.checkpoint)) {
             r.trapped = true;
             r.reason = ctx.last_error.empty()
                 ? std::string(trap_reason_str(ctx.last_trap))
@@ -631,7 +631,7 @@ static RunResult run_keyed(KeyedModule& km, const std::string& entry_name,
     context_t ctx; ctx.budget_remaining = 1'000'000'000LL; ctx.max_call_depth = 64;
     if (use_checkpoint) {
         ctx.has_checkpoint = true;
-        if (__builtin_setjmp(ctx.checkpoint)) {
+        if (setjmp(ctx.checkpoint)) {
             r.trapped = true;
             r.reason = ctx.last_error.empty()
                 ? std::string(trap_reason_str(ctx.last_trap))
@@ -662,7 +662,7 @@ static RunResult run_keyed(KeyedModule& km, const std::string& entry_name,
     context_t ctx; ctx.budget_remaining = 1'000'000'000LL; ctx.max_call_depth = 64;
     if (use_checkpoint) {
         ctx.has_checkpoint = true;
-        if (__builtin_setjmp(ctx.checkpoint)) {
+        if (setjmp(ctx.checkpoint)) {
             r.trapped = true;
             r.reason = ctx.last_error.empty()
                 ? std::string(trap_reason_str(ctx.last_trap))
@@ -722,7 +722,7 @@ static WrongKeyResult run_keyed_wrong_r15_ii(KeyedModule& km, const std::string&
     context_t& ctx = *ctxp;
     ctx.budget_remaining = 1'000'000'000LL; ctx.max_call_depth = 64;
     ctx.has_checkpoint = true;
-    if (__builtin_setjmp(ctx.checkpoint)) {
+    if (setjmp(ctx.checkpoint)) {
         r.ok = true; r.last_trap = ctx.last_trap; r.call_depth = ctx.call_depth;
         r.reason = std::string(trap_reason_str(ctx.last_trap)) + ": " + ctx.last_error;
         ctx.has_checkpoint = false; ctx.reset_for_call();
@@ -752,7 +752,7 @@ static WrongKeyResult run_keyed_wrong_r15_i(KeyedModule& km, const std::string& 
     context_t& ctx = *ctxp;
     ctx.budget_remaining = 1'000'000'000LL; ctx.max_call_depth = 64;
     ctx.has_checkpoint = true;
-    if (__builtin_setjmp(ctx.checkpoint)) {
+    if (setjmp(ctx.checkpoint)) {
         r.ok = true; r.last_trap = ctx.last_trap; r.call_depth = ctx.call_depth;
         r.reason = std::string(trap_reason_str(ctx.last_trap)) + ": " + ctx.last_error;
         ctx.has_checkpoint = false; ctx.reset_for_call();

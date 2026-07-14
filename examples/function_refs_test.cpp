@@ -57,7 +57,7 @@ extern "C" void fr_trap(ember::context_t* ctx, int reason, const char* detail) {
     if (ctx) {
         ctx->last_trap = static_cast<ember::TrapReason>(reason);
         ctx->last_error = detail ? detail : "";
-        if (ctx->has_checkpoint) __builtin_longjmp(ctx->checkpoint, 1);
+        if (ctx->has_checkpoint) longjmp(ctx->checkpoint, 1);
     }
     std::abort();
 }
@@ -145,7 +145,7 @@ static bool compile_fr(const std::string& src, FRModule& m) {
 static int64_t run_main(FRModule& m, bool* trapped) {
     *trapped = false;
     m.ctx.call_depth = 0; m.ctx.has_checkpoint=true;
-    if (__builtin_setjmp(m.ctx.checkpoint)) { *trapped=true; m.ctx.has_checkpoint=false;
+    if (setjmp(m.ctx.checkpoint)) { *trapped=true; m.ctx.has_checkpoint=false;
         return int64_t(m.ctx.last_trap); }
     using F0=int64_t(*)();
     int64_t r = reinterpret_cast<F0>(m.main_entry)();
@@ -305,7 +305,7 @@ int main() {
             // NOTE: the trap_ctx baked at compile was &ectx; the run must use the
             // SAME context address or the longjmp lands wrong. Reuse ectx.
             ectx.has_checkpoint=true;
-            if (__builtin_setjmp(ectx.checkpoint)) { trapped=true; ectx.has_checkpoint=false; }
+            if (setjmp(ectx.checkpoint)) { trapped=true; ectx.has_checkpoint=false; }
             else { using F0=int64_t(*)(); reinterpret_cast<F0>(entry)(); ectx.has_checkpoint=false; }
             check(trapped, "C1: out-of-range forged handle (99999) traps via the guard, not a raw call");
             check(ectx.last_trap == TrapReason::BadCallTarget,
@@ -362,7 +362,7 @@ int main() {
             for(auto&fn:pr.program.funcs){auto cf=compile_func(fn,ctx); finalize(cf); m.table.set(fn.slot,cf.entry); m.fns.push_back(std::move(cf));}
             auto sit=m.slots.find("main"); void* entry = m.table.get(sit->second);
             ectx.has_checkpoint=true; bool trapped=false;
-            if (__builtin_setjmp(ectx.checkpoint)) { trapped=true; ectx.has_checkpoint=false; }
+            if (setjmp(ectx.checkpoint)) { trapped=true; ectx.has_checkpoint=false; }
             else { using F0=int64_t(*)(); reinterpret_cast<F0>(entry)(); ectx.has_checkpoint=false; }
             check(trapped, "C2: in-range-but-unregistered handle (slot 2, bit clear) traps (bt fires)");
             check(ectx.last_trap == TrapReason::BadCallTarget, "C2: trap reason BadCallTarget");

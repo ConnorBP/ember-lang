@@ -582,7 +582,7 @@ extern "C" void kdm_trap(ember::context_t* ctx, int reason, const char* detail) 
     if (ctx) {
         ctx->last_trap = static_cast<ember::TrapReason>(reason);
         ctx->last_error = detail ? detail : "";
-        if (ctx->has_checkpoint) __builtin_longjmp(ctx->checkpoint, 1);
+        if (ctx->has_checkpoint) longjmp(ctx->checkpoint, 1);
     }
     std::abort();
 }
@@ -604,7 +604,7 @@ static RunResult run_keyed_main(CompiledModule& m, uint64_t route_word,
     m.ctx.budget_remaining = 2'000'000'000LL;
     if (use_checkpoint) {
         m.ctx.has_checkpoint = true;
-        if (__builtin_setjmp(m.ctx.checkpoint)) {
+        if (setjmp(m.ctx.checkpoint)) {
             r.trapped = true; r.ok = true;
             r.last_trap = m.ctx.last_trap;
             r.reason = std::string(trap_reason_str(m.ctx.last_trap)) + ": " + m.ctx.last_error;
@@ -624,7 +624,7 @@ static RunResult run_identity_main(CompiledModule& m) {
     m.ctx.call_depth = 0;
     m.ctx.budget_remaining = 2'000'000'000LL;
     m.ctx.has_checkpoint = true;
-    if (__builtin_setjmp(m.ctx.checkpoint)) {
+    if (setjmp(m.ctx.checkpoint)) {
         r.trapped = true; r.ok = true;
         r.last_trap = m.ctx.last_trap;
         r.reason = std::string(trap_reason_str(m.ctx.last_trap)) + ": " + m.ctx.last_error;
@@ -1126,7 +1126,7 @@ int main() {
                 if (!entry) { r.reason = "outer resolver null"; return r; }
                 caller->ctx.call_depth = 0; caller->ctx.budget_remaining = 2'000'000'000LL;
                 caller->ctx.has_checkpoint = true;
-                if (__builtin_setjmp(caller->ctx.checkpoint)) {
+                if (setjmp(caller->ctx.checkpoint)) {
                     r.trapped = true; r.ok = true; r.last_trap = caller->ctx.last_trap;
                     r.reason = std::string(trap_reason_str(caller->ctx.last_trap)) + ": " + caller->ctx.last_error;
                     caller->ctx.has_checkpoint = false; caller->ctx.reset_for_call();
@@ -1497,7 +1497,7 @@ int main() {
                 if (!entry) { r.reason = "outer resolver null"; return r; }
                 caller->ctx.call_depth = 0; caller->ctx.budget_remaining = 2'000'000'000LL;
                 caller->ctx.has_checkpoint = true;
-                if (__builtin_setjmp(caller->ctx.checkpoint)) {
+                if (setjmp(caller->ctx.checkpoint)) {
                     r.trapped = true; r.ok = true; r.last_trap = caller->ctx.last_trap;
                     caller->ctx.has_checkpoint = false; caller->ctx.reset_for_call();
                     return r;

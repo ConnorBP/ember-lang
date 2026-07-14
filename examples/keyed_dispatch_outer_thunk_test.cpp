@@ -251,7 +251,7 @@ extern "C" void kt_trap(ember::context_t* ctx, int reason, const char* detail) {
     if (ctx) {
         ctx->last_trap = static_cast<ember::TrapReason>(reason);
         ctx->last_error = detail ? detail : "";
-        if (ctx->has_checkpoint) __builtin_longjmp(ctx->checkpoint, 1);
+        if (ctx->has_checkpoint) longjmp(ctx->checkpoint, 1);
     }
     std::abort();
 }
@@ -346,7 +346,7 @@ int main() {
             inst.trap_stub = reinterpret_cast<void*>(kt_trap);
             context_t ctx; ctx.budget_remaining = 1000; ctx.max_call_depth = 64;
             ctx.has_checkpoint = true;
-            if (__builtin_setjmp(ctx.checkpoint)) {
+            if (setjmp(ctx.checkpoint)) {
                 ck(ctx.last_trap == TrapReason::BudgetExceeded,
                    "r14 correctness: budget trap recorded on the SUPPLIED context (r14 = ctx)");
                 ck(ctx.last_error.size() > 0, "r14 correctness: trap carried a detail string");
@@ -458,7 +458,7 @@ int main() {
             uint64_t caller_r15 = 0xDEADBEEF11111111ULL;
             ember_set_r15(caller_r15);
             ctx.has_checkpoint = true;
-            if (__builtin_setjmp(ctx.checkpoint)) {
+            if (setjmp(ctx.checkpoint)) {
                 uint64_t after = ember_read_r15();
                 ck(after == caller_r15,
                    "trapped exit: transient r15 cleared + caller r15 restored (callee-saved preserved across longjmp)");

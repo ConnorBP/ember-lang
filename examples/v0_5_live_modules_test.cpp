@@ -53,7 +53,7 @@ static void check(bool cond, const char* msg) {
 
 extern "C" void test_trap_stub(context_t* ctx, int reason, const char* detail) {
     if (ctx) { ctx->last_trap=static_cast<TrapReason>(reason); ctx->last_error=detail?detail:"";
-               if (ctx->has_checkpoint) __builtin_longjmp(ctx->checkpoint, 1); }
+               if (ctx->has_checkpoint) longjmp(ctx->checkpoint, 1); }
     std::abort();
 }
 
@@ -110,7 +110,7 @@ static RunResult run_script(const std::string& src, ModuleRegistry& registry,
     auto sit=slots.find("main"); if(sit==slots.end()){rr.trapped=true;return rr;}
     void* entry=table.get(sit->second);
     ectx.has_checkpoint=true;
-    if (__builtin_setjmp(ectx.checkpoint)) { rr.trapped=true; rr.reason=ectx.last_trap; return rr; }
+    if (setjmp(ectx.checkpoint)) { rr.trapped=true; rr.reason=ectx.last_trap; return rr; }
     using F0=int64_t(*)(); rr.value=reinterpret_cast<F0>(entry)();
     ectx.has_checkpoint=false;
     for(auto&fn:fns) if(fn.exec) free_executable(fn.exec);

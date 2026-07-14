@@ -40,7 +40,7 @@ extern "C" void lc_trap(ember::context_t* ctx, int reason, const char* detail) {
     if (ctx) {
         ctx->last_trap = static_cast<ember::TrapReason>(reason);
         ctx->last_error = detail ? detail : "";
-        if (ctx->has_checkpoint) __builtin_longjmp(ctx->checkpoint, 1);
+        if (ctx->has_checkpoint) longjmp(ctx->checkpoint, 1);
     }
     std::abort();
 }
@@ -93,7 +93,7 @@ int main() {
 
     auto sit=slots.find("main"); void* entry=table.get(sit->second);
     ectx.has_checkpoint=true;
-    if (__builtin_setjmp(ectx.checkpoint)) {
+    if (setjmp(ectx.checkpoint)) {
         std::printf("FAIL: main trapped: %s\n", ectx.last_error.c_str()); return 1;
     }
     using F0=int64_t(*)(); int64_t routine_id = reinterpret_cast<F0>(entry)();

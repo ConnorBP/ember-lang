@@ -488,7 +488,7 @@ int64_t keyed_call_core(ModuleInstance& inst, void* entry, context_t& ctx,
     // fault — the wrapper does NOT install a checkpoint in that case.
     if (inst.trap_stub) {
         ctx.has_checkpoint = true;
-        if (__builtin_setjmp(ctx.checkpoint)) {
+        if (setjmp(ctx.checkpoint)) {
             // Trapped exit: the trap stub longjmp'd back here. The transient
             // r15 was in the abandoned thunk frame; this wrapper's callee-saved
             // r14/r15 are the caller's values (restored by the C++ epilogue at

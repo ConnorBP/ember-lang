@@ -89,7 +89,7 @@ extern "C" void test_trap(ember::context_t* ctx, int reason, const char* detail)
     if (ctx) {
         ctx->last_trap = static_cast<ember::TrapReason>(reason);
         ctx->last_error = detail ? detail : "";
-        if (ctx->has_checkpoint) __builtin_longjmp(ctx->checkpoint, 1);
+        if (ctx->has_checkpoint) longjmp(ctx->checkpoint, 1);
     }
     std::abort();
 }
@@ -119,7 +119,7 @@ static ember::TrapReason run_under_safetrap(const std::string& src, int64_t budg
     auto sit=slots.find("main"); if(sit==slots.end()) return ember::TrapReason::None;
     void* entry=table.get(sit->second); if(!entry) return ember::TrapReason::None;
     ectx.has_checkpoint=true;
-    if (__builtin_setjmp(ectx.checkpoint)) { return ectx.last_trap; }  // trap fired
+    if (setjmp(ectx.checkpoint)) { return ectx.last_trap; }  // trap fired
     using F0=int64_t(*)(); reinterpret_cast<F0>(entry)();
     ectx.has_checkpoint=false;
     for(auto&fn:fns) if(fn.exec) free_executable(fn.exec);
@@ -156,7 +156,7 @@ static bool counter_wrap_guards_test() {
     // `sub` and execute. The pre-check must trap without arithmetic overflow.
     ectx.budget_remaining=INT64_MIN; ectx.max_call_depth=64; ectx.has_checkpoint=true;
     bool budget_trap=false;
-    if (__builtin_setjmp(ectx.checkpoint)) budget_trap=ectx.last_trap==TrapReason::BudgetExceeded;
+    if (setjmp(ectx.checkpoint)) budget_trap=ectx.last_trap==TrapReason::BudgetExceeded;
     else (void)ember_call_void(main_entry,&ectx);
     ectx.has_checkpoint=false;
 
@@ -164,7 +164,7 @@ static bool counter_wrap_guards_test() {
     // signed comparison must not falsely reject values above INT64_MAX-cost.
     ectx.reset_for_call(); ectx.budget_remaining=INT64_MAX; ectx.max_call_depth=64;
     ectx.has_checkpoint=true; bool huge_budget_ok=false;
-    if (__builtin_setjmp(ectx.checkpoint)) huge_budget_ok=false;
+    if (setjmp(ectx.checkpoint)) huge_budget_ok=false;
     else huge_budget_ok=(ember_call_void(main_entry,&ectx)==7);
     ectx.has_checkpoint=false;
 
@@ -172,7 +172,7 @@ static bool counter_wrap_guards_test() {
     ectx.reset_for_call(); ectx.budget_remaining=1'000'000; ectx.call_depth=INT32_MAX;
     ectx.max_call_depth=64; ectx.has_checkpoint=true;
     bool depth_trap=false;
-    if (__builtin_setjmp(ectx.checkpoint)) depth_trap=ectx.last_trap==TrapReason::StackOverflow;
+    if (setjmp(ectx.checkpoint)) depth_trap=ectx.last_trap==TrapReason::StackOverflow;
     else (void)ember_call_void(main_entry,&ectx);
     ectx.has_checkpoint=false;
 
@@ -211,7 +211,7 @@ static bool native_reentry_depth_test() {
     g_reenter_entry=table.get(slots["bounce"]); void* main_entry=table.get(slots["main"]);
     g_reenter_enabled=true; ectx.has_checkpoint=true;
     bool trapped=false;
-    if (__builtin_setjmp(ectx.checkpoint)) {
+    if (setjmp(ectx.checkpoint)) {
         trapped=ectx.last_trap==ember::TrapReason::StackOverflow;
     } else {
         (void)ember_call_void(main_entry, &ectx);
@@ -222,7 +222,7 @@ static bool native_reentry_depth_test() {
     const bool reset = ectx.call_depth == 0 && ectx.last_trap == ember::TrapReason::None;
     g_reenter_enabled=false; ectx.budget_remaining=1'000'000; ectx.has_checkpoint=true;
     int64_t recovered=-1;
-    if (__builtin_setjmp(ectx.checkpoint) == 0) {
+    if (setjmp(ectx.checkpoint) == 0) {
         recovered=ember_call_void(main_entry, &ectx);
     }
     ectx.has_checkpoint=false; g_reenter_entry=nullptr;
@@ -292,7 +292,7 @@ static bool budget_300_native_calls_trap() {
     for(auto&fn:pr.program.funcs){auto cf=compile_func(fn,ctx);finalize(cf);table.set(fn.slot,cf.entry);fns.push_back(std::move(cf));}
     ectx.has_checkpoint=true;
     bool trapped=false;
-    if (__builtin_setjmp(ectx.checkpoint)) trapped = (ectx.last_trap==ember::TrapReason::BudgetExceeded);
+    if (setjmp(ectx.checkpoint)) trapped = (ectx.last_trap==ember::TrapReason::BudgetExceeded);
     else reinterpret_cast<int64_t(*)()>(table.get(0))();
     ectx.has_checkpoint=false;
     for(auto&fn:fns)if(fn.exec)free_executable(fn.exec);
@@ -336,7 +336,7 @@ static bool budget_aggregate_copies_trap() {
     void* entry=table.get(main_it->second); if(!entry) return false;
     ectx.has_checkpoint=true;
     bool trapped=false;
-    if (__builtin_setjmp(ectx.checkpoint)) trapped = (ectx.last_trap==ember::TrapReason::BudgetExceeded);
+    if (setjmp(ectx.checkpoint)) trapped = (ectx.last_trap==ember::TrapReason::BudgetExceeded);
     else reinterpret_cast<int64_t(*)()>(entry)();
     ectx.has_checkpoint=false;
     for(auto&fn:fns)if(fn.exec)free_executable(fn.exec);
@@ -383,7 +383,7 @@ static bool b1_per_context_max_call_depth() {
     ember::context_t ectxA; ectxA.budget_remaining=1'000'000; ectxA.max_call_depth=1;
     ctx.trap_ctx=&ectxA; ectxA.has_checkpoint=true;
     bool a_trapped=false;
-    if (__builtin_setjmp(ectxA.checkpoint)) a_trapped=(ectxA.last_trap==ember::TrapReason::StackOverflow);
+    if (setjmp(ectxA.checkpoint)) a_trapped=(ectxA.last_trap==ember::TrapReason::StackOverflow);
     else ember_call_void(entry, &ectxA);
     ectxA.has_checkpoint=false;
 
@@ -392,7 +392,7 @@ static bool b1_per_context_max_call_depth() {
     ember::context_t ectxB; ectxB.budget_remaining=1'000'000; ectxB.max_call_depth=100;
     ctx.trap_ctx=&ectxB; ectxB.has_checkpoint=true;
     bool b_trapped=false; int64_t b_val=-999;
-    if (__builtin_setjmp(ectxB.checkpoint)) b_trapped=true;
+    if (setjmp(ectxB.checkpoint)) b_trapped=true;
     else b_val=ember_call_void(entry, &ectxB);
     ectxB.has_checkpoint=false;
 

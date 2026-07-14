@@ -67,7 +67,7 @@ extern "C" void ts_trap(ember::context_t* ctx, int reason, const char* detail) {
     if (ctx) {
         ctx->last_trap = static_cast<ember::TrapReason>(reason);
         ctx->last_error = detail ? detail : "";
-        if (ctx->has_checkpoint) __builtin_longjmp(ctx->checkpoint, 1);
+        if (ctx->has_checkpoint) longjmp(ctx->checkpoint, 1);
     }
     std::abort();
 }
@@ -140,7 +140,7 @@ static bool compile_b1(const std::string& src, B1Module& m) {
 static int64_t run_with_ctx(void* entry, context_t* ectx, bool* trapped) {
     *trapped = false;
     ectx->has_checkpoint = true;
-    if (__builtin_setjmp(ectx->checkpoint)) { *trapped = true; ectx->has_checkpoint=false; return 0; }
+    if (setjmp(ectx->checkpoint)) { *trapped = true; ectx->has_checkpoint=false; return 0; }
     int64_t r = ember_call_void(entry, ectx);
     ectx->has_checkpoint = false;
     return r;

@@ -75,7 +75,7 @@ extern "C" void ict_trap(ember::context_t* ctx, int reason, const char* detail) 
     if (ctx) {
         ctx->last_trap = static_cast<ember::TrapReason>(reason);
         ctx->last_error = detail ? detail : "";
-        if (ctx->has_checkpoint) __builtin_longjmp(ctx->checkpoint, 1);
+        if (ctx->has_checkpoint) longjmp(ctx->checkpoint, 1);
     }
     std::abort();
 }
@@ -161,7 +161,7 @@ static int64_t run_main_locked(ThreadModule& m, bool* trapped) {
     m.ctx.budget_remaining = 2'000'000'000LL;
     m.ctx.has_checkpoint = true;
     m.ctx.call_mutex.lock();                 // in-context: serialize with spawned workers
-    if (__builtin_setjmp(m.ctx.checkpoint)) {
+    if (setjmp(m.ctx.checkpoint)) {
         // Trap during the MAIN thread's ember_call. The trap stub longjmp'd
         // here (the main thread held the mutex when it trapped, so the
         // checkpoint is ours). Release the mutex before unwinding.

@@ -56,7 +56,7 @@ extern "C" void tc_trap(ember::context_t* ctx, int reason, const char* detail) {
     if (ctx) {
         ctx->last_trap = static_cast<ember::TrapReason>(reason);
         ctx->last_error = detail ? detail : "";
-        if (ctx->has_checkpoint) __builtin_longjmp(ctx->checkpoint, 1);
+        if (ctx->has_checkpoint) longjmp(ctx->checkpoint, 1);
     }
     std::abort();
 }
@@ -126,7 +126,7 @@ static int64_t run_main(TCModule& m, bool* trapped) {
     m.ctx.catch_depth = 0;
     m.ctx.thrown_value = 0;
     m.ctx.has_checkpoint=true;
-    if (__builtin_setjmp(m.ctx.checkpoint)) { *trapped=true; m.ctx.has_checkpoint=false;
+    if (setjmp(m.ctx.checkpoint)) { *trapped=true; m.ctx.has_checkpoint=false;
         return int64_t(m.ctx.last_trap); }
     // Use the B1 thunk (installs r14 = context before the JIT'd entry).
     int64_t r = ember::ember_call_void(m.main_entry, &m.ctx);

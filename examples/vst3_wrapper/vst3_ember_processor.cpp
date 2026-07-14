@@ -107,7 +107,7 @@ extern "C" void vst3EmberTrap(ember::context_t* context, int reason,
     if (!context) return;
     context->last_trap = static_cast<ember::TrapReason>(reason);
     if (context->has_checkpoint)
-        __builtin_longjmp(context->checkpoint, 1);
+        longjmp(context->checkpoint, 1);
 }
 
 enum class ScriptProfile { Gain, Delay, Filter, Oscillator };
@@ -349,7 +349,7 @@ private:
         executionContext.catch_depth = 0;
         executionContext.last_trap = ember::TrapReason::None;
         executionContext.has_checkpoint = true;
-        if (__builtin_setjmp(executionContext.checkpoint)) {
+        if (setjmp(executionContext.checkpoint)) {
             executionContext.has_checkpoint = false;
             executionContext.call_depth = 0;
             executionContext.catch_depth = 0;

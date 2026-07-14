@@ -211,11 +211,11 @@ extern "C" void ember_cli_trap(ember::context_t* ctx, int reason, const char* de
         ctx->last_trap = static_cast<ember::TrapReason>(reason);
         ctx->last_error = detail ? detail : "<no detail>";
         if (ctx->has_checkpoint) {
-            // __builtin_longjmp (not std::longjmp): restores saved rsp/rbp/ip
+            // longjmp (not std::longjmp): restores saved rsp/rbp/ip
             // WITHOUT walking SEH/unwind tables. JIT'd frames have no .pdata,
             // so std::longjmp's table walk faults; the builtin is a direct
             // register restore (matches the spec's "directly, not libc setjmp/longjmp").
-            __builtin_longjmp(ctx->checkpoint, 1);
+            longjmp(ctx->checkpoint, 1);
         }
     }
     std::fprintf(stderr, "ember: unhandled trap (no checkpoint): %s\n", detail ? detail : "?");
@@ -899,7 +899,7 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
             // every outer call so thread_join can hand it to a worker safely.
             // Raw lock/unlock is intentional: a trap longjmp skips destructors.
             ectx.call_mutex.lock();
-            if (__builtin_setjmp(ectx.checkpoint)) {
+            if (setjmp(ectx.checkpoint)) {
                 ectx.call_mutex.unlock();
                 std::fprintf(stderr, "ember: bench warmup trap: %s\n", ectx.last_error.c_str());
                 ectx.has_checkpoint = false; do_cleanup(); return {70};
@@ -912,7 +912,7 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
         bool bench_trapped = false;
         for (int it = 0; it < opts.bench_iters; ++it) {
             ectx.call_mutex.lock();
-            if (__builtin_setjmp(ectx.checkpoint)) {
+            if (setjmp(ectx.checkpoint)) {
                 ectx.call_mutex.unlock();
                 std::fprintf(stderr, "ember: bench iter %d trap: %s\n", it, ectx.last_error.c_str());
                 bench_trapped = true; break;
@@ -966,7 +966,7 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
     // spawned workers. This prevents a worker from replacing ectx.checkpoint
     // while the main thread is executing and potentially trapping.
     ectx.call_mutex.lock();
-    if (__builtin_setjmp(ectx.checkpoint)) {
+    if (setjmp(ectx.checkpoint)) {
         ectx.call_mutex.unlock();
         std::fprintf(stderr, "ember: RUNTIME TRAP: %s (%s)\n",
                      ectx.last_error.c_str(), ember::trap_reason_str(ectx.last_trap));
@@ -1005,7 +1005,7 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
                     tick_ctx.call_depth = 0;
                     tick_ctx.has_checkpoint = true;
                     tick_ctx.call_mutex.lock();
-                    if (__builtin_setjmp(tick_ctx.checkpoint)) {
+                    if (setjmp(tick_ctx.checkpoint)) {
                         tick_ctx.call_mutex.unlock();
                         tick_ctx.has_checkpoint = false;
                         tick_trapped.store(true); stop.store(true); break;
@@ -1520,7 +1520,7 @@ static int run_pipe_command(const std::string& config_path) {
         int64_t value = int64_t(input_start + i);
         int64_t out = value;
         ectx.has_checkpoint = true;
-        if (__builtin_setjmp(ectx.checkpoint)) {
+        if (setjmp(ectx.checkpoint)) {
             std::fprintf(stderr, "ember pipe: RUNTIME TRAP at value %lld: %s (%s)\n",
                          (long long)value, ectx.last_error.c_str(), trap_reason_str(ectx.last_trap));
             trapped = true; break;
@@ -1604,7 +1604,7 @@ static int run_live_command(const std::string& file_path,
             context_t ectx; ectx.budget_remaining = 100000000; ectx.max_call_depth = 512;
             ectx.has_checkpoint = true;
             int64_t entry_ret = 0;
-            if (__builtin_setjmp(ectx.checkpoint)) {
+            if (setjmp(ectx.checkpoint)) {
                 std::fprintf(stderr, "ember live: @entry trap: %s (%s)\n",
                              ectx.last_error.c_str(), trap_reason_str(ectx.last_trap));
                 return 70;
@@ -1645,7 +1645,7 @@ static int run_live_command(const std::string& file_path,
             context_t ectx; ectx.budget_remaining = 100000000; ectx.max_call_depth = 512;
             ectx.call_depth = 0;
             ectx.has_checkpoint = true;
-            if (__builtin_setjmp(ectx.checkpoint)) {
+            if (setjmp(ectx.checkpoint)) {
                 std::fprintf(stderr, "ember live: tick %llu trap: %s (%s)\n",
                              (unsigned long long)tick_count, ectx.last_error.c_str(),
                              trap_reason_str(ectx.last_trap));
@@ -1687,7 +1687,7 @@ static int run_live_command(const std::string& file_path,
                             context_t ectx; ectx.budget_remaining = 100000000; ectx.max_call_depth = 512;
                             ectx.has_checkpoint = true;
                             int64_t er = 0;
-                            if (__builtin_setjmp(ectx.checkpoint)) {
+                            if (setjmp(ectx.checkpoint)) {
                                 std::fprintf(stderr, "ember live: reloaded @entry trap: %s (%s)\n",
                                              ectx.last_error.c_str(), trap_reason_str(ectx.last_trap));
                                 keep_new = false;
@@ -1889,7 +1889,7 @@ int main(int argc, char** argv) {
         ember::context_t ectx;
         ectx.budget_remaining = 100000000;  // 100M instruction budget (same as normal run)
         ectx.max_call_depth = 512;
-        ectx.has_checkpoint = (__builtin_setjmp(ectx.checkpoint) == 0);
+        ectx.has_checkpoint = (setjmp(ectx.checkpoint) == 0);
         if (!ectx.has_checkpoint) {
             // We arrived here via a trap longjmp — recoverable exit.
             std::fprintf(stderr, "ember: loaded .em trapped: %s\n", ectx.last_error.c_str());
