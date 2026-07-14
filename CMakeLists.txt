@@ -454,7 +454,7 @@ add_test(NAME ext_bounds COMMAND ext_bounds_test)
 add_executable(ext_registration_test examples/ext_registration_test.cpp)
 target_link_libraries(ext_registration_test PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat ember_ext_string ember_ext_array ember_ext_math
-    ember_ext_sync ember_ext_lifecycle ember_frontend)
+    ember_ext_sync ember_ext_lifecycle ember ember_frontend)
 add_test(NAME ext_registration COMMAND ext_registration_test)
 
 # v0.4 hardening regression: pins the red-team V5 (W^X JIT memory) and

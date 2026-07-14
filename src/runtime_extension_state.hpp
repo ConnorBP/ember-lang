@@ -107,7 +107,19 @@ struct LifecycleRuntimeState {
 // instance owns this state via shared_ptr; the back-pointer is valid for the
 // state's lifetime, which is the instance's lifetime). It carries NO route
 // material — only the runtime identity the worker needs to reach the
-// provider + dispatch record for re-resolution.
+// provider + dispatch record for re-resolution. `instance_wp` is the shared-
+// ownership weak back-pointer: a keyed worker locks it to obtain a
+// shared_ptr<ModuleInstance> so the instance (and its borrowed dispatch
+// record / provider / entry table) stays alive for the worker's whole
+// execution (§6.6, §10.3). Set by thread_init_keyed when the host manages the
+// instance via make_shared<ModuleInstance> (enable_shared_from_this).
+//
+// KEYED FAIL-CLOSED (task constraint): `keyed_mode` is set by
+// thread_init_keyed. When it is true and the TLS current-keyed-runtime is
+// active, the store selector MUST use this per-runtime state and MUST NOT
+// fall back to the file-static singleton — even if ext_state is somehow null
+// on the TLS runtime. The legacy identity path (keyed_mode == false) targets
+// the file-static default store as before.
 struct ThreadRuntimeState {
     struct ThreadSlot {
         std::thread        th;            // the OS thread (default-constructed if free)
@@ -118,6 +130,7 @@ struct ThreadRuntimeState {
         std::mutex         done_lock;
         std::condition_variable done_cv;
         bool               in_use = false;
+        bool               joined   = false;  // retired: host joined + recycled
         // The logical handle (bare dispatch slot) the script spawned with,
         // captured at spawn so the worker can RE-RESOLVE at execution time
         // (§12.4) instead of caching a raw entry.
@@ -128,13 +141,53 @@ struct ThreadRuntimeState {
     std::vector<int64_t>                     free_ids;
     std::recursive_mutex                     setup_mutex;
     // The per-runtime context + dispatch table the spawned threads call into.
-    // Set by keyed thread init writing into THIS runtime's state. These
-    // identify the runtime's dispatch storage (a base pointer + count); they
-    // carry NO route material.
+    // Set by the LEGACY thread_init(ctx, base, count) writing into THIS
+    // runtime's state. The KEYED worker does NOT use these — it owns its own
+    // context_t (§6.6: "Each independently entered OS thread owns its own
+    // context_t") and derives the entry from the ModuleInstance's dispatch
+    // record + provider. These carry NO route material.
     context_t* ctx           = nullptr;
     void*      dispatch_base = nullptr;   // atomic<void*>[] base
     int64_t    slot_count    = 0;
-    ModuleInstance* instance = nullptr;   // back-pointer for re-resolution (no route material)
+    ModuleInstance* instance = nullptr;   // non-owning back-pointer (legacy + keyed)
+    std::weak_ptr<ModuleInstance> instance_wp;  // shared-ownership back-pointer (keyed)
+    bool keyed_mode = false;              // set by thread_init_keyed (fail-closed guard)
+    // Test gate: when non-null, the keyed worker blocks on this gate before
+    // calling ember_call_keyed_i64_by_slot (before resolving its entry). This
+    // lets a test deterministically publish a replacement BETWEEN spawn and
+    // the worker's execution-time resolution (§12.4). Null = no gate (the
+    // worker resolves immediately). The gate is a simple atomic flag + CV.
+    struct WorkerGate {
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::atomic<bool> open{false};
+        bool enabled = false;
+    };
+    std::unique_ptr<WorkerGate> worker_gate;
+    // ── Deterministic cleanup (§6.6, task: active-worker destruction) ──────
+    // A joinable std::thread's destructor calls std::terminate, so destroying
+    // a runtime with an active (not-yet-joined) worker would terminate the
+    // process. This destructor joins every still-joinable worker that is NOT
+    // the current thread (a thread cannot join itself), and detaches the
+    // current thread (if we're being destroyed from within a worker's
+    // shared_ptr release — the worker holds shared_ptr<ModuleInstance>, not
+    // shared_ptr<RuntimeExtensionState>, so this destructor runs from the
+    // ModuleInstance's destruction after the worker has released its
+    // shared_ptr and returned; the detach path is defensive for the case
+    // where destruction is triggered from the worker thread itself). After
+    // this, every std::thread in `threads` is non-joinable, so the vector's
+    // destruction does not terminate.
+    ~ThreadRuntimeState() {
+        std::lock_guard<std::recursive_mutex> guard(setup_mutex);
+        for (auto& s : threads) {
+            if (s && s->th.joinable() && s->th.get_id() != std::this_thread::get_id())
+                s->th.join();
+        }
+        for (auto& s : threads) {
+            if (s && s->th.joinable())  // only the current thread remains joinable
+                s->th.detach();
+        }
+    }
 };
 
 // ─── Per-runtime coroutine state (§6.7, replaces ext_coroutine globals) ────

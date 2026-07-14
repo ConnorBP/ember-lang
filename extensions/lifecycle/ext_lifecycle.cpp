@@ -6,18 +6,32 @@
 // ModuleInstance's per-runtime state (inst.ext_state->lifecycle) so two
 // runtimes carry independent routine tables (§10.3). The natives select the
 // store via the current-keyed-runtime TLS. No keyed path consults the
-// file-static singleton. lifecycle_tick_keyed re-resolves each handle through
-// the keyed resolver AT INVOCATION (§12.4), so a replaced entry is observed.
+// file-static singleton.
+//
+// KEYED FAIL-CLOSED (task constraint): when the TLS current-keyed-runtime is
+// active (non-null) but the runtime's ext_state is null, the keyed store
+// selector does NOT fall back to the file-static singleton — it returns a
+// null StoreView so the native fails closed (returns 0 / no-op). Only when NO
+// keyed runtime is active on this thread does the legacy path target the
+// file-static default store. This prevents a keyed native from silently
+// selecting legacy globals.
+//
+// lifecycle_tick_keyed re-resolves each handle through the GUARDED CORE
+// keyed-call API (ember_call_keyed_i64_by_slot) AT INVOCATION (§12.4), so a
+// replaced entry is observed. The core API establishes the current-runtime
+// TLS, the recoverable checkpoint, the reload/generation guard, and cleans up
+// on every normal AND trapped exit — the raw ember_keyed_reentry_i64 thunk
+// does NONE of those, so it MUST NOT be used here (task constraint: use the
+// guarded core keyed-call API, not an unguarded raw re-entry).
 //
 // Layout-safety: both stores use the SAME Slot type
 // (LifecycleRuntimeState::Slot), removing unsafe reinterpret_cast aliasing.
 #include "ext_lifecycle.hpp"
 #include "ast.hpp"
 #include "binding_builder.hpp"
-#include "engine.hpp"            // Red 8: ember_keyed_reentry_i64
+#include "engine.hpp"            // Red 8: ember_call_keyed_i64_by_slot
 #include "module_instance.hpp"   // Red 8: ModuleInstance, ember_current_keyed_runtime
 #include "key_provider.hpp"      // Red 8: DispatchKeyAdapter
-#include "module_layout.hpp"     // Red 8: resolve_keyed_dispatch
 #include "runtime_extension_state.hpp" // Red 8: LifecycleRuntimeState
 #include <vector>
 #include <mutex>
@@ -34,9 +48,23 @@ static std::vector<Slot> g_routines;
 static std::vector<int64_t>     g_free;
 static std::mutex               g_mutex;
 
+// Returns the per-runtime keyed state when a keyed runtime is active on this
+// thread. Returns nullptr when NO keyed runtime is active (the legacy identity
+// path serves that case via the file-static default store). When a keyed
+// runtime IS active but its ext_state is null, returns a sentinel non-null
+// pointer so select_store can fail closed instead of falling back to the
+// file-static singleton (task constraint).
+static LifecycleRuntimeState* g_fail_closed_sentinel = nullptr;
+static LifecycleRuntimeState* fail_closed_sentinel() {
+    if (!g_fail_closed_sentinel)
+        g_fail_closed_sentinel = reinterpret_cast<LifecycleRuntimeState*>(uintptr_t(0x1));
+    return g_fail_closed_sentinel;
+}
+
 static LifecycleRuntimeState* current_keyed_state() {
     ModuleInstance* rt = ember_current_keyed_runtime();
-    if (!rt || !rt->ext_state) return nullptr;
+    if (!rt) return nullptr;  // no keyed runtime active -> legacy path
+    if (!rt->ext_state) return fail_closed_sentinel();  // keyed active but no state -> fail closed
     return &rt->ext_state->lifecycle;
 }
 
@@ -44,19 +72,28 @@ struct StoreView {
     std::vector<Slot>*   routines;
     std::vector<int64_t>*     free_ids;
     std::mutex*               mutex;
+    bool valid;
 };
 
 static StoreView select_store() {
-    if (LifecycleRuntimeState* s = current_keyed_state()) {
-        return StoreView{&s->routines, &s->free_ids, &s->mutex};
+    LifecycleRuntimeState* s = current_keyed_state();
+    if (s == fail_closed_sentinel()) {
+        // Keyed TLS active but ext_state is null: fail closed (do NOT fall
+        // back to the file-static singleton).
+        return StoreView{nullptr, nullptr, nullptr, /*valid=*/false};
     }
-    return StoreView{&g_routines, &g_free, &g_mutex};
+    if (s) {
+        return StoreView{&s->routines, &s->free_ids, &s->mutex, /*valid=*/true};
+    }
+    // No keyed runtime active: legacy identity path -> file-static default store.
+    return StoreView{&g_routines, &g_free, &g_mutex, /*valid=*/true};
 }
 
 extern "C" {
     static int64_t n_register_routine(int64_t handle, int64_t data) {
         try {
             StoreView st = select_store();
+            if (!st.valid) return 0;  // keyed fail-closed
             std::lock_guard<std::mutex> guard(*st.mutex);
             if (!st.free_ids->empty()) {
                 int64_t id = st.free_ids->back(); st.free_ids->pop_back();
@@ -70,6 +107,7 @@ extern "C" {
     }
     static int64_t n_unregister_routine(int64_t id) {
         StoreView st = select_store();
+        if (!st.valid) return 0;  // keyed fail-closed
         std::lock_guard<std::mutex> guard(*st.mutex);
         if (id < 1 || id > int64_t(st.routines->size())) return 0;
         auto& s = (*st.routines)[size_t(id - 1)];
@@ -131,19 +169,41 @@ std::vector<Routine> host_routines_keyed(ModuleInstance& inst) {
     return out;
 }
 
+// lifecycle_tick_keyed re-resolves each registered routine's logical handle
+// through the GUARDED CORE keyed-call API (ember_call_keyed_i64_by_slot) at
+// INVOCATION time (§12.4), so a replaced entry is observed. The core API:
+//   - derives the route word from the provider via the adapter (transient);
+//   - resolves the logical slot through the instance's CURRENT immutable
+//     ModuleDispatchRecord (NOT raw entry_table[logical_slot]);
+//   - sets the current-keyed-runtime TLS on entry + clears on every exit;
+//   - acquires the reload/generation guard from resolution through return/trap;
+//   - establishes a setjmp checkpoint (when inst.trap_stub is set) and returns
+//     a structured CallResult{trapped=true} on a trap;
+//   - cleans all runtime/TLS state on every normal AND trapped exit.
+// The raw ember_keyed_reentry_i64 thunk does NONE of these — it is a bare
+// assembly re-entry that only installs r14/r15 — so it MUST NOT be used here
+// (task constraint). Each routine's logical identity (the slot from &fn) is
+// retained; the entry is resolved at invocation, not cached at registration.
 int64_t lifecycle_tick_keyed(ModuleInstance& inst, context_t& ctx,
                              const DispatchKeyAdapter& adapter) {
     if (!inst.ext_state) return 0;
+    if (!inst.provider) return 0;
     auto routines = host_routines_keyed(inst);
     int64_t sum = 0;
     for (const auto& r : routines) {
-        auto rw = adapter.route_word(ModuleId{inst.module_id, 1}, inst.strategy_version,
-                                     "ember/dispatch");
-        if (!rw) continue;
-        auto er = resolve_keyed_dispatch(&inst.record, uint32_t(r.slot), *rw.value);
-        if (!er || !*er.value) continue;
-        int64_t got = ember_keyed_reentry_i64(*er.value, &ctx, r.data, *rw.value);
-        sum += got;
+        // Re-resolve at invocation through the guarded core API (§12.4).
+        // The logical slot r.slot is the routine's retained logical identity;
+        // the core API derives the route word + resolves through the record +
+        // establishes TLS/guard/checkpoint. r.data is the opaque arg.
+        auto cr = ember_call_keyed_i64_by_slot(inst, uint32_t(r.slot), ctx, r.data, adapter);
+        if (cr.ok) {
+            sum += cr.value;
+        }
+        // On a trapped routine (cr.trapped), the core API already cleaned up
+        // TLS/guard/checkpoint and reset ctx via reset_for_call. We skip the
+        // trapped routine's contribution (value 0) and continue ticking the
+        // remaining routines — a single routine's trap does not abort the
+        // whole tick (the structured CallResult lets us recover per-routine).
     }
     return sum;
 }

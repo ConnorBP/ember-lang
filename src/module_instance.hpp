@@ -106,7 +106,19 @@ class HotReloadDomain;
 // permutation (§3.3, §6.4, §14.6). The route word is supplied PER CALL to the
 // safe API (derived from the provider via the adapter) and installed in r15
 // for the call tree only.
-struct ModuleInstance {
+// Red 8 (§6.6, §10.3, §12.4): enable_shared_from_this so the keyed thread
+// extension's worker can capture a shared_ptr<ModuleInstance> (shared lifetime
+// ownership) when the host manages the instance via make_shared — the worker
+// then keeps the instance (and its borrowed dispatch record / provider / entry
+// table) alive for its whole execution, so a host destroying the runtime while
+// a worker is in-flight does not dangle the worker's borrowed references. The
+// host MUST manage a keyed-thread instance via std::make_shared<ModuleInstance>
+// (or shared_ptr(new ModuleInstance(...))) for shared_from_this() to be valid;
+// a stack-allocated instance MUST NOT call shared_from_this() (UB). Non-thread
+// keyed paths (lifecycle tick, coroutine, safe host calls) do NOT need this —
+// they consult the instance by reference for the duration of a single call and
+// never let it escape to another thread.
+struct ModuleInstance : public std::enable_shared_from_this<ModuleInstance> {
     std::string module_id;
     uint32_t strategy_version = 1;
     DispatchMode mode = DispatchMode::Identity;
