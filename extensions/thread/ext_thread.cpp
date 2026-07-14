@@ -1,31 +1,23 @@
 // ext_thread.cpp - ember extension: in-context threads (Tier 4).
 // See ext_thread.hpp for the scope statement + correctness model.
 //
-// A Tier-4 extension mirroring ext_array/ext_sync (one TU per the
-// extensions/README.md purity rule; depends only on ember public headers +
-// stdlib). Host-owned thread registry behind 1-based i64 handles. The spawned
-// threads call ember back into the SAME context_t, serialized by
-// context_t::call_mutex with save/restore of the per-call state.
-//
-// Memory-ordering / sync notes:
-//   - `done` + `result` + `trapped` + `trap_reason` are written by the spawned
-//     thread BEFORE it unlocks call_mutex + notifies the cv, and read by the
-//     joining thread AFTER it reacquires call_mutex. The mutex pair
-//     (unlock-with-notify on producer, lock-after-wait on consumer) is a
-//     release/acquire pair, so the joining thread sees the final values without
-//     extra atomics. The cv's wait/notify is the阻塞 mechanism; the mutex is
-//     the happens-before edge.
-//   - The fn-handle -> entry resolution reads the dispatch table slot under
-//     std::memory_order_acquire (the dispatch table stores under release in
-//     DispatchTable::set), so a handle baked at compile resolves to the fn the
-//     host published, not a stale null.
+// Red 8 (§6.6, §10.3, §12.4): DUAL-HOMED thread registry. The keyed path
+// targets a SPECIFIC ModuleInstance's per-runtime state; the worker re-resolves
+// its logical entry at EXECUTION time through the current immutable record
+// (§12.4) and uses the core safe-call API (ember_keyed_reentry_i64, §6.5) —
+// NOT an unguarded raw re-entry. Layout-safety: both stores use the SAME
+// ThreadSlot type (ThreadRuntimeState::ThreadSlot), no reinterpret_cast aliasing.
 #include "ext_thread.hpp"
-#include "ast.hpp"            // type_i64, Prim, Type
-#include "binding_builder.hpp" // BindingBuilder
-#include "engine.hpp"          // ember_call_i64
+#include "ast.hpp"
+#include "binding_builder.hpp"
+#include "engine.hpp"
+#include "module_instance.hpp"
+#include "key_provider.hpp"
+#include "module_layout.hpp"
+#include "runtime_extension_state.hpp"
 #include <atomic>
 #include <condition_variable>
-#include <cstring>             // memcpy (jmp_buf save/restore)
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -37,69 +29,59 @@ using namespace ember;
 
 namespace ember::ext_thread {
 
-// Sentinel returned by thread_join when the joined thread trapped (so a script
-// can distinguish "the fn returned INT64_MIN" from "the fn trapped" — the
-// former is a valid return value, the latter is a control-flow signal). A
-// script that expects its worker to possibly return INT64_MIN should also call
-// thread_trap_reason to disambiguate. Mirrors ext_sync's EMPTY_SENTINEL shape.
 static constexpr int64_t TRAP_SENTINEL = INT64_MIN;
 
-// ---- Host setup state (set by thread_init, read by thread_spawn) ----
-// One store-management mutex serializes lookup/init/reset across contexts.
-// The dispatch base + slot count + context pointer are the three things a
-// native (which only gets i64 args) cannot recover on its own.
+using ThreadSlot = ThreadRuntimeState::ThreadSlot;
+
 static std::recursive_mutex g_setup_mutex;
 static context_t*           g_ctx           = nullptr;
-static void*                g_dispatch_base = nullptr;   // atomic<void*>[] base
+static void*                g_dispatch_base = nullptr;
 static int64_t              g_slot_count    = 0;
-
-// ---- Thread registry (1-based handles, mirrors ext_sync's slot shape) ----
-struct ThreadSlot {
-    std::thread        th;            // the OS thread (default-constructed if free)
-    int64_t            result   = 0;  // the fn's i64 return (valid when done)
-    bool               done     = false;
-    bool               trapped  = false;
-    int                trap_reason = 0;  // TrapReason as int (0 = None)
-    std::mutex         done_lock;     // guards done/result/trapped + the cv
-    std::condition_variable done_cv;  // join waits on this
-    bool               in_use = false;
-};
 static std::vector<std::unique_ptr<ThreadSlot>> g_threads;
 static std::vector<int64_t>                     g_threads_free;
 
-// Raw observing lookup (the worker + join hold a ThreadSlot* that is stable for
-// the thread's lifetime — reset() never erases an in_use slot, it only clears
-// the registry when all slots are free). 1-based handle, returns nullptr for
-// out-of-range or not-in-use slots (mirrors ext_sync's slot() shape).
-static ThreadSlot* raw_slot(int64_t h) {
-    std::lock_guard<std::recursive_mutex> guard(g_setup_mutex);
-    if (h < 1 || h > int64_t(g_threads.size())) return nullptr;
-    auto& s = g_threads[size_t(h - 1)];
+static ThreadRuntimeState* current_keyed_state() {
+    ModuleInstance* rt = ember_current_keyed_runtime();
+    if (!rt || !rt->ext_state) return nullptr;
+    return &rt->ext_state->thread;
+}
+
+struct StoreView {
+    std::vector<std::unique_ptr<ThreadSlot>>* threads;
+    std::vector<int64_t>*                     free_ids;
+    std::recursive_mutex*                     setup_mutex;
+    context_t**                               ctx_pp;
+    void**                                    dispatch_base_pp;
+    int64_t*                                  slot_count_p;
+    ModuleInstance*                           instance;
+    bool keyed;
+};
+
+static StoreView select_store() {
+    if (ThreadRuntimeState* s = current_keyed_state()) {
+        return StoreView{&s->threads, &s->free_ids, &s->setup_mutex,
+                         &s->ctx, &s->dispatch_base, &s->slot_count,
+                         s->instance, /*keyed=*/true};
+    }
+    return StoreView{&g_threads, &g_threads_free, &g_setup_mutex,
+                     &g_ctx, &g_dispatch_base, &g_slot_count,
+                     nullptr, /*keyed=*/false};
+}
+
+static ThreadSlot* raw_slot(StoreView& st, int64_t h) {
+    if (h < 1 || h > int64_t(st.threads->size())) return nullptr;
+    auto& s = (*st.threads)[size_t(h - 1)];
     return (s && s->in_use) ? s.get() : nullptr;
 }
 
-// Resolve a fn_handle (bare dispatch slot) to the JIT entry. Returns nullptr
-// for out-of-range / cross-module (bit 63 set) / not-yet-published slots.
-// The dispatch table is an array of std::atomic<void*>; read under acquire so
-// the entry published by DispatchTable::set (release) is visible.
-static void* resolve_entry(int64_t handle) {
-    if (handle < 0) return nullptr;           // negative == bit 63 set (cross-module)
-    if (g_slot_count <= 0 || handle >= g_slot_count) return nullptr;
-    if (!g_dispatch_base) return nullptr;
-    auto* slots = static_cast<std::atomic<void*>*>(g_dispatch_base);
+static void* resolve_entry_legacy(int64_t handle, void* dispatch_base, int64_t slot_count) {
+    if (handle < 0) return nullptr;
+    if (slot_count <= 0 || handle >= slot_count) return nullptr;
+    if (!dispatch_base) return nullptr;
+    auto* slots = static_cast<std::atomic<void*>*>(dispatch_base);
     return slots[size_t(handle)].load(std::memory_order_acquire);
 }
 
-// ---- The spawned-thread worker ----
-// Locks call_mutex, saves the caller's per-call state, runs a complete
-// ember_call on the shared context, restores, unlocks, marks done + notifies.
-//
-// The save/restore is the crux: the caller is blocked on call_mutex at a
-// native call boundary (thread_join released it for us), so its in-progress
-// budget/depth/catch/checkpoint are frozen. We must not clobber them
-// permanently — reset_for_call zeroes depth + clears catch, and setjmp
-// overwrites checkpoint. So we snapshot, run, restore. On resumption the
-// caller sees its exact pre-spawn state.
 struct SavedState {
     int64_t   budget_remaining;
     int32_t   call_depth;
@@ -139,13 +121,8 @@ static void restore_state(context_t* ctx, const SavedState& s) {
     ctx->last_error       = s.last_error;
 }
 
-// The worker runs in the spawned OS thread. It captures the entry + arg + the
-// ThreadSlot* it reports into. The trap stub (baked at compile) longjmps to
-// ctx->checkpoint, which we set here via __builtin_setjmp — so a trap unwinds
-// to THIS worker, not the caller. We record the trap reason off the context
-// (the trap stub set ctx->last_trap before the longjmp) + restore the caller's
-// state before unlocking.
-static void thread_worker(void* entry, context_t* ctx, int64_t arg, ThreadSlot* slot) {
+static void thread_worker_legacy(void* entry, context_t* ctx, int64_t arg,
+                                 ThreadSlot* slot) {
     SavedState saved;
     int64_t result = 0;
     bool trapped = false;
@@ -155,9 +132,7 @@ static void thread_worker(void* entry, context_t* ctx, int64_t arg, ThreadSlot* 
     save_state(ctx, saved);
     ctx->reset_for_call();
     ctx->has_checkpoint = true;
-    if (__builtin_setjmp(ctx->checkpoint)) {
-        // Trap fired during our ember_call -> the trap stub longjmp'd here.
-        // ctx->last_trap was set by the stub before the longjmp.
+    if (setjmp(ctx->checkpoint)) {
         trapped = true;
         reason  = int(ctx->last_trap);
         ctx->has_checkpoint = false;
@@ -165,15 +140,7 @@ static void thread_worker(void* entry, context_t* ctx, int64_t arg, ThreadSlot* 
         result = ember_call_i64(entry, ctx, arg);
         ctx->has_checkpoint = false;
     }
-    // Restore the caller's per-call state exactly; our call's depth/catch
-    // increments are discarded (mirrors reset_for_call after a longjmp).
     restore_state(ctx, saved);
-
-    // Publish the result + done under done_lock, then notify the cv so a
-    // thread_join blocked in cv.wait wakes. Release call_mutex AFTER the
-    // publish so the happens-before edge through the mutex also orders the
-    // result write for a joiner that reacquires call_mutex (belt + suspenders
-    // with the cv's own edge).
     {
         std::lock_guard<std::mutex> g(slot->done_lock);
         slot->result      = result;
@@ -185,107 +152,113 @@ static void thread_worker(void* entry, context_t* ctx, int64_t arg, ThreadSlot* 
     ctx->call_mutex.unlock();
 }
 
-// ---- Natives ----
+static void thread_worker_keyed(ModuleInstance* inst, int64_t logical_handle,
+                                context_t* ctx, int64_t arg,
+                                ThreadSlot* slot) {
+    SavedState saved;
+    int64_t result = 0;
+    bool trapped = false;
+    int  reason  = 0;
+
+    ctx->call_mutex.lock();
+    save_state(ctx, saved);
+    ctx->reset_for_call();
+    ctx->has_checkpoint = true;
+    if (setjmp(ctx->checkpoint)) {
+        trapped = true;
+        reason  = int(ctx->last_trap);
+        ctx->has_checkpoint = false;
+    } else {
+        if (inst && inst->provider && logical_handle >= 0) {
+            DispatchKeyAdapter adapter(inst->provider);
+            auto rw = adapter.route_word(ModuleId{inst->module_id, 1},
+                                         inst->strategy_version, "ember/dispatch");
+            if (rw) {
+                auto er = resolve_keyed_dispatch(&inst->record,
+                                                 uint32_t(logical_handle), *rw.value);
+                if (er && *er.value) {
+                    result = ember_keyed_reentry_i64(*er.value, ctx, arg, *rw.value);
+                }
+            }
+        }
+        ctx->has_checkpoint = false;
+    }
+    restore_state(ctx, saved);
+    {
+        std::lock_guard<std::mutex> g(slot->done_lock);
+        slot->result      = result;
+        slot->trapped     = trapped;
+        slot->trap_reason = reason;
+        slot->done        = true;
+    }
+    slot->done_cv.notify_all();
+    ctx->call_mutex.unlock();
+}
+
 extern "C" {
 
-// thread_spawn(fn_handle, arg) -> thread_id
-// fn_handle is a bare dispatch slot (an intra-module `&fn`). We resolve it to
-// the JIT entry + validate the range (REDSHELL guard: a forged/out-of-range
-// handle yields thread_id 0, never a wild call). A cross-module handle (bit 63
-// set, i.e. a negative i64) is rejected for v1. Returns 0 on any setup error
-// (thread_init not called, dispatch base null, slot out of range, entry null,
-// or thread allocation failure).
 static int64_t n_thread_spawn(int64_t handle, int64_t arg) {
-    std::lock_guard<std::recursive_mutex> guard(g_setup_mutex);
-    if (!g_ctx || !g_dispatch_base || g_slot_count <= 0) return 0;
-    void* entry = resolve_entry(handle);
-    if (!entry) return 0;
+    StoreView st = select_store();
+    std::lock_guard<std::recursive_mutex> guard(*st.setup_mutex);
+    if (!*st.ctx_pp || !*st.dispatch_base_pp || *st.slot_count_p <= 0) return 0;
 
-    // Allocate a slot (reuse from the free-list if possible).
+    void* entry = nullptr;
+    if (st.keyed) {
+        if (handle < 0 || handle >= *st.slot_count_p) return 0;
+    } else {
+        entry = resolve_entry_legacy(handle, *st.dispatch_base_pp, *st.slot_count_p);
+        if (!entry) return 0;
+    }
+
     int64_t idx;
     ThreadSlot* raw;
-    if (!g_threads_free.empty()) {
-        idx = g_threads_free.back();
-        g_threads_free.pop_back();
-        g_threads[size_t(idx - 1)] = std::make_unique<ThreadSlot>();
-        raw = g_threads[size_t(idx - 1)].get();
+    if (!st.free_ids->empty()) {
+        idx = st.free_ids->back();
+        st.free_ids->pop_back();
+        (*st.threads)[size_t(idx - 1)] = std::make_unique<ThreadSlot>();
+        raw = (*st.threads)[size_t(idx - 1)].get();
     } else {
-        if (g_threads.size() >= (size_t(1) << 20)) return 0;   // hard ceiling (mirrors ext_sync)
-        g_threads.push_back(std::make_unique<ThreadSlot>());
-        idx = int64_t(g_threads.size());
-        raw = g_threads.back().get();
+        if (st.threads->size() >= (size_t(1) << 20)) return 0;
+        st.threads->push_back(std::make_unique<ThreadSlot>());
+        idx = int64_t(st.threads->size());
+        raw = st.threads->back().get();
     }
     raw->in_use  = true;
     raw->done    = false;
     raw->trapped = false;
     raw->trap_reason = 0;
     raw->result  = 0;
-    context_t* ctx  = g_ctx;
+    raw->logical_handle = handle;
+    raw->arg     = arg;
+    context_t* ctx  = *st.ctx_pp;
 
-    // Launch the OS thread. We hand it the entry + ctx + arg + its slot.
-    // std::thread constructs BEFORE we release g_setup_mutex; the worker
-    // synchronizes on call_mutex (not g_setup_mutex), so releasing
-    // g_setup_mutex here is safe.
     try {
-        raw->th = std::thread(thread_worker, entry, ctx, arg, raw);
+        if (st.keyed) {
+            raw->th = std::thread(thread_worker_keyed, st.instance, handle, ctx, arg, raw);
+        } else {
+            raw->th = std::thread(thread_worker_legacy, entry, ctx, arg, raw);
+        }
     } catch (const std::exception&) {
-        // Thread creation failed (resource exhaustion). Free the slot.
         raw->in_use = false;
-        g_threads[size_t(idx - 1)].reset();
-        g_threads_free.push_back(idx);
+        (*st.threads)[size_t(idx - 1)].reset();
+        st.free_ids->push_back(idx);
         return 0;
     }
     return idx;
 }
 
-// thread_join(thread_id) -> i64
-// Waits for the spawned thread to finish + returns its i64 result. If the
-// thread trapped, returns TRAP_SENTINEL (INT64_MIN); the script can call
-// thread_trap_reason to see which trap. Returns 0 on a bad handle.
-//
-// DEADLOCK-FREEDOM: the caller is inside an ember_call that holds call_mutex.
-// The spawned worker needs call_mutex to run. So thread_join RELEASES
-// call_mutex, waits on the slot's cv (which the worker notifies when done),
-// then REACQUIRES call_mutex before returning to the JIT. The worker acquires
-// call_mutex while join waits, runs to completion, unlocks + notifies, join
-// wakes + reacquires. The lock is balanced (one unlock + one lock here), so
-// the caller's ember_call still owns exactly one lock on return.
-//
-// g_setup_mutex is held ONLY for the slot lookup, then RELEASED before the
-// cv wait. This is critical for nested spawn (test 7): the joined worker may
-// itself call thread_spawn for a grandchild, and thread_spawn needs
-// g_setup_mutex to allocate a slot. If join held g_setup_mutex across the
-// wait, the worker's nested thread_spawn would block on it, the worker could
-// never finish, and join's done_cv would never fire -> deadlock. The
-// ThreadSlot* is stable for the thread's lifetime (reset() never erases an
-// in_use slot), so it is safe to use after releasing g_setup_mutex.
-//
-// The slot is NOT freed here: the result/trap data must stay readable so a
-// subsequent thread_trap_reason(handle) works (the script inspects it after
-// join). The slot is reclaimed by thread_reset (the host's between-runs
-// isolation gesture). The std::thread IS joined here (OS resources reclaimed);
-// the slot just keeps the result fields + in_use=true.
 static int64_t n_thread_join(int64_t handle) {
-    // Look up the slot under g_setup_mutex, then release it. The slot pointer
-    // is stable for the worker's lifetime (in_use slots are never erased), so
-    // we can use it after unlocking the registry mutex.
+    StoreView st = select_store();
     ThreadSlot* s;
     {
-        std::lock_guard<std::recursive_mutex> guard(g_setup_mutex);
-        if (!g_ctx) return 0;
-        s = raw_slot(handle);
+        std::lock_guard<std::recursive_mutex> guard(*st.setup_mutex);
+        if (!*st.ctx_pp) return 0;
+        s = raw_slot(st, handle);
     }
     if (!s) return 0;
 
-    // Release the context call_mutex so the worker can acquire it. The caller
-    // (host's outer ember_call) holds it; we unlock it here + reacquire before
-    // returning. If the worker already finished + unlocked, this is a no-op
-    // lock-unlock-lock cycle (still correct).
-    g_ctx->call_mutex.unlock();
-
-    // Wait for the worker to publish done. cv.wait handles the
-    // unlock-wait-reacquire of done_lock atomically. g_setup_mutex is NOT held
-    // here, so a nested thread_spawn inside the worker can proceed.
+    context_t* ctx = *st.ctx_pp;
+    ctx->call_mutex.unlock();
     bool trapped = false;
     int64_t result = 0;
     {
@@ -294,28 +267,15 @@ static int64_t n_thread_join(int64_t handle) {
         trapped = s->trapped;
         result  = s->result;
     }
-
-    // Reacquire the context call_mutex before returning to the caller's JIT
-    // frame (the caller's ember_call expects to still hold it).
-    g_ctx->call_mutex.lock();
-
-    // Join the std::thread (reclaim OS resources). The worker has finished
-    // (done == true), so join returns immediately.
+    ctx->call_mutex.lock();
     if (s->th.joinable()) s->th.join();
-
-    // NOTE: the slot stays in_use so thread_trap_reason(handle) can read the
-    // trap reason after join. thread_reset reclaims it.
-
     return trapped ? TRAP_SENTINEL : result;
 }
 
-// thread_trap_reason(thread_id) -> i64
-// Returns the TrapReason (as int) the spawned thread recorded, or 0 (None) if
-// it completed normally or the handle is bad. Inspect after thread_join
-// returned TRAP_SENTINEL to see WHICH trap unwound the thread.
 static int64_t n_thread_trap_reason(int64_t handle) {
-    std::lock_guard<std::recursive_mutex> guard(g_setup_mutex);
-    ThreadSlot* s = raw_slot(handle);
+    StoreView st = select_store();
+    std::lock_guard<std::recursive_mutex> guard(*st.setup_mutex);
+    ThreadSlot* s = raw_slot(st, handle);
     if (!s) return 0;
     std::lock_guard<std::mutex> dlk(s->done_lock);
     return int64_t(s->trap_reason);
@@ -323,31 +283,18 @@ static int64_t n_thread_trap_reason(int64_t handle) {
 
 } // extern "C"
 
-// ---- Registration ----
 void register_natives(std::unordered_map<std::string, NativeSig>& m) {
     BindingBuilder b;
-    // thread_id is a plain i64 handle (1-based, 0 = null). v1 keeps it untagged
-    // so a script can compare `tid == 0` + pass it to thread_join without an
-    // i64<->handle conversion friction; the slot is still bounds-checked in
-    // every native (raw_slot rejects out-of-range / not-in-use). A tagged
-    // `thread` handle remains a future ergonomic refinement (it would need a
-    // `thread` type keyword + a null literal to be ergonomic in script).
     Type T = type_i64();
-    // A bare `fn` param: is_fn_handle=true, no recorded sig. Type::same accepts
-    // a recorded-sig fn handle against a bare `fn` param (the one subtyping
-    // direction), so `thread_spawn(&worker, arg)` type-checks for any worker.
     Type fn_param = type_i64();
     fn_param.is_fn_handle = true;
-
     b.add("thread_spawn",        T, {fn_param, type_i64()},        (void*)&n_thread_spawn);
     b.add("thread_join",         type_i64(), {T},                  (void*)&n_thread_join);
     b.add("thread_trap_reason",  type_i64(), {T},                  (void*)&n_thread_trap_reason);
-
     NativeTable t = b.build();
     for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }
 
-// ---- Host setup / reset ----
 bool thread_init(ember::context_t* ctx, void* dispatch_base, int64_t slot_count) {
     if (!ctx || !dispatch_base || slot_count <= 0) return false;
     std::lock_guard<std::recursive_mutex> guard(g_setup_mutex);
@@ -359,13 +306,6 @@ bool thread_init(ember::context_t* ctx, void* dispatch_base, int64_t slot_count)
 
 void thread_reset() {
     std::lock_guard<std::recursive_mutex> guard(g_setup_mutex);
-    // Detach (not join) any still-running threads: a reset between runs is a
-    // host isolation gesture, not a synchronization point, and joining would
-    // require call_mutex (which the host may not be holding here). A detached
-    // worker that is mid-ember_call will finish on its own; it references
-    // g_ctx/g_dispatch_base which the host must keep alive past reset OR call
-    // reset only when the context + table are quiescent. The test harness
-    // joins every thread before reset, so this path is a safety net.
     for (auto& s : g_threads) {
         if (s && s->in_use && s->th.joinable()) s->th.detach();
     }
@@ -374,6 +314,53 @@ void thread_reset() {
     g_ctx           = nullptr;
     g_dispatch_base = nullptr;
     g_slot_count    = 0;
+}
+
+bool thread_init_keyed(ember::ModuleInstance& inst) {
+    if (!inst.ext_state) return false;
+    if (!inst.entry_table || inst.logical_slot_count == 0) return false;
+    auto& s = inst.ext_state->thread;
+    std::lock_guard<std::recursive_mutex> guard(s.setup_mutex);
+    s.ctx           = nullptr;
+    s.dispatch_base = const_cast<void*>(static_cast<const void*>(inst.entry_table->slots.data()));
+    s.slot_count    = int64_t(inst.logical_slot_count);
+    s.instance      = &inst;
+    if (inst.record.physical_slots == nullptr && inst.logical_slot_count > 0)
+        assemble_identity_dispatch_record(inst);
+    return true;
+}
+
+int64_t thread_join_keyed(ember::ModuleInstance& inst, int64_t handle,
+                          ember::context_t& ctx,
+                          const ember::DispatchKeyAdapter& adapter) {
+    if (!inst.ext_state) return 0;
+    auto& s = inst.ext_state->thread;
+    {
+        std::lock_guard<std::recursive_mutex> guard(s.setup_mutex);
+        s.ctx = &ctx;
+    }
+    StoreView st{&s.threads, &s.free_ids, &s.setup_mutex,
+                 &s.ctx, &s.dispatch_base, &s.slot_count,
+                 s.instance, /*keyed=*/true};
+    ThreadSlot* slot;
+    {
+        std::lock_guard<std::recursive_mutex> guard(*st.setup_mutex);
+        slot = raw_slot(st, handle);
+    }
+    if (!slot) return 0;
+    (void)adapter;
+    ctx.call_mutex.unlock();
+    bool trapped = false;
+    int64_t result = 0;
+    {
+        std::unique_lock<std::mutex> dlk(slot->done_lock);
+        slot->done_cv.wait(dlk, [&] { return slot->done; });
+        trapped = slot->trapped;
+        result  = slot->result;
+    }
+    ctx.call_mutex.lock();
+    if (slot->th.joinable()) slot->th.join();
+    return trapped ? TRAP_SENTINEL : result;
 }
 
 } // namespace ember::ext_thread

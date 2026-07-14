@@ -73,7 +73,7 @@ extern "C" void gcit_trap(ember::context_t* ctx, int reason, const char* detail)
     if (ctx) {
         ctx->last_trap = static_cast<ember::TrapReason>(reason);
         ctx->last_error = detail ? detail : "";
-        if (ctx->has_checkpoint) longjmp(ctx->checkpoint, 1);
+        if (ctx->has_checkpoint) EMBER_LONGJMP(ctx->checkpoint, 1);
     }
     std::abort();
 }
@@ -247,7 +247,7 @@ static bool compile_gcit(const std::string& src, GcitModule& m) {
 static int64_t run_main(GcitModule& m, bool* trapped) {
     *trapped = false;
     m.ctx.call_depth = 0; m.ctx.has_checkpoint=true;
-    if (setjmp(m.ctx.checkpoint)) { *trapped=true; m.ctx.has_checkpoint=false;
+    if (EMBER_SETJMP(m.ctx.checkpoint)) { *trapped=true; m.ctx.has_checkpoint=false;
         return int64_t(m.ctx.last_trap); }
     using F0=int64_t(*)();
     int64_t r = reinterpret_cast<F0>(m.main_entry)();

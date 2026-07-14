@@ -9,15 +9,18 @@
 #include "ast.hpp"
 #include "key_provider.hpp"        // Red 5: DerivedMaterialProvider, DispatchKeyAdapter, ModuleId
 #include "module_layout.hpp"       // Red 5: DispatchMode (for ModuleInstance assembly)
+#include "module_instance.hpp"     // Red 8: ModuleInstance, LogicalCallableId, ember_current_keyed_runtime
 #include <cstdint>
 #include <vector>
 #include <string>
 #include <utility>
+#include <string_view>             // Red 8: resolve_entry_by_name_keyed
 
 namespace ember {
 
 // Forward decl: ModuleInstance (src/module_instance.hpp) — the host-owned
-// per-runtime container the safe keyed APIs consult.
+// per-runtime container the safe keyed APIs consult. (Also pulled in via
+// module_instance.hpp above; kept for readability of the engine.hpp surface.)
 struct ModuleInstance;
 
 // A compiled function: its JIT'd bytes, the exec-memory pointer, and
@@ -148,8 +151,14 @@ struct CallResult {
 //      transient r15 is in the abandoned thunk frame), so the caller's values
 //      survive and the transient r15 is cleared (§6.3 step 5).
 //
-// `name` resolves against the module's export name directory (the host's
-// CompiledFn table); "main" is the conventional entry. The instance's mode +
+// Red 8: resolution goes through the instance's CURRENT immutable
+// ModuleDispatchRecord + the transient route word (NOT raw
+// entry_table[logical_slot], §9.8), the hot-reload/generation guard is held
+// from resolution through return or trap, and the current-keyed-runtime TLS is
+// set on entry and cleared on every normal/trapped exit.
+//
+// `name` resolves against the module's export name directory (the instance's
+// named_entries map); "main" is the conventional entry. The instance's mode +
 // counts select identity or keyed resolution; the route word participates in
 // keyed resolution (Red 4's resolver) and in r15 installation regardless of
 // mode (the thunk reserves r15 for the whole call tree, §6.4).
@@ -161,6 +170,89 @@ CallResult ember_call_keyed_i64(ModuleInstance& inst, const std::string& name,
 CallResult ember_call_keyed_i64_i64(ModuleInstance& inst, const std::string& name,
                                     context_t& ctx, int64_t a, int64_t b,
                                     const DispatchKeyAdapter& adapter);
+
+// ─── Red 8: safe keyed host-call overloads BY LOGICAL SLOT (§9.8, §12.4) ────
+// The name forms above are retained; these overloads resolve a logical slot
+// directly (a host that already knows the slot — e.g. a lifecycle tick or a
+// delayed thread worker — bypasses the name directory). Resolution goes
+// through the instance's CURRENT immutable ModuleDispatchRecord + the
+// transient provider-derived route word (NOT raw entry_table[logical_slot]),
+// the applicable hot-reload/generation guard is held from resolution through
+// return or trap, and all runtime/TLS state (the current-keyed-runtime TLS)
+// is cleaned on every normal AND trapped exit. The caller's r14/r15 are
+// restored by the thunk (normal) or the wrapper epilogue (trap).
+CallResult ember_call_keyed_void_by_slot(ModuleInstance& inst, uint32_t logical_slot,
+                                         context_t& ctx,
+                                         const DispatchKeyAdapter& adapter);
+CallResult ember_call_keyed_i64_by_slot(ModuleInstance& inst, uint32_t logical_slot,
+                                        context_t& ctx, int64_t a,
+                                        const DispatchKeyAdapter& adapter);
+CallResult ember_call_keyed_i64_i64_by_slot(ModuleInstance& inst, uint32_t logical_slot,
+                                            context_t& ctx, int64_t a, int64_t b,
+                                            const DispatchKeyAdapter& adapter);
+
+// ─── Red 8: structured keyed entry resolvers (§9.8) ────────────────────────
+// A host that needs a resolved entry pointer (lifecycle tick, thread entry,
+// or FFI hand-off) obtains it through a keyed resolver, NEVER by indexing the
+// dispatch storage with a bare logical slot (§9.8). `resolve_entry_keyed`
+// validates the logical identity against the instance's published logical
+// count, derives the route word from the provider via the adapter, applies the
+// strategy permutation through the immutable ModuleDispatchRecord (identity
+// mode -> physical_slots[logical_slot]; keyed mode -> P(route_word, domain,
+// ordinal)), and returns the finalized entry. `resolve_entry_by_name_keyed`
+// maps an export name to a LogicalCallableId first, then performs the same
+// resolution. Both return a structured ExtensionError BEFORE yielding any
+// pointer if the provider cannot derive, the logical slot exceeds the
+// published logical count, the name is absent, or the domain/ABI fingerprint
+// does not match. They hold the applicable generation guard across the
+// resolution (a scoped lease: the guard is held for the duration of the
+// resolver call and released before returning; a host that lets the returned
+// pointer escape a guarded region must use resolve_entry_keyed_leased below,
+// which holds the guard across the callback, or take its own guard). The route
+// word is a transient; it is never stored.
+// (LogicalCallableId + ember_current_keyed_runtime are declared in
+// module_instance.hpp.)
+ExtensionResult<void*> resolve_entry_keyed(ModuleInstance& inst,
+                                           const LogicalCallableId& id,
+                                           const DispatchKeyAdapter& adapter);
+ExtensionResult<void*> resolve_entry_by_name_keyed(ModuleInstance& inst,
+                                                   std::string_view name,
+                                                   const DispatchKeyAdapter& adapter);
+
+// ─── Red 8: the lifetime-safe scoped-lease resolver form (§9.8, §12.4) ──────
+// `resolve_entry_keyed` returns a raw pointer that a host CAN let escape the
+// resolver's guarded region — and the guard held during resolution is released
+// before the pointer is returned, so it does NOT protect the returned pointer
+// once the host uses it. To avoid falsely claiming a dropped guard protects an
+// escaped pointer, this scoped-lease form holds the generation guard for the
+// duration of `body(entry)` and releases it (on normal return OR a recovered
+// trap inside `body`) before returning to the host. A host that needs a
+// resolved pointer to escape (lifecycle tick, thread entry, FFI hand-off, or
+// any use beyond a single guarded invocation) MUST route through this form OR
+// take its own ExecutionGuard on inst.reload_domain and keep it for the
+// pointer's whole use — never assume the bare resolver's guard outlives the
+// call. `body` is invoked with a non-null entry; it returns an i64 the lease
+// form returns in its result. The TLS current-keyed-runtime is set for `body`
+// and cleared on every exit. If `body` traps (longjmp to the lease's
+// checkpoint, when inst.trap_stub is set), the guard + TLS are cleaned and the
+// structured result reports trapped=true. NO route material is stored: the
+// route word is derived transiently and discarded; only the entry pointer
+// reaches `body`.
+struct LeaseResult {
+    bool ok = false;            // body ran and returned normally
+    bool trapped = false;       // body trapped + longjmp'd back to the lease checkpoint
+    int64_t value = 0;          // body's i64 return (normal)
+    std::string reason;         // structured diagnostic on failure/trap
+};
+// The callback body signature: receives the resolved non-null entry + the
+// caller's context (so body can invoke via the keyed re-entry thunk or a raw
+// call) + the arg the host passed through. Returns an i64.
+using KeyedLeaseBody = int64_t(*)(void* entry, context_t* ctx, int64_t arg);
+LeaseResult resolve_entry_keyed_leased(ModuleInstance& inst,
+                                       const LogicalCallableId& id,
+                                       context_t& ctx, int64_t arg,
+                                       KeyedLeaseBody body,
+                                       const DispatchKeyAdapter& adapter);
 
 // Keyed re-entry thunk (§6.5): a native that re-enters the script under the
 // SAME route word calls this instead of a raw ember_call_*. It installs r14 =

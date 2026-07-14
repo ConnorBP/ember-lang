@@ -1,9 +1,13 @@
-// module_instance.hpp — Red 5 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md
-// §10.3): the host-owned object that keeps all of a module's lifetimes together.
+// module_instance.hpp — Red 5 + Red 8
+// (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §10.3): the host-owned object
+// that keeps all of a module's lifetimes together.
 //
-// This is the GREEN side of the §10.3 ModuleInstance contract. A ModuleInstance
-// owns (or borrows with a documented lifetime) the per-runtime state the keyed
-// outer thunk + the keyed call APIs consult:
+// This is the GREEN side of the §10.3 ModuleInstance contract (Red 5 laid the
+// field set + the safe-API consult pattern; Red 8 migrates the per-runtime
+// extension state off the file-static globals onto this container and routes
+// keyed resolution through the immutable ModuleDispatchRecord). A
+// ModuleInstance owns (or borrows with a documented lifetime) the per-runtime
+// state the keyed outer thunk + the keyed call APIs consult:
 //
 //   - the stable module identity (§2.1, §6.1);
 //   - the dispatch mode + strategy version;
@@ -18,12 +22,13 @@
 //   - the host-provided trap stub (the safe API establishes a checkpoint and
 //     the trap stub longjmps to it; the instance carries the stub so a host
 //     wires it once per runtime, not per call);
-//   - future runtime state (lifecycle routines, thread registry, coroutine
-//     fibers) scoped to THIS runtime — §10.3 mandates these move off the file-
-//     static globals and onto the per-runtime container. This phase does NOT
-//     migrate the extensions (that is Red 8); the ModuleInstance is the
-//     designated owner the migration will target, so the field is reserved here
-//     as a documented future slot.
+//   - the per-runtime extension state (lifecycle routines, thread registry,
+//     coroutine fibers) scoped to THIS runtime — §10.3 mandates these move off
+//     the file-static globals and onto the per-runtime container. Red 8 lands
+//     that migration: the instance owns a shared_ptr<RuntimeExtensionState>
+//     (lifecycle / thread / coroutine sub-state) plus the immutable
+//     ModuleDispatchRecord + its storage the keyed host boundary resolves
+//     through, and an optional hot-reload domain for the generation guard.
 //
 // Constraints (§6.4, §10.3, §14.6): NO route material is stored in the
 // ModuleInstance or in any module record. The route word is a per-call
@@ -53,9 +58,17 @@
 #include "dispatch_table.hpp"        // DispatchTable (borrowed entry table)
 #include "extension_registry.hpp"    // shared ExtensionResult vocabulary
 #include "key_provider.hpp"          // DerivedMaterialProvider (shared ownership)
-#include "module_layout.hpp"         // DispatchMode, ModuleDispatchRecord
+#include "module_layout.hpp"         // DispatchMode, ModuleDispatchRecord, RecordBuilderStorage
+#include "runtime_extension_state.hpp"  // Red 8: per-runtime lifecycle/thread/coroutine state
 
 namespace ember {
+
+// Forward decl (src/hot_reload_domain.hpp) — the instance may borrow a reload
+// domain so the safe keyed API can hold an ExecutionGuard from resolution
+// through return/trap (Red 8 §9.8 / §12.4). Forward-declared (not included)
+// here so this header does not pull jit_memory.hpp / dispatch_table internals
+// beyond what it already includes; engine.cpp includes hot_reload_domain.hpp.
+class HotReloadDomain;
 
 // ─── ModuleInstance (§10.3) ──────────────────────────────────────────────
 // A host-owned, per-runtime container. Plain data so a host constructs one
@@ -104,8 +117,8 @@ struct ModuleInstance {
     // The name -> logical-slot map for the safe keyed APIs (§9.8). A host
     // populates this from its compiled module's slots so the safe APIs can
     // resolve "main"/named exports to a logical slot (then to the entry via
-    // entry_table). Empty = the safe API cannot resolve by name (the host
-    // must populate it or use a lower-level entry resolver).
+    // the record). Empty = the safe API cannot resolve by name (the host
+    // must populate it or use a by-slot overload / lower-level resolver).
     std::unordered_map<std::string, uint32_t> named_entries;
     std::shared_ptr<const DerivedMaterialProvider> provider;
     // The host-provided trap stub (context.hpp TrapStub). When set, the safe
@@ -120,16 +133,85 @@ struct ModuleInstance {
     // but it is part of the §10.3 "globals" ownership slot.
     int64_t globals_base = 0;
 
-    // ─── Future runtime state (§10.3, reserved) ─────────────────────────
-    // The §10.3-listed file-static extension globals (g_routines/g_free,
-    // g_ctx/g_dispatch_base/g_slot_count/g_threads, the coroutine fiber store)
-    // are a process-global singleton hazard. Red 8 migrates each extension's
-    // mutable state off the file-scope globals and onto this per-runtime
-    // container. This phase reserves the slot (a documented opaque pointer the
-    // migration will populate) so the ModuleInstance is the designated owner
-    // from the start. Null in this phase; a non-null value in a later phase
-    // means the extensions have been migrated.
-    void* future_runtime_state = nullptr;
+    // ─── Red 8: per-runtime extension state (§10.3, replaces the Red 5
+    // future_runtime_state opaque pointer) ─────────────────────────────
+    // The ownership-safe per-runtime container for lifecycle / thread /
+    // coroutine state. The §4.10 / §10.3-listed file-static extension globals
+    // are a process-global singleton hazard; Red 8 migrates each extension's
+    // mutable state off those globals and onto this per-runtime container.
+    // Shared ownership so an extension native running under the keyed host
+    // boundary (and a spawned OS thread) can hold a reference to the current
+    // runtime's state without a process-global lookup. Null = the host has
+    // not allocated per-runtime state (the legacy identity wrappers + the
+    // file-static default store serve that case). The container stores NO
+    // route material (§6.4, §10.3, §14.6): no route word, no expected key, no
+    // fingerprint, no digest/verifier — only the extensions' mutable
+    // operational state + per-runtime context/dispatch-base/slot-count
+    // handles + back-pointers for re-resolution.
+    std::shared_ptr<RuntimeExtensionState> ext_state;
+
+    // ─── Red 8: the immutable dispatch record + its storage (§9.8, §10.1,
+    // §10.3) ─────────────────────────────────────────────────────────────
+    // The keyed host boundary resolves a logical callable through the
+    // instance's CURRENT immutable ModuleDispatchRecord (its logical routes /
+    // domains / allowlist + the borrowed physical slot storage) and the
+    // transient provider-derived route word — NOT raw entry_table[logical_slot]
+    // (§9.8). The instance owns the record's storage (routes / domains /
+    // descriptors / allowlist — key-independent metadata, §10.1) and carries a
+    // borrowed view (`record`) over it. The host (or assemble_identity_
+    // dispatch_record) populates these; the safe keyed resolvers consult
+    // `record`. The storage + record carry NO route material (§3.3, §14.6):
+    // the abi_fingerprint in routes/domains is the canonical calling-convention
+    // classifier (Red 2), not a machine fingerprint; the route word is a
+    // per-call transient, never stored here.
+    RecordBuilderStorage record_storage;
+    ModuleDispatchRecord record{};
+
+    // ─── Red 8: the applicable hot-reload/generation guard (§9.8, §12.4) ───
+    // When non-null, the safe keyed API holds an ExecutionGuard on this domain
+    // from resolution through return or trap, so a reload that retires the
+    // replaced page cannot free code still in execution. Borrowed (the host
+    // owns the domain); null = no reload domain (the guard is a no-op). The
+    // guard is held across the call tree (nested script calls share it); the
+    // safe API manually leaves it on both normal return and trapped longjmp
+    // recovery (longjmp does not run C++ destructors, so the guard cannot be
+    // RAII-only across a trap).
+    HotReloadDomain* reload_domain = nullptr;
+};
+
+// ─── Red 8: assemble an identity ModuleDispatchRecord on a ModuleInstance ──
+// (§9.8, §10.1). Builds a minimal identity record over the instance's borrowed
+// entry_table + counts: logical routes where route[i].logical_slot == i (each
+// in a single identity domain), an all-set logical allowlist, and the physical
+// slot storage pointing at the instance's entry_table. The keyed resolver then
+// resolves a logical slot through the record (identity mode ->
+// physical_slots[logical_slot]) instead of raw entry_table[logical_slot]. For
+// a keyed module the host builds the record via build_module_dispatch_record
+// (Red 4) from a layout plan and stores it on the instance. Returns true on
+// success, false on a missing entry_table or zero counts. The record carries
+// NO route material (§3.3, §14.6).
+bool assemble_identity_dispatch_record(ModuleInstance& inst);
+
+// ─── Red 8: the current keyed runtime TLS (§6.6, §10.3) ─────────────────────
+// The keyed host boundary sets this thread-local to identify the current
+// keyed runtime on entry and clears it on every normal/trapped exit. It
+// identifies a RUNTIME (a ModuleInstance*); it carries NO route material
+// (a bare pointer, §6.4). Extension natives consult it to find the current
+// runtime's RuntimeExtensionState. Returns null when no keyed runtime is
+// active on this thread (the legacy identity wrappers serve that case via the
+// file-static default store).
+struct ModuleInstance* ember_current_keyed_runtime() noexcept;
+
+// ─── Red 8: the logical callable identity for the keyed host boundary ──────
+// (§2.1, §9.8). A lightweight logical identity: the logical slot within the
+// module (the module is implied by the ModuleInstance the resolver is called
+// on). The abi_fingerprint is optional (0 = the resolver validates the route
+// against its domain's fingerprint, which is the canonical classifier, not a
+// machine fingerprint — §7.1, §14.6). A physical dispatch index is NEVER
+// stored here (§2.3, §4.6).
+struct LogicalCallableId {
+    uint32_t logical_slot = 0;
+    uint64_t abi_fingerprint = 0;  // optional; 0 = let the route's domain own it
 };
 
 } // namespace ember

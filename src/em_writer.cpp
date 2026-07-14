@@ -35,6 +35,7 @@
 
 #include "em_writer.hpp"
 #include "em_type_codec.hpp"  // shared .em canonical-type codec (emit_type/emit_signature/validate_canonical_type/validate_signature)
+#include "thin_ir_ser.hpp"   // IR_BLOB_MAGIC / IR_BLOB_VERSION (v6 blob-version gate)
 
 #include <algorithm>
 #include <array>
@@ -296,6 +297,17 @@ bool write_em_file_v5(const EmModule& mod, const char* path, std::string* err) {
     return true;
 }
 
+bool write_em_bytes_v5(const EmModule& mod, std::vector<uint8_t>& out, std::string* err) {
+    uint64_t rodata_total = 0;
+    if (!preflight_em_module(mod, err, rodata_total, EM_VERSION_V5)) return false;
+    std::ostringstream ofs(std::ios::binary | std::ios::out);
+    if (!emit_em_content(ofs, mod, EM_VERSION_V5, rodata_total, err)) return false;
+    ofs.flush();
+    std::string s = ofs.str();
+    out.assign(s.begin(), s.end());
+    return true;
+}
+
 bool write_em_file_signed(const EmModule& mod, const char* path,
                           const std::array<uint8_t,32>& pub,
                           const std::array<uint8_t,64>& priv,
@@ -330,6 +342,153 @@ bool write_em_file_signed(const EmModule& mod, const char* path,
     emit_bytes(ofs, signature.data(), signature.size());
     ofs.flush();
     if (!ofs) { if (err) *err = "em_writer: I/O error during write/flush"; return false; }
+    return true;
+}
+
+// ─── v6 (Red 9, plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §11) ───────────
+namespace {
+uint16_t ir_blob_version(const std::vector<uint8_t>& blob) {
+    if (blob.size() < 6) return 0;
+    return static_cast<uint16_t>(blob[4]) | static_cast<uint16_t>(blob[5]) << 8;
+}
+bool preflight_v6_metadata(const EmModule& mod, std::string* err) {
+    if (!mod.has_v6 || !mod.v6) { if (err) *err = "em_writer: v6 module has no V6 metadata"; return false; }
+    const EmV6Metadata& m = *mod.v6;
+    if (m.strategy_id.empty()) { if (err) *err = "em_writer: v6 strategy id is empty"; return false; }
+    if (m.strategy_version != 1u) { if (err) *err = "em_writer: v6 unsupported strategy_version " + std::to_string(m.strategy_version); return false; }
+    if (m.dispatch_mode != EM_V6_DISPATCH_IDENTITY && m.dispatch_mode != EM_V6_DISPATCH_KEYED) { if (err) *err = "em_writer: v6 invalid dispatch_mode " + std::to_string(unsigned(m.dispatch_mode)); return false; }
+    if (m.logical_slot_count > m.physical_slot_count) { if (err) *err = "em_writer: v6 logical_slot_count > physical_slot_count"; return false; }
+    if (m.dispatch_mode == EM_V6_DISPATCH_IDENTITY && m.logical_slot_count != m.physical_slot_count) { if (err) *err = "em_writer: v6 identity mode requires logical == physical"; return false; }
+    if (m.capabilities.empty()) { if (err) *err = "em_writer: v6 capability matrix is empty"; return false; }
+    std::vector<bool> seen(EM_V6_CAP_MAX_KNOWN + 1, false);
+    bool has_keyed_runtime = false, has_blob_v2 = false, has_strategy = false, has_mode = false, has_domain_set = false;
+    for (const auto& c : m.capabilities) {
+        if (c.capability_id == 0 || c.capability_id > EM_V6_CAP_MAX_KNOWN) { if (err) *err = "em_writer: v6 unrecognized capability id " + std::to_string(c.capability_id); return false; }
+        if (seen[c.capability_id]) { if (err) *err = "em_writer: v6 duplicate capability id " + std::to_string(c.capability_id); return false; }
+        seen[c.capability_id] = true;
+        switch (c.capability_id) {
+            case EM_V6_CAP_KEYED_DISPATCH_RUNTIME: has_keyed_runtime = true; if (c.required_value == 0) { if (err) *err = "em_writer: v6 CapKeyedDispatchRuntime required_value == 0"; return false; } break;
+            case EM_V6_CAP_BLOB_V2_RE_EMIT: has_blob_v2 = true; if (c.required_value == 0) { if (err) *err = "em_writer: v6 CapBlobV2ReEmit required_value == 0"; return false; } break;
+            case EM_V6_CAP_DISPATCH_STRATEGY: has_strategy = true; if (c.required_value != m.strategy_version) { if (err) *err = "em_writer: v6 CapDispatchStrategy value != strategy_version"; return false; } break;
+            case EM_V6_CAP_DISPATCH_MODE: has_mode = true; if (c.required_value != m.dispatch_mode) { if (err) *err = "em_writer: v6 CapDispatchMode value != dispatch_mode"; return false; } break;
+            case EM_V6_CAP_ABI_DOMAIN_SET: has_domain_set = true; if (c.required_value != m.domains.size()) { if (err) *err = "em_writer: v6 CapAbiDomainSet value != domains.size()"; return false; } break;
+            default: if (err) *err = "em_writer: v6 unrecognized capability id " + std::to_string(c.capability_id); return false;
+        }
+    }
+    if (m.dispatch_mode == EM_V6_DISPATCH_KEYED && !has_keyed_runtime) { if (err) *err = "em_writer: v6 keyed module missing CapKeyedDispatchRuntime"; return false; }
+    if (!has_blob_v2) { if (err) *err = "em_writer: v6 module missing CapBlobV2ReEmit"; return false; }
+    if (!has_strategy) { if (err) *err = "em_writer: v6 module missing CapDispatchStrategy"; return false; }
+    if (!has_mode) { if (err) *err = "em_writer: v6 module missing CapDispatchMode"; return false; }
+    if (!has_domain_set) { if (err) *err = "em_writer: v6 module missing CapAbiDomainSet"; return false; }
+    if (m.logical_routes.size() != m.logical_slot_count) { if (err) *err = "em_writer: v6 logical_routes size != logical_slot_count"; return false; }
+    std::vector<bool> ls_seen(m.logical_slot_count, false);
+    for (const auto& r : m.logical_routes) { if (r.logical_slot >= m.logical_slot_count || ls_seen[r.logical_slot]) { if (err) *err = "em_writer: v6 logical route slot out of range or duplicate"; return false; } ls_seen[r.logical_slot] = true; }
+    if (m.physical_entries.size() != m.physical_slot_count) { if (err) *err = "em_writer: v6 physical_entries size != physical_slot_count"; return false; }
+    std::vector<bool> ps_seen(m.physical_slot_count, false);
+    for (const auto& p : m.physical_entries) { if (p.physical_slot >= m.physical_slot_count || ps_seen[p.physical_slot]) { if (err) *err = "em_writer: v6 physical entry slot out of range or duplicate"; return false; } ps_seen[p.physical_slot] = true; }
+    uint32_t keyed_domains = 0;
+    for (const auto& d : m.domains) if (d.padding_count > 0) ++keyed_domains;
+    if (m.padding_descriptors.size() != keyed_domains) { if (err) *err = "em_writer: v6 padding descriptor count != keyed domain count"; return false; }
+    if (m.dispatch_mode == EM_V6_DISPATCH_IDENTITY && !m.padding_descriptors.empty()) { if (err) *err = "em_writer: v6 identity mode must have no padding descriptors"; return false; }
+    for (const auto& f : mod.functions) {
+        if (!f.ir_blob.empty()) {
+            const uint16_t bv = ir_blob_version(f.ir_blob);
+            if (bv != IR_BLOB_VERSION) { if (err) *err = "em_writer: v6 IR function \"" + f.name + "\" carries blob version " + std::to_string(bv) + " (require blob v2)"; return false; }
+        }
+    }
+    return true;
+}
+void emit_u64_le(std::ostream& ofs, uint64_t v) {
+    uint8_t b[8];
+    for (int i = 0; i < 8; ++i) b[i] = static_cast<uint8_t>((v >> (8 * i)) & 0xFFu);
+    ofs.write(reinterpret_cast<const char*>(b), 8);
+}
+bool emit_v6_metadata(std::ostream& ofs, const EmV6Metadata& m, std::string* err) {
+    emit_u32_le(ofs, EM_V6_META_MAGIC); emit_u32_le(ofs, EM_V6_META_LAYOUT);
+    if (m.strategy_id.size() > 0xFFFFu) { if (err) *err = "em_writer: v6 strategy id too long (>u16)"; return false; }
+    emit_u16_le(ofs, static_cast<uint16_t>(m.strategy_id.size())); emit_string(ofs, m.strategy_id);
+    emit_u32_le(ofs, m.strategy_version); emit_u8(ofs, m.dispatch_mode);
+    emit_u32_le(ofs, m.logical_slot_count); emit_u32_le(ofs, m.physical_slot_count);
+    emit_u32_le(ofs, static_cast<uint32_t>(m.capabilities.size()));
+    for (const auto& c : m.capabilities) { emit_u16_le(ofs, c.capability_id); emit_u32_le(ofs, c.required_value); }
+    emit_u32_le(ofs, static_cast<uint32_t>(m.domains.size()));
+    for (const auto& d : m.domains) {
+        emit_u8(ofs, d.visibility); emit_u8(ofs, d.calling_mode);
+        emit_u64_le(ofs, d.abi_fingerprint); emit_u64_le(ofs, d.domain_salt);
+        emit_u32_le(ofs, d.strategy_version); emit_u32_le(ofs, d.physical_base);
+        emit_u32_le(ofs, d.physical_count); emit_u32_le(ofs, d.logical_count);
+        emit_u32_le(ofs, d.padding_count); emit_u32_le(ofs, d.padding_ordinal);
+        if (d.dispatch_domain.size() > 0xFFFFu) { if (err) *err = "em_writer: v6 domain dispatch_domain too long (>u16)"; return false; }
+        emit_u16_le(ofs, static_cast<uint16_t>(d.dispatch_domain.size())); emit_string(ofs, d.dispatch_domain);
+        emit_u32_le(ofs, static_cast<uint32_t>(d.logical_slots.size()));
+        for (uint32_t s : d.logical_slots) emit_u32_le(ofs, s);
+    }
+    emit_u32_le(ofs, static_cast<uint32_t>(m.logical_routes.size()));
+    for (const auto& r : m.logical_routes) {
+        emit_u32_le(ofs, r.logical_slot); emit_u32_le(ofs, r.domain_index); emit_u32_le(ofs, r.ordinal);
+        emit_u64_le(ofs, r.abi_fingerprint); emit_u8(ofs, r.visibility); emit_u8(ofs, r.calling_mode);
+        if (r.dispatch_domain.size() > 0xFFFFu) { if (err) *err = "em_writer: v6 route dispatch_domain too long (>u16)"; return false; }
+        emit_u16_le(ofs, static_cast<uint16_t>(r.dispatch_domain.size())); emit_string(ofs, r.dispatch_domain);
+    }
+    emit_u32_le(ofs, static_cast<uint32_t>(m.physical_entries.size()));
+    for (const auto& p : m.physical_entries) {
+        emit_u32_le(ofs, p.physical_slot); emit_u64_le(ofs, p.abi_fingerprint);
+        emit_u8(ofs, p.visibility); emit_u8(ofs, p.calling_mode);
+        if (p.dispatch_domain.size() > 0xFFFFu) { if (err) *err = "em_writer: v6 physical dispatch_domain too long (>u16)"; return false; }
+        emit_u16_le(ofs, static_cast<uint16_t>(p.dispatch_domain.size())); emit_string(ofs, p.dispatch_domain);
+        if (p.name.size() > 0xFFFFu) { if (err) *err = "em_writer: v6 physical name too long (>u16)"; return false; }
+        emit_u16_le(ofs, static_cast<uint16_t>(p.name.size())); emit_string(ofs, p.name);
+        emit_u8(ofs, p.is_padding ? 1u : 0u);
+        emit_u32_le(ofs, p.logical_slot); emit_u32_le(ofs, p.domain_index); emit_u32_le(ofs, p.ordinal);
+    }
+    emit_u32_le(ofs, static_cast<uint32_t>(m.padding_descriptors.size()));
+    for (const auto& pd : m.padding_descriptors) {
+        emit_u32_le(ofs, pd.domain_index); emit_u32_le(ofs, pd.ordinal); emit_u32_le(ofs, pd.physical_slot);
+        emit_u64_le(ofs, pd.abi_fingerprint); emit_u8(ofs, pd.visibility); emit_u8(ofs, pd.calling_mode);
+        if (pd.dispatch_domain.size() > 0xFFFFu) { if (err) *err = "em_writer: v6 padding dispatch_domain too long (>u16)"; return false; }
+        emit_u16_le(ofs, static_cast<uint16_t>(pd.dispatch_domain.size())); emit_string(ofs, pd.dispatch_domain);
+    }
+    return true;
+}
+bool emit_v6_content(std::ostream& ofs, const EmModule& mod, uint64_t rodata_total, std::string* err) {
+    emit_u32_le(ofs, EM_MAGIC); emit_u32_le(ofs, EM_VERSION_V6); emit_u32_le(ofs, 0u);
+    emit_u32_le(ofs, static_cast<uint32_t>(mod.functions.size()));
+    emit_u32_le(ofs, static_cast<uint32_t>(mod.globals.size()));
+    emit_u32_le(ofs, static_cast<uint32_t>(rodata_total));
+    emit_u32_le(ofs, mod.entry_slot);
+    emit_u32_le(ofs, static_cast<uint32_t>(EM_BUILD_ID));
+    emit_u32_le(ofs, static_cast<uint32_t>(EM_BUILD_ID >> 32));
+    emit_u32_le(ofs, EM_TARGET_ABI_HASH);
+    if (!emit_v6_metadata(ofs, *mod.v6, err)) return false;
+    std::ostringstream body(std::ios::binary | std::ios::out);
+    if (!emit_em_content(body, mod, EM_VERSION_V5, rodata_total, err)) return false;
+    std::string bs = body.str();
+    if (bs.size() < EM_HEADER_SIZE) { if (err) *err = "em_writer: v6 internal: v5 body shorter than header"; return false; }
+    ofs.write(bs.data() + EM_HEADER_SIZE, static_cast<std::streamsize>(bs.size() - EM_HEADER_SIZE));
+    return true;
+}
+} // namespace
+
+bool write_em_file_v6(const EmModule& mod, const char* path, std::string* err) {
+    uint64_t rodata_total = 0;
+    if (!preflight_em_module(mod, err, rodata_total, EM_VERSION_V5)) return false;
+    if (!preflight_v6_metadata(mod, err)) return false;
+    std::ofstream ofs(path, std::ios::binary | std::ios::out | std::ios::trunc);
+    if (!ofs) { if (err) *err = std::string("em_writer: could not open output file: ") + path; return false; }
+    if (!emit_v6_content(ofs, mod, rodata_total, err)) { ofs.close(); return false; }
+    ofs.flush();
+    if (!ofs) { if (err) *err = "em_writer: I/O error during write/flush"; return false; }
+    return true;
+}
+bool write_em_bytes_v6(const EmModule& mod, std::vector<uint8_t>& out, std::string* err) {
+    uint64_t rodata_total = 0;
+    if (!preflight_em_module(mod, err, rodata_total, EM_VERSION_V5)) return false;
+    if (!preflight_v6_metadata(mod, err)) return false;
+    std::ostringstream ofs(std::ios::binary | std::ios::out);
+    if (!emit_v6_content(ofs, mod, rodata_total, err)) return false;
+    ofs.flush();
+    std::string s = ofs.str();
+    out.assign(s.begin(), s.end());
     return true;
 }
 

@@ -53,6 +53,25 @@
 #include <mutex>
 #include <string>
 
+// Portable setjmp/longjmp for the host-managed trap-recovery checkpoint.
+// The JIT'd try/catch mechanism uses a CUSTOM register save/restore (not libc
+// jmp_buf), so this only affects the HOST-side checkpoint in context_t. On
+// Windows/MinGW, __builtin_setjmp/__builtin_longjmp save+restore the FULL
+// register file (including callee-saved r14/r15 + SSE) the JIT'd code and the
+// C++ frame rely on; the MSVCRT setjmp/longjmp save fewer registers, which
+// corrupts the caller's callee-saved state across a trap longjmp and crashes
+// the host (SEGFAULT before/inside main). On Linux/Clang the jmp_buf type is
+// __jmp_buf_tag[1] (incompatible with __builtin_setjmp's void**), so the
+// standard setjmp/longjmp is used there. The macros resolve to the correct
+// primitive per platform; all host checkpoint call sites use them.
+#if defined(__GNUC__) && (defined(_WIN32) || defined(__MINGW32__) || defined(__MINGW64__))
+  #define EMBER_SETJMP(buf) __builtin_setjmp(buf)
+  #define EMBER_LONGJMP(buf, val) __builtin_longjmp(buf, val)
+#else
+  #define EMBER_SETJMP(buf) setjmp(buf)
+  #define EMBER_LONGJMP(buf, val) longjmp(buf, val)
+#endif
+
 namespace ember {
 
 // Default maximum simultaneously active script-issued calls (script or native,

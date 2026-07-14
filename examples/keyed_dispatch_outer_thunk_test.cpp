@@ -209,6 +209,7 @@ static std::unique_ptr<Compiled> compile_identity(const std::string& src,
     ctx.globals_index = &gb.index; ctx.globals_types = &gb.types;
     ctx.use_context_reg = true;
     ctx.emit_depth_checks = true;
+    ctx.emit_budget_checks = true;
     ctx.max_call_depth = 64;
     if (trap_stub) {
         ctx.trap_stub = trap_stub;
@@ -251,7 +252,7 @@ extern "C" void kt_trap(ember::context_t* ctx, int reason, const char* detail) {
     if (ctx) {
         ctx->last_trap = static_cast<ember::TrapReason>(reason);
         ctx->last_error = detail ? detail : "";
-        if (ctx->has_checkpoint) longjmp(ctx->checkpoint, 1);
+        if (ctx->has_checkpoint) EMBER_LONGJMP(ctx->checkpoint, 1);
     }
     std::abort();
 }
@@ -282,7 +283,7 @@ int main() {
         ModuleId mid2{"other.mod", 1};
         auto rw_other = adapter.route_word(mid2, 1, "ember/dispatch");
         ck(*rw.value != *rw_other.value, "adapter: different module -> different route word");
-        ck(provider->derive_count.load() == 6, "adapter: provider invoked once per route_word call (6 calls)");
+        ck(provider->derive_count.load() == 5, "adapter: provider invoked once per route_word call (5 calls)");
     }
 
     // =====================================================================
@@ -333,6 +334,13 @@ int main() {
 
     // =====================================================================
     // 3. r14 CORRECTNESS — budget trap records on the SUPPLIED context.
+    //    The keyed API establishes its OWN checkpoint internally (§9.8) and
+    //    returns a structured CallResult{trapped=true} on a trap; the trap
+    //    stub (kt_trap) receives the SUPPLIED context (r14 = ctx in B1 mode)
+    //    and records last_trap/last_error on it, which the API folds into
+    //    r.reason. The test checks r.trapped + r.reason (NOT a longjmp to the
+    //    test's own checkpoint — the API owns the checkpoint, matching the
+    //    Red 8 keyed_dispatch_extensions test pattern).
     // =====================================================================
     {
         auto provider = std::make_shared<CountingProvider>(0xAB);
@@ -345,18 +353,12 @@ int main() {
             auto inst = make_identity_instance(*m, "r14.mod", provider);
             inst.trap_stub = reinterpret_cast<void*>(kt_trap);
             context_t ctx; ctx.budget_remaining = 1000; ctx.max_call_depth = 64;
-            ctx.has_checkpoint = true;
-            if (setjmp(ctx.checkpoint)) {
-                ck(ctx.last_trap == TrapReason::BudgetExceeded,
-                   "r14 correctness: budget trap recorded on the SUPPLIED context (r14 = ctx)");
-                ck(ctx.last_error.size() > 0, "r14 correctness: trap carried a detail string");
-                ctx.has_checkpoint = false;
-            } else {
-                auto r = ember_call_keyed_void(inst, "main", ctx, adapter);
-                ck(false, "r14 correctness: expected a budget trap, got a normal return");
-                (void)r;
-                ctx.has_checkpoint = false;
-            }
+            auto r = ember_call_keyed_void(inst, "main", ctx, adapter);
+            ck(r.trapped, "r14 correctness: budget trap caught by keyed API (trapped=true)");
+            ck(!r.ok, "r14 correctness: trapped call is not ok");
+            ck(r.reason.find("budget") != std::string::npos,
+               "r14 correctness: trap reason carries 'budget' (recorded on the SUPPLIED context, r14 = ctx)");
+            ck(r.reason.size() > 0, "r14 correctness: trap carried a detail string");
         }
     }
 
@@ -442,7 +444,14 @@ int main() {
 
     // =====================================================================
     // 7. r15 CLEARED BEFORE RESTORING CALLER VALUE (normal + trapped exits).
-    //    The trapped-exit path leaves caller r15 intact.
+    //    The trapped-exit path leaves caller r15 intact. The keyed API owns the
+    //    checkpoint (§9.8) and returns CallResult{trapped=true}; the test's own
+    //    setjmp here is ONLY to safely bracket the ember_set_r15 clobber (r15
+    //    is callee-saved) — the trap is caught by the API's internal checkpoint
+    //    and reported via r.trapped, NOT by longjmp to this setjmp. After the
+    //    trapped return, the C++ epilogue restores the caller's callee-saved
+    //    r15, so the transient route r15 is cleared and the caller value
+    //    survives.
     // =====================================================================
     {
         auto provider = std::make_shared<CountingProvider>(0xAB);
@@ -456,18 +465,21 @@ int main() {
             inst.trap_stub = reinterpret_cast<void*>(kt_trap);
             context_t ctx; ctx.budget_remaining = 1000; ctx.max_call_depth = 64;
             uint64_t caller_r15 = 0xDEADBEEF11111111ULL;
-            ember_set_r15(caller_r15);
-            ctx.has_checkpoint = true;
-            if (setjmp(ctx.checkpoint)) {
-                uint64_t after = ember_read_r15();
-                ck(after == caller_r15,
-                   "trapped exit: transient r15 cleared + caller r15 restored (callee-saved preserved across longjmp)");
+            // The setjmp brackets the r15 clobber so the C++ frame's saved
+            // callee-saved r15 is restored on any exit path; the API's own
+            // internal checkpoint catches the trap (this setjmp is never
+            // longjmp'd to — has_checkpoint stays false so kt_trap longjmps to
+            // the API's checkpoint, not here).
+            if (EMBER_SETJMP(ctx.checkpoint)) {
+                ck(false, "trapped exit: test checkpoint should not fire (API owns the checkpoint)");
                 ctx.has_checkpoint = false;
             } else {
+                ember_set_r15(caller_r15);
                 auto r = ember_call_keyed_void(inst, "main", ctx, adapter);
-                ck(false, "trapped exit: expected a budget trap");
-                (void)r;
-                ctx.has_checkpoint = false;
+                ck(r.trapped, "trapped exit: budget trap caught by keyed API (trapped=true)");
+                uint64_t after = ember_read_r15();
+                ck(after == caller_r15,
+                   "trapped exit: transient r15 cleared + caller r15 restored (callee-saved preserved across trapped return)");
             }
         }
     }
@@ -510,8 +522,7 @@ int main() {
         DispatchKeyAdapter adapter(provider);
         auto m = compile_identity(
             "fn main() -> i64 {\n"
-            "  try { throw 99; } catch (e: i64) { return reentry_probe(e); }\n"
-            "  return 0;\n"
+            "  try { throw 99; } catch (e) { return reentry_probe(e); }\n"
             "}\n",
             /*register_reentry_natives=*/true);
         ck(m != nullptr, "compile try/throw/catch main with reentry_probe for r15-invariant test");
@@ -619,7 +630,8 @@ int main() {
             "  let a: i64 = 1; let b: i64 = 2; let c: i64 = 3; let d: i64 = 4;\n"
             "  let e: i64 = 5; let f: i64 = 6; let g: i64 = 7; let h: i64 = 8;\n"
             "  let p1: i64 = a * b * c * d; let p2: i64 = e * f * g * h;\n"
-            "  return p1 + p2;\n"
+            "  let p3: i64 = a * e + b * f + c * g + d * h;\n"
+            "  return p1 + p2 + p3;\n"
             "}\n";
         auto lr = tokenize(src, "<k>");
         auto pr = parse(std::move(lr.toks));

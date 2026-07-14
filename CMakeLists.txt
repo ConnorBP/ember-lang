@@ -1426,6 +1426,25 @@ if(WIN32)
 endif()
 add_test(NAME em_v5_mixed COMMAND em_v5_mixed_test)
 
+add_executable(em_v6_keyed examples/em_v6_keyed_test.cpp)
+target_link_libraries(em_v6_keyed PRIVATE ember ember_frontend)
+if(WIN32)
+    target_link_libraries(em_v6_keyed PRIVATE kernel32)
+endif()
+
+# keyed_dispatch_extensions - Red 8 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md
+# §6.5-§6.7, §9.8, §10.3, §12.4, §14.2, §14.3 Red 8): the host / lifecycle /
+# thread / coroutine integration gate for keyed dispatch. NOT a CTest entry:
+# the configured/filtered CTest count must stay unchanged (§14.1); the target
+# building cleanly + the executable passing IS the gate.
+add_executable(keyed_dispatch_extensions examples/keyed_dispatch_extensions_test.cpp)
+target_link_libraries(keyed_dispatch_extensions PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_lifecycle ember_ext_thread ember_ext_coroutine)
+if(WIN32)
+    target_link_libraries(keyed_dispatch_extensions PRIVATE kernel32)
+endif()
+
 set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
     v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
     array_lit aggregate_global em_signed codegen_opt thin_ir_struct thin_ir

@@ -12,6 +12,8 @@
 #include "thin_emit.hpp"    // Stage B: emit_x64 (re-emit deserialized IR -> x64)
 #include "codegen.hpp"      // Stage B: CodeGenCtx (the load-time re-emit context)
 #include "dispatch_table.hpp" // Stage B: DispatchTable (for the load-time dispatch base)
+#include "keyed_dispatch.hpp"  // Red 9: keyed_dispatch_permute_runtime (V6 keyed resolve)
+#include "module_layout.hpp"   // Red 9: ModuleDispatchRecord / validate_dispatch_record / ember_keyed_padding_trap_target / ember_resolve_keyed_dispatch
 
 #include <algorithm>
 #include <array>
@@ -93,6 +95,15 @@ struct Reader {
             static_cast<uint32_t>(p[3]) << 24;
         return true;
     }
+
+    bool u64(uint64_t& v) {
+        const uint8_t* p = nullptr;
+        if (!take(8, p)) return false;
+        v = 0;
+        for (int i = 0; i < 8; ++i)
+            v |= static_cast<uint64_t>(p[i]) << (8 * i);
+        return true;
+    }
 };
 
 void write_u64_le(uint8_t* p, uint64_t v) {
@@ -127,6 +138,19 @@ struct ParsedFn {
     std::vector<uint8_t> ir_blob;
 };
 
+struct ParsedV6Meta {
+    std::string strategy_id;
+    uint32_t strategy_version = 1;
+    uint8_t  dispatch_mode = 0;
+    uint32_t logical_slot_count = 0;
+    uint32_t physical_slot_count = 0;
+    std::vector<EmV6Capability> capabilities;
+    std::vector<EmV6DomainDescriptor> domains;
+    std::vector<EmV6LogicalRoute> logical_routes;
+    std::vector<EmV6PhysicalEntry> physical_entries;
+    std::vector<EmV6PaddingDescriptor> padding_descriptors;
+};
+
 struct ParsedModule {
     std::vector<ParsedFn> functions;
     std::vector<uint8_t> globals;
@@ -145,6 +169,8 @@ struct ParsedModule {
     std::array<uint8_t, EM_SIG_PUBKEY_SIZE>  pubkey_id{};
     std::array<uint8_t, EM_SIG_SIGNATURE_SIZE> signature{};
     bool has_signature_block = false;
+    bool present_v6 = false;
+    std::shared_ptr<ParsedV6Meta> v6;
 };
 
 // Owns pages until the complete module has been sealed and committed to `out`.
@@ -157,6 +183,14 @@ struct StagedModule {
     uint32_t entry_slot = EM_NO_ENTRY;
     uint32_t version = EM_VERSION_V1;
     std::vector<EmSignature> signatures_by_slot;
+    bool is_v6 = false;
+    bool v6_keyed = false;
+    uint8_t v6_dispatch_mode = 0;
+    uint32_t v6_logical_slot_count = 0;
+    uint32_t v6_physical_slot_count = 0;
+    std::shared_ptr<EmV6Metadata> v6_metadata;
+    std::shared_ptr<RecordBuilderStorage> v6_record_storage;
+    std::shared_ptr<ModuleDispatchRecord> v6_record;
 
     ~StagedModule() {
         for (void* page : pages) free_executable(page);
@@ -170,6 +204,14 @@ struct StagedModule {
         signatures_by_slot.swap(out.signatures_by_slot);
         std::swap(entry_slot, out.entry_slot);
         std::swap(version, out.format_version);
+        std::swap(is_v6, out.is_v6);
+        std::swap(v6_keyed, out.v6_keyed);
+        std::swap(v6_dispatch_mode, out.v6_dispatch_mode);
+        std::swap(v6_logical_slot_count, out.v6_logical_slot_count);
+        std::swap(v6_physical_slot_count, out.v6_physical_slot_count);
+        v6_metadata.swap(out.v6_metadata);
+        v6_record_storage.swap(out.v6_record_storage);
+        v6_record.swap(out.v6_record);
         // This object now owns the old contents of `out`; its destructor frees
         // any old pages after the new module has been atomically assembled.
     }
@@ -216,6 +258,94 @@ bool parse_signature(Reader& rd, EmSignature& sig, std::string* err) {
     return true;
 }
 
+namespace {
+bool v6_parse_name(Reader& rd, std::string& out, const char* field, std::string* err) {
+    uint16_t len = 0;
+    if (!rd.u16(len)) { set_error(err, std::string("em_loader: v6: truncated ") + field + " length"); return false; }
+    if (len > MAX_NAME_SIZE) { set_error(err, std::string("em_loader: v6: ") + field + " exceeds MAX_NAME_SIZE"); return false; }
+    const uint8_t* p = nullptr;
+    if (!rd.take(len, p)) { set_error(err, std::string("em_loader: v6: truncated ") + field); return false; }
+    out.assign(reinterpret_cast<const char*>(p), len);
+    return true;
+}
+} // namespace
+
+constexpr uint32_t EM_V6_MAX_CAPS = 64u;
+constexpr uint32_t EM_V6_MAX_DOMAINS = MAX_SLOTS;
+constexpr uint32_t EM_V6_MAX_ROUTES = MAX_SLOTS;
+constexpr uint32_t EM_V6_MAX_PHYS = MAX_SLOTS;
+constexpr uint32_t EM_V6_MAX_PADDING = MAX_SLOTS;
+constexpr uint32_t EM_V6_MAX_DOM_SLOTS = MAX_SLOTS;
+
+bool parse_v6_metadata(Reader& rd, ParsedV6Meta& m, std::string* err) {
+    uint32_t magic = 0, layout = 0;
+    if (!rd.u32(magic) || !rd.u32(layout)) { set_error(err, "em_loader: v6: truncated metadata magic/layout"); return false; }
+    if (magic != EM_V6_META_MAGIC) { set_error(err, "em_loader: v6: bad metadata magic"); return false; }
+    if (layout != EM_V6_META_LAYOUT) { set_error(err, "em_loader: v6: unsupported metadata layout version " + std::to_string(layout)); return false; }
+    if (!v6_parse_name(rd, m.strategy_id, "strategy id", err)) return false;
+    if (!rd.u32(m.strategy_version)) { set_error(err, "em_loader: v6: truncated strategy_version"); return false; }
+    if (!rd.u8(m.dispatch_mode)) { set_error(err, "em_loader: v6: truncated dispatch_mode"); return false; }
+    if (m.dispatch_mode != EM_V6_DISPATCH_IDENTITY && m.dispatch_mode != EM_V6_DISPATCH_KEYED) { set_error(err, "em_loader: v6: invalid dispatch_mode " + std::to_string(unsigned(m.dispatch_mode))); return false; }
+    if (!rd.u32(m.logical_slot_count) || !rd.u32(m.physical_slot_count)) { set_error(err, "em_loader: v6: truncated logical/physical counts"); return false; }
+    if (m.logical_slot_count > MAX_SLOTS || m.physical_slot_count > MAX_SLOTS) { set_error(err, "em_loader: v6: counts exceed MAX_SLOTS"); return false; }
+    if (m.logical_slot_count > m.physical_slot_count) { set_error(err, "em_loader: v6: logical_slot_count > physical_slot_count"); return false; }
+    uint32_t cap_count = 0;
+    if (!rd.u32(cap_count)) { set_error(err, "em_loader: v6: truncated capability count"); return false; }
+    if (cap_count > EM_V6_MAX_CAPS) { set_error(err, "em_loader: v6: capability count exceeds limit"); return false; }
+    m.capabilities.resize(cap_count);
+    for (auto& c : m.capabilities) { if (!rd.u16(c.capability_id) || !rd.u32(c.required_value)) { set_error(err, "em_loader: v6: truncated capability entry"); return false; } }
+    uint32_t domain_count = 0;
+    if (!rd.u32(domain_count)) { set_error(err, "em_loader: v6: truncated domain count"); return false; }
+    if (domain_count > EM_V6_MAX_DOMAINS) { set_error(err, "em_loader: v6: domain count exceeds limit"); return false; }
+    m.domains.resize(domain_count);
+    for (auto& d : m.domains) {
+        if (!rd.u8(d.visibility) || !rd.u8(d.calling_mode) || !rd.u64(d.abi_fingerprint) || !rd.u64(d.domain_salt) ||
+            !rd.u32(d.strategy_version) || !rd.u32(d.physical_base) || !rd.u32(d.physical_count) ||
+            !rd.u32(d.logical_count) || !rd.u32(d.padding_count) || !rd.u32(d.padding_ordinal)) { set_error(err, "em_loader: v6: truncated domain descriptor"); return false; }
+        if (d.visibility > 1 || d.calling_mode > 1) { set_error(err, "em_loader: v6: invalid domain visibility/calling_mode"); return false; }
+        if (d.physical_base > m.physical_slot_count || uint64_t(d.physical_base) + d.physical_count > m.physical_slot_count) { set_error(err, "em_loader: v6: domain physical range out of bounds"); return false; }
+        if (d.logical_count + d.padding_count != d.physical_count) { set_error(err, "em_loader: v6: domain logical+padding != physical_count"); return false; }
+        if (!v6_parse_name(rd, d.dispatch_domain, "domain dispatch_domain", err)) return false;
+        uint32_t ls_count = 0;
+        if (!rd.u32(ls_count)) { set_error(err, "em_loader: v6: truncated domain logical_slots count"); return false; }
+        if (ls_count > EM_V6_MAX_DOM_SLOTS || ls_count != d.logical_count) { set_error(err, "em_loader: v6: domain logical_slots count mismatch"); return false; }
+        d.logical_slots.resize(ls_count);
+        for (auto& s : d.logical_slots) { if (!rd.u32(s)) { set_error(err, "em_loader: v6: truncated domain logical_slot"); return false; } }
+    }
+    uint32_t route_count = 0;
+    if (!rd.u32(route_count)) { set_error(err, "em_loader: v6: truncated route count"); return false; }
+    if (route_count > EM_V6_MAX_ROUTES || route_count != m.logical_slot_count) { set_error(err, "em_loader: v6: route count != logical_slot_count"); return false; }
+    m.logical_routes.resize(route_count);
+    for (auto& r : m.logical_routes) {
+        if (!rd.u32(r.logical_slot) || !rd.u32(r.domain_index) || !rd.u32(r.ordinal) ||
+            !rd.u64(r.abi_fingerprint) || !rd.u8(r.visibility) || !rd.u8(r.calling_mode)) { set_error(err, "em_loader: v6: truncated route descriptor"); return false; }
+        if (!v6_parse_name(rd, r.dispatch_domain, "route dispatch_domain", err)) return false;
+    }
+    uint32_t phys_count = 0;
+    if (!rd.u32(phys_count)) { set_error(err, "em_loader: v6: truncated physical entry count"); return false; }
+    if (phys_count > EM_V6_MAX_PHYS || phys_count != m.physical_slot_count) { set_error(err, "em_loader: v6: physical entry count != physical_slot_count"); return false; }
+    m.physical_entries.resize(phys_count);
+    for (auto& p : m.physical_entries) {
+        if (!rd.u32(p.physical_slot) || !rd.u64(p.abi_fingerprint) || !rd.u8(p.visibility) || !rd.u8(p.calling_mode)) { set_error(err, "em_loader: v6: truncated physical entry"); return false; }
+        if (!v6_parse_name(rd, p.dispatch_domain, "physical dispatch_domain", err)) return false;
+        if (!v6_parse_name(rd, p.name, "physical name", err)) return false;
+        uint8_t is_pad = 0;
+        if (!rd.u8(is_pad)) { set_error(err, "em_loader: v6: truncated physical is_padding"); return false; }
+        p.is_padding = (is_pad != 0);
+        if (!rd.u32(p.logical_slot) || !rd.u32(p.domain_index) || !rd.u32(p.ordinal)) { set_error(err, "em_loader: v6: truncated physical entry tail"); return false; }
+    }
+    uint32_t pad_count = 0;
+    if (!rd.u32(pad_count)) { set_error(err, "em_loader: v6: truncated padding count"); return false; }
+    if (pad_count > EM_V6_MAX_PADDING) { set_error(err, "em_loader: v6: padding count exceeds limit"); return false; }
+    m.padding_descriptors.resize(pad_count);
+    for (auto& pd : m.padding_descriptors) {
+        if (!rd.u32(pd.domain_index) || !rd.u32(pd.ordinal) || !rd.u32(pd.physical_slot) ||
+            !rd.u64(pd.abi_fingerprint) || !rd.u8(pd.visibility) || !rd.u8(pd.calling_mode)) { set_error(err, "em_loader: v6: truncated padding descriptor"); return false; }
+        if (!v6_parse_name(rd, pd.dispatch_domain, "padding dispatch_domain", err)) return false;
+    }
+    return true;
+}
+
 bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
                 ModuleRegistry* registry,
                 const std::unordered_map<std::string, NativeSig>* natives,
@@ -239,7 +369,7 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
     }
     if (version != EM_VERSION_V1 && version != EM_VERSION_V2 &&
         version != EM_VERSION_V3 && version != EM_VERSION &&
-        version != EM_VERSION_V5) {
+        version != EM_VERSION_V5 && version != EM_VERSION_V6) {
         set_error(err, "em_loader: format: unsupported version " + std::to_string(version)); return false;
     }
     mod.version = version;
@@ -261,6 +391,13 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
     if (rodata_total > MAX_FILE_SIZE) {
         set_error(err, "em_loader: limit: rodata_total exceeds file limit");
         return false;
+    }
+
+    if (version == EM_VERSION_V6) {
+        auto v6m = std::make_shared<ParsedV6Meta>();
+        if (!parse_v6_metadata(rd, *v6m, err)) return false;
+        mod.present_v6 = true;
+        mod.v6 = std::move(v6m);
     }
 
     // Even zero-length records need 18 fixed bytes. Check multiplication and
@@ -299,14 +436,14 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
 
         // v5 per-function record: is_ir byte + hoisted signature, then either
         // the IR blob (is_ir=1) or the v4 raw-x86 body (is_ir=0).
-        if (version == EM_VERSION_V5) {
+        if (version == EM_VERSION_V5 || version == EM_VERSION_V6) {
             uint8_t is_ir = 0;
             if (!rd.u8(is_ir)) {
-                set_error(err, "em_loader: format: truncated v5 is_ir byte");
+                set_error(err, "em_loader: format: truncated is_ir byte");
                 return false;
             }
             if (is_ir != 0 && is_ir != 1) {
-                set_error(err, "em_loader: format: invalid v5 is_ir byte (must be 0 or 1)");
+                set_error(err, "em_loader: format: invalid is_ir byte (must be 0 or 1)");
                 return false;
             }
             // Record the explicit per-function IR/raw marker. This is the
@@ -429,7 +566,7 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
         // the name directory's contents differ - F1 visibility). v5 hoisted
         // the signature above the is_ir branch, so it is NOT re-read here.
         if(version >= EM_VERSION_V2) {
-            if (version != EM_VERSION_V5) {
+            if (version != EM_VERSION_V5 && version != EM_VERSION_V6) {
                 if(!parse_signature(rd,f.signature,err))return false;
             }
             uint32_t binding_count=0;if(!rd.u32(binding_count)){set_error(err,"em_loader: format: truncated native binding count");return false;}
@@ -560,10 +697,81 @@ bool parse_file(const std::vector<uint8_t>& file, ParsedModule& mod,
         return false;
     }
 
-    mod.dispatch_size = function_count == 0
-        ? 0
-        : std::max<size_t>(static_cast<size_t>(max_slot) + 1, function_count);
+    if (mod.version == EM_VERSION_V6 && mod.present_v6 && mod.v6) {
+        mod.dispatch_size = mod.v6->physical_slot_count;
+    } else {
+        mod.dispatch_size = function_count == 0
+            ? 0
+            : std::max<size_t>(static_cast<size_t>(max_slot) + 1, function_count);
+    }
     return true;
+}
+
+// ─── v6 (Red 9) V6-metadata -> ModuleLayoutPlan adapter ─────────────────────
+ModuleLayoutPlan v6_metadata_as_plan(const ParsedV6Meta& m) {
+    ModuleLayoutPlan plan;
+    plan.module_id = "<v6-loaded>";
+    plan.keyed = (m.dispatch_mode == EM_V6_DISPATCH_KEYED);
+    plan.logical_slot_count = m.logical_slot_count;
+    plan.physical_slot_count = m.physical_slot_count;
+    plan.domains.reserve(m.domains.size());
+    for (const auto& d : m.domains) {
+        DispatchDomain dd;
+        dd.module_id = "<v6-loaded>";
+        dd.visibility = static_cast<Visibility>(d.visibility);
+        dd.calling_mode = static_cast<CallingMode>(d.calling_mode);
+        dd.abi_fingerprint = d.abi_fingerprint;
+        dd.dispatch_domain = d.dispatch_domain;
+        dd.domain_salt = d.domain_salt;
+        dd.strategy_version = d.strategy_version;
+        dd.physical_base = d.physical_base;
+        dd.physical_count = d.physical_count;
+        dd.logical_count = d.logical_count;
+        dd.padding_count = d.padding_count;
+        dd.padding_ordinal = d.padding_ordinal;
+        dd.logical_slots = d.logical_slots;
+        plan.domains.push_back(std::move(dd));
+    }
+    plan.logical_routes.reserve(m.logical_routes.size());
+    for (const auto& r : m.logical_routes) {
+        LogicalRoute lr;
+        lr.logical_slot = r.logical_slot;
+        lr.domain_index = r.domain_index;
+        lr.ordinal = r.ordinal;
+        lr.abi_fingerprint = r.abi_fingerprint;
+        lr.visibility = static_cast<Visibility>(r.visibility);
+        lr.calling_mode = static_cast<CallingMode>(r.calling_mode);
+        lr.dispatch_domain = r.dispatch_domain;
+        plan.logical_routes.push_back(std::move(lr));
+    }
+    plan.physical_entries.reserve(m.physical_entries.size());
+    for (const auto& p : m.physical_entries) {
+        PhysicalEntry pe;
+        pe.physical_slot = p.physical_slot;
+        pe.abi_fingerprint = p.abi_fingerprint;
+        pe.visibility = static_cast<Visibility>(p.visibility);
+        pe.calling_mode = static_cast<CallingMode>(p.calling_mode);
+        pe.dispatch_domain = p.dispatch_domain;
+        pe.name = p.name;
+        pe.is_padding = p.is_padding;
+        pe.logical_slot = p.logical_slot;
+        pe.domain_index = p.domain_index;
+        pe.ordinal = p.ordinal;
+        plan.physical_entries.push_back(std::move(pe));
+    }
+    plan.padding_descriptors.reserve(m.padding_descriptors.size());
+    for (const auto& pd : m.padding_descriptors) {
+        PaddingDescriptor pdd;
+        pdd.domain_index = pd.domain_index;
+        pdd.ordinal = pd.ordinal;
+        pdd.physical_slot = pd.physical_slot;
+        pdd.abi_fingerprint = pd.abi_fingerprint;
+        pdd.visibility = static_cast<Visibility>(pd.visibility);
+        pdd.calling_mode = static_cast<CallingMode>(pd.calling_mode);
+        pdd.dispatch_domain = pd.dispatch_domain;
+        plan.padding_descriptors.push_back(std::move(pdd));
+    }
+    return plan;
 }
 
 // The post-file-read tail of `load_em_file_impl`: parse the in-memory buffer,
@@ -576,7 +784,8 @@ bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
                         std::string* err, ModuleRegistry* registry,
                         const std::unordered_map<std::string, NativeSig>* natives,
                         const EmVerifyPolicy* verify,
-                        const EmLoadPolicy* load_policy) {
+                        const EmLoadPolicy* load_policy,
+                        const EmV6HostCaps* v6_caps) {
     // EmLoadPolicy: null == the SECURE DEFAULT (module_permissions = 0,
     // allow_raw_x86 = false). Resolve the effective values once so every
     // check below uses the same policy.
@@ -594,10 +803,11 @@ bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
     // existing v1-v4 artifacts passes EmLoadPolicy{allow_raw_x86=true} for
     // back-compat. This check runs BEFORE the signature/dev-mode policy so a
     // raw-x86 module is rejected regardless of its signature status.
-    if (parsed.version != EM_VERSION_V5 && !allow_raw_x86) {
+    if (parsed.version != EM_VERSION_V5 && parsed.version != EM_VERSION_V6 &&
+        !allow_raw_x86) {
         set_error(err, "em_loader: format: raw x86 format v" +
                        std::to_string(parsed.version) +
-                       " rejected by default (only v5 IR accepted); " +
+                       " rejected by default (only v5/v6 IR accepted); " +
                        "pass EmLoadPolicy{allow_raw_x86=true} for back-compat");
         return false;
     }
@@ -627,6 +837,118 @@ bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
                                "EmLoadPolicy{allow_raw_x86=true} for back-compat");
                 return false;
             }
+        }
+    }
+
+    // ─── v6 (Red 9, §11.3, §11.4, §11.6) capability-matrix validation ───────
+    bool v6_keyed_mode = false;
+    if (parsed.version == EM_VERSION_V6) {
+        if (!parsed.present_v6 || !parsed.v6) { set_error(err, "em_loader: v6: missing parsed metadata"); return false; }
+        const ParsedV6Meta& m = *parsed.v6;
+        const bool host_keyed_runtime = v6_caps ? v6_caps->keyed_dispatch_runtime : false;
+        const bool host_blob_v2 = v6_caps ? v6_caps->blob_v2_re_emit : false;
+        const bool host_allow_identity = v6_caps ? v6_caps->allow_identity_mode : false;
+        const bool host_allow_keyed = v6_caps ? v6_caps->allow_keyed_mode : false;
+        const bool host_allow_raw = v6_caps ? v6_caps->allow_raw_x86 : false;
+        const auto* host_strategies = v6_caps ? &v6_caps->registered_strategies : nullptr;
+        const bool host_abi_all = v6_caps ? v6_caps->supports_all_abi_domains : false;
+        const auto* host_abi_set = v6_caps ? &v6_caps->supported_abi_domains : nullptr;
+        v6_keyed_mode = (m.dispatch_mode == EM_V6_DISPATCH_KEYED);
+        if (!host_allow_raw) {
+            for (const auto& pf : parsed.functions) {
+                if (!pf.is_ir) { set_error(err, "em_loader: v6: function \"" + pf.name + "\" ships raw x86 (is_ir=0), rejected by default (V6 raw code requires EmV6HostCaps{allow_raw_x86=true})"); return false; }
+            }
+        }
+        std::vector<bool> cap_seen(EM_V6_CAP_MAX_KNOWN + 1, false);
+        for (const auto& c : m.capabilities) {
+            if (c.capability_id == 0 || c.capability_id > EM_V6_CAP_MAX_KNOWN) { set_error(err, "em_loader: v6: unrecognized capability id " + std::to_string(c.capability_id)); return false; }
+            if (cap_seen[c.capability_id]) { set_error(err, "em_loader: v6: duplicate capability id " + std::to_string(c.capability_id)); return false; }
+            cap_seen[c.capability_id] = true;
+            switch (c.capability_id) {
+                case EM_V6_CAP_KEYED_DISPATCH_RUNTIME:
+                    if (c.required_value == 0) { set_error(err, "em_loader: v6: CapKeyedDispatchRuntime required_value == 0 (contradictory)"); return false; }
+                    if (!host_keyed_runtime) { set_error(err, "em_loader: v6: module requires keyed-dispatch runtime; host provides none"); return false; }
+                    break;
+                case EM_V6_CAP_BLOB_V2_RE_EMIT:
+                    if (c.required_value == 0) { set_error(err, "em_loader: v6: CapBlobV2ReEmit required_value == 0 (contradictory)"); return false; }
+                    if (!host_blob_v2) { set_error(err, "em_loader: v6: module requires blob-v2 Thin IR re-emit; host deserializer does not support it"); return false; }
+                    break;
+                case EM_V6_CAP_DISPATCH_STRATEGY: {
+                    if (c.required_value != m.strategy_version) { set_error(err, "em_loader: v6: CapDispatchStrategy value != strategy_version (contradictory)"); return false; }
+                    bool found = false;
+                    if (host_strategies) { for (const auto& [sid, sv] : *host_strategies) if (sid == m.strategy_id && sv == m.strategy_version) { found = true; break; } }
+                    if (!found) { set_error(err, "em_loader: v6: module strategy \"" + m.strategy_id + "\" v" + std::to_string(m.strategy_version) + " not registered with the host"); return false; }
+                    break;
+                }
+                case EM_V6_CAP_DISPATCH_MODE:
+                    if (c.required_value != m.dispatch_mode) { set_error(err, "em_loader: v6: CapDispatchMode value != dispatch_mode (contradictory)"); return false; }
+                    if (m.dispatch_mode == EM_V6_DISPATCH_KEYED && !host_allow_keyed) { set_error(err, "em_loader: v6: module dispatch mode is Keyed; host did not opt into keyed V6"); return false; }
+                    if (m.dispatch_mode == EM_V6_DISPATCH_IDENTITY && !host_allow_identity) { set_error(err, "em_loader: v6: module dispatch mode is Identity; host did not opt into identity V6"); return false; }
+                    break;
+                case EM_V6_CAP_ABI_DOMAIN_SET:
+                    if (c.required_value != m.domains.size()) { set_error(err, "em_loader: v6: CapAbiDomainSet value != domain count (contradictory)"); return false; }
+                    if (!host_abi_all) {
+                        for (const auto& d : m.domains) {
+                            bool supported = false;
+                            if (host_abi_set) { for (uint64_t fp : *host_abi_set) if (fp == d.abi_fingerprint) { supported = true; break; } }
+                            if (!supported) { set_error(err, "em_loader: v6: module declares ABI domain fingerprint " + std::to_string(d.abi_fingerprint) + " not in the host's supported ABI-domain set"); return false; }
+                        }
+                    }
+                    break;
+                default: set_error(err, "em_loader: v6: unrecognized capability id " + std::to_string(c.capability_id)); return false;
+            }
+        }
+        if (v6_keyed_mode && !cap_seen[EM_V6_CAP_KEYED_DISPATCH_RUNTIME]) { set_error(err, "em_loader: v6: keyed module missing CapKeyedDispatchRuntime (contradictory)"); return false; }
+        if (!cap_seen[EM_V6_CAP_BLOB_V2_RE_EMIT]) { set_error(err, "em_loader: v6: module missing CapBlobV2ReEmit (V6 IR requires blob-v2)"); return false; }
+        if (!cap_seen[EM_V6_CAP_DISPATCH_MODE]) { set_error(err, "em_loader: v6: module missing CapDispatchMode (contradictory)"); return false; }
+        if (!cap_seen[EM_V6_CAP_DISPATCH_STRATEGY]) { set_error(err, "em_loader: v6: module missing CapDispatchStrategy (contradictory)"); return false; }
+        if (!cap_seen[EM_V6_CAP_ABI_DOMAIN_SET]) { set_error(err, "em_loader: v6: module missing CapAbiDomainSet (contradictory)"); return false; }
+        std::vector<bool> ls_seen(m.logical_slot_count, false);
+        for (const auto& r : m.logical_routes) {
+            if (r.logical_slot >= m.logical_slot_count || ls_seen[r.logical_slot]) { set_error(err, "em_loader: v6: logical route slot out of range or duplicate"); return false; }
+            ls_seen[r.logical_slot] = true;
+            if (r.domain_index >= m.domains.size()) { set_error(err, "em_loader: v6: route domain_index out of range"); return false; }
+            const auto& d = m.domains[r.domain_index];
+            if (r.abi_fingerprint != d.abi_fingerprint || r.visibility != d.visibility || r.calling_mode != d.calling_mode || r.dispatch_domain != d.dispatch_domain) { set_error(err, "em_loader: v6: route/domain ABI/visibility/mode/domain mismatch"); return false; }
+            if (r.ordinal >= d.logical_count) { set_error(err, "em_loader: v6: route ordinal >= domain logical_count"); return false; }
+            if (d.logical_slots.size() != d.logical_count || d.logical_slots[r.ordinal] != r.logical_slot) { set_error(err, "em_loader: v6: route logical slot != domain logical_slots[ordinal]"); return false; }
+        }
+        std::vector<bool> ps_seen(m.physical_slot_count, false);
+        std::vector<uint32_t> slot_domain(m.physical_slot_count, UINT32_MAX);
+        for (uint32_t di = 0; di < m.domains.size(); ++di) {
+            const auto& d = m.domains[di];
+            for (uint32_t s = d.physical_base; s < d.physical_base + d.physical_count; ++s) {
+                if (s >= m.physical_slot_count || ps_seen[s]) { set_error(err, "em_loader: v6: physical domain overlap or out of range"); return false; }
+                ps_seen[s] = true; slot_domain[s] = di;
+            }
+        }
+        for (const auto& p : m.physical_entries) {
+            if (p.physical_slot >= m.physical_slot_count || !ps_seen[p.physical_slot]) { set_error(err, "em_loader: v6: physical entry out of range or uncovered"); return false; }
+            const uint32_t di = slot_domain[p.physical_slot];
+            const auto& d = m.domains[di];
+            if (p.domain_index != di || p.abi_fingerprint != d.abi_fingerprint || p.visibility != d.visibility || p.calling_mode != d.calling_mode || p.dispatch_domain != d.dispatch_domain) { set_error(err, "em_loader: v6: physical entry domain/ABI/visibility/mode/domain mismatch"); return false; }
+            if (p.is_padding) {
+                if (p.ordinal != d.padding_ordinal) { set_error(err, "em_loader: v6: padding physical entry ordinal != padding_ordinal"); return false; }
+                if (p.logical_slot != 0xFFFFFFFFu) { set_error(err, "em_loader: v6: padding physical entry logical_slot != sentinel"); return false; }
+            } else {
+                if (p.ordinal >= d.logical_count) { set_error(err, "em_loader: v6: real physical entry ordinal >= domain logical_count"); return false; }
+                if (d.logical_slots.size() != d.logical_count || d.logical_slots[p.ordinal] != p.logical_slot) { set_error(err, "em_loader: v6: real physical entry logical_slot != domain logical_slots[ordinal]"); return false; }
+            }
+        }
+        for (uint32_t s = 0; s < m.physical_slot_count; ++s) { if (!ps_seen[s]) { set_error(err, "em_loader: v6: physical slot not covered by any domain"); return false; } }
+        uint32_t keyed_domains = 0;
+        for (const auto& d : m.domains) if (d.padding_count > 0) ++keyed_domains;
+        if (m.padding_descriptors.size() != keyed_domains) { set_error(err, "em_loader: v6: padding descriptor count != keyed domain count"); return false; }
+        if (m.dispatch_mode == EM_V6_DISPATCH_IDENTITY && !m.padding_descriptors.empty()) { set_error(err, "em_loader: v6: identity mode must have no padding descriptors"); return false; }
+        for (const auto& pd : m.padding_descriptors) {
+            if (pd.domain_index >= m.domains.size()) { set_error(err, "em_loader: v6: padding descriptor domain_index out of range"); return false; }
+            const auto& d = m.domains[pd.domain_index];
+            if (pd.abi_fingerprint != d.abi_fingerprint || pd.visibility != d.visibility || pd.calling_mode != d.calling_mode || pd.dispatch_domain != d.dispatch_domain) { set_error(err, "em_loader: v6: padding descriptor ABI/visibility/mode/domain mismatch"); return false; }
+            if (pd.ordinal != d.padding_ordinal) { set_error(err, "em_loader: v6: padding descriptor ordinal != domain padding_ordinal"); return false; }
+            if (pd.physical_slot >= m.physical_slot_count || slot_domain[pd.physical_slot] != pd.domain_index) { set_error(err, "em_loader: v6: padding descriptor physical slot out of range or not in its domain"); return false; }
+            bool found_pad = false;
+            for (const auto& pe : m.physical_entries) { if (pe.physical_slot == pd.physical_slot) { if (!pe.is_padding) { set_error(err, "em_loader: v6: padding descriptor points at a non-padding physical entry"); return false; } found_pad = true; break; } }
+            if (!found_pad) { set_error(err, "em_loader: v6: padding descriptor physical slot has no physical entry"); return false; }
         }
     }
 
@@ -691,6 +1013,25 @@ bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
         for(const auto& f:parsed.functions)
             staged.signatures_by_slot[f.slot_index]=f.signature;
     }
+    if (parsed.version == EM_VERSION_V6 && parsed.present_v6 && parsed.v6) {
+        staged.is_v6 = true;
+        staged.v6_keyed = (parsed.v6->dispatch_mode == EM_V6_DISPATCH_KEYED);
+        staged.v6_dispatch_mode = parsed.v6->dispatch_mode;
+        staged.v6_logical_slot_count = parsed.v6->logical_slot_count;
+        staged.v6_physical_slot_count = parsed.v6->physical_slot_count;
+        auto meta = std::make_shared<EmV6Metadata>();
+        meta->strategy_id = parsed.v6->strategy_id;
+        meta->strategy_version = parsed.v6->strategy_version;
+        meta->dispatch_mode = parsed.v6->dispatch_mode;
+        meta->logical_slot_count = parsed.v6->logical_slot_count;
+        meta->physical_slot_count = parsed.v6->physical_slot_count;
+        meta->capabilities = parsed.v6->capabilities;
+        meta->domains = parsed.v6->domains;
+        meta->logical_routes = parsed.v6->logical_routes;
+        meta->physical_entries = parsed.v6->physical_entries;
+        meta->padding_descriptors = parsed.v6->padding_descriptors;
+        staged.v6_metadata = std::move(meta);
+    }
     staged.pages.reserve(parsed.functions.size());
     std::vector<void*> entries(parsed.functions.size(), nullptr);
 
@@ -700,7 +1041,7 @@ bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
     // validation with NO executable page allocated. The re-emitted code/rodata/
     // relocs/native_bindings replace the ParsedFn's empty fields so the
     // existing exec-page loop below handles them uniformly.
-    if (parsed.version == EM_VERSION_V5) {
+    if (parsed.version == EM_VERSION_V5 || parsed.version == EM_VERSION_V6) {
         // Build the load-time CodeGenCtx for re-emit. The dispatch + globals
         // bases are the staged backing stores (stable — never resize after
         // an address is patched). natives is the host table. script_slots is
@@ -755,6 +1096,11 @@ bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
 
         for (auto& pf : parsed.functions) {
             if (!pf.is_ir) continue;  // raw-x86 fallback — skip (re-emit IR only)
+            if (parsed.version == EM_VERSION_V6) {
+                if (pf.ir_blob.size() < 6) { set_error(err, "em_loader: v6 IR: function \"" + pf.name + "\" blob too short to carry a version"); return false; }
+                const uint16_t bv = static_cast<uint16_t>(pf.ir_blob[4]) | static_cast<uint16_t>(pf.ir_blob[5]) << 8;
+                if (bv != IR_BLOB_VERSION) { set_error(err, "em_loader: v6 IR: function \"" + pf.name + "\" carries blob version " + std::to_string(bv) + " (V6 requires blob v2; v1 loses data_temp_off)"); return false; }
+            }
             ThinFunction thf;
             const uint8_t* cur = pf.ir_blob.data();
             const uint8_t* end = pf.ir_blob.data() + pf.ir_blob.size();
@@ -914,8 +1260,53 @@ bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
     }
 
     // Publish only after every page is patched and RX-sealed.
-    for (size_t i = 0; i < parsed.functions.size(); ++i)
-        staged.dispatch[parsed.functions[i].slot_index] = entries[i];
+    //
+    // v6 (Red 9, §11.4 step 7-11): for a V6 module the dispatch storage is the
+    // PHYSICAL topology. Each function is published at its PHYSICAL slot
+    // (derived from the V6 metadata's physical_entries). Padding physical
+    // slots are filled with the ABI-compatible padding-trap stub
+    // (ember_keyed_padding_trap) so a wrong route word that lands on a padding
+    // ordinal is memory-safe and fires the recoverable keyed-padding trap. The
+    // loader loads the serialized physical topology AS-IS and NEVER derives a
+    // local runtime key to reorder it (§11.4). For an identity V6 module
+    // physical == logical. For a non-V6 module the legacy logical publish is
+    // unchanged.
+    if (parsed.version == EM_VERSION_V6 && parsed.present_v6 && parsed.v6) {
+        const ParsedV6Meta& m = *parsed.v6;
+        std::unordered_map<uint32_t, uint32_t> logical_to_physical;
+        logical_to_physical.reserve(parsed.functions.size());
+        for (const auto& pe : m.physical_entries) { if (!pe.is_padding) logical_to_physical[pe.logical_slot] = pe.physical_slot; }
+        for (size_t i = 0; i < parsed.functions.size(); ++i) {
+            auto it = logical_to_physical.find(parsed.functions[i].slot_index);
+            if (it == logical_to_physical.end()) { set_error(err, "em_loader: v6: function \"" + parsed.functions[i].name + "\" has no physical placement"); return false; }
+            uint32_t phys = it->second;
+            if (phys >= staged.dispatch.size()) { set_error(err, "em_loader: v6: physical slot out of range"); return false; }
+            staged.dispatch[phys] = entries[i];
+        }
+        const void* pad_stub = ember_keyed_padding_trap_target();
+        for (const auto& pe : m.physical_entries) {
+            if (!pe.is_padding) continue;
+            if (pe.physical_slot >= staged.dispatch.size()) { set_error(err, "em_loader: v6: padding physical slot out of range"); return false; }
+            staged.dispatch[pe.physical_slot] = const_cast<void*>(pad_stub);
+        }
+        for (size_t s = 0; s < staged.dispatch.size(); ++s) {
+            if (!staged.dispatch[s]) { set_error(err, "em_loader: v6: physical slot " + std::to_string(s) + " is null/unfinalized (no publication)"); return false; }
+        }
+        if (m.dispatch_mode == EM_V6_DISPATCH_KEYED) {
+            auto rec_st = std::make_shared<RecordBuilderStorage>();
+            auto build_res = build_module_dispatch_record(*rec_st, v6_metadata_as_plan(m),
+                [&](uint32_t physical_slot) -> void* { if (physical_slot >= staged.dispatch.size()) return nullptr; return staged.dispatch[physical_slot]; });
+            if (!build_res) { set_error(err, "em_loader: v6: build_module_dispatch_record failed: " + (build_res.error.has_value() ? build_res.error->message : std::string("(no diag)"))); return false; }
+            auto rec = std::make_shared<ModuleDispatchRecord>(*build_res.value);
+            auto vs = validate_dispatch_record(*rec);
+            if (!vs) { set_error(err, "em_loader: v6: validate_dispatch_record failed: " + (vs.error.has_value() ? vs.error->message : std::string("(no diag)"))); return false; }
+            staged.v6_record_storage = std::move(rec_st);
+            staged.v6_record = std::move(rec);
+        }
+    } else {
+        for (size_t i = 0; i < parsed.functions.size(); ++i)
+            staged.dispatch[parsed.functions[i].slot_index] = entries[i];
+    }
     staged.commit(out);
     return true;
 }
@@ -928,7 +1319,8 @@ bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
                        ModuleRegistry* registry,
                        const std::unordered_map<std::string, NativeSig>* natives,
                        const EmVerifyPolicy* verify,
-                       const EmLoadPolicy* load_policy) {
+                       const EmLoadPolicy* load_policy,
+                       const EmV6HostCaps* v6_caps) {
     if (!path) {
         set_error(err, "em_loader: argument: null path");
         return false;
@@ -964,7 +1356,7 @@ bool load_em_file_impl(const char* path, LoadedModule& out, std::string* err,
         set_error(err, "em_loader: io: short file read");
         return false;
     }
-    return load_em_bytes_impl(file, out, err, registry, natives, verify, load_policy);
+    return load_em_bytes_impl(file, out, err, registry, natives, verify, load_policy, v6_caps);
 }
 
 LoadedModule::~LoadedModule() {
@@ -975,9 +1367,18 @@ LoadedModule::LoadedModule(LoadedModule&& other) noexcept
     : dispatch(std::move(other.dispatch)), globals(std::move(other.globals)),
       pages(std::move(other.pages)), name_table(std::move(other.name_table)),
       entry_slot(other.entry_slot), format_version(other.format_version),
-      signatures_by_slot(std::move(other.signatures_by_slot)) {
+      signatures_by_slot(std::move(other.signatures_by_slot)),
+      is_v6(other.is_v6), v6_keyed(other.v6_keyed),
+      v6_dispatch_mode(other.v6_dispatch_mode),
+      v6_logical_slot_count(other.v6_logical_slot_count),
+      v6_physical_slot_count(other.v6_physical_slot_count),
+      v6_metadata(std::move(other.v6_metadata)),
+      v6_record_storage(std::move(other.v6_record_storage)),
+      v6_record(std::move(other.v6_record)) {
     other.pages.clear();
     other.entry_slot = EM_NO_ENTRY;
+    other.is_v6 = false;
+    other.v6_keyed = false;
 }
 
 LoadedModule& LoadedModule::operator=(LoadedModule&& other) noexcept {
@@ -990,13 +1391,24 @@ LoadedModule& LoadedModule::operator=(LoadedModule&& other) noexcept {
     entry_slot = other.entry_slot;
     format_version = other.format_version;
     signatures_by_slot = std::move(other.signatures_by_slot);
+    is_v6 = other.is_v6;
+    v6_keyed = other.v6_keyed;
+    v6_dispatch_mode = other.v6_dispatch_mode;
+    v6_logical_slot_count = other.v6_logical_slot_count;
+    v6_physical_slot_count = other.v6_physical_slot_count;
+    v6_metadata = std::move(other.v6_metadata);
+    v6_record_storage = std::move(other.v6_record_storage);
+    v6_record = std::move(other.v6_record);
     other.pages.clear();
     other.entry_slot = EM_NO_ENTRY;
+    other.is_v6 = false;
+    other.v6_keyed = false;
     return *this;
 }
 
 void* LoadedModule::entry_by_name(const char* name) const {
     if (!name) return nullptr;
+    if (is_v6 && v6_keyed) return nullptr;  // §11.5: no raw logical indexing for keyed V6
     for (const auto& item : name_table) {
         if (item.first == name)
             return item.second < dispatch.size() ? dispatch[item.second] : nullptr;
@@ -1004,7 +1416,19 @@ void* LoadedModule::entry_by_name(const char* name) const {
     return nullptr;
 }
 
+void* LoadedModule::resolve_entry_by_name(const char* name, uint64_t transient_route_word) const {
+    if (!name) return nullptr;
+    uint32_t logical_slot = EM_NO_ENTRY;
+    for (const auto& item : name_table) { if (item.first == name) { logical_slot = item.second; break; } }
+    if (logical_slot == EM_NO_ENTRY) return nullptr;
+    if (!(is_v6 && v6_keyed))
+        return logical_slot < dispatch.size() ? dispatch[logical_slot] : nullptr;
+    if (!v6_record) return nullptr;
+    return ember_resolve_keyed_dispatch(v6_record.get(), logical_slot, transient_route_word);
+}
+
 void* LoadedModule::entry() const {
+    if (is_v6 && v6_keyed) return nullptr;  // §11.5: no raw logical indexing for keyed V6
     if (entry_slot == EM_NO_ENTRY || entry_slot >= dispatch.size()) return nullptr;
     return dispatch[entry_slot];
 }
@@ -1013,11 +1437,12 @@ bool load_em_file(const char* path, LoadedModule& out, std::string* err,
                   ModuleRegistry* registry,
                   const std::unordered_map<std::string, NativeSig>* native_bindings,
                   const EmVerifyPolicy* verify,
-                  const EmLoadPolicy* load_policy) {
+                  const EmLoadPolicy* load_policy,
+                  const EmV6HostCaps* v6_caps) {
     // Complete public no-throw boundary: malformed input and allocation/library
     // failures are always reported as false plus a categorized error.
     try {
-        return load_em_file_impl(path, out, err, registry, native_bindings, verify, load_policy);
+        return load_em_file_impl(path, out, err, registry, native_bindings, verify, load_policy, v6_caps);
     } catch (const std::bad_alloc&) {
         set_error(err, "em_loader: allocation: std::bad_alloc");
     } catch (const std::length_error&) {
@@ -1035,7 +1460,8 @@ bool load_em_bytes(const uint8_t* data, size_t len, LoadedModule& out,
                    ModuleRegistry* registry,
                    const std::unordered_map<std::string, NativeSig>* native_bindings,
                    const EmVerifyPolicy* verify,
-                   const EmLoadPolicy* load_policy) {
+                   const EmLoadPolicy* load_policy,
+                   const EmV6HostCaps* v6_caps) {
     // Complete public no-throw boundary: malformed input and allocation/library
     // failures are always reported as false plus a categorized error.
     try {
@@ -1052,7 +1478,7 @@ bool load_em_bytes(const uint8_t* data, size_t len, LoadedModule& out,
             return false;
         }
         std::vector<uint8_t> file(data, data + len);
-        return load_em_bytes_impl(file, out, err, registry, native_bindings, verify, load_policy);
+        return load_em_bytes_impl(file, out, err, registry, native_bindings, verify, load_policy, v6_caps);
     } catch (const std::bad_alloc&) {
         set_error(err, "em_loader: allocation: std::bad_alloc");
     } catch (const std::length_error&) {

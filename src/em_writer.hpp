@@ -72,4 +72,8 @@ bool write_em_file_signed(const EmModule& mod, const char* path,
 // v5 per-function record layout + the security model.
 bool write_em_file_v5(const EmModule& mod, const char* path, std::string* err);
 
+bool write_em_bytes_v5(const EmModule& mod, std::vector<uint8_t>& out, std::string* err);
+bool write_em_file_v6(const EmModule& mod, const char* path, std::string* err);
+bool write_em_bytes_v6(const EmModule& mod, std::vector<uint8_t>& out, std::string* err);
+
 } // namespace ember

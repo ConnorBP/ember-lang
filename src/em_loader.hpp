@@ -58,6 +58,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -133,9 +134,23 @@ struct EmVerifyPolicy {
 // recommendation, and the v5 mixed-mode secure-default gate in
 // load_em_bytes_impl (MAINTENANCE_LOG 2026-07-12).
 struct EmLoadPolicy {
-    uint32_t module_permissions = 0;  // PERM_FFI etc. granted to the loading module
-    bool allow_raw_x86 = false;       // if true, accept v1-v4 + v5 raw-x86 fallback fns; default false (all-IR v5 only)
+    uint32_t module_permissions = 0;
+    bool allow_raw_x86 = false;
 };
+
+struct EmV6HostCaps {
+    bool keyed_dispatch_runtime = false;
+    bool blob_v2_re_emit = true;
+    std::vector<std::pair<std::string, uint32_t>> registered_strategies;
+    bool allow_identity_mode = true;
+    bool allow_keyed_mode = false;
+    bool allow_raw_x86 = false;
+    bool supports_all_abi_domains = false;
+    std::vector<uint64_t> supported_abi_domains;
+};
+
+struct RecordBuilderStorage;
+struct ModuleDispatchRecord;
 
 // A loaded `.em` module: owns the dispatch table, the globals block, and the
 // per-function exec pages. The runtime (ember_call, hot reload) treats this
@@ -167,6 +182,14 @@ struct LoadedModule {
     // v3 carries the same per-slot signatures as v2; the difference is which
     // names appear in `name_table` (the export table), not the signature shape.
     std::vector<EmSignature>                       signatures_by_slot;
+    bool                                           is_v6 = false;
+    bool                                           v6_keyed = false;
+    uint8_t                                        v6_dispatch_mode = 0;
+    uint32_t                                       v6_logical_slot_count = 0;
+    uint32_t                                       v6_physical_slot_count = 0;
+    std::shared_ptr<EmV6Metadata>                  v6_metadata;
+    std::shared_ptr<RecordBuilderStorage>          v6_record_storage;
+    std::shared_ptr<ModuleDispatchRecord>          v6_record;
 
     LoadedModule() = default;
     ~LoadedModule();
@@ -180,9 +203,7 @@ struct LoadedModule {
     // function - v3's name_table IS the export table, so a `priv fn` is not
     // reachable here). Matches the writer's name_table convention (Section 2.2).
     void* entry_by_name(const char* name) const;
-
-    // The @entry function's entry (nullptr if no entry, i.e. entry_slot ==
-    // EM_NO_ENTRY or the slot is out of range).
+    void* resolve_entry_by_name(const char* name, uint64_t transient_route_word) const;
     void* entry() const;
 };
 
@@ -245,7 +266,8 @@ bool load_em_file(const char* path, LoadedModule& out, std::string* err,
                   ModuleRegistry* registry = nullptr,
                   const std::unordered_map<std::string, NativeSig>* native_bindings = nullptr,
                   const EmVerifyPolicy* verify = nullptr,
-                  const EmLoadPolicy* load_policy = nullptr);
+                  const EmLoadPolicy* load_policy = nullptr,
+                  const EmV6HostCaps* v6_caps = nullptr);
 
 // Load a `.em` from an in-memory byte buffer (the standalone-exe stub's path —
 // the `.em` is appended to the stub's own exe, read into memory, loaded here).
@@ -266,6 +288,7 @@ bool load_em_bytes(const uint8_t* data, size_t len, LoadedModule& out,
                    ModuleRegistry* registry = nullptr,
                    const std::unordered_map<std::string, NativeSig>* native_bindings = nullptr,
                    const EmVerifyPolicy* verify = nullptr,
-                   const EmLoadPolicy* load_policy = nullptr);
+                   const EmLoadPolicy* load_policy = nullptr,
+                   const EmV6HostCaps* v6_caps = nullptr);
 
 } // namespace ember

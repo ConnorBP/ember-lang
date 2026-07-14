@@ -482,7 +482,7 @@ extern "C" void kt6_trap(ember::context_t* ctx, int reason, const char* detail) 
     if (ctx) {
         ctx->last_trap = static_cast<ember::TrapReason>(reason);
         ctx->last_error = detail ? detail : "";
-        if (ctx->has_checkpoint) longjmp(ctx->checkpoint, 1);
+        if (ctx->has_checkpoint) EMBER_LONGJMP(ctx->checkpoint, 1);
     }
     std::abort();
 }
@@ -544,7 +544,7 @@ static LONG WINAPI kt6_seh_filter(EXCEPTION_POINTERS* ep) {
             c == EXCEPTION_PRIV_INSTRUCTION) {
             g_seh_code = c;
             g_seh_armed = false;
-            longjmp(g_seh_jmp, 1);
+            EMBER_LONGJMP(g_seh_jmp, 1);
         }
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -559,7 +559,7 @@ static CrashedResult run_guarded(F fn) {
     PVOID veh = AddVectoredExceptionHandler(1 /*first handler*/, kt6_seh_filter);
     g_seh_code = 0;
     g_seh_armed = true;
-    if (setjmp(g_seh_jmp) == 0) {
+    if (EMBER_SETJMP(g_seh_jmp) == 0) {
         fn(out);            // runs the JIT'd code; may crash
         g_seh_armed = false;
         out.ran = true;
@@ -585,7 +585,7 @@ static RunResult run_keyed(KeyedModule& km, const std::string& entry_name,
     context_t ctx; ctx.budget_remaining = 1'000'000'000LL; ctx.max_call_depth = 64;
     if (use_checkpoint && km.compiled) {
         ctx.has_checkpoint = true;
-        if (setjmp(ctx.checkpoint)) {
+        if (EMBER_SETJMP(ctx.checkpoint)) {
             r.trapped = true;
             r.reason = ctx.last_error.empty()
                 ? std::string(trap_reason_str(ctx.last_trap))
@@ -631,7 +631,7 @@ static RunResult run_keyed(KeyedModule& km, const std::string& entry_name,
     context_t ctx; ctx.budget_remaining = 1'000'000'000LL; ctx.max_call_depth = 64;
     if (use_checkpoint) {
         ctx.has_checkpoint = true;
-        if (setjmp(ctx.checkpoint)) {
+        if (EMBER_SETJMP(ctx.checkpoint)) {
             r.trapped = true;
             r.reason = ctx.last_error.empty()
                 ? std::string(trap_reason_str(ctx.last_trap))
@@ -662,7 +662,7 @@ static RunResult run_keyed(KeyedModule& km, const std::string& entry_name,
     context_t ctx; ctx.budget_remaining = 1'000'000'000LL; ctx.max_call_depth = 64;
     if (use_checkpoint) {
         ctx.has_checkpoint = true;
-        if (setjmp(ctx.checkpoint)) {
+        if (EMBER_SETJMP(ctx.checkpoint)) {
             r.trapped = true;
             r.reason = ctx.last_error.empty()
                 ? std::string(trap_reason_str(ctx.last_trap))
@@ -722,7 +722,7 @@ static WrongKeyResult run_keyed_wrong_r15_ii(KeyedModule& km, const std::string&
     context_t& ctx = *ctxp;
     ctx.budget_remaining = 1'000'000'000LL; ctx.max_call_depth = 64;
     ctx.has_checkpoint = true;
-    if (setjmp(ctx.checkpoint)) {
+    if (EMBER_SETJMP(ctx.checkpoint)) {
         r.ok = true; r.last_trap = ctx.last_trap; r.call_depth = ctx.call_depth;
         r.reason = std::string(trap_reason_str(ctx.last_trap)) + ": " + ctx.last_error;
         ctx.has_checkpoint = false; ctx.reset_for_call();
@@ -752,7 +752,7 @@ static WrongKeyResult run_keyed_wrong_r15_i(KeyedModule& km, const std::string& 
     context_t& ctx = *ctxp;
     ctx.budget_remaining = 1'000'000'000LL; ctx.max_call_depth = 64;
     ctx.has_checkpoint = true;
-    if (setjmp(ctx.checkpoint)) {
+    if (EMBER_SETJMP(ctx.checkpoint)) {
         r.ok = true; r.last_trap = ctx.last_trap; r.call_depth = ctx.call_depth;
         r.reason = std::string(trap_reason_str(ctx.last_trap)) + ": " + ctx.last_error;
         ctx.has_checkpoint = false; ctx.reset_for_call();
@@ -1257,11 +1257,13 @@ int main() {
             if (m) {
                 auto g = run_guarded([&](CrashedResult& out) {
                     context_t ctx; ctx.budget_remaining = 1'000'000'000LL; ctx.max_call_depth = 64;
+                    uint64_t saved_r15 = ember_read_r15();
                     ember_set_r15(0);  // r15 untouched in legacy mode
                     int64_t v = ember_call_i64(m->main_entry, &ctx, 0);
                     out.value = v; out.call_depth = ctx.call_depth;
                     // r15 must remain 0 in legacy mode (captured post-call).
                     (void)ember_read_r15();
+                    ember_set_r15(saved_r15);  // restore caller r15 (callee-saved)
                 });
                 if (ir) {
                     ck(!g.crashed, (std::string("legacy ") + be + ": multiword/stack lambda args — run did not crash (arg stash ABI sound)").c_str());
@@ -1273,9 +1275,11 @@ int main() {
                     // longjmp recovery would skip this read on a crash; the
                     // non-guarded tree path never crashes so this is safe).
                     context_t ctx2; ctx2.budget_remaining = 1'000'000'000LL; ctx2.max_call_depth = 64;
+                    uint64_t saved_r15_2 = ember_read_r15();
                     ember_set_r15(0);
                     (void)ember_call_i64(m->main_entry, &ctx2, 0);
                     ck(ember_read_r15() == 0, (std::string("legacy ") + be + ": multiword/stack lambda args — r15 untouched (legacy)").c_str());
+                    ember_set_r15(saved_r15_2);  // restore caller r15 (callee-saved)
                 } else if (ir) {
                     unsigned long fc = static_cast<unsigned long>(g.code);
                     char buf[160]; std::snprintf(buf, sizeof(buf),
@@ -1915,17 +1919,21 @@ int main() {
         ck(m_thin != nullptr, "identity: thin — compile_identity succeeded (keyed_dispatch null)");
         if (m_tree) {
             context_t ctx; ctx.budget_remaining = 1'000'000'000LL; ctx.max_call_depth = 64;
+            uint64_t saved_r15_tree = ember_read_r15();
             ember_set_r15(0);  // r15 untouched in legacy mode
             int64_t v = ember_call_i64(m_tree->main_entry, &ctx, 0);
             ck(v == 7, "identity: tree — add(3,4)==7 (legacy dispatch, no resolver)");
             ck(ember_read_r15() == 0, "identity: tree — r15 untouched (no route word in legacy)");
+            ember_set_r15(saved_r15_tree);  // restore caller r15 (callee-saved)
         }
         if (m_thin) {
             context_t ctx; ctx.budget_remaining = 1'000'000'000LL; ctx.max_call_depth = 64;
+            uint64_t saved_r15_thin = ember_read_r15();
             ember_set_r15(0);
             int64_t v = ember_call_i64(m_thin->main_entry, &ctx, 0);
             ck(v == 7, "identity: thin — add(3,4)==7 (legacy dispatch, no resolver)");
             ck(ember_read_r15() == 0, "identity: thin — r15 untouched (no route word in legacy)");
+            ember_set_r15(saved_r15_thin);  // restore caller r15 (callee-saved)
         }
     }
 

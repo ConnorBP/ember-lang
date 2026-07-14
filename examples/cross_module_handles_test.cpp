@@ -73,7 +73,7 @@ extern "C" void cmh_trap(ember::context_t* ctx, int reason, const char* detail) 
     if (ctx) {
         ctx->last_trap = static_cast<ember::TrapReason>(reason);
         ctx->last_error = detail ? detail : "";
-        if (ctx->has_checkpoint) longjmp(ctx->checkpoint, 1);
+        if (ctx->has_checkpoint) EMBER_LONGJMP(ctx->checkpoint, 1);
     }
     std::abort();
 }
@@ -196,7 +196,7 @@ static void add_module_exports(ModuleExportTable& table, const std::string& src,
 static int64_t run_main(JITModule& m, bool* trapped) {
     *trapped = false;
     m.ctx.call_depth = 0; m.ctx.has_checkpoint=true;
-    if (setjmp(m.ctx.checkpoint)) { *trapped=true; m.ctx.has_checkpoint=false;
+    if (EMBER_SETJMP(m.ctx.checkpoint)) { *trapped=true; m.ctx.has_checkpoint=false;
         return int64_t(m.ctx.last_trap); }
     using F0=int64_t(*)();
     int64_t r = reinterpret_cast<F0>(m.main_entry)();
@@ -395,7 +395,7 @@ int main() {
             for(auto&fn:pr.program.funcs){auto cf=compile_func(fn,ctx); finalize(cf); main.table.set(fn.slot,cf.entry); main.fns.push_back(std::move(cf));}
             auto sit=main.slots.find("main"); void* entry = main.table.get(sit->second);
             ectx.has_checkpoint=true; bool trapped=false;
-            if (setjmp(ectx.checkpoint)) { trapped=true; ectx.has_checkpoint=false; }
+            if (EMBER_SETJMP(ectx.checkpoint)) { trapped=true; ectx.has_checkpoint=false; }
             else { using F0=int64_t(*)(); reinterpret_cast<F0>(entry)(); ectx.has_checkpoint=false; }
             check(trapped, "C: out-of-range cross-module handle (mod_id=200) traps via the guard, not a raw call");
             check(ectx.last_trap == TrapReason::BadCallTarget, "C: trap reason is BadCallTarget");
@@ -457,7 +457,7 @@ int main() {
             for(auto&fn:pr.program.funcs){auto cf=compile_func(fn,ctx); finalize(cf); main.table.set(fn.slot,cf.entry); main.fns.push_back(std::move(cf));}
             auto sit=main.slots.find("main"); void* entry = main.table.get(sit->second);
             ectx.has_checkpoint=true; bool trapped=false;
-            if (setjmp(ectx.checkpoint)) { trapped=true; ectx.has_checkpoint=false; }
+            if (EMBER_SETJMP(ectx.checkpoint)) { trapped=true; ectx.has_checkpoint=false; }
             else { using F0=int64_t(*)(); reinterpret_cast<F0>(entry)(); ectx.has_checkpoint=false; }
             check(trapped, "D: in-mod_id-but-out-of-slot handle (slot=999, lib has 2) traps (slot range check)");
             check(ectx.last_trap == TrapReason::BadCallTarget, "D: trap reason BadCallTarget");
@@ -546,7 +546,7 @@ int main() {
             for(auto&fn:pr.program.funcs){auto cf=compile_func(fn,ctx); finalize(cf); main.table.set(fn.slot,cf.entry); main.fns.push_back(std::move(cf));}
             auto sit=main.slots.find("main"); void* entry = main.table.get(sit->second);
             ectx.has_checkpoint=true; bool trapped=false;
-            if (setjmp(ectx.checkpoint)) { trapped=true; ectx.has_checkpoint=false; }
+            if (EMBER_SETJMP(ectx.checkpoint)) { trapped=true; ectx.has_checkpoint=false; }
             else { using F0=int64_t(*)(); reinterpret_cast<F0>(entry)(); ectx.has_checkpoint=false; }
             check(trapped, "D2: in-range-but-unregistered handle (slot 5, bit clear) traps (bt fires)");
             check(ectx.last_trap == TrapReason::BadCallTarget, "D2: trap reason BadCallTarget");

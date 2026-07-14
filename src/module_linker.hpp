@@ -187,4 +187,35 @@ inline void add_exports(ModuleExportTable& table, const std::string& alias,
     table[alias] = exports;
 }
 
+inline uint32_t link_em_file_v6(ModuleRegistry& reg, const std::string& name,
+                                LoadedModule& out, std::string* err = nullptr) {
+    uint32_t id = reg.register_module(name, out.dispatch.data(), err);
+    if (id == UINT32_MAX) return id;
+    if (out.is_v6 && out.v6_keyed && out.v6_record) {
+        reg.set_dispatch_slot_count(id, int64_t(out.v6_logical_slot_count));
+        reg.publish_dispatch_record(id, out.v6_record.get());
+    } else {
+        reg.set_dispatch_slot_count(id, int64_t(out.dispatch.size()));
+    }
+    return id;
+}
+
+inline std::vector<ModuleExport> build_em_v6_exports(const LoadedModule& mod, uint32_t module_id) {
+    std::vector<ModuleExport> out;
+    out.reserve(mod.name_table.size());
+    DispatchMode mode = (mod.is_v6 && mod.v6_keyed) ? DispatchMode::Keyed : DispatchMode::Identity;
+    for (const auto& [name, slot] : mod.name_table) {
+        ModuleExport exp;
+        exp.fn_name = name; exp.module_id = module_id; exp.slot = int(slot);
+        if (mod.format_version >= EM_VERSION_V2 && slot < mod.signatures_by_slot.size()) {
+            exp.ret = mod.signatures_by_slot[slot].ret;
+            exp.params = mod.signatures_by_slot[slot].params;
+            exp.unknown_sig = false;
+        } else { exp.unknown_sig = true; }
+        exp.dispatch_mode = mode;
+        out.push_back(std::move(exp));
+    }
+    return out;
+}
+
 } // namespace ember

@@ -67,7 +67,7 @@ extern "C" void test_trap(ember::context_t* ctx, int reason, const char* detail)
     if (ctx) {
         ctx->last_trap = static_cast<ember::TrapReason>(reason);
         ctx->last_error = detail ? detail : "";
-        if (ctx->has_checkpoint) longjmp(ctx->checkpoint, 1);
+        if (ctx->has_checkpoint) EMBER_LONGJMP(ctx->checkpoint, 1);
     }
     std::abort();
 }
@@ -104,7 +104,7 @@ static int64_t run_script(const std::string& src, bool* trapped) {
     void* entry=table.get(sit->second);
     if(!entry){ for(auto&fn:fns)if(fn.exec)free_executable(fn.exec); *trapped=true; return 0; }
     ectx.has_checkpoint=true;
-    if (setjmp(ectx.checkpoint)) { *trapped=true;
+    if (EMBER_SETJMP(ectx.checkpoint)) { *trapped=true;
         for(auto&fn:fns)if(fn.exec)free_executable(fn.exec);
         return 0;
     }

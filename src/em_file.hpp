@@ -157,6 +157,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -177,6 +178,21 @@ constexpr uint32_t EM_VERSION_V5 = 5u;     // v5 (Stage B, IL-.em): per-function
                                             // (v5 + Ed25519 block) is FUTURE work. INERT until the Stage-B writer/
                                             // loader land — EM_VERSION stays 4 (the default writer version); no v5
                                             // code path exists in em_writer.cpp / em_loader.cpp yet.
+constexpr uint32_t EM_VERSION_V6 = 6u;     // v6 (Red 9, §11): target-specific keyed-dispatch artifact. ADDITIVE:
+                                            // keeps the 40-byte header byte-identical (version=6) and appends a
+                                            // versioned V6 keyed-dispatch metadata block after the header, BEFORE the
+                                            // per-fn records. The per-fn records reuse the v5 shape; a v6 IR function
+                                            // MUST carry Thin IR blob version 2 (IR_BLOB_VERSION == 2) — the loader
+                                            // rejects an embedded blob-v1 IR. The V6 metadata block carries: dispatch
+                                            // strategy id/version, dispatch mode, logical + physical counts, a
+                                            // versioned capability matrix, ABI/domain descriptors, logical route
+                                            // descriptors, physical placement records, and padding records. It contains
+                                            // NO target/runtime key, NO machine fingerprint, NO expected key, NO key
+                                            // hash/digest/verifier, NO direct comparison constant, and NO runtime
+                                            // predecoded permutation map (§11.3, §14.6). The physical order itself is
+                                            // the build-time key's influence and is necessarily observable; the loader
+                                            // loads the serialized physical topology AS-IS and never derives a local
+                                            // runtime key to reorder it (§11.4).
 constexpr uint32_t EM_VERSION_V3 = 3u;     // historical v3: name directory IS the export table (F1 pub/priv visibility)
 constexpr uint32_t EM_VERSION_V2 = 2u;     // historical v2: canonical signatures, native bindings, rodata relocs
 constexpr uint32_t EM_VERSION_V1 = 1u;     // historical v1: ABI-trusted, unknown signatures
@@ -354,11 +370,62 @@ struct EmFunctionRecord {
 // also the module's EXPORT TABLE: the writer/host populates it from only the
 // `is_exported` (`pub fn` / bare `fn`) functions, so a `priv fn` is absent and
 // is not callable cross-module. v1/v2 directories listed every function.
+struct EmV6Metadata;  // forward decl (defined below)
 struct EmModule {
     std::vector<EmFunctionRecord>                functions;
     std::vector<uint8_t>                         globals;
     uint32_t                                     entry_slot = EM_NO_ENTRY;
     std::vector<std::pair<std::string, uint32_t>> name_table;
+    bool                                          has_v6 = false;
+    std::shared_ptr<EmV6Metadata>                v6;
+};
+
+// ─── V6 (Red 9, §11): target-specific keyed-dispatch metadata ───────────────
+constexpr uint8_t EM_V6_DISPATCH_IDENTITY = 0u;
+constexpr uint8_t EM_V6_DISPATCH_KEYED    = 1u;
+constexpr uint32_t EM_V6_META_MAGIC   = 0x454D5636u;
+constexpr uint32_t EM_V6_META_LAYOUT  = 1u;
+constexpr uint16_t EM_V6_CAP_KEYED_DISPATCH_RUNTIME = 1u;
+constexpr uint16_t EM_V6_CAP_BLOB_V2_RE_EMIT        = 2u;
+constexpr uint16_t EM_V6_CAP_DISPATCH_STRATEGY      = 3u;
+constexpr uint16_t EM_V6_CAP_DISPATCH_MODE          = 4u;
+constexpr uint16_t EM_V6_CAP_ABI_DOMAIN_SET         = 5u;
+constexpr uint16_t EM_V6_CAP_MAX_KNOWN              = EM_V6_CAP_ABI_DOMAIN_SET;
+struct EmV6Capability { uint16_t capability_id = 0; uint32_t required_value = 0; };
+struct EmV6DomainDescriptor {
+    uint8_t  visibility = 0; uint8_t  calling_mode = 0;
+    uint64_t abi_fingerprint = 0; uint64_t domain_salt = 0;
+    uint32_t strategy_version = 1; uint32_t physical_base = 0;
+    uint32_t physical_count = 0; uint32_t logical_count = 0;
+    uint32_t padding_count = 0; uint32_t padding_ordinal = 0;
+    std::string dispatch_domain; std::vector<uint32_t> logical_slots;
+};
+struct EmV6LogicalRoute {
+    uint32_t logical_slot = 0; uint32_t domain_index = 0; uint32_t ordinal = 0;
+    uint64_t abi_fingerprint = 0; uint8_t visibility = 0; uint8_t calling_mode = 0;
+    std::string dispatch_domain;
+};
+struct EmV6PhysicalEntry {
+    uint32_t physical_slot = 0; uint64_t abi_fingerprint = 0;
+    uint8_t visibility = 0; uint8_t calling_mode = 0;
+    std::string dispatch_domain; std::string name;
+    bool is_padding = false; uint32_t logical_slot = 0;
+    uint32_t domain_index = 0; uint32_t ordinal = 0;
+};
+struct EmV6PaddingDescriptor {
+    uint32_t domain_index = 0; uint32_t ordinal = 0; uint32_t physical_slot = 0;
+    uint64_t abi_fingerprint = 0; uint8_t visibility = 0; uint8_t calling_mode = 0;
+    std::string dispatch_domain;
+};
+struct EmV6Metadata {
+    std::string strategy_id; uint32_t strategy_version = 1;
+    uint8_t  dispatch_mode = EM_V6_DISPATCH_IDENTITY;
+    uint32_t logical_slot_count = 0; uint32_t physical_slot_count = 0;
+    std::vector<EmV6Capability> capabilities;
+    std::vector<EmV6DomainDescriptor> domains;
+    std::vector<EmV6LogicalRoute> logical_routes;
+    std::vector<EmV6PhysicalEntry> physical_entries;
+    std::vector<EmV6PaddingDescriptor> padding_descriptors;
 };
 
 } // namespace ember

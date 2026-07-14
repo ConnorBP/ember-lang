@@ -78,7 +78,7 @@ static void check(bool cond, const char* msg) {
 
 extern "C" void test_trap_stub(context_t* ctx, int reason, const char* detail) {
     if (ctx) { ctx->last_trap=static_cast<TrapReason>(reason); ctx->last_error=detail?detail:"";
-               if (ctx->has_checkpoint) longjmp(ctx->checkpoint, 1); }
+               if (ctx->has_checkpoint) EMBER_LONGJMP(ctx->checkpoint, 1); }
     std::abort();
 }
 
@@ -138,7 +138,7 @@ static RunResult run_script(const std::string& src, ModuleRegistry& registry,
     auto sit=slots.find("main"); if(sit==slots.end()){rr.kind=RunKind::SemaFailed;return rr;}
     void* entry=table.get(sit->second);
     ectx.has_checkpoint=true;
-    if (setjmp(ectx.checkpoint)) { rr.kind=RunKind::RuntimeTrap; rr.reason=ectx.last_trap; return rr; }
+    if (EMBER_SETJMP(ectx.checkpoint)) { rr.kind=RunKind::RuntimeTrap; rr.reason=ectx.last_trap; return rr; }
     using F0=int64_t(*)(); rr.value=reinterpret_cast<F0>(entry)();
     ectx.has_checkpoint=false;
     for(auto&fn:fns) if(fn.exec) free_executable(fn.exec);

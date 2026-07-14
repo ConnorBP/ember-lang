@@ -24,31 +24,26 @@
 //   host to iterate + call.
 #pragma once
 #include "sema.hpp"
+#include "context.hpp"
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <vector>
+
+namespace ember { struct ModuleInstance; class DispatchKeyAdapter; }
 
 namespace ember::ext_lifecycle {
 
-// Register the two natives (register_routine, unregister_routine) into m.
-// register_routine's first param is a `fn` handle (is_fn_handle=true) so sema
-// types it distinctly from a plain i64.
 void register_natives(std::unordered_map<std::string, NativeSig>& m);
-
-// Clear the routine table (mirrors ext_array/sync reset).
 void reset();
-
-// A stored routine: the slot (a fn handle from &fn) + the opaque data arg the
-// script passed. The host iterates these + calls table.get(slot) with data.
 struct Routine { int64_t slot; int64_t data; };
-
-// Host-side reach-in: the current set of registered routines, keyed by id.
-// The host iterates this on its tick/render loop to call each routine via the
-// dispatch table. (Mirrors ext_sync's *_host accessors — host-side entry, not
-// an ember native.)
 std::vector<Routine> host_routines();
-
-// The next id that register_routine would return (for the host to size/peek).
 int64_t host_count();
+
+// ─── Red 8 (§6.5, §10.3, §12.4): per-runtime keyed lifecycle ────────────────
+bool lifecycle_init_keyed(ModuleInstance& inst);
+std::vector<Routine> host_routines_keyed(ModuleInstance& inst);
+int64_t lifecycle_tick_keyed(ModuleInstance& inst, context_t& ctx,
+                             const DispatchKeyAdapter& adapter);
 
 } // namespace ember::ext_lifecycle
