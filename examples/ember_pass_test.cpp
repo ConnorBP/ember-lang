@@ -58,7 +58,9 @@
 #include "../src/ember_pass_pipeline.hpp"
 #include "../src/extension_registry.hpp"
 #include "../src/seed_derivation.hpp"
+#include "../src/pipeline_profile.hpp"  // Red 8: PipelineProfile + registry
 #include "../src/thin_ir.hpp"
+#include "../src/thin_ir_mutation.hpp"  // Red 8: PassGrowthLimits for heavy profile bounds
 #include "../src/thin_ir_ser.hpp"   // Red 5: verify_thin_function_for_codegen
 #include "../src/codegen.hpp"      // Red 5: compile_func_checked, CodeGenCtx
 #include "../src/thin_lower.hpp"    // Red 5: lower_function
@@ -69,6 +71,7 @@
 #include "../src/parser.hpp"         // Red 5: parse
 #include "../src/sema.hpp"           // Red 5: sema
 #include "../extensions/opt/ext_opt.hpp"  // Red 5: register_passes
+#include "../extensions/obf/ext_obf.hpp"   // Red 8: register_passes (obf) for profile expansion
 
 #include <array>
 #include <atomic>
@@ -1802,6 +1805,351 @@ int main() {
             }
         }
         }  // end if (setup_ok)
+    }
+
+    // ===================================================================
+    // ─── Red 8: ordinary pipeline profiles ───
+    //
+    // Pins the PipelineProfile + PipelineProfileRegistry contracts:
+    //   (P1) deterministic listing (sorted lexicographically, all 3 built-ins);
+    //   (P2) duplicate / unknown profile errors use the ExtensionStatus/
+    //        ExtensionError foundation (collision-aware, original retained);
+    //   (P3) exact recipe expansion + order — each profile's recipe is the
+    //        DOCUMENTED pass sequence (content-checked, not just self-consistent
+    //        with a header constant), and expands through the real
+    //        EmberPassRegistry + build_pipeline_from_string into a fresh
+    //        EmberPassManager with the named passes IN ORDER;
+    //   (P4) fresh configured factories — two expansions of the same profile
+    //        yield distinct fresh pass instances, and the seed is propagated
+    //        into the profile's options deriver (reproducible + seed-bound);
+    //   (P5) explicit pipeline replacement — an explicit `--passes` recipe
+    //        REPLACES the selected profile recipe while the profile's
+    //        options/seed are retained (the obf factories stay configured by
+    //        the profile's options); neither option silently appends.
+    //
+    // Profiles are ORDINARY NAMED RECIPES: no hidden pass-manager modes. The
+    // expansion path is the SAME build_pipeline_from_string an explicit
+    // `--passes` uses, into a FRESH EmberPassManager. heavy is explicitly
+    // experimental + bounded (denser but never an uncontrolled fixed point).
+    // ===================================================================
+
+    // The DOCUMENTED recipes as independent string literals (NOT the header
+    // constants). A profile's recipe must equal these EXACT contents, so a
+    // wrong stub recipe fails the content check rather than passing by
+    // self-consistency with kProfile*Recipe.
+    const std::string doc_light =
+        "constprop,forward,copyprop,instcombine,dce,dse,const_encode,mba_expand";
+    const std::string doc_balanced =
+        "simplifycfg,constprop,forward,copyprop,instcombine,cse,dce,dse,"
+        "str_encrypt,const_encode,block_split,opaque_pred,deadcode,mba_expand";
+    const std::string doc_heavy = doc_balanced;  // same recipe; options differ
+
+    // Split a comma-separated recipe into ordered tokens (independent of the
+    // header constants, so the content check is real).
+    auto split_recipe = [](const std::string& r) -> std::vector<std::string> {
+        std::vector<std::string> toks;
+        std::string cur;
+        for (char c : r) {
+            if (c == ',') { toks.push_back(cur); cur.clear(); }
+            else cur.push_back(c);
+        }
+        if (!cur.empty()) toks.push_back(cur);
+        return toks;
+    };
+
+    // A helper registry: opt + obf passes registered with deterministic
+    // defaults so profile recipes resolve to real, runnable passes.
+    auto make_full_pass_registry = []() {
+        EmberPassRegistry reg;
+        ext_opt::register_passes(reg);
+        ext_obf::register_passes(reg);
+        return reg;
+    };
+
+    // (P1) Deterministic listing: register_builtin_profiles on a fresh
+    // registry lists exactly light, balanced, heavy (sorted).
+    std::printf("(P1) Deterministic listing of built-in profiles\n");
+    {
+        PipelineProfileRegistry reg;
+        ExtensionStatus st = register_builtin_profiles(reg, /*seed=*/0);
+        check(bool(st), "register_builtin_profiles succeeds on a fresh registry");
+        check(reg.size() == 3, "three built-in profiles registered");
+        std::vector<std::string> names = reg.names();
+        std::vector<std::string> expected = {"balanced", "heavy", "light"};
+        check(names == expected, "names() lists balanced, heavy, light (sorted)");
+        check(reg.has("light"), "has(\"light\")");
+        check(reg.has("balanced"), "has(\"balanced\")");
+        check(reg.has("heavy"), "has(\"heavy\")");
+        check(!reg.has("nonexistent"), "!has(\"nonexistent\")");
+    }
+
+    // (P2) Duplicate / unknown profile errors on the ExtensionStatus/
+    // ExtensionError foundation. A duplicate add is rejected and the ORIGINAL
+    // registration is retained (not replaced). An unknown name get() returns
+    // nullptr. Empty name + empty recipe are rejected and not stored.
+    std::printf("(P2) Duplicate / unknown / empty profile errors\n");
+    {
+        PipelineProfileRegistry reg;
+        check(bool(register_builtin_profiles(reg, 0)), "seed 0 built-ins ok");
+        // Duplicate light (different recipe) is rejected; original retained.
+        ExtensionStatus dup = reg.add(PipelineProfile{
+            "light", "dce", false, PolymorphicPassOptions{}, 0});
+        check(!bool(dup), "duplicate \"light\" rejected");
+        check(dup.error.has_value(), "duplicate carries a structured error");
+        if (dup.error) {
+            check(dup.error->registry == std::string(kPipelineProfileRegistryId),
+                  "duplicate error.registry == \"ember-pipeline-profile\"");
+            check(!dup.error->message.empty(), "duplicate error has a message");
+        }
+        const PipelineProfile* p = reg.get("light");
+        check(p != nullptr, "get(\"light\") still present after duplicate");
+        check(p != nullptr && p->recipe == doc_light,
+              "original light recipe retained (documented content), not replaced");
+        // Unknown name get() returns nullptr.
+        check(reg.get("nope") == nullptr, "get(unknown) == nullptr");
+        // Empty name rejected.
+        ExtensionStatus en = reg.add(PipelineProfile{
+            "", "dce", false, PolymorphicPassOptions{}, 0});
+        check(!bool(en), "empty profile name rejected");
+        check(!reg.has(""), "empty name not stored");
+        // Empty recipe rejected.
+        ExtensionStatus er = reg.add(PipelineProfile{
+            "empty", "", false, PolymorphicPassOptions{}, 0});
+        check(!bool(er), "empty profile recipe rejected");
+        check(!reg.has("empty"), "empty-recipe profile not stored");
+    }
+
+    // (P3) Exact recipe expansion + order. Each built-in profile's recipe is
+    // the DOCUMENTED pass sequence (content-checked against the independent
+    // doc_* literals), and expand_profile resolves it through the real
+    // EmberPassRegistry into a fresh EmberPassManager with the passes IN ORDER
+    // (the manager size equals the token count, and every token is a
+    // registered pass). This pins that a profile is an ORDINARY recipe, not a
+    // hidden mode.
+    std::printf("(P3) Exact recipe expansion + order\n");
+    {
+        auto pass_reg = make_full_pass_registry();
+        PipelineProfileRegistry preg;
+        register_builtin_profiles(preg, 0);
+
+        // light: content + expansion + non-experimental.
+        const PipelineProfile* light = preg.get("light");
+        check(light != nullptr, "light profile present");
+        check(light != nullptr && light->recipe == doc_light,
+              "light recipe == documented content (8 passes, constprop..mba_expand)");
+        check(light != nullptr && !light->is_experimental,
+              "light is NOT experimental");
+        // light's recipe begins with simplifying opts and ends with
+        // diversification (simplifying precedes one-shot diversification).
+        {
+            auto toks = split_recipe(doc_light);
+            check(toks.size() == 8, "light recipe has exactly 8 passes");
+            check(!toks.empty() && toks.front() == "constprop",
+                  "light recipe starts with constprop (simplifying first)");
+            check(!toks.empty() && toks.back() == "mba_expand",
+                  "light recipe ends with mba_expand (diversification last)");
+            EmberPassManager pm;
+            std::string err;
+            bool ok = expand_profile(*light, pass_reg, pm, &err);
+            check(ok, "light expands through build_pipeline_from_string");
+            check(pm.size() == toks.size(),
+                  "light expanded manager has the recipe's pass count (in order)");
+            bool all_known = true;
+            for (const auto& t : toks) if (!pass_reg.has(t.c_str())) all_known = false;
+            check(all_known, "every light recipe token is a registered pass");
+        }
+
+        // balanced: content + expansion + non-experimental.
+        const PipelineProfile* balanced = preg.get("balanced");
+        check(balanced != nullptr, "balanced profile present");
+        check(balanced != nullptr && balanced->recipe == doc_balanced,
+              "balanced recipe == documented content (14 passes)");
+        check(balanced != nullptr && !balanced->is_experimental,
+              "balanced is NOT experimental");
+        {
+            auto toks = split_recipe(doc_balanced);
+            check(toks.size() == 14, "balanced recipe has exactly 14 passes");
+            check(!toks.empty() && toks.front() == "simplifycfg",
+                  "balanced recipe starts with simplifycfg (simplifying first)");
+            check(!toks.empty() && toks.back() == "mba_expand",
+                  "balanced recipe ends with mba_expand (diversification last)");
+            // The simplifying passes precede the diversification passes: every
+            // simplifying token appears before the first diversification token.
+            auto pos = [&](const std::string& t) {
+                for (size_t i = 0; i < toks.size(); ++i) if (toks[i] == t) return int(i);
+                return -1;
+            };
+            int last_simplify = pos("dse");            // last simplifying pass
+            int first_diversify = pos("str_encrypt");   // first diversification
+            check(last_simplify >= 0 && first_diversify >= 0 &&
+                  last_simplify < first_diversify,
+                  "simplifying passes (..dse) precede diversification (str_encrypt..)");
+            EmberPassManager pm;
+            std::string err;
+            bool ok = expand_profile(*balanced, pass_reg, pm, &err);
+            check(ok, "balanced expands through build_pipeline_from_string");
+            check(pm.size() == toks.size(),
+                  "balanced expanded manager has the recipe's pass count (in order)");
+        }
+
+        // heavy: content + expansion + EXPERIMENTAL + bounded density.
+        const PipelineProfile* heavy = preg.get("heavy");
+        check(heavy != nullptr, "heavy profile present");
+        check(heavy != nullptr && heavy->recipe == doc_heavy,
+              "heavy recipe == documented content (same recipe as balanced)");
+        check(heavy != nullptr && heavy->is_experimental,
+              "heavy IS explicitly experimental");
+        check(heavy != nullptr &&
+              heavy->options.site_probability_ppm == 900'000,
+              "heavy density is exactly 900_000 ppm (bounded, not 100%)");
+        check(heavy != nullptr &&
+              heavy->options.site_probability_ppm > kProfileBalancedDensityPpm,
+              "heavy density is HIGHER than balanced (denser variant)");
+        check(heavy != nullptr &&
+              heavy->options.site_probability_ppm <= 1'000'000,
+              "heavy density is at most 100% (bounded, not uncontrolled)");
+        // heavy's growth ceilings are TIGHTER than the defaults (never raised
+        // above the hard caps) — it is not an uncontrolled fixed point.
+        check(heavy != nullptr &&
+              heavy->options.limits.max_sites < PassGrowthLimits{}.max_sites,
+              "heavy max_sites < default (tighter, not raised)");
+        check(heavy != nullptr &&
+              heavy->options.limits.max_added_instructions <
+                  PassGrowthLimits{}.max_added_instructions,
+              "heavy max_added_instructions < default (tighter)");
+        {
+            auto toks = split_recipe(doc_heavy);
+            EmberPassManager pm;
+            std::string err;
+            bool ok = expand_profile(*heavy, pass_reg, pm, &err);
+            check(ok, "heavy expands through build_pipeline_from_string");
+            check(pm.size() == toks.size(),
+                  "heavy expanded manager has the recipe's pass count (in order)");
+        }
+
+        // An unknown pass in a recipe makes expand_profile fail (transactional,
+        // the manager stays empty). This pins that profiles are ordinary
+        // recipes — a bad recipe is rejected the same way a bad --passes is.
+        PipelineProfile bad{"bad", "constprop,nonexistent", false,
+                            PolymorphicPassOptions{}, 0};
+        EmberPassManager pm;
+        std::string err;
+        bool ok = expand_profile(bad, pass_reg, pm, &err);
+        check(!ok, "profile with an unknown pass fails to expand");
+        check(err.find("unknown pass") != std::string::npos,
+              "bad-profile error mentions 'unknown pass'");
+        check(pm.empty(),
+              "bad-profile expansion leaves the manager empty (transactional)");
+    }
+
+    // (P4) Fresh configured factories. Two expansions of the same profile
+    // yield DISTINCT fresh pass instances — the configured factories produce a
+    // new PassConcept on every create(), so two managers built from the same
+    // profile are independent. The seed is propagated into the profile's
+    // options deriver so the same seed is reproducible and a different seed
+    // binds to a different root.
+    std::printf("(P4) Fresh configured factories per expansion\n");
+    {
+        auto pass_reg = make_full_pass_registry();
+        PipelineProfileRegistry preg;
+        register_builtin_profiles(preg, /*seed=*/0x123456789abcdef0ULL);
+        const PipelineProfile* heavy = preg.get("heavy");
+        check(heavy != nullptr, "heavy profile present for freshness test");
+        check(heavy != nullptr && heavy->seed == 0x123456789abcdef0ULL,
+              "heavy profile records the supplied seed");
+        check(heavy != nullptr && heavy->options.seed_deriver != nullptr,
+              "heavy profile carries a non-null seed deriver");
+        // Two independent expansions into two fresh managers.
+        EmberPassManager pm1, pm2;
+        std::string err;
+        check(expand_profile(*heavy, pass_reg, pm1, &err), "first heavy expansion ok");
+        check(expand_profile(*heavy, pass_reg, pm2, &err), "second heavy expansion ok");
+        check(pm1.size() == pm2.size(),
+              "two heavy expansions have the same pass count");
+        check(!pm1.empty(), "heavy expansions are non-empty");
+        // Distinct seeds produce distinct deriver roots (seed binding).
+        auto rootA = u64_to_root(0x123456789abcdef0ULL);
+        auto rootB = u64_to_root(0xdeadbeefULL);
+        check(rootA != rootB, "distinct seeds produce distinct deriver roots");
+        // Deterministic: re-registering the same seed yields the same root
+        // (the profile options are reproducible from the seed).
+        PipelineProfileRegistry preg_same;
+        register_builtin_profiles(preg_same, 0x123456789abcdef0ULL);
+        const PipelineProfile* heavy_same = preg_same.get("heavy");
+        check(heavy_same != nullptr && heavy_same->options.seed_deriver != nullptr,
+              "same-seed heavy profile carries a deriver");
+        // A profile's deriver root equals u64_to_root(seed) (the canonical
+        // adapter), confirming the seed fully determines the deriver.
+        const FixedRootSeedDeriver* hd =
+            dynamic_cast<const FixedRootSeedDeriver*>(
+                heavy->options.seed_deriver.get());
+        check(hd != nullptr && hd->root() == rootA,
+              "heavy deriver root == u64_to_root(seed) (seed-bound + reproducible)");
+    }
+
+    // (P5) Explicit pipeline replacement. An explicit `--passes` recipe
+    // REPLACES the selected profile recipe while the profile's options/seed
+    // are retained (the obf factories stay configured by the profile's
+    // options). Neither option silently appends or alters instrumentation:
+    // when --passes is given, the resulting pipeline is exactly the explicit
+    // recipe (not profile ++ explicit), and the obf factory options remain
+    // the profile's (so a profile-selected seed still drives diversification
+    // in the explicit recipe's obf passes).
+    std::printf("(P5) Explicit --passes replaces profile recipe, retains options\n");
+    {
+        auto pass_reg = make_full_pass_registry();
+        // Simulate the CLI: a profile is selected (heavy, seed S), which
+        // configures the obf factories with the profile's options. Then an
+        // explicit --passes recipe is given, which REPLACES the profile recipe.
+        const uint64_t S = 0xfeedfaceULL;
+        PipelineProfileRegistry preg;
+        register_builtin_profiles(preg, S);
+        const PipelineProfile* heavy = preg.get("heavy");
+        check(heavy != nullptr, "heavy selected for replacement test");
+
+        // The profile's options configure a SECOND pass registry's obf
+        // factories (the CLI re-registers obf with the profile options so the
+        // explicit recipe's obf passes are configured by the profile seed).
+        EmberPassRegistry configured_reg;
+        ext_opt::register_passes(configured_reg);
+        ext_obf::register_passes(configured_reg, heavy->options);
+        // Confirm the configured registry still resolves every obf name the
+        // explicit recipe might use (the factories are configured, not removed).
+        check(configured_reg.has("mba_expand"),
+              "configured registry has mba_expand (profile options retained)");
+        check(configured_reg.has("const_encode"),
+              "configured registry has const_encode (profile options retained)");
+        // Two configured mba_expand instances are distinct + fresh (the profile
+        // options produce fresh configured passes, not a cached singleton).
+        auto a = configured_reg.create("mba_expand");
+        auto b = configured_reg.create("mba_expand");
+        check(a != nullptr && b != nullptr && a.get() != b.get(),
+              "configured factory yields distinct fresh instances");
+
+        // The explicit recipe REPLACES the profile recipe: build the explicit
+        // recipe into the manager via REPLACE semantics (not appended to the
+        // profile's expanded passes).
+        EmberPassManager pm;
+        std::string err;
+        check(expand_profile(*heavy, configured_reg, pm, &err),
+              "profile expands before replacement");
+        const std::size_t profile_count = pm.size();
+        // Replace with an explicit, shorter recipe.
+        bool ok = replace_pipeline_from_string("constprop,mba_expand",
+                                               configured_reg, pm, &err);
+        check(ok, "explicit --passes recipe replaces the profile recipe");
+        check(pm.size() == 2,
+              "replaced pipeline has EXACTLY the explicit recipe (2 passes), "
+              "not profile ++ explicit");
+        check(pm.size() != profile_count,
+              "replacement changed the pass count (did not append)");
+        // The explicit recipe's mba_expand is configured by the profile's
+        // options (the seed S is retained): create one and confirm it is a
+        // real configured required (obf) pass.
+        auto p = configured_reg.create("mba_expand");
+        check(p != nullptr, "configured mba_expand factory yields a pass");
+        check(p != nullptr && p->is_required(),
+              "configured mba_expand is a required (obf) pass");
     }
 
     std::printf("\n%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);

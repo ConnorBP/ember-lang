@@ -1,0 +1,85 @@
+// profile_target.ember — Red 8 candidate-rich profile execution script.
+//
+// Lives under tests/features/ (NOT tests/lang/), so the language test
+// classifier's expected corpus is unchanged — `ember test` and
+// run_lang_tests.sh scan only tests/lang/ (non-recursive). This file is a
+// profile-execution asset driven by the polymorphic_cli_test subprocess
+// harness, not a lang-suite file.
+//
+// Value-preservation target: exercises a representative mix of simplifying
+// optimization opportunities (constant folding, copy/store forwarding, dead
+// code/stores, CSE, CFG simplification) AND diversification candidates
+// (integer arithmetic for MBA/const-encode, a string literal for str_encrypt,
+// straight-line blocks for block_split/opaque_pred/deadcode). The computed
+// result is a DETERMINISTIC i64 so every profile (light/balanced/heavy) and
+// every --pass-seed MUST return the same value. A profile that breaks
+// value-preservation changes the exit code, making the break observable.
+//
+// expect: 250
+//
+// Run (any of these MUST exit 250):
+//   ember_cli.exe run tests/features/profile_target.ember
+//   ember_cli.exe run tests/features/profile_target.ember --profile light
+//   ember_cli.exe run tests/features/profile_target.ember --profile balanced
+//   ember_cli.exe run tests/features/profile_target.ember --profile heavy
+//   ember_cli.exe run tests/features/profile_target.ember --profile balanced --pass-seed 0
+//   ember_cli.exe run tests/features/profile_target.ember --profile balanced --pass-seed 0xFFFFFFFFFFFFFFFF
+//   ember_cli.exe run tests/features/profile_target.ember --passes constprop,forward,copyprop,instcombine,dce,dse
+
+fn fib(n: i64) -> i64 {
+    if (n < 2) { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn sum_loop(n: i64) -> i64 {
+    let mut acc: i64 = 0;
+    let mut i: i64 = 0;
+    while (i < n) {
+        acc = acc + i;
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn opaque_math(a: i64, b: i64) -> i64 {
+    // Plenty of integer arithmetic for mba_expand / const_encode / subst.
+    let x: i64 = a * 2 + b;
+    let y: i64 = x - a + b * 3;
+    let z: i64 = (y + 7) * 1 + 0;
+    return z;
+}
+
+fn string_user() -> i64 {
+    // A string literal exercises str_encrypt (a ConstStringRef rodata site).
+    let s: string = "profile-target-marker";
+    return string_length(s);
+}
+
+fn main() -> i64 {
+    // Constant folding + dead code + copy propagation opportunities.
+    let c1: i64 = 3 + 4;            // folds to 7
+    let c2: i64 = c1 * 2;           // folds to 14
+    let dead: i64 = 999;            // dead (never read) -> dce removes
+    let copy: i64 = c2;             // copy -> copyprop forwards
+    let _unused: i64 = dead;
+
+    // Loop + recursion (simplifying + diversification candidates).
+    let loop_sum: i64 = sum_loop(10);        // 45
+    let fib_val: i64 = fib(10);              // 55
+
+    // Arithmetic chain for MBA / const-encode.
+    let m: i64 = opaque_math(5, 3);          // (5*2+3) -5 + 3*3 = 13 -5 +9 = 17, +7 =24, *1+0=24
+
+    // String site for str_encrypt.
+    let slen: i64 = string_user();           // len("profile-target-marker") = 21
+
+    // Dead store + dead code for dce/dse.
+    let mut buf: i64 = 100;
+    buf = 200;                               // first store dead -> dse removes
+    buf = buf + 50;                          // 250
+
+    // Final accumulator kept < 256 so the CLI's 8-bit exit-code reading is exact.
+    let acc: i64 = c2 + loop_sum + fib_val + m + slen + buf;  // 14+45+55+24+21+250 = 409
+    // Fold a distinctive tail so the result is a recognizable sentinel.
+    return acc - 159;  // 409 - 159 = 250
+}

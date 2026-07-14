@@ -1202,7 +1202,7 @@ add_test(NAME em_v5_ir COMMAND em_v5_ir_test)
 # the compile_func_checked boundary). Links ember + ember_frontend + the opt
 # extension so the checked-compile vectors can drive the real pass pipeline.
 add_executable(ember_pass_test examples/ember_pass_test.cpp)
-target_link_libraries(ember_pass_test PRIVATE ember ember_frontend ember_ext_opt)
+target_link_libraries(ember_pass_test PRIVATE ember ember_frontend ember_ext_opt ember_ext_obf)
 add_test(NAME ember_pass COMMAND ember_pass_test)
 
 # polymorphic_pass_test - Red 6 part one (plan_POLYMORPHIC_CODE_ENGINE.md §9.3
@@ -1220,6 +1220,22 @@ add_executable(polymorphic_pass_test examples/polymorphic_pass_test.cpp)
 target_link_libraries(polymorphic_pass_test PRIVATE ember ember_frontend ember_ext_obf)
 if(WIN32)
     target_link_libraries(polymorphic_pass_test PRIVATE kernel32)
+endif()
+
+# polymorphic_cli_test - Red 8 (plan_POLYMORPHIC_CODE_ENGINE.md §9.3 Red 8):
+# the ordinary pipeline profile CLI regression harness. Shells out to the real
+# ember_cli.exe as a subprocess and verifies --profile light|balanced|heavy,
+# --pass-seed (decimal/hex/0/UINT64_MAX + malformed/overflow rejection),
+# --passes-replaces-profile, and no-profile behavior preservation. Built as a
+# standalone executable WITHOUT add_test so the filtered CTest total is
+# unchanged (run explicitly: ./buildt/polymorphic_cli_test <ember_cli> <src>).
+# Does NOT link ember — it only invokes the CLI as a subprocess, like
+# ember_cli_pipe_live_test / em_cli_emit_test.
+add_executable(polymorphic_cli_test examples/polymorphic_cli_test.cpp)
+if(WIN32)
+    # No ember linkage: the harness only invokes ember_cli as a subprocess
+    # (CreateProcess + std::filesystem). It needs only the C++ stdlib + the
+    # Windows API, both available by default on MinGW/MSVC.
 endif()
 
 # host_struct_test - proof-of-concept: host C++ struct types as first-class

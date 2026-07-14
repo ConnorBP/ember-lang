@@ -78,6 +78,9 @@
 #include "../src/ember_pass.hpp"       // Stage C: EmberPassManager
 #include "../src/ember_pass_registry.hpp" // Stage C: EmberPassRegistry
 #include "../src/ember_pass_pipeline.hpp" // Stage C: build_pipeline_from_string
+#include "../src/pipeline_profile.hpp"   // Red 8: PipelineProfile + registry
+#include "../src/polymorphic_options.hpp" // Red 8: PolymorphicPassOptions
+#include "../src/seed_derivation.hpp"     // Red 8: u64_to_root / FixedRootSeedDeriver
 
 #include <cstdio>
 #include <csetjmp>   // setjmp/longjmp (v0.4 safe-execution checkpoint)
@@ -119,6 +122,79 @@ static std::string read_file(const char* path) {
     if (!f) return std::string();
     std::stringstream ss; ss << f.rdbuf();
     return ss.str();
+}
+
+// ─── Red 8: fixed --pass-seed parsing ───
+//
+// Parse a 64-bit fixed root seed from a CLI string. Accepts decimal and hex
+// (with a `0x` prefix, any case). 0 and UINT64_MAX are accepted (the documented
+// edge seeds). A leading sign, any non-numeric character, an empty string, or a
+// value that overflows uint64 is rejected with a structured diagnostic written
+// to *err (the caller exits 2). The parse uses an explicit overflow-aware
+// accumulation so a too-large hex value (e.g. 0x10000000000000000) is rejected,
+// not silently wrapped to a small value, and so a legitimate UINT64_MAX
+// (0xFFFFFFFFFFFFFFFF) is accepted regardless of letter case.
+//
+// Returns true + *out on success; false + *err on failure. Never prints.
+static bool parse_pass_seed(const char* s, uint64_t* out, std::string* err) {
+    if (!s || s[0] == '\0') {
+        if (err) *err = "--pass-seed needs a value (decimal or 0x-prefixed hex u64)";
+        return false;
+    }
+    // Reject a leading sign: the seed is an unsigned u64; '-1' is not UINT64_MAX
+    // via a signed parse (it would wrap, hiding the rejection).
+    if (s[0] == '-' || s[0] == '+') {
+        if (err) *err = std::string("--pass-seed '") + s +
+                        "' must not have a sign (expected an unsigned 64-bit value)";
+        return false;
+    }
+    // Detect hex vs decimal by a `0x` / `0X` prefix.
+    bool hex = (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'));
+    const char* digits = hex ? (s + 2) : s;
+    if (hex && digits[0] == '\0') {
+        if (err) *err = "--pass-seed '0x' has no hex digits";
+        return false;
+    }
+    // Validate every digit is a legal char for the base, and accumulate with an
+    // explicit overflow check. Leading zeros are allowed and skipped. The
+    // accumulation detects overflow BEFORE the wrap so UINT64_MAX is accepted
+    // but anything strictly greater is rejected.
+    uint64_t value = 0;
+    bool any_digit = false;
+    for (const char* p = digits; *p; ++p) {
+        char c = *p;
+        uint64_t digit;
+        if (c >= '0' && c <= '9') {
+            digit = uint64_t(c - '0');
+        } else if (hex && c >= 'a' && c <= 'f') {
+            digit = uint64_t(c - 'a' + 10);
+        } else if (hex && c >= 'A' && c <= 'F') {
+            digit = uint64_t(c - 'A' + 10);
+        } else {
+            if (err) *err = std::string("--pass-seed '") + s +
+                            "' is malformed (expected " +
+                            (hex ? "hex" : "decimal") + " digits)";
+            return false;
+        }
+        any_digit = true;
+        // Overflow-aware shift+add: value = value*base + digit, but detect
+        // overflow before it wraps. For base 16 and 10 this is exact.
+        uint64_t base = hex ? 16ull : 10ull;
+        // value*base overflows iff value > (UINT64_MAX - digit) / base.
+        if (value > (UINT64_MAX - digit) / base) {
+            if (err) *err = std::string("--pass-seed '") + s +
+                            "' overflows a 64-bit unsigned value";
+            return false;
+        }
+        value = value * base + digit;
+    }
+    if (!any_digit) {
+        if (err) *err = std::string("--pass-seed '") + s +
+                        "' has no digits";
+        return false;
+    }
+    *out = value;
+    return true;
 }
 
 // v0.4 safe-execution trap stub: the JIT calls this (Win64: rcx=context_t*,
@@ -180,7 +256,8 @@ static void usage(FILE* out) {
         "usage:\n"
         "  ember run <input.ember> [--fn NAME] [--dump] [--emit-em OUTPUT.em]\n"
         "                          [--tick [--tick-count N] [--tick-interval MS]]\n"
-        "                          [--passes SPEC]\n"
+        "                          [--passes SPEC] [--profile light|balanced|heavy]\n"
+        "                          [--pass-seed <u64>]\n"
         "  ember emit-em <input.ember> <output.em>\n"
         "  ember bundle <input.ember> <output.exe> [--stub PATH] [--fn NAME]\n"
         "               [--permissions none|ffi]\n"
@@ -227,6 +304,15 @@ static void usage(FILE* out) {
         "  --tick-count N      stop automatically after N ticks (default: keypress)\n"
         "  --tick-interval MS  tick interval in milliseconds (default: 16)\n"
         "  --passes SPEC      run IR optimization passes (e.g. constprop,cse,dce,licm,subst)\n"
+        "  --profile NAME     ordinary pipeline profile: light, balanced, or heavy\n"
+        "                     (a named recipe expanded through the pass registry;\n"
+        "                      --pass-profile is a documented alias). heavy is an\n"
+        "                      explicitly experimental bounded-density variant\n"
+        "  --pass-seed U64    fixed 64-bit root seed (decimal or 0x-hex) for the\n"
+        "                     profile's configured obfuscation factories; 0 and\n"
+        "                     UINT64_MAX accepted; malformed/overflow rejected.\n"
+        "                     An explicit --passes replaces the profile recipe while\n"
+        "                     retaining the profile's seed/options\n"
         "  --ffi              grant FFI permission: enable I/O natives (print, file, path)\n");
 }
 
@@ -311,6 +397,15 @@ struct RunOptions {
     bool dump = false;
     std::string emit_em_path;
     std::string passes_spec;
+    // Red 8: ordinary pipeline profiles + fixed root seed. `profile` is the
+    // selected built-in profile name ("light"/"balanced"/"heavy") or empty
+    // (no profile). `pass_seed` is the fixed root seed for the profile's
+    // configured obf factories (0 by default = fully deterministic). `seed_set`
+    // is true when --pass-seed was given explicitly so the seed travels even
+    // when its value is 0.
+    std::string profile;
+    uint64_t pass_seed = 0;
+    bool seed_set = false;
     bool tick_mode = false;
     int tick_interval_ms = 16;
     int tick_max = 0;
@@ -572,20 +667,80 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
     }
     ctx.use_gc_env = opts.gc_env;
 
-    // Stage C: --passes <spec>
+    // Stage C: --passes <spec>  +  Red 8: --profile <name> [--pass-seed <u64>]
+    //
+    // Profiles are ORDINARY NAMED RECIPES expanded through the existing
+    // EmberPassRegistry + build_pipeline_from_string into a fresh
+    // EmberPassManager — no hidden pass-manager modes. Selecting a profile
+    // configures the obf factories with the profile's options (derived from the
+    // fixed root seed) ONLY AFTER the seed/options overrides are resolved, then
+    // expands the profile's recipe. An explicit `--passes` REPLACES the selected
+    // profile recipe while retaining the profile's options/seed (the obf factories
+    // stay configured by the profile's options so a profile-selected seed still
+    // drives diversification in the explicit recipe's obf passes). Neither
+    // option silently appends or alters instrumentation. With no profile and no
+    // --passes the pass manager stays empty (the existing no-pass behavior is
+    // preserved exactly).
     EmberPassRegistry pass_reg;
     ext_opt::register_passes(pass_reg);
-    ext_obf::register_passes(pass_reg);
+    // Configure the obf factories: if a profile is selected, use the profile's
+    // options (seed-bound); otherwise use the deterministic defaults so an
+    // explicit --passes recipe resolves obf names the way it always has.
+    PolymorphicPassOptions obf_options;
+    std::string profile_recipe;  // the profile's recipe (empty if no profile)
+    bool profile_selected = !opts.profile.empty();
+    if (profile_selected) {
+        PipelineProfileRegistry preg;
+        ExtensionStatus pst = register_builtin_profiles(preg, opts.pass_seed);
+        if (!bool(pst)) {
+            std::fprintf(stderr, "ember: --profile: internal error: %s\n",
+                          pst.error ? pst.error->message.c_str() : "unknown");
+            do_cleanup(); return {2};
+        }
+        const PipelineProfile* prof = preg.get(opts.profile);
+        if (!prof) {
+            std::fprintf(stderr, "ember: --profile: unknown profile '%s' "
+                          "(expected light, balanced, or heavy)\n",
+                          opts.profile.c_str());
+            do_cleanup(); return {2};
+        }
+        obf_options = prof->options;
+        profile_recipe = prof->recipe;
+        if (prof->is_experimental) {
+            std::fprintf(stderr, "ember: --profile: note: '%s' is an experimental "
+                          "profile (bounded higher density)\n", opts.profile.c_str());
+        }
+        ext_obf::register_passes(pass_reg, obf_options);
+    } else {
+        ext_obf::register_passes(pass_reg);  // deterministic defaults
+    }
     EmberPassManager pass_pm;
+    // Decide the effective recipe. An explicit --passes REPLACES the profile
+    // recipe (the profile's options/seed are retained for the obf factories).
+    // If only a profile is selected, the profile recipe is the pipeline. If
+    // neither is given, the pass manager stays empty.
+    std::string effective_recipe;
+    bool have_recipe = false;
     if (!opts.passes_spec.empty()) {
+        // Explicit --passes replaces the profile recipe; the profile's options
+        // already configured the obf factories above (profile_selected branch).
+        effective_recipe = opts.passes_spec;
+        have_recipe = true;
+    } else if (profile_selected) {
+        effective_recipe = profile_recipe;
+        have_recipe = true;
+    }
+    if (have_recipe) {
         std::string pass_err;
-        if (!build_pipeline_from_string(opts.passes_spec, pass_reg, pass_pm, &pass_err)) {
-            std::fprintf(stderr, "ember: --passes: %s\n", pass_err.c_str());
+        if (!build_pipeline_from_string(effective_recipe, pass_reg, pass_pm, &pass_err)) {
+            std::fprintf(stderr, "ember: %s: %s\n",
+                          opts.passes_spec.empty() ? "--profile" : "--passes",
+                          pass_err.c_str());
             do_cleanup(); return {2};
         }
         ctx.pass_manager = &pass_pm;
         ctx.enable_ir_backend = true;
-        ctx.enable_regalloc = true;  // Stage 3: linear-scan regalloc with --passes
+        ctx.enable_regalloc = true;  // regalloc runs once after the whole pass pipeline
     }
 
     // ---- compile + finalize each function ----
@@ -1518,6 +1673,9 @@ int main(int argc, char** argv) {
     std::string emit_em_path;   // v0.5: --emit-em <out> pre-compiles to a .em bundle
     std::string load_em_path;
     std::string passes_spec;     // Stage C: --passes <spec> run IR optimization passes
+    std::string profile;         // Red 8: --profile <name> (alias --pass-profile)
+    uint64_t pass_seed = 0;      // Red 8: --pass-seed <u64> fixed root seed
+    bool seed_set = false;       // Red 8: --pass-seed was given (so 0 travels)
     bool tick_mode = false;     // v0.6: --tick runs @on_tick fns on a thread until a keybind
     int tick_interval_ms = 16;  // v0.6: --tick-interval (default ~60fps)
     int tick_max = 0;           // v0.6: --tick-count N auto-stop after N ticks (0 = until keybind; for tests/non-interactive)
@@ -1538,6 +1696,31 @@ int main(int argc, char** argv) {
         } else if (a == "--passes") {
             if (++i >= argc) { std::fprintf(stderr, "ember: --passes needs a spec (e.g. constprop,cse,dce)\n"); return 2; }
             passes_spec = argv[i];
+        } else if (a == "--profile" || a == "--pass-profile") {
+            // Red 8: ordinary pipeline profile (light/balanced/heavy).
+            // --pass-profile is a documented alias. Missing value -> exit 2;
+            // an unknown value is rejected later (run_ember_file resolves it
+            // against the built-in registry).
+            if (++i >= argc) {
+                std::fprintf(stderr, "ember: %s needs a profile name (light, balanced, or heavy)\n",
+                             a.c_str());
+                return 2;
+            }
+            profile = argv[i];
+        } else if (a == "--pass-seed") {
+            // Red 8: fixed 64-bit root seed for the profile's configured obf
+            // factories. Decimal or 0x-prefixed hex; 0 and UINT64_MAX accepted;
+            // malformed/overflow/sign rejected with a structured diagnostic.
+            if (++i >= argc) {
+                std::fprintf(stderr, "ember: --pass-seed needs a value (decimal or 0x-hex u64)\n");
+                return 2;
+            }
+            std::string seed_err;
+            if (!parse_pass_seed(argv[i], &pass_seed, &seed_err)) {
+                std::fprintf(stderr, "ember: --pass-seed: %s\n", seed_err.c_str());
+                return 2;
+            }
+            seed_set = true;
         } else if (a == "--emit-em") {
             if (++i >= argc) { std::fprintf(stderr, "ember: --emit-em needs a path\n"); return 2; }
             emit_em_path = argv[i];
@@ -1666,6 +1849,9 @@ int main(int argc, char** argv) {
     opts.dump = dump;
     opts.emit_em_path = emit_em_path;
     opts.passes_spec = passes_spec;
+    opts.profile = profile;
+    opts.pass_seed = pass_seed;
+    opts.seed_set = seed_set;
     opts.tick_mode = tick_mode;
     opts.tick_interval_ms = tick_interval_ms;
     opts.tick_max = tick_max;
