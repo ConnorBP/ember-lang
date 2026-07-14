@@ -9,12 +9,17 @@
 // runtime error rather than a link failure.
 #include "binding_builder.hpp"
 #include "ext_coroutine.hpp"
+#include "context.hpp"
 
 namespace ember::ext_coroutine {
 
 static int64_t n_coroutine_start(int64_t, int64_t) { return 0; }  // 0 = invalid
 static int64_t n_coroutine_next(int64_t) { return 0; }
 static int64_t n_coroutine_done(int64_t) { return 1; }  // true = done (nothing to run)
+
+// Stub: no-op init (the real version converts the main thread to a fiber).
+// Returns false so any coroutine_start immediately fails with an invalid handle.
+bool coroutine_init(ember::context_t*, void*, int64_t) { return false; }
 
 void register_natives(std::unordered_map<std::string, NativeSig>& m) {
     BindingBuilder b;

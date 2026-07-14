@@ -59,14 +59,14 @@ jobs:
         shell: msys2 {0}
         run: |
           cd build
-          # The validation script returns 177 as its exit code (the expected
-          # value — it's an i64 return that becomes the process exit code).
-          # A non-177 exit is a failure; 177 is success.
+          set +e
           ./ember_cli.exe run ../tests/lang/optimization_validation.ember --fn main \
             --passes constprop,forward,copyprop,instcombine,dce,licm,dse,simplifycfg,bounds-elim,sccp,unroll,spill_elim,peephole,lsr
           rc=$?
           echo "validation exit: $rc"
-          if [ $rc -ne 177 ]; then echo "::error::validation failed (expected 177, got $rc)"; exit 1; fi
+          if [ "$rc" -ne 177 ]; then echo "::error::validation failed (expected 177, got $rc)"; exit 1; fi
+          echo "validation passed (177)"
+          exit 0
 
   # ---- Sanitizer build: ASAN + UBSAN (Linux — ASAN on Windows is experimental) ----
   sanitizer:
