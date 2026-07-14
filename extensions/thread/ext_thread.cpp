@@ -132,7 +132,14 @@ static void thread_worker_legacy(void* entry, context_t* ctx, int64_t arg,
     save_state(ctx, saved);
     ctx->reset_for_call();
     ctx->has_checkpoint = true;
-    if (setjmp(ctx->checkpoint)) {
+    // EMBER_SETJMP (not raw setjmp): the JIT'd trap stub longjmps via
+    // EMBER_LONGJMP (__builtin_longjmp on MinGW), which expects a
+    // __builtin_setjmp-format buffer. Raw setjmp saves fewer registers and
+    // uses an incompatible buffer layout, so mixing setjmp + __builtin_longjmp
+    // corrupts callee-saved state across the trap unwind and segfaults the
+    // worker (the Red 8 trap/thread recovery regression). The macros in
+    // context.hpp resolve to the matching primitive per platform.
+    if (EMBER_SETJMP(ctx->checkpoint)) {
         trapped = true;
         reason  = int(ctx->last_trap);
         ctx->has_checkpoint = false;
@@ -164,7 +171,11 @@ static void thread_worker_keyed(ModuleInstance* inst, int64_t logical_handle,
     save_state(ctx, saved);
     ctx->reset_for_call();
     ctx->has_checkpoint = true;
-    if (setjmp(ctx->checkpoint)) {
+    // EMBER_SETJMP (see thread_worker_legacy): the keyed worker's trap stub
+    // longjmps via EMBER_LONGJMP, so the checkpoint must be set with the
+    // matching EMBER_SETJMP primitive (raw setjmp + __builtin_longjmp is UB
+    // and segfaults — the Red 8 regression).
+    if (EMBER_SETJMP(ctx->checkpoint)) {
         trapped = true;
         reason  = int(ctx->last_trap);
         ctx->has_checkpoint = false;

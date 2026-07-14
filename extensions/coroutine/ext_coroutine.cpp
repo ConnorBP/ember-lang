@@ -113,7 +113,12 @@ static void WINAPI coro_trampoline(PVOID lpParameter) {
     int     reason  = 0;
 
     ctx->has_checkpoint = true;
-    if (setjmp(ctx->checkpoint)) {
+    // EMBER_SETJMP (not raw setjmp): the JIT'd trap stub longjmps via
+    // EMBER_LONGJMP (__builtin_longjmp on MinGW), which expects a
+    // __builtin_setjmp-format buffer. Raw setjmp + __builtin_longjmp is UB
+    // and corrupts callee-saved state across the trap unwind (segfaults the
+    // fiber). The macros in context.hpp resolve to the matching primitive.
+    if (EMBER_SETJMP(ctx->checkpoint)) {
         trapped = true;
         reason  = int(ctx->last_trap);
         ctx->has_checkpoint = false;
