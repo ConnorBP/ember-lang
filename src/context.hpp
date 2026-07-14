@@ -72,6 +72,16 @@ enum class TrapReason : uint8_t {
                        // call target wasn't a registered fn (REDSHELL guard #6)
     UnhandledThrow,    // Tier 4: a `throw` with no enclosing try/catch unwound
                        // to the host checkpoint (mirrors runtime_error severity)
+    KeyedDispatchPadding, // Red 4 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md
+                          // §7.3): a keyed-dispatch resolution selected an ABI-
+                          // compatible padding/trap ordinal. The padding target
+                          // does NOT compare a key (§7.3); it simply occupies a
+                          // physical ordinal selected by the build permutation
+                          // and traps through Ember's recoverable mechanism. A
+                          // wrong route word that lands here is memory-safe
+                          // (the entry is non-null finalized RX code) but
+                          // semantically incorrect, so the trap stub fires this
+                          // reason before longjmp to the host checkpoint.
 };
 
 struct context_t {
@@ -176,6 +186,7 @@ inline const char* trap_reason_str(TrapReason r) {
     case TrapReason::DivByZero:          return "divide by zero";
     case TrapReason::BadCallTarget:      return "bad call target";
     case TrapReason::UnhandledThrow:     return "unhandled throw";
+    case TrapReason::KeyedDispatchPadding: return "keyed dispatch padding";
     }
     return "unknown";
 }

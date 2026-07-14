@@ -13,6 +13,7 @@
 #include "module_layout.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <set>
@@ -802,6 +803,369 @@ ExtensionStatus register_implicit_keyed_v1(KeyedDispatchRegistry& registry) {
         return std::unique_ptr<ModuleLayoutConcept>(
             std::make_unique<ImplicitKeyedLayoutV1>());
     });
+}
+
+// ============================================================================
+// Red 4: runtime resolver + immutable module dispatch record (§10, §5.5,
+// §14.3). The GREEN side of the runtime-resolver contract.
+//
+// validate_dispatch_record — strict whole-record validation BEFORE publication
+// (§10.4). resolve_keyed_dispatch — structured C++ resolver wrapper.
+// ember_resolve_keyed_dispatch — the stable C-ABI reference helper (§5.5).
+//
+// The resolver delegates to the ONE Red 1 authoritative runtime wrapper
+// keyed_dispatch_permute_runtime (the mathematics cannot drift between build
+// placement and runtime navigation). It validates the logical identity, adds
+// the domain base safely with checked arithmetic, acquire-loads a non-null
+// entry, and returns a structured failure / nullptr BEFORE any out-of-bounds
+// physical-slot read. No expected-key comparison ever occurs (§3.3).
+// ============================================================================
+
+// Internal: is allowlist bit i set? Defensive against a null/short allowlist.
+static bool allowlist_bit_set(const uint8_t* allowlist, uint32_t bytes,
+                              uint32_t logical_slot) noexcept {
+    if (!allowlist || bytes == 0) return false;
+    uint32_t byte_idx = logical_slot >> 3;
+    if (byte_idx >= bytes) return false;
+    uint32_t bit_idx = logical_slot & 7u;
+    return (allowlist[byte_idx] & (uint8_t(1) << bit_idx)) != 0;
+}
+
+ExtensionStatus validate_dispatch_record(const ModuleDispatchRecord& rec) noexcept {
+    // Mode must be a supported value.
+    if (rec.mode != DispatchMode::Identity && rec.mode != DispatchMode::Keyed) {
+        return ExtensionStatus{err("", "dispatch record: unsupported mode")};
+    }
+    // Strategy version 1 is the only currently-supported version. Identity
+    // mode does not permute but still carries the field for shape uniformity.
+    if (rec.strategy_version != 1) {
+        return ExtensionStatus{err("", "dispatch record: unsupported strategy version")};
+    }
+
+    // An empty module (logical_slot_count 0) is valid only in Identity mode
+    // (an empty identity table is valid — preserves existing DispatchTable
+    // behavior). A keyed empty module has no dispatch domains and is rejected
+    // (mirroring the Red 3 keyed planner's strict empty-module rejection).
+    if (rec.logical_slot_count == 0) {
+        if (rec.mode == DispatchMode::Keyed) {
+            return ExtensionStatus{err("", "keyed dispatch record: empty module (logical_slot_count 0)")};
+        }
+        // Identity empty: physical_slot_count must also be 0 and no routes/domains.
+        if (rec.physical_slot_count != 0) {
+            return ExtensionStatus{err("", "identity empty record: physical_slot_count != 0")};
+        }
+        if (rec.domain_count != 0) {
+            return ExtensionStatus{err("", "identity empty record: domain_count != 0")};
+        }
+        // An empty allowlist (null, 0 bytes) is the canonical empty shape.
+        return ExtensionStatus{};
+    }
+
+    // Non-empty module: the allowlist must be non-null and large enough to
+    // cover every logical slot.
+    const uint32_t need_allowlist_bytes = (rec.logical_slot_count + 7u) >> 3;
+    if (rec.logical_allowlist == nullptr) {
+        return ExtensionStatus{err("", "dispatch record: null allowlist with nonzero logical_slot_count")};
+    }
+    if (rec.logical_allowlist_bytes < need_allowlist_bytes) {
+        return ExtensionStatus{err("", "dispatch record: allowlist too short for logical_slot_count")};
+    }
+
+    // Routes pointer must be non-null and cover every logical slot.
+    if (rec.logical_routes == nullptr) {
+        return ExtensionStatus{err("", "dispatch record: null logical_routes")};
+    }
+    // Physical storage must be non-null for a non-empty module.
+    if (rec.physical_slots == nullptr) {
+        return ExtensionStatus{err("", "dispatch record: null physical_slots")};
+    }
+
+    if (rec.mode == DispatchMode::Identity) {
+        // Identity invariants (§10.1 legacy path): physical == logical, no
+        // keyed domains, the resolver indexes physical_slots[logical_slot]
+        // directly. A domain_count > 0 in identity mode is malformed (keyed
+        // domains are not part of the identity record shape).
+        if (rec.physical_slot_count != rec.logical_slot_count) {
+            return ExtensionStatus{err("", "identity record: physical_slot_count != logical_slot_count")};
+        }
+        if (rec.domain_count != 0) {
+            return ExtensionStatus{err("", "identity record: domain_count != 0 (no keyed domains)")};
+        }
+        // Routes must be dense (route[i].logical_slot == i). No domain to
+        // cross-check (domain_count 0), but the route's domain_index is
+        // unused in identity mode — we do not require it to be 0 here; the
+        // identity resolver ignores it.
+        for (uint32_t i = 0; i < rec.logical_slot_count; ++i) {
+            if (rec.logical_routes[i].logical_slot != i) {
+                return ExtensionStatus{err("", "identity record: route[" + std::to_string(i) +
+                    "].logical_slot != " + std::to_string(i))};
+            }
+            if (!allowlist_bit_set(rec.logical_allowlist, rec.logical_allowlist_bytes, i)) {
+                return ExtensionStatus{err("", "identity record: allowlist bit clear for slot " +
+                    std::to_string(i))};
+            }
+        }
+        return ExtensionStatus{};
+    }
+
+    // ---- Keyed mode ----
+    if (rec.domain_count == 0) {
+        return ExtensionStatus{err("", "keyed record: domain_count == 0")};
+    }
+    if (rec.domains == nullptr) {
+        return ExtensionStatus{err("", "keyed record: null domains")};
+    }
+    if (rec.physical_slot_count < rec.logical_slot_count) {
+        return ExtensionStatus{err("", "keyed record: physical_slot_count < logical_slot_count")};
+    }
+
+    // Domain range/identity invariants + non-overlapping coverage.
+    {
+        std::set<uint32_t> covered;
+        uint32_t domain_phys_total = 0;
+        for (uint32_t di = 0; di < rec.domain_count; ++di) {
+            const auto& d = rec.domains[di];
+            if (d.padding_count != 1) {
+                return ExtensionStatus{err("", "keyed record: domain " + std::to_string(di) +
+                    " padding_count != 1")};
+            }
+            if (d.physical_count != d.logical_count + d.padding_count) {
+                return ExtensionStatus{err("", "keyed record: domain " + std::to_string(di) +
+                    " physical_count != logical_count + padding_count")};
+            }
+            if (d.physical_count < 2 || d.physical_count > KEYED_DISPATCH_MAX_DOMAIN_SIZE) {
+                return ExtensionStatus{err("", "keyed record: domain " + std::to_string(di) +
+                    " physical_count out of range [2, MAX]")};
+            }
+            if (d.strategy_version != rec.strategy_version) {
+                return ExtensionStatus{err("", "keyed record: domain " + std::to_string(di) +
+                    " strategy_version != record strategy_version")};
+            }
+            if (d.logical_slots.size() != d.logical_count) {
+                return ExtensionStatus{err("", "keyed record: domain " + std::to_string(di) +
+                    " logical_slots size != logical_count")};
+            }
+            if (d.padding_ordinal != d.logical_count) {
+                return ExtensionStatus{err("", "keyed record: domain " + std::to_string(di) +
+                    " padding_ordinal != logical_count")};
+            }
+            // Domain physical range must be in-bounds and non-overlapping.
+            if (uint64_t(d.physical_base) + uint64_t(d.physical_count) >
+                uint64_t(rec.physical_slot_count)) {
+                return ExtensionStatus{err("", "keyed record: domain " + std::to_string(di) +
+                    " physical range exceeds physical_slot_count")};
+            }
+            for (uint32_t s = d.physical_base; s < d.physical_base + d.physical_count; ++s) {
+                auto [it, ok] = covered.insert(s);
+                if (!ok) {
+                    return ExtensionStatus{err("", "keyed record: overlapping physical domain range at slot " +
+                        std::to_string(s))};
+                }
+            }
+            domain_phys_total += d.physical_count;
+        }
+        if (domain_phys_total != rec.physical_slot_count) {
+            return ExtensionStatus{err("", "keyed record: sum of domain physical_counts != physical_slot_count")};
+        }
+    }
+
+    // Dense logical routes + route/domain metadata consistency + allowlist.
+    {
+        std::set<uint32_t> seen_slots;
+        for (uint32_t i = 0; i < rec.logical_slot_count; ++i) {
+            const auto& r = rec.logical_routes[i];
+            if (r.logical_slot != i) {
+                return ExtensionStatus{err("", "keyed record: route[" + std::to_string(i) +
+                    "].logical_slot != " + std::to_string(i))};
+            }
+            auto [it, ok] = seen_slots.insert(r.logical_slot);
+            if (!ok) {
+                return ExtensionStatus{err("", "keyed record: duplicate logical route slot " +
+                    std::to_string(r.logical_slot))};
+            }
+            if (r.domain_index >= rec.domain_count) {
+                return ExtensionStatus{err("", "keyed record: route domain_index OOB for slot " +
+                    std::to_string(i))};
+            }
+            const auto& d = rec.domains[r.domain_index];
+            // Route metadata must match its domain identity (ABI fingerprint,
+            // visibility, calling mode, dispatch-domain label). A mutated
+            // route that disagrees with its domain is a malformed record.
+            if (r.abi_fingerprint != d.abi_fingerprint) {
+                return ExtensionStatus{err("", "keyed record: route ABI fingerprint != domain for slot " +
+                    std::to_string(i))};
+            }
+            if (r.visibility != d.visibility) {
+                return ExtensionStatus{err("", "keyed record: route visibility != domain for slot " +
+                    std::to_string(i))};
+            }
+            if (r.calling_mode != d.calling_mode) {
+                return ExtensionStatus{err("", "keyed record: route calling_mode != domain for slot " +
+                    std::to_string(i))};
+            }
+            if (r.dispatch_domain != d.dispatch_domain) {
+                return ExtensionStatus{err("", "keyed record: route dispatch_domain != domain for slot " +
+                    std::to_string(i))};
+            }
+            // The route's ordinal must be a real (non-padding) ordinal, and the
+            // domain must assign that ordinal to this logical slot.
+            if (r.ordinal >= d.logical_count) {
+                return ExtensionStatus{err("", "keyed record: route ordinal >= domain logical_count for slot " +
+                    std::to_string(i))};
+            }
+            if (r.ordinal >= d.logical_slots.size() ||
+                d.logical_slots[r.ordinal] != r.logical_slot) {
+                return ExtensionStatus{err("", "keyed record: route ordinal/logical_slots mismatch for slot " +
+                    std::to_string(i))};
+            }
+            // The allowlist bit for every present route must be set (a route
+            // without an allowlist bit is a publication-inconsistent record).
+            if (!allowlist_bit_set(rec.logical_allowlist, rec.logical_allowlist_bytes, i)) {
+                return ExtensionStatus{err("", "keyed record: allowlist bit clear for present route slot " +
+                    std::to_string(i))};
+            }
+        }
+    }
+
+    return ExtensionStatus{};
+}
+
+// Internal: the core resolution, shared by the C++ wrapper and the C-ABI
+// helper. Validates the logical identity, resolves through the permutation
+// (keyed) or the identity index, adds the domain base safely, and acquire-
+// loads a non-null entry. On failure sets `out_err` and returns false WITHOUT
+// any out-of-bounds physical-slot read. On success returns true and sets
+// `out_entry` to a non-null entry pointer.
+static bool resolve_core(const ModuleDispatchRecord* rec, uint32_t logical_slot,
+                         uint64_t transient_route_word, void*& out_entry,
+                         ExtensionError& out_err) noexcept {
+    out_entry = nullptr;
+    if (!rec) {
+        out_err = err("", "resolve: null dispatch record");
+        return false;
+    }
+    // Logical identity range check BEFORE any array read.
+    if (logical_slot >= rec->logical_slot_count) {
+        out_err = err("", "resolve: logical_slot >= logical_slot_count");
+        return false;
+    }
+    // Validate the logical handle with the allowlist FIRST (§9.6).
+    if (!allowlist_bit_set(rec->logical_allowlist, rec->logical_allowlist_bytes,
+                           logical_slot)) {
+        out_err = err("", "resolve: logical slot not in allowlist");
+        return false;
+    }
+    // Routes must be present (a validated record guarantees this; check
+    // defensively so a malformed record never crashes the resolver).
+    if (!rec->logical_routes) {
+        out_err = err("", "resolve: null logical_routes");
+        return false;
+    }
+    if (!rec->physical_slots) {
+        out_err = err("", "resolve: null physical_slots");
+        return false;
+    }
+    const LogicalRoute& r = rec->logical_routes[logical_slot];
+
+    uint32_t physical_index = 0;
+    if (rec->mode == DispatchMode::Identity) {
+        // Legacy path: physical_slots[logical_slot] directly. No permutation,
+        // no padding. Preserve existing DispatchTable behavior (§4.4).
+        physical_index = logical_slot;
+        if (physical_index >= rec->physical_slot_count) {
+            out_err = err("", "resolve: identity physical index OOB");
+            return false;
+        }
+    } else if (rec->mode == DispatchMode::Keyed) {
+        // Keyed path: validate the route's domain, then resolve through the
+        // ONE Red 1 runtime permutation helper.
+        if (r.domain_index >= rec->domain_count) {
+            out_err = err("", "resolve: route domain_index OOB");
+            return false;
+        }
+        if (!rec->domains) {
+            out_err = err("", "resolve: null domains");
+            return false;
+        }
+        const DispatchDomain& d = rec->domains[r.domain_index];
+        // The route's ordinal must be a real (non-padding) ordinal of the
+        // domain. A validated record guarantees this; check defensively.
+        if (r.ordinal >= d.logical_count) {
+            out_err = err("", "resolve: route ordinal >= domain logical_count");
+            return false;
+        }
+        // The domain must publish the same strategy version as the record.
+        if (d.strategy_version != rec->strategy_version) {
+            out_err = err("", "resolve: domain strategy_version != record");
+            return false;
+        }
+        KeyedDispatchDomain kd{d.domain_salt, d.strategy_version, d.physical_count};
+        auto pr = keyed_dispatch_permute_runtime(transient_route_word, kd, r.ordinal);
+        if (!pr) {
+            out_err = err("", "resolve: keyed_dispatch_permute_runtime failed");
+            return false;
+        }
+        const uint32_t local = *pr.value;
+        if (local >= d.physical_count) {
+            // Defensive — the Red 1 helper guarantees [0, n) for a valid
+            // domain; this never fires for a validated record but guards a
+            // corrupted domain.
+            out_err = err("", "resolve: permute result out of domain range");
+            return false;
+        }
+        // Add the domain base SAFELY with checked 64-bit arithmetic so a
+        // corrupted domain base + local can never overflow into an OOB read.
+        const uint64_t slot64 = uint64_t(d.physical_base) + uint64_t(local);
+        if (slot64 >= uint64_t(rec->physical_slot_count)) {
+            out_err = err("", "resolve: physical index (base + permute) OOB");
+            return false;
+        }
+        physical_index = uint32_t(slot64);
+    } else {
+        out_err = err("", "resolve: unsupported dispatch mode");
+        return false;
+    }
+
+    // Acquire-load the physical entry. A null/unfinalized entry is a structured
+    // failure (§2.4 item 4) — the storage rejects null at publication (§10.4),
+    // but the resolver is defensive so a half-published or corrupted table
+    // yields a clean failure, never a raw null/wild call.
+    void* entry = rec->physical_slots[physical_index].load(std::memory_order_acquire);
+    if (!entry) {
+        out_err = err("", "resolve: physical entry is null/unfinalized");
+        return false;
+    }
+    out_entry = entry;
+    return true;
+}
+
+ExtensionResult<void*> resolve_keyed_dispatch(
+    const ModuleDispatchRecord* rec, uint32_t logical_slot,
+    uint64_t transient_route_word) noexcept {
+    void* entry = nullptr;
+    ExtensionError e{};
+    if (resolve_core(rec, logical_slot, transient_route_word, entry, e)) {
+        return ExtensionResult<void*>{entry};
+    }
+    return ExtensionResult<void*>{std::move(e)};
+}
+
+// Stable C-ABI reference resolver (§5.5). extern "C" linkage, no exceptions.
+// Returns a non-null entry pointer on success or nullptr on any failure, with
+// NO out-of-bounds read. Delegates to the same core resolution as the C++
+// wrapper. Defined inside namespace ember (the header declaration is already
+// extern "C"; extern "C" inside a namespace gives the function C linkage — an
+// unmangled symbol name — while keeping it a namespace member for lookup). The
+// emitted symbol is `ember_resolve_keyed_dispatch`, the planned §5.5 name.
+extern "C" void* ember_resolve_keyed_dispatch(const ModuleDispatchRecord* rec,
+                                              uint32_t logical_slot,
+                                              uint64_t transient_route_word) noexcept {
+    void* entry = nullptr;
+    ExtensionError e{};
+    if (resolve_core(rec, logical_slot, transient_route_word, entry, e)) {
+        return entry;
+    }
+    return nullptr;
 }
 
 } // namespace ember

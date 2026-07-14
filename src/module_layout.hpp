@@ -248,6 +248,150 @@ public:
 // Free-function form for identity layout (convenience; matches IdentityLayout).
 ExtensionResult<ModuleLayoutPlan> plan_identity_layout(const ModuleManifest& manifest);
 
+// ─── Red 4: runtime resolver + immutable module dispatch record (§10, §5.5,
+//   §14.3) ────────────────────────────────────────────────────────────────
+// The GREEN side of the runtime-resolver contract. An IMMUTABLE, host-published
+// record describing a module's keyed dispatch topology at runtime, plus a
+// stable C-ABI resolver that validates a logical identity and resolves it to
+// a physical dispatch entry through the same versioned permutation the build
+// placed it with (keyed_dispatch_permute_runtime — the ONE Red 1 helper).
+//
+// The record (§10.1) is the runtime shape of the §10.4 atomic immutable
+// publication: build/validate the complete generation privately, then publish
+// one coherent record. It carries separate logical and physical counts
+// (§2.3, §9.7), the physical atomic slot storage pointer, the logical routes,
+// the domains, the logical allowlist, and the strategy version. It carries NO
+// expected key, machine fingerprint, key digest, verifier, or predecoded
+// key-specific permutation (§3.3, §11.3, §14.6) — the route word is transient,
+// supplied per resolution, and only participates in the routing arithmetic.
+//
+// The resolver implements the §2.4 wrong-key safety contract:
+//   1. resolution terminates in bounded work (one permute evaluation);
+//   2. the resulting physical index lies inside the callable's domain;
+//   3. the selected entry shares the domain's canonical ABI fingerprint,
+//      visibility, calling mode, and dispatch-domain label (these are
+//      properties of the domain, so any in-domain entry — including a padding
+//      entry — matches them by construction);
+//   4. the entry is non-null finalized RX code (the storage rejects null at
+//      publication, §10.4; the resolver acquire-loads and returns null on a
+//      null/unfinalized entry);
+//   5. malformed metadata resolves to a structured failure (C++ wrapper) or
+//      null (C-ABI) BEFORE any physical-slot read — no OOB read;
+//   6. NO expected-key comparison occurs (§3.3).
+//
+// A wrong route word may route a logical callable to a DIFFERENT same-domain
+// physical entry (alternate selection) or to the domain's padding ordinal (a
+// non-null same-ABI trap stub that fires TrapReason::KeyedDispatchPadding,
+// §7.3). Not every wrong key traps; this is implicit keyed control-flow, not
+// authentication (§1, §3.3). Every selected destination nevertheless remains
+// inside the chosen domain and matches its ABI fingerprint/visibility/calling-
+// mode/domain label, NOT merely inside the global physical table range (§14.2
+// regression bucket).
+
+// Dispatch mode of a module's dispatch record (§9.7, §11.3). Identity mode is
+// the legacy/unkeyed path (logical slot == physical index, no permutation,
+// no padding); Keyed mode permutes logical ordinals into physical slots.
+enum class DispatchMode : uint8_t {
+    Identity = 0,   // legacy/unkeyed: physical_slots[logical_slot] is the entry
+    Keyed    = 1,   // keyed: P(route_word, domain, ordinal) selects the entry
+};
+
+// The immutable module dispatch record (§10.1). A borrowed, read-only view
+// over host-owned storage. Lifetime: the host owns the physical slot storage,
+// the routes, the domains, and the allowlist on the ModuleInstance (§10.3) and
+// guarantees they outlive every record that references them. The record itself
+// is plain data so it can be published through one atomic pointer swap (§10.2:
+// std::atomic<const ModuleDispatchRecord*>).
+//
+// Field set (§10.1 + the task's "sufficient per-entry metadata for strict
+// validation"): mode, strategy_version, physical_slots, physical_slot_count,
+// logical_slot_count, logical_routes, domains, domain_count, logical_allowlist,
+// logical_allowlist_bytes. The LogicalRoute and DispatchDomain types (defined
+// above) carry the per-entry/per-domain metadata (ABI fingerprint, visibility,
+// calling mode, dispatch-domain label, salt, strategy_version, base, counts,
+// logical_slots) the strict whole-record validator and the resolver both use.
+//
+// The record contains NO field for: an expected target/runtime key, a machine
+// fingerprint, a key digest/hash, a verifier/comparison constant, or a
+// predecoded key-specific permutation map (§3.3, §11.3, §14.6). The route word
+// is NEVER stored here — it is a per-resolution transient supplied to the
+// resolver. The physical slot order itself is the build-time key's influence
+// and is necessarily observable (§3.3); the record exposes that order, not the
+// key.
+struct ModuleDispatchRecord {
+    DispatchMode mode = DispatchMode::Identity;
+    uint32_t strategy_version = 1;          // versioned permutation contract
+    const std::atomic<void*>* physical_slots = nullptr;   // physical slot storage (borrowed)
+    uint32_t physical_slot_count = 0;       // keyed dispatch storage size (§9.7)
+    uint32_t logical_slot_count = 0;        // stable logical identity range (§2.3)
+    const LogicalRoute* logical_routes = nullptr;         // indexed by logical_slot (borrowed)
+    const DispatchDomain* domains = nullptr;              // domain descriptors (borrowed)
+    uint32_t domain_count = 0;
+    // Logical allowlist bitset: bit i set iff logical slot i is a registered,
+    // callable entry (the function-ref REDSHELL guard #6 shape, extended to
+    // keyed mode — §4.6, §9.6 validate the logical handle with the allowlist
+    // FIRST). logical_allowlist_bytes = ceil(logical_slot_count / 8). A null
+    // allowlist with a nonzero logical_slot_count is malformed (rejected by
+    // validation); an empty (0-count) module has a null/0-byte allowlist.
+    const uint8_t* logical_allowlist = nullptr;
+    uint32_t logical_allowlist_bytes = 0;
+};
+
+// Strict whole-record validation BEFORE publication (§10.4, §14.2 should-fail
+// bucket). Rejects a malformed record through a structured ExtensionStatus so a
+// bad generation is never published. Checks:
+//   - mode is Identity or Keyed; strategy_version is supported;
+//   - counts are consistent (physical >= logical for keyed; physical == logical
+//     for identity with no domains);
+//   - every logical route is in range, dense, and matches its domain's ABI
+//     fingerprint, visibility, calling mode, and dispatch-domain label;
+//   - every route's domain_index is in range and its ordinal is a real (<
+//     logical_count) ordinal that the domain assigns to its logical slot;
+//   - domains do not overlap and cover the physical range exactly for keyed;
+//   - the allowlist is non-null when logical_slot_count > 0 and has the right
+//     byte count, and every set bit indexes a present route;
+//   - no expected-key / fingerprint / digest / verifier field exists (the
+//     record's field set is the documented one — this is a structural shape
+//     check, not a value check).
+// Identity mode (§10.1 legacy path): a record with mode == Identity and zero
+// domains is accepted if counts match and physical_slots is non-null (or the
+// module is empty); the identity resolver indexes physical_slots[logical_slot]
+// directly.
+ExtensionStatus validate_dispatch_record(const ModuleDispatchRecord& rec) noexcept;
+
+// Structured C++ resolver wrapper (for diagnostics). Validates the logical
+// identity against the record, resolves through keyed_dispatch_permute_runtime
+// (keyed mode) or the identity index (identity mode), adds the domain base
+// safely, and acquire-loads a non-null entry. Returns the entry pointer on
+// success or a structured ExtensionError on failure. NEVER performs an OOB
+// read: a malformed record, an out-of-range logical slot, a cleared allowlist
+// bit, a permute failure, an OOB base+ordinal, or a null/unfinalized entry all
+// return a structured failure BEFORE any physical-slot read past the validated
+// index.
+//
+// The route word is a transient, locally-derived value (§6.3); it is NEVER
+// stored in the record and NEVER compared to an expected value. The resolver
+// only feeds it to the permutation arithmetic (§3.3).
+ExtensionResult<void*> resolve_keyed_dispatch(
+    const ModuleDispatchRecord* rec, uint32_t logical_slot,
+    uint64_t transient_route_word) noexcept;
+
+// ─── Stable C-ABI reference resolver (§5.5 prototype path) ───────────────
+// The planned C-ABI contract:
+//   extern "C" void* ember_resolve_keyed_dispatch(const ModuleDispatchRecord*,
+//                                                  uint32_t logical_slot,
+//                                                  uint64_t transient_route_word);
+//
+// Returns a non-null finalized entry pointer on success, or nullptr on any
+// failure (malformed record, OOB logical slot, cleared allowlist bit, permute
+// failure, OOB physical index, or a null/unfinalized entry) — with NO out-of-
+// bounds read. The C++ wrapper `resolve_keyed_dispatch` carries the structured
+// diagnostic; this C helper is the no-exceptions, host-callable form that the
+// generated resolver helper path and the §11.5 name resolver use.
+extern "C" void* ember_resolve_keyed_dispatch(const ModuleDispatchRecord* rec,
+                                              uint32_t logical_slot,
+                                              uint64_t transient_route_word) noexcept;
+
 // ─── Deterministic derivations (exposed for oracle cross-checking) ───────
 // Fold a BuildKeyView into a deterministic route word (pinned FNV-1a 64-bit
 // over the key bytes; NOT std::hash). Empty input folds to the FNV-1a offset

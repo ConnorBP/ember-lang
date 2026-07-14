@@ -1164,6 +1164,26 @@ target_link_libraries(keyed_dispatch_math PRIVATE ember)
 add_executable(module_layout_test examples/module_layout_test.cpp)
 target_link_libraries(module_layout_test PRIVATE ember ember_frontend)
 
+# keyed_dispatch_runtime - Red 4 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md
+# §2.4, §5.5, §7.3, §10, §14.2, §14.3, §14.5, §14.6): the runtime resolver +
+# immutable module dispatch record gate. Pins correct-key pinned physical-index
+# vectors, many wrong keys (including 0 and UINT64_MAX) with per-domain in-range
+# + same-ABI/visibility/mode/label membership (NOT a global-range assertion),
+# alternate/padding selection, malformed-record null/OOB safety with no OOB
+# read, null/unfinalized entry rejection + strict publish_keyed, strict
+# whole-record validation, identity-mode legacy behavior preservation,
+# TrapReason::KeyedDispatchPadding + its stable string, and the §14.6 no-key-
+# storage schema assertion (no expected key / fingerprint / digest / verifier /
+# predecoded permutation in the record). Cross-checks the production resolver
+# against an INDEPENDENT resolution oracle. Links ember (keyed_dispatch.* —
+# Red 1 helper, context.hpp — TrapReason, dispatch_table.hpp —
+# KeyedDispatchStorage) + ember_frontend (module_layout.* — Red 3 planner, Red
+# 4 record/resolver/C-ABI helper). NOT a CTest entry: the filtered suite count
+# must stay 67 (§14.1); the target building cleanly + the executable passing IS
+# the gate.
+add_executable(keyed_dispatch_runtime examples/keyed_dispatch_runtime_test.cpp)
+target_link_libraries(keyed_dispatch_runtime PRIVATE ember ember_frontend)
+
 # thin_ir_ser_test - Stage B c1b (IL-.em): the IR SERIALIZER round-trip gate.
 # Hand-builds a ThinFunction + uses the real lower_function path (fib) to
 # prove serialize->deserialize->validate->re-emit->execute works end-to-end,
