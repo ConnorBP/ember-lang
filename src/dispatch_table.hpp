@@ -37,6 +37,34 @@ struct DispatchTable {
         return slots[slot].load(std::memory_order_acquire);
     }
 
+    // Atomic batch publication: validate EVERY (slot, entry) pair FIRST
+    // (slot in range + entry non-null), then commit all pairs with release
+    // ordering. Returns false on a validation failure with NO slot mutated —
+    // the table is left byte-for-byte unchanged, so a host that staged its
+    // compiled functions into private ownership can free them and report a
+    // clean publication failure with no partial record visible to callers.
+    // This is the prevalidated batch dispatch publication path the host
+    // boundary uses so a half-published dispatch table is impossible. A pair
+    // list may be empty (returns true; nothing to publish is a valid no-op).
+    bool publish_batch(const std::vector<std::pair<size_t, void*>>& entries) {
+        for (const auto& [slot, fn] : entries) {
+            if (slot >= slots.size()) return false;     // out of range -> reject, no mutation
+            if (!fn) return false;                      // null fn -> reject, no mutation
+        }
+        // All pairs validated: commit atomically (release ordering so a
+        // caller that loads a slot with acquire sees a fully-published table).
+        for (const auto& [slot, fn] : entries)
+            slots[slot].store(fn, std::memory_order_release);
+        return true;
+    }
+
+    // True iff every slot is null (no record visible). Used by hosts/tests to
+    // assert the table is observably unchanged after a failed publication.
+    bool all_clear() const {
+        for (const auto& s : slots) if (s.load(std::memory_order_acquire) != nullptr) return false;
+        return true;
+    }
+
     void* base() { return const_cast<void*>(static_cast<const void*>(slots.data())); }
 };
 

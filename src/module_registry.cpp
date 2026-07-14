@@ -101,6 +101,32 @@ const std::string& ModuleRegistry::name_of(uint32_t module_id) const {
     return names_[module_id];
 }
 
+// Preflight: mirror register_module's acceptance conditions WITHOUT mutating.
+// Same failure modes (null base, invalid allowlist is N/A here since the host
+// boundary registers __main__ with the default no-allowlist), same id
+// assignment (existing id for a reload, next dense id for a new name). The
+// only side-effect-free read is by_name_ + next_id_ + capacity_ (all stable
+// during a single publication sequence).
+uint32_t ModuleRegistry::preflight_register_module(const std::string& name,
+                                                    void* dispatch_table_base,
+                                                    std::string* err) const {
+    if (!dispatch_table_base) {
+        if (err) *err = "ModuleRegistry: null dispatch table base";
+        return UINT32_MAX;
+    }
+    auto it = by_name_.find(name);
+    if (it != by_name_.end()) return it->second;  // reload keeps the id
+    if (next_id_ >= capacity_) {
+        if (err) *err = "ModuleRegistry: capacity exhausted (registered " +
+                        std::to_string(next_id_) + " of " +
+                        std::to_string(capacity_) + "; grow is forbidden by the "
+                        "REGISTRY-BASE STABILITY INVARIANT - raise the registry's "
+                        "construction capacity)";
+        return UINT32_MAX;
+    }
+    return next_id_;  // the id a new registration would assign
+}
+
 // v1.0 Tier 2 cross-module handles: the per-module records table accessors.
 void* ModuleRegistry::handle_records_base() const {
     return const_cast<void*>(static_cast<const void*>(handle_records_.data()));

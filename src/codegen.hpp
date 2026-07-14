@@ -230,6 +230,13 @@ struct CodeGenCtx {
     //   ctx.pass_manager = &pm;
     EmberPassManager* pass_manager = nullptr;
     EmberAnalysisManager* analysis_manager = nullptr;
+    // Red 5: when true, compile_func_checked populates CompileResult::
+    // transformed with the post-pass ThinFunction (a deep copy of the IR as
+    // it stood after the checked pass pipeline, before regalloc/emit). Default
+    // false = `transformed` is left empty (the opt-out path; no extra copy).
+    // The legacy compile_func wrapper ignores this flag (it returns only the
+    // CompiledFn).
+    bool request_transformed_ir = false;
 
     // --- GC-managed lambda environments (#20, ext_gc) ---
     // When true, the lambda-env codegen path allocates the closure env on the
@@ -246,24 +253,59 @@ struct CodeGenCtx {
 };
 
 // Compile one function. Returns the JIT'd bytes + (after finalize) entry.
-// Source-compatible legacy wrapper (Red 5): kept as the simple return-by-value
-// path. The checked, structured path is compile_func_checked below.
+// Source-compatible legacy wrapper (Red 5): a thin shim over the internal
+// checked implementation that returns just the CompiledFn. It is
+// EXCEPTION-SAFE: a thrown pass or backend error becomes an empty CompiledFn
+// (exec == nullptr), never a propagated exception across this public
+// boundary. The checked, structured path is compile_func_checked below.
 CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx);
 
 // ─── Red 5: the checked compile boundary ───
 //
-// Which backend a compile used (or attempted). Obf/try/catch/coroutine
-// functions fall back to the tree-walker; the IR backend is the optimized path.
+// Which backend a compile used (or attempted). Obf / coroutine functions
+// fall back to the tree-walker; the IR backend is the optimized path.
+// Tier 4 try/catch/throw no longer forces a fallback — they lower to
+// TryCatch/CatchCleanup/CatchEntry/Throw ThinOps through the IR backend.
 enum class CompileBackend : uint8_t {
     TreeWalker,   // the v1 stack-spilling tree-walker (default / fallback)
     IRBackend,    // lower_function -> [checked passes] -> regalloc -> emit_x64
 };
 
+// A single stage of the checked compile pipeline, recorded for evidence.
+// `reached` is false only for stages that were never attempted because an
+// earlier stage failed (e.g. regalloc/emit after a validation failure).
+// `ok` is the stage's own outcome; `detail` carries a short human-readable
+// note (counts, the failure reason, or "skipped: prior stage failed").
+// This is the structured evidence the Red 9 gate + any audit consults to
+// prove: lowering ran, the checked passes validated after every reported
+// mutation, stale regalloc was cleared, regalloc ran zero or exactly once,
+// emission was attempted + produced bytes, and the result is finalizable —
+// OR, on a validation/pass failure, that regalloc AND emission were NOT
+// reached (no partial executable).
+enum class CompileStage : uint8_t {
+    Lowering,            // lower_function: AST -> ThinFunction
+    CheckedPasses,       // run_checked over the pass manager (validated after each mutation)
+    PreEmitVerify,       // verify_thin_function_for_codegen (the pre-regalloc/emit gate)
+    StaleRegallocClear,  // thf.ra = RegAllocResult{} before the single allocation stage
+    Regalloc,            // run_regalloc (zero or exactly one invocation)
+    Emission,            // emit_x64: ThinFunction -> x86-64 bytes
+    FinalizationEligible,// compiled.exec != nullptr + bytes non-empty (finalize()-able)
+};
+struct CompileStageTrace {
+    CompileStage stage = CompileStage::Lowering;
+    bool reached = false;     // was this stage attempted at all?
+    bool ok = false;          // the stage's own outcome
+    std::string detail;       // short note (counts / reason / skip reason)
+};
+
 // Structured compile result. `ok()` is true only when an executable CompiledFn
 // was produced AND every gate passed (passes verified, regalloc/emit reached).
 // On any failure `compiled.exec == nullptr`, the failure `reason` is set, and
-// the pass_reports carry the per-pass checked outcome. Validation failure can
-// NOT reach run_regalloc or emit_x64 (the checked path stops before them).
+// the pass_reports carry the per-pass checked outcome. `stage_trace` carries
+// the ordered per-stage evidence (Lowering..FinalizationEligible); a
+// validation/pass failure records Regalloc/Emission as NOT reached so a host
+// can assert no partial executable was produced. Validation failure can NOT
+// reach run_regalloc or emit_x64 (the checked path stops before them).
 // Exceptions never cross this boundary: a thrown pass or backend error becomes
 // a structured failure here, not a propagated exception.
 struct CompileResult {
@@ -272,8 +314,14 @@ struct CompileResult {
     std::string reason;                      // fallback/failure reason (empty on success)
     std::optional<ThinFunction> transformed; // the post-pass ThinFunction when requested
     std::vector<PassRunReport> pass_reports; // one report per checked run that executed
+    std::vector<CompileStageTrace> stage_trace; // ordered per-stage evidence
     CompiledFn compiled;                     // emitted fn; exec == nullptr on failure/fallback-not-emitted
     bool ok() const { return ok_; }
+    // Lookup a stage's trace (reached=false when absent / not attempted).
+    const CompileStageTrace* stage(CompileStage s) const {
+        for (const auto& t : stage_trace) if (t.stage == s) return &t;
+        return nullptr;
+    }
 };
 
 // Compile one function with the checked pass path. Honors ctx.pass_manager
@@ -284,9 +332,16 @@ struct CompileResult {
 // are not reached). Stale/pre-existing regalloc on the lowered function is
 // cleared before the single allowed allocation stage. Exceptions are caught at
 // the boundary. When the IR backend is unavailable for this function (obf /
-// try/catch / coroutine / empty lowering) the result falls back to the
-// tree-walker and reports the fallback reason. compile_func(...) stays
-// source-compatible as the legacy wrapper returning just CompiledFn.
+// coroutine / empty lowering) the result falls back to the
+// tree-walker and reports the fallback reason. (Tier 4 try/catch/throw do NOT
+// force a fallback — they lower to the IR backend.) The reported `backend` is
+// the
+// ACTUAL backend used (IRBackend whenever the IR path ran, including when
+// pass_manager is null; TreeWalker only on a real fallback). When
+// ctx.request_transformed_ir is true, `transformed` is populated with the
+// post-pass ThinFunction; otherwise it is left empty. compile_func(...) stays
+// source-compatible as the exception-safe legacy wrapper returning just
+// CompiledFn.
 CompileResult compile_func_checked(const FuncDecl& f, const CodeGenCtx& ctx);
 
 // Globals block used by codegen (set by the host before compiling/calling).

@@ -257,6 +257,14 @@ bool is_frame_alias_barrier(const ThinInstr& in) {
     case ThinOp::StoreAddr:
     case ThinOp::StructLitInit:
     case ThinOp::ArrayLitInit:
+    // Tier 4 try/catch/throw: opaque control-flow barriers. They read/write
+    // the per-context catch stack + may longjmp across frames, so a pass's
+    // frame-slot alias map must flush across them (a tracked frame slot may
+    // be read by a catch body reached via longjmp with no intervening store).
+    case ThinOp::TryCatch:
+    case ThinOp::CatchCleanup:
+    case ThinOp::CatchEntry:
+    case ThinOp::Throw:
         return true;
     default:
         return false;

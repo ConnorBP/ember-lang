@@ -53,6 +53,7 @@
 #include "../src/safety.hpp"      // process-wide failsafes: RSS memory cap, deadline (incident post-mortem)
 #include "../src/module_registry.hpp" // v0.5 live modules (ModuleRegistry)
 #include "../src/module_linker.hpp"  // v0.5 live modules (link_em_file, build_*_exports)
+#include "../src/module_build.hpp"   // Red 9: compile_publish_module_checked (the required --profile/--passes host boundary)
 #include "../src/hot_reload.hpp"    // Family C: `ember live` (HotReloadDomain + ExecutionGuard)
 #include "../src/em_loader.hpp"      // v0.5 live modules (LoadedModule, for linked .em modules)
 #include "../src/em_file.hpp"        // v0.5 --emit-em (EmModule/EmFunctionRecord)
@@ -624,13 +625,27 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
     ctx.script_slots = &slots;
     ctx.structs = &struct_layouts;
     ctx.registry_base = int64_t(registry.base());
+    // Red 9 host boundary: the __main__ module-registry entry is published
+    // ONLY after every function has compiled + finalized. The no-profile /
+    // no-pass (legacy) path registers __main__ here (before compile) and uses
+    // the existing compile_func loop; the --profile / --passes (required)
+    // path DEFERS the __main__ registration to compile_publish_module_checked's
+    // publication step so a compile/finalize failure leaves the registry +
+    // dispatch table byte-for-byte unchanged (no partial record visible).
+    // registry_base + dispatch_base are the STABLE bases baked into the JIT'd
+    // code (both stable from construction), so deferring the __main__ ENTRY
+    // does not move any baked address.
+    const bool needs_recipe = !opts.passes_spec.empty() || !opts.profile.empty();
     std::string reg_err;
-    uint32_t self_id = registry.register_module("__main__", table.base(), &reg_err);
-    (void)self_id;
-    // X1 redesign: publish __main__'s dispatch-table slot count so a loaded v5
-    // .em that calls back into the host via CallCrossModule range-checks its
-    // slot against the REAL host dispatch size at load time.
-    registry.set_dispatch_slot_count(self_id, int64_t(table.slots.size()));
+    uint32_t self_id = UINT32_MAX;
+    if (!needs_recipe) {
+        self_id = registry.register_module("__main__", table.base(), &reg_err);
+        (void)self_id;
+        // X1 redesign: publish __main__'s dispatch-table slot count so a loaded v5
+        // .em that calls back into the host via CallCrossModule range-checks its
+        // slot against the REAL host dispatch size at load time.
+        registry.set_dispatch_slot_count(self_id, int64_t(table.slots.size()));
+    }
 
     // ---- v0.4/v1.0 safe-execution context ----
     context_t ectx;
@@ -743,21 +758,69 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
         ctx.enable_regalloc = true;  // regalloc runs once after the whole pass pipeline
     }
 
-    // ---- compile + finalize each function ----
+    // ---- compile + finalize + publish each function ----
+    // Red 9 host boundary: the --profile / --passes (required) path uses
+    // compile_publish_module_checked — compile_func_checked for EVERY fn,
+    // private staged ownership, atomic publication of the dispatch slots +
+    // __main__ registry metadata only after every fn compiled + finalized.
+    // On any required failure it frees every staged exec allocation and
+    // leaves the dispatch table + registry + name state byte-for-byte
+    // unchanged (the structured ModuleBuildReport records per-function
+    // compile/validation/regalloc/emission/finalization/publication status,
+    // proving a validation failure reached none of the later stages).
+    //
+    // TreeWalker rejection: a named --profile is a REQUIRED optimized build —
+    // a CompileBackend::TreeWalker fallback is a hard failure (the IR backend
+    // is required for every fn in a profile build). Bare --passes (the pass-
+    // VALIDATION path, e.g. optimization_validation.ember) intentionally
+    // exercises features that lower to the tree-walker (for-each, match,
+    // structs); the passes still run on the IR-backend functions and the
+    // tree-walker functions run unoptimized, so a tree-walker fallback is
+    // ACCEPTED for bare --passes (reject_trewalker = profile-selected only).
+    // This preserves the documented pass-validation semantics (validation
+    // returns 177) while a named profile enforces the optimized-build contract.
+    // The no-profile / no-pass (legacy) path keeps the existing compile_func +
+    // inline finalize + table.set loop (behavior unchanged; __main__ was
+    // registered before compile in that path).
     fns.reserve(pr.program.funcs.size());
-    try {
-        for (auto& fn : pr.program.funcs) {
-            CompiledFn cf = compile_func(fn, ctx);
-            if (!finalize(cf)) {
-                std::fprintf(stderr, "ember: alloc_executable failed for %s\n", fn.name.c_str());
-                do_cleanup(); return {2};
+    if (needs_recipe) {
+        std::string mb_err;
+        ModuleBuildReport mb = compile_publish_module_checked(
+            pr.program.funcs, slots, ctx, table, registry,
+            "__main__", fns, /*reject_trewalker=*/profile_selected, &mb_err);
+        if (!mb.ok) {
+            // The helper freed every staged exec allocation; the dispatch
+            // table + registry are unchanged. Report the first failure with
+            // the per-function stage evidence so a host can see WHICH fn +
+            // WHICH stage failed (compile / checked-passes / pre-emit-verify /
+            // emission / finalize / publication / trewalker-fallback).
+            std::fprintf(stderr, "ember: %s\n", mb.fail_reason.c_str());
+            for (const auto& fr : mb.fn_reports) {
+                if (!fr.compile_ok || !fr.first_failure.empty()) {
+                    std::fprintf(stderr, "ember:   %s: backend=%d first_failure=%s reason=%s\n",
+                                 fr.name.c_str(), int(fr.backend),
+                                 fr.first_failure.c_str(), fr.reason.c_str());
+                }
             }
-            table.set(fn.slot, cf.entry);
-            fns.push_back(std::move(cf));
+            do_cleanup(); return {2};
         }
-    } catch (const safety::DepthLimitExceeded& e) {
-        std::fprintf(stderr, "ember: fatal: %s\n", e.what());
-        do_cleanup(); return {2};
+        // Publication succeeded: dispatch slots + __main__ registry metadata
+        // are committed. fns holds the caller-owned finalized CompiledFns.
+    } else {
+        try {
+            for (auto& fn : pr.program.funcs) {
+                CompiledFn cf = compile_func(fn, ctx);
+                if (!finalize(cf)) {
+                    std::fprintf(stderr, "ember: alloc_executable failed for %s\n", fn.name.c_str());
+                    do_cleanup(); return {2};
+                }
+                table.set(fn.slot, cf.entry);
+                fns.push_back(std::move(cf));
+            }
+        } catch (const safety::DepthLimitExceeded& e) {
+            std::fprintf(stderr, "ember: fatal: %s\n", e.what());
+            do_cleanup(); return {2};
+        }
     }
 
     // ---- v0.5 --emit-em: pre-compile the parsed module to a .em bundle ----

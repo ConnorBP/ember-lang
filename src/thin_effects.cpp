@@ -109,6 +109,33 @@ ThinEffectDescriptor classify_thin_effects(const ThinInstr& in) {
         break;
     }
 
+    // Tier 4 try/catch/throw: opaque control-flow barriers. They read/write
+    // the per-context catch stack (context_t::catch_bufs / catch_depth /
+    // thrown_value / catch_saved_call_depths) via r14, restore callee-saved
+    // registers + rsp, and longjmp across frames. They are NEVER removable
+    // and are full alias barriers (a pass's frame-slot map must flush across
+    // them). TryCatch + Throw may trap (a full catch stack or an unhandled
+    // throw); CatchCleanup (a depth pop) + CatchEntry (a thrown_value load
+    // into a frame slot) do not trap but are still opaque barriers.
+    // src1 of Throw is a use for liveness (the thrown value); the descriptor
+    // carries no frame/global intervals for it (the value is in a VReg, not
+    // accessed through a classified slot here).
+    switch (in.op) {
+    case ThinOp::TryCatch:
+    case ThinOp::Throw:
+        d.flags |= flag(ThinEffectFlag::MayTrap);
+        d.flags |= flag(ThinEffectFlag::WritesIndirect);
+        d.aliases_unknown_memory = true;
+        return d;
+    case ThinOp::CatchCleanup:
+    case ThinOp::CatchEntry:
+        d.flags |= flag(ThinEffectFlag::WritesIndirect);
+        d.aliases_unknown_memory = true;
+        return d;
+    default:
+        break;
+    }
+
     // Trapping arithmetic: integer Div/Mod emit a div-by-zero / signed-
     // overflow trap (emit_integer_divmod); FMod directly emits a trap. These
     // are NOT pure — a dead-result rule must not remove them even if dst is
@@ -409,6 +436,10 @@ bool removable_if_result_dead(const ThinInstr& in, const ThinEffectDescriptor& d
     case ThinOp::IndexAddr:
     case ThinOp::MakeSlice:
     case ThinOp::ConstStringRef:
+    case ThinOp::TryCatch:
+    case ThinOp::CatchCleanup:
+    case ThinOp::CatchEntry:
+    case ThinOp::Throw:
         return false;
     default:
         break;

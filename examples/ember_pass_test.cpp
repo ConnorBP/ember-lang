@@ -1804,6 +1804,176 @@ int main() {
                 }
             }
         }
+        // (38f) No-pass-manager IR compilation: when enable_ir_backend is true
+        // but pass_manager is nullptr, compile_func_checked STILL uses the IR
+        // backend (reports CompileBackend::IRBackend, NOT TreeWalker), runs
+        // the checked pre-regalloc/emit verification, clears stale regalloc,
+        // and emits a working CompiledFn.
+        {
+            CodeGenCtx ctx;
+            ctx.globals_base = 0;
+            ctx.dispatch_base = int64_t(table.base());
+            ctx.natives = &natives;
+            ctx.script_slots = &slots;
+            ctx.structs = &layouts;
+            ctx.use_context_reg = true;
+            ctx.enable_ir_backend = true;
+            ctx.enable_regalloc = true;
+            ctx.pass_manager = nullptr;   // no passes, but IR backend requested
+            CompileResult cr = compile_func_checked(pr.program.funcs[0], ctx);
+            check(cr.ok(), "no-pass-manager checked-compile succeeds");
+            check(cr.backend == CompileBackend::IRBackend,
+                  "no-pass-manager checked-compile used the IR backend (not TreeWalker)");
+            check(cr.pass_reports.empty(),
+                  "no-pass-manager checked-compile carries no pass reports");
+            check(!cr.compiled.bytes.empty(),
+                  "no-pass-manager checked-compile emitted bytes");
+            if (!cr.compiled.bytes.empty()) {
+                if (finalize(cr.compiled)) {
+                    check(cr.compiled.exec != nullptr,
+                          "no-pass-manager checked-compile finalized an executable");
+                    table.set(pr.program.funcs[0].slot, cr.compiled.entry);
+                    using F = int64_t (*)();
+                    int64_t got = reinterpret_cast<F>(table.get(pr.program.funcs[0].slot))();
+                    check(got == 10, "no-pass-manager IR-backend emitted fn returns 10");
+                    free_executable(cr.compiled.exec);
+                }
+            }
+        }
+        // (38g) Requested transformed Thin IR: when ctx.request_transformed_ir
+        // is true, compile_func_checked populates cr.transformed with the
+        // post-pass ThinFunction, which must verify clean for codegen.
+        {
+            EmberPassRegistry reg;
+            ext_opt::register_passes(reg);
+            EmberPassManager pm;
+            std::string perr;
+            check(build_pipeline_from_string("constprop,dce", reg, pm, &perr),
+                  "transformed-IR pipeline builds");
+            CodeGenCtx ctx;
+            ctx.globals_base = 0;
+            ctx.dispatch_base = int64_t(table.base());
+            ctx.natives = &natives;
+            ctx.script_slots = &slots;
+            ctx.structs = &layouts;
+            ctx.use_context_reg = true;
+            ctx.enable_ir_backend = true;
+            ctx.enable_regalloc = true;
+            ctx.pass_manager = &pm;
+            ctx.request_transformed_ir = true;   // ask for the post-pass IR
+            CompileResult cr = compile_func_checked(pr.program.funcs[0], ctx);
+            check(cr.ok(), "transformed-IR checked-compile succeeds");
+            check(cr.transformed.has_value(),
+                  "checked-compile populated transformed ThinFunction when requested");
+            if (cr.transformed.has_value()) {
+                std::string verr;
+                check(verify_thin_function_for_codegen(*cr.transformed, &verr),
+                      "requested transformed ThinFunction verifies clean for codegen");
+                check(!cr.transformed->blocks.empty(),
+                      "requested transformed ThinFunction has blocks");
+            }
+            if (cr.compiled.exec) free_executable(cr.compiled.exec);
+        }
+        // (38h) When request_transformed_ir is false (default), transformed is
+        // NOT populated (the opt-out path is honored).
+        {
+            EmberPassRegistry reg;
+            ext_opt::register_passes(reg);
+            EmberPassManager pm;
+            std::string perr;
+            check(build_pipeline_from_string("dce", reg, pm, &perr),
+                  "no-transform pipeline builds");
+            CodeGenCtx ctx;
+            ctx.globals_base = 0;
+            ctx.dispatch_base = int64_t(table.base());
+            ctx.natives = &natives;
+            ctx.script_slots = &slots;
+            ctx.structs = &layouts;
+            ctx.use_context_reg = true;
+            ctx.enable_ir_backend = true;
+            ctx.pass_manager = &pm;
+            ctx.request_transformed_ir = false;  // default: do NOT hand back IR
+            CompileResult cr = compile_func_checked(pr.program.funcs[0], ctx);
+            check(cr.ok(), "no-transform checked-compile succeeds");
+            check(!cr.transformed.has_value(),
+                  "checked-compile leaves transformed empty when not requested");
+            if (cr.compiled.exec) free_executable(cr.compiled.exec);
+        }
+        // (38i) Exceptions through legacy compile_func: a pass that throws does
+        // NOT let the exception cross the public compile_func boundary. The
+        // legacy wrapper returns an empty CompiledFn (exec == nullptr) instead.
+        {
+            EmberPassRegistry reg;
+            ext_opt::register_passes(reg);
+            reg.add<PassErrorPass>("perr");
+            EmberPassManager pm;
+            std::string perr;
+            check(build_pipeline_from_string("perr", reg, pm, &perr),
+                  "throwing legacy pipeline builds");
+            CodeGenCtx ctx;
+            ctx.globals_base = 0;
+            ctx.dispatch_base = int64_t(table.base());
+            ctx.natives = &natives;
+            ctx.script_slots = &slots;
+            ctx.structs = &layouts;
+            ctx.use_context_reg = true;
+            ctx.enable_ir_backend = true;
+            ctx.pass_manager = &pm;
+            CompiledFn cf = compile_func(pr.program.funcs[0], ctx);
+            check(cf.exec == nullptr,
+                  "legacy compile_func swallowed the pass exception (exec == nullptr)");
+            check(cf.bytes.empty(),
+                  "legacy compile_func produced no bytes on pass exception");
+        }
+        // (38j) An unexpected std::exception (not PassError) through a pass
+        // likewise does not cross the legacy compile_func boundary.
+        {
+            EmberPassRegistry reg;
+            ext_opt::register_passes(reg);
+            reg.add<UnexpectedExceptionPass>("unexpected");
+            EmberPassManager pm;
+            std::string perr;
+            check(build_pipeline_from_string("unexpected", reg, pm, &perr),
+                  "unexpected-exception legacy pipeline builds");
+            CodeGenCtx ctx;
+            ctx.globals_base = 0;
+            ctx.dispatch_base = int64_t(table.base());
+            ctx.natives = &natives;
+            ctx.script_slots = &slots;
+            ctx.structs = &layouts;
+            ctx.use_context_reg = true;
+            ctx.enable_ir_backend = true;
+            ctx.pass_manager = &pm;
+            CompiledFn cf = compile_func(pr.program.funcs[0], ctx);
+            check(cf.exec == nullptr,
+                  "legacy compile_func swallowed the unexpected exception (exec == nullptr)");
+        }
+        // (38k) Legacy compile_func reports the ACTUAL backend through the
+        // checked result when wrapped: a clean IR-backend compile via the
+        // checked path with a pass manager reports IRBackend, not TreeWalker.
+        {
+            EmberPassRegistry reg;
+            ext_opt::register_passes(reg);
+            EmberPassManager pm;
+            std::string perr;
+            check(build_pipeline_from_string("dce", reg, pm, &perr),
+                  "backend-report pipeline builds");
+            CodeGenCtx ctx;
+            ctx.globals_base = 0;
+            ctx.dispatch_base = int64_t(table.base());
+            ctx.natives = &natives;
+            ctx.script_slots = &slots;
+            ctx.structs = &layouts;
+            ctx.use_context_reg = true;
+            ctx.enable_ir_backend = true;
+            ctx.enable_regalloc = false;  // no regalloc; still IR backend
+            ctx.pass_manager = &pm;
+            CompileResult cr = compile_func_checked(pr.program.funcs[0], ctx);
+            check(cr.ok(), "no-regalloc checked-compile succeeds");
+            check(cr.backend == CompileBackend::IRBackend,
+                  "no-regalloc checked-compile still reports IR backend");
+            if (cr.compiled.exec) free_executable(cr.compiled.exec);
+        }
         }  // end if (setup_ok)
     }
 
@@ -2000,21 +2170,21 @@ int main() {
         check(heavy != nullptr && heavy->is_experimental,
               "heavy IS explicitly experimental");
         check(heavy != nullptr &&
-              heavy->options.site_probability_ppm == 900'000,
+              heavy->options.site_probability_ppm() == 900'000,
               "heavy density is exactly 900_000 ppm (bounded, not 100%)");
         check(heavy != nullptr &&
-              heavy->options.site_probability_ppm > kProfileBalancedDensityPpm,
+              heavy->options.site_probability_ppm() > kProfileBalancedDensityPpm,
               "heavy density is HIGHER than balanced (denser variant)");
         check(heavy != nullptr &&
-              heavy->options.site_probability_ppm <= 1'000'000,
+              heavy->options.site_probability_ppm() <= 1'000'000,
               "heavy density is at most 100% (bounded, not uncontrolled)");
         // heavy's growth ceilings are TIGHTER than the defaults (never raised
         // above the hard caps) — it is not an uncontrolled fixed point.
         check(heavy != nullptr &&
-              heavy->options.limits.max_sites < PassGrowthLimits{}.max_sites,
+              heavy->options.limits().max_sites < PassGrowthLimits{}.max_sites,
               "heavy max_sites < default (tighter, not raised)");
         check(heavy != nullptr &&
-              heavy->options.limits.max_added_instructions <
+              heavy->options.limits().max_added_instructions <
                   PassGrowthLimits{}.max_added_instructions,
               "heavy max_added_instructions < default (tighter)");
         {
@@ -2057,7 +2227,7 @@ int main() {
         check(heavy != nullptr, "heavy profile present for freshness test");
         check(heavy != nullptr && heavy->seed == 0x123456789abcdef0ULL,
               "heavy profile records the supplied seed");
-        check(heavy != nullptr && heavy->options.seed_deriver != nullptr,
+        check(heavy != nullptr && heavy->options.seed_deriver() != nullptr,
               "heavy profile carries a non-null seed deriver");
         // Two independent expansions into two fresh managers.
         EmberPassManager pm1, pm2;
@@ -2076,13 +2246,13 @@ int main() {
         PipelineProfileRegistry preg_same;
         register_builtin_profiles(preg_same, 0x123456789abcdef0ULL);
         const PipelineProfile* heavy_same = preg_same.get("heavy");
-        check(heavy_same != nullptr && heavy_same->options.seed_deriver != nullptr,
+        check(heavy_same != nullptr && heavy_same->options.seed_deriver() != nullptr,
               "same-seed heavy profile carries a deriver");
         // A profile's deriver root equals u64_to_root(seed) (the canonical
         // adapter), confirming the seed fully determines the deriver.
         const FixedRootSeedDeriver* hd =
             dynamic_cast<const FixedRootSeedDeriver*>(
-                heavy->options.seed_deriver.get());
+                heavy->options.seed_deriver().get());
         check(hd != nullptr && hd->root() == rootA,
               "heavy deriver root == u64_to_root(seed) (seed-bound + reproducible)");
     }

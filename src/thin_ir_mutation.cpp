@@ -455,6 +455,15 @@ MutationResult<void> ThinIRMutation::canonicalize_block_ids() {
             b.term.target = remap(b.term.target);
             b.term.false_target = remap(b.term.false_target);
         }
+        // Tier 4: TryCatch's meta.slot is a block-id reference (the catch
+        // block whose entry rip the inline setjmp saves). A pass that
+        // renumbers blocks MUST remap it too, or the Throw's longjmp lands at
+        // the wrong (renumbered) block — a silent miscompile / infinite
+        // loop. This is the only block-id reference outside the terminators.
+        for (ThinInstr& in : b.instrs) {
+            if (in.op == ThinOp::TryCatch && in.meta.slot >= 0)
+                in.meta.slot = int32_t(remap(uint32_t(in.meta.slot)));
+        }
         b.id = static_cast<uint32_t>(i);
     }
     staged_change_ = true;

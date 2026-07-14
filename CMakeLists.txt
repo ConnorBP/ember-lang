@@ -176,6 +176,15 @@ add_library(ember_frontend STATIC
     # thin_ir_mutation.hpp (header-only types) + the C++ standard library. Lives
     # in ember_frontend alongside seed_derivation.cpp / ember_pass.cpp.
     src/polymorphic_options.cpp
+    # The required host boundary for profile/pass compilation: the production
+    # compile_func_checked + staged-ownership + atomic-publication primitive
+    # shared by the JIT host (ember_cli --profile/--passes) and the integration
+    # gate (polymorphic_pass_test PUB/LIFE). Depends on codegen.hpp
+    # (compile_func_checked/CompileResult), engine.hpp (finalize),
+    # dispatch_table.hpp (publish_batch), module_registry.hpp (preflight/register),
+    # ember_pass.hpp (PassRunReport). Lives in ember_frontend (a compile-time /
+    # host-boundary concern) and adds no new link direction.
+    src/module_build.cpp
 )
 target_include_directories(ember_frontend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ember_frontend PUBLIC ember)
@@ -1205,19 +1214,34 @@ add_executable(ember_pass_test examples/ember_pass_test.cpp)
 target_link_libraries(ember_pass_test PRIVATE ember ember_frontend ember_ext_opt ember_ext_obf)
 add_test(NAME ember_pass COMMAND ember_pass_test)
 
-# polymorphic_pass_test - Red 6 part one (plan_POLYMORPHIC_CODE_ENGINE.md §9.3
-# Red 6): the configured polymorphic obfuscation pass test. Pins options
-# validation, configured factory registration, no-op/changed preservation,
-# same-seed serialized Thin IR equality, two-pinned-seed structural variation,
-# baseline differential execution, serialize/deserialize round-trip, stale-
-# regalloc invalidation, and exact growth boundaries + stop-before-site
-# atomicity for the six migrated transforms (subst, mba_expand, const_encode,
-# opaque_pred, deadcode, block_split) plus str_encrypt no-op scaffolding. Built
-# as a standalone executable WITHOUT add_test so the filtered CTest total
-# stays 67; run explicitly: ./buildt/polymorphic_pass_test. Links ember +
-# ember_frontend + ember_ext_obf (the configured obf factories).
+# polymorphic_pass_test - Red 9 (plan_POLYMORPHIC_CODE_ENGINE.md §9.3
+# Red 9): the configured polymorphic obfuscation pass test + the non-tautological
+# polymorphic integration gate. Pins options validation, configured factory
+# registration, no-op/changed preservation, same-seed serialized Thin IR equality,
+# two-pinned-seed structural variation, baseline differential execution,
+# serialize/deserialize round-trip, stale-regalloc invalidation, and exact growth
+# boundaries + stop-before-site atomicity for the six migrated transforms
+# (subst, mba_expand, const_encode, opaque_pred, deadcode, block_split) plus the
+# full str_encrypt matrix (the Red 9 overlap gate: repeated + partial-overlap
+# rodata ranges get PRIVATE non-overlapping encrypted regions with the original
+# plaintext scrubbed). PLUS the Red 9 integration gate: a genuine multi-function
+# module (real lex/parse/sema/lower) driven through compile_func_checked with an
+# optimization prefix + all seven configured obfuscators, source/reverse order,
+# serialize/deserialize/execute (regalloc off + on) of the deserialized Thin
+# functions, byte-identical serialized Thin IR across order changes + repeated
+# fresh construction, seed-0 vs UINT64_MAX variation with observable
+# preservation, all seven legacy names EXECUTED through configured factories,
+# structured lifecycle evidence (stale-regalloc, regalloc-once, corrupting-pass
+# rollback, validation-failure-prevents-publication), and the real compile /
+# publication boundary (compile_func_checked, reject TreeWalker, private staged
+# ownership, rollback on failure, no partial record). Built as a standalone
+# executable WITHOUT add_test so the unfiltered CTest baseline is unchanged
+# (the add_test source-line count is 69; the filtered CI ctest total stays 67);
+# run explicitly: ./buildt/polymorphic_pass_test. Links ember + ember_frontend +
+# ember_ext_obf (the configured obf factories) + ember_ext_opt (the optimization
+# prefix) + ember_ext_string (string_length for the module's string site).
 add_executable(polymorphic_pass_test examples/polymorphic_pass_test.cpp)
-target_link_libraries(polymorphic_pass_test PRIVATE ember ember_frontend ember_ext_obf)
+target_link_libraries(polymorphic_pass_test PRIVATE ember ember_frontend ember_ext_obf ember_ext_opt ember_ext_string)
 if(WIN32)
     target_link_libraries(polymorphic_pass_test PRIVATE kernel32)
 endif()

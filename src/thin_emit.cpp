@@ -154,6 +154,19 @@ struct EmitCtx {
     // ─── type / width helpers ───
     const StructLayoutTable* structs() const { return ctx.structs; }
 
+    // Stage B rebind: resolve a CallNative target by symbolic name from the
+    // host's ctx.natives table. Returns nullptr if no host table is attached or
+    // the name is absent / has no fn_ptr. emit_native_call uses this for a
+    // deserialized / hand-built ThinFunction whose native_fn was dropped by the
+    // serializer (the design intent was always to rebind by name at emit time,
+    // mirroring em_loader's load-time rebind).
+    void* resolve_native_ptr(const std::string& name) const {
+        if (!ctx.natives) return nullptr;
+        auto it = ctx.natives->find(name);
+        if (it == ctx.natives->end() || !it->second.fn_ptr) return nullptr;
+        return it->second.fn_ptr;
+    }
+
     bool vreg_is_float(VReg v) const {
         auto it = vregs.find(v);
         return it != vregs.end() && it->second.type && it->second.type->is_float();
@@ -809,10 +822,19 @@ struct EmitCtx {
     void emit_native_call(const ThinInstr& in) {
         // mov rax, native (relocatable); record pending native binding
         const std::string& name = in.meta.native_name;
+        // Stage B rebind: a deserialized / hand-built ThinFunction carries no
+        // JIT-time native_fn ptr (the serializer drops it; the design always
+        // intended emit to rebind by name from the host table — see the
+        // native_fn comment in thin_ir.hpp). resolve_native_ptr looks up the
+        // binding in ctx.natives by native_name and returns its fn_ptr, so a
+        // deserialized module's CallNative sites get a real target. Without
+        // this the JIT-time fill below writes 0 and the call jumps to nullptr.
+        void* target = in.native_fn;
+        if (!target && !name.empty()) target = resolve_native_ptr(name);
         if (name.empty() || !in.ret_type || in.arg_types.empty()) {
             if (non_serializable_reason.empty())
                 non_serializable_reason = "native call has no complete symbolic NativeSig binding";
-            e.mov_reg_imm64(Reg::rax, int64_t(in.native_fn));
+            e.mov_reg_imm64(Reg::rax, int64_t(target));
         } else {
             e.mov_reg_native(Reg::rax, name);
             PendingNative pn;
@@ -822,7 +844,7 @@ struct EmitCtx {
             // arg_types is vector<const Type*>; CompiledNativeBinding.params
             // is vector<Type>. Copy the Type values.
             for (const Type* t : in.arg_types) pn.binding.params.push_back(*t);
-            pn.target = in.native_fn;
+            pn.target = target;
             pending_natives.push_back(std::move(pn));
         }
         e.call_reg(Reg::rax);
@@ -1269,6 +1291,150 @@ struct EmitCtx {
             }
             break;
         }
+        // ── Tier 4 try/catch/throw: mirror CG::exec_stmt's TryCatchStmt /
+        // ThrowStmt emit EXACTLY (same X64Emitter ops, same context_offsets,
+        // same EmitCtx::emit_trap which is byte-identical to CG::emit_trap).
+        // The IR lowerer lays a try/catch out as: TryCatch (setjmp) in the try
+        // block -> try body -> CatchCleanup (pop) + Jmp end; CatchEntry
+        // (thrown_value -> catch_name slot) at the catch block head -> catch
+        // body -> Jmp end; a continuation end block. The catch-entry rip saved
+        // by the setjmp is block_labels[meta.slot] (the catch block's label).
+        case ThinOp::TryCatch: {
+            // inline setjmp into context_t::catch_bufs[catch_depth]. Mirrors
+            // CG::exec_stmt's TryCatchStmt prologue (the save + catch_depth++
+            // half); the normal-completion pop is the separate CatchCleanup op.
+            if (!ctx.use_context_reg) {
+                emit_trap(int(TrapReason::IllegalInstruction),
+                          "try/catch requires a context register (use_context_reg)");
+                break;
+            }
+            const int32_t cd_off = context_offsets::catch_depth();
+            const int32_t cb_off = context_offsets::catch_bufs();
+            const int32_t csd_off = context_offsets::catch_saved_depths();
+            // rax = catch_depth; reject a full/corrupted catch stack.
+            e.load_reg_mem32(Reg::rax, Reg::r14, cd_off);
+            e.cmp_reg_imm32(Reg::rax, context_t::MAX_CATCH_DEPTH);
+            Label catch_depth_ok = e.alloc_label();
+            e.jcc(Cond::b, catch_depth_ok);
+            emit_trap(int(TrapReason::StackOverflow),
+                      "try/catch nesting exceeded MAX_CATCH_DEPTH");
+            e.bind(catch_depth_ok);
+            // r9 = &catch_bufs[catch_depth] = r14 + cb_off + catch_depth*64
+            e.imul_reg_imm32(Reg::r8, Reg::rax, 64);
+            e.mov_reg_reg(Reg::r9, Reg::r14);
+            e.add_reg_imm32(Reg::r9, cb_off);
+            e.add_reg_reg(Reg::r9, Reg::r8);
+            // save callee-saved regs + rbp: [0]=rbx [1]=rbp [2]=r12 [3]=r13
+            // [4]=r14 [5]=r15 [6]=rsp [7]=rip
+            e.store_reg_mem(Reg::r9, 0,  Reg::rbx);
+            e.store_reg_mem(Reg::r9, 8,  Reg::rbp);
+            e.store_reg_mem(Reg::r9, 16, Reg::r12);
+            e.store_reg_mem(Reg::r9, 24, Reg::r13);
+            e.store_reg_mem(Reg::r9, 32, Reg::r14);
+            e.store_reg_mem(Reg::r9, 40, Reg::r15);
+            e.store_reg_mem(Reg::r9, 48, Reg::rsp);
+            // save catch-entry rip: lea rax, [rip + catch_label]; store [r9+56]
+            e.lea_reg_rip(Reg::rax, block_labels[in.meta.slot]);
+            e.store_reg_mem(Reg::r9, 56, Reg::rax);
+            // save call_depth into catch_saved_call_depths[catch_depth]
+            e.load_reg_mem32(Reg::r10, Reg::r14, cd_off);
+            e.imul_reg_imm32(Reg::r11, Reg::r10, 4);
+            e.mov_reg_reg(Reg::rax, Reg::r14);
+            e.add_reg_imm32(Reg::rax, csd_off);
+            e.add_reg_reg(Reg::rax, Reg::r11);
+            e.load_reg_mem32(Reg::r11, Reg::r14, context_offsets::depth());
+            e.store_reg_mem32(Reg::rax, 0, Reg::r11);
+            // increment catch_depth
+            e.add_reg_imm32(Reg::r10, 1);
+            e.store_reg_mem32(Reg::r14, cd_off, Reg::r10);
+            // The in-rax model is unsound across the try body (the body may
+            // clobber rax via calls/traps); the lowerer frame-backs every live
+            // value before the TryCatch, so clearing the rax/xmm tracking here
+            // matches the tree-walker's `++active_try_depth` boundary.
+            rax_vreg = 0; xmm0_vreg = 0;
+            break;
+        }
+        case ThinOp::CatchCleanup: {
+            // Pop catch_depth by in.imm.i (default 1: the normal try-completion
+            // pop; N: an unwind before a return/break/continue that exits N
+            // enclosing try handlers). Mirrors CG's TryCatchStmt normal-completion
+            // pop + emit_catch_unwind_to (catch_depth -= delta).
+            if (!ctx.use_context_reg) break;
+            const int64_t pops = in.imm.i > 0 ? in.imm.i : 1;
+            const int32_t cd_off = context_offsets::catch_depth();
+            if (pops == 1) {
+                e.load_reg_mem32(Reg::rax, Reg::r14, cd_off);
+                e.sub_reg_imm32(Reg::rax, 1);
+                e.store_reg_mem32(Reg::r14, cd_off, Reg::rax);
+            } else {
+                e.load_reg_mem32(Reg::rax, Reg::r14, cd_off);
+                e.sub_reg_imm32(Reg::rax, int32_t(pops));
+                e.store_reg_mem32(Reg::r14, cd_off, Reg::rax);
+            }
+            rax_vreg = 0;
+            break;
+        }
+        case ThinOp::CatchEntry: {
+            // catch-block prologue: load context_t::thrown_value into the
+            // catch_name i64 slot (meta.frame_off). The throw's longjmp already
+            // restored registers + rsp + rip to land at this block's label.
+            if (!ctx.use_context_reg) break;
+            e.load_reg_mem(Reg::rax, Reg::r14, context_offsets::thrown_value());
+            if (in.meta.frame_off != 0) {
+                store_rax_to_rbp(e, in.meta.frame_off);
+            }
+            rax_vreg = 0;
+            break;
+        }
+        case ThinOp::Throw: {
+            // throw expr; — eval the thrown i64 (src1) into rax, store it in
+            // context_t::thrown_value, then longjmp to the nearest catch (or
+            // trap UnhandledThrow if none). Mirrors CG::exec_stmt's ThrowStmt.
+            if (!ctx.use_context_reg) {
+                emit_trap(int(TrapReason::IllegalInstruction),
+                          "throw requires a context register (use_context_reg)");
+                break;
+            }
+            load_int_vreg(in.src1);
+            e.store_reg_mem(Reg::r14, context_offsets::thrown_value(), Reg::rax);
+            e.load_reg_mem32(Reg::rax, Reg::r14, context_offsets::catch_depth());
+            e.cmp_reg_imm32(Reg::rax, 0);
+            Label no_handler = e.alloc_label();
+            e.jcc(Cond::e, no_handler);
+            // has a handler: longjmp to catch_bufs[catch_depth-1]
+            e.sub_reg_imm32(Reg::rax, 1);
+            e.store_reg_mem32(Reg::r14, context_offsets::catch_depth(), Reg::rax);
+            // restore call_depth from catch_saved_call_depths[rax]
+            e.mov_reg_reg(Reg::r11, Reg::r14);
+            e.add_reg_imm32(Reg::r11, context_offsets::catch_saved_depths());
+            e.imul_reg_imm32(Reg::r9, Reg::rax, 4);
+            e.add_reg_reg(Reg::r11, Reg::r9);
+            e.load_reg_mem32(Reg::r9, Reg::r11, 0);
+            e.store_reg_mem32(Reg::r14, context_offsets::depth(), Reg::r9);
+            // r9 = &catch_bufs[catch_depth-1]
+            e.imul_reg_imm32(Reg::r8, Reg::rax, 64);
+            e.mov_reg_reg(Reg::r9, Reg::r14);
+            e.add_reg_imm32(Reg::r9, context_offsets::catch_bufs());
+            e.add_reg_reg(Reg::r9, Reg::r8);
+            // load saved catch-entry rip into rax BEFORE restoring regs
+            e.load_reg_mem(Reg::rax, Reg::r9, 56);
+            // restore callee-saved registers
+            e.load_reg_mem(Reg::rbx, Reg::r9, 0);
+            e.load_reg_mem(Reg::rbp, Reg::r9, 8);
+            e.load_reg_mem(Reg::r12, Reg::r9, 16);
+            e.load_reg_mem(Reg::r13, Reg::r9, 24);
+            e.load_reg_mem(Reg::r14, Reg::r9, 32);
+            e.load_reg_mem(Reg::r15, Reg::r9, 40);
+            // restore rsp LAST (switches to the catching frame's stack)
+            e.load_reg_mem(Reg::rsp, Reg::r9, 48);
+            e.jmp_reg(Reg::rax);
+            // no handler: trap (unhandled throw -> host checkpoint)
+            e.bind(no_handler);
+            emit_trap(int(TrapReason::UnhandledThrow),
+                      "unhandled throw (no enclosing try/catch)");
+            break;
+        }
+
         case ThinOp::LoadGlobal: {
             // dst = [globals_base + meta.addend] (with type-based load)
             const Type* ty = in.meta.type;

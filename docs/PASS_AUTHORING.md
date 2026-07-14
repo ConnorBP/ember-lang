@@ -486,7 +486,7 @@ lives in `src/polymorphic_options.hpp`:
 ```cpp
 #include "polymorphic_options.hpp"
 
-struct ember::PolymorphicPassOptions {
+class ember::PolymorphicPassOptions {
     std::shared_ptr<const ember::SeedDeriver> seed_deriver;
     uint32_t algorithm_version = 1;            // independent per pass
     std::string engine_version;                // stable module/profile identities
@@ -503,15 +503,17 @@ record and return a structured `ExtensionStatus` / `ExtensionResult` (registry
 - `site_probability_ppm > 1_000_000` (above 100%);
 - `limits.growth_denominator == 0`;
 - a growth ratio that overflows the instruction ceiling.
-A null `seed_deriver` is **not** rejected by validation (the no-op compatibility
-wrapper legitimately carries a null deriver); a configured factory that would
-derive treats a null deriver as a per-site skip.
+- a null `seed_deriver` (a configured factory must derive; the only null-deriver
+  record is the no-op sentinel, which is never a functioning pass configuration).
 
-A configured pass is a no-op when it cannot derive — `seed_deriver == nullptr`
-**or** `site_probability_ppm == 0`. This is both the bare `reg.add<T>()`
-legacy path (default-constructed `PolymorphicPassOptions{}`) and the
-zero-density configured path, so a default-constructed obfuscation pass is a
-deterministic no-op and never accidentally transforms.
+A configured pass is a no-op when it cannot derive -- `seed_deriver() == nullptr`
+**or** `site_probability_ppm() == 0`. This is the ZERO-DENSITY CONFIGURED path
+(a profile that wants no diversification), NOT the bare `reg.add<T>()` legacy
+path: the obf passes' DEFAULT constructors capture `legacy_defaults(pass_name)`
+(a non-null deriver + the pass's prior per-pass eligibility density), so a bare
+`reg.add<SubstitutionPass>("subst")` is a FUNCTIONING pass that transforms
+every eligible Add -- preserving the prior `reg.add<T>()` behavior, not a
+zero-density no-op.
 
 Register a whole obfuscation extension with deterministic defaults through the
 configured factory entry point, then expose a no-argument compatibility wrapper
@@ -520,33 +522,51 @@ that retains the existing pipeline names and eligibility behavior:
 ```cpp
 // extensions/obf/ext_obf.hpp
 namespace ember::ext_obf {
-void register_passes(ember::EmberPassRegistry& reg,
+ember::ExtensionStatus register_passes(ember::EmberPassRegistry& reg,
                      const ember::PolymorphicPassOptions& options);
 void register_passes(ember::EmberPassRegistry& reg);  // compat wrapper
 }
 
-// extensions/obf/ext_obf.cpp
 void ext_obf::register_passes(ember::EmberPassRegistry& reg,
                               const ember::PolymorphicPassOptions& options) {
+    // VALIDATING (Red 6): reject unvalidated options; register nothing on failure.
+    if (auto st = ember::validate_polymorphic_options(options); !st) return st;
     reg.add_factory("mba_expand", [options]() {
         return ember::make_pass_concept(MBAExpansionPass{options});
     });
     // ...one add_factory per pass...
+    return ember::make_extension_ok();
 }
+// The compat wrapper: every pass through its DEFAULT constructor, which
+// captures legacy_defaults(pass_name) -- a functioning pass with the prior
+// per-pass eligibility (NOT a no-op).
 void ext_obf::register_passes(ember::EmberPassRegistry& reg) {
-    ember::PolymorphicPassOptions defaults;
-    defaults.seed_deriver =
-        std::make_shared<const ember::FixedRootSeedDeriver>(ember::u64_to_root(0));
-    defaults.site_probability_ppm = 500'000;   // retain 50% eligibility
-    register_passes(reg, defaults);
+    reg.add<SubstitutionPass>("subst");
+    reg.add<MBAExpansionPass>("mba_expand");
+    // ...one reg.add<T>() per pass...
 }
 ```
-
 The factory captures `options` **by value**; every `create("mba_expand")`
-returns a fresh `PassConcept` carrying its own constructed pass. The compat
-wrapper's deterministic defaults (a fixed-root seed deriver + the legacy
-eligibility density) preserve the existing pipeline names and selection
-density, so existing `register_passes(reg)` callers keep working unchanged.
+returns a fresh `PassConcept` carrying its own constructed pass. The validating
+configured overload rejects unvalidated options (registers nothing on failure).
+The compat wrapper registers every pass through its DEFAULT constructor
+(`reg.add<T>()` -> `legacy_defaults(pass_name)`), so the resulting passes are
+FUNCTIONING with the prior per-pass eligibility, and existing
+`register_passes(reg)` callers keep working unchanged.
+
+### Per-purpose streams
+
+Each configured pass derives INDEPENDENT per-site, per-purpose streams through
+`src/seed_derivation.hpp` (a stable `SeedRequest` per site: the ORIGINAL block
+ID + instruction ordinal + a domain-separated `purpose`). The purposes are
+`select` (site-selection density), `variant` (which MBA identity / encode
+form), `constant` (the encode key), `truth` (always-true vs always-false
+opaque predicate), and `junk-count` (the dead-code junk immediates). There is
+NO single advancing function-wide RNG: a draw for one site never reshuffles a
+later site, so the transformed IR is a pure function of (source, options,
+seed) and is reproducible. The site identity uses the ORIGINAL block ID +
+ordinal (snapshotted before any mutation) so two runs of the same function
+produce identical streams regardless of how earlier sites shifted indices.
 
 ## Registration and invocation
 
@@ -802,8 +822,29 @@ reports, and the emitted `CompiledFn`):
   coroutine / empty lowering) it falls back to the tree-walker and reports the
   reason.
 
+The reported `backend` is the **actual** backend used: `CompileBackend::
+IRBackend` whenever the IR path ran — including when `ctx.pass_manager` is
+`nullptr` (lower → no passes → regalloc → emit, still the IR backend, with the
+checked pre-regalloc/emit verification gate still applied) — and
+`CompileBackend::TreeWalker` only on a real fallback (IR backend disabled,
+unavailable for the function, or `lower_function` produced no blocks). A null
+`pass_manager` is NOT reported as TreeWalker.
+
+To request the post-pass IR back, set `ctx.request_transformed_ir = true`; the
+checked path then populates `CompileResult::transformed` with a deep copy of
+the `ThinFunction` as it stood after the checked pass pipeline and AFTER the
+pre-regalloc/emit verification gate (so a requested `transformed` is always
+clean for codegen). With `request_transformed_ir = false` (the default)
+`transformed` is left empty (the opt-out path; no extra copy).
+
 `compile_func(...)` stays source-compatible as the legacy wrapper returning just
-`CompiledFn`.
+`CompiledFn` — and is now **exception-safe**: it delegates to the same internal
+checked implementation as `compile_func_checked` (in legacy, non-checked mode)
+and catches any pass or backend exception, returning an empty `CompiledFn`
+(`exec == nullptr`) on failure rather than propagating the exception across
+the public compile boundary. A pass that throws `PassError` or any other
+`std::exception` through the legacy `compile_func` therefore produces an empty
+`CompiledFn`, never a propagated exception.
 
 ## Composition and tests
 
@@ -826,6 +867,11 @@ equality, two-pinned-seed structural variation, baseline differential
 execution, serialize/deserialize round-trip, stale-regalloc invalidation, exact
 growth boundaries + stop-before-site atomicity, widths 1/2/4/8, empty and
 no-candidate functions, straight-line / diamond / loop / long-block CFGs, and
-the full str_encrypt matrix (seeded per-site keys, plaintext absence,
-overlapping/repeated/empty literals, distinct nonoverlapping data/slice frame
-regions, atomic rodata rebuild, and no double encryption).
+the full str_encrypt matrix (per-site `site_selected` density gating, seeded
+per-site nonzero keys, plaintext absence from rodata AND serialized v2 blobs,
+REAL overlapping/repeated/empty literals via hand-built explicit (addend,len)
+specs, distinct nonoverlapping data/slice frame regions, an atomic
+private-region-per-site rodata rebuild with original-plaintext scrubbing for
+every selected site, exact/repeated/partial-overlap execution that inspects
+every StringDecrypt key + verifies each encrypted region == plaintext XOR key,
+and no double encryption).

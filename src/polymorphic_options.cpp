@@ -1,16 +1,20 @@
-// polymorphic_options.cpp — Red 6: validation for PolymorphicPassOptions.
+// polymorphic_options.cpp — Red 6: validation + builders for PolymorphicPassOptions.
 //
-// The pure validation logic for the immutable option record. Lives in
-// ember_frontend alongside seed_derivation.cpp (a compile-time pass concern)
-// and depends only on the C++ standard library + the header-only option
-// record. Never prints or throws; failures travel in the structured result.
+// The pure validation logic + the two construction paths (the strict
+// `make_polymorphic_options` builder and the deterministic `legacy_defaults`
+// builder) for the immutable option record. Lives in ember_frontend alongside
+// seed_derivation.cpp (a compile-time pass concern) and depends only on the
+// C++ standard library + the header-only option record. Never prints or
+// throws; failures travel in the structured result.
 //
 // Design ref: docs/planning/plan_POLYMORPHIC_CODE_ENGINE.md §4.2, §9.3 Red 6.
 
 #include "polymorphic_options.hpp"
 
 #include <cstdint>
+#include <cstring>
 #include <limits>
+#include <memory>
 #include <utility>
 
 namespace ember {
@@ -32,33 +36,51 @@ ExtensionStatus check_growth_ratio(const PassGrowthLimits& limits) {
         return make_extension_error(kPolymorphicOptionsRegistryId, std::string{},
                                     "growth_denominator must not be zero");
     }
-    // growth_multiplier = ceil(numerator * kHardIrInstructions / denominator),
-    // computed with overflow guards. numerator and kHardIrInstructions are
-    // both <= 10^5-class values (well below 2^32), so the product cannot
-    // overflow uint64 for any sane configuration; we guard anyway.
     const std::uint64_t num = limits.growth_numerator;
-    const std::uint64_t den = limits.growth_denominator;
     if (num != 0 && num > std::numeric_limits<std::uint64_t>::max() / kHardIrInstructions) {
         return make_extension_error(kPolymorphicOptionsRegistryId, std::string{},
                                     "growth ratio overflows the instruction ceiling");
     }
-    const std::uint64_t scaled = num * kHardIrInstructions;
-    (void)den;   // the ratio is representable whenever `scaled` is; den <= num
-                 // would grow the cap, but the soft ceiling + hard ceiling are
-                 // enforced separately by ThinIRMutation at mutation time.
-    (void)scaled;
     return make_extension_ok();
+}
+
+// The legacy per-pass eligibility density (parts-per-million) for a pass name.
+// Mirrors the per-pass gating that existed BEFORE Red 6 so a default-
+// constructed pass (the bare `reg.add<T>()` path) preserves the prior
+// eligibility semantics, not a zero-density no-op.
+uint32_t legacy_density_ppm(const char* pass_name) {
+    if (!pass_name) return 500'000u;
+    // subst / str_encrypt / block_split had NO per-site gating before Red 6 —
+    // they transformed EVERY eligible site. Preserve that at 100% density.
+    if (std::strcmp(pass_name, "subst") == 0)        return 1'000'000u;
+    if (std::strcmp(pass_name, "str_encrypt") == 0) return 1'000'000u;
+    if (std::strcmp(pass_name, "block_split") == 0) return 1'000'000u;
+    // opaque_pred / deadcode picked ONE site before Red 6. They run at 100%
+    // density but the run selects AT MOST ONE site (the first accepted site),
+    // preserving the "pick one site" eligibility. See ext_obf.cpp.
+    if (std::strcmp(pass_name, "opaque_pred") == 0) return 1'000'000u;
+    if (std::strcmp(pass_name, "deadcode") == 0)    return 1'000'000u;
+    // mba_expand / const_encode used `(rng.next() & 1U) == 0` -> ~50%.
+    return 500'000u;
 }
 
 } // namespace
 
 ExtensionStatus validate_polymorphic_options(const PolymorphicPassOptions& opts) {
-    if (opts.site_probability_ppm > 1000000u) {
+    // A configured factory must derive: a null deriver is the no-op sentinel
+    // (PolymorphicPassOptions{}) only, and is never a functioning pass's
+    // configuration. Reject it here so configured registration cannot silently
+    // accept a no-op sentinel as a "configured" record.
+    if (!opts.seed_deriver_) {
+        return make_extension_error(kPolymorphicOptionsRegistryId, std::string{},
+                                    "seed_deriver must not be null");
+    }
+    if (opts.site_probability_ppm_ > 1000000u) {
         return make_extension_error(kPolymorphicOptionsRegistryId,
                                     std::string{},
                                     "site_probability_ppm must not exceed 1000000");
     }
-    if (auto st = check_growth_ratio(opts.limits); !st) {
+    if (auto st = check_growth_ratio(opts.limits_); !st) {
         return st;
     }
     return make_extension_ok();
@@ -72,18 +94,35 @@ make_polymorphic_options(std::shared_ptr<const SeedDeriver> seed_deriver,
                          std::string build_profile_id,
                          uint32_t site_probability_ppm,
                          PassGrowthLimits limits) {
-    PolymorphicPassOptions opts;
-    opts.seed_deriver = std::move(seed_deriver);
-    opts.algorithm_version = algorithm_version;
-    opts.engine_version = std::move(engine_version);
-    opts.module_id = std::move(module_id);
-    opts.build_profile_id = std::move(build_profile_id);
-    opts.site_probability_ppm = site_probability_ppm;
-    opts.limits = limits;
+    // Build the record via the private full constructor (this function is a
+    // friend), then validate. On validation failure return the error (no
+    // value). The private constructor sets every field in one shot; the
+    // fields are immutable thereafter.
+    PolymorphicPassOptions opts(std::move(seed_deriver), algorithm_version,
+                                std::move(engine_version), std::move(module_id),
+                                std::move(build_profile_id), site_probability_ppm,
+                                std::move(limits));
     if (auto st = validate_polymorphic_options(opts); !st) {
         return ExtensionResult<PolymorphicPassOptions>{std::move(st.error.value())};
     }
     return ExtensionResult<PolymorphicPassOptions>{std::move(opts)};
+}
+
+PolymorphicPassOptions legacy_defaults(const char* pass_name) {
+    // A deterministic fixed-root deriver (seed 0): fully reproducible,
+    // thread-safe, immutable. This is the configuration the obf passes'
+    // DEFAULT constructors capture, so a bare `reg.add<T>()` is a functioning
+    // pass with the prior eligibility semantics.
+    auto deriver = std::make_shared<FixedRootSeedDeriver>(u64_to_root(0));
+    // legacy_defaults is always valid (non-null deriver + a density <= 1M +
+    // default nonzero denominator), so build directly via the private
+    // constructor (this function is a friend).
+    return PolymorphicPassOptions(std::move(deriver), /*algorithm_version=*/1u,
+                                  /*engine_version=*/"ember",
+                                  /*module_id=*/"default",
+                                  /*build_profile_id=*/"default",
+                                  legacy_density_ppm(pass_name),
+                                  PassGrowthLimits{});
 }
 
 } // namespace ember

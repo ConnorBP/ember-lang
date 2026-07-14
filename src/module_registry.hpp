@@ -204,6 +204,21 @@ public:
     // linker). Returns "" for an out-of-range id.
     const std::string& name_of(uint32_t module_id) const;
 
+    // Preflight a register_module(name, base) call WITHOUT mutating the
+    // registry. Returns the module_id that register_module WOULD assign
+    // (the existing id for a reload of an already-registered name, or the
+    // next dense id for a new name) and sets *err on a failure (capacity
+    // exhausted / capacity==0 / null base). The host boundary uses this to
+    // PROVE the registry can accept the __main__ publication BEFORE it commits
+    // the dispatch-table batch, so a publication failure (capacity) is observed
+    // with the registry byte-for-byte unchanged (no entry, no name, no slot
+    // count) — register_module itself is already atomic (fails without
+    // mutating), but preflight lets the host order dispatch validation BEFORE
+    // the registry commit so the two commits are sequenced atomically.
+    // Returns UINT32_MAX on a failed preflight (matching register_module).
+    uint32_t preflight_register_module(const std::string& name, void* dispatch_table_base,
+                                        std::string* err = nullptr) const;
+
 private:
     uint32_t capacity_ = 0;                          // reserved upper bound
     std::vector<void*>     entries_;                 // entries_[id] = DispatchTable base

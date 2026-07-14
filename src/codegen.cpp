@@ -4934,8 +4934,9 @@ std::vector<uint8_t> build_fn_allowlist(
 // Returns a non-empty reason string when the IR backend cannot compile `f`
 // (it must fall back to the tree-walker), or nullptr when the IR backend is
 // available. Shared by compile_func (legacy) and compile_func_checked so the
-// fallback policy is identical. Mirrors the original inline obf / try/catch /
-// coroutine detection.
+// fallback policy is identical. Mirrors the original inline obf / coroutine
+// detection. Tier 4 try/catch/throw no longer force a fallback (they lower to
+// TryCatch/CatchCleanup/CatchEntry/Throw ThinOps through the IR backend).
 static const char* ir_backend_unavailable_reason(const FuncDecl& f,
                                                   const CodeGenCtx& ctx) {
     for (auto& ann : f.annotations) {
@@ -4944,73 +4945,25 @@ static const char* ir_backend_unavailable_reason(const FuncDecl& f,
     }
     if (ctx.obf.mba || ctx.obf.opaque || ctx.obf.keyed)
         return "IR backend unavailable: ctx obf flags set";
-    // Tier 4: try/catch/throw are tree-walker-only.
-    std::function<bool(const Block&)> has_try_catch = [&](const Block& b) -> bool {
-        for (auto& s : b.stmts) {
-            if (dynamic_cast<const TryCatchStmt*>(s.get()) ||
-                dynamic_cast<const ThrowStmt*>(s.get())) return true;
-            if (auto* is = dynamic_cast<const IfStmt*>(s.get())) {
-                if (has_try_catch(is->then_b)) return true;
-                if (is->has_else && has_try_catch(is->else_b)) return true;
-            }
-            if (auto* ws = dynamic_cast<const WhileStmt*>(s.get())) { if (has_try_catch(ws->body)) return true; }
-            if (auto* ds = dynamic_cast<const DoWhileStmt*>(s.get())) { if (has_try_catch(ds->body)) return true; }
-            if (auto* fe = dynamic_cast<const ForEachStmt*>(s.get())) { if (has_try_catch(fe->body)) return true; }
-            if (auto* fs = dynamic_cast<const ForStmt*>(s.get())) { if (has_try_catch(fs->body)) return true; }
-            if (auto* bs = dynamic_cast<const BlockStmt*>(s.get())) { if (has_try_catch(bs->block)) return true; }
-            if (auto* sw = dynamic_cast<const SwitchStmt*>(s.get()))
-                for (auto& c : sw->cases) if (has_try_catch(c.body)) return true;
-            if (auto* ms = dynamic_cast<const MatchStmt*>(s.get()))
-                for (auto& arm : ms->arms) if (has_try_catch(arm.body)) return true;
-        }
-        return false;
-    };
-    if (has_try_catch(f.body))
-        return "IR backend unavailable: function uses try/catch/throw";
+    // Tier 4: try/catch/throw are now lowered to the IR backend (TryCatch /
+    // CatchCleanup / CatchEntry / Throw ThinOps + the same setjmp/longjmp emit
+    // as the tree-walker), so they no longer force a tree-walker fallback.
     // #21 coroutines: yield is tree-walker-only.
     if (f.is_coroutine)
         return "IR backend unavailable: function is a coroutine";
     return nullptr;
 }
 
-CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
-    if (ctx.enable_ir_backend) {
-        if (const char* fb = ir_backend_unavailable_reason(f, ctx)) {
-            // (fall through to the tree-walker; the IR backend is unavailable
-            // for this function — obf / try/catch / coroutine / ctx obf flags.)
-            (void)fb;
-        } else {
-            ThinFunction thf = lower_function(f, ctx);
-            if (!thf.blocks.empty()) {
-                // Stage C: run IR optimization passes between lower and emit.
-                if (ctx.pass_manager) {
-                    // Red 5: honor CodeGenCtx::analysis_manager instead of always
-                    // constructing a local manager (the host's cached analyses,
-                    // when present, flow to the passes).
-                    EmberAnalysisManager local_am;
-                    EmberAnalysisManager& am = ctx.analysis_manager ? *ctx.analysis_manager : local_am;
-                    ctx.pass_manager->run(thf, am);
-                }
-                // Red 5: stale/pre-existing regalloc is cleared before the single
-                // allowed allocation stage. Lowering produces ra.enabled=false
-                // and ThinIRMutation::commit clears stale ra, so for shipped
-                // passes this is a no-op; it only protects against a hand-rolled
-                // pass that left a stale ra behind.
-                thf.ra = RegAllocResult{};
-                // Stage 3: linear-scan register allocation after the optimization
-                // passes, before emit. Assigns VRegs to callee-saved registers
-                // (rbx/rsi/rdi/r12/r13/r15) instead of frame slots. Value-
-                // preserving: the emit uses the regalloc map to keep values in
-                // registers; spilled VRegs use their existing frame slots.
-                if (ctx.enable_regalloc) {
-                    run_regalloc(thf);
-                }
-                return emit_x64(thf, ctx);
-            }
-            // empty body / lowering gave up (non_serializable) -> fall through to tree-walker
-        }
-    }
-    // ... existing CG tree-walk continues unchanged (default-off path) ...
+// ─── Red 5: the IR-backend + checked compile boundary ───
+//
+// The tree-walker is the legacy/default backend. compile_tree_walker_ is the
+// ORIGINAL compile_func body (byte-identical, default-off path) with the IR-
+// backend prefix factored out so the checked compile can drive the IR path
+// itself. compile_impl_ is the single internal implementation both public
+// entry points delegate to: it picks the IR backend (run_checked when a pass
+// manager is present, ordinary run otherwise) or falls back to the tree-
+// walker, and is EXCEPTION-SAFE so neither public boundary propagates.
+static CompiledFn compile_tree_walker_(const FuncDecl& f, const CodeGenCtx& ctx) {
     CG cg(ctx, f);
     // #20: if this is a synthetic lambda fn, set up the capture map so the
     // Ident eval loads captures from [env_ptr + offset]. The __env param is
@@ -5373,118 +5326,286 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
     return out;
 }
 
-// ─── Red 5: the checked compile boundary ───
+// ─── Red 5: the IR-backend + checked compile boundary (internal) ───
 //
-// The structured, exception-safe compile path. It runs the configured pass
-// manager in CHECKED mode between lower_function and regalloc/emit, honors
-// ctx.analysis_manager, clears stale regalloc before the single allocation
-// stage, and guarantees a validation/pass/growth/exception failure can NEVER
-// reach run_regalloc or emit_x64 (no executable is produced on failure).
-// Exceptions do not cross this boundary: a thrown pass or backend error becomes
-// a structured CompileResult failure, not a propagated exception. Falls back to
-// the tree-walker (and reports the reason) when the IR backend is unavailable
-// for this function.
-CompileResult compile_func_checked(const FuncDecl& f, const CodeGenCtx& ctx) {
+// The single internal implementation BOTH public entry points delegate to.
+// `checked` selects the checked pass path (run_checked, pass reports, optional
+// transformed IR, and a pre-regalloc/emit verification gate) versus the legacy
+// ordinary path (run, no reports, no transformed). In BOTH modes the IR
+// backend is taken whenever it is available — `backend` reports the ACTUAL
+// backend used (IRBackend whenever the IR path ran, including when
+// pass_manager is null; TreeWalker only on a real fallback). Stale/pre-existing
+// regalloc is cleared before the single allowed allocation stage. The whole
+// compile is wrapped so NO exception crosses the boundary: a thrown pass or
+// backend error becomes a structured CompileResult failure (checked) or an
+// empty CompiledFn (legacy), never a propagated exception.
+static CompileResult compile_impl_(const FuncDecl& f, const CodeGenCtx& ctx,
+                                   bool checked) {
     CompileResult cr;
-    // The whole compile is wrapped so no exception crosses the boundary.
+    // Append a stage-trace entry. `reached`=true means the stage was
+    // attempted; `ok` is its own outcome; `detail` is a short note.
+    auto stage = [&](CompileStage s, bool reached, bool ok,
+                     std::string detail) {
+        CompileStageTrace t; t.stage=s; t.reached=reached; t.ok=ok;
+        t.detail=std::move(detail);
+        cr.stage_trace.push_back(std::move(t));
+    };
     try {
-        if (!ctx.enable_ir_backend || !ctx.pass_manager) {
-            // No IR backend / no passes: plain legacy compile (tree-walker or the
-            // IR path without checked passes). Keep the legacy behavior exactly.
-            cr.compiled = compile_func(f, ctx);
-            cr.backend = CompileBackend::TreeWalker;
-            cr.ok_ = true;
-            cr.reason.clear();
-            return cr;
+        // IR backend is taken whenever it is enabled AND available for this
+        // function — independent of whether a pass manager is present. A null
+        // pass_manager simply means "lower -> (no passes) -> regalloc -> emit"
+        // through the IR backend (backend == IRBackend).
+        if (ctx.enable_ir_backend &&
+            ir_backend_unavailable_reason(f, ctx) == nullptr) {
+            ThinFunction thf = lower_function(f, ctx);
+            const size_t lowered_blocks = thf.blocks.size();
+            const size_t lowered_instrs =
+                [&]{ size_t n=0; for (const auto& b: thf.blocks) n+=b.instrs.size(); return n; }();
+            if (!thf.blocks.empty()) {
+                cr.backend = CompileBackend::IRBackend;
+                stage(CompileStage::Lowering, /*reached=*/true, /*ok=*/true,
+                      "blocks=" + std::to_string(lowered_blocks) +
+                      " instrs=" + std::to_string(lowered_instrs));
+                // Run the passes. In checked mode the pass manager (if any) is
+                // driven through run_checked with the structured report + per-
+                // pass validation + rollback; in legacy mode it is driven through
+                // the ordinary run (which also enforces the hard growth ceilings).
+                // Honor ctx.analysis_manager (the host's cached analyses flow to
+                // the passes) instead of always constructing a local manager.
+                EmberAnalysisManager local_am;
+                EmberAnalysisManager& am = ctx.analysis_manager ? *ctx.analysis_manager : local_am;
+                if (ctx.pass_manager) {
+                    if (checked) {
+                        CheckedRunOptions opts;
+                        PassRunReport rep = ctx.pass_manager->run_checked(thf, am, opts);
+                        cr.pass_reports.push_back(rep);
+                        // Evidence: the checked pass execution. The report's
+                        // stop_reason + the per-pass validation-after-mutation
+                        // count (rep.rounds / rep.final_count) prove the pipeline
+                        // ran and validated after every reported mutation.
+                        stage(CompileStage::CheckedPasses, /*reached=*/true,
+                              rep.stop_reason == PassStopReason::Completed,
+                              "stop=" + std::to_string(int(rep.stop_reason)) +
+                              " final_count=" + std::to_string(rep.final_count) +
+                              (rep.pass_name.empty() ? "" : (" last='" + rep.pass_name + "'")));
+                        // A failure (ValidationFailure / GrowthLimit / PassError /
+                        // ExceptionError) stops BEFORE regalloc/emit: no executable
+                        // is produced. thf was rolled back inside run_checked.
+                        // Record regalloc + emission as NOT reached (the audit
+                        // proof that no partial executable was produced).
+                        if (rep.stop_reason != PassStopReason::Completed) {
+                            cr.ok_ = false;
+                            cr.reason = "checked pass pipeline failed: " + rep.error;
+                            stage(CompileStage::PreEmitVerify, /*reached=*/false, /*ok=*/false,
+                                  "skipped: checked passes failed");
+                            stage(CompileStage::StaleRegallocClear, /*reached=*/false, /*ok=*/false,
+                                  "skipped: checked passes failed");
+                            stage(CompileStage::Regalloc, /*reached=*/false, /*ok=*/false,
+                                  "skipped: checked passes failed");
+                            stage(CompileStage::Emission, /*reached=*/false, /*ok=*/false,
+                                  "skipped: checked passes failed");
+                            stage(CompileStage::FinalizationEligible, /*reached=*/false, /*ok=*/false,
+                                  "skipped: checked passes failed");
+                            return cr;
+                        }
+                    } else {
+                        // Legacy ordinary run (exception-safe: caught below).
+                        ctx.pass_manager->run(thf, am);
+                        stage(CompileStage::CheckedPasses, /*reached=*/true, /*ok=*/true,
+                              "legacy ordinary run (no per-pass report)");
+                    }
+                } else {
+                    stage(CompileStage::CheckedPasses, /*reached=*/false, /*ok=*/true,
+                          "skipped: no pass manager");
+                }
+                // Checked mode only: the pre-regalloc/emit verification gate.
+                // The checked run already validated after each mutation; this
+                // re-verify is defense-in-depth, the single gate that guarantees
+                // a validation failure cannot reach regalloc/emit. In legacy mode
+                // the ordinary run does not validate (source-compatible with the
+                // pre-Red-5 IR path, which never verified post-pass); the hard
+                // growth ceilings in run() are the legacy safety bound.
+                if (checked) {
+                    std::string verr;
+                    bool vok = verify_thin_function_for_codegen(thf, &verr);
+                    stage(CompileStage::PreEmitVerify, /*reached=*/true, vok,
+                          vok ? ("ok blocks=" + std::to_string(thf.blocks.size())) : verr);
+                    if (!vok) {
+                        cr.ok_ = false;
+                        cr.reason = "codegen verify before regalloc/emit failed: " + verr;
+                        stage(CompileStage::StaleRegallocClear, /*reached=*/false, /*ok=*/false,
+                              "skipped: pre-emit verify failed");
+                        stage(CompileStage::Regalloc, /*reached=*/false, /*ok=*/false,
+                              "skipped: pre-emit verify failed");
+                        stage(CompileStage::Emission, /*reached=*/false, /*ok=*/false,
+                              "skipped: pre-emit verify failed");
+                        stage(CompileStage::FinalizationEligible, /*reached=*/false, /*ok=*/false,
+                              "skipped: pre-emit verify failed");
+                        return cr;
+                    }
+                } else {
+                    stage(CompileStage::PreEmitVerify, /*reached=*/false, /*ok=*/true,
+                          "skipped: legacy mode (no pre-emit verify)");
+                }
+                // Hand back the post-pass ThinFunction when the host asked for it
+                // (checked mode only; the legacy wrapper returns just the CompiledFn
+                // and never populates `transformed`). The copy is taken AFTER the
+                // verification gate so a requested `transformed` is always clean.
+                if (checked && ctx.request_transformed_ir) {
+                    cr.transformed = thf;
+                }
+                // Stale/pre-existing regalloc is cleared before the single allowed
+                // allocation stage. Lowering produces ra.enabled=false and
+                // ThinIRMutation::commit clears stale ra; this clear is the
+                // boundary guarantee that a bogus ra from a hand-rolled pass never
+                // reaches emit.
+                thf.ra = RegAllocResult{};
+                stage(CompileStage::StaleRegallocClear, /*reached=*/true, /*ok=*/true,
+                      "cleared (ra.enabled=false before allocation)");
+                if (ctx.enable_regalloc) {
+                    run_regalloc(thf);
+                    stage(CompileStage::Regalloc, /*reached=*/true, /*ok=*/true,
+                          std::string("ran once (enabled=") +
+                          (thf.ra.enabled ? "true" : "false") +
+                          " assigned=" + std::to_string(thf.ra.map.size()) + ")");
+                } else {
+                    stage(CompileStage::Regalloc, /*reached=*/false, /*ok=*/true,
+                          "skipped: regalloc disabled (zero invocations)");
+                }
+                cr.compiled = emit_x64(thf, ctx);
+                // Empty/failed emission is a STRUCTURED compile failure, not a
+                // silent success: an emit that produced no bytes cannot be
+                // finalized or executed, so the boundary reports ok_=false + a
+                // reason and records FinalizationEligible as not reached. Note
+                // `compiled.exec` is intentionally null here — exec memory is
+                // allocated by the host's separate finalize() step, NOT by
+                // emit_x64 — so the success test is bytes-non-empty only.
+                const bool emitted = !cr.compiled.bytes.empty();
+                stage(CompileStage::Emission, /*reached=*/true, emitted,
+                      emitted ? ("bytes=" + std::to_string(cr.compiled.bytes.size()))
+                             : "emit_x64 produced no executable bytes");
+                if (!emitted) {
+                    cr.ok_ = false;
+                    cr.reason = "IR backend emit_x64 produced no executable (empty emission)";
+                    cr.compiled = CompiledFn{};
+                    stage(CompileStage::FinalizationEligible, /*reached=*/false, /*ok=*/false,
+                          "skipped: empty emission");
+                    return cr;
+                }
+                stage(CompileStage::FinalizationEligible, /*reached=*/true, /*ok=*/true,
+                      "eligible (exec + bytes non-empty)");
+                cr.ok_ = true;
+                cr.reason.clear();
+                return cr;
+            }
+            // empty body / lowering gave up (non_serializable) -> fall through
+            // to the tree-walker fallback below.
+            stage(CompileStage::Lowering, /*reached=*/true, /*ok=*/false,
+                  "lower_function produced no blocks (non-serializable)");
         }
-        // IR backend with a pass manager: the checked path.
-        if (const char* fb = ir_backend_unavailable_reason(f, ctx)) {
-            // Fallback to the tree-walker; report the reason. No passes run.
-            cr.compiled = compile_func(f, ctx);
-            cr.backend = CompileBackend::TreeWalker;
-            cr.ok_ = true;
-            cr.reason = fb;
-            return cr;
+        // Fallback: the tree-walker (IR backend disabled, unavailable for this
+        // function, or lowering produced no blocks). backend == TreeWalker.
+        const char* fb = ctx.enable_ir_backend ? ir_backend_unavailable_reason(f, ctx) : nullptr;
+        // If we did not already record a Lowering stage above (the IR path was
+        // not even attempted because the backend was disabled/unavailable),
+        // record that the IR lowering stage was not reached.
+        if (cr.stage_trace.empty()) {
+            stage(CompileStage::Lowering, /*reached=*/false, /*ok=*/false,
+                  fb ? ("IR backend unavailable: " + std::string(fb))
+                     : "IR backend disabled");
         }
-        cr.backend = CompileBackend::IRBackend;
-        ThinFunction thf = lower_function(f, ctx);
-        if (thf.blocks.empty()) {
-            // Lowering gave up (non_serializable / empty body) -> tree-walker fallback.
-            cr.compiled = compile_func(f, ctx);
-            cr.backend = CompileBackend::TreeWalker;
-            cr.ok_ = true;
-            cr.reason = "IR backend unavailable: lower_function produced no blocks";
-            return cr;
-        }
-        // Run the passes in checked mode. Honor ctx.analysis_manager (the
-        // host's cached analyses flow to the passes) instead of always
-        // constructing a local manager.
-        EmberAnalysisManager local_am;
-        EmberAnalysisManager& am = ctx.analysis_manager ? *ctx.analysis_manager : local_am;
-        CheckedRunOptions opts;
-        PassRunReport rep = ctx.pass_manager->run_checked(thf, am, opts);
-        cr.pass_reports.push_back(rep);
-        // A failure (ValidationFailure / GrowthLimit / PassError / ExceptionError)
-        // stops BEFORE regalloc/emit: no executable is produced.
-        if (rep.stop_reason != PassStopReason::Completed) {
+        cr.compiled = compile_tree_walker_(f, ctx);
+        cr.backend = CompileBackend::TreeWalker;
+        // `compiled.exec` is null until the host's finalize() step; the
+        // emission-success test is bytes-non-empty only (see the IR-backend
+        // path above for the same rationale).
+        const bool tw_emitted = !cr.compiled.bytes.empty();
+        stage(CompileStage::Emission, /*reached=*/true, tw_emitted,
+              tw_emitted ? ("tree-walker bytes=" + std::to_string(cr.compiled.bytes.size()))
+                         : "tree-walker produced no executable bytes");
+        if (!tw_emitted) {
             cr.ok_ = false;
-            cr.reason = "checked pass pipeline failed: " + rep.error;
-            // thf was rolled back inside run_checked; no emit attempted.
+            cr.reason = "tree-walker emit produced no executable (empty emission)";
+            cr.compiled = CompiledFn{};
+            stage(CompileStage::FinalizationEligible, /*reached=*/false, /*ok=*/false,
+                  "skipped: empty emission");
             return cr;
         }
-        // The checked run already validated after each mutation. Re-verify once
-        // more before the regalloc/emit stage (defense-in-depth: the single
-        // gate that guarantees a validation failure cannot reach regalloc/emit).
-        std::string verr;
-        if (!verify_thin_function_for_codegen(thf, &verr)) {
-            cr.ok_ = false;
-            cr.reason = "codegen verify before regalloc/emit failed: " + verr;
-            return cr;
-        }
-        // Stale/pre-existing regalloc is cleared before the single allowed
-        // allocation stage. Lowering produces ra.enabled=false and
-        // ThinIRMutation::commit clears stale ra; this clear is the boundary
-        // guarantee that a bogus ra from a hand-rolled pass never reaches emit.
-        thf.ra = RegAllocResult{};
-        if (ctx.enable_regalloc) {
-            run_regalloc(thf);
-        }
-        cr.compiled = emit_x64(thf, ctx);
+        stage(CompileStage::FinalizationEligible, /*reached=*/true, /*ok=*/true,
+              "eligible (tree-walker exec + bytes non-empty)");
         cr.ok_ = true;
-        cr.reason.clear();
-        // Hand back the transformed IR when the host asked for it (future hook;
-        // the current API does not request it, so we leave `transformed` empty
-        // unless a compile option later asks).
+        if (fb) cr.reason = fb;
+        else if (ctx.enable_ir_backend) cr.reason = "IR backend unavailable: lower_function produced no blocks";
+        else cr.reason.clear();
         return cr;
     } catch (const PassError& e) {
         cr.ok_ = false;
         cr.compiled = CompiledFn{};
+        cr.backend = CompileBackend::TreeWalker;
         cr.reason = std::string("checked compile PassError: ") + e.what();
-        PassRunReport rep;
-        rep.stop_reason = PassStopReason::PassError;
-        rep.pass_name = e.pass_name;
-        rep.error = e.message;
-        cr.pass_reports.push_back(std::move(rep));
+        if (checked) {
+            PassRunReport rep;
+            rep.stop_reason = PassStopReason::PassError;
+            rep.pass_name = e.pass_name;
+            rep.error = e.message;
+            cr.pass_reports.push_back(std::move(rep));
+        }
+        stage(CompileStage::Regalloc, /*reached=*/false, /*ok=*/false,
+              "skipped: PassError before regalloc");
+        stage(CompileStage::Emission, /*reached=*/false, /*ok=*/false,
+              "skipped: PassError before emission");
+        stage(CompileStage::FinalizationEligible, /*reached=*/false, /*ok=*/false,
+              "skipped: PassError");
         return cr;
     } catch (const std::exception& e) {
         cr.ok_ = false;
         cr.compiled = CompiledFn{};
+        cr.backend = CompileBackend::TreeWalker;
         cr.reason = std::string("checked compile exception: ") + e.what();
-        PassRunReport rep;
-        rep.stop_reason = PassStopReason::ExceptionError;
-        rep.error = e.what();
-        cr.pass_reports.push_back(std::move(rep));
+        if (checked) {
+            PassRunReport rep;
+            rep.stop_reason = PassStopReason::ExceptionError;
+            rep.error = e.what();
+            cr.pass_reports.push_back(std::move(rep));
+        }
+        stage(CompileStage::Regalloc, /*reached=*/false, /*ok=*/false,
+              "skipped: exception before regalloc");
+        stage(CompileStage::Emission, /*reached=*/false, /*ok=*/false,
+              "skipped: exception before emission");
+        stage(CompileStage::FinalizationEligible, /*reached=*/false, /*ok=*/false,
+              "skipped: exception");
         return cr;
     } catch (...) {
         cr.ok_ = false;
         cr.compiled = CompiledFn{};
+        cr.backend = CompileBackend::TreeWalker;
         cr.reason = "checked compile: unknown exception";
-        PassRunReport rep;
-        rep.stop_reason = PassStopReason::ExceptionError;
-        rep.error = "unknown exception";
-        cr.pass_reports.push_back(std::move(rep));
+        if (checked) {
+            PassRunReport rep;
+            rep.stop_reason = PassStopReason::ExceptionError;
+            rep.error = "unknown exception";
+            cr.pass_reports.push_back(std::move(rep));
+        }
+        stage(CompileStage::Regalloc, /*reached=*/false, /*ok=*/false,
+              "skipped: unknown exception before regalloc");
+        stage(CompileStage::Emission, /*reached=*/false, /*ok=*/false,
+              "skipped: unknown exception before emission");
+        stage(CompileStage::FinalizationEligible, /*reached=*/false, /*ok=*/false,
+              "skipped: unknown exception");
         return cr;
     }
+}
+
+// Source-compatible legacy wrapper: returns just the CompiledFn. It is
+// EXCEPTION-SAFE — a thrown pass or backend error becomes an empty CompiledFn
+// (exec == nullptr), never a propagated exception across this public boundary.
+CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
+    return compile_impl_(f, ctx, /*checked=*/false).compiled;
+}
+
+// The checked, structured compile boundary. See compile_impl_ for the contract.
+CompileResult compile_func_checked(const FuncDecl& f, const CodeGenCtx& ctx) {
+    return compile_impl_(f, ctx, /*checked=*/true);
 }
 
 } // namespace ember

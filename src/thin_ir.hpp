@@ -155,6 +155,29 @@ enum class ThinOp : uint16_t {
     // Indirect memory store: [src2 + meta.frame_off] = src1. Appended to keep
     // the serialized ThinOp IDs above stable.
     StoreAddr,
+    // Tier 4 try/catch/throw (in-language recoverable exceptions). Appended
+    // AFTER StoreAddr to keep the serialized ThinOp IDs above stable.
+    //   TryCatch     : inline setjmp — save callee-saved regs + rsp + the
+    //                  catch-entry rip (block_labels[meta.slot]) into
+    //                  context_t::catch_bufs[catch_depth], snapshot call_depth,
+    //                  increment catch_depth. meta.slot = catch block id;
+    //                  meta.frame_off = the catch_name i64 slot (allocated by
+    //                  the lowerer; the catch entry loads thrown_value there).
+    //                  An opaque barrier to every pass (classify_thin_effects'
+    //                  default: WritesIndirect + aliases_unknown_memory).
+    //   CatchCleanup : normal try-completion pop — decrement catch_depth.
+    //                  Emitted at the end of the try body's final block before
+    //                  the Jmp to the end block. Opaque barrier.
+    //   CatchEntry   : catch-block prologue — load context_t::thrown_value into
+    //                  the catch_name slot (meta.frame_off). The throw's longjmp
+    //                  restored registers + rsp + rip to land here. Opaque.
+    //   Throw        : src1 = the thrown i64 value. Store it into
+    //                  context_t::thrown_value, then if catch_depth > 0 longjmp
+    //                  to catch_bufs[catch_depth-1] (restore regs + rsp + jmp
+    //                  to the saved catch-entry rip), else trap
+    //                  (TrapReason::UnhandledThrow). Opaque barrier; src1 is a
+    //                  use for liveness.
+    TryCatch, CatchCleanup, CatchEntry, Throw,
 };
 
 // Immediate payload. ConstInt uses i; ConstFloat uses f (with meta.is_f32 for

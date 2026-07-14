@@ -169,8 +169,10 @@ bool read_type(const uint8_t*& cur, const uint8_t* end,
 // ─── enum range helpers ───
 
 // ThinOp is append-only on disk; keep the deserializer ceiling at the actual
-// final enumerator. StoreAddr was appended after CallTargetGuard.
-constexpr uint16_t THIN_OP_LAST = static_cast<uint16_t>(ThinOp::StoreAddr);
+// final enumerator. StoreAddr was appended after CallTargetGuard; the Tier 4
+// try/catch ops (TryCatch/CatchCleanup/CatchEntry/Throw) were appended after
+// StoreAddr.
+constexpr uint16_t THIN_OP_LAST = static_cast<uint16_t>(ThinOp::Throw);
 constexpr uint8_t  TERM_KIND_LAST = static_cast<uint8_t>(TermKind::Trap);
 constexpr uint8_t  BASE_KIND_LAST = static_cast<uint8_t>(AbsFixup::FunctionRodataBase);
 
@@ -1099,6 +1101,21 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err,
             if (in.op == ThinOp::Cmp && in.meta.cmp > 5) {
                 if (err) *err = "thin_ir_ser: validate: Cmp predicate out of range";
                 return false;
+            }
+            // Tier 4: TryCatch's meta.slot is a block-id reference (the catch
+            // block whose entry rip the inline setjmp saves into
+            // context_t::catch_bufs). It MUST be a valid, in-range block id —
+            // a stale slot (a pass that renumbered blocks without remapping
+            // it) would make the Throw longjmp land at the wrong block (a
+            // silent miscompile / infinite loop). canonicalize_block_ids
+            // remaps it; this validator is the defense-in-depth gate that
+            // rejects a corrupt or hand-rolled blob.
+            if (in.op == ThinOp::TryCatch) {
+                if (in.meta.slot < 0 ||
+                    uint32_t(in.meta.slot) >= num_blocks) {
+                    if (err) *err = "thin_ir_ser: validate: TryCatch catch-block slot out of bounds";
+                    return false;
+                }
             }
         }
         // Block-target bounds (Jmp/Branch).

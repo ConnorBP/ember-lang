@@ -68,6 +68,7 @@ struct LoopCtx {
     uint32_t exit_bb = 0;   // break target
     bool is_switch = false;
     size_t cleanup_depth = 0;
+    int32_t try_depth = 0;  // active_try_depth at loop entry (break/continue unwind)
 };
 
 struct PinState { std::string name; int32_t offset = 0; };
@@ -110,6 +111,16 @@ struct ThinLowerer {
     std::vector<DeferSite> defer_sites;
     std::unordered_map<const DeferStmt*, size_t> defer_site_indices;
     std::vector<CleanupScope> cleanup_scopes;
+
+    // Tier 4 try/catch: the number of active try handlers on the catch stack
+    // at the current point (mirrors CG::active_try_depth). A return/break/
+    // continue that exits one or more enclosing try bodies must pop
+    // catch_depth by the delta before transferring control (mirrors CG's
+    // emit_catch_unwind_to), or the catch stack leaks across calls (catch_depth
+    // lives in the persistent context_t). The TryCatchStmt lowering pushes a
+    // TryCatch (catch_depth++) + increments this; the normal-completion pop is
+    // a CatchCleanup(imm=1) + the delta is decremented back.
+    int32_t active_try_depth = 0;
 
     // --- loop / pin ---
     std::vector<LoopCtx> loops;
@@ -304,6 +315,16 @@ struct ThinLowerer {
             for (auto& c : sw->cases) prescan_block(c.body);
             return;
         }
+        // Tier 4: try/catch recurses both bodies; throw prescans its expr.
+        if (auto* tc = dynamic_cast<const TryCatchStmt*>(&s)) {
+            prescan_block(tc->try_body);
+            prescan_block(tc->catch_body);
+            return;
+        }
+        if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) {
+            if (th->value) prescan_expr(*th->value);
+            return;
+        }
     }
     void prescan_expr(const Expr& ex) {
         safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::prescan_expr");
@@ -357,6 +378,12 @@ struct ThinLowerer {
             for (auto& c : sw->cases) count_struct_temps_block(c.body, total);
             return;
         }
+        if (auto* tc = dynamic_cast<const TryCatchStmt*>(&s)) {
+            count_struct_temps_block(tc->try_body, total);
+            count_struct_temps_block(tc->catch_body, total);
+            return;
+        }
+        if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) { if (th->value) count_struct_temps_expr(*th->value, total); return; }
     }
     void count_struct_temps_expr(const Expr& ex, int32_t& total) {
         safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_struct_temps_expr");
@@ -410,6 +437,12 @@ struct ThinLowerer {
             for (auto& c : sw->cases) count_arr_temps_block(c.body, total);
             return;
         }
+        if (auto* tc = dynamic_cast<const TryCatchStmt*>(&s)) {
+            count_arr_temps_block(tc->try_body, total);
+            count_arr_temps_block(tc->catch_body, total);
+            return;
+        }
+        if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) { if (th->value) count_arr_temps_expr(*th->value, total); return; }
     }
     void count_arr_temps_expr(const Expr& ex, int32_t& total) {
         safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_arr_temps_expr");
@@ -465,12 +498,32 @@ struct ThinLowerer {
             for (auto& c : sw->cases) count_str_temps_block(c.body, total);
             return;
         }
+        if (auto* tc = dynamic_cast<const TryCatchStmt*>(&s)) {
+            count_str_temps_block(tc->try_body, total);
+            count_str_temps_block(tc->catch_body, total);
+            return;
+        }
+        if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) { if (th->value) count_str_temps_expr(*th->value, total); return; }
     }
     void count_str_temps_expr(const Expr& ex, int32_t& total) {
         safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_str_temps_expr");
         if (auto* lit = dynamic_cast<const StringLit*>(&ex)) {
+            // The StringLit lowering (lower_expr's StringLit case) ALWAYS
+            // allocates a 16-byte {ptr,len} slice frame slot (encrypted or
+            // not — the slice must be frame-backed because the ConstInt(len)
+            // that follows clobbers rax where ptr lives). An encrypted literal
+            // additionally allocates baked_len bytes for the decrypted-data
+            // buffer (alloc_str_temp). An implicit-to-string literal
+            // additionally allocates an 8-byte handle slot for the CallNative
+            // result (frame-backed across the next DepthCheck). The frame-size
+            // pre-count MUST account for all three or the lowerer writes past
+            // frame_size (the validator's frame_off-span check then rejects
+            // the lowered IR — the marker-baseline failure).
+            total += 16;  // slice {ptr,len} slot (always)
             if (lit->encrypted && lit->baked_key != 0 && lit->baked_len > 0)
-                total += int32_t(lit->baked_len);
+                total += int32_t(lit->baked_len);  // decrypted-data buffer
+            if (lit->implicit_to_string && lit->to_string_native_fn)
+                total += 8;  // string-handle CallNative result slot
             return;
         }
         if (auto* c = dynamic_cast<const CallExpr*>(&ex)) {
@@ -524,6 +577,12 @@ struct ThinLowerer {
             for (auto& c : sw->cases) count_logical_temps_block(c.body, total);
             return;
         }
+        if (auto* tc = dynamic_cast<const TryCatchStmt*>(&s)) {
+            count_logical_temps_block(tc->try_body, total);
+            count_logical_temps_block(tc->catch_body, total);
+            return;
+        }
+        if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) { if (th->value) count_logical_temps_expr(*th->value, total); return; }
     }
     void count_logical_temps_expr(const Expr& ex, int32_t& total) {
         safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_logical_temps_expr");
@@ -560,6 +619,7 @@ struct ThinLowerer {
             if (auto* bs = dynamic_cast<const BlockStmt*>(s.get())) collect_defers(bs->block);
             if (auto* fs = dynamic_cast<const ForStmt*>(s.get())) collect_defers(fs->body);
             if (auto* sw = dynamic_cast<const SwitchStmt*>(s.get())) for (auto& c : sw->cases) collect_defers(c.body);
+            if (auto* tc = dynamic_cast<const TryCatchStmt*>(s.get())) { collect_defers(tc->try_body); collect_defers(tc->catch_body); }
         }
     }
 
@@ -593,6 +653,12 @@ struct ThinLowerer {
             for (auto& c : sw->cases) count_pin_refs_block(c.body, counts);
             return;
         }
+        if (auto* tc = dynamic_cast<const TryCatchStmt*>(&s)) {
+            count_pin_refs_block(tc->try_body, counts);
+            count_pin_refs_block(tc->catch_body, counts);
+            return;
+        }
+        if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) { if (th->value) count_pin_refs_expr(*th->value, counts); return; }
     }
     void count_pin_refs_expr(const Expr& ex, std::unordered_map<std::string,int>& counts) {
         safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_pin_refs_expr");
@@ -962,6 +1028,18 @@ struct ThinLowerer {
         for (auto it = reached.rbegin(); it != reached.rend(); ++it)
             emit_defer_site(*it, loc);
     }
+    // Tier 4: pop catch_depth by (active_try_depth - retained) before a
+    // return/break/continue that exits one or more enclosing try handlers.
+    // Emits a CatchCleanup with imm = the pop count (0 = no try handlers to
+    // unwind -> emits nothing). Mirrors CG::emit_catch_unwind_to.
+    void emit_catch_unwind(int32_t retained, Loc loc) {
+        int32_t pops = active_try_depth - retained;
+        if (pops <= 0) return;
+        ThinInstr& in = emit(ThinOp::CatchCleanup, 0, 0, 0, loc);
+        in.imm.i = int64_t(pops);
+        in.meta.type = &type_i64(); in.meta.width = 8;
+    }
+
     void emit_cleanups_to(size_t retained_depth, Loc loc) {
         for (size_t n = cleanup_scopes.size(); n > retained_depth; --n)
             emit_cleanup_scope(n - 1, loc);
@@ -1063,6 +1141,15 @@ struct ThinLowerer {
                 }
                 if (auto* sw = dynamic_cast<const SwitchStmt*>(s.get()))
                     for (auto& c : sw->cases) sum_bytes(c.body);
+                // Tier 4: each try/catch allocates one i64 catch-variable slot
+                // (alloc_local in lower_stmt's TryCatchStmt case). Recurse into
+                // both try + catch bodies for nested locals (mirrors CG's
+                // sum_bytes).
+                if (auto* tc = dynamic_cast<const TryCatchStmt*>(s.get())) {
+                    locals_area += 8;  // catch_name (i64)
+                    sum_bytes(tc->try_body);
+                    sum_bytes(tc->catch_body);
+                }
             }
         };
         sum_bytes(f.body);
@@ -1146,8 +1233,10 @@ struct ThinLowerer {
 
         // Implicit void return if the current block falls through.
         if (cur_block().term.kind == TermKind::None) {
-            // run remaining cleanups through depth 0, then return void
+            // run remaining cleanups through depth 0, unwind any active try
+            // handlers, then return void
             emit_cleanups_to(0, f.loc);
+            emit_catch_unwind(0, f.loc);
             set_term_return(0);
         }
 
@@ -2637,6 +2726,7 @@ void ThinLowerer::lower_stmt(const Stmt& s) {
                 }
             }
             if (has_defers) emit_cleanups_to(0, loc);
+            emit_catch_unwind(0, loc);
             VReg ret = new_vreg(&type_i64());
             ThinInstr& ld = emit(ThinOp::LoadFrame, ret, 0, 0, loc);
             ld.meta.frame_off = struct_ret_ptr_offset; ld.meta.type = &type_i64(); ld.meta.width = 8;
@@ -2665,10 +2755,12 @@ void ThinLowerer::lower_stmt(const Stmt& s) {
                 if (is_float_ret) m.meta.is_f32 = (rv.ty && rv.ty->prim == Prim::F32) ? 1 : 0;
             }
             emit_cleanups_to(0, loc);
+            emit_catch_unwind(0, loc);
             set_term_return(save_v);
             return;
         }
         if (has_defers) emit_cleanups_to(0, loc);
+        emit_catch_unwind(0, loc);
         set_term_return(rs->value ? rv.vreg : 0);
         return;
     }
@@ -2727,7 +2819,7 @@ void ThinLowerer::lower_stmt(const Stmt& s) {
                     set_pin_here = true;
                 }
             }
-            loops.push_back({latch, exit_bb, false, cleanup_scopes.size()});
+            loops.push_back({latch, exit_bb, false, cleanup_scopes.size(), active_try_depth});
             lower_block(ws->body);
             loops.pop_back();
             if (set_pin_here) active_pin.reset();
@@ -2746,7 +2838,7 @@ void ThinLowerer::lower_stmt(const Stmt& s) {
         if (cur_block().term.kind == TermKind::None) set_term_jmp(body_bb);
         enter_block(body_bb);
         {
-            loops.push_back({cond_bb, exit_bb, false, cleanup_scopes.size()});
+            loops.push_back({cond_bb, exit_bb, false, cleanup_scopes.size(), active_try_depth});
             lower_block(ds->body);
             loops.pop_back();
             if (cur_block().term.kind == TermKind::None) set_term_jmp(cond_bb);
@@ -2803,7 +2895,7 @@ void ThinLowerer::lower_stmt(const Stmt& s) {
                     set_pin_here = true;
                 }
             }
-            loops.push_back({step_bb, end_bb, false, cleanup_scopes.size()});
+            loops.push_back({step_bb, end_bb, false, cleanup_scopes.size(), active_try_depth});
             lower_block(fs->body);
             loops.pop_back();
             if (set_pin_here) active_pin.reset();
@@ -2843,7 +2935,7 @@ void ThinLowerer::lower_stmt(const Stmt& s) {
         set_term_jmp(default_idx >= 0 ? case_labels[size_t(default_idx)] : end_label);
         for (size_t i = 0; i < sw->cases.size(); ++i) {
             enter_block(case_labels[i]);
-            loops.push_back({0, end_label, true, cleanup_scopes.size()});  // break-only
+            loops.push_back({0, end_label, true, cleanup_scopes.size(), active_try_depth});  // break-only
             lower_block(sw->cases[i].body);
             loops.pop_back();
             if (cur_block().term.kind == TermKind::None) {
@@ -2856,10 +2948,107 @@ void ThinLowerer::lower_stmt(const Stmt& s) {
         enter_block(end_label);
         return;
     }
+    // Tier 4: try { ... } catch (name) { ... } — lowered to the CFG as a
+    // TryCatch (inline setjmp into context_t::catch_bufs, catch_target = the
+    // catch block) in the try block, the try body in following blocks, a
+    // CatchCleanup(imm=1) (normal-completion pop) + Jmp end at the try body's
+    // tail, a catch block (CatchEntry loads thrown_value into the catch_name
+    // slot + the catch body + Jmp end), and a continuation end block. A throw
+    // is the Throw op (longjmp-or-trap). Mirrors CG::exec_stmt's TryCatchStmt /
+    // ThrowStmt; the emit (thin_emit.cpp) reuses the same X64Emitter sequence +
+    // context_offsets + emit_trap, so the IR-backend try/catch is byte-for-byte
+    // the same setjmp/longjmp as the tree-walker's.
+    if (auto* tc = dynamic_cast<const TryCatchStmt*>(&s)) {
+        if (!ctx.use_context_reg) {
+            // Without a context register the catch stack is unavailable. Fall
+            // back to the tree-walker (which emits the loud trap), not a silent
+            // miscompile. (The Red 9 gate compiles try/catch with
+            // use_context_reg=true, so this path is the host-setup-error guard.)
+            non_serializable = true;
+            non_serializable_reason =
+                "try/catch requires a context register (use_context_reg); "
+                "falling back to tree-walker";
+            return;
+        }
+        uint32_t catch_bb = new_block();   // pre-allocate the catch target
+        uint32_t end_bb   = new_block();   // pre-allocate the continuation
+        // Bind the catch_name i64 slot up front (the CatchEntry op loads
+        // thrown_value here; the catch body references it as a local). Sema
+        // declared catch_name as i64 in the catch block's scope.
+        int32_t catch_off = alloc_local(tc->catch_name, &type_i64());
+        // TryCatch: inline setjmp. meta.slot = catch block id (the catch-entry
+        // rip saved into catch_bufs is block_labels[catch_bb]); meta.frame_off =
+        // the catch_name slot (carried for the CatchEntry op's reference).
+        ThinInstr& tcop = emit(ThinOp::TryCatch, 0, 0, 0, loc);
+        tcop.meta.slot = int32_t(catch_bb);
+        tcop.meta.frame_off = catch_off;
+        tcop.meta.type = &type_i64(); tcop.meta.width = 8;
+        ++active_try_depth;
+        lower_block(tc->try_body);
+        --active_try_depth;
+        // Normal try completion: pop the catch handler + jump to end. If the
+        // try body already terminated (a return/throw/break), the block is
+        // sealed and this is unreachable — only emit when the block is open.
+        if (cur_block().term.kind == TermKind::None) {
+            ThinInstr& pop = emit(ThinOp::CatchCleanup, 0, 0, 0, loc);
+            pop.imm.i = 1; pop.meta.type = &type_i64(); pop.meta.width = 8;
+            set_term_jmp(end_bb);
+        }
+        // Catch block: a throw's longjmp restored registers + rsp + rip to
+        // land at block_labels[catch_bb]. Load thrown_value into the catch_name
+        // slot, then run the catch body with catch_name visible as a local.
+        enter_block(catch_bb);
+        ThinInstr& centry = emit(ThinOp::CatchEntry, 0, 0, 0, loc);
+        centry.meta.frame_off = catch_off;
+        centry.meta.type = &type_i64(); centry.meta.width = 8;
+        {
+            auto saved_locals = locals;
+            auto saved_types = local_types;
+            locals[tc->catch_name] = catch_off;
+            local_types[tc->catch_name] = &type_i64();
+            lower_block(tc->catch_body);
+            locals = std::move(saved_locals);
+            local_types = std::move(saved_types);
+        }
+        if (cur_block().term.kind == TermKind::None) set_term_jmp(end_bb);
+        // Continuation end block.
+        enter_block(end_bb);
+        return;
+    }
+    // Tier 4: throw expr; — the Throw op. Eval the i64 value into a vreg, then
+    // Throw(src1 = that vreg). Emit stores it into context_t::thrown_value +
+    // longjmps to the nearest catch (or traps UnhandledThrow). Mirrors CG's
+    // ThrowStmt.
+    if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) {
+        if (!ctx.use_context_reg) {
+            non_serializable = true;
+            non_serializable_reason =
+                "throw requires a context register (use_context_reg); "
+                "falling back to tree-walker";
+            return;
+        }
+        LoweredValue v = th->value ? lower_expr(*th->value) : LoweredValue{LoweredValue::Scalar, 0, 0, &type_i64()};
+        VReg val = v.vreg;
+        if (val == 0) {
+            // void throw (`throw;`): throw 0.
+            val = new_vreg(&type_i64());
+            ThinInstr& z = emit(ThinOp::ConstInt, val, 0, 0, loc);
+            z.imm.i = 0; z.meta.type = &type_i64(); z.meta.width = 8;
+        }
+        ThinInstr& top = emit(ThinOp::Throw, 0, val, 0, loc);
+        top.meta.type = &type_i64(); top.meta.width = 8;
+        // A throw never falls through. Seal this block with a Trap terminator
+        // (unreachable: the emit either longjmps or traps) + start a fresh
+        // unreachable block so subsequent lowering has somewhere to go.
+        set_term_trap(uint8_t(TrapReason::None));
+        new_and_enter();
+        return;
+    }
     if (auto* bs = dynamic_cast<const BlockStmt*>(&s)) { lower_block(bs->block); return; }
     if (dynamic_cast<const BreakStmt*>(&s)) {
         if (!loops.empty()) {
             emit_cleanups_to(loops.back().cleanup_depth, loc);
+            emit_catch_unwind(loops.back().try_depth, loc);
             set_term_jmp(loops.back().exit_bb);
             // start a fresh (unreachable) block so subsequent lowering has somewhere to go
             new_and_enter();
@@ -2871,6 +3060,7 @@ void ThinLowerer::lower_stmt(const Stmt& s) {
         for (int i = int(loops.size()) - 1; i >= 0; --i) {
             if (!loops[size_t(i)].is_switch) {
                 emit_cleanups_to(loops[size_t(i)].cleanup_depth, loc);
+                emit_catch_unwind(loops[size_t(i)].try_depth, loc);
                 set_term_jmp(loops[size_t(i)].cond_bb);
                 new_and_enter();
                 break;

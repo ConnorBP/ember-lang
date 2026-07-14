@@ -1365,14 +1365,21 @@ int main() {
         ThinBlock blk0;
         blk0.id = 0;
 
-        // v1 = StringDecrypt: decrypts 8 bytes into data_temp_off=-32,
-        // slice result slot at frame_off=-16.
+        // v1 = StringDecrypt: decrypts 8 bytes into data_temp_off=-40,
+        // slice result slot at frame_off=-24.
+        //
+        // Frame layout (the slice result's LEN word lives at frame_off+8; it
+        // must NOT collide with the rbx save slot at -8, and the 16-byte slice
+        // slot must not overlap the 8-byte data buffer). With frame_off=-24 the
+        // slice spans [-24,-8) (ptr@-24, len@-16) and rbx is at [-8,0) — adjacent,
+        // no overlap. The data buffer at -40 spans [-40,-32) — distinct from
+        // the slice. frame_size=48 covers [-48,0).
         ThinInstr sd;
         sd.op = ThinOp::StringDecrypt;
         sd.dst = 1;
         sd.imm.i = key;
-        sd.meta.frame_off = -16;       // slice RESULT slot {ptr,len}
-        sd.meta.data_temp_off = -32;   // decrypted-data buffer (DISTINCT from frame_off)
+        sd.meta.frame_off = -24;       // slice RESULT slot {ptr,len}
+        sd.meta.data_temp_off = -40;   // decrypted-data buffer (DISTINCT from frame_off)
         sd.meta.len = 8;
         sd.meta.addend = 0;
         sd.meta.width = 8;
@@ -1380,13 +1387,13 @@ int main() {
         sd.meta.type = slice_ty.get();
         blk0.instrs.push_back(sd);
 
-        // v2 = LoadFrame from data_temp_off=-32: reads first 8 bytes of
+        // v2 = LoadFrame from data_temp_off=-40: reads first 8 bytes of
         // decrypted data as an i64.
         ThinInstr lf;
         lf.op = ThinOp::LoadFrame;
         lf.dst = 2;
         lf.src1 = 0;  // rbp-relative
-               lf.meta.frame_off = -32;  // read from the decrypted-data buffer
+        lf.meta.frame_off = -40;  // read from the decrypted-data buffer
         lf.meta.width = 8;
         lf.meta.type = thf.ret_type;
         blk0.instrs.push_back(lf);
@@ -1413,10 +1420,10 @@ int main() {
 
         // Assert both offsets survive.
         check(!thf2.blocks.empty() &&
-              thf2.blocks[0].instrs[0].meta.data_temp_off == -32,
-              "P7: data_temp_off survives (-32)");
-        check(thf2.blocks[0].instrs[0].meta.frame_off == -16,
-              "P7: frame_off survives (-16, distinct from data_temp_off)");
+              thf2.blocks[0].instrs[0].meta.data_temp_off == -40,
+              "P7: data_temp_off survives (-40)");
+        check(thf2.blocks[0].instrs[0].meta.frame_off == -24,
+              "P7: frame_off survives (-24, distinct from data_temp_off)");
 
         // Validate.
         std::string verr;
@@ -1424,6 +1431,32 @@ int main() {
 
         // Structural equality (both offsets preserved).
         check(thinfn_equal(thf, thf2), "P7: structural equality (distinct offsets round-trip)");
+
+        // ── Direct execution: emit the deserialized v2 IR, finalize it, call
+        //    it, and assert the decrypted runtime result. The function XOR-
+        //    decrypts 8 rodata bytes (key 0x41) into the data_temp_off=-32
+        //    buffer, then LoadFrame reads those 8 decrypted bytes as an i64.
+        //    The expected return is the little-endian i64 of "HelloHi\0".
+        //    This is the required hand-built StringDecrypt emit/execute/
+        //    decrypted-result assertion: it proves the v2 blob carries both
+        //    offsets to the emitter and the emitted XOR loop writes the
+        //    decrypted bytes to the DATA buffer (data_temp_off), not the slice
+        //    result slot (frame_off).
+        CodeGenCtx ctx;
+        ctx.globals_base = 0;
+        ctx.dispatch_base = 0;
+        ctx.enable_ir_backend = true;
+        ctx.use_context_reg = false;
+        CompiledFn cf = emit_x64(thf2, ctx);
+        check(!cf.bytes.empty(), "P7: emit_x64 produced bytes");
+        check(finalize(cf), "P7: finalize ok");
+        check(cf.entry != nullptr, "P7: finalized entry non-null");
+        int64_t got = call_i64_i64(cf.entry);
+        char p7buf[128];
+        std::snprintf(p7buf, sizeof(p7buf), "P7: executed decrypted result (%lld == %lld)",
+                      (long long)got, (long long)expected);
+        check(got == expected, p7buf);
+        if (cf.exec) free_executable(cf.exec);
     }
 
     // ─── Part 8: writer emits version 2 ───
@@ -1651,26 +1684,126 @@ int main() {
 
     // ─── Part 11: malformed/truncated v2 data_temp_off rejected ───
     //
-    // Take a valid v2 blob and truncate it right before the first
-    // instruction's data_temp_off field would be read. The deserializer
-    // must report a truncation error.
+    // The v2 instruction-meta layout adds data_temp_off as the 7th i32
+    // (after frame_off, width, len, slot, mod_id, field_off). Truncating a
+    // v2 blob so the first instruction's data_temp_off field is missing
+    // (entirely or partially) must be rejected with a diagnostic that names
+    // data_temp_off — NOT a generic end-of-blob failure. This pins the
+    // versioned-location contract: a v2 reader MUST attempt to read that exact
+    // field and report its absence by name.
+    //
+    // Rather than guess the field offset inside a serializer-produced blob,
+    // build a minimal v2 blob by hand for a one-instruction function and
+    // RECORD the byte offset where the first instruction's data_temp_off i32
+    // begins. Then truncate precisely there (and partway into it) and assert
+    // the named rejection. A control blob (the full hand-built v2 blob)
+    // deserializes successfully, proving the layout is otherwise well-formed
+    // and the ONLY thing missing in the truncated variants is data_temp_off.
     std::printf("Part 11: malformed/truncated v2 data_temp_off rejected\n");
     {
-        auto thf = build_hand_thinfn();
-        std::vector<uint8_t> blob;
-        std::string err;
-        check(serialize_thin_function(thf, blob, &err), "P11: serialize");
-        // Truncate the blob aggressively — cut 20 bytes from the end so the
-        // meta.data_temp_off of at least one instruction is missing.
-        if (blob.size() > 20) {
-            auto truncated = blob;
-            truncated.resize(blob.size() - 20);
+        // Build a minimal v2 blob for: ConstInt(1) dst=2 + Return ret=3.
+        // Same shape as the Part 9 v1 blob, but version=2 and the meta block
+        // carries the 7th i32 (data_temp_off). data_temp_off_pos = the index
+        // where the first instr's data_temp_off i32 starts.
+        std::vector<uint8_t> v2;
+        put_u32(v2, IR_BLOB_MAGIC);   // magic
+        put_u16(v2, IR_BLOB_VERSION); // version = 2
+        put_i32(v2, 3);               // slot
+        put_u32(v2, 4);               // max_vreg
+        put_u16(v2, 1);               // num_blocks
+        put_u8(v2, 0);                // has_ret_type = 0
+        // Frame plan
+        put_i32(v2, 16);              // frame_size
+        put_i32(v2, -8);              // rbx_save_offset
+        put_i32(v2, 0);               // struct_ret_ptr_offset
+        put_i32(v2, 0);               // arg_temps_base
+        put_i32(v2, 8);               // next_local_off
+        put_u8(v2, 0);               // returns_struct_by_ptr
+        put_u16(v2, 0);               // num_params
+        put_u16(v2, 0);               // num_native_fixup_names
+        // Rodata
+        put_u32(v2, 0);               // rodata_len = 0
+        // Block 0
+        put_u32(v2, 0);               // block_id
+        put_u16(v2, 1);               // num_instrs
+        // Instruction 0: ConstInt(1) dst=2
+        put_u16(v2, 0);               // op = ConstInt
+        put_u32(v2, 2);               // dst
+        put_u32(v2, 0);               // src1
+        put_u32(v2, 0);               // src2
+        put_i64(v2, 1);              // imm_i
+        put_f64(v2, 0.0);            // imm_f
+        // v2 meta: 7 i32s — frame_off, width, len, slot, mod_id, field_off,
+        // then data_temp_off. Record the position of data_temp_off.
+        put_i32(v2, 0);               // frame_off
+        put_i32(v2, 8);               // width
+        put_i32(v2, 0);               // len
+        put_i32(v2, -1);              // slot
+        put_i32(v2, -1);              // mod_id
+        put_i32(v2, 0);              // field_off
+        const size_t data_temp_off_pos = v2.size();  // <-- data_temp_off starts here
+        put_i32(v2, 0);               // data_temp_off (v2 field under test)
+        put_u8(v2, 0);               // base_kind
+        put_u32(v2, 0);              // addend
+        put_u16(v2, 0);               // native_name_len
+        put_u8(v2, 0);               // has_type = 0
+        put_u8(v2, 0);               // cmp
+        put_u8(v2, 0);               // is_unsigned
+        put_u8(v2, 0);               // is_f32
+        put_u8(v2, 0);               // trap_reason
+        put_u8(v2, 0);               // num_args
+        put_u8(v2, 0);               // num_arg_frame_offs
+        put_u8(v2, 0);               // num_arg_types
+        put_u8(v2, 0);               // has_ret_type
+        put_u32(v2, 0);              // loc_line
+        put_u32(v2, 0);              // loc_col
+        // Terminator: Return ret=3
+        put_u8(v2, static_cast<uint8_t>(TermKind::Return));
+        put_u32(v2, 0);              // cond
+        put_u32(v2, 0);              // target
+        put_u32(v2, 0);              // false_target
+        put_u32(v2, 3);              // ret
+        put_u8(v2, 0);               // trap_reason
+
+        // Control: the full hand-built v2 blob deserializes cleanly.
+        {
             ThinFunction out;
-            const uint8_t* cur = truncated.data();
-            const uint8_t* end = truncated.data() + truncated.size();
+            const uint8_t* cur = v2.data();
+            const uint8_t* end = v2.data() + v2.size();
             std::string derr;
-            check(!deserialize_thin_function(cur, end, "x", 0, out, &derr),
-                  "P11: truncated v2 blob rejected");
+            check(deserialize_thin_function(cur, end, "v2_ctrl", 3, out, &derr),
+                  "P11: control v2 blob deserializes (layout otherwise well-formed)");
+            check(cur == end, "P11: control v2 blob fully consumed");
+        }
+        // Truncation A: cut exactly at data_temp_off_pos so the whole
+        // data_temp_off i32 (and everything after it) is missing.
+        {
+            std::vector<uint8_t> trunc(v2.begin(), v2.begin() + data_temp_off_pos);
+            ThinFunction out;
+            const uint8_t* cur = trunc.data();
+            const uint8_t* end = trunc.data() + trunc.size();
+            std::string derr;
+            bool ok = deserialize_thin_function(cur, end, "v2_trunc_a", 3, out, &derr);
+            check(!ok, "P11-A: v2 blob truncated at data_temp_off rejected");
+            if (!ok) {
+                check(derr.find("data_temp_off") != std::string::npos,
+                      "P11-A: rejection names data_temp_off");
+            }
+        }
+        // Truncation B: cut 2 bytes into the data_temp_off i32 (a partial
+        // field). The reader starts the read but runs out of bytes mid-field.
+        {
+            std::vector<uint8_t> trunc(v2.begin(), v2.begin() + data_temp_off_pos + 2);
+            ThinFunction out;
+            const uint8_t* cur = trunc.data();
+            const uint8_t* end = trunc.data() + trunc.size();
+            std::string derr;
+            bool ok = deserialize_thin_function(cur, end, "v2_trunc_b", 3, out, &derr);
+            check(!ok, "P11-B: v2 blob truncated mid-data_temp_off rejected");
+            if (!ok) {
+                check(derr.find("data_temp_off") != std::string::npos,
+                      "P11-B: rejection names data_temp_off");
+            }
         }
     }
 

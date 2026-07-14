@@ -66,19 +66,19 @@ bool derive_site(const PolymorphicPassOptions& opts, const char* pass_name,
                  const ThinFunction& f, uint32_t block_id,
                  uint32_t instruction_ordinal, const char* purpose,
                  std::array<uint8_t, 32>& out) {
-    if (!opts.seed_deriver) return false;
+    if (!opts.seed_deriver()) return false;
     SeedRequest req;
-    req.engine_version = opts.engine_version;
-    req.module_id = opts.module_id;
-    req.build_profile_id = opts.build_profile_id;
+    req.engine_version = opts.engine_version();
+    req.module_id = opts.module_id();
+    req.build_profile_id = opts.build_profile_id();
     req.pass_name = pass_name;
-    req.pass_algorithm_version = opts.algorithm_version;
+    req.pass_algorithm_version = opts.algorithm_version();
     req.function_name = f.name;
     req.logical_slot = static_cast<uint32_t>(f.slot);
     req.block_id = block_id;
     req.instruction_ordinal = instruction_ordinal;
     req.purpose = purpose;
-    auto dr = opts.seed_deriver->derive(req);
+    auto dr = opts.seed_deriver()->derive(req);
     if (!dr) return false;
     out = std::move(dr.value.value());
     return true;
@@ -115,14 +115,14 @@ bool site_selected(const PolymorphicPassOptions& opts, const char* pass_name,
     StableRng rng = site_rng(opts, pass_name, f, block_id, instruction_ordinal,
                              "select", ok);
     if (!ok) return false;
-    return rng.bounded(1000000ull) < opts.site_probability_ppm;
+    return rng.bounded(1000000ull) < opts.site_probability_ppm();
 }
 
 // A configured pass is a no-op when it cannot derive: null deriver or zero
 // density. This is the bare `add<T>()` legacy path (default-constructed
 // PolymorphicPassOptions{}) AND the zero-density configured path.
 bool configured_noop(const PolymorphicPassOptions& opts) {
-    return !opts.seed_deriver || opts.site_probability_ppm == 0;
+    return !opts.seed_deriver() || opts.site_probability_ppm() == 0;
 }
 
 // ─── Candidate predicates (shared with the legacy predicates) ───
@@ -191,7 +191,7 @@ std::vector<size_t> split_candidates(const std::vector<ThinInstr>& instrs) {
 EmberPreserved SubstitutionPass::run(ThinFunction& f, EmberAnalysisManager&) {
     if (configured_noop(options)) return EmberPreserved::all();
 
-    ThinIRMutation mut(f, options.limits);
+    ThinIRMutation mut(f, options.limits());
     bool changed = false;
 
     for (auto& blk : f.blocks) {
@@ -296,7 +296,7 @@ subst_done:
 EmberPreserved MBAExpansionPass::run(ThinFunction& f, EmberAnalysisManager&) {
     if (configured_noop(options)) return EmberPreserved::all();
 
-    ThinIRMutation mut(f, options.limits);
+    ThinIRMutation mut(f, options.limits());
     bool changed = false;
 
     for (auto& blk : f.blocks) {
@@ -445,7 +445,7 @@ EmberPreserved MBAExpansionPass::run(ThinFunction& f, EmberAnalysisManager&) {
 EmberPreserved ConstantEncodingPass::run(ThinFunction& f, EmberAnalysisManager&) {
     if (configured_noop(options)) return EmberPreserved::all();
 
-    ThinIRMutation mut(f, options.limits);
+    ThinIRMutation mut(f, options.limits());
     bool changed = false;
 
     for (auto& blk : f.blocks) {
@@ -603,7 +603,7 @@ EmberPreserved OpaquePredicatesPass::run(ThinFunction& f, EmberAnalysisManager&)
     }
     if (sites.empty()) return EmberPreserved::all();
 
-    ThinIRMutation mut(f, options.limits);
+    ThinIRMutation mut(f, options.limits());
     bool changed = false;
 
     for (const Site& s : sites) {
@@ -718,6 +718,12 @@ EmberPreserved OpaquePredicatesPass::run(ThinFunction& f, EmberAnalysisManager&)
         f.blocks.insert(f.blocks.begin() + ptrdiff_t(bi + 1),
                         std::move(bogus));
         changed = true;
+        // PRIOR eligibility (Red 6 feedback): opaque_pred selected ONE site
+        // before Red 6 (sites[rng.index(sites.size())]). Preserve that "pick
+        // one site" semantics: stop after the first selected + committed site.
+        // This also keeps the per-site worst-case preflight honest (only one
+        // split + one bogus block are ever produced).
+        break;
     }
 
     if (!changed) return EmberPreserved::all();
@@ -748,7 +754,7 @@ EmberPreserved DeadCodeInjectionPass::run(ThinFunction& f, EmberAnalysisManager&
     for (size_t bi = 0; bi < f.blocks.size(); ++bi)
         sites.push_back({f.blocks[bi].id, bi});
 
-    ThinIRMutation mut(f, options.limits);
+    ThinIRMutation mut(f, options.limits());
     bool changed = false;
 
     for (const Site& s : sites) {
@@ -839,6 +845,12 @@ EmberPreserved DeadCodeInjectionPass::run(ThinFunction& f, EmberAnalysisManager&
         original.term.target = continuation_id;
         original.term.false_target = continuation_id;
         changed = true;
+        // PRIOR eligibility (Red 6 feedback): deadcode selected ONE block
+        // before Red 6 (f.blocks[rng.index(f.blocks.size())]). Preserve that
+        // "pick one block" semantics: stop after the first selected +
+        // committed site. This keeps the per-site worst-case preflight honest
+        // (only one split + one 5-instr chain are ever produced).
+        break;
     }
 
     if (!changed) return EmberPreserved::all();
@@ -852,36 +864,54 @@ EmberPreserved DeadCodeInjectionPass::run(ThinFunction& f, EmberAnalysisManager&
 // StringEncryptionPass: plaintext rodata to inline stack decryption
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Red 7 (plan §7.7): the full migration. Per-site streams: "select" gates the
-// site (density); "string-key" derives a NONZERO per-site byte key. Each
-// ConstStringRef is rewritten in place to a StringDecrypt with a DISTINCT
-// data_temp_off (the decrypted-data buffer, len bytes, allocated via
-// ThinIRMutation) and frame_off (the slice result slot, 16 bytes, allocated
-// via ThinIRMutation). The rodata is encrypted with the site's key.
+// Red 7 (plan §7.7): the full migration. Per-site streams: "select" gates
+// the site (PolymorphicPassOptions density semantics — only selected sites
+// are transformed; non-selected stay ConstStringRef); "string-key" derives a
+// NONZERO per-site byte key.
 //
-// Overlapping references: when two sites share rodata bytes but require
-// DIFFERENT keys, in-place XOR is unsafe (one site's decrypt would use the
-// wrong key). The pass detects such clusters and rebuilds the conflicting
-// sites' rodata into fresh non-overlapping regions (allocate_rodata + copy the
-// plaintext), then re-points each rebuilt site's addend there. Sites with the
-// SAME key can share an overlapping range (the shared-key XOR is correct for
-// both). No double encryption: the second run sees StringDecrypt (not
-// ConstStringRef), so there are no candidates → no-op.
+// Atomic rodata rebuild (the correctness rule for overlaps). Every SELECTED
+// site gets a PRIVATE non-overlapping encrypted rodata region (plaintext XOR
+// key) allocated via ThinIRMutation, and the site's addend is re-pointed there.
+// This is correct for ALL overlap shapes a hand-built blob can carry:
+//   - repeated identical ranges (two ConstStringRef at the same addend+len):
+//     each site gets its own private copy, so the shared bytes are never
+//     XORed twice. (The old in-place scheme XORed the shared range once per
+//     site, so same-key overlaps cancelled b^k^k=b and different-key overlaps
+//     cross-corrupted b^k1^k2 — both left plaintext or wrong bytes.)
+//   - partial overlaps (one range starts inside another): each private
+//     region is distinct, so no byte is shared and no double-XOR happens.
+//   - disjoint ranges: trivially private.
 //
-// Plaintext absence: the derived key is forced nonzero, so XOR always changes
-// every byte of a selected literal → no plaintext byte survives in the final
-// rodata or the serialized v2 blob. Frame regions are distinct (data_temp_off
-// != frame_off, allocated non-overlapping via ThinIRMutation). Stale regalloc
-// is cleared by commit().
+// Plaintext absence. After re-pointing, the ORIGINAL plaintext ranges of
+// selected sites are SCRUBBED (zeroed) in f.rodata — but only the bytes NOT
+// still referenced by a NON-selected ConstStringRef (a non-selected site that
+// shares bytes with a selected one must keep its plaintext; this conflict is
+// inherent to hand-built overlapping IR and the scrub skips those bytes). The
+// derived key is forced nonzero, so every byte of a selected literal's private
+// region is plaintext^key != plaintext — no plaintext byte of a selected site
+// survives in the final rodata or the serialized v2 blob.
+//
+// Frame regions. Each StringDecrypt gets a DISTINCT data_temp_off (the
+// decrypted-data buffer, len bytes, 8-byte aligned) and frame_off (the slice
+// result slot, 16 bytes, 16-byte aligned) allocated non-overlapping via
+// ThinIRMutation. Stale regalloc is cleared by commit().
+//
+// No double encryption. The second run sees StringDecrypt (not
+// ConstStringRef) for every previously-selected site, so those are no longer
+// candidates; the remaining non-selected ConstStringRef re-evaluate site_selected
+// deterministically (same seed -> same selection -> still not selected), so a
+// re-run is a no-op unless an explicit rekey mode is supplied. Only
+// successfully-transformed (selected) sites are tracked.
 
 EmberPreserved StringEncryptionPass::run(ThinFunction& f, EmberAnalysisManager&) {
     if (configured_noop(options)) return EmberPreserved::all();
 
     // Snapshot the ConstStringRef candidates with their ORIGINAL block id +
-    // ordinal so the per-site key derivation is stable. We capture the instr
-    // POINTER (into the function's blocks) for the rewrite below; the pointer
-    // stays valid because str_encrypt does NOT insert/remove instructions
-    // (it only rewrites existing ConstStringRef -> StringDecrypt in place).
+// ordinal so the per-site selection + key derivation are stable. We capture
+// the instr POINTER (into the function's blocks) for the rewrite below; the
+// pointer stays valid because str_encrypt does NOT insert/remove
+// instructions (it only rewrites existing ConstStringRef -> StringDecrypt in
+// place).
     struct Site {
         ThinInstr* in;
         uint32_t block_id;
@@ -889,7 +919,7 @@ EmberPreserved StringEncryptionPass::run(ThinFunction& f, EmberAnalysisManager&)
         uint32_t addend;
         uint32_t len;
     };
-    std::vector<Site> sites;
+    std::vector<Site> all_sites;
     for (auto& block : f.blocks) {
         uint32_t ord = 0;
         for (auto& in : block.instrs) {
@@ -897,18 +927,29 @@ EmberPreserved StringEncryptionPass::run(ThinFunction& f, EmberAnalysisManager&)
             const uint64_t begin = in.meta.addend;
             const uint64_t end = begin + static_cast<uint32_t>(in.meta.len);
             if (end > f.rodata.size()) { ++ord; continue; }
-            sites.push_back({&in, block.id, ord, in.meta.addend,
-                             static_cast<uint32_t>(in.meta.len)});
+            all_sites.push_back({&in, block.id, ord, in.meta.addend,
+                                static_cast<uint32_t>(in.meta.len)});
             ++ord;
         }
     }
-    if (sites.empty()) return EmberPreserved::all();
+    if (all_sites.empty()) return EmberPreserved::all();
+
+    // Per-site SELECTION (PolymorphicPassOptions density semantics): only
+    // sites that pass site_selected are transformed. Non-selected sites stay
+    // ConstStringRef (their rodata stays plaintext — correct, they are not
+    // encrypted). Track only the selected sites.
+    std::vector<Site> sel;
+    sel.reserve(all_sites.size());
+    for (const Site& s : all_sites)
+        if (site_selected(options, pass_name, f, s.block_id, s.ordinal))
+            sel.push_back(s);
+    if (sel.empty()) return EmberPreserved::all();
 
     // Derive a per-site nonzero byte key from the seed (purpose "string-key").
     // A zero key would leave plaintext in rodata, so we force nonzero.
     std::vector<uint8_t> keys;
-    keys.reserve(sites.size());
-    for (const Site& s : sites) {
+    keys.reserve(sel.size());
+    for (const Site& s : sel) {
         bool ok = false;
         StableRng krng = site_rng(options, pass_name, f, s.block_id, s.ordinal,
                                   "string-key", ok);
@@ -917,53 +958,46 @@ EmberPreserved StringEncryptionPass::run(ThinFunction& f, EmberAnalysisManager&)
         keys.push_back(key);
     }
 
-    // Detect overlapping ranges that require DIFFERENT keys. When two sites
-    // share rodata bytes but have different keys, in-place XOR is unsafe (one
-    // site's decrypt would use the wrong key). For such sites, rebuild the
-    // rodata: copy each site's plaintext to a fresh non-overlapping region and
-    // re-point the site's addend there. Sites with the SAME key can share an
-    // overlapping region (in-place XOR with the shared key is correct for
-    // both).\    //
-    // For simplicity + correctness, when ANY site in an overlapping cluster
-    // has a different key from another site in the same cluster, we rebuild
-    // ALL sites in that cluster. (A more precise scheme would rebuild only
-    // the conflicting sites, but the cluster-wide rebuild is simpler and the
-    // growth is bounded.)
-    //
-    // rebuild_needed[i] = true if site i's rodata range must be copied to a
-    // fresh region (because it overlaps another site with a different key).
-    std::vector<bool> rebuild_needed(sites.size(), false);
-    for (size_t i = 0; i < sites.size(); ++i) {
-        for (size_t j = i + 1; j < sites.size(); ++j) {
-            const uint64_t ib = sites[i].addend, ie = ib + sites[i].len;
-            const uint64_t jb = sites[j].addend, je = jb + sites[j].len;
-            // overlap iff ib < je && jb < ie
-            if (ib < je && jb < ie) {
-                if (keys[i] != keys[j]) {
-                    rebuild_needed[i] = true;
-                    rebuild_needed[j] = true;
-                }
-            }
-        }
+    // Compute the byte ranges still referenced by NON-selected ConstStringRef
+    // (the sites we are NOT transforming). The scrub below must NOT zero bytes
+    // a non-selected site still needs as plaintext — a non-selected site that
+    // shares bytes with a selected one keeps them (the conflict is inherent to
+    // hand-built overlapping IR; the realistic lowerer never overlaps). For
+    // the all-selected / no-overlap cases this set is empty and the scrub is
+    // unconditional.
+    std::vector<std::pair<uint64_t,uint64_t>> protected_ranges;  // [begin, end)
+    for (const Site& s : all_sites) {
+        bool is_selected = false;
+        for (const Site& ss : sel)
+            if (ss.in == s.in) { is_selected = true; break; }
+        if (!is_selected && s.len > 0)
+            protected_ranges.emplace_back(uint64_t(s.addend),
+                                          uint64_t(s.addend) + s.len);
     }
+    auto byte_is_protected = [&](uint64_t k) -> bool {
+        for (const auto& pr : protected_ranges)
+            if (k >= pr.first && k < pr.second) return true;
+        return false;
+    };
 
-    ThinIRMutation mut(f, options.limits);
+    ThinIRMutation mut(f, options.limits());
     bool changed = false;
 
-    // For each site: allocate the data buffer (len bytes) + the slice result
-    // slot (16 bytes) via ThinIRMutation, derive the key, and (if needed)
-    // allocate a fresh rodata region + copy the plaintext there. The worst
-    // case per site is: 0 VRegs (no new VRegs; the slice dst stays the same),
-    // len+16 frame bytes, 0 instructions (the rewrite is in place), and
-    // (len) rodata bytes if a rebuild is needed.
-    for (size_t i = 0; i < sites.size(); ++i) {
-        const Site& s = sites[i];
+    // For each selected site: reserve the worst-case growth (0 VRegs, len+16
+    // frame bytes, 0 instructions, len rodata bytes — empty literals need 0
+    // rodata bytes), allocate the data buffer (len bytes) + slice slot (16
+    // bytes) via ThinIRMutation, allocate a PRIVATE rodata region (len bytes)
+    // for the encrypted copy, write plaintext^key there, and rewrite the
+    // ConstStringRef -> StringDecrypt in place.
+    for (size_t i = 0; i < sel.size(); ++i) {
+        const Site& s = sel[i];
+        const uint8_t key = keys[i];
         const uint32_t wc_frame = s.len + 16;
-        const uint32_t wc_rodata = rebuild_needed[i] ? s.len : 0;
+        const uint32_t wc_rodata = s.len;  // 0 for empty literals
         auto rs = mut.reserve_site(0, wc_frame, 0, 0, wc_rodata);
         if (!rs.ok()) continue;  // stop-before-site atomicity
 
-        // Allocate the data buffer (len bytes, 8-byte aligned) + slice slot
+        // Data buffer (len bytes, 8-byte aligned) + slice result slot
         // (16 bytes, 16-byte aligned). The data buffer holds the decrypted
         // bytes; the slice slot holds {ptr, len}.
         auto r_data = mut.allocate_frame_bytes(s.len, 8);
@@ -973,28 +1007,28 @@ EmberPreserved StringEncryptionPass::run(ThinFunction& f, EmberAnalysisManager&)
         const int32_t data_temp_off = r_data.get();
         const int32_t slice_off = r_slice.get();
 
-        // Determine the rodata addend: if a rebuild is needed, allocate a
-        // fresh region and copy the plaintext there; otherwise keep the
-        // original addend.
+        // Private encrypted rodata region. For a non-empty literal, allocate
+        // len bytes and write plaintext^key there (the runtime XOR decrypt
+        // restores the plaintext). For an empty literal (len==0) there are no
+        // bytes to encrypt; keep the original addend (validate checks
+        // addend+0 <= rodata.size(), which holds).
         uint32_t addend = s.addend;
-        if (rebuild_needed[i]) {
+        if (s.len > 0) {
             auto r_rodata = mut.allocate_rodata(s.len);
             if (!r_rodata.ok()) continue;
             addend = r_rodata.get();
-            // Copy the ORIGINAL (plaintext) bytes to the new region. The
-            // encryption pass below XORs them with the site's key.
             // NOTE: f.rodata is mutated directly here; the ThinIRMutation
             // snapshot restore on abandon undoes this on failure.
             if (f.rodata.size() < addend + s.len)
                 f.rodata.resize(addend + s.len, 0);
-            std::memcpy(f.rodata.data() + addend,
-                        f.rodata.data() + s.addend, s.len);
+            for (uint32_t k = 0; k < s.len; ++k)
+                f.rodata[addend + k] = uint8_t(f.rodata[s.addend + k] ^ key);
         }
 
         // Rewrite the ConstStringRef -> StringDecrypt in place.
         ThinInstr& in = *s.in;
         in.op = ThinOp::StringDecrypt;
-        in.imm.i = int64_t(keys[i]);
+        in.imm.i = int64_t(key);
         in.meta.addend = addend;
         in.meta.len = int32_t(s.len);
         in.meta.data_temp_off = data_temp_off;
@@ -1005,21 +1039,18 @@ EmberPreserved StringEncryptionPass::run(ThinFunction& f, EmberAnalysisManager&)
 
     if (!changed) return EmberPreserved::all();
 
-    // Encrypt the rodata: XOR each site's [addend, addend+len) range with its
-    // key. For non-rebuilt sites this is an in-place XOR of the original
-    // range; for rebuilt sites this is an XOR of the fresh copy. Rebuilt
-    // sites have a distinct addend, so they never collide with another site's
-    // range. Non-rebuilt sites with the SAME key can share an overlapping
-    // range (the XOR is idempotent for the shared key). Non-rebuilt sites with
-    // DIFFERENT keys would overlap, but those were flagged for rebuild above,
-    // so no two non-rebuilt sites with different keys share bytes.
-    for (size_t i = 0; i < sites.size(); ++i) {
-        if (!changed) break;
-        const uint32_t addend = sites[i].in->meta.addend;
-        const uint32_t len = uint32_t(sites[i].in->meta.len);
-        const uint8_t key = uint8_t(sites[i].in->imm.i);
-        for (uint32_t k = 0; k < len; ++k)
-            f.rodata[addend + k] ^= key;
+    // Scrub the ORIGINAL plaintext ranges of selected sites so no selected
+    // plaintext survives at the old offsets. Skip bytes still referenced by a
+    // non-selected ConstStringRef (protected_ranges) — those must remain
+    // plaintext for the non-selected site. Each selected byte is now either
+    // re-pointed to a private encrypted region or unreferenced, so zeroing
+    // the old offset removes the plaintext without breaking any live reference.
+    for (const Site& s : sel) {
+        for (uint32_t k = 0; k < s.len; ++k) {
+            uint64_t off = uint64_t(s.addend) + k;
+            if (off < f.rodata.size() && !byte_is_protected(off))
+                f.rodata[off] = 0;
+        }
     }
 
     auto rc = mut.commit();
@@ -1055,7 +1086,7 @@ EmberPreserved BlockSplittingPass::run(ThinFunction& f, EmberAnalysisManager&) {
     }
     if (sites.empty()) return EmberPreserved::all();
 
-    ThinIRMutation mut(f, options.limits);
+    ThinIRMutation mut(f, options.limits());
     bool changed = false;
 
     for (const Site& s : sites) {
@@ -1103,8 +1134,16 @@ EmberPreserved BlockSplittingPass::run(ThinFunction& f, EmberAnalysisManager&) {
 
 // Configured registration: each pass is registered through a factory that
 // captures `options` by value and returns a fresh PassConcept on every
-// create(). Strict: rejects empty names, null factories, and duplicates.
-void register_passes(EmberPassRegistry& reg, const PolymorphicPassOptions& options) {
+// create(). STRICT + VALIDATING (Red 6 feedback: configured registration must
+// not silently accept unvalidated options): `options` is validated first; on
+// a validation failure NOTHING is registered and the structured ExtensionError
+// is returned. On success, all 7 passes are registered (strict per-name: empty
+// names, null factories, and duplicate names are rejected without replacing
+// the first registration) and an ok status is returned. Never prints or throws.
+ExtensionStatus register_passes(EmberPassRegistry& reg, const PolymorphicPassOptions& options) {
+    if (auto st = validate_polymorphic_options(options); !st) {
+        return st;  // unvalidated options rejected; nothing registered
+    }
     reg.add_factory("subst",        [options]() { return ember::make_pass_concept(SubstitutionPass{options}); });
     reg.add_factory("mba_expand",   [options]() { return ember::make_pass_concept(MBAExpansionPass{options}); });
     reg.add_factory("const_encode", [options]() { return ember::make_pass_concept(ConstantEncodingPass{options}); });
@@ -1112,24 +1151,28 @@ void register_passes(EmberPassRegistry& reg, const PolymorphicPassOptions& optio
     reg.add_factory("deadcode",     [options]() { return ember::make_pass_concept(DeadCodeInjectionPass{options}); });
     reg.add_factory("str_encrypt",  [options]() { return ember::make_pass_concept(StringEncryptionPass{options}); });
     reg.add_factory("block_split",  [options]() { return ember::make_pass_concept(BlockSplittingPass{options}); });
+    return make_extension_ok();
 }
 
-// Compatibility wrapper: DETERMINISTIC DEFAULTS that retain the existing
-// pipeline names + eligibility behavior. A fixed-root seed deriver (seed 0,
-// fully deterministic) + the legacy 50% site selection density (500_000 ppm,
-// matching the legacy `(rng.next() & 1U) == 0` eligibility). Existing
-// `register_passes(reg)` callers keep working unchanged; the pipeline names
-// and the eligibility behavior are preserved.
+// Compatibility wrapper: register every obfuscation pass through its DEFAULT
+// constructor, which captures `legacy_defaults(pass_name)` -- a DETERMINISTIC
+// fixed-root seed-0 deriver + the pass PRIOR per-pass eligibility density
+// (subst / str_encrypt / block_split = 100% every eligible site; mba_expand /
+// const_encode = 50%; opaque_pred / deadcode = 100% with at-most-one-site
+// selection). This preserves the existing `register_passes(reg)` pipeline names
+// AND the prior per-pass eligibility behavior, and the resulting passes are
+// FUNCTIONING (not no-ops). Existing `register_passes(reg)` callers
+// (ember_cli no-profile branch, ir_passes_test, ember_pass_test) keep working
+// unchanged. Uses `reg.add<T>()` (the default-constructor path) so each pass
+// captures its own `legacy_defaults(pass_name)`.
 void register_passes(EmberPassRegistry& reg) {
-    PolymorphicPassOptions defaults;
-    defaults.seed_deriver = std::make_shared<FixedRootSeedDeriver>(u64_to_root(0));
-    defaults.algorithm_version = 1;
-    defaults.engine_version = "ember";
-    defaults.module_id = "default";
-    defaults.build_profile_id = "default";
-    defaults.site_probability_ppm = 500'000;
-    defaults.limits = PassGrowthLimits{};
-    register_passes(reg, defaults);
+    reg.add<SubstitutionPass>("subst");
+    reg.add<MBAExpansionPass>("mba_expand");
+    reg.add<ConstantEncodingPass>("const_encode");
+    reg.add<OpaquePredicatesPass>("opaque_pred");
+    reg.add<DeadCodeInjectionPass>("deadcode");
+    reg.add<StringEncryptionPass>("str_encrypt");
+    reg.add<BlockSplittingPass>("block_split");
 }
 
 } // namespace ember::ext_obf
