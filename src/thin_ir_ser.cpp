@@ -284,6 +284,7 @@ bool serialize_thin_function(const ThinFunction& thf, std::vector<uint8_t>& out,
             put_i32(out, in.meta.slot);
             put_i32(out, in.meta.mod_id);
             put_i32(out, in.meta.field_off);
+            put_i32(out, in.meta.data_temp_off);  // v2: StringDecrypt data buffer
             put_u8(out, static_cast<uint8_t>(in.meta.base_kind));
             put_u32(out, in.meta.addend);
             if (!ser_name(out, in.meta.native_name, err, "native_name")) return false;
@@ -472,6 +473,7 @@ bool deserialize_thin_function(const uint8_t*& cur, const uint8_t* end,
             if (!read_i32(cur, end, in.meta.slot)) { if (err) *err = "thin_ir_ser: truncated meta.slot"; return false; }
             if (!read_i32(cur, end, in.meta.mod_id)) { if (err) *err = "thin_ir_ser: truncated meta.mod_id"; return false; }
             if (!read_i32(cur, end, in.meta.field_off)) { if (err) *err = "thin_ir_ser: truncated meta.field_off"; return false; }
+            if (!read_i32(cur, end, in.meta.data_temp_off)) { if (err) *err = "thin_ir_ser: truncated meta.data_temp_off"; return false; }
             uint8_t base_kind_raw = 0;
             if (!read_u8(cur, end, base_kind_raw)) { if (err) *err = "thin_ir_ser: truncated meta.base_kind"; return false; }
             if (base_kind_raw > BASE_KIND_LAST) { if (err) *err = "thin_ir_ser: invalid meta.base_kind ordinal"; return false; }
@@ -1080,6 +1082,39 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err,
         // Trap: no successor checks (dead end); trap_reason is a u8, no range
         // check needed (it's a TrapReason ordinal used only if the host
         // installs a trap stub).
+    }
+    return true;
+}
+
+// ─── Red 5: the in-memory, codegen-facing verifier ───
+//
+// Delegates the shared CFG/frame/rodata/VReg/op-shape invariants to
+// validate_thin_function (dispatch=registry=0, so the host-table-only slot
+// checks are skipped — those are load-time concerns, not pass-output ones),
+// then adds a codegen-specific frame-plan consistency check (next_local_off
+// must stay within the allocated frame) that the disk validator does not make.
+// It does NOT validate the regalloc result: `thf.ra` is a JIT-time annotation
+// computed by run_regalloc, not an IR invariant a pass produces. A stale/bogus
+// `ra` is rejected/cleared by compile_func_checked before the single regalloc/
+// emit stage, not by this verifier (see thin_ir_ser.hpp +
+// docs/PASS_AUTHORING.md).
+bool verify_thin_function_for_codegen(const ThinFunction& thf, std::string* err) {
+    std::string v;
+    std::string* ep = err ? err : &v;
+    if (!validate_thin_function(thf, ep, /*dispatch_size=*/0,
+                                /*registry_size=*/0, /*cross_module_slot_counts=*/nullptr)) {
+        if (err && !err->empty() && err->find("codegen") == std::string::npos)
+            *err = "codegen verify: " + *err;
+        return false;
+    }
+    // Codegen-specific strengthening: the next-free local offset must stay
+    // within the allocated frame (a pass that bumped next_local_off past
+    // frame_size would let emit write outside the frame). next_local_off is a
+    // magnitude (e.g. 8 => the next free slot is [rbp-8]); frame_size is the
+    // rounded total. Permit frame_size == 0 only when nothing is allocated.
+    if (thf.frame.frame_size < thf.frame.next_local_off) {
+        if (err) *err = "codegen verify: frame.next_local_off exceeds frame_size";
+        return false;
     }
     return true;
 }

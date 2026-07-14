@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -111,6 +112,75 @@ public:
     }
 };
 
+// ─── Red 5: checked execution ───
+//
+// A pass may throw a recoverable PassError to signal a structured failure (a
+// bad site, a missing analysis, an unmet precondition). The checked run adapter
+// catches PassError, rolls back the per-pass snapshot, and reports
+// PassStopReason::PassError. An unexpected std::exception (NOT a PassError) is
+// caught separately and reported as PassStopReason::ExceptionError. Neither
+// crosses the compile/module boundary. Library code returns diagnostics in the
+// report rather than printing to stderr (the host chooses logging policy).
+//
+// PassError carries the offending pass name + a short message. It is the ONLY
+// exception type the checked adapter treats as a recoverable, expected pass
+// failure; everything else is an unexpected exception.
+struct PassError : std::exception {
+    std::string pass_name;
+    std::string message;
+    PassError(std::string pn, std::string msg)
+        : pass_name(std::move(pn)), message(std::move(msg)) {
+        what_ = pass_name + ": " + message;
+    }
+    const char* what() const noexcept override { return what_.c_str(); }
+private:
+    std::string what_;
+};
+
+// Why a checked run stopped. The report carries this plus the pass name, a
+// diagnostic, the round count, and the initial/final instruction counts.
+enum class PassStopReason : uint8_t {
+    Completed,         // one-shot: every pass ran and the IR verified clean
+    Converged,         // fixpoint: no pass changed anything this round
+    RoundLimit,        // fixpoint: hit max_rounds before converging
+    GrowthLimit,       // a pass exceeded the instruction/growth ceiling
+    ValidationFailure, // a pass produced IR that failed the codegen verifier
+                       // (or the INPUT failed validation before any pass ran)
+    PassError,         // a pass threw a recoverable PassError
+    ExceptionError,    // a pass threw an unexpected std::exception
+};
+
+// Structured report from a checked run. The pass_name is the name of the pass
+// that was running when the run stopped (the failing pass, or the last pass on
+// success). error carries a diagnostic on every non-Completed/Converged stop.
+// rounds is 1 for one-shot run_checked, the number of fixpoint rounds for
+// run_checked_fixpoint. initial_count / final_count are the total instruction
+// counts before the run and at the point the run stopped (pre-rollback on a
+// failure, so final_count may exceed initial_count on a GrowthLimit).
+struct PassRunReport {
+    PassStopReason stop_reason = PassStopReason::Completed;
+    std::string pass_name;
+    std::string error;
+    unsigned rounds = 0;
+    std::size_t initial_count = 0;
+    std::size_t final_count = 0;
+};
+
+// Options for a checked run. The hard failsafes (EmberPassManager::
+// hard_max_ir_instructions / hard_max_ir_growth_factor) are ALWAYS enforced on
+// top of these; a caller may request SMALLER ceilings but cannot raise them
+// above the hard caps. max_rounds is clamped to hard_max_fixpoint_rounds and
+// is used only by run_checked_fixpoint (one-shot run_checked runs one round).
+struct CheckedRunOptions {
+    unsigned max_rounds = 8;
+    std::size_t max_instructions = 0;     // 0 = use the hard cap
+    uint32_t growth_numerator = 0;        // 0 = use the hard growth factor
+    uint32_t growth_denominator = 1;
+    bool validate_input = true;           // validate the function before any pass
+    bool validate_after_each_mutation = true; // validate after each pass that
+                                              // reports a mutation (none())
+};
+
 // ─── The pass manager (composition) ───
 // Holds vector<unique_ptr<PassConcept>>. addPass<T>(T{}) type-erases into a
 // PassModel<T>. run() executes passes in order with instrumentation.
@@ -165,6 +235,29 @@ public:
     EmberPreserved run_to_fixpoint(ThinFunction& f, EmberAnalysisManager& am,
                                    unsigned max_rounds = 8);
 
+    // ─── Red 5: checked execution ───
+    //
+    // Run the pipeline once with full safety: validate the input, snapshot the
+    // function, run each pass, validate after each REPORTED mutation, enforce
+    // the instruction/growth ceilings, catch recoverable PassError and
+    // unexpected std::exception, and on ANY failure restore the snapshot so the
+    // function is byte-for-byte unchanged. Returns a structured PassRunReport
+    // (no library-only stderr: diagnostics travel in the report). Later passes
+    // do not run after a failure. Preserves the EmberPreserved run()/
+    // run_to_fixpoint() compatibility contract — those methods keep their
+    // signatures and now also enforce the hard growth ceilings (stopping, not
+    // printing, on exceed).
+    PassRunReport run_checked(ThinFunction& f, EmberAnalysisManager& am,
+                              const CheckedRunOptions& opts = CheckedRunOptions{});
+
+    // Checked fixpoint: run rounds until convergence (no pass changed
+    // anything), the round limit, or a growth/validation/pass/exception
+    // failure. On failure the snapshot is restored and the report carries the
+    // failing pass + reason. opts.max_rounds (clamped to the hard cap) is the
+    // round ceiling; opts.stop_reason is Converged on a clean convergence.
+    PassRunReport run_checked_fixpoint(ThinFunction& f, EmberAnalysisManager& am,
+                                       const CheckedRunOptions& opts = CheckedRunOptions{});
+
     bool empty() const { return passes_.empty(); }
     size_t size() const { return passes_.size(); }
 
@@ -173,6 +266,24 @@ public:
 
 private:
     std::vector<std::unique_ptr<PassConcept>> passes_;
+
+    // Shared one-round checked driver used by both run_checked (one shot) and
+    // run_checked_fixpoint (per round). `snapshot` is restored on any failure.
+    // `round_report` is filled with this round's outcome (stop_reason, the
+    // running pass name, error, and the post-round instruction count).
+    // Returns true if the round completed cleanly (every pass ran, IR verified,
+    // ceiling respected) and the round may continue to a next fixpoint round;
+    // false if the run must stop (failure or clean one-shot completion).
+    bool checked_round_(ThinFunction& f, EmberAnalysisManager& am,
+                        ThinFunction& snapshot, const CheckedRunOptions& opts,
+                        PassRunReport& round_report);
+    // Resolve the effective growth ceilings from opts clamped by the hard
+    // caps. Returns {absolute_instruction_cap, growth_limit} where growth_limit
+    // is max(initial, initial*num/den) clamped to the hard absolute cap.
+    void resolve_ceilings_(const CheckedRunOptions& opts,
+                           std::size_t initial_count,
+                           std::size_t& abs_cap,
+                           std::size_t& growth_cap) const;
 };
 
 // ─── Analysis manager (stub for the first Stage C cut) ───

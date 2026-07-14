@@ -36,7 +36,8 @@
 //
 //   Header:
 //     ir_magic     : u32 = 0x4952464E ("IRFN") — reject garbage immediately
-//     ir_version   : u16 = 1                  — IR serialization format version
+//     ir_version   : u16 = 2                  — IR serialization format version
+//                                                       (v2 adds meta.data_temp_off)
 //     slot         : i32                      — dispatch slot
 //     max_vreg     : u32                      — highest VReg+1; all VReg refs < this
 //     num_blocks   : u16 (<= 65535)
@@ -73,7 +74,9 @@
 //       imm_i     : i64
 //       imm_f     : f64 (raw 8 bytes)
 //       meta:
-//         frame_off, width, len, slot, mod_id, field_off : 6×i32
+//         frame_off, width, len, slot, mod_id, field_off,
+//           data_temp_off : 7×i32 (data_temp_off added in v2: the StringDecrypt
+//                              decrypted-data buffer offset)
 //         base_kind : u8 (validated against AbsFixup::Kind range)
 //         addend    : u32
 //         native_name_len : u16 (<= MAX_NAME_SIZE), native_name
@@ -117,7 +120,7 @@ namespace ember {
 
 // ir_blob magic + version.
 constexpr uint32_t IR_BLOB_MAGIC    = 0x4952464Eu;  // "IRFN" (LE: 'N','F','R','I')
-constexpr uint16_t IR_BLOB_VERSION  = 1u;
+constexpr uint16_t IR_BLOB_VERSION  = 2u;
 
 // Hard maxima (bounded counts — checked before any resize/reserve).
 constexpr uint32_t IR_MAX_BLOCKS   = 65535u;
@@ -223,5 +226,35 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err,
                             uint32_t dispatch_size = 0,
                             uint32_t registry_size = 0,
                             const int64_t* cross_module_slot_counts = nullptr);
+
+// ─── Red 5: the in-memory, codegen-facing verifier ───
+//
+// `validate_thin_function` is the DISK-facing structural/security validator run
+// by the loader after deserialize and before emit (it needs the host native /
+// dispatch / registry tables to range-check call slots). `verify_thin_function
+// _for_codegen` is the IN-MEMORY validator for pass OUTPUT: it runs after a pass
+// mutates a JIT-time ThinFunction and before regalloc/emit. It covers the same
+// CFG/frame/rodata/VReg/op-shape invariants as validate_thin_function (the
+// shared checks that do NOT need the host tables: block ids, terminators, edge
+// bounds, frame spans, rodata bounds, VReg bounds, op/term enum ranges, native
+// name presence), and ADDITIONALLY checks the frame-plan consistency
+// (next_local_off must stay within frame_size) so a pass that bumped the
+// next-free offset past the allocated frame is caught before emit_x64. It does
+// NOT validate the regalloc result (`thf.ra` is a JIT-time annotation produced
+// by run_regalloc, not an IR invariant a pass produces); a stale/bogus `ra` is
+// rejected/cleared by compile_func_checked before the single regalloc/emit
+// stage.
+//
+// It does NOT perform native-name rebinding (at JIT time `native_fn` is already
+// a valid host pointer) and does NOT range-check CallScript/CallCrossModule
+// slots against the dispatch/registry tables (those are load-time concerns;
+// passes do not rewrite call slots). `dispatch_size`/`registry_size` are
+// therefore passed as 0 to the shared validator (the slot checks are skipped).
+//
+// Returns true on a codegen-valid function; on failure sets *err and returns
+// false. Tests and the checked pass path use THIS verifier for pass output;
+// `validate_thin_function` remains the disk-facing validator (see
+// docs/PASS_AUTHORING.md).
+bool verify_thin_function_for_codegen(const ThinFunction& thf, std::string* err);
 
 } // namespace ember

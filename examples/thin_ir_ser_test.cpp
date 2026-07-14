@@ -136,6 +136,9 @@ static bool thinfn_equal(const ThinFunction& a, const ThinFunction& b) {
             if (ia.imm.i != ib.imm.i) return false;
             if (ia.meta.width != ib.meta.width) return false;
             if (ia.meta.frame_off != ib.meta.frame_off) return false;
+            if (ia.meta.data_temp_off != ib.meta.data_temp_off) return false;
+            if (ia.meta.len != ib.meta.len) return false;
+            if (ia.meta.addend != ib.meta.addend) return false;
             if (ia.meta.native_name != ib.meta.native_name) return false;
             if (ia.args.size() != ib.args.size()) return false;
             for (size_t k = 0; k < ia.args.size(); ++k)
@@ -1231,6 +1234,55 @@ int main() {
     // rbp-relative full-span validation c1 deferred as out-of-scope).
     std::printf("Part 5: instr frame_off full-span + arg_frame_offs + data_temp_off + computed-address distinction\n");
     check(frame_span_arg_validation(), "instr full-span / arg_frame_offs / data_temp_off / computed-address validation (slice 16B, F32 4B, int 8B, copy/string len, StringDecrypt data+result, struct-by-value afo, struct-return dest, StoreAddr/LoadFrame/StoreFrame computed distinction, legitimate boundary controls accepted)");
+
+    // Part 6: ir_blob v2 round-trips meta.data_temp_off (the StringDecrypt
+    // decrypted-data buffer offset). Pre-v2 this field was NOT serialized, so a
+    // round-trip silently zeroed it. This pins that the v2 blob carries it.
+    std::printf("Part 6: ir_blob v2 round-trips meta.data_temp_off\n");
+    {
+        ThinFunction thf;
+        thf.name = "strdec";
+        thf.slot = 1;
+        thf.frame.frame_size = 32;
+        thf.frame.rbx_save_offset = -8;
+        thf.frame.next_local_off = 32;
+        ThinBlock blk0;
+        blk0.id = 0;
+        ThinInstr sd;
+        sd.op = ThinOp::StringDecrypt;
+        sd.dst = 1;
+        sd.imm.i = 0;
+        sd.meta.frame_off = -16;    // slice RESULT slot ({ptr,len})
+        sd.meta.data_temp_off = -32;  // decrypted-data buffer (the field under test)
+        sd.meta.len = 4;
+        sd.meta.addend = 0;
+        sd.meta.width = 8;
+        // rodata backs the encrypted bytes; addend+len must be in bounds.
+        thf.rodata.assign(4, 0xAA);
+        blk0.instrs.push_back(sd);
+        blk0.term.kind = TermKind::Return;
+        blk0.term.ret = 1;
+        thf.blocks.push_back(std::move(blk0));
+        thf.declared_max_vreg = 2;
+        std::string serr;
+        std::vector<uint8_t> blob;
+        check(serialize_thin_function(thf, blob, &serr), "serialize StringDecrypt (v2)");
+        ThinFunction thf2;
+        const uint8_t* cur = blob.data();
+        const uint8_t* end = blob.data() + blob.size();
+        std::string derr;
+        check(deserialize_thin_function(cur, end, thf.name, thf.slot, thf2, &derr),
+              "deserialize StringDecrypt (v2)");
+        check(cur == end, "v2 blob fully consumed");
+        std::string verr;
+        check(validate_thin_function(thf2, &verr), "validate StringDecrypt (v2)");
+        check(!thf2.blocks.empty() &&
+              thf2.blocks[0].instrs[0].meta.data_temp_off == -32,
+              "data_temp_off round-trips (-32 preserved)");
+        check(thf2.blocks[0].instrs[0].meta.frame_off == -16,
+              "frame_off still round-trips alongside data_temp_off");
+        check(thinfn_equal(thf, thf2), "structural equality (v2 data_temp_off round-trip)");
+    }
 
     std::printf("\n%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

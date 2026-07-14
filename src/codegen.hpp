@@ -7,6 +7,10 @@
 #include "x64_emitter.hpp"
 #include "jit_memory.hpp"
 #include "sema.hpp"
+#include "engine.hpp"        // Red 5: CompiledFn (complete type for CompileResult::compiled)
+#include "thin_ir.hpp"        // Red 5: ThinFunction for CompileResult::transformed
+#include "ember_pass.hpp"    // Red 5: PassRunReport / CheckedRunOptions for compile_func_checked
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -242,7 +246,48 @@ struct CodeGenCtx {
 };
 
 // Compile one function. Returns the JIT'd bytes + (after finalize) entry.
+// Source-compatible legacy wrapper (Red 5): kept as the simple return-by-value
+// path. The checked, structured path is compile_func_checked below.
 CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx);
+
+// ─── Red 5: the checked compile boundary ───
+//
+// Which backend a compile used (or attempted). Obf/try/catch/coroutine
+// functions fall back to the tree-walker; the IR backend is the optimized path.
+enum class CompileBackend : uint8_t {
+    TreeWalker,   // the v1 stack-spilling tree-walker (default / fallback)
+    IRBackend,    // lower_function -> [checked passes] -> regalloc -> emit_x64
+};
+
+// Structured compile result. `ok()` is true only when an executable CompiledFn
+// was produced AND every gate passed (passes verified, regalloc/emit reached).
+// On any failure `compiled.exec == nullptr`, the failure `reason` is set, and
+// the pass_reports carry the per-pass checked outcome. Validation failure can
+// NOT reach run_regalloc or emit_x64 (the checked path stops before them).
+// Exceptions never cross this boundary: a thrown pass or backend error becomes
+// a structured failure here, not a propagated exception.
+struct CompileResult {
+    bool ok_ = false;                       // true iff an executable was produced
+    CompileBackend backend = CompileBackend::TreeWalker;
+    std::string reason;                      // fallback/failure reason (empty on success)
+    std::optional<ThinFunction> transformed; // the post-pass ThinFunction when requested
+    std::vector<PassRunReport> pass_reports; // one report per checked run that executed
+    CompiledFn compiled;                     // emitted fn; exec == nullptr on failure/fallback-not-emitted
+    bool ok() const { return ok_; }
+};
+
+// Compile one function with the checked pass path. Honors ctx.pass_manager
+// (run in checked mode between lower_function and regalloc/emit) AND
+// ctx.analysis_manager (passes receive the host-provided manager instead of a
+// freshly-constructed local one). On a pass validation/growth/error failure the
+// result reports the failure and emits NO executable (run_regalloc/emit_x64
+// are not reached). Stale/pre-existing regalloc on the lowered function is
+// cleared before the single allowed allocation stage. Exceptions are caught at
+// the boundary. When the IR backend is unavailable for this function (obf /
+// try/catch / coroutine / empty lowering) the result falls back to the
+// tree-walker and reports the fallback reason. compile_func(...) stays
+// source-compatible as the legacy wrapper returning just CompiledFn.
+CompileResult compile_func_checked(const FuncDecl& f, const CodeGenCtx& ctx);
 
 // Globals block used by codegen (set by the host before compiling/calling).
 // A single process-wide pointer (v1 frontend; the host wires one block per

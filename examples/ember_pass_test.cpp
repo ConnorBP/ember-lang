@@ -59,15 +59,27 @@
 #include "../src/extension_registry.hpp"
 #include "../src/seed_derivation.hpp"
 #include "../src/thin_ir.hpp"
+#include "../src/thin_ir_ser.hpp"   // Red 5: verify_thin_function_for_codegen
+#include "../src/codegen.hpp"      // Red 5: compile_func_checked, CodeGenCtx
+#include "../src/thin_lower.hpp"    // Red 5: lower_function
+#include "../src/thin_emit.hpp"      // Red 5: emit_x64
+#include "../src/engine.hpp"        // Red 5: CompiledFn, DispatchTable, finalize
+#include "../src/dispatch_table.hpp"  // Red 5: DispatchTable
+#include "../src/lexer.hpp"         // Red 5: tokenize
+#include "../src/parser.hpp"         // Red 5: parse
+#include "../src/sema.hpp"           // Red 5: sema
+#include "../extensions/opt/ext_opt.hpp"  // Red 5: register_passes
 
 #include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+#include <unordered_map>
 
 using namespace ember;
 
@@ -138,6 +150,120 @@ struct TaggedPass : EmberPassInfoMixin<TaggedPass> {
     TaggedPass(int t, int* s) : tag(t), sink(s) {}
     EmberPreserved run(ThinFunction&, EmberAnalysisManager&) {
         if (sink) *sink = tag;
+        return EmberPreserved::none();
+    }
+};
+
+// ─── Red 5 test passes (file-scope: local classes cannot hold static
+// constexpr data members, so these must live outside main, like the passes
+// above). They reference the checked-path symbols (PassError, etc.) that land
+// in the GREEN phase; until then this file does not compile (the intended RED
+// state). ───
+
+// A pass that corrupts the CFG (drops the entry block's terminator) and
+// reports a mutation (none()). Checked execution must catch this via the
+// verifier, roll back, and report ValidationFailure.
+struct CorruptTermPass : EmberPassInfoMixin<CorruptTermPass> {
+    static constexpr const char* pass_name = "corrupt-term";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager&) {
+        if (!f.blocks.empty()) f.blocks[0].term.kind = TermKind::None;
+        return EmberPreserved::none();
+    }
+};
+
+// A pass that corrupts the CFG via an out-of-range block id.
+struct CorruptBlockIdPass : EmberPassInfoMixin<CorruptBlockIdPass> {
+    static constexpr const char* pass_name = "corrupt-blockid";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager&) {
+        if (!f.blocks.empty()) f.blocks[0].id = 9999;
+        return EmberPreserved::none();
+    }
+};
+
+// A pass that corrupts the frame plan (negative frame_size).
+struct CorruptFramePass : EmberPassInfoMixin<CorruptFramePass> {
+    static constexpr const char* pass_name = "corrupt-frame";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager&) {
+        f.frame.frame_size = -1;
+        return EmberPreserved::none();
+    }
+};
+
+// A pass that corrupts rodata (a ConstStringRef pointing past rodata end).
+struct CorruptRodataPass : EmberPassInfoMixin<CorruptRodataPass> {
+    static constexpr const char* pass_name = "corrupt-rodata";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager&) {
+        if (f.blocks.empty()) return EmberPreserved::none();
+        ThinInstr bad;
+        bad.op = ThinOp::ConstStringRef;
+        bad.meta.addend = 1000;
+        bad.meta.len = 100;
+        f.blocks[0].instrs.push_back(bad);
+        return EmberPreserved::none();
+    }
+};
+
+// A pass that injects a large number of instructions to blow a low growth
+// ceiling (used with CheckedRunOptions.max_instructions set small).
+struct BlowupPass : EmberPassInfoMixin<BlowupPass> {
+    static constexpr const char* pass_name = "blowup";
+    std::size_t n = 0;
+    explicit BlowupPass(std::size_t count = 0) : n(count) {}
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager&) {
+        if (f.blocks.empty()) return EmberPreserved::none();
+        // resize (one allocation + in-place default construction) rather than a
+        // push_back loop, so the large-N vectors stay cheap. Default ThinInstrs
+        // have empty vectors/strings (no per-element heap allocation).
+        f.blocks[0].instrs.resize(f.blocks[0].instrs.size() + n);
+        return EmberPreserved::none();
+    }
+};
+
+// A pass that throws a recoverable PassError carrying a pass name + message.
+struct PassErrorPass : EmberPassInfoMixin<PassErrorPass> {
+    static constexpr const char* pass_name = "perr";
+    std::string msg;
+    PassErrorPass() = default;
+    explicit PassErrorPass(std::string m) : msg(std::move(m)) {}
+    EmberPreserved run(ThinFunction&, EmberAnalysisManager&) {
+        throw PassError("perr", msg);
+    }
+};
+
+// A pass that throws an UNEXPECTED std::exception (not a PassError).
+struct UnexpectedExceptionPass : EmberPassInfoMixin<UnexpectedExceptionPass> {
+    static constexpr const char* pass_name = "unexpected";
+    EmberPreserved run(ThinFunction&, EmberAnalysisManager&) {
+        throw std::runtime_error("unexpected boom");
+    }
+};
+
+// A pass that records the address of the EmberAnalysisManager it received,
+// so a test can confirm compile_func_checked honored ctx.analysis_manager
+// instead of always constructing a local manager.
+struct AmCapturePass : EmberPassInfoMixin<AmCapturePass> {
+    static constexpr const char* pass_name = "amcap";
+    const EmberAnalysisManager** out = nullptr;
+    AmCapturePass() = default;
+    explicit AmCapturePass(const EmberAnalysisManager** o) : out(o) {}
+    EmberPreserved run(ThinFunction&, EmberAnalysisManager& am) {
+        if (out) *out = &am;
+        return EmberPreserved::all();
+    }
+};
+
+// A pass that sets a STALE regalloc result (enabled with a bogus map) so a
+// test can confirm the stale/pre-existing regalloc is cleared before emit.
+struct StaleRegallocPass : EmberPassInfoMixin<StaleRegallocPass> {
+    static constexpr const char* pass_name = "stale-ra";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager&) {
+        f.ra = RegAllocResult{};
+        f.ra.enabled = true;
+        f.ra.map[1].in_reg = true;
+        f.ra.map[1].reg_id = 99;  // a bogus pool register id
+        f.ra.frame_reg_map[-8] = 99;
+        f.ra.used_reg_ids.push_back(99);
+        f.ra.save_offsets.push_back(-64);
         return EmberPreserved::none();
     }
 };
@@ -1153,6 +1279,529 @@ int main() {
         auto okr = ok_deriver.derive(mkreq("", "", "", "", 0, "", 0, 0, 0, "select"));
         check(bool(okr) && okr.value.has_value() && !okr.error.has_value(),
               "fixed-root deriver always succeeds (structured ok)");
+    }
+
+    // ===================================================================
+    // ─── Red 5: checked pass execution ───
+    //
+    // Pins the checked pass path: per-pass snapshots, validation after each
+    // reported mutation, rollback on validation/pass/growth failure, recoverable
+    // PassError vs unexpected std::exception, hard growth ceilings in the
+    // ordinary one-shot run AND fixed-point execution, no library-only stderr,
+    // structured pass name / stop reason / error / rounds / initial+final
+    // counts, and a checked compile boundary that stops before regalloc/emit on
+    // validation failure while honoring CodeGenCtx::analysis_manager.
+    //
+    // During the RED phase these symbols do not exist yet, so this section does
+    // not compile. Once the checked path lands, every assertion below must hold.
+    // ===================================================================
+
+    // ─── Red 5 helpers ───
+
+    // A minimal VALID ThinFunction (a single entry block returning a const).
+    // verify_thin_function_for_codegen MUST accept this.
+    auto build_valid_thinfn = []() -> ThinFunction {
+        ThinFunction thf;
+        thf.name = "checked";
+        thf.slot = 0;
+        auto i64_ty = std::make_shared<Type>();
+        i64_ty->prim = Prim::I64;
+        thf.ret_type = i64_ty.get();
+        thf.owned_types.push_back(std::move(i64_ty));
+        thf.frame.frame_size = 16;
+        thf.frame.rbx_save_offset = -8;
+        thf.frame.struct_ret_ptr_offset = 0;
+        thf.frame.arg_temps_base = 0;
+        thf.frame.next_local_off = 8;
+        thf.frame.returns_struct_by_ptr = false;
+        ThinBlock blk0;
+        blk0.id = 0;
+        ThinInstr c;
+        c.op = ThinOp::ConstInt;
+        c.dst = 1;
+        c.imm.i = 42;
+        c.meta.width = 8;
+        blk0.instrs.push_back(c);
+        blk0.term.kind = TermKind::Return;
+        blk0.term.ret = 1;
+        thf.blocks.push_back(std::move(blk0));
+        thf.declared_max_vreg = 2;  // v1 valid; v0 invalid
+        return thf;
+    };
+
+    // Count total instructions across all blocks.
+    auto total_instrs = [](const ThinFunction& f) -> std::size_t {
+        std::size_t n = 0;
+        for (const auto& b : f.blocks) n += b.instrs.size();
+        return n;
+    };
+
+    // ─── (31) verify_thin_function_for_codegen accepts valid IR ───
+    std::printf("(31) verify_thin_function_for_codegen accepts valid IR\n");
+    {
+        auto thf = build_valid_thinfn();
+        std::string verr;
+        bool ok = verify_thin_function_for_codegen(thf, &verr);
+        check(ok, "valid ThinFunction verifies for codegen");
+        if (!ok) std::printf("    verr: %s\n", verr.c_str());
+    }
+
+    // ─── (32) a pass that creates malformed CFG/frame/rodata and returns
+    //       changed is caught by the verifier, rolled back, and reported ───
+    std::printf("(32) malformed-mutation pass: validation failure + rollback\n");
+    {
+        struct Case { const char* label; std::function<void()> run; };
+        // CorruptTerm
+        {
+            auto thf = build_valid_thinfn();
+            ThinFunction snapshot = thf;  // known-good copy
+            EmberPassManager pm;
+            pm.add_pass(CorruptTermPass{});
+            EmberAnalysisManager am;
+            CheckedRunOptions opts;
+            PassRunReport rep = pm.run_checked(thf, am, opts);
+            check(rep.stop_reason == PassStopReason::ValidationFailure,
+                  "corrupt-term -> ValidationFailure");
+            check(std::string(rep.pass_name) == "corrupt-term",
+                  "report names the corrupting pass");
+            check(!rep.error.empty(), "ValidationFailure carries an error message");
+            // Snapshot restoration: the function equals the known-good copy.
+            check(thf.blocks.size() == snapshot.blocks.size(),
+                  "rollback restored block count");
+            check(!thf.blocks.empty() &&
+                  thf.blocks[0].term.kind == TermKind::Return,
+                  "rollback restored the entry terminator");
+            check(total_instrs(thf) == total_instrs(snapshot),
+                  "rollback restored instruction count");
+        }
+        // CorruptBlockId
+        {
+            auto thf = build_valid_thinfn();
+            EmberPassManager pm;
+            pm.add_pass(CorruptBlockIdPass{});
+            EmberAnalysisManager am;
+            CheckedRunOptions opts;
+            PassRunReport rep = pm.run_checked(thf, am, opts);
+            check(rep.stop_reason == PassStopReason::ValidationFailure,
+                  "corrupt-blockid -> ValidationFailure");
+            check(!thf.blocks.empty() && thf.blocks[0].id == 0,
+                  "rollback restored entry block id 0");
+        }
+        // CorruptFrame
+        {
+            auto thf = build_valid_thinfn();
+            EmberPassManager pm;
+            pm.add_pass(CorruptFramePass{});
+            EmberAnalysisManager am;
+            CheckedRunOptions opts;
+            PassRunReport rep = pm.run_checked(thf, am, opts);
+            check(rep.stop_reason == PassStopReason::ValidationFailure,
+                  "corrupt-frame -> ValidationFailure");
+            check(thf.frame.frame_size == 16, "rollback restored frame_size");
+        }
+        // CorruptRodata
+        {
+            auto thf = build_valid_thinfn();
+            EmberPassManager pm;
+            pm.add_pass(CorruptRodataPass{});
+            EmberAnalysisManager am;
+            CheckedRunOptions opts;
+            PassRunReport rep = pm.run_checked(thf, am, opts);
+            check(rep.stop_reason == PassStopReason::ValidationFailure,
+                  "corrupt-rodata -> ValidationFailure");
+            check(total_instrs(thf) == 1, "rollback removed the injected bad instr");
+        }
+    }
+
+    // ─── (33) input validation failure: an already-malformed function is
+    //       rejected before any pass runs ───
+    std::printf("(33) input validation failure (no pass runs)\n");
+    {
+        auto thf = build_valid_thinfn();
+        thf.blocks[0].term.kind = TermKind::None;  // malformed input
+        int ran = 0;
+        EmberPassManager pm;
+        pm.add_pass(CountingPass(&ran));
+        EmberAnalysisManager am;
+        CheckedRunOptions opts;
+        PassRunReport rep = pm.run_checked(thf, am, opts);
+        check(rep.stop_reason == PassStopReason::ValidationFailure,
+              "malformed input -> ValidationFailure");
+        check(ran == 0, "no pass runs when input fails validation");
+        // The malformed input is left as-is (no snapshot to restore TO a good
+        // state — the input itself was bad); the pass simply did not run.
+        check(thf.blocks[0].term.kind == TermKind::None,
+              "malformed input left unchanged (pass did not run)");
+    }
+
+    // ─── (34) later passes do not run after a failure ───
+    std::printf("(34) later passes do not run after a failure\n");
+    {
+        auto thf = build_valid_thinfn();
+        int later_ran = 0;
+        EmberPassManager pm;
+        pm.add_pass(CorruptTermPass{});
+        pm.add_pass(CountingPass(&later_ran));
+        EmberAnalysisManager am;
+        CheckedRunOptions opts;
+        PassRunReport rep = pm.run_checked(thf, am, opts);
+        check(rep.stop_reason == PassStopReason::ValidationFailure,
+              "first-pass corruption stops the pipeline");
+        check(later_ran == 0, "the later CountingPass did not run after failure");
+        check(std::string(rep.pass_name) == "corrupt-term",
+              "report names the first (failing) pass");
+    }
+
+    // ─── (35) PassError and unexpected std::exception conversion ───
+    std::printf("(35) PassError + unexpected std::exception conversion\n");
+    {
+        // Recoverable PassError -> stop_reason == PassError, message carried.
+        auto thf = build_valid_thinfn();
+        EmberPassManager pm;
+        pm.add_pass(PassErrorPass{"boom"});
+        EmberAnalysisManager am;
+        CheckedRunOptions opts;
+        PassRunReport rep = pm.run_checked(thf, am, opts);
+        check(rep.stop_reason == PassStopReason::PassError,
+              "PassError -> stop_reason PassError");
+        check(std::string(rep.pass_name) == "perr",
+              "PassError report names the throwing pass");
+        check(rep.error.find("boom") != std::string::npos,
+              "PassError carries the message");
+        // Rollback: the function is unchanged.
+        check(!thf.blocks.empty() && thf.blocks[0].term.kind == TermKind::Return,
+              "PassError rolled back the function");
+    }
+    {
+        // Unexpected std::exception -> stop_reason == ExceptionError.
+        auto thf = build_valid_thinfn();
+        EmberPassManager pm;
+        pm.add_pass(UnexpectedExceptionPass{});
+        EmberAnalysisManager am;
+        CheckedRunOptions opts;
+        PassRunReport rep = pm.run_checked(thf, am, opts);
+        check(rep.stop_reason == PassStopReason::ExceptionError,
+              "unexpected std::exception -> stop_reason ExceptionError");
+        check(std::string(rep.pass_name) == "unexpected",
+              "exception report names the throwing pass");
+        check(!rep.error.empty(), "ExceptionError carries a message");
+        check(!thf.blocks.empty() && thf.blocks[0].term.kind == TermKind::Return,
+              "exception rolled back the function");
+    }
+
+    // ─── (36) an ordinary one-shot pass exceeding instruction/growth ceilings ───
+    std::printf("(36) one-shot pass exceeding instruction/growth ceilings\n");
+    {
+        auto thf = build_valid_thinfn();
+        const std::size_t before = total_instrs(thf);
+        EmberPassManager pm;
+        pm.add_pass(BlowupPass{100});  // +100 instrs
+        EmberAnalysisManager am;
+        CheckedRunOptions opts;
+        opts.max_instructions = 50;   // a low absolute ceiling
+        PassRunReport rep = pm.run_checked(thf, am, opts);
+        check(rep.stop_reason == PassStopReason::GrowthLimit,
+              "blowup pass -> stop_reason GrowthLimit");
+        check(std::string(rep.pass_name) == "blowup",
+              "GrowthLimit report names the blowup pass");
+        // Rollback: the injected instructions are gone.
+        check(total_instrs(thf) == before, "GrowthLimit rolled back the blowup");
+        check(rep.initial_count == before, "report.initial_count is the pre-run count");
+        check(rep.final_count > before, "report.final_count reflects the blowup (pre-rollback)");
+    }
+    // The ordinary (legacy) one-shot run() also enforces a hard growth ceiling:
+    // a pass that exceeds the hard instruction cap does not let later passes
+    // run. (run() cannot report a structured stop reason — it returns
+    // EmberPreserved — so the observable contract is "stops running further
+    // passes".)
+    {
+        auto thf = build_valid_thinfn();
+        int later_ran = 0;
+        EmberPassManager pm;
+        pm.add_pass(BlowupPass{EmberPassManager::hard_max_ir_instructions + 1});
+        pm.add_pass(CountingPass(&later_ran));
+        EmberAnalysisManager am;
+        EmberPreserved p = pm.run(thf, am);
+        check(later_ran == 0,
+              "ordinary run() stops after a hard-cap-exceeding pass (later pass skipped)");
+        (void)p;
+    }
+
+    // ─── (37) structured pass name / stop reason / error / rounds /
+    //       initial+final counts ───
+    std::printf("(37) structured report fields\n");
+    {
+        // Clean one-shot: NoOp (no change). Completed, rounds=1, counts equal,
+        // error empty, pass_name of the last pass.
+        auto thf = build_valid_thinfn();
+        const std::size_t n = total_instrs(thf);
+        EmberPassManager pm;
+        pm.add_pass(NoOpPass{});
+        EmberAnalysisManager am;
+        CheckedRunOptions opts;
+        PassRunReport rep = pm.run_checked(thf, am, opts);
+        check(rep.stop_reason == PassStopReason::Completed,
+              "clean one-shot -> Completed");
+        check(rep.rounds == 1, "one-shot report rounds == 1");
+        check(rep.initial_count == n, "Completed initial_count");
+        check(rep.final_count == n, "Completed final_count == initial_count");
+        check(rep.error.empty(), "Completed report has no error");
+        check(std::string(rep.pass_name) == "noop", "Completed report names the pass");
+    }
+    {
+        // Checked fixpoint: a ConvergingPass that changes for 2 rounds then
+        // converges. Converged, rounds == 3, error empty.
+        auto thf = build_valid_thinfn();
+        int round = 0;
+        EmberPassManager pm;
+        pm.add_pass(ConvergingPass(&round));
+        EmberAnalysisManager am;
+        CheckedRunOptions opts;
+        opts.max_rounds = 8;
+        PassRunReport rep = pm.run_checked_fixpoint(thf, am, opts);
+        check(rep.stop_reason == PassStopReason::Converged,
+              "converging fixpoint -> Converged");
+        check(rep.rounds == 3, "Converged report rounds == 3");
+        check(rep.error.empty(), "Converged report has no error");
+        check(rep.initial_count == total_instrs(build_valid_thinfn()),
+              "fixpoint report.initial_count");
+    }
+    {
+        // Round limit: a pass that always changes (never converges) hits
+        // max_rounds -> RoundLimit.
+        auto thf = build_valid_thinfn();
+        int round = 0;
+        EmberPassManager pm;
+        pm.add_pass(CountingPass{});  // always returns none() (always changes)
+        EmberAnalysisManager am;
+        CheckedRunOptions opts;
+        opts.max_rounds = 3;
+        PassRunReport rep = pm.run_checked_fixpoint(thf, am, opts);
+        check(rep.stop_reason == PassStopReason::RoundLimit,
+              "never-converging fixpoint -> RoundLimit");
+        check(rep.rounds == 3, "RoundLimit report rounds == max_rounds");
+    }
+
+    // ─── (38) checked compilation stops before regalloc or emit ───
+    //
+    // compile_func_checked runs the configured pass manager in checked mode
+    // between lower_function and regalloc/emit. On a pass that corrupts the
+    // IR, the result must report a validation failure, emit NO CompiledFn
+    // (exec == nullptr), and never reach run_regalloc or emit_x64. A clean
+    // compile produces an emitted CompiledFn that runs correctly.
+    std::printf("(38) compile_func_checked stops before regalloc/emit\n");
+    {
+        // Compile helper: parse + sema a tiny i64 source, register the opt
+        // passes + a custom corrupting pass, and call compile_func_checked.
+        const char* src =
+            "fn main() -> i64 { let x = 7; let y = 3; return x + y; }\n";
+        auto lr = tokenize(src, "<checked>");
+        auto pr = parse(std::move(lr.toks));
+        check(pr.ok, "checked-compile source parses");
+        bool setup_ok = pr.ok;
+        int si = 0;
+        std::unordered_map<std::string, int> slots;
+        if (setup_ok) {
+            for (auto& fn : pr.program.funcs) { slots[fn.name] = si++; fn.slot = si - 1; }
+        }
+        std::unordered_map<std::string, NativeSig> natives;
+        OpOverloadTable overloads;
+        StructLayoutTable layouts;
+        if (setup_ok) {
+            layouts = build_struct_layouts(pr.program);
+            pr.program.string_xor_key = 0;
+            auto sr = sema(pr.program, natives, slots, 0, &overloads, &layouts);
+            check(sr.ok, "checked-compile source semas");
+            setup_ok = setup_ok && sr.ok;
+        }
+        // Wire a minimal globals block + dispatch table (no globals/calls here).
+        GlobalsBlock gb; gb.base = 0;
+        g_globals_for_codegen = &gb;
+        DispatchTable table(setup_ok ? pr.program.funcs.size() : 1);
+
+        if (setup_ok) {
+
+        // (38a) Clean compile: passes that do not corrupt -> emitted fn runs
+        // and returns 10. Backend used == IR; pass reports present.
+        {
+            EmberPassRegistry reg;
+            ext_opt::register_passes(reg);
+            EmberPassManager pm;
+            std::string perr;
+            check(build_pipeline_from_string("constprop,dce", reg, pm, &perr),
+                  "clean checked-compile pipeline builds");
+            CodeGenCtx ctx;
+            ctx.globals_base = 0;
+            ctx.dispatch_base = int64_t(table.base());
+            ctx.natives = &natives;
+            ctx.script_slots = &slots;
+            ctx.structs = &layouts;
+            ctx.use_context_reg = true;
+            ctx.enable_ir_backend = true;
+            ctx.enable_regalloc = true;
+            ctx.pass_manager = &pm;
+            CompileResult cr = compile_func_checked(pr.program.funcs[0], ctx);
+            check(cr.ok(), "clean checked-compile succeeds");
+            check(cr.backend == CompileBackend::IRBackend,
+                  "clean checked-compile used the IR backend");
+            check(!cr.pass_reports.empty(), "clean checked-compile carries pass reports");
+            check(!cr.compiled.bytes.empty(),
+                  "clean checked-compile emitted bytes (pre-finalize)");
+            if (!cr.compiled.bytes.empty()) {
+                if (!finalize(cr.compiled)) {
+                    check(false, "clean checked-compile finalize failed");
+                } else {
+                    check(cr.compiled.exec != nullptr,
+                          "clean checked-compile finalized an executable CompiledFn");
+                    table.set(pr.program.funcs[0].slot, cr.compiled.entry);
+                    using F = int64_t (*)();
+                    int64_t got = reinterpret_cast<F>(table.get(pr.program.funcs[0].slot))();
+                    check(got == 10, "clean checked-compile emitted fn returns 10");
+                    free_executable(cr.compiled.exec);
+                }
+            }
+        }
+        // (38b) Corrupting pass -> validation failure, no emit, no exec.
+        {
+            EmberPassRegistry reg;
+            ext_opt::register_passes(reg);
+            reg.add<CorruptTermPass>("corrupt-term");
+            EmberPassManager pm;
+            std::string perr;
+            check(build_pipeline_from_string("corrupt-term", reg, pm, &perr),
+                  "corrupting pipeline builds");
+            CodeGenCtx ctx;
+            ctx.globals_base = 0;
+            ctx.dispatch_base = int64_t(table.base());
+            ctx.natives = &natives;
+            ctx.script_slots = &slots;
+            ctx.structs = &layouts;
+            ctx.use_context_reg = true;
+            ctx.enable_ir_backend = true;
+            ctx.enable_regalloc = true;
+            ctx.pass_manager = &pm;
+            CompileResult cr = compile_func_checked(pr.program.funcs[0], ctx);
+            check(!cr.ok(), "corrupting checked-compile does not succeed");
+            check(cr.compiled.exec == nullptr,
+                  "corrupting checked-compile emitted NO executable (stopped before emit)");
+            bool failure_reported = false;
+            for (const auto& rep : cr.pass_reports)
+                if (rep.stop_reason == PassStopReason::ValidationFailure)
+                    failure_reported = true;
+            check(failure_reported,
+                  "corrupting checked-compile reports a ValidationFailure pass report");
+            check(!cr.reason.empty(),
+                  "corrupting checked-compile carries a failure reason");
+        }
+        // (38c) A pass that throws -> the exception does NOT cross the compile
+        // boundary; the result reports failure with no exec.
+        {
+            EmberPassRegistry reg;
+            ext_opt::register_passes(reg);
+            reg.add<PassErrorPass>("perr");
+            EmberPassManager pm;
+            std::string perr;
+            check(build_pipeline_from_string("perr", reg, pm, &perr),
+                  "throwing pipeline builds");
+            CodeGenCtx ctx;
+            ctx.globals_base = 0;
+            ctx.dispatch_base = int64_t(table.base());
+            ctx.natives = &natives;
+            ctx.script_slots = &slots;
+            ctx.structs = &layouts;
+            ctx.use_context_reg = true;
+            ctx.enable_ir_backend = true;
+            ctx.pass_manager = &pm;
+            CompileResult cr = compile_func_checked(pr.program.funcs[0], ctx);
+            check(!cr.ok(), "throwing checked-compile does not succeed");
+            check(cr.compiled.exec == nullptr,
+                  "throwing checked-compile emitted NO executable");
+            check(!cr.reason.empty(),
+                  "throwing checked-compile carries a failure reason");
+            bool passerr = false;
+            for (const auto& rep : cr.pass_reports)
+                if (rep.stop_reason == PassStopReason::PassError) passerr = true;
+            check(passerr, "throwing checked-compile reports a PassError pass report");
+        }
+        // (38d) compile_func_checked honors CodeGenCtx::analysis_manager: the
+        // passes receive the host-provided manager, not a freshly-constructed
+        // local one.
+        {
+            EmberPassRegistry reg;
+            ext_opt::register_passes(reg);
+            reg.add<AmCapturePass>("amcap");
+            EmberPassManager pm;
+            std::string perr;
+            check(build_pipeline_from_string("amcap", reg, pm, &perr),
+                  "amcap pipeline builds");
+            EmberAnalysisManager host_am;
+            const EmberAnalysisManager* captured = nullptr;
+            // Stash the capture sink into the pass via a configured factory so
+            // the fresh instance records the manager it received.
+            reg.add_factory("amcap2", [&captured]() -> std::unique_ptr<PassConcept> {
+                return make_pass_concept(AmCapturePass{&captured});
+            });
+            EmberPassManager pm2;
+            check(build_pipeline_from_string("amcap2", reg, pm2, &perr),
+                  "amcap2 configured pipeline builds");
+            CodeGenCtx ctx;
+            ctx.globals_base = 0;
+            ctx.dispatch_base = int64_t(table.base());
+            ctx.natives = &natives;
+            ctx.script_slots = &slots;
+            ctx.structs = &layouts;
+            ctx.use_context_reg = true;
+            ctx.enable_ir_backend = true;
+            ctx.pass_manager = &pm2;
+            ctx.analysis_manager = &host_am;
+            CompileResult cr = compile_func_checked(pr.program.funcs[0], ctx);
+            check(cr.ok(), "amcap checked-compile succeeds");
+            check(captured == &host_am,
+                  "compile_func_checked passed ctx.analysis_manager to the pass");
+            if (cr.compiled.exec) free_executable(cr.compiled.exec);
+        }
+        // (38e) stale/pre-existing regalloc is cleared before the single
+        // allowed allocation stage. A pass leaves a bogus ra.enabled=true; with
+        // enable_regalloc=false the stale ra must NOT reach emit (the emitted
+        // fn still computes the right value, proving the stale ra was cleared).
+        {
+            EmberPassRegistry reg;
+            ext_opt::register_passes(reg);
+            reg.add<StaleRegallocPass>("stale-ra");
+            EmberPassManager pm;
+            std::string perr;
+            check(build_pipeline_from_string("stale-ra", reg, pm, &perr),
+                  "stale-ra pipeline builds");
+            CodeGenCtx ctx;
+            ctx.globals_base = 0;
+            ctx.dispatch_base = int64_t(table.base());
+            ctx.natives = &natives;
+            ctx.script_slots = &slots;
+            ctx.structs = &layouts;
+            ctx.use_context_reg = true;
+            ctx.enable_ir_backend = true;
+            ctx.enable_regalloc = false;  // no fresh regalloc; stale ra must be cleared
+            ctx.pass_manager = &pm;
+            CompileResult cr = compile_func_checked(pr.program.funcs[0], ctx);
+            check(cr.ok(), "stale-ra checked-compile succeeds");
+            check(!cr.compiled.bytes.empty(),
+                  "stale-ra checked-compile emitted bytes (pre-finalize)");
+            if (!cr.compiled.bytes.empty()) {
+                if (!finalize(cr.compiled)) {
+                    check(false, "stale-ra checked-compile finalize failed");
+                } else {
+                    check(cr.compiled.exec != nullptr,
+                          "stale-ra cleared before emit -> finalized an executable");
+                    table.set(pr.program.funcs[0].slot, cr.compiled.entry);
+                    using F = int64_t (*)();
+                    int64_t got = reinterpret_cast<F>(table.get(pr.program.funcs[0].slot))();
+                    check(got == 10,
+                          "stale-ra cleared before emit -> emitted fn still returns 10");
+                    free_executable(cr.compiled.exec);
+                }
+            }
+        }
+        }  // end if (setup_ok)
     }
 
     std::printf("\n%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);

@@ -7,6 +7,7 @@
 #include "thin_emit.hpp"   // Stage A c3: ThinFunction -> x86-64 emit (the IR-backend path)
 #include "regalloc.hpp"    // Stage 3: linear-scan register allocation (post-pass, pre-emit)
 #include "ember_pass.hpp"  // Stage C: EmberPassManager (run IR optimization passes)
+#include "thin_ir_ser.hpp"  // Red 5: verify_thin_function_for_codegen (checked compile gate)
 #include "safety.hpp"
 #include <cassert>
 #include <cstring>
@@ -4928,55 +4929,74 @@ std::vector<uint8_t> build_fn_allowlist(
     return bits;
 }
 
+// ─── Red 5: IR-backend availability + the checked compile boundary ───
+//
+// Returns a non-empty reason string when the IR backend cannot compile `f`
+// (it must fall back to the tree-walker), or nullptr when the IR backend is
+// available. Shared by compile_func (legacy) and compile_func_checked so the
+// fallback policy is identical. Mirrors the original inline obf / try/catch /
+// coroutine detection.
+static const char* ir_backend_unavailable_reason(const FuncDecl& f,
+                                                  const CodeGenCtx& ctx) {
+    for (auto& ann : f.annotations) {
+        if (ann.name == "obf" || ann.name == "obf_keyed")
+            return "IR backend unavailable: function uses obf annotations";
+    }
+    if (ctx.obf.mba || ctx.obf.opaque || ctx.obf.keyed)
+        return "IR backend unavailable: ctx obf flags set";
+    // Tier 4: try/catch/throw are tree-walker-only.
+    std::function<bool(const Block&)> has_try_catch = [&](const Block& b) -> bool {
+        for (auto& s : b.stmts) {
+            if (dynamic_cast<const TryCatchStmt*>(s.get()) ||
+                dynamic_cast<const ThrowStmt*>(s.get())) return true;
+            if (auto* is = dynamic_cast<const IfStmt*>(s.get())) {
+                if (has_try_catch(is->then_b)) return true;
+                if (is->has_else && has_try_catch(is->else_b)) return true;
+            }
+            if (auto* ws = dynamic_cast<const WhileStmt*>(s.get())) { if (has_try_catch(ws->body)) return true; }
+            if (auto* ds = dynamic_cast<const DoWhileStmt*>(s.get())) { if (has_try_catch(ds->body)) return true; }
+            if (auto* fe = dynamic_cast<const ForEachStmt*>(s.get())) { if (has_try_catch(fe->body)) return true; }
+            if (auto* fs = dynamic_cast<const ForStmt*>(s.get())) { if (has_try_catch(fs->body)) return true; }
+            if (auto* bs = dynamic_cast<const BlockStmt*>(s.get())) { if (has_try_catch(bs->block)) return true; }
+            if (auto* sw = dynamic_cast<const SwitchStmt*>(s.get()))
+                for (auto& c : sw->cases) if (has_try_catch(c.body)) return true;
+            if (auto* ms = dynamic_cast<const MatchStmt*>(s.get()))
+                for (auto& arm : ms->arms) if (has_try_catch(arm.body)) return true;
+        }
+        return false;
+    };
+    if (has_try_catch(f.body))
+        return "IR backend unavailable: function uses try/catch/throw";
+    // #21 coroutines: yield is tree-walker-only.
+    if (f.is_coroutine)
+        return "IR backend unavailable: function is a coroutine";
+    return nullptr;
+}
+
 CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
     if (ctx.enable_ir_backend) {
-        // Obf fallback: the IR path does not handle @obf_keyed/mba/opaque in
-        // Stage A (host-DLL build-time phase). If the function uses obf, fall
-        // back to the tree-walker for correctness.
-        bool uses_obf = false;
-        for (auto& ann : f.annotations) {
-            if (ann.name == "obf" || ann.name == "obf_keyed") { uses_obf = true; break; }
-        }
-        // Tier 4: the IR path (thin_lower) does not lower try/catch/throw yet.
-        // If the function body contains a TryCatchStmt or ThrowStmt anywhere
-        // (recursively, in any nested block), fall back to the tree-walker
-        // which handles them via the inline setjmp/longjmp catch stack.
-        std::function<bool(const Block&)> has_try_catch = [&](const Block& b) -> bool {
-            for (auto& s : b.stmts) {
-                if (dynamic_cast<const TryCatchStmt*>(s.get()) ||
-                    dynamic_cast<const ThrowStmt*>(s.get())) return true;
-                if (auto* is = dynamic_cast<const IfStmt*>(s.get())) {
-                    if (has_try_catch(is->then_b)) return true;
-                    if (is->has_else && has_try_catch(is->else_b)) return true;
-                }
-                if (auto* ws = dynamic_cast<const WhileStmt*>(s.get())) { if (has_try_catch(ws->body)) return true; }
-                if (auto* ds = dynamic_cast<const DoWhileStmt*>(s.get())) { if (has_try_catch(ds->body)) return true; }
-                if (auto* fe = dynamic_cast<const ForEachStmt*>(s.get())) { if (has_try_catch(fe->body)) return true; }
-                if (auto* fs = dynamic_cast<const ForStmt*>(s.get())) { if (has_try_catch(fs->body)) return true; }
-                if (auto* bs = dynamic_cast<const BlockStmt*>(s.get())) { if (has_try_catch(bs->block)) return true; }
-                if (auto* sw = dynamic_cast<const SwitchStmt*>(s.get()))
-                    for (auto& c : sw->cases) if (has_try_catch(c.body)) return true;
-                if (auto* ms = dynamic_cast<const MatchStmt*>(s.get()))
-                    for (auto& arm : ms->arms) if (has_try_catch(arm.body)) return true;
-            }
-            return false;
-        };
-        bool uses_try_catch = has_try_catch(f.body);
-        // #21 coroutines: the IR path (thin_lower) does not lower yield yet
-        // (yield is lowered by the tree-walker to a __ember_coro_yield native
-        // call with shadow-space setup). If the fn is a coroutine (sema set
-        // is_coroutine when it saw a yield), fall back to the tree-walker.
-        // This mirrors the try/catch fallback: the tree-walker is the
-        // correctness path for features the IR backend has not lowered.
-        bool is_coroutine = f.is_coroutine;
-        if (!uses_obf && !uses_try_catch && !is_coroutine && !(ctx.obf.mba || ctx.obf.opaque || ctx.obf.keyed)) {
+        if (const char* fb = ir_backend_unavailable_reason(f, ctx)) {
+            // (fall through to the tree-walker; the IR backend is unavailable
+            // for this function — obf / try/catch / coroutine / ctx obf flags.)
+            (void)fb;
+        } else {
             ThinFunction thf = lower_function(f, ctx);
             if (!thf.blocks.empty()) {
                 // Stage C: run IR optimization passes between lower and emit.
                 if (ctx.pass_manager) {
-                    EmberAnalysisManager am;
+                    // Red 5: honor CodeGenCtx::analysis_manager instead of always
+                    // constructing a local manager (the host's cached analyses,
+                    // when present, flow to the passes).
+                    EmberAnalysisManager local_am;
+                    EmberAnalysisManager& am = ctx.analysis_manager ? *ctx.analysis_manager : local_am;
                     ctx.pass_manager->run(thf, am);
                 }
+                // Red 5: stale/pre-existing regalloc is cleared before the single
+                // allowed allocation stage. Lowering produces ra.enabled=false
+                // and ThinIRMutation::commit clears stale ra, so for shipped
+                // passes this is a no-op; it only protects against a hand-rolled
+                // pass that left a stale ra behind.
+                thf.ra = RegAllocResult{};
                 // Stage 3: linear-scan register allocation after the optimization
                 // passes, before emit. Assigns VRegs to callee-saved registers
                 // (rbx/rsi/rdi/r12/r13/r15) instead of frame slots. Value-
@@ -5351,6 +5371,120 @@ CompiledFn compile_func(const FuncDecl& f, const CodeGenCtx& ctx) {
     out.non_serializable_reason = std::move(cg.non_serializable_reason);
     out.bytes = std::move(cg.e.code);
     return out;
+}
+
+// ─── Red 5: the checked compile boundary ───
+//
+// The structured, exception-safe compile path. It runs the configured pass
+// manager in CHECKED mode between lower_function and regalloc/emit, honors
+// ctx.analysis_manager, clears stale regalloc before the single allocation
+// stage, and guarantees a validation/pass/growth/exception failure can NEVER
+// reach run_regalloc or emit_x64 (no executable is produced on failure).
+// Exceptions do not cross this boundary: a thrown pass or backend error becomes
+// a structured CompileResult failure, not a propagated exception. Falls back to
+// the tree-walker (and reports the reason) when the IR backend is unavailable
+// for this function.
+CompileResult compile_func_checked(const FuncDecl& f, const CodeGenCtx& ctx) {
+    CompileResult cr;
+    // The whole compile is wrapped so no exception crosses the boundary.
+    try {
+        if (!ctx.enable_ir_backend || !ctx.pass_manager) {
+            // No IR backend / no passes: plain legacy compile (tree-walker or the
+            // IR path without checked passes). Keep the legacy behavior exactly.
+            cr.compiled = compile_func(f, ctx);
+            cr.backend = CompileBackend::TreeWalker;
+            cr.ok_ = true;
+            cr.reason.clear();
+            return cr;
+        }
+        // IR backend with a pass manager: the checked path.
+        if (const char* fb = ir_backend_unavailable_reason(f, ctx)) {
+            // Fallback to the tree-walker; report the reason. No passes run.
+            cr.compiled = compile_func(f, ctx);
+            cr.backend = CompileBackend::TreeWalker;
+            cr.ok_ = true;
+            cr.reason = fb;
+            return cr;
+        }
+        cr.backend = CompileBackend::IRBackend;
+        ThinFunction thf = lower_function(f, ctx);
+        if (thf.blocks.empty()) {
+            // Lowering gave up (non_serializable / empty body) -> tree-walker fallback.
+            cr.compiled = compile_func(f, ctx);
+            cr.backend = CompileBackend::TreeWalker;
+            cr.ok_ = true;
+            cr.reason = "IR backend unavailable: lower_function produced no blocks";
+            return cr;
+        }
+        // Run the passes in checked mode. Honor ctx.analysis_manager (the
+        // host's cached analyses flow to the passes) instead of always
+        // constructing a local manager.
+        EmberAnalysisManager local_am;
+        EmberAnalysisManager& am = ctx.analysis_manager ? *ctx.analysis_manager : local_am;
+        CheckedRunOptions opts;
+        PassRunReport rep = ctx.pass_manager->run_checked(thf, am, opts);
+        cr.pass_reports.push_back(rep);
+        // A failure (ValidationFailure / GrowthLimit / PassError / ExceptionError)
+        // stops BEFORE regalloc/emit: no executable is produced.
+        if (rep.stop_reason != PassStopReason::Completed) {
+            cr.ok_ = false;
+            cr.reason = "checked pass pipeline failed: " + rep.error;
+            // thf was rolled back inside run_checked; no emit attempted.
+            return cr;
+        }
+        // The checked run already validated after each mutation. Re-verify once
+        // more before the regalloc/emit stage (defense-in-depth: the single
+        // gate that guarantees a validation failure cannot reach regalloc/emit).
+        std::string verr;
+        if (!verify_thin_function_for_codegen(thf, &verr)) {
+            cr.ok_ = false;
+            cr.reason = "codegen verify before regalloc/emit failed: " + verr;
+            return cr;
+        }
+        // Stale/pre-existing regalloc is cleared before the single allowed
+        // allocation stage. Lowering produces ra.enabled=false and
+        // ThinIRMutation::commit clears stale ra; this clear is the boundary
+        // guarantee that a bogus ra from a hand-rolled pass never reaches emit.
+        thf.ra = RegAllocResult{};
+        if (ctx.enable_regalloc) {
+            run_regalloc(thf);
+        }
+        cr.compiled = emit_x64(thf, ctx);
+        cr.ok_ = true;
+        cr.reason.clear();
+        // Hand back the transformed IR when the host asked for it (future hook;
+        // the current API does not request it, so we leave `transformed` empty
+        // unless a compile option later asks).
+        return cr;
+    } catch (const PassError& e) {
+        cr.ok_ = false;
+        cr.compiled = CompiledFn{};
+        cr.reason = std::string("checked compile PassError: ") + e.what();
+        PassRunReport rep;
+        rep.stop_reason = PassStopReason::PassError;
+        rep.pass_name = e.pass_name;
+        rep.error = e.message;
+        cr.pass_reports.push_back(std::move(rep));
+        return cr;
+    } catch (const std::exception& e) {
+        cr.ok_ = false;
+        cr.compiled = CompiledFn{};
+        cr.reason = std::string("checked compile exception: ") + e.what();
+        PassRunReport rep;
+        rep.stop_reason = PassStopReason::ExceptionError;
+        rep.error = e.what();
+        cr.pass_reports.push_back(std::move(rep));
+        return cr;
+    } catch (...) {
+        cr.ok_ = false;
+        cr.compiled = CompiledFn{};
+        cr.reason = "checked compile: unknown exception";
+        PassRunReport rep;
+        rep.stop_reason = PassStopReason::ExceptionError;
+        rep.error = "unknown exception";
+        cr.pass_reports.push_back(std::move(rep));
+        return cr;
+    }
 }
 
 } // namespace ember

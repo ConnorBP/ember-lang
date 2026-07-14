@@ -40,7 +40,10 @@ The lifecycle is:
    return `none()` after any current transform.
 6. **Invalidation:** selective cached invalidation is future work. Until then,
    `none()` is the conservative contract for all mutations.
-7. **Validation:** tests should validate after each mutating pass.
+7. **Validation:** tests should validate after each mutating pass with
+   `verify_thin_function_for_codegen` (the in-memory, codegen-facing verifier;
+   `validate_thin_function` is the disk-facing one). The checked execution path
+   does this for you — see [Checked execution](#checked-execution).
 8. **Serialization/emission:** transformed IR must survive a serialize,
    deserialize, validate, and emit cycle. Immediate-JIT-only success is not
    enough for a user-facing IR pass.
@@ -601,6 +604,98 @@ ember run program.ember --passes constprop,my-pass,dce
 The stock `ember_cli` registers only `ext_opt` and `ext_obf`; it reports
 `unknown pass` for custom names until its registry setup calls the custom
 registration function.
+
+## Checked execution
+
+The plain `run` / `run_to_fixpoint` return `EmberPreserved` and stay
+source-compatible, but they now ALSO enforce the hard growth ceilings: a pass
+that blows the IR past the absolute instruction cap or the 10× growth factor
+simply stops the pipeline (later passes do not run). They do not print to
+`stderr` — a host that needs the reason uses the checked path below.
+
+The checked path returns a structured `PassRunReport` and never prints:
+
+```cpp
+ember::PassRunReport rep = pm.run_checked(f, am, opts);
+// rep.stop_reason: Completed | Converged | RoundLimit | GrowthLimit |
+//                  ValidationFailure | PassError | ExceptionError
+// rep.pass_name:   the pass that was running when the run stopped
+// rep.error:       a diagnostic on every non-clean stop (empty on success)
+// rep.rounds:       1 for one-shot, N for run_checked_fixpoint
+// rep.initial_count / rep.final_count: total instrs before / at stop
+```
+
+`run_checked` runs the pipeline once; `run_checked_fixpoint` runs rounds until
+convergence, the round limit, or a failure. Both:
+
+1. **validate the input** (`verify_thin_function_for_codegen`) before any pass
+   — an already-malformed function is reported as `ValidationFailure` and no
+   pass runs;
+2. **snapshot the function** and run each pass under that snapshot;
+3. **validate after each reported mutation** — a pass returning `none()` claims
+   a change, so the verifier runs on its output; a pass returning `all()` claims
+   no change and is not re-verified;
+4. **enforce the instruction/growth ceilings** after each pass — a pass that
+   exceeds `opts.max_instructions` or the growth ratio (clamped to the hard 10×)
+   is reported as `GrowthLimit`;
+5. **catch `PassError`** as a recoverable, expected failure (`stop_reason ==
+   PassError`, the message carried) and **any other `std::exception`** as an
+   unexpected failure (`stop_reason == ExceptionError`);
+6. **roll back to the last verified state** on any failure — the function is
+   byte-for-byte unchanged after a `ValidationFailure` / `GrowthLimit` /
+   `PassError` / `ExceptionError`;
+7. **stop** — later passes do not run after a failure.
+
+`CheckedRunOptions` lets a caller request SMALLER ceilings than the hard caps
+but never larger: `max_instructions = 0` means "use the hard cap",
+`growth_numerator = 0` means "use the hard 10×". A tighter ratio (smaller
+numerator or larger denominator) is honored; a looser one is clamped to 10×.
+
+A pass signals a structured, recoverable failure by throwing `PassError`:
+
+```cpp
+if (precondition_unmet)
+    throw ember::PassError("my-pass", "site requires a dominator tree");
+```
+
+`PassError` is the ONLY exception type the adapter treats as expected. Anything
+else (a `std::runtime_error`, an `assert`, …) is an unexpected exception and
+becomes `ExceptionError`. Neither crosses the compile boundary — see below.
+
+### The codegen verifier
+
+`verify_thin_function_for_codegen` is the **in-memory** verifier for pass
+output (and the pre-regalloc/emit gate). It covers the same CFG / frame /
+rodata / VReg / op-shape invariants as the disk-facing
+`validate_thin_function`, plus a frame-plan consistency check
+(`next_local_off` must stay within `frame_size`). It does NOT validate the
+regalloc result — `thf.ra` is a JIT-time annotation produced by
+`run_regalloc`, not an IR invariant a pass produces; a stale or bogus `ra` is
+cleared by `compile_func_checked` before the single regalloc/emit stage. Tests
+must say which verifier they use; "validator-clean" alone is not a semantic
+claim.
+
+### The compile boundary
+
+`compile_func_checked` runs the configured pass manager in checked mode between
+`lower_function` and regalloc/emit and returns a structured `CompileResult`
+(backend used, fallback/failure reason, transformed IR when requested, the pass
+reports, and the emitted `CompiledFn`):
+
+- it honors `CodeGenCtx::analysis_manager` (passes receive the host's manager,
+  not a freshly-constructed local);
+- a validation / growth / pass / exception failure **cannot reach
+  `run_regalloc` or `emit_x64`** — no executable is produced on failure;
+- stale / pre-existing regalloc on the lowered function is cleared before the
+  single allowed allocation stage;
+- **exceptions do not cross the boundary** — a thrown pass or backend error
+  becomes a structured `CompileResult` failure, not a propagated exception;
+- when the IR backend is unavailable for a function (obf / try/catch /
+  coroutine / empty lowering) it falls back to the tree-walker and reports the
+  reason.
+
+`compile_func(...)` stays source-compatible as the legacy wrapper returning just
+`CompiledFn`.
 
 ## Composition and tests
 

@@ -1191,10 +1191,12 @@ add_test(NAME em_v5_ir COMMAND em_v5_ir_test)
 
 # ember_pass_test - Stage C: the composable pass system infrastructure test.
 # Pins the pass manager, registry, pipeline parser, instrumentation,
-# PreservedAnalyses, is_required, and run_to_fixpoint — no real passes yet.
-# Links ember + ember_frontend (ember_pass.cpp lives in ember_frontend).
+# PreservedAnalyses, is_required, run_to_fixpoint, and the Red 5 checked
+# execution path (snapshots, validation, rollback, structured reports, and
+# the compile_func_checked boundary). Links ember + ember_frontend + the opt
+# extension so the checked-compile vectors can drive the real pass pipeline.
 add_executable(ember_pass_test examples/ember_pass_test.cpp)
-target_link_libraries(ember_pass_test PRIVATE ember ember_frontend)
+target_link_libraries(ember_pass_test PRIVATE ember ember_frontend ember_ext_opt)
 add_test(NAME ember_pass COMMAND ember_pass_test)
 
 # host_struct_test - proof-of-concept: host C++ struct types as first-class
