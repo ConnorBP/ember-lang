@@ -38,6 +38,11 @@
 //     ir_magic     : u32 = 0x4952464E ("IRFN") — reject garbage immediately
 //     ir_version   : u16 = 2                  — IR serialization format version
 //                                                       (v2 adds meta.data_temp_off)
+//                                                       v1 blobs (no data_temp_off)
+//                                                       are still decoded with
+//                                                       data_temp_off defaulting
+//                                                       to 0; a v1 StringDecrypt
+//                                                       is rejected as unsafe
 //     slot         : i32                      — dispatch slot
 //     max_vreg     : u32                      — highest VReg+1; all VReg refs < this
 //     num_blocks   : u16 (<= 65535)

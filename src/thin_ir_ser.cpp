@@ -351,7 +351,10 @@ bool deserialize_thin_function(const uint8_t*& cur, const uint8_t* end,
         if (err) *err = "thin_ir_ser: truncated header (version)";
         return false;
     }
-    if (version != IR_BLOB_VERSION) {
+    // Accept v1 (legacy: no data_temp_off in the instruction-meta layout) and
+    // v2 (current: data_temp_off serialized at a fixed versioned location).
+    // Unknown future versions are rejected (fail-closed).
+    if (version != 1 && version != IR_BLOB_VERSION) {
         if (err) *err = "thin_ir_ser: unsupported IR blob version " + std::to_string(version);
         return false;
     }
@@ -473,7 +476,14 @@ bool deserialize_thin_function(const uint8_t*& cur, const uint8_t* end,
             if (!read_i32(cur, end, in.meta.slot)) { if (err) *err = "thin_ir_ser: truncated meta.slot"; return false; }
             if (!read_i32(cur, end, in.meta.mod_id)) { if (err) *err = "thin_ir_ser: truncated meta.mod_id"; return false; }
             if (!read_i32(cur, end, in.meta.field_off)) { if (err) *err = "thin_ir_ser: truncated meta.field_off"; return false; }
-            if (!read_i32(cur, end, in.meta.data_temp_off)) { if (err) *err = "thin_ir_ser: truncated meta.data_temp_off"; return false; }
+            // v2 adds meta.data_temp_off at this fixed versioned location
+            // (the StringDecrypt decrypted-data buffer offset). v1 blobs do
+            // NOT carry this field — it defaults to 0 (the pre-v2 behavior).
+            if (version >= IR_BLOB_VERSION) {
+                if (!read_i32(cur, end, in.meta.data_temp_off)) { if (err) *err = "thin_ir_ser: truncated meta.data_temp_off"; return false; }
+            } else {
+                in.meta.data_temp_off = 0;  // v1: no data_temp_off field
+            }
             uint8_t base_kind_raw = 0;
             if (!read_u8(cur, end, base_kind_raw)) { if (err) *err = "thin_ir_ser: truncated meta.base_kind"; return false; }
             if (base_kind_raw > BASE_KIND_LAST) { if (err) *err = "thin_ir_ser: invalid meta.base_kind ordinal"; return false; }
@@ -537,6 +547,33 @@ bool deserialize_thin_function(const uint8_t*& cur, const uint8_t* end,
     out.non_serializable = false;
     out.non_serializable_reason.clear();
     out.abs_fixups.clear();  // populated by emit_x64 at load time
+
+    // ─── v1 compatibility safety rule ───
+    // A v1 blob does not carry meta.data_temp_off; it defaults to 0. The
+    // emit fallback (data_temp_off != 0 ? data_temp_off : frame_off) then uses
+    // frame_off as the decrypted-data buffer, which OVERLAPS the slice result
+    // slot (also at frame_off). The XOR loop writes len bytes to frame_off,
+    // then the slice result {ptr,len} overwrites the first 16 bytes of that
+    // buffer — the decrypted data is corrupted and the slice ptr points into
+    // the corrupted region. This is ALWAYS unsafe for a v1 StringDecrypt
+    // (the data and slice regions can never be proven nonoverlapping when
+    // data_temp_off defaults to 0). Reject such blobs with a format
+    // diagnostic rather than allowing them through to emit (plan §7.7: "a
+    // v1 StringDecrypt whose buffer/result layout cannot be proven
+    // nonoverlapping is rejected with a format diagnostic rather than emitted").
+    if (version == 1) {
+        for (const auto& blk : out.blocks) {
+            for (const auto& in : blk.instrs) {
+                if (in.op == ThinOp::StringDecrypt) {
+                    if (err) *err = "thin_ir_ser: incompatible v1 blob: StringDecrypt "
+                                   "requires data_temp_off (added in v2) for a safe "
+                                   "nonoverlapping data/slice layout; v1 default "
+                                   "data_temp_off=0 overlaps the slice result slot";
+                    return false;
+                }
+            }
+        }
+    }
 
     return true;
 }

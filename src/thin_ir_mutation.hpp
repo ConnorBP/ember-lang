@@ -185,6 +185,15 @@ public:
     // StringDecrypt buffers, dead-code injection storage, etc.
     MutationResult<int32_t> allocate_frame_bytes(uint32_t size, uint32_t alignment);
 
+    // Allocate `size` bytes of rodata and return the addend (byte offset into
+    // the function's rodata blob). Pre-checks the added-rodata-byte limit and
+    // the hard rodata-size ceiling. The caller writes the bytes into
+    // f.rodata at the returned offset AFTER a successful commit (the
+    // allocation only reserves the offset + tracks the growth). Used by
+    // str_encrypt's atomic rodata rebuild when overlapping references
+    // require different keys. Returns InvalidArgument if size == 0.
+    MutationResult<uint32_t> allocate_rodata(uint32_t size);
+
     // Split `block` at `instruction_index` (the suffix starting at that index
     // moves to a new continuation block; the original keeps [0, index)).
     // `instruction_index` must be in [0, block.instrs.size()]. The new block
@@ -213,16 +222,18 @@ public:
     MutationResult<void> commit();
 
     // Atomic per-site preflight (§6.1): check that one site's worst-case
-    // resource consumption (vregs, frame_bytes, instructions, blocks) fits
-    // within ALL configured soft limits + hard ceilings + the growth ratio,
-    // WITHOUT staging anything. On success, increments only the site counter
-    // (used_sites_); the individual allocate_* / split_block / record_* methods
-    // increment the resource counters as they consume. On failure, increments
-    // NOTHING and returns LimitExceeded. A pass calls this BEFORE mutating a
-    // site so a mid-site limit failure cannot leave an orphan partial
-    // allocation (if preflight passes, the subsequent allocate calls succeed).
+    // resource consumption (vregs, frame_bytes, instructions, blocks, rodata)
+    // fits within ALL configured soft limits + hard ceilings + the growth
+    // ratio, WITHOUT staging anything. On success, increments only the site
+    // counter (used_sites_); the individual allocate_* / split_block /
+    // record_* methods increment the resource counters as they consume. On
+    // failure, increments NOTHING and returns LimitExceeded. A pass calls this
+    // BEFORE mutating a site so a mid-site limit failure cannot leave an
+    // orphan partial allocation (if preflight passes, the subsequent allocate
+    // calls succeed).
     MutationResult<void> reserve_site(uint32_t vregs, uint32_t frame_bytes,
-                                      uint32_t instructions, uint32_t blocks);
+                                      uint32_t instructions, uint32_t blocks,
+                                      uint32_t rodata_bytes = 0);
 
     // Record `count` instructions added directly by the pass (not via an
     // allocate method). Used after inserting instructions into blocks so the
@@ -254,12 +265,13 @@ private:
     uint32_t added_blocks_ = 0;
     uint32_t added_instructions_ = 0;
     uint32_t added_frame_bytes_ = 0;
+    uint32_t added_rodata_bytes_ = 0;
     uint32_t used_sites_ = 0;
     uint32_t initial_instructions_ = 0;
-    // Staged next VReg / next frame offset (start from the central enumeration
-    // + the function's current frame plan).
+    // Staged next VReg / next frame offset / next rodata addend.
     uint32_t next_vreg_ = 1;
     int32_t next_off_ = 0;
+    uint32_t next_rodata_off_ = 0;
     int32_t initial_frame_size_ = 0;
     // Staged frame regions (rbp-negative begin, size) for non-overlap checks.
     struct Region { int64_t begin; uint64_t size; };

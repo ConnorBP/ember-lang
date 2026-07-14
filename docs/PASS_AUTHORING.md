@@ -816,13 +816,16 @@ pinned-seed variation, compilation-order independence, instrumentation skip
 behavior for optional passes, and growth limits.
 
 The `polymorphic_pass_test` executable (`examples/polymorphic_pass_test.cpp`)
-is the Red 6 coverage driver for the six migrated obfuscation transforms
-(subst, mba_expand, const_encode, opaque_pred, deadcode, block_split) plus the
-`str_encrypt` no-op scaffolding. It is built by CMakeLists.txt **without**
+is the Red 6 / Red 7 coverage driver for the seven obfuscation transforms
+(subst, mba_expand, const_encode, opaque_pred, deadcode, block_split,
+str_encrypt). It is built by CMakeLists.txt **without**
 `add_test` so the filtered CTest total is unchanged; run it explicitly, e.g.
 `./buildt/polymorphic_pass_test`. It covers options validation, configured
 factory registration, no-op/changed preservation, same-seed serialized Thin IR
 equality, two-pinned-seed structural variation, baseline differential
 execution, serialize/deserialize round-trip, stale-regalloc invalidation, exact
 growth boundaries + stop-before-site atomicity, widths 1/2/4/8, empty and
-no-candidate functions, and straight-line / diamond / loop / long-block CFGs.
+no-candidate functions, straight-line / diamond / loop / long-block CFGs, and
+the full str_encrypt matrix (seeded per-site keys, plaintext absence,
+overlapping/repeated/empty literals, distinct nonoverlapping data/slice frame
+regions, atomic rodata rebuild, and no double encryption).

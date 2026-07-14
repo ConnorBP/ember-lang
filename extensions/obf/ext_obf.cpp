@@ -24,11 +24,12 @@
 // delegated to the shared SeedDeriver; RNG is the shared StableRng; mutation
 // is the shared ThinIRMutation.
 //
-// `str_encrypt` is registered through the configured factory and has its
-// no-op scaffolding (zero density / no candidates → no-op), but its final
-// seeded key, rodata rebuild, and ThinIRMutation conversion are deferred to
-// Red 7 (blob v2 is the hard gate for that migration). Its `run` keeps the
-// existing fixed-key rodata transform gated by the configured density.
+// `str_encrypt` is registered through the configured factory with its full
+// Red 7 migration: per-site seed-derived nonzero byte key (purpose
+// "string-key"), distinct data_temp_off / frame_off frame regions allocated
+// via ThinIRMutation, and an atomic rodata rebuild when overlapping
+// references require different keys. No double encryption (the second run sees
+// StringDecrypt, not ConstStringRef → no candidates).
 
 #include "ext_obf.hpp"
 
@@ -851,61 +852,178 @@ EmberPreserved DeadCodeInjectionPass::run(ThinFunction& f, EmberAnalysisManager&
 // StringEncryptionPass: plaintext rodata to inline stack decryption
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Red 6 part one: registered through the configured factory with no-op
-// scaffolding (zero density / no ConstStringRef → no-op). The body keeps the
-// existing fixed-key (0xA5) rodata transform, GATED by the configured density,
-// so a full-density run still rewrites ConstStringRef references. The final
-// SEEDED key, rodata rebuild, and ThinIRMutation conversion (distinct
-// data/slice slots via allocate_frame_bytes) are deferred to Red 7: the plan
-// makes Thin IR blob v2 a hard gate for that migration, and Red 6 part one is
-// not complete until the next chunk finishes it.
+// Red 7 (plan §7.7): the full migration. Per-site streams: "select" gates the
+// site (density); "string-key" derives a NONZERO per-site byte key. Each
+// ConstStringRef is rewritten in place to a StringDecrypt with a DISTINCT
+// data_temp_off (the decrypted-data buffer, len bytes, allocated via
+// ThinIRMutation) and frame_off (the slice result slot, 16 bytes, allocated
+// via ThinIRMutation). The rodata is encrypted with the site's key.
+//
+// Overlapping references: when two sites share rodata bytes but require
+// DIFFERENT keys, in-place XOR is unsafe (one site's decrypt would use the
+// wrong key). The pass detects such clusters and rebuilds the conflicting
+// sites' rodata into fresh non-overlapping regions (allocate_rodata + copy the
+// plaintext), then re-points each rebuilt site's addend there. Sites with the
+// SAME key can share an overlapping range (the shared-key XOR is correct for
+// both). No double encryption: the second run sees StringDecrypt (not
+// ConstStringRef), so there are no candidates → no-op.
+//
+// Plaintext absence: the derived key is forced nonzero, so XOR always changes
+// every byte of a selected literal → no plaintext byte survives in the final
+// rodata or the serialized v2 blob. Frame regions are distinct (data_temp_off
+// != frame_off, allocated non-overlapping via ThinIRMutation). Stale regalloc
+// is cleared by commit().
 
 EmberPreserved StringEncryptionPass::run(ThinFunction& f, EmberAnalysisManager&) {
     if (configured_noop(options)) return EmberPreserved::all();
 
-    constexpr uint8_t key = 0xA5;
-
-    struct Site { ThinInstr* in; uint32_t addend; uint32_t len; };
+    // Snapshot the ConstStringRef candidates with their ORIGINAL block id +
+    // ordinal so the per-site key derivation is stable. We capture the instr
+    // POINTER (into the function's blocks) for the rewrite below; the pointer
+    // stays valid because str_encrypt does NOT insert/remove instructions
+    // (it only rewrites existing ConstStringRef -> StringDecrypt in place).
+    struct Site {
+        ThinInstr* in;
+        uint32_t block_id;
+        uint32_t ordinal;
+        uint32_t addend;
+        uint32_t len;
+    };
     std::vector<Site> sites;
-    std::vector<uint8_t> encrypt_byte(f.rodata.size(), 0);
-
     for (auto& block : f.blocks) {
+        uint32_t ord = 0;
         for (auto& in : block.instrs) {
-            if (in.op != ThinOp::ConstStringRef || in.meta.len < 0) continue;
+            if (in.op != ThinOp::ConstStringRef || in.meta.len < 0) { ++ord; continue; }
             const uint64_t begin = in.meta.addend;
             const uint64_t end = begin + static_cast<uint32_t>(in.meta.len);
-            if (end > f.rodata.size()) continue;
-            sites.push_back({&in, in.meta.addend,
+            if (end > f.rodata.size()) { ++ord; continue; }
+            sites.push_back({&in, block.id, ord, in.meta.addend,
                              static_cast<uint32_t>(in.meta.len)});
-            for (uint64_t i = begin; i < end; ++i)
-                encrypt_byte[static_cast<size_t>(i)] = 1;
+            ++ord;
         }
     }
     if (sites.empty()) return EmberPreserved::all();
 
-    for (size_t i = 0; i < f.rodata.size(); ++i)
-        if (encrypt_byte[i]) f.rodata[i] ^= key;
-
-    int32_t next_off = f.frame.next_local_off;
-    for (const Site& site : sites) {
-        ThinInstr& in = *site.in;
-        next_off += static_cast<int32_t>(site.len);
-        const int32_t data_temp_off = -next_off;
-        next_off += 16;
-        const int32_t slice_off = -next_off;
-        in.op = ThinOp::StringDecrypt;
-        in.imm.i = key;
-        in.meta.addend = site.addend;
-        in.meta.len = static_cast<int32_t>(site.len);
-        in.meta.data_temp_off = data_temp_off;
-        in.meta.frame_off = slice_off;
+    // Derive a per-site nonzero byte key from the seed (purpose "string-key").
+    // A zero key would leave plaintext in rodata, so we force nonzero.
+    std::vector<uint8_t> keys;
+    keys.reserve(sites.size());
+    for (const Site& s : sites) {
+        bool ok = false;
+        StableRng krng = site_rng(options, pass_name, f, s.block_id, s.ordinal,
+                                  "string-key", ok);
+        uint8_t key = ok ? uint8_t(krng.next() & 0xFFu) : 0xA5u;
+        if (key == 0) key = 0xA5u;  // force nonzero (plaintext-absence guarantee)
+        keys.push_back(key);
     }
 
-    f.frame.next_local_off = next_off;
-    const int32_t needed = next_off + 16;
-    if (needed > f.frame.frame_size)
-        f.frame.frame_size = (needed + 15) & ~15;
-    f.ra = {};
+    // Detect overlapping ranges that require DIFFERENT keys. When two sites
+    // share rodata bytes but have different keys, in-place XOR is unsafe (one
+    // site's decrypt would use the wrong key). For such sites, rebuild the
+    // rodata: copy each site's plaintext to a fresh non-overlapping region and
+    // re-point the site's addend there. Sites with the SAME key can share an
+    // overlapping region (in-place XOR with the shared key is correct for
+    // both).\    //
+    // For simplicity + correctness, when ANY site in an overlapping cluster
+    // has a different key from another site in the same cluster, we rebuild
+    // ALL sites in that cluster. (A more precise scheme would rebuild only
+    // the conflicting sites, but the cluster-wide rebuild is simpler and the
+    // growth is bounded.)
+    //
+    // rebuild_needed[i] = true if site i's rodata range must be copied to a
+    // fresh region (because it overlaps another site with a different key).
+    std::vector<bool> rebuild_needed(sites.size(), false);
+    for (size_t i = 0; i < sites.size(); ++i) {
+        for (size_t j = i + 1; j < sites.size(); ++j) {
+            const uint64_t ib = sites[i].addend, ie = ib + sites[i].len;
+            const uint64_t jb = sites[j].addend, je = jb + sites[j].len;
+            // overlap iff ib < je && jb < ie
+            if (ib < je && jb < ie) {
+                if (keys[i] != keys[j]) {
+                    rebuild_needed[i] = true;
+                    rebuild_needed[j] = true;
+                }
+            }
+        }
+    }
+
+    ThinIRMutation mut(f, options.limits);
+    bool changed = false;
+
+    // For each site: allocate the data buffer (len bytes) + the slice result
+    // slot (16 bytes) via ThinIRMutation, derive the key, and (if needed)
+    // allocate a fresh rodata region + copy the plaintext there. The worst
+    // case per site is: 0 VRegs (no new VRegs; the slice dst stays the same),
+    // len+16 frame bytes, 0 instructions (the rewrite is in place), and
+    // (len) rodata bytes if a rebuild is needed.
+    for (size_t i = 0; i < sites.size(); ++i) {
+        const Site& s = sites[i];
+        const uint32_t wc_frame = s.len + 16;
+        const uint32_t wc_rodata = rebuild_needed[i] ? s.len : 0;
+        auto rs = mut.reserve_site(0, wc_frame, 0, 0, wc_rodata);
+        if (!rs.ok()) continue;  // stop-before-site atomicity
+
+        // Allocate the data buffer (len bytes, 8-byte aligned) + slice slot
+        // (16 bytes, 16-byte aligned). The data buffer holds the decrypted
+        // bytes; the slice slot holds {ptr, len}.
+        auto r_data = mut.allocate_frame_bytes(s.len, 8);
+        if (!r_data.ok()) continue;
+        auto r_slice = mut.allocate_frame_bytes(16, 16);
+        if (!r_slice.ok()) continue;
+        const int32_t data_temp_off = r_data.get();
+        const int32_t slice_off = r_slice.get();
+
+        // Determine the rodata addend: if a rebuild is needed, allocate a
+        // fresh region and copy the plaintext there; otherwise keep the
+        // original addend.
+        uint32_t addend = s.addend;
+        if (rebuild_needed[i]) {
+            auto r_rodata = mut.allocate_rodata(s.len);
+            if (!r_rodata.ok()) continue;
+            addend = r_rodata.get();
+            // Copy the ORIGINAL (plaintext) bytes to the new region. The
+            // encryption pass below XORs them with the site's key.
+            // NOTE: f.rodata is mutated directly here; the ThinIRMutation
+            // snapshot restore on abandon undoes this on failure.
+            if (f.rodata.size() < addend + s.len)
+                f.rodata.resize(addend + s.len, 0);
+            std::memcpy(f.rodata.data() + addend,
+                        f.rodata.data() + s.addend, s.len);
+        }
+
+        // Rewrite the ConstStringRef -> StringDecrypt in place.
+        ThinInstr& in = *s.in;
+        in.op = ThinOp::StringDecrypt;
+        in.imm.i = int64_t(keys[i]);
+        in.meta.addend = addend;
+        in.meta.len = int32_t(s.len);
+        in.meta.data_temp_off = data_temp_off;
+        in.meta.frame_off = slice_off;
+        in.meta.base_kind = AbsFixup::FunctionRodataBase;
+        changed = true;
+    }
+
+    if (!changed) return EmberPreserved::all();
+
+    // Encrypt the rodata: XOR each site's [addend, addend+len) range with its
+    // key. For non-rebuilt sites this is an in-place XOR of the original
+    // range; for rebuilt sites this is an XOR of the fresh copy. Rebuilt
+    // sites have a distinct addend, so they never collide with another site's
+    // range. Non-rebuilt sites with the SAME key can share an overlapping
+    // range (the XOR is idempotent for the shared key). Non-rebuilt sites with
+    // DIFFERENT keys would overlap, but those were flagged for rebuild above,
+    // so no two non-rebuilt sites with different keys share bytes.
+    for (size_t i = 0; i < sites.size(); ++i) {
+        if (!changed) break;
+        const uint32_t addend = sites[i].in->meta.addend;
+        const uint32_t len = uint32_t(sites[i].in->meta.len);
+        const uint8_t key = uint8_t(sites[i].in->imm.i);
+        for (uint32_t k = 0; k < len; ++k)
+            f.rodata[addend + k] ^= key;
+    }
+
+    auto rc = mut.commit();
+    if (!rc.ok()) return EmberPreserved::all();
     return EmberPreserved::none();
 }
 

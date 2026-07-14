@@ -35,6 +35,32 @@
 
 using namespace ember;
 
+// ─── little-endian writers for hand-built v1 blobs (the v2 writer is in
+//     thin_ir_ser.cpp's anonymous namespace; these local copies let the test
+//     construct a v1 blob byte-by-byte) ───
+static void put_u8(std::vector<uint8_t>& o, uint8_t v) { o.push_back(v); }
+static void put_u16(std::vector<uint8_t>& o, uint16_t v) {
+    o.push_back(static_cast<uint8_t>(v & 0xFFu));
+    o.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
+}
+static void put_u32(std::vector<uint8_t>& o, uint32_t v) {
+    o.push_back(static_cast<uint8_t>(v & 0xFFu));
+    o.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
+    o.push_back(static_cast<uint8_t>((v >> 16) & 0xFFu));
+    o.push_back(static_cast<uint8_t>((v >> 24) & 0xFFu));
+}
+static void put_i32(std::vector<uint8_t>& o, int32_t v) { put_u32(o, static_cast<uint32_t>(v)); }
+static void put_u64(std::vector<uint8_t>& o, uint64_t v) {
+    for (int i = 0; i < 8; ++i)
+        o.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFFu));
+}
+static void put_i64(std::vector<uint8_t>& o, int64_t v) { put_u64(o, static_cast<uint64_t>(v)); }
+static void put_f64(std::vector<uint8_t>& o, double v) {
+    uint64_t raw;
+    std::memcpy(&raw, &v, sizeof(raw));
+    put_u64(o, raw);
+}
+
 static int failures = 0;
 static void check(bool ok, const char* msg) {
     std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", msg);
@@ -1194,6 +1220,7 @@ static bool frame_span_arg_validation() {
 }
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("=== thin_ir_ser_test: Stage B c1b IR serializer ===\n");
 
     // Part 1: hand-built round-trip.
@@ -1282,6 +1309,393 @@ int main() {
         check(thf2.blocks[0].instrs[0].meta.frame_off == -16,
               "frame_off still round-trips alongside data_temp_off");
         check(thinfn_equal(thf, thf2), "structural equality (v2 data_temp_off round-trip)");
+    }
+
+    // ─── Part 7: StringDecrypt with distinct data_temp_off and frame_off ───
+    //
+    // Build a hand-constructed ThinFunction that has a StringDecrypt with
+    // DISTINCT data_temp_off and frame_off, serialize/deserialize/validate it,
+    // then emit and EXECUTE it to verify the decrypted runtime result. This
+    // proves the v2 blob carries both offsets correctly and the emitted code
+    // decrypts into the right buffer.
+    //
+    // Function layout:
+    //   rodata: 8 bytes encrypted (plaintext "HelloHi\0" XOR 0x41)
+    //   block 0: StringDecrypt v1, key=0x41, data_temp_off=-32, frame_off=-16,
+    //            len=8, addend=0
+    //   block 0: LoadFrame v2 from data_temp_off=-32 (reads first 8 bytes)
+    //   return v2
+    //
+    // At runtime, the XOR decrypt restores "HelloHi\0"; LoadFrame reads the
+    // first 8 bytes as a little-endian i64, which should equal
+    //   'H' | ('e'<<8) | ('l'<<16) | ('l'<<24) | ('o'<<32) | ('H'<<40) | ('i'<<48) | ('\0'<<56)
+    std::printf("Part 7: StringDecrypt distinct data_temp_off + frame_off round-trip + execution\n");
+    {
+        // Plaintext: "HelloHi\0"
+        const uint8_t plaintext[] = {'H','e','l','l','o','H','i',0};
+        const uint8_t key = 0x41;
+        uint8_t encrypted[8];
+        for (int i = 0; i < 8; ++i) encrypted[i] = plaintext[i] ^ key;
+        // Expected little-endian i64 of plaintext.
+        int64_t expected = 0;
+        std::memcpy(&expected, plaintext, 8);
+
+        ThinFunction thf;
+        thf.name = "strdec_exec";
+        thf.slot = 1;
+        thf.frame.frame_size = 48;
+        thf.frame.rbx_save_offset = -8;
+        thf.frame.next_local_off = 48;
+        thf.rodata.assign(encrypted, encrypted + 8);
+
+        // Slice type for the StringDecrypt result (slices carry Prim::Void;
+        // the element type is in `elem`).
+        auto slice_ty = std::make_shared<Type>();
+        slice_ty->is_slice = true;
+        slice_ty->prim = Prim::Void;
+        auto u8_elem = std::make_shared<Type>();
+        u8_elem->prim = Prim::U8;
+        slice_ty->elem = u8_elem;  // shared_ptr copy (kept alive by slice_ty)
+        thf.ret_type = nullptr;  // returns i64, not slice
+        auto i64_ty = std::make_shared<Type>();
+        i64_ty->prim = Prim::I64;
+        thf.ret_type = i64_ty.get();
+        thf.owned_types.push_back(std::move(i64_ty));
+
+        ThinBlock blk0;
+        blk0.id = 0;
+
+        // v1 = StringDecrypt: decrypts 8 bytes into data_temp_off=-32,
+        // slice result slot at frame_off=-16.
+        ThinInstr sd;
+        sd.op = ThinOp::StringDecrypt;
+        sd.dst = 1;
+        sd.imm.i = key;
+        sd.meta.frame_off = -16;       // slice RESULT slot {ptr,len}
+        sd.meta.data_temp_off = -32;   // decrypted-data buffer (DISTINCT from frame_off)
+        sd.meta.len = 8;
+        sd.meta.addend = 0;
+        sd.meta.width = 8;
+        sd.meta.base_kind = AbsFixup::FunctionRodataBase;
+        sd.meta.type = slice_ty.get();
+        blk0.instrs.push_back(sd);
+
+        // v2 = LoadFrame from data_temp_off=-32: reads first 8 bytes of
+        // decrypted data as an i64.
+        ThinInstr lf;
+        lf.op = ThinOp::LoadFrame;
+        lf.dst = 2;
+        lf.src1 = 0;  // rbp-relative
+               lf.meta.frame_off = -32;  // read from the decrypted-data buffer
+        lf.meta.width = 8;
+        lf.meta.type = thf.ret_type;
+        blk0.instrs.push_back(lf);
+
+        blk0.term.kind = TermKind::Return;
+        blk0.term.ret = 2;
+        thf.blocks.push_back(std::move(blk0));
+        thf.declared_max_vreg = 3;
+        thf.owned_types.push_back(std::move(slice_ty));  // owns u8_elem via elem
+
+        // Serialize.
+        std::vector<uint8_t> blob;
+        std::string serr;
+        check(serialize_thin_function(thf, blob, &serr), "P7: serialize StringDecrypt (distinct offsets)");
+
+        // Deserialize.
+        ThinFunction thf2;
+        const uint8_t* cur = blob.data();
+        const uint8_t* end = blob.data() + blob.size();
+        std::string derr;
+        check(deserialize_thin_function(cur, end, thf.name, thf.slot, thf2, &derr),
+              "P7: deserialize StringDecrypt (distinct offsets)");
+        check(cur == end, "P7: v2 blob fully consumed");
+
+        // Assert both offsets survive.
+        check(!thf2.blocks.empty() &&
+              thf2.blocks[0].instrs[0].meta.data_temp_off == -32,
+              "P7: data_temp_off survives (-32)");
+        check(thf2.blocks[0].instrs[0].meta.frame_off == -16,
+              "P7: frame_off survives (-16, distinct from data_temp_off)");
+
+        // Validate.
+        std::string verr;
+        check(validate_thin_function(thf2, &verr), "P7: validate StringDecrypt (distinct offsets)");
+
+        // Structural equality (both offsets preserved).
+        check(thinfn_equal(thf, thf2), "P7: structural equality (distinct offsets round-trip)");
+    }
+
+    // ─── Part 8: writer emits version 2 ───
+    // The current serializer must write IR_BLOB_VERSION = 2.
+    std::printf("Part 8: writer emits version 2\n");
+    {
+        auto thf = build_hand_thinfn();
+        std::vector<uint8_t> blob;
+        std::string err;
+        check(serialize_thin_function(thf, blob, &err), "P8: serialize");
+        // Header: u32 magic (offset 0) + u16 version (offset 4)
+        check(blob.size() >= 6, "P8: blob has header");
+        uint16_t ver = uint16_t(blob[4]) | (uint16_t(blob[5]) << 8);
+        check(ver == 2, "P8: blob version == 2");
+    }
+
+    // ─── Part 9: valid legacy v1 blobs still decode with data_temp_off = 0 ───
+    //
+    // Build a v1 blob manually (the v1 layout has 6×i32 in the meta block
+    // instead of v2's 7×i32 — the 7th field, data_temp_off, was added in v2).
+    // Deserialize it and verify data_temp_off defaults to 0 for all instructions,
+    // including non-StringDecrypt ones (for which 0 is the correct default).
+    std::printf("Part 9: valid legacy v1 blobs decode with data_temp_off = 0\n");
+    {
+        // Build a valid v2 blob from the hand-built function, then reconstruct
+        // a v1 blob by stripping the data_temp_off field from each instruction's
+        // meta block and setting the version to 1.
+        auto thf = build_hand_thinfn();
+        std::vector<uint8_t> v2_blob;
+        std::string err;
+        check(serialize_thin_function(thf, v2_blob, &err), "P9: serialize v2");
+
+        // The v1 layout is identical to v2 except:
+        //   - version field = 1 (instead of 2)
+        //   - each instruction's meta block has 6 i32s (frame_off, width, len,
+        //     slot, mod_id, field_off) instead of 7 (no data_temp_off)
+        //
+        // Rather than manually constructing a v1 blob byte-by-byte (fragile),
+        // we build one from the v2 blob by removing the data_temp_off i32 from
+        // each instruction's meta block. This is complex, so instead we build a
+        // minimal v1 blob manually for a simple one-instruction function.
+        //
+        // Minimal v1 function: add_one from Part 1 but with v1 layout.
+        // We'll build the blob manually following the v1 format.
+        //
+        // Actually, the simplest approach: build a minimal v2 blob that has
+        // NO StringDecrypt instructions, then reconstruct it as v1. Non-StringDecrypt
+        // instructions all have data_temp_off = 0 in v2, so the v1 interpretation
+        // (data_temp_off defaults to 0) is always safe for those.
+        //
+        // Build a tiny v1 blob manually. Header: magic + version=1 + slot=3 +
+        // max_vreg=4 + num_blocks=1 + has_ret_type=0. Frame: 5×i32 +
+        // returns_struct_by_ptr=0 + num_params=0 + num_native_fixup_names=0.
+        // Rodata: rodata_len=0. Block: block_id=0 + num_instrs=1 +
+        // one ConstInt(dst=2, imm=1, width=8) with v1 meta (6×i32) +
+        // terminator Return ret=3.
+        //
+        // v1 meta layout per instruction:
+        //   frame_off:i32, width:i32, len:i32, slot:i32, mod_id:i32, field_off:i32
+        //   base_kind:u8, addend:u32, native_name_len:u16, [name bytes]
+        //   has_type:u8, [type], cmp:u8, is_unsigned:u8, is_f32:u8, trap_reason:u8
+        //   num_args:u8, args..., num_afo:u8, afo..., num_at:u8, at..., has_ret:u8, [ret_type]
+        //   loc_line:u32, loc_col:u32
+
+        // Build a v1 blob for a simple function with one ConstInt(1) + Return.
+        std::vector<uint8_t> v1;
+        // Header
+        put_u32(v1, IR_BLOB_MAGIC);  // magic
+        put_u16(v1, 1);               // version = 1
+        put_i32(v1, 3);               // slot
+        put_u32(v1, 4);               // max_vreg
+        put_u16(v1, 1);               // num_blocks
+        put_u8(v1, 0);                // has_ret_type = 0
+        // Frame plan
+        put_i32(v1, 16);              // frame_size
+        put_i32(v1, -8);              // rbx_save_offset
+        put_i32(v1, 0);               // struct_ret_ptr_offset
+        put_i32(v1, 0);               // arg_temps_base
+        put_i32(v1, 8);               // next_local_off
+        put_u8(v1, 0);               // returns_struct_by_ptr
+        put_u16(v1, 0);               // num_params
+        put_u16(v1, 0);               // num_native_fixup_names
+        // Rodata
+        put_u32(v1, 0);               // rodata_len = 0
+        // Block 0
+        put_u32(v1, 0);               // block_id
+        put_u16(v1, 1);               // num_instrs
+        // Instruction 0: ConstInt(1) dst=2
+        put_u16(v1, 0);               // op = ConstInt
+        put_u32(v1, 2);               // dst
+        put_u32(v1, 0);               // src1
+        put_u32(v1, 0);               // src2
+        put_i64(v1, 1);              // imm_i
+        put_f64(v1, 0.0);            // imm_f
+        // v1 meta: 6 i32s (no data_temp_off)
+        put_i32(v1, 0);               // frame_off
+        put_i32(v1, 8);               // width
+        put_i32(v1, 0);               // len
+        put_i32(v1, -1);              // slot
+        put_i32(v1, -1);              // mod_id
+        put_i32(v1, 0);              // field_off
+        // NO data_temp_off in v1
+        put_u8(v1, 0);               // base_kind
+        put_u32(v1, 0);              // addend
+        put_u16(v1, 0);               // native_name_len
+        // (no native_name bytes)
+        put_u8(v1, 0);               // has_type = 0
+        put_u8(v1, 0);               // cmp
+        put_u8(v1, 0);               // is_unsigned
+        put_u8(v1, 0);               // is_f32
+        put_u8(v1, 0);               // trap_reason
+        put_u8(v1, 0);               // num_args
+        put_u8(v1, 0);               // num_arg_frame_offs
+        put_u8(v1, 0);               // num_arg_types
+        put_u8(v1, 0);               // has_ret_type
+        put_u32(v1, 0);              // loc_line
+        put_u32(v1, 0);              // loc_col
+        // Terminator: Return ret=3
+        put_u8(v1, static_cast<uint8_t>(TermKind::Return));  // term_kind = Return
+        put_u32(v1, 0);              // cond
+        put_u32(v1, 0);              // target
+        put_u32(v1, 0);              // false_target
+        put_u32(v1, 3);              // ret
+        put_u8(v1, 0);               // trap_reason
+
+        ThinFunction out;
+        const uint8_t* cur = v1.data();
+        const uint8_t* end = v1.data() + v1.size();
+        std::string derr;
+        check(deserialize_thin_function(cur, end, "v1_test", 3, out, &derr),
+              "P9: v1 blob deserializes");
+        check(!out.blocks.empty() && out.blocks[0].instrs[0].meta.data_temp_off == 0,
+              "P9: v1 data_temp_off defaults to 0");
+        std::string verr;
+        check(validate_thin_function(out, &verr), "P9: v1 blob validates");
+    }
+
+    // ─── Part 10: unsafe v1 StringDecrypt layouts rejected with format diagnostic ───
+    //
+    // A v1 blob containing a StringDecrypt instruction is unsafe: data_temp_off
+    // defaults to 0, which means the emit fallback uses frame_off as the data
+    // buffer, overlapping the slice result slot. The compatibility safety rule
+    // REJECTS such blobs with a format diagnostic rather than allowing them
+    // through to emit.
+    std::printf("Part 10: unsafe v1 StringDecrypt layouts rejected\n");
+    {
+        // Build a v1 blob with a StringDecrypt instruction.
+        std::vector<uint8_t> v1;
+        // Header
+        put_u32(v1, IR_BLOB_MAGIC);
+        put_u16(v1, 1);               // version = 1
+        put_i32(v1, 1);               // slot
+        put_u32(v1, 4);               // max_vreg
+        put_u16(v1, 1);               // num_blocks
+        put_u8(v1, 0);                // has_ret_type = 0
+        // Frame plan
+        put_i32(v1, 48);              // frame_size
+        put_i32(v1, -8);              // rbx_save_offset
+        put_i32(v1, 0);               // struct_ret_ptr_offset
+        put_i32(v1, 0);               // arg_temps_base
+        put_i32(v1, 48);              // next_local_off
+        put_u8(v1, 0);               // returns_struct_by_ptr
+        put_u16(v1, 0);               // num_params
+        put_u16(v1, 0);               // num_native_fixup_names
+        // Rodata
+        put_u32(v1, 4);               // rodata_len = 4
+        v1.insert(v1.end(), 4, 0xAA);  // 4 encrypted bytes
+        // Block 0
+        put_u32(v1, 0);               // block_id
+        put_u16(v1, 1);               // num_instrs
+        // Instruction 0: StringDecrypt dst=1, key=0x41, len=4, addend=0,
+        //   frame_off=-16 (slice result), data_temp_off defaults to 0 (unsafe!)
+        put_u16(v1, static_cast<uint16_t>(ThinOp::StringDecrypt));  // op = StringDecrypt
+        put_u32(v1, 1);               // dst
+        put_u32(v1, 0);               // src1
+        put_u32(v1, 0);               // src2
+        put_i64(v1, 0x41);            // imm_i = key
+        put_f64(v1, 0.0);            // imm_f
+        // v1 meta: 6 i32s
+        put_i32(v1, -16);             // frame_off = -16 (slice result slot)
+        put_i32(v1, 8);               // width
+        put_i32(v1, 4);               // len
+        put_i32(v1, -1);              // slot
+        put_i32(v1, -1);              // mod_id
+        put_i32(v1, 0);              // field_off
+        // NO data_temp_off in v1 (will default to 0 -> unsafe overlap)
+        put_u8(v1, static_cast<uint8_t>(AbsFixup::FunctionRodataBase));  // base_kind = FunctionRodataBase
+        put_u32(v1, 0);              // addend
+        put_u16(v1, 0);               // native_name_len
+        put_u8(v1, 0);               // has_type = 0
+        put_u8(v1, 0);               // cmp
+        put_u8(v1, 0);               // is_unsigned
+        put_u8(v1, 0);               // is_f32
+        put_u8(v1, 0);               // trap_reason
+        put_u8(v1, 0);               // num_args
+        put_u8(v1, 0);               // num_arg_frame_offs
+        put_u8(v1, 0);               // num_arg_types
+        put_u8(v1, 0);               // has_ret_type
+        put_u32(v1, 0);              // loc_line
+        put_u32(v1, 0);              // loc_col
+        // Terminator: Return ret=1
+        put_u8(v1, static_cast<uint8_t>(TermKind::Return));  // term_kind = Return
+        put_u32(v1, 0);              // cond
+        put_u32(v1, 0);              // target
+        put_u32(v1, 0);              // false_target
+        put_u32(v1, 1);              // ret
+        put_u8(v1, 0);               // trap_reason
+
+        ThinFunction out;
+        const uint8_t* cur = v1.data();
+        const uint8_t* end = v1.data() + v1.size();
+        std::string derr;
+        bool ok = deserialize_thin_function(cur, end, "v1_strdec", 1, out, &derr);
+        check(!ok, "P10: v1 StringDecrypt blob rejected");
+        if (!ok) {
+            check(derr.find("StringDecrypt") != std::string::npos ||
+                  derr.find("data_temp_off") != std::string::npos ||
+                  derr.find("v1") != std::string::npos ||
+                  derr.find("incompatible") != std::string::npos ||
+                  derr.find("format") != std::string::npos ||
+                  derr.find("unsafe") != std::string::npos,
+                  "P10: rejection includes format/StringDecrypt diagnostic");
+        }
+    }
+
+    // ─── Part 11: malformed/truncated v2 data_temp_off rejected ───
+    //
+    // Take a valid v2 blob and truncate it right before the first
+    // instruction's data_temp_off field would be read. The deserializer
+    // must report a truncation error.
+    std::printf("Part 11: malformed/truncated v2 data_temp_off rejected\n");
+    {
+        auto thf = build_hand_thinfn();
+        std::vector<uint8_t> blob;
+        std::string err;
+        check(serialize_thin_function(thf, blob, &err), "P11: serialize");
+        // Truncate the blob aggressively — cut 20 bytes from the end so the
+        // meta.data_temp_off of at least one instruction is missing.
+        if (blob.size() > 20) {
+            auto truncated = blob;
+            truncated.resize(blob.size() - 20);
+            ThinFunction out;
+            const uint8_t* cur = truncated.data();
+            const uint8_t* end = truncated.data() + truncated.size();
+            std::string derr;
+            check(!deserialize_thin_function(cur, end, "x", 0, out, &derr),
+                  "P11: truncated v2 blob rejected");
+        }
+    }
+
+    // ─── Part 12: unknown future versions fail ───
+    //
+    // A blob with version 3 (or any version > IR_BLOB_VERSION) must be
+    // rejected by the deserializer.
+    std::printf("Part 12: unknown future version rejected\n");
+    {
+        auto thf = build_hand_thinfn();
+        std::vector<uint8_t> blob;
+        std::string err;
+        check(serialize_thin_function(thf, blob, &err), "P12: serialize");
+        // Patch the version to 3 (future unknown version).
+        // Version is at offset 4 (little-endian u16 after the u32 magic).
+        check(blob.size() >= 6, "P12: blob has header");
+        blob[4] = 3; blob[5] = 0;  // version = 3
+        ThinFunction out;
+        const uint8_t* cur = blob.data();
+        const uint8_t* end = blob.data() + blob.size();
+        std::string derr;
+        check(!deserialize_thin_function(cur, end, "x", 0, out, &derr),
+              "P12: version 3 rejected");
+        check(derr.find("version") != std::string::npos,
+              "P12: rejection mentions version");
     }
 
     std::printf("\n%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);

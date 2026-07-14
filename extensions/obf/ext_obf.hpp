@@ -36,11 +36,10 @@
 // DETERMINISTIC DEFAULTS so existing pipeline names + eligibility behavior are
 // retained.
 //
-// `str_encrypt` is registered through the configured factory and has its
-// option/no-op scaffolding, but its final seeded key, rodata rebuild, and
-// ThinIRMutation conversion are deferred to Red 7 (the plan makes Thin IR blob
-// v2 a hard gate for that migration; Red 6 part one does not complete that
-// pass).
+// `str_encrypt` is registered through the configured factory with its full
+// Red 7 migration: per-site seed-derived nonzero byte key, distinct data/
+// slice frame regions via ThinIRMutation, and an atomic rodata rebuild when
+// overlapping references require different keys.
 //
 // Design ref: docs/spec/PASS_SYSTEM_DESIGN.md §8 Step 5, §11;
 // docs/planning/plan_POLYMORPHIC_CODE_ENGINE.md §4–§6, §9.3 Red 6.
@@ -112,9 +111,9 @@ struct StringEncryptionPass : EmberPassInfoMixin<StringEncryptionPass> {
     PolymorphicPassOptions options;
     StringEncryptionPass() = default;
     explicit StringEncryptionPass(PolymorphicPassOptions o) : options(std::move(o)) {}
-    // Red 6 part one: registered through the configured factory with no-op
-    // scaffolding (zero density → no-op). The final seeded key, rodata rebuild,
-    // and ThinIRMutation conversion are deferred to Red 7 (blob v2 hard gate).
+    // Red 7: per-site seed-derived nonzero byte key, distinct data_temp_off /
+    // frame_off frame regions via ThinIRMutation, atomic rodata rebuild for
+    // overlapping references requiring different keys, plaintext absence.
     EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
 };
 

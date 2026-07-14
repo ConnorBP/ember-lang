@@ -110,6 +110,7 @@ ThinIRMutation::ThinIRMutation(ThinFunction& f, const PassGrowthLimits& limits)
     , snapshot_(std::make_unique<ThinFunction>(f))
     , next_vreg_(compute_central_max_vreg(f))
     , next_off_(f.frame.next_local_off)
+    , next_rodata_off_(static_cast<uint32_t>(f.rodata.size()))
     , initial_frame_size_(f.frame.frame_size) {
     // Count the initial instruction count for growth-ratio accounting.
     for (const auto& blk : f.blocks)
@@ -320,6 +321,38 @@ MutationResult<int32_t> ThinIRMutation::allocate_frame_bytes(uint32_t size, uint
     return res;
 }
 
+MutationResult<uint32_t> ThinIRMutation::allocate_rodata(uint32_t size) {
+    MutationResult<uint32_t> res;
+    if (committed_) {
+        res.error = {MutationStatus::NotCommitted, "allocate_rodata after commit"};
+        return res;
+    }
+    if (size == 0) {
+        res.error = {MutationStatus::InvalidArgument, "allocate_rodata: size must be nonzero"};
+        return res;
+    }
+    // Checked added-rodata-byte limit: added_rodata_bytes_ + size must not
+    // overflow uint32_t.
+    if (size > limits_.max_added_rodata_bytes ||
+        added_rodata_bytes_ > limits_.max_added_rodata_bytes - size) {
+        res.error = {MutationStatus::LimitExceeded, "max_added_rodata_bytes exceeded"};
+        return res;
+    }
+    // Checked rodata-offset arithmetic: next_rodata_off_ + size must not
+    // overflow uint32_t (rodata addends are uint32_t in the IR).
+    uint64_t new_off_64 = uint64_t(next_rodata_off_) + uint64_t(size);
+    if (new_off_64 > uint64_t(UINT32_MAX)) {
+        res.error = {MutationStatus::LimitExceeded, "rodata offset overflow"};
+        return res;
+    }
+    uint32_t addend = next_rodata_off_;
+    next_rodata_off_ = uint32_t(new_off_64);
+    added_rodata_bytes_ += size;
+    staged_change_ = true;
+    res.value = addend;
+    return res;
+}
+
 MutationResult<uint32_t> ThinIRMutation::split_block(uint32_t block, size_t instruction_index) {
     MutationResult<uint32_t> res;
     if (committed_) {
@@ -430,7 +463,8 @@ MutationResult<void> ThinIRMutation::canonicalize_block_ids() {
 }
 
 MutationResult<void> ThinIRMutation::reserve_site(uint32_t vregs, uint32_t frame_bytes,
-                                      uint32_t instructions, uint32_t blocks) {
+                                      uint32_t instructions, uint32_t blocks,
+                                      uint32_t rodata_bytes) {
     MutationResult<void> res;
     if (committed_) {
         res.error = {MutationStatus::NotCommitted, "reserve_site after commit"};
@@ -490,6 +524,19 @@ MutationResult<void> ThinIRMutation::reserve_site(uint32_t vregs, uint32_t frame
     if (blocks > limits_.max_added_blocks ||
         added_blocks_ > limits_.max_added_blocks - blocks) {
         res.error = {MutationStatus::LimitExceeded, "max_added_blocks exceeded (preflight)"};
+        return res;
+    }
+
+    // Soft rodata-byte limit (checked: added_rodata_bytes_ + rodata_bytes).
+    if (rodata_bytes > limits_.max_added_rodata_bytes ||
+        added_rodata_bytes_ > limits_.max_added_rodata_bytes - rodata_bytes) {
+        res.error = {MutationStatus::LimitExceeded, "max_added_rodata_bytes exceeded (preflight)"};
+        return res;
+    }
+    // Checked rodata-offset arithmetic: next_rodata_off_ + rodata_bytes must
+    // not overflow uint32_t.
+    if (uint64_t(next_rodata_off_) + uint64_t(rodata_bytes) > uint64_t(UINT32_MAX)) {
+        res.error = {MutationStatus::LimitExceeded, "rodata offset overflow (preflight)"};
         return res;
     }
 
