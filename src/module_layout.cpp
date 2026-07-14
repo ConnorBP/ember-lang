@@ -1373,7 +1373,7 @@ extern "C" int64_t ember_keyed_padding_trap(ember::context_t* ctx) noexcept {
 // It has NO key parameter and performs NO key comparison (§7.3). The C-ABI
 // `ember_keyed_padding_trap` above (ctx in rcx) remains for the host/Red 4 test
 // path; this r14 variant is what the keyed record installs at padding slots.
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__GNUC__) && defined(__x86_64__)
 extern "C" int64_t ember_keyed_padding_trap_r14(ember::context_t* /*unused*/) noexcept;
 asm(
     ".p2align 4\n"

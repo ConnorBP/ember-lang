@@ -753,8 +753,9 @@ struct EmitCtx {
     // in `hidden_dest_vreg` (a vreg holding the dest pointer, when != 0) or, if
     // that is 0, in `hidden_dest_off` (a frame slot the callee writes into, via
     // `lea rax, [rbp+hidden_dest_off]`). For regular calls both are 0 and
-    // `ret_struct` is false. The handle word (for indirect calls) is at
-    // [rsp+stash_size] if `is_indirect`.
+    // `ret_struct` is false. The handle word (for indirect calls) is stashed at
+    // [rsp+stash_size] (the first 8 bytes of the Win64 shadow space) if
+    // `is_indirect`.
     void emit_call_arg_stash(const ThinInstr& in, std::vector<CallArg>& ops,
                              bool ret_struct, VReg hidden_dest_vreg,
                              int32_t hidden_dest_off, bool is_indirect) {
@@ -762,7 +763,18 @@ struct EmitCtx {
         for (auto& op : ops) n += op.words;
         if (ret_struct) n += 1;  // word 0 = hidden dest ptr
         int32_t stash_size = n * 8;
-        int32_t handle_word = is_indirect ? 8 : 0;
+        // The indirect-call handle lives in the FIRST 8 bytes of the Win64
+        // shadow space ([rsp+stash_size]), NOT as a separate word between the
+        // stash and the shadow. A separate handle word would shift outgoing
+        // stack args by 8 bytes relative to where the callee's param-spill
+        // reads them (emit_param_spills expects outgoing at [rbp+48+stash_size+
+        // (w-4)*8] = caller rsp + stash_size + 32 + (w-4)*8, i.e. shadow
+        // immediately after the stash, outgoing immediately after the 32-byte
+        // shadow). The handle is reloaded BEFORE the call (for the keyed
+        // resolve or the lea+load dispatch), so the callee reusing its shadow
+        // after the call never clobbers a live value. handle_word stays 0 so
+        // `total` + the outgoing-arg offsets match that callee expectation.
+        int32_t handle_word = 0;
         int32_t outgoing = std::max(0, n - 4) * 8;
         int32_t total = round16(stash_size + handle_word + 32 + outgoing);
 
