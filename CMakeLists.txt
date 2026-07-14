@@ -108,6 +108,13 @@ add_library(ember STATIC
     # with no ember_frontend dependency (one-way link direction).
     src/thin_effects.cpp
     src/thin_ir_mutation.cpp
+    # Red 1 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §14.3): the versioned
+    # reference affine dispatch permutation. Self-contained — only unsigned
+    # integer arithmetic + the shared ExtensionResult/ExtensionError vocabulary
+    # (extension_registry.hpp), no Type methods, no frontend symbols — so it
+    # stays in the core lib with no ember_frontend dependency (one-way link
+    # direction), matching thin_ir.cpp / thin_ir_ser.cpp / em_type_codec.cpp.
+    src/keyed_dispatch.cpp
     src/gc.cpp              # GC: tracing mark-sweep core (foundational infra for lambdas/coroutines)
     src/safety.cpp          # process-wide failsafes: RSS memory cap, recursion depth guard, deadline
 )
@@ -150,6 +157,19 @@ add_library(ember_frontend STATIC
     # concern) and depends only on extension_registry.hpp (header-only) + the
     # C++ standard library.
     src/seed_derivation.cpp
+    # Red 2 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §7, §14.3): the
+    # stable canonical ABI fingerprint classifier. A concrete CallableDescriptor
+    # + a pinned byte encoder + a non-std::hash 64-bit FNV-1a fingerprint.
+    # Lives in ember_frontend (a compile-time/layout concern) and depends only
+    # on the C++ standard library.
+    src/dispatch_abi.cpp
+    # Red 3 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §5, §9.2, §14.3): the
+    # logical/physical module layout planner, identity layout, and the configured
+    # KeyedDispatchRegistry for implicit-keyed-v1. A compile-time/layout concern
+    # that depends on keyed_dispatch.* (core ember, the Red 1 helper — reached via
+    # ember_frontend -> ember) and dispatch_abi.hpp (Red 2 header-only enum types).
+    # No cycle: the core lib never depends on ember_frontend.
+    src/module_layout.cpp
 )
 target_include_directories(ember_frontend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ember_frontend PUBLIC ember)
@@ -1088,6 +1108,46 @@ add_test(NAME thin_ir COMMAND thin_ir_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 add_executable(thin_ir_struct_test examples/thin_ir_struct_test.cpp)
 target_link_libraries(thin_ir_struct_test PRIVATE ember)
 add_test(NAME thin_ir_struct COMMAND thin_ir_struct_test)
+
+# keyed_dispatch_math - Red 1 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md
+# §14.3): the versioned reference affine dispatch permutation's property/
+# bijection/bounds/domain-separation/wrong-key gate. Pins determinism,
+# exhaustive bijection+bounds for every domain size 2..KEYED_DISPATCH_MAX_DOMAIN_SIZE,
+# route words 0 and UINT64_MAX, first/last ordinals, multiple keys/salts/
+# strategy versions, domain-separated pinned vectors, many wrong keys,
+# hard-coded golden vectors, distinct build/runtime wrapper parity, and
+# structured ExtensionResult/ExtensionError rejection of invalid sizes/
+# ordinals. Cross-checks the production helper against an INDEPENDENT
+# reimplementation of the spec written in the test (two implementations of
+# one spec, exhaustively cross-checked). Links only the core `ember` lib
+# (keyed_dispatch.* lives there, same self-contained discipline as thin_ir.cpp
+# / thin_ir_ser.cpp). NOT a CTest entry: the filtered suite count must stay
+# 67 (see docs/planning/plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §14.1);
+# the target building cleanly + the executable passing IS the gate.
+add_executable(keyed_dispatch_math examples/keyed_dispatch_math_test.cpp)
+target_link_libraries(keyed_dispatch_math PRIVATE ember)
+
+# module_layout_test - Red 3 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md
+# §5, §9.2, §14.3): the logical/physical module-layout planner gate. Pins
+# canonical-classifier fingerprints (Red 2), domain grouping by module/
+# visibility/calling-mode/ABI-fingerprint/label, golden logical-to-physical
+# placements under two pinned target route words (cross-checked against an
+# independent salt/route-word oracle + the Red 1 permute helper), deterministic
+# repeat builds, different keyed layouts, dense logical identity, exact
+# ABI/visibility/label isolation, one ABI-compatible padding entry per keyed
+# domain, singleton-real-function domains with physical count two, wrong-key
+# per-domain in-range + same-metadata safety (NOT a global-range assertion),
+# strict negatives (duplicate/non-dense slots, missing routes, overlapping/OOB
+# placements, missing/duplicate padding, inconsistent counts, cross-ABI/
+# cross-visibility membership, oversized domains, empty modules), disabled
+# identity layout (slot i -> physical i, counts match, no padding), and the
+# configured KeyedDispatchRegistry (implicit-keyed-v1) with structured
+# diagnostics. Links ember (keyed_dispatch.* — Red 1 helper) + ember_frontend
+# (dispatch_abi.* — Red 2 classifier, module_layout.* — Red 3 planner). NOT a
+# CTest entry: the filtered suite count must stay 67 (§14.1); the target
+# building cleanly + the executable passing IS the gate.
+add_executable(module_layout_test examples/module_layout_test.cpp)
+target_link_libraries(module_layout_test PRIVATE ember ember_frontend)
 
 # thin_ir_ser_test - Stage B c1b (IL-.em): the IR SERIALIZER round-trip gate.
 # Hand-builds a ThinFunction + uses the real lower_function path (fib) to

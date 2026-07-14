@@ -88,6 +88,7 @@ StructLayoutTable build_struct_layouts(const Program& prog) {
         }
         active.erase(name);
         layout.size = int32_t(off);
+        layout.alignment = 1;  // script structs are packed (no alignment padding)
         out[name] = std::move(layout);
         return true;
     };

@@ -87,6 +87,15 @@ struct OpOverloadTable {
 struct StructFieldLayout { const Type* ty; int32_t offset; };
 struct StructLayout {
     int32_t size = 0;
+    // The struct's alignment requirement in bytes. Script-declared structs
+    // use packed declaration-order layout with alignment 1 (no padding);
+    // host-registered structs (register_struct in binding_builder.hpp) carry
+    // their computed C++ natural alignment. The ABI classifier
+    // (dispatch_abi.hpp) encodes this so two aggregates with identical size
+    // but different alignment (packed vs C++-aligned) produce distinct
+    // fingerprints. Defaults to 1 so existing script-struct behavior is
+    // unchanged; no existing code reads this field.
+    uint32_t alignment = 1;
     std::vector<std::string> field_names;   // declaration order
     std::unordered_map<std::string, StructFieldLayout> fields;
     // Host-registered structs own their field Types via shared_ptrs so the

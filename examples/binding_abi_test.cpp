@@ -36,6 +36,7 @@
 #include "../src/codegen.hpp"
 #include "../src/binding_builder.hpp"
 #include "../src/jit_memory.hpp"
+#include "../src/dispatch_abi.hpp"
 
 #include "ext_vec.hpp"
 #include "ext_math.hpp"
@@ -734,6 +735,688 @@ static void test_mixed_slot_parallel() {
     std::printf("       got=%lld\n", (long long)r);
 }
 
+// ===========================================================================
+// Red 2 — ABI classifier fingerprint tests (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §7, §14.3)
+//
+// The existing ABI tests above pin the CALLING SEQUENCE (the host receives the
+// values in the right registers). These tests pin the CANONICAL FINGERPRINT —
+// the stable byte encoding + 64-bit FNV-1a that partitions callables into
+// exact ABI domains for keyed dispatch. Every ABI shape exercised above has a
+// pinned golden byte encoding + golden fingerprint; every collision-negative
+// pair (similar size/word count but different ABI) must produce DISTINCT
+// fingerprints.
+//
+// The classifier is src/dispatch_abi.{hpp,cpp}. The encoding is fully
+// specified in dispatch_abi.hpp: explicit tags, length-prefixed UTF-8 names,
+// fixed-width little-endian integers, deterministic field order, a fixed
+// domain header, a pinned FNV-1a 64-bit (NOT std::hash, NOT Type::to_string,
+// no native struct bytes, no pointer values, no unordered-map iteration
+// order). Each parameter encodes an EXPLICIT class for every occupied word
+// (GP / XmmF32 / XmmF64 / Stack / HiddenPtr), the param's true byte extent,
+// and the width of any partial final word, so a 12-byte V3 (2 words, 4-byte
+// partial final word) is distinguishable from a 16-byte two-word aggregate,
+// and a stack-spill word is distinguishable from a GP-register word. A nominal
+// opaque handle (vec3-style) is encoded as its own type kind so its return is
+// distinguishable from an ordinary i64 scalar.
+// ===========================================================================
+
+// Hex-compare a canonical byte encoding against a pinned golden hex string.
+// The golden string is whitespace-tolerant (spaces/newlines ignored) so the
+// pinned values are readable in the source.
+static std::string hex_to_bytes(const char* hex) {
+    std::string out;
+    for (const char* p = hex; *p; ++p) {
+        char c = *p;
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+        // read two hex digits
+        char hi = c;
+        const char* q = p + 1;
+        if (!*q) break;
+        char lo = *q;
+        auto hv = [](char ch) -> int {
+            if (ch >= '0' && ch <= '9') return ch - '0';
+            if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+            if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+            return -1;
+        };
+        int h = hv(hi), l = hv(lo);
+        if (h < 0 || l < 0) break;
+        out.push_back(static_cast<char>((h << 4) | l));
+        p = q;  // advance past the second digit
+    }
+    return out;
+}
+
+static void check_abi_encoding(const char* tag, const ember::CallableDescriptor& d,
+                               const char* golden_hex, uint64_t golden_fp) {
+    ember::AbiClassification c = ember::classify_callable(d);
+    std::string golden = hex_to_bytes(golden_hex);
+    bool bytes_ok = (c.bytes == golden);
+    bool fp_ok = (c.fingerprint == golden_fp);
+    record(bytes_ok && fp_ok, tag);
+    if (!bytes_ok) {
+        std::printf("       bytes mismatch: got %zu bytes, expected %zu\n",
+                    c.bytes.size(), golden.size());
+        std::printf("       got:    ");
+        for (size_t i = 0; i < c.bytes.size(); ++i)
+            std::printf("%02X", static_cast<uint8_t>(c.bytes[i]));
+        std::printf("\n       expect: ");
+        for (size_t i = 0; i < golden.size(); ++i)
+            std::printf("%02X", static_cast<uint8_t>(golden[i]));
+        std::printf("\n");
+    }
+    if (!fp_ok) {
+        std::printf("       fingerprint mismatch: got 0x%016llX, expected 0x%016llX\n",
+                    (unsigned long long)c.fingerprint, (unsigned long long)golden_fp);
+    }
+}
+
+static void check_fp_differs(const char* tag, uint64_t fp_a, uint64_t fp_b) {
+    record(fp_a != fp_b, tag);
+    if (fp_a == fp_b)
+        std::printf("       both fingerprints are 0x%016llX\n",
+                    (unsigned long long)fp_a);
+}
+
+// ─── ABI shape golden vectors (from binding_abi_test + win64_abi_test) ───
+
+// [A1] no-argument scalar function: fn entry() -> i64
+// DOMAIN | arch=0 | conv=1 | mode=legacy(0) | vis=public(1) | ret=gp(1)
+//       | ret_type=Scalar(I64) | hidden_ret=0 | hidden_env=0 | coroutine=0
+//       | special=0 | param_count=0
+static void test_abi_no_arg_scalar() {
+    using namespace ember;
+    CallableDescriptor d;
+    d.return_kind = ReturnKind::GpScalar;
+    d.return_type = abi_scalar(PrimTag::I64);
+    static const char* golden =
+        "45 6D 62 65 72 2E 44 69 73 70 61 74 63 68 41 62"
+        " 69 2E 76 31 00 01 00 00 00 00 01 01 00 05 00 00"
+        " 00 00 00 00 00 00";
+    check_abi_encoding("[AB1] no-arg scalar fn -> i64 (golden bytes+fingerprint)",
+                       d, golden, 0x5E4DC79110E73983ULL);
+}
+
+// [A2] Pair8 by-value param: add_pair8(Pair8) -> i64
+// Pair8 { x: i32 @0, y: i32 @4 }, size=8, align=1 (script packed), 1 word GP
+// Param: word_count=1, byte_extent=8, partial_final=0, classes={GP}, pos=0
+static void test_abi_pair8_param() {
+    using namespace ember;
+    CallableDescriptor d;
+    d.return_kind = ReturnKind::GpScalar;
+    d.return_type = abi_scalar(PrimTag::I64);
+    AbiType pair8 = abi_struct("Pair8", 8, 1, {
+        {"x", 0, std::make_shared<AbiType>(abi_scalar(PrimTag::I32))},
+        {"y", 4, std::make_shared<AbiType>(abi_scalar(PrimTag::I32))},
+    });
+    d.params.push_back(abi_param(pair8, 1, 8, 0, {WordClass::GP}, 0));
+    static const char* golden =
+        "45 6D 62 65 72 2E 44 69 73 70 61 74 63 68 41 62"
+        " 69 2E 76 31 00 01 00 00 00 00 01 01 00 05 00 00"
+        " 00 00 01 00 00 00 01 05 00 00 00 50 61 69 72 38"
+        " 08 00 00 00 01 00 00 00 02 00 00 00 01 00 00 00"
+        " 78 00 00 00 00 00 04 01 00 00 00 79 04 00 00 00"
+        " 00 04 01 00 00 00 08 00 00 00 00 00 00 00 01 00"
+        " 00 00 00 00 00 00 00";
+    check_abi_encoding("[AB2] Pair8 by-value param -> i64 (golden bytes+fingerprint)",
+                       d, golden, 0xEF26EBAB179ECBDAULL);
+}
+
+// [A3] PackedOuter nested by-value param: read_packed(PackedOuter) -> i64
+// PackedInner { a: u8 @0, b: u16 @1 } size=3 align=1
+// PackedOuter { tag: u8 @0, value: i32 @1, inner: PackedInner @5 } size=8 align=1
+// Param: 1 word, 8 bytes, no partial final word, class {GP}, pos 0
+static void test_abi_packed_outer_param() {
+    using namespace ember;
+    CallableDescriptor d;
+    d.return_kind = ReturnKind::GpScalar;
+    d.return_type = abi_scalar(PrimTag::I64);
+    AbiType inner = abi_struct("PackedInner", 3, 1, {
+        {"a", 0, std::make_shared<AbiType>(abi_scalar(PrimTag::U8))},
+        {"b", 1, std::make_shared<AbiType>(abi_scalar(PrimTag::U16))},
+    });
+    AbiType outer = abi_struct("PackedOuter", 8, 1, {
+        {"tag", 0, std::make_shared<AbiType>(abi_scalar(PrimTag::U8))},
+        {"value", 1, std::make_shared<AbiType>(abi_scalar(PrimTag::I32))},
+        {"inner", 5, std::make_shared<AbiType>(inner)},
+    });
+    d.params.push_back(abi_param(outer, 1, 8, 0, {WordClass::GP}, 0));
+    static const char* golden =
+        "45 6D 62 65 72 2E 44 69 73 70 61 74 63 68 41 62"
+        " 69 2E 76 31 00 01 00 00 00 00 01 01 00 05 00 00"
+        " 00 00 01 00 00 00 01 0B 00 00 00 50 61 63 6B 65"
+        " 64 4F 75 74 65 72 08 00 00 00 01 00 00 00 03 00"
+        " 00 00 03 00 00 00 74 61 67 00 00 00 00 00 06 05"
+        " 00 00 00 76 61 6C 75 65 01 00 00 00 00 04 05 00"
+        " 00 00 69 6E 6E 65 72 05 00 00 00 01 0B 00 00 00"
+        " 50 61 63 6B 65 64 49 6E 6E 65 72 03 00 00 00 01"
+        " 00 00 00 02 00 00 00 01 00 00 00 61 00 00 00 00"
+        " 00 06 01 00 00 00 62 01 00 00 00 00 07 01 00 00"
+        " 00 08 00 00 00 00 00 00 00 01 00 00 00 00 00 00"
+        " 00 00";
+    check_abi_encoding("[AB3] PackedOuter nested by-value param -> i64 (golden bytes+fingerprint)",
+                       d, golden, 0x4DD5675FB5FDD8B6ULL);
+}
+
+// [A4] Vec3s hidden aggregate return: make_vec3s(f32,f32,f32) -> Vec3s
+// Vec3s { x: f32 @0, y: f32 @4, z: f32 @8 } size=12 align=1 (script packed)
+// Hidden return ptr at word 0; f32 args at words 1,2,3 -> xmm1,xmm2,xmm3
+// Each f32 param: word_count=1, byte_extent=4, partial_final=4, class {XmmF32}
+static void test_abi_vec3s_hidden_ret() {
+    using namespace ember;
+    CallableDescriptor d;
+    d.return_kind = ReturnKind::HiddenAggregate;
+    AbiType vec3s = abi_struct("Vec3s", 12, 1, {
+        {"x", 0, std::make_shared<AbiType>(abi_scalar(PrimTag::F32))},
+        {"y", 4, std::make_shared<AbiType>(abi_scalar(PrimTag::F32))},
+        {"z", 8, std::make_shared<AbiType>(abi_scalar(PrimTag::F32))},
+    });
+    d.return_type = vec3s;
+    d.has_hidden_return = true;
+    d.params.push_back(abi_param(abi_scalar(PrimTag::F32), 1, 4, 4, {WordClass::XmmF32}, 1));
+    d.params.push_back(abi_param(abi_scalar(PrimTag::F32), 1, 4, 4, {WordClass::XmmF32}, 2));
+    d.params.push_back(abi_param(abi_scalar(PrimTag::F32), 1, 4, 4, {WordClass::XmmF32}, 3));
+    static const char* golden =
+        "45 6D 62 65 72 2E 44 69 73 70 61 74 63 68 41 62"
+        " 69 2E 76 31 00 01 00 00 00 00 01 06 01 05 00 00"
+        " 00 56 65 63 33 73 0C 00 00 00 01 00 00 00 03 00"
+        " 00 00 01 00 00 00 78 00 00 00 00 00 0A 01 00 00"
+        " 00 79 04 00 00 00 00 0A 01 00 00 00 7A 08 00 00"
+        " 00 00 0A 01 00 00 00 03 00 00 00 00 0A 01 00 00"
+        " 00 04 00 00 00 04 00 00 00 01 00 00 00 01 01 00"
+        " 00 00 00 0A 01 00 00 00 04 00 00 00 04 00 00 00"
+        " 01 00 00 00 01 02 00 00 00 00 0A 01 00 00 00 04"
+        " 00 00 00 04 00 00 00 01 00 00 00 01 03 00 00 00";
+    check_abi_encoding("[AB4] Vec3s hidden agg ret (f32,f32,f32) (golden bytes+fingerprint)",
+                       d, golden, 0x1E4F48671CF0C28CULL);
+}
+
+// [A5] six GP args with stack spill: sum6(i64,i64,i64,i64,i64,i64) -> i64
+// words 0-3 in rcx/rdx/r8/r9 (GP), words 4-5 on the outgoing stack (Stack)
+static void test_abi_six_gp_args() {
+    using namespace ember;
+    CallableDescriptor d;
+    d.return_kind = ReturnKind::GpScalar;
+    d.return_type = abi_scalar(PrimTag::I64);
+    for (uint32_t i = 0; i < 6; ++i) {
+        WordClass wc = (i < 4) ? WordClass::GP : WordClass::Stack;
+        d.params.push_back(abi_param(abi_scalar(PrimTag::I64), 1, 8, 0, {wc}, i));
+    }
+    static const char* golden =
+        "45 6D 62 65 72 2E 44 69 73 70 61 74 63 68 41 62"
+        " 69 2E 76 31 00 01 00 00 00 00 01 01 00 05 00 00"
+        " 00 00 06 00 00 00 00 05 01 00 00 00 08 00 00 00"
+        " 00 00 00 00 01 00 00 00 00 00 00 00 00 00 05 01"
+        " 00 00 00 08 00 00 00 00 00 00 00 01 00 00 00 00"
+        " 01 00 00 00 00 05 01 00 00 00 08 00 00 00 00 00"
+        " 00 00 01 00 00 00 00 02 00 00 00 00 05 01 00 00"
+        " 00 08 00 00 00 00 00 00 00 01 00 00 00 00 03 00"
+        " 00 00 00 05 01 00 00 00 08 00 00 00 00 00 00 00"
+        " 01 00 00 00 04 04 00 00 00 00 05 01 00 00 00 08"
+        " 00 00 00 00 00 00 00 01 00 00 00 04 05 00 00 00";
+    check_abi_encoding("[AB5] six GP args with stack spill -> i64 (golden bytes+fingerprint)",
+                       d, golden, 0xBF7448398219C772ULL);
+}
+
+// [A6] f32 args + f32 return: fadd(f32,f32) -> f32
+// word 0 = xmm0, word 1 = xmm1 (slot-parallel for floats)
+static void test_abi_f32_args() {
+    using namespace ember;
+    CallableDescriptor d;
+    d.return_kind = ReturnKind::XmmF32;
+    d.return_type = abi_scalar(PrimTag::F32);
+    d.params.push_back(abi_param(abi_scalar(PrimTag::F32), 1, 4, 4, {WordClass::XmmF32}, 0));
+    d.params.push_back(abi_param(abi_scalar(PrimTag::F32), 1, 4, 4, {WordClass::XmmF32}, 1));
+    static const char* golden =
+        "45 6D 62 65 72 2E 44 69 73 70 61 74 63 68 41 62"
+        " 69 2E 76 31 00 01 00 00 00 00 01 02 00 0A 00 00"
+        " 00 00 02 00 00 00 00 0A 01 00 00 00 04 00 00 00"
+        " 04 00 00 00 01 00 00 00 01 00 00 00 00 00 0A 01"
+        " 00 00 00 04 00 00 00 04 00 00 00 01 00 00 00 01"
+        " 01 00 00 00";
+    check_abi_encoding("[AB6] f32 args (xmm0,xmm1) -> f32 (golden bytes+fingerprint)",
+                       d, golden, 0x8583716DB7BA791EULL);
+}
+
+// [A7] slice ptr+len: first_byte(slice<u8>) -> i64
+// 1 slice param -> 2 words (ptr@0=rcx, len@1=rdx), both GP, byte_extent=16
+static void test_abi_slice_param() {
+    using namespace ember;
+    CallableDescriptor d;
+    d.return_kind = ReturnKind::GpScalar;
+    d.return_type = abi_scalar(PrimTag::I64);
+    AbiType slice_u8 = abi_slice(abi_scalar(PrimTag::U8));
+    d.params.push_back(abi_param(slice_u8, 2, 16, 0, {WordClass::GP, WordClass::GP}, 0));
+    static const char* golden =
+        "45 6D 62 65 72 2E 44 69 73 70 61 74 63 68 41 62"
+        " 69 2E 76 31 00 01 00 00 00 00 01 01 00 05 00 00"
+        " 00 00 01 00 00 00 02 00 06 02 00 00 00 10 00 00"
+        " 00 00 00 00 00 02 00 00 00 00 00 00 00 00 00";
+    check_abi_encoding("[AB7] slice<u8> ptr+len -> i64 (golden bytes+fingerprint)",
+                       d, golden, 0xB788CDA6BCA585A2ULL);
+}
+
+// [A8] mixed i64/f32/i64 slot-parallel: mixed_if(i64,f32,i64) -> i64
+// word0=GP(rcx), word1=XmmF32(xmm1 NOT xmm0), word2=GP(r8)
+static void test_abi_mixed_slot_parallel() {
+    using namespace ember;
+    CallableDescriptor d;
+    d.return_kind = ReturnKind::GpScalar;
+    d.return_type = abi_scalar(PrimTag::I64);
+    d.params.push_back(abi_param(abi_scalar(PrimTag::I64), 1, 8, 0, {WordClass::GP}, 0));
+    d.params.push_back(abi_param(abi_scalar(PrimTag::F32), 1, 4, 4, {WordClass::XmmF32}, 1));
+    d.params.push_back(abi_param(abi_scalar(PrimTag::I64), 1, 8, 0, {WordClass::GP}, 2));
+    static const char* golden =
+        "45 6D 62 65 72 2E 44 69 73 70 61 74 63 68 41 62"
+        " 69 2E 76 31 00 01 00 00 00 00 01 01 00 05 00 00"
+        " 00 00 03 00 00 00 00 05 01 00 00 00 08 00 00 00"
+        " 00 00 00 00 01 00 00 00 00 00 00 00 00 00 0A 01"
+        " 00 00 00 04 00 00 00 04 00 00 00 01 00 00 00 01"
+        " 01 00 00 00 00 05 01 00 00 00 08 00 00 00 00 00"
+        " 00 00 01 00 00 00 00 02 00 00 00";
+    check_abi_encoding("[AB8] mixed i64/f32/i64 slot-parallel -> i64 (golden bytes+fingerprint)",
+                       d, golden, 0x429AA7814484E92EULL);
+}
+
+// [A9] opaque vec3 handle return: vec3_new(f32,f32,f32) -> vec3 handle
+// The vec3 handle is a NOMINAL opaque handle (TypeKind::OpaqueHandle, name
+// "vec3", 8-byte storage) returned via the OpaqueHandle return kind, NOT an
+// ordinary Scalar(I64) GpScalar return. This makes the handle's return
+// representation distinguishable from a plain i64.
+static void test_abi_vec3_handle_ret() {
+    using namespace ember;
+    CallableDescriptor d;
+    d.return_kind = ReturnKind::OpaqueHandle;
+    d.return_type = abi_opaque_handle("vec3", 8);
+    d.params.push_back(abi_param(abi_scalar(PrimTag::F32), 1, 4, 4, {WordClass::XmmF32}, 0));
+    d.params.push_back(abi_param(abi_scalar(PrimTag::F32), 1, 4, 4, {WordClass::XmmF32}, 1));
+    d.params.push_back(abi_param(abi_scalar(PrimTag::F32), 1, 4, 4, {WordClass::XmmF32}, 2));
+    static const char* golden =
+        "45 6D 62 65 72 2E 44 69 73 70 61 74 63 68 41 62"
+        " 69 2E 76 31 00 01 00 00 00 00 01 07 06 04 00 00"
+        " 00 76 65 63 33 08 00 00 00 00 00 00 00 03 00 00"
+        " 00 00 0A 01 00 00 00 04 00 00 00 04 00 00 00 01"
+        " 00 00 00 01 00 00 00 00 00 0A 01 00 00 00 04 00"
+        " 00 00 04 00 00 00 01 00 00 00 01 01 00 00 00 00"
+        " 0A 01 00 00 00 04 00 00 00 04 00 00 00 01 00 00"
+        " 00 01 02 00 00 00";
+    check_abi_encoding("[AB9] opaque vec3 handle ret (f32,f32,f32) -> vec3 handle (golden bytes+fingerprint)",
+                       d, golden, 0x25A610C7C2C166FEULL);
+}
+
+// [A10] ordinary i64 entry signature: fn main(x: i64) -> i64
+static void test_abi_ordinary_i64_entry() {
+    using namespace ember;
+    CallableDescriptor d;
+    d.return_kind = ReturnKind::GpScalar;
+    d.return_type = abi_scalar(PrimTag::I64);
+    d.params.push_back(abi_param(abi_scalar(PrimTag::I64), 1, 8, 0, {WordClass::GP}, 0));
+    static const char* golden =
+        "45 6D 62 65 72 2E 44 69 73 70 61 74 63 68 41 62"
+        " 69 2E 76 31 00 01 00 00 00 00 01 01 00 05 00 00"
+        " 00 00 01 00 00 00 00 05 01 00 00 00 08 00 00 00"
+        " 00 00 00 00 01 00 00 00 00 00 00 00 00";
+    check_abi_encoding("[AB10] ordinary i64 entry (i64) -> i64 (golden bytes+fingerprint)",
+                       d, golden, 0x11B05B43CD30AA73ULL);
+}
+
+// ─── Complete V3 golden vectors ───
+//
+// The V3 struct { x: f32, y: f32, z: f32 } is 12 bytes (script packed,
+// align=1). It occupies 2 GP words with a 4-byte partial final word. These
+// four vectors cover every V3 ABI shape exercised by the calling-sequence
+// tests above ([2c], [2d], [2e]) plus the by-value param shape.
+
+static ember::AbiType v3_struct_type() {
+    using namespace ember;
+    return abi_struct("V3", 12, 1, {
+        {"x", 0, std::make_shared<AbiType>(abi_scalar(PrimTag::F32))},
+        {"y", 4, std::make_shared<AbiType>(abi_scalar(PrimTag::F32))},
+        {"z", 8, std::make_shared<AbiType>(abi_scalar(PrimTag::F32))},
+    });
+}
+
+// [V1] no-argument hidden aggregate return: v3_lit_up() -> V3
+// Hidden return ptr at word 0; no params. (matches calling-seq test [2c])
+static void test_abi_v3_no_arg_hidden_ret() {
+    using namespace ember;
+    CallableDescriptor d;
+    d.return_kind = ReturnKind::HiddenAggregate;
+    d.return_type = v3_struct_type();
+    d.has_hidden_return = true;
+    static const char* golden =
+        "45 6D 62 65 72 2E 44 69 73 70 61 74 63 68 41 62"
+        " 69 2E 76 31 00 01 00 00 00 00 01 06 01 02 00 00"
+        " 00 56 33 0C 00 00 00 01 00 00 00 03 00 00 00 01"
+        " 00 00 00 78 00 00 00 00 00 0A 01 00 00 00 79 04"
+        " 00 00 00 00 0A 01 00 00 00 7A 08 00 00 00 00 0A"
+        " 01 00 00 00 00 00 00 00";
+    check_abi_encoding("[AB-V1] no-arg hidden agg ret: v3_lit_up() -> V3 (golden bytes+fingerprint)",
+                       d, golden, 0xA1CF1DABB196BC68ULL);
+}
+
+// [V2] 12-byte V3 by-value param with a partial final word: take_v3(v: V3) -> i64
+// V3 occupies 2 words (8 + 4 partial), byte_extent=12, partial_final=4.
+static void test_abi_v3_by_value_param() {
+    using namespace ember;
+    CallableDescriptor d;
+    d.return_kind = ReturnKind::GpScalar;
+    d.return_type = abi_scalar(PrimTag::I64);
+    d.params.push_back(abi_param(v3_struct_type(), 2, 12, 4, {WordClass::GP, WordClass::GP}, 0));
+    static const char* golden =
+        "45 6D 62 65 72 2E 44 69 73 70 61 74 63 68 41 62"
+        " 69 2E 76 31 00 01 00 00 00 00 01 01 00 05 00 00"
+        " 00 00 01 00 00 00 01 02 00 00 00 56 33 0C 00 00"
+        " 00 01 00 00 00 03 00 00 00 01 00 00 00 78 00 00"
+        " 00 00 00 0A 01 00 00 00 79 04 00 00 00 00 0A 01"
+        " 00 00 00 7A 08 00 00 00 00 0A 02 00 00 00 0C 00"
+        " 00 00 04 00 00 00 02 00 00 00 00 00 00 00 00 00";
+    check_abi_encoding("[AB-V2] V3 by-value param (2 words, 4-byte partial final) -> i64 (golden bytes+fingerprint)",
+                       d, golden, 0x8A50F36DE61E26F2ULL);
+}
+
+// [V3] two V3 parameters: v3_dot(a: V3, b: V3) -> f32
+// V3 a at words 0,1 (rcx,rdx = GP,GP); V3 b at words 2,3 (r8 = GP, then word 3
+// spills to the outgoing stack = GP,Stack). (matches calling-seq test [2d])
+static void test_abi_v3_two_params() {
+    using namespace ember;
+    CallableDescriptor d;
+    d.return_kind = ReturnKind::XmmF32;
+    d.return_type = abi_scalar(PrimTag::F32);
+    d.params.push_back(abi_param(v3_struct_type(), 2, 12, 4, {WordClass::GP, WordClass::GP}, 0));
+    d.params.push_back(abi_param(v3_struct_type(), 2, 12, 4, {WordClass::GP, WordClass::Stack}, 2));
+    static const char* golden =
+        "45 6D 62 65 72 2E 44 69 73 70 61 74 63 68 41 62"
+        " 69 2E 76 31 00 01 00 00 00 00 01 02 00 0A 00 00"
+        " 00 00 02 00 00 00 01 02 00 00 00 56 33 0C 00 00"
+        " 00 01 00 00 00 03 00 00 00 01 00 00 00 78 00 00"
+        " 00 00 00 0A 01 00 00 00 79 04 00 00 00 00 0A 01"
+        " 00 00 00 7A 08 00 00 00 00 0A 02 00 00 00 0C 00"
+        " 00 00 04 00 00 00 02 00 00 00 00 00 00 00 00 00"
+        " 01 02 00 00 00 56 33 0C 00 00 00 01 00 00 00 03"
+        " 00 00 00 01 00 00 00 78 00 00 00 00 00 0A 01 00"
+        " 00 00 79 04 00 00 00 00 0A 01 00 00 00 7A 08 00"
+        " 00 00 00 0A 02 00 00 00 0C 00 00 00 04 00 00 00"
+        " 02 00 00 00 00 04 02 00 00 00";
+    check_abi_encoding("[AB-V3] two V3 params: v3_dot(a: V3, b: V3) -> f32 (golden bytes+fingerprint)",
+                       d, golden, 0x1871454329088573ULL);
+}
+
+// [V4] hidden-return-plus-V3-parameter placement: v3_shift(a: V3) -> V3
+// Hidden return ptr at word 0 (HiddenPtr class is implicit in has_hidden_return
+// + start_position offset); the V3 param occupies words 1,2 (GP,GP). The param's
+// start_position is 1 because the hidden return pointer consumes word 0.
+// (matches calling-seq test [2e])
+static void test_abi_v3_hidden_ret_plus_param() {
+    using namespace ember;
+    CallableDescriptor d;
+    d.return_kind = ReturnKind::HiddenAggregate;
+    d.return_type = v3_struct_type();
+    d.has_hidden_return = true;
+    d.params.push_back(abi_param(v3_struct_type(), 2, 12, 4, {WordClass::GP, WordClass::GP}, 1));
+    static const char* golden =
+        "45 6D 62 65 72 2E 44 69 73 70 61 74 63 68 41 62"
+        " 69 2E 76 31 00 01 00 00 00 00 01 06 01 02 00 00"
+        " 00 56 33 0C 00 00 00 01 00 00 00 03 00 00 00 01"
+        " 00 00 00 78 00 00 00 00 00 0A 01 00 00 00 79 04"
+        " 00 00 00 00 0A 01 00 00 00 7A 08 00 00 00 00 0A"
+        " 01 00 00 00 01 00 00 00 01 02 00 00 00 56 33 0C"
+        " 00 00 00 01 00 00 00 03 00 00 00 01 00 00 00 78"
+        " 00 00 00 00 00 0A 01 00 00 00 79 04 00 00 00 00"
+        " 0A 01 00 00 00 7A 08 00 00 00 00 0A 02 00 00 00"
+        " 0C 00 00 00 04 00 00 00 02 00 00 00 00 00 01 00"
+        " 00 00";
+    check_abi_encoding("[AB-V4] hidden ret + V3 param: v3_shift(a: V3) -> V3 (golden bytes+fingerprint)",
+                       d, golden, 0xCBF495197646C198ULL);
+}
+
+// ─── Collision-negative pairs (must differ despite similar size/word count) ───
+
+static void test_abi_collision_i64_vs_f64() {
+    using namespace ember;
+    // i64 vs f64 — both 8 bytes, 1 word, but different prim + word class
+    CallableDescriptor di; di.return_kind = ReturnKind::GpScalar;
+    di.return_type = abi_scalar(PrimTag::I64);
+    di.params.push_back(abi_param(abi_scalar(PrimTag::I64), 1, 8, 0, {WordClass::GP}, 0));
+    CallableDescriptor df; df.return_kind = ReturnKind::XmmF64;
+    df.return_type = abi_scalar(PrimTag::F64);
+    df.params.push_back(abi_param(abi_scalar(PrimTag::F64), 1, 8, 0, {WordClass::XmmF64}, 0));
+    uint64_t fi = abi_fingerprint(di), ff = abi_fingerprint(df);
+    check_fp_differs("[AB-C1] i64 vs f64 fingerprints differ", fi, ff);
+}
+
+static void test_abi_collision_slice_vs_lambda() {
+    using namespace ember;
+    // slice vs lambda — both 2 words / 16 bytes, but different type kind
+    CallableDescriptor ds; ds.return_kind = ReturnKind::GpScalar;
+    ds.return_type = abi_scalar(PrimTag::I64);
+    ds.params.push_back(abi_param(abi_slice(abi_scalar(PrimTag::U8)), 2, 16, 0, {WordClass::GP, WordClass::GP}, 0));
+    CallableDescriptor dl; dl.return_kind = ReturnKind::GpScalar;
+    dl.return_type = abi_scalar(PrimTag::I64);
+    dl.params.push_back(abi_param(
+        abi_lambda({abi_scalar(PrimTag::I64)}, abi_scalar(PrimTag::I64)),
+        2, 16, 0, {WordClass::GP, WordClass::GP}, 0));
+    uint64_t fs = abi_fingerprint(ds), fl = abi_fingerprint(dl);
+    check_fp_differs("[AB-C2] slice vs lambda pair fingerprints differ", fs, fl);
+}
+
+static void test_abi_collision_i64_vs_fn_handle() {
+    using namespace ember;
+    // plain i64 vs function handle — both 1 word i64, but different type kind
+    CallableDescriptor di; di.return_kind = ReturnKind::GpScalar;
+    di.return_type = abi_scalar(PrimTag::I64);
+    di.params.push_back(abi_param(abi_scalar(PrimTag::I64), 1, 8, 0, {WordClass::GP}, 0));
+    CallableDescriptor dh; dh.return_kind = ReturnKind::GpScalar;
+    dh.return_type = abi_scalar(PrimTag::I64);
+    dh.params.push_back(abi_param(
+        abi_fn_handle("", false, false, {}, abi_scalar(PrimTag::Void)),
+        1, 8, 0, {WordClass::GP}, 0));
+    uint64_t fi = abi_fingerprint(di), fh = abi_fingerprint(dh);
+    check_fp_differs("[AB-C3] plain i64 vs fn handle fingerprints differ", fi, fh);
+}
+
+static void test_abi_collision_intra_vs_cross_module_handle() {
+    using namespace ember;
+    // intra- vs cross-module function handle — both fn_handle with recorded sig
+    CallableDescriptor din; din.return_kind = ReturnKind::GpScalar;
+    din.return_type = abi_scalar(PrimTag::I64);
+    din.params.push_back(abi_param(
+        abi_fn_handle("", false, true, {abi_scalar(PrimTag::I64)}, abi_scalar(PrimTag::I64)),
+        1, 8, 0, {WordClass::GP}, 0));
+    CallableDescriptor dcr; dcr.return_kind = ReturnKind::GpScalar;
+    dcr.return_type = abi_scalar(PrimTag::I64);
+    dcr.params.push_back(abi_param(
+        abi_fn_handle("", true, true, {abi_scalar(PrimTag::I64)}, abi_scalar(PrimTag::I64)),
+        1, 8, 0, {WordClass::GP}, 0));
+    uint64_t fi = abi_fingerprint(din), fc = abi_fingerprint(dcr);
+    check_fp_differs("[AB-C4] intra vs cross-module fn handle fingerprints differ", fi, fc);
+}
+
+static void test_abi_collision_two_aggregates_same_size() {
+    using namespace ember;
+    // Pair8 { x: i32, y: i32 } size=8 vs TwoI32 { a: i32, b: i32 } size=8
+    // same size + word count, different nominal identity
+    CallableDescriptor d1; d1.return_kind = ReturnKind::GpScalar;
+    d1.return_type = abi_scalar(PrimTag::I64);
+    AbiType pair8 = abi_struct("Pair8", 8, 1, {
+        {"x", 0, std::make_shared<AbiType>(abi_scalar(PrimTag::I32))},
+        {"y", 4, std::make_shared<AbiType>(abi_scalar(PrimTag::I32))},
+    });
+    d1.params.push_back(abi_param(pair8, 1, 8, 0, {WordClass::GP}, 0));
+    CallableDescriptor d2; d2.return_kind = ReturnKind::GpScalar;
+    d2.return_type = abi_scalar(PrimTag::I64);
+    AbiType two = abi_struct("TwoI32", 8, 1, {
+        {"a", 0, std::make_shared<AbiType>(abi_scalar(PrimTag::I32))},
+        {"b", 4, std::make_shared<AbiType>(abi_scalar(PrimTag::I32))},
+    });
+    d2.params.push_back(abi_param(two, 1, 8, 0, {WordClass::GP}, 0));
+    uint64_t f1 = abi_fingerprint(d1), f2 = abi_fingerprint(d2);
+    check_fp_differs("[AB-C5] two aggregates same size, different name: fingerprints differ", f1, f2);
+}
+
+// [AB-C6] ISOLATED alignment/layout collision. Nominal identity (name "Mixed")
+// and field TYPES (u8, u32) are kept CONSTANT; ONLY alignment, field offsets,
+// size, and the partial-final-word width change. This proves the fingerprint
+// reflects layout/alignment, not merely nominal identity or type list.
+//   packed:  { a: u8 @0, b: u32 @1 } size=5 align=1 -> 1 word, 5 bytes, partial=5
+//   aligned: { a: u8 @0, b: u32 @4 } size=8 align=4 -> 1 word, 8 bytes, partial=0
+static void test_abi_collision_alignment_layout() {
+    using namespace ember;
+    CallableDescriptor d1; d1.return_kind = ReturnKind::GpScalar;
+    d1.return_type = abi_scalar(PrimTag::I64);
+    AbiType packed = abi_struct("Mixed", 5, 1, {
+        {"a", 0, std::make_shared<AbiType>(abi_scalar(PrimTag::U8))},
+        {"b", 1, std::make_shared<AbiType>(abi_scalar(PrimTag::U32))},
+    });
+    d1.params.push_back(abi_param(packed, 1, 5, 5, {WordClass::GP}, 0));
+    CallableDescriptor d2; d2.return_kind = ReturnKind::GpScalar;
+    d2.return_type = abi_scalar(PrimTag::I64);
+    AbiType aligned = abi_struct("Mixed", 8, 4, {
+        {"a", 0, std::make_shared<AbiType>(abi_scalar(PrimTag::U8))},
+        {"b", 4, std::make_shared<AbiType>(abi_scalar(PrimTag::U32))},
+    });
+    d2.params.push_back(abi_param(aligned, 1, 8, 0, {WordClass::GP}, 0));
+    uint64_t f1 = abi_fingerprint(d1), f2 = abi_fingerprint(d2);
+    check_fp_differs("[AB-C6] isolated: same name+types, only alignment/offsets/size change: fingerprints differ", f1, f2);
+}
+
+static void test_abi_collision_hidden_ret_vs_scalar_ret() {
+    using namespace ember;
+    // hidden aggregate return vs ordinary scalar return
+    // both take (f32,f32,f32); one returns Vec3s (hidden ptr), other returns f32
+    CallableDescriptor d1; d1.return_kind = ReturnKind::HiddenAggregate;
+    AbiType vec3s = abi_struct("Vec3s", 12, 1, {
+        {"x", 0, std::make_shared<AbiType>(abi_scalar(PrimTag::F32))},
+        {"y", 4, std::make_shared<AbiType>(abi_scalar(PrimTag::F32))},
+        {"z", 8, std::make_shared<AbiType>(abi_scalar(PrimTag::F32))},
+    });
+    d1.return_type = vec3s;
+    d1.has_hidden_return = true;
+    d1.params.push_back(abi_param(abi_scalar(PrimTag::F32), 1, 4, 4, {WordClass::XmmF32}, 1));
+    d1.params.push_back(abi_param(abi_scalar(PrimTag::F32), 1, 4, 4, {WordClass::XmmF32}, 2));
+    d1.params.push_back(abi_param(abi_scalar(PrimTag::F32), 1, 4, 4, {WordClass::XmmF32}, 3));
+    CallableDescriptor d2; d2.return_kind = ReturnKind::XmmF32;
+    d2.return_type = abi_scalar(PrimTag::F32);
+    d2.params.push_back(abi_param(abi_scalar(PrimTag::F32), 1, 4, 4, {WordClass::XmmF32}, 0));
+    d2.params.push_back(abi_param(abi_scalar(PrimTag::F32), 1, 4, 4, {WordClass::XmmF32}, 1));
+    d2.params.push_back(abi_param(abi_scalar(PrimTag::F32), 1, 4, 4, {WordClass::XmmF32}, 2));
+    uint64_t f1 = abi_fingerprint(d1), f2 = abi_fingerprint(d2);
+    check_fp_differs("[AB-C7] hidden agg ret vs scalar ret: fingerprints differ", f1, f2);
+}
+
+// [AB-C8] ISOLATED placement collision. Parameter TYPES and their ORDER are
+// kept CONSTANT (i64, f32, i64); ONLY the start_position (placement) of each
+// param changes. d1 places them at words 0,1,2; d2 shifts them to words
+// 1,2,3 (as if a hidden word preceded). This proves the fingerprint reflects
+// placement, not merely the type list.
+static void test_abi_collision_placement_only() {
+    using namespace ember;
+    CallableDescriptor d1; d1.return_kind = ReturnKind::GpScalar;
+    d1.return_type = abi_scalar(PrimTag::I64);
+    d1.params.push_back(abi_param(abi_scalar(PrimTag::I64), 1, 8, 0, {WordClass::GP}, 0));
+    d1.params.push_back(abi_param(abi_scalar(PrimTag::F32), 1, 4, 4, {WordClass::XmmF32}, 1));
+    d1.params.push_back(abi_param(abi_scalar(PrimTag::I64), 1, 8, 0, {WordClass::GP}, 2));
+    CallableDescriptor d2; d2.return_kind = ReturnKind::GpScalar;
+    d2.return_type = abi_scalar(PrimTag::I64);
+    d2.params.push_back(abi_param(abi_scalar(PrimTag::I64), 1, 8, 0, {WordClass::GP}, 1));
+    d2.params.push_back(abi_param(abi_scalar(PrimTag::F32), 1, 4, 4, {WordClass::XmmF32}, 2));
+    d2.params.push_back(abi_param(abi_scalar(PrimTag::I64), 1, 8, 0, {WordClass::GP}, 3));
+    uint64_t f1 = abi_fingerprint(d1), f2 = abi_fingerprint(d2);
+    check_fp_differs("[AB-C8] isolated: same types+order, only placement (start_position) changes: fingerprints differ", f1, f2);
+}
+
+// [AB-C8b] Word-class placement collision: identical V3 two-param shape, but
+// the second V3's second word is GP in one and Stack (a spill) in the other.
+// Same types, same order, same word counts — only the per-word class differs.
+static void test_abi_collision_word_class_only() {
+    using namespace ember;
+    AbiType v3 = v3_struct_type();
+    CallableDescriptor d1; d1.return_kind = ReturnKind::XmmF32;
+    d1.return_type = abi_scalar(PrimTag::F32);
+    d1.params.push_back(abi_param(v3, 2, 12, 4, {WordClass::GP, WordClass::GP}, 0));
+    d1.params.push_back(abi_param(v3, 2, 12, 4, {WordClass::GP, WordClass::GP}, 2));
+    CallableDescriptor d2; d2.return_kind = ReturnKind::XmmF32;
+    d2.return_type = abi_scalar(PrimTag::F32);
+    d2.params.push_back(abi_param(v3, 2, 12, 4, {WordClass::GP, WordClass::GP}, 0));
+    d2.params.push_back(abi_param(v3, 2, 12, 4, {WordClass::GP, WordClass::Stack}, 2));
+    uint64_t f1 = abi_fingerprint(d1), f2 = abi_fingerprint(d2);
+    check_fp_differs("[AB-C8b] isolated: same types, only a per-word class (GP vs Stack) changes: fingerprints differ", f1, f2);
+}
+
+static void test_abi_collision_legacy_vs_keyed() {
+    using namespace ember;
+    // legacy-context vs keyed-r15 mode — same signature, different calling mode
+    CallableDescriptor d1; d1.return_kind = ReturnKind::GpScalar;
+    d1.return_type = abi_scalar(PrimTag::I64);
+    d1.params.push_back(abi_param(abi_scalar(PrimTag::I64), 1, 8, 0, {WordClass::GP}, 0));
+    d1.calling_mode = CallingMode::LegacyContext;
+    CallableDescriptor d2 = d1;
+    d2.calling_mode = CallingMode::KeyedR15;
+    uint64_t f1 = abi_fingerprint(d1), f2 = abi_fingerprint(d2);
+    check_fp_differs("[AB-C9] legacy-context vs keyed-r15 mode: fingerprints differ", f1, f2);
+}
+
+static void test_abi_collision_ordinary_vs_coroutine_special() {
+    using namespace ember;
+    // ordinary vs coroutine vs special entry — same signature, different entry
+    CallableDescriptor d1; d1.return_kind = ReturnKind::GpScalar;
+    d1.return_type = abi_scalar(PrimTag::I64);
+    d1.params.push_back(abi_param(abi_scalar(PrimTag::I64), 1, 8, 0, {WordClass::GP}, 0));
+    CallableDescriptor d2 = d1; d2.is_coroutine = true;
+    CallableDescriptor d3 = d1; d3.is_special_entry = true;
+    uint64_t f1 = abi_fingerprint(d1), f2 = abi_fingerprint(d2), f3 = abi_fingerprint(d3);
+    check_fp_differs("[AB-C10a] ordinary vs coroutine: fingerprints differ", f1, f2);
+    check_fp_differs("[AB-C10b] ordinary vs special entry: fingerprints differ", f1, f3);
+    check_fp_differs("[AB-C10c] coroutine vs special entry: fingerprints differ", f2, f3);
+}
+
+// [AB-C11] opaque handle vs ordinary i64 return. Both are 8-byte GP storage,
+// but one returns a nominal opaque handle (ReturnKind::OpaqueHandle +
+// OpaqueHandle type "vec3") and the other an ordinary Scalar(I64) GpScalar
+// return. The handle's return representation must be distinguishable.
+static void test_abi_collision_opaque_handle_vs_i64() {
+    using namespace ember;
+    CallableDescriptor d1; d1.return_kind = ReturnKind::GpScalar;
+    d1.return_type = abi_scalar(PrimTag::I64);
+    CallableDescriptor d2; d2.return_kind = ReturnKind::OpaqueHandle;
+    d2.return_type = abi_opaque_handle("vec3", 8);
+    uint64_t f1 = abi_fingerprint(d1), f2 = abi_fingerprint(d2);
+    check_fp_differs("[AB-C11] ordinary i64 ret vs opaque vec3 handle ret: fingerprints differ", f1, f2);
+}
+
+// ─── Stability: same descriptor always produces same fingerprint ───
+static void test_abi_stability() {
+    using namespace ember;
+    CallableDescriptor d;
+    d.return_kind = ReturnKind::GpScalar;
+    d.return_type = abi_scalar(PrimTag::I64);
+    d.params.push_back(abi_param(abi_scalar(PrimTag::I64), 1, 8, 0, {WordClass::GP}, 0));
+    uint64_t f1 = abi_fingerprint(d);
+    uint64_t f2 = abi_fingerprint(d);
+    // Re-encode with a fresh copy to ensure no hidden mutable state.
+    CallableDescriptor d2 = d;
+    uint64_t f3 = abi_fingerprint(d2);
+    record(f1 == f2 && f2 == f3, "[AB-S] classifier is stable (same descriptor = same fingerprint)");
+}
+
+// ─── Domain header + convention version sanity ───
+static void test_abi_domain_and_version() {
+    using namespace ember;
+    CallableDescriptor d;
+    d.return_kind = ReturnKind::GpScalar;
+    d.return_type = abi_scalar(PrimTag::I64);
+    std::string bytes = encode_callable(d);
+    // The first 20 bytes must be the domain header.
+    record(bytes.size() >= 20 &&
+           bytes.compare(0, 20, std::string(kDispatchAbiDomain, kDispatchAbiDomainLen)) == 0,
+           "[AB-D] canonical encoding starts with the fixed domain header");
+    // Convention version 1 is encoded as 01 00 00 00 at offset 21.
+    record(bytes.size() >= 25 &&
+           uint8_t(bytes[21]) == 0x01 && uint8_t(bytes[22]) == 0x00 &&
+           uint8_t(bytes[23]) == 0x00 && uint8_t(bytes[24]) == 0x00,
+           "[AB-D] convention version 1 is little-endian at offset 21");
+}
+
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("=== ember binding ABI correctness suite ===\n");
@@ -753,6 +1436,38 @@ int main() {
     test_f32_args();               // [4] + [4b]
     test_slice_arg();              // [5]
     test_mixed_slot_parallel();    // [6]
+
+    // Red 2 — ABI classifier fingerprint tests (§7, §14.3)
+    test_abi_no_arg_scalar();                 // [AB1]
+    test_abi_pair8_param();                   // [AB2]
+    test_abi_packed_outer_param();            // [AB3]
+    test_abi_vec3s_hidden_ret();              // [AB4]
+    test_abi_six_gp_args();                   // [AB5]
+    test_abi_f32_args();                      // [AB6]
+    test_abi_slice_param();                   // [AB7]
+    test_abi_mixed_slot_parallel();           // [AB8]
+    test_abi_vec3_handle_ret();               // [AB9]
+    test_abi_ordinary_i64_entry();            // [AB10]
+    // Complete V3 ABI shape coverage
+    test_abi_v3_no_arg_hidden_ret();          // [AB-V1]
+    test_abi_v3_by_value_param();             // [AB-V2]
+    test_abi_v3_two_params();                 // [AB-V3]
+    test_abi_v3_hidden_ret_plus_param();      // [AB-V4]
+    // Collision-negative pairs
+    test_abi_collision_i64_vs_f64();          // [AB-C1]
+    test_abi_collision_slice_vs_lambda();     // [AB-C2]
+    test_abi_collision_i64_vs_fn_handle();    // [AB-C3]
+    test_abi_collision_intra_vs_cross_module_handle(); // [AB-C4]
+    test_abi_collision_two_aggregates_same_size();     // [AB-C5]
+    test_abi_collision_alignment_layout();    // [AB-C6]
+    test_abi_collision_hidden_ret_vs_scalar_ret();    // [AB-C7]
+    test_abi_collision_placement_only();      // [AB-C8]
+    test_abi_collision_word_class_only();     // [AB-C8b]
+    test_abi_collision_legacy_vs_keyed();     // [AB-C9]
+    test_abi_collision_ordinary_vs_coroutine_special(); // [AB-C10]
+    test_abi_collision_opaque_handle_vs_i64(); // [AB-C11]
+    test_abi_stability();                     // [AB-S]
+    test_abi_domain_and_version();            // [AB-D]
 
     std::printf("\nbinding ABI suite: %s\n", g_fail == 0 ? "PASS" : "FAIL");
     return g_fail == 0 ? 0 : 1;

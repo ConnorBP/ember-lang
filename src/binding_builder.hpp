@@ -93,6 +93,7 @@ inline void register_struct(StructLayoutTable& table, const char* name,
     // Trailing padding: round up to struct alignment.
     off = (off + int32_t(struct_align) - 1) & ~int32_t(struct_align - 1);
     layout.size = off;
+    layout.alignment = struct_align;  // retain the computed C++ alignment
     table[name] = std::move(layout);
 }
 
