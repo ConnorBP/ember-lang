@@ -186,6 +186,17 @@ add_library(ember_frontend STATIC
     # ember_pass.hpp (PassRunReport). Lives in ember_frontend (a compile-time /
     # host-boundary concern) and adds no new link direction.
     src/module_build.cpp
+    # Red 10 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §12, §10, §14.2,
+    # §14.3 Red 10): keyed single-function hot reload + whole-module keyed-
+    # generation replacement. Depends on codegen.hpp (compile_func_checked),
+    # engine.hpp (finalize/free_executable), sema.hpp/parser (ast.hpp)/lexer,
+    # module_layout.* (ModuleDispatchRecord + validate_dispatch_record +
+    # derive_route_word), keyed_dispatch.* (the Red 1 permutation helper),
+    # key_provider.hpp (the transient provider route), hot_reload_domain.hpp
+    # (publish_keyed_slot + guard-enrolled reclamation), module_registry.*
+    # (atomic record publication). Lives in ember_frontend (a compile-time /
+    # reload concern); no new link direction.
+    src/keyed_hot_reload.cpp
 )
 target_include_directories(ember_frontend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ember_frontend PUBLIC ember)
@@ -1443,6 +1454,29 @@ target_link_libraries(keyed_dispatch_extensions PRIVATE
     ember_ext_lifecycle ember_ext_thread ember_ext_coroutine)
 if(WIN32)
     target_link_libraries(keyed_dispatch_extensions PRIVATE kernel32)
+endif()
+
+# keyed_dispatch_hot_reload - Red 10 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md
+# §12, §10, §14.2, §14.3 Red 10): the keyed single-function hot-reload +
+# whole-generation replacement gate. Pins physical-slot replacement at the
+# keyed domain slot (P(K, domain, ordinal), NOT the raw logical index — a HARD
+# assertion under a deterministic topology/seed), logical handle stability,
+# ABI/visibility/calling-mode/dispatch-domain preservation, provider/compile/
+# validation failure safety (publish nothing, epoch unchanged), wrong build-
+# provider bounded non-null same-domain safety, guard-pins-old-page, whole-
+# generation replacement under a stable module ID with a fresh immutable
+# ModuleDispatchRecord + possibly changed topology (readers see only
+# coherent old or new records, old backing alive under guard), disabled-keyed
+# identity-layout reload_function preservation, and topology-rejection
+# (single-fn reload rejects domain/topology changes, directing them to
+# whole-generation replacement). NOT a CTest entry: the filtered suite count
+# must stay 67 (§14.1); the target building cleanly + the executable passing
+# IS the gate.
+add_executable(keyed_dispatch_hot_reload examples/keyed_dispatch_hot_reload_test.cpp)
+target_link_libraries(keyed_dispatch_hot_reload PRIVATE
+    ember ember_frontend ember_import)
+if(WIN32)
+    target_link_libraries(keyed_dispatch_hot_reload PRIVATE kernel32)
 endif()
 
 set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
