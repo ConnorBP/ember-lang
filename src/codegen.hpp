@@ -215,6 +215,21 @@ struct CodeGenCtx {
     // handles exist in a module that did not wire the records table).
     int64_t module_handle_records_base = 0;
     int64_t module_handle_records_count = 0;
+    // Red 7 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §9.7, §10.2): the
+    // per-process module dispatch-records array base
+    // (ModuleRegistry::dispatch_records_base()) — a raw imm64 baked into keyed
+    // cross-module call sites (direct + handle). A keyed caller loads
+    // [dispatch_records_base + mod_id*8] to acquire the target's CURRENT
+    // ModuleDispatchRecord generation at call time, then resolves the target's
+    // logical slot through ember_resolve_keyed_dispatch(rec, slot, r15) using
+    // the caller's transient r15. Process-local (like
+    // module_handle_records_base) → functions using keyed cross-module calls
+    // are non-serializable to .em. 0 = keyed cross-module dispatch not
+    // configured → a keyed caller cannot resolve a keyed target (the keyed
+    // emit path falls back to a trap or the legacy registry-hop for identity
+    // targets). The legacy identity cross-module path (registry_base +
+    // entries_) is unchanged and does not consult this field.
+    int64_t module_dispatch_records_base = 0;
 
     // --- Stage 1 codegen optimization (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4) ---
     // Two independent flags, BOTH default false -> the codegen is BYTE-IDENTICAL

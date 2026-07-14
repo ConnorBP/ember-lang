@@ -25,17 +25,12 @@
 
 namespace ember {
 
-// Build the ModuleExportTable entry for a JIT-compiled module: one export per
-// EXPORTED function in `prog.funcs` (F1 visibility, docs/spec/SPEC_AUDIT_2026-07-10.md
-// F1), carrying its slot, the module_id (assigned on registration), and its
-// signature (ret + param types) for sema's cross-module arg/return type-
-// checking. A `priv fn` (is_exported==false) is intentionally OMITTED: it is
-// still callable from its own module (intra-module visibility is unchanged)
-// but is not published to other modules. Backward compat: a bare `fn` is
-// is_exported==true, so every existing JIT module's surface is unchanged.
-// Call AFTER slot assignment + sema (so FuncDecl::ret and param types are
-// resolved) and AFTER registration (so module_id is known).
-inline std::vector<ModuleExport> build_jit_exports(const Program& prog, uint32_t module_id) {
+// Red 7 overload: build the export table with the target's DispatchMode so
+// sema can stamp it on CallExpr/FnHandleExpr for the keyed/legacy cross-module
+// emit path selection + the legacy→keyed rejection. Defined BEFORE the
+// 1-arg backward-compat wrapper so the wrapper can delegate to it.
+inline std::vector<ModuleExport> build_jit_exports(const Program& prog, uint32_t module_id,
+                                                    DispatchMode mode) {
     std::vector<ModuleExport> out;
     out.reserve(prog.funcs.size());
     for (const auto& fn : prog.funcs) {
@@ -46,9 +41,17 @@ inline std::vector<ModuleExport> build_jit_exports(const Program& prog, uint32_t
         exp.slot = fn.slot;
         exp.ret = fn.ret ? *fn.ret : Type{};
         for (const auto& p : fn.params) exp.params.push_back(p.ty ? *p.ty : Type{});
+        exp.dispatch_mode = mode;
         out.push_back(std::move(exp));
     }
     return out;
+}
+
+// Backward-compat wrapper: build the export table with Identity mode (the
+// pre-Red-7 default). Existing callers that do not pass a DispatchMode get
+// Identity exports, preserving the legacy behavior.
+inline std::vector<ModuleExport> build_jit_exports(const Program& prog, uint32_t module_id) {
+    return build_jit_exports(prog, module_id, DispatchMode::Identity);
 }
 
 // Build one export per name-directory entry. v2 looks up its canonical
@@ -126,8 +129,54 @@ inline bool link_em_file(ModuleRegistry& reg, const char* path, const std::strin
     // its REAL dispatch size at load time (the loader threads
     // dispatch_slot_count into validate_thin_function). Without this a
     // cross-module caller could index out of this module's dispatch table.
+    //
+    // Red 7 (§9.7): logical_slot_count falls back to this single count for an
+    // identity module (no published keyed record), so the validator's
+    // logical-count range check is identical to the pre-Red-7 X1 check for
+    // identity .em modules (no weakening of V5).
     reg.set_dispatch_slot_count(id, int64_t(out.dispatch.size()));
     return true;
+}
+
+// ─── Red 7: keyed/legacy cross-module compatibility (§9.7) ────────────────
+//
+// The cross-module call path's (caller_mode, target_mode) matrix:
+//   - keyed caller → keyed target:   the keyed caller resolves the target's
+//                                     current record at call time via r15.
+//   - keyed caller → identity target: the keyed caller uses the legacy
+//                                     registry-hop (r15 unused for identity).
+//   - legacy caller → identity target: the existing path, unchanged.
+//   - legacy caller → keyed target:   REJECTED at codegen (the legacy caller
+//                                     has no r15 route word; emit_cross_module
+//                                     call emits a trap).
+//
+// A module's DispatchMode is published via publish_dispatch_record (a keyed
+// module) or defaults to Identity (a legacy module with no published record).
+// The linker inspects the target's mode (via ModuleExport::dispatch_mode, set
+// when building exports) before allowing a legacy caller to bind to it; the
+// codegen emit_cross_module_call enforces the reject at the call site.
+
+// Register a JIT module AND publish its keyed ModuleDispatchRecord. The
+// module's dispatch record (built from its layout plan + compiled entries) is
+// published through one release/acquire atomic pointer update (§10.2), so
+// concurrent readers observe a coherent generation. The module_id is stable
+// (a same-name reload keeps the id). `register_with_handles` publishes the
+// fn allowlist for cross-module handles. Returns the module_id or UINT32_MAX
+// on failure.
+inline uint32_t register_keyed_jit_module(ModuleRegistry& reg, const std::string& name,
+                                          void* dispatch_table_base,
+                                          const ModuleDispatchRecord* rec,
+                                          void* allowlist_base = nullptr,
+                                          int64_t slot_count = 0,
+                                          std::string* err = nullptr) {
+    uint32_t id = reg.register_module(name, dispatch_table_base, err,
+                                      allowlist_base, slot_count);
+    if (id == UINT32_MAX) return id;
+    // Publish the logical/physical counts from the record (the record carries
+    // them; the registry reads them via acquire-load for its typed accessors).
+    reg.set_dispatch_slot_count(id, int64_t(rec->logical_slot_count));
+    reg.publish_dispatch_record(id, rec);
+    return id;
 }
 
 // Convenience: add a module's exports to a ModuleExportTable under its alias.

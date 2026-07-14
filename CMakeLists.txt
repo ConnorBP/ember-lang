@@ -1233,6 +1233,29 @@ if(WIN32)
     target_link_libraries(keyed_dispatch_codegen PRIVATE kernel32)
 endif()
 
+# keyed_dispatch_modules - Red 7 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md
+# §9.7, §10, §14.2, §14.3): the module registry + cross-module call gate for
+# keyed dispatch. Pins atomic ModuleDispatchRecord publication (one
+# release/acquire pointer update), stable module IDs across same-name reload,
+# separate logical/physical slot counts, keyed→keyed + keyed→identity +
+# legacy→identity direct cross-module calls, legacy→keyed rejection at
+# codegen, correct/wrong route words with same-ABI/padding safety, cross-module
+# handles retaining (module_id, logical_slot) identity, concurrent readers
+# observing coherent generations only, unsupported strategy/mode rejection,
+# logical/physical count mismatch rejection, and legacy identity byte/behavior
+# preservation. Links ember (keyed_dispatch.* — Red 1, context.hpp, engine.* —
+# Red 5 thunks, dispatch_table.hpp, module_registry.* — Red 7 atomic
+# publication) + ember_frontend (module_layout.* — Red 3/4, module_instance.hpp
+# — Red 5, codegen.* — the keyed CodeGenCtx + cross-module lowering,
+# thin_lower.*, thin_emit.*, dispatch_abi.*, module_linker.hpp). NOT a CTest
+# entry: the filtered suite count must stay 67 (§14.1); the target building
+# cleanly + the executable passing IS the gate.
+add_executable(keyed_dispatch_modules examples/keyed_dispatch_modules_test.cpp)
+target_link_libraries(keyed_dispatch_modules PRIVATE ember ember_frontend ember_import)
+if(WIN32)
+    target_link_libraries(keyed_dispatch_modules PRIVATE kernel32)
+endif()
+
 # thin_ir_ser_test - Stage B c1b (IL-.em): the IR SERIALIZER round-trip gate.
 # Hand-builds a ThinFunction + uses the real lower_function path (fib) to
 # prove serialize->deserialize->validate->re-emit->execute works end-to-end,

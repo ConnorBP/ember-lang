@@ -47,9 +47,23 @@
 //   sites is the natural order anyway).
 #pragma once
 #include <cstdint>
+#include <atomic>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+// Red 7 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §10.2): the registry
+// publishes a complete immutable ModuleDispatchRecord generation per module
+// through one release/acquire atomic pointer update. ModuleDispatchRecord +
+// DispatchMode are defined in module_layout.hpp (ember_frontend); the registry
+// is in the CORE lib and must NOT call functions defined in module_layout.cpp.
+// It only stores opaque atomic pointers + reads the record's fields (mode,
+// logical/physical counts) for its typed accessors — the same header-only-type
+// pattern engine.hpp already uses (engine.hpp includes module_layout.hpp for
+// DispatchMode). No cycle: module_layout.hpp does not include this header, and
+// module_registry.cpp never calls module_layout.cpp functions.
+#include "module_layout.hpp"  // ModuleDispatchRecord, DispatchMode (type definitions only)
 
 namespace ember {
 
@@ -196,6 +210,81 @@ public:
     // (defensive; register_module returned UINT32_MAX on failure).
     void set_dispatch_slot_count(uint32_t module_id, int64_t count);
 
+    // ─── Red 7: atomic ModuleDispatchRecord publication (§10.2) ───────────
+    // The registry publishes a complete immutable ModuleDispatchRecord
+    // generation per module through ONE release-store on a per-module atomic
+    // pointer. Readers acquire-load one coherent generation — the record's
+    // mode, strategy_version, physical_slots, logical/physical counts,
+    // logical_routes, domains, and allowlist are published TOGETHER, never a
+    // partially updated table/allowlist/count combination. This replaces the
+    // pre-Red-7 hazard where a reload touched the table pointer, allowlist,
+    // and slot count as SEPARATE observable updates.
+    //
+    // The dispatch_records_ array is sized to `capacity` at construction
+    // (same REGISTRY-BASE STABILITY INVARIANT as entries_); its base address
+    // (dispatch_records_base()) is baked into keyed cross-module call sites
+    // as a raw imm64 (process-local, like handle_records_base). A reader
+    // loads [dispatch_records_base + module_id*8] to acquire the target's
+    // CURRENT record generation at call time, then resolves the target's
+    // logical slot through ember_resolve_keyed_dispatch(rec, slot, r15).
+    //
+    // For an identity/legacy module that did NOT publish a record,
+    // dispatch_record() returns nullptr and dispatch_mode() returns Identity;
+    // the logical/physical counts fall back to the legacy single count
+    // (dispatch_slot_count). For a keyed module, the counts come FROM the
+    // published record (one acquire-load → coherent mode + counts + table).
+    //
+    // No expected key, machine fingerprint, key digest, or verifier is stored
+    // in the record or in the registry (§3.3, §14.6). The route word is a
+    // per-call transient (r15); it never lives in the registry.
+
+    // Publish module_id's immutable ModuleDispatchRecord generation. One
+    // release-store on the per-module atomic pointer publishes the complete
+    // generation (mode + counts + table + allowlist + routes + domains).
+    // The caller owns the record + its backing storage and must keep them
+    // alive for the registry's lifetime (the registry stores a borrowed
+    // pointer). Out-of-range id is a no-op (defensive). Passing nullptr
+    // clears the published record (unpublishes — useful for teardown).
+    void publish_dispatch_record(uint32_t module_id, const ModuleDispatchRecord* rec);
+
+    // Acquire-load module_id's current ModuleDispatchRecord generation. One
+    // acquire-load returns a coherent generation (the record published by the
+    // latest release-store). Returns nullptr for an identity module that did
+    // not publish a record, or for an out-of-range id. The caller must not
+    // dereference a null return; use dispatch_mode() to distinguish a keyed
+    // module (non-null record) from an identity module (null record).
+    const ModuleDispatchRecord* dispatch_record(uint32_t module_id) const;
+
+    // The base address of the dispatch_records_ array — baked into keyed
+    // cross-module call sites as a raw imm64 (process-local, like
+    // handle_records_base()). Stable for the registry's lifetime
+    // (dispatch_records_ is allocated at construction + filled by index).
+    void* dispatch_records_base() const;
+
+    // module_id's dispatch mode. For a keyed module (published record), this
+    // reads rec->mode from the acquire-loaded record. For an identity module
+    // (no record), returns DispatchMode::Identity. Out-of-range id → Identity.
+    DispatchMode dispatch_mode(uint32_t module_id) const;
+
+    // module_id's published LOGICAL slot count (§2.3, §9.7): the stable
+    // logical identity range a cross-module caller speaks. For a keyed
+    // module, reads rec->logical_slot_count from the acquire-loaded record.
+    // For an identity module, returns the legacy single count
+    // (dispatch_slot_count). Out-of-range id → 0. A cross-module caller's
+    // logical slot is range-checked against THIS count (not the physical
+    // count) in keyed mode; the keyed strategy then maps the logical ordinal
+    // into the target's physical domain.
+    uint32_t logical_slot_count(uint32_t module_id) const;
+
+    // module_id's published PHYSICAL slot count (§2.3, §9.7): the keyed
+    // dispatch storage size (logical + padding). For a keyed module, reads
+    // rec->physical_slot_count from the acquire-loaded record. For an
+    // identity module, returns the legacy single count
+    // (dispatch_slot_count). Out-of-range id → 0. The loader confirms the
+    // published dispatch storage matches this count (a separate invariant
+    // from the logical-count slot-range check).
+    uint32_t physical_slot_count(uint32_t module_id) const;
+
     // Find a module_id by name (Section 2 `find_by_name`, used by the linker stage
     // Section 5, not the hot call path). Returns UINT32_MAX if not registered.
     uint32_t find_by_name(const std::string& name) const;
@@ -225,6 +314,16 @@ private:
     std::vector<std::string> names_;                 // names_[id] = module name
     std::vector<ModuleHandleRecord> handle_records_; // handle_records_[id] = (dispatch, allowlist, slot_count)
     std::vector<int64_t>        dispatch_slot_counts_;  // dispatch_slot_counts_[id] = target's dispatch size (X1)
+    // Red 7 (§10.2): per-module atomic pointers to immutable
+    // ModuleDispatchRecord generations. Allocated at construction (capacity
+    // elements), filled by index via publish_dispatch_record. The base
+    // address (dispatch_records_base()) is baked into keyed cross-module
+    // call sites. A unique_ptr<T[]> is used (not std::vector<std::atomic<...>>)
+    // because std::atomic is neither copyable nor movable, so a vector of
+    // atomics is not portable across standard-library implementations; a
+    // dynamically allocated array of atomics is value-initialized and never
+    // moved, so the base is stable for the registry's lifetime.
+    std::unique_ptr<std::atomic<const ModuleDispatchRecord*>[]> dispatch_records_;
     std::unordered_map<std::string, uint32_t> by_name_;  // name -> id (reload keeps id)
     uint32_t next_id_ = 0;                           // == count() while dense
 };

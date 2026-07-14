@@ -179,6 +179,14 @@ struct FnHandleExpr : Expr {
     uint32_t cross_module_id = 0;    // target module's registry id (sema)
     int cross_module_slot = -1;      // target fn's slot in that module (sema)
     bool cross_module_unresolved = false;  // sema couldn't resolve (hard error for handles)
+    // Red 7 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §9.7): the target
+    // module's dispatch mode, stamped by sema from ModuleExport::dispatch_mode.
+    // 0 = Identity (legacy), 1 = Keyed. Stored as a raw uint8_t (NOT the
+    // DispatchMode enum) so ast.hpp does not need to include module_layout.hpp.
+    // Codegen reads this to emit the correct cross-module handle dispatch path
+    // (keyed resolve vs legacy allowlist+table) and to reject a legacy caller
+    // linking to a keyed target.
+    uint8_t cross_module_target_mode = 0;  // DispatchMode::Identity = 0
 };
 struct CallExpr : Expr { std::string name; std::vector<ExprPtr> args;
                          // sema-resolved target (native fn ptr or script slot)
@@ -196,6 +204,16 @@ struct CallExpr : Expr { std::string name; std::vector<ExprPtr> args;
                          int cross_module_id = -1;        // registry module_id (resolved)
                          int cross_module_slot = -1;     // target fn's slot in that module
                          bool cross_module_unresolved = false; // sema couldn't resolve (deferred trap)
+                         // Red 7 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §9.7):
+                         // the target module's dispatch mode, stamped by sema
+                         // from ModuleExport::dispatch_mode. 0 = Identity
+                         // (legacy), 1 = Keyed. Stored as a raw uint8_t (NOT
+                         // the DispatchMode enum) so ast.hpp does not need to
+                         // include module_layout.hpp. Codegen reads this to
+                         // emit the correct cross-module call path (keyed
+                         // resolve vs legacy registry-hop) and to reject a
+                         // legacy caller linking to a keyed target.
+                         uint8_t cross_module_target_mode = 0;  // DispatchMode::Identity = 0
                          // method-call sugar: obj.method(args) desugars to
                          // method(obj, args) - receiver becomes arg[0]. Null
                          // for free-function calls. (docs/spec/BINDING_API.md Section 3)

@@ -1685,6 +1685,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                     h->cross_module_unresolved = false;
                     h->cross_module_id = exp.module_id;
                     h->cross_module_slot = exp.slot;
+                    h->cross_module_target_mode = static_cast<uint8_t>(exp.dispatch_mode);  // Red 7
                     Type t = type_i64();
                     t.is_fn_handle = true;
                     t.is_cross_module_handle = true;
@@ -1862,6 +1863,7 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
                             c->cross_module_unresolved = false;
                             c->cross_module_id = int(exp.module_id);
                             c->cross_module_slot = exp.slot;
+                            c->cross_module_target_mode = static_cast<uint8_t>(exp.dispatch_mode);  // Red 7
                             if (exp.unknown_sig) {
                                 // .em export: signature not in the name table (the .em was
                                 // type-checked at compile time). Skip arity/return checks;

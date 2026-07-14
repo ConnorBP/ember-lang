@@ -227,6 +227,17 @@ struct ThinMeta {
                                 // FAdd..FMod / Cast / float Cmp).
     uint8_t trap_reason = 0;    // Trap-site reason (TrapReason ordinal) for
                                 // guards / BoundsCheck / DivOverflowCheck.
+    // Red 7 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §9.7): the target
+    // module's dispatch mode for a CallCrossModule, stamped by thin_lower from
+    // the CallExpr's cross_module_target_mode. 0 = Identity (legacy registry-
+    // hop emit), 1 = Keyed (keyed resolve emit). Stored as a raw uint8_t (NOT
+    // the DispatchMode enum) so thin_ir.hpp does not need to include
+    // module_layout.hpp. NOT serialized: V5 modules are identity-layout (V6
+    // keyed serialization is Red 9), so the deserializer leaves it at 0
+    // (Identity) and the V5 cross-module path is byte-identical to pre-Red-7.
+    // The JIT emit path (thin_emit) reads it to select keyed vs identity
+    // cross-module lowering.
+    uint8_t cross_module_target_mode = 0;  // DispatchMode::Identity = 0
     int32_t data_temp_off = 0;  // StringDecrypt: rbp-relative offset (negative)
                                 // for the decrypted-data temp buffer (separate
                                 // from frame_off which is the slice result slot).

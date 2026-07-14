@@ -734,11 +734,23 @@ bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
         // (no registration happens inside the loop), so the snapshot is valid
         // for every function. With no registry the vector stays empty and the
         // validator fails closed on CallCrossModule (registry_size == 0).
+        //
+        // Red 7 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §9.7): use the
+        // published LOGICAL slot count (registry->logical_slot_count), not the
+        // physical dispatch-slot count. A cross-module caller speaks LOGICAL
+        // identity (§2.3, §9.7), so the valid range is [0, logical_count). For
+        // an identity module logical == physical (no weakening of the V5 X1
+        // check — the bound is identical). For a keyed module logical_count <=
+        // physical_count (padding), so the check is STRICTER (correct: the
+        // caller's logical slot must be < the target's logical identity range;
+        // the keyed strategy then maps it into the physical domain). This does
+        // NOT weaken V5 identity checks: an identity target's logical_count ==
+        // its dispatch_slot_count, so the accepted slot range is unchanged.
         std::vector<int64_t> cross_module_slot_counts;
         if (registry) {
             cross_module_slot_counts.reserve(registry->count());
             for (uint32_t i = 0; i < registry->count(); ++i)
-                cross_module_slot_counts.push_back(registry->dispatch_slot_count(i));
+                cross_module_slot_counts.push_back(int64_t(registry->logical_slot_count(i)));
         }
 
         for (auto& pf : parsed.functions) {

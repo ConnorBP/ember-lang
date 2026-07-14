@@ -628,16 +628,183 @@ struct CG {
             non_serializable_reason = "keyed dispatch resolution requires process-local module record";
     }
 
+    // Red 7 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §9.7): emit the
+    // keyed cross-module call resolution. A keyed caller resolves the TARGET's
+    // current ModuleDispatchRecord generation at call time by loading
+    // [dispatch_records_base + mod_id*8] (acquire-load), then calls
+    // ember_resolve_keyed_dispatch(rec, target_logical_slot, r15) using the
+    // caller's transient r15. The target's domain salt + the caller's r15
+    // produce the target-specific physical resolution. The entry lands in r11,
+    // ready for `call r11` after arg placement. The resolver call needs 32
+    // bytes of Win64 shadow space; a fresh sub rsp,32 / add rsp,32 allocates
+    // it. This is emitted BEFORE arg placement (the resolver clobbers
+    // rcx/rdx/r8), mirroring the same-module keyed resolve.
+    //
+    // No handle/reloc/import/export contains a resolved physical index: the
+    // call site carries (mod_id, logical_slot) identity + the caller's r15;
+    // the physical index is derived at call time from the target's CURRENT
+    // record + the transient route word. A wrong route word routes within the
+    // target's same-ABI domain (alternate real or padding), never an OOB read.
+    void emit_keyed_cross_module_resolve(uint32_t mod_id, uint32_t logical_slot) {
+        // Load the target's current ModuleDispatchRecord* (acquire-load from
+        // the registry's dispatch_records_ array). mov r11, imm64(base);
+        // mov rcx, [r11 + mod_id*8].
+        e.mov_reg_imm64(Reg::r11, ctx.module_dispatch_records_base);
+        e.load_reg_mem(Reg::rcx, Reg::r11, int32_t(mod_id) * 8);
+        // Resolve: ember_resolve_keyed_dispatch(rcx=rec, rdx=logical_slot, r8=r15).
+        e.sub_reg_imm32(Reg::rsp, 32);
+        // rcx already holds the record pointer (the first arg).
+        e.byte(0x48); e.byte(0xC7); e.byte(0xC2); e.imm32(int32_t(logical_slot));  // mov rdx, imm32
+        e.mov_reg_reg(Reg::r8, Reg::r15);
+        e.mov_reg_imm64(Reg::r11, int64_t(reinterpret_cast<uintptr_t>(
+            &ember_resolve_keyed_dispatch)));
+        e.call_reg(Reg::r11);
+        e.add_reg_imm32(Reg::rsp, 32);
+        // Null check → trap (a malformed record or bad logical slot).
+        e.cmp_reg_imm32(Reg::rax, 0);
+        Label trap = e.alloc_label(), after = e.alloc_label();
+        e.jcc(Cond::e, trap);
+        e.mov_reg_reg(Reg::r11, Reg::rax);  // r11 = resolved entry
+        e.jmp(after);
+        e.bind(trap);
+        emit_trap(int(TrapReason::BadCallTarget),
+                  "keyed cross-module dispatch: resolver returned null (malformed target record or bad logical slot)");
+        e.bind(after);
+        if (non_serializable_reason.empty())
+            non_serializable_reason = "keyed cross-module dispatch requires process-local module dispatch records";
+    }
+
+    // Red 7 (§9.7): emit the keyed INDIRECT resolve for a keyed caller. A
+    // keyed caller's indirect call (`h(args)` where h is a fn-typed variable)
+    // may hold either an INTRA-module handle (a bare logical slot, bit 63
+    // clear) or a CROSS-module handle ((1<<63)|(module_id<<32)|slot, bit 63
+    // set). This is emitted BEFORE arg placement (the resolver clobbers
+    // rcx/rdx/r8), so the entry lands in r11 and survives arg placement.
+    //
+    // Runtime branch on bit 63 of the handle (loaded from [rsp+stash_size]):
+    //   - bit 63 clear (intra): resolve via the SAME-module record
+    //     (ctx.keyed_dispatch->module_record) with the handle as the logical
+    //     slot (the allowlist guard already validated it).
+    //   - bit 63 set (cross): extract module_id + logical_slot, load the
+    //     TARGET's current dispatch record from [dispatch_records_base +
+    //     mod_id*8] (acquire), resolve via ember_resolve_keyed_dispatch with
+    //     the caller's r15. A legacy identity target (null record) falls back
+    //     to the raw-table index [entries_base + mod_id*8] then [r11+slot*8]
+    //     (the keyed caller has r15 but does not use it for the identity
+    //     target).
+    //
+    // No handle contains a resolved physical index: the handle is
+    // (module_id, logical_slot) identity; the physical index is derived at
+    // call time from the target's CURRENT record + the transient route word.
+    void emit_keyed_indirect_resolve(int32_t stash_size) {
+        // Load the handle from [rsp+stash_size] into rax.
+        e.load_reg_mem(Reg::rax, Reg::rsp, stash_size);
+        // Branch on bit 63 (cross-module flag).
+        Label cross = e.alloc_label(), after = e.alloc_label();
+        Label intra_resolve = e.alloc_label();
+        // bt rax, 63: REX.W 0F BA /4 ib (rm=rax, reg=4, imm8=63)
+        e.byte(0x48); e.byte(0x0F); e.byte(0xBA); e.byte(0xE0); e.byte(0x3F);
+        e.jcc(Cond::b, cross);  // bit 63 set -> cross-module path
+        // ---- intra: same-module keyed resolve (rax = logical slot) ----
+        e.bind(intra_resolve);
+        emit_keyed_resolve(0, /*logical_slot_in_rax=*/true);
+        e.jmp(after);
+        // ---- cross: extract module_id + slot, load target record, resolve ----
+        e.bind(cross);
+        {
+            // r11 = slot = handle & 0xFFFFFFFF (zero-extend low 32).
+            e.mov_reg_reg(Reg::r11, Reg::rax);          // mov r11, rax
+            e.byte(0x45); e.byte(0x89); e.byte(0xDB);   // mov r11d, r11d -> r11 = slot
+            // rdx = logical_slot for the resolver (mov rdx, r11).
+            e.mov_reg_reg(Reg::rdx, Reg::r11);           // rdx = slot (will be arg2 to resolver)
+            // rax = module_id = (handle >> 32) & 0x7FFFFFFF.
+            e.shr_reg_imm8(Reg::rax, 32);                // shr rax, 32
+            e.byte(0x48); e.byte(0x25); e.imm32(int32_t(0x7FFFFFFF));  // and rax, 0x7FFFFFFF
+            // rcx = [dispatch_records_base + module_id*8] (target record).
+            // mov r10, dispatch_records_base; mov rcx, [r10 + rax*8].
+            e.mov_reg_imm64(Reg::r10, ctx.module_dispatch_records_base);
+            // lea rcx, [r10 + rax*8] then mov rcx, [rcx]. Use: shl rax,3; add r10,rax; mov rcx,[r10].
+            e.byte(0x48); e.byte(0xC1); e.byte(0xE0); e.byte(0x03);  // shl rax, 3
+            e.add_reg_reg(Reg::r10, Reg::rax);           // r10 = dispatch_records_base + mod_id*8
+            e.load_reg_mem(Reg::rcx, Reg::r10, 0);       // rcx = target record (acquire-load)
+            // If the target record is null (identity target), fall back to the
+            // raw-table index: r11 = [entries_base + mod_id*8]; r11 = [r11 + slot*8].
+            // The keyed caller has r15 but does not use it for the identity target.
+            Label keyed_path = e.alloc_label(), id_path = e.alloc_label();
+            e.cmp_reg_imm32(Reg::rcx, 0);
+            e.jcc(Cond::e, id_path);  // null record -> identity raw-table dispatch
+            // keyed target: resolve via ember_resolve_keyed_dispatch(rec=rcx, slot=rdx, r15=r8).
+            e.bind(keyed_path);
+            e.sub_reg_imm32(Reg::rsp, 32);
+            // rcx already = rec; rdx already = slot.
+            e.mov_reg_reg(Reg::r8, Reg::r15);            // r8 = route word
+            e.mov_reg_imm64(Reg::rax, int64_t(reinterpret_cast<uintptr_t>(
+                &ember_resolve_keyed_dispatch)));
+            e.call_reg(Reg::rax);
+            e.add_reg_imm32(Reg::rsp, 32);
+            e.cmp_reg_imm32(Reg::rax, 0);
+            Label ktrap = e.alloc_label();
+            e.jcc(Cond::e, ktrap);
+            e.mov_reg_reg(Reg::r11, Reg::rax);           // r11 = resolved entry
+            e.jmp(after);
+            e.bind(ktrap);
+            emit_trap(int(TrapReason::BadCallTarget),
+                      "keyed cross-module handle: resolver returned null (malformed target record or bad logical slot)");
+            // identity target: raw-table dispatch.
+            e.bind(id_path);
+            // Recompute module_id (rax was clobbered by the cmp path? no — rax
+            // still holds module_id here because the cmp used rcx only). But
+            // rax was modified by shl+add. Recompute from the handle.
+            e.load_reg_mem(Reg::rax, Reg::rsp, stash_size);  // reload handle
+            e.shr_reg_imm8(Reg::rax, 32);                // shr rax, 32
+            e.byte(0x48); e.byte(0x25); e.imm32(int32_t(0x7FFFFFFF));  // and rax, 0x7FFFFFFF
+            // r10 = entries_base (registry_base); r10 = [r10 + mod_id*8] (target table base).
+            e.mov_reg_imm64_external(Reg::r10, AbsFixup::ModuleRegistryBase);
+            e.byte(0x48); e.byte(0xC1); e.byte(0xE0); e.byte(0x03);  // shl rax, 3
+            e.add_reg_reg(Reg::r10, Reg::rax);           // r10 = registry_base + mod_id*8
+            e.load_reg_mem(Reg::r10, Reg::r10, 0);       // r10 = target dispatch table base
+            // r11 already = slot. lea r11, [r10 + r11*8]; mov r11, [r11].
+            e.lea_reg_mem_sib(Reg::r11, Reg::r10, Reg::r11, 3);  // lea r11, [r10 + r11*8]
+            e.load_reg_mem(Reg::r11, Reg::r11, 0);       // r11 = callee entry
+            e.jmp(after);
+        }
+        e.bind(after);
+        if (non_serializable_reason.empty())
+            non_serializable_reason = "keyed indirect dispatch requires process-local module record + dispatch records";
+    }
+
     // was unresolved at sema (the module/fn not yet registered), emit a trap
     // stub call instead — the call traps gracefully until a relink resolves it
     // (docs/MODULES.md §5 step 3). Args are already stashed by the caller; this only
     // replaces the final `call [r11+slot*8]` with the registry-hop + call.
+    //
+    // Red 7 (§9.7): a LEGACY caller (no keyed_dispatch / no r15 route word)
+    // linking to a KEYED target is rejected here at code-generation time. A
+    // legacy caller has no runtime-key contract, so it cannot resolve a keyed
+    // target's permuted physical table; emitting the legacy registry-hop
+    // (`mov r11,[registry+mod_id*8]; mov r11,[r11+slot*8]`) would index a keyed
+    // physical table as if it were logical (slot i → physical i is wrong for a
+    // permuted table). The emit produces a trap (BadCallTarget) instead — the
+    // call site never dispatches into a keyed physical table as if it were
+    // logical. The caller is legacy iff ctx.keyed_dispatch == null; the target
+    // is keyed iff c.cross_module_target_mode == 1 (DispatchMode::Keyed).
     void emit_cross_module_call(const CallExpr& c) {
         if (c.cross_module_unresolved) {
             // deferred trap (module/fn not registered yet). Args are stashed;
             // the trap longjmps (never returns) so the stashed args + the sub
             // rsp,total are harmless. rax=trap_ctx, etc. handled by emit_trap.
             emit_trap(int(TrapReason::None), "cross-module call unresolved: module or function not registered");
+            return;
+        }
+        // Red 7: reject a legacy caller linking to a keyed target. A legacy
+        // caller (ctx.keyed_dispatch == null) has no r15 route word and cannot
+        // resolve a keyed target's permuted physical table. The target is
+        // keyed iff c.cross_module_target_mode == 1 (DispatchMode::Keyed).
+        if (!ctx.keyed_dispatch && c.cross_module_target_mode == 1) {
+            emit_trap(int(TrapReason::BadCallTarget),
+                      "cross-module call rejected: legacy caller cannot call keyed target (no runtime-key contract)");
+            if (non_serializable_reason.empty())
+                non_serializable_reason = "legacy-to-keyed cross-module call rejected at codegen";
             return;
         }
         // mov r11, [registry_base + mod_id*8]  ; r11 = target module's DispatchTable base
@@ -3355,14 +3522,39 @@ void CG::eval(const Expr& ex) {
         const bool keyed_same_module =
             ctx.keyed_dispatch && ctx.keyed_dispatch->module_record &&
             !c->is_native && c->module_alias.empty();
+        // Red 7: keyed cross-module resolution. A keyed caller calling a KEYED
+        // target resolves the target's current record at call time using the
+        // caller's r15. The target is keyed iff cross_module_target_mode == 1.
+        // This is emitted BEFORE arg placement (the resolver clobbers rcx/rdx/r8),
+        // mirroring the same-module keyed resolve. A keyed caller calling an
+        // IDENTITY target (mode == 0) takes the legacy registry-hop path below
+        // (the keyed caller has r15 but does not use it for the identity target).
+        const bool keyed_cross_module =
+            ctx.keyed_dispatch && !c->is_native && !c->module_alias.empty() &&
+            !c->cross_module_unresolved && c->cross_module_target_mode == 1 &&
+            ctx.module_dispatch_records_base != 0;
         if (keyed_same_module) {
             emit_depth_check();
             if (c->is_indirect) {
-                e.load_reg_mem(Reg::rax, Reg::rsp, stash_size);
-                emit_keyed_resolve(0, /*logical_slot_in_rax=*/true);
+                // Red 7: a keyed caller's indirect call may hold an intra OR
+                // cross-module handle. emit_keyed_indirect_resolve branches on
+                // bit 63 at runtime and resolves through the correct record
+                // (same-module for intra, target's current record for cross).
+                // This requires the dispatch_records_base for cross handles.
+                if (ctx.module_dispatch_records_base != 0 &&
+                    ctx.module_handle_records_base != 0) {
+                    emit_keyed_indirect_resolve(stash_size);
+                } else {
+                    e.load_reg_mem(Reg::rax, Reg::rsp, stash_size);
+                    emit_keyed_resolve(0, /*logical_slot_in_rax=*/true);
+                }
             } else {
                 emit_keyed_resolve(uint32_t(c->script_slot), /*logical_slot_in_rax=*/false);
             }
+        } else if (keyed_cross_module) {
+            emit_depth_check();
+            emit_keyed_cross_module_resolve(uint32_t(c->cross_module_id),
+                                            uint32_t(c->cross_module_slot));
         }
         // Load physical slots 0..3 into registers.
         for (int p = 0; p < n_phys && p < 4; ++p) {
@@ -3401,9 +3593,22 @@ void CG::eval(const Expr& ex) {
             emit_counted_named_native(c->native_fn, c->native_binding_name, "native call");
         } else if (!c->module_alias.empty()) {
             // v0.5 cross-module call (mod::fn): kind-2 registry-hop sequence.
-            emit_depth_check();
-            emit_cross_module_call(*c);
-            emit_depth_leave();
+            // Red 7: if the caller is keyed and the target is keyed, the
+            // resolve already happened before arg placement
+            // (emit_keyed_cross_module_resolve left the entry in r11). Just
+            // call r11 + depth leave. If the caller is keyed and the target
+            // is identity, OR the caller is legacy and the target is identity,
+            // the legacy registry-hop (emit_cross_module_call) dispatches via
+            // the target's raw table. A legacy caller to a keyed target is
+            // rejected inside emit_cross_module_call (emits a trap).
+            if (keyed_cross_module) {
+                e.call_reg(Reg::r11);
+                emit_depth_leave();
+            } else {
+                emit_depth_check();
+                emit_cross_module_call(*c);
+                emit_depth_leave();
+            }
         } else if (c->is_indirect) {
             if (non_serializable_reason.empty())
                 non_serializable_reason = "function-reference call requires process-local allowlist storage";

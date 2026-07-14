@@ -4,6 +4,7 @@
 // other operand's type if the value fits; variables stay strict per Section 7).
 #pragma once
 #include "ast.hpp"
+#include "module_layout.hpp"  // Red 7: DispatchMode for ModuleExport (keyed/legacy target classification)
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -27,6 +28,14 @@ struct ModuleExport {
     uint32_t module_id = 0;
     int slot = -1;
     bool unknown_sig = false;  // v1 .em ABI-trusted export: format has no sigs; sema skips arg/return checks
+    // Red 7 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §9.7): the target
+    // module's dispatch mode. The linker sets this when building exports from
+    // a registered module's published record (Keyed) or its legacy single
+    // count (Identity). Sema stamps it on CallExpr/FnHandleExpr so codegen
+    // can emit the correct cross-module call path (keyed resolve vs legacy
+    // registry-hop) and reject a legacy caller linking to a keyed target.
+    // Default Identity (backward compat: pre-Red-7 modules are identity).
+    DispatchMode dispatch_mode = DispatchMode::Identity;
 };
 // module_alias -> list of exported fns. Host populates from the registry.
 using ModuleExportTable = std::unordered_map<std::string, std::vector<ModuleExport>>;

@@ -35,6 +35,13 @@ ModuleRegistry::ModuleRegistry(uint32_t capacity)
     // check (the secure default — a module that did not publish its dispatch
     // size cannot be the validated target of a cross-module direct dispatch).
     dispatch_slot_counts_.assign(static_cast<size_t>(capacity), 0);
+    // Red 7 (§10.2): allocate the per-module atomic dispatch-record pointer
+    // array. Sized to capacity at construction (same stability invariant);
+    // dispatch_records_base() never moves. Value-initialized (null) so an
+    // unregistered/unpublished id has no keyed record (dispatch_mode returns
+    // Identity, counts fall back to the legacy single count).
+    dispatch_records_ = std::make_unique<std::atomic<const ModuleDispatchRecord*>[]>(
+        static_cast<size_t>(capacity));
 }
 
 uint32_t ModuleRegistry::register_module(const std::string& name,
@@ -151,6 +158,52 @@ int64_t ModuleRegistry::dispatch_slot_count(uint32_t module_id) const {
 void ModuleRegistry::set_dispatch_slot_count(uint32_t module_id, int64_t count) {
     if (module_id >= next_id_) return;  // defensive; register_module failed
     dispatch_slot_counts_[module_id] = (count > 0) ? count : 0;
+}
+
+// ─── Red 7: atomic ModuleDispatchRecord publication (§10.2) ───────────────
+//
+// publish_dispatch_record: one release-store publishes the complete immutable
+// generation. Readers acquire-load one coherent record (mode + counts + table
+// + allowlist + routes + domains together). This replaces the pre-Red-7
+// hazard where a reload touched the table pointer, allowlist, and slot count
+// as SEPARATE observable updates.
+void ModuleRegistry::publish_dispatch_record(uint32_t module_id,
+                                              const ModuleDispatchRecord* rec) {
+    if (module_id >= capacity_) return;  // defensive; out-of-range id
+    dispatch_records_[module_id].store(rec, std::memory_order_release);
+}
+
+const ModuleDispatchRecord* ModuleRegistry::dispatch_record(uint32_t module_id) const {
+    if (module_id >= capacity_) return nullptr;  // out-of-range id
+    return dispatch_records_[module_id].load(std::memory_order_acquire);
+}
+
+void* ModuleRegistry::dispatch_records_base() const {
+    return static_cast<void*>(dispatch_records_.get());
+}
+
+DispatchMode ModuleRegistry::dispatch_mode(uint32_t module_id) const {
+    const ModuleDispatchRecord* rec = dispatch_record(module_id);
+    if (rec) return rec->mode;
+    return DispatchMode::Identity;  // no published record → identity/legacy
+}
+
+uint32_t ModuleRegistry::logical_slot_count(uint32_t module_id) const {
+    const ModuleDispatchRecord* rec = dispatch_record(module_id);
+    if (rec) return rec->logical_slot_count;
+    // Identity/legacy: fall back to the single count (logical == physical).
+    if (module_id >= next_id_) return 0;
+    int64_t c = dispatch_slot_counts_[module_id];
+    return c > 0 ? uint32_t(c) : 0u;
+}
+
+uint32_t ModuleRegistry::physical_slot_count(uint32_t module_id) const {
+    const ModuleDispatchRecord* rec = dispatch_record(module_id);
+    if (rec) return rec->physical_slot_count;
+    // Identity/legacy: fall back to the single count (logical == physical).
+    if (module_id >= next_id_) return 0;
+    int64_t c = dispatch_slot_counts_[module_id];
+    return c > 0 ? uint32_t(c) : 0u;
 }
 
 } // namespace ember

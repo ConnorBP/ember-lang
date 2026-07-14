@@ -699,7 +699,8 @@ static int64_t dst_spill_span(const Type* ty, uint8_t is_f32, bool narrow_field,
 bool validate_thin_function(const ThinFunction& thf, std::string* err,
                             uint32_t dispatch_size,
                             uint32_t registry_size,
-                            const int64_t* cross_module_slot_counts) {
+                            const int64_t* cross_module_slot_counts,
+                            bool skip_cross_module_range) {
     const uint32_t num_blocks = static_cast<uint32_t>(thf.blocks.size());
     if (num_blocks == 0) {
         if (err) *err = "thin_ir_ser: validate: zero blocks";
@@ -1075,26 +1076,35 @@ bool validate_thin_function(const ThinFunction& thf, std::string* err,
             // dispatch size rejects every slot (it opted out of being a
             // cross-module dispatch target).
             if (in.op == ThinOp::CallCrossModule) {
-                if (registry_size == 0 || in.meta.mod_id < 0 ||
+                if (skip_cross_module_range) {
+                    // Red 7: the codegen verifier (verify_thin_function_for_codegen)
+                    // has no registry view (registry_size == 0), so it SKIPS the
+                    // CallCrossModule mod_id/slot range check — the JIT emit
+                    // handles a bad mod_id/slot at runtime (the keyed resolver
+                    // returns null -> trap; the legacy registry-hop reads a null
+                    // table base -> the host's trap stub fires). The LOAD-time
+                    // validator (em_loader) passes skip_cross_module_range=false
+                    // so it fails closed on an out-of-range mod_id/slot (V5 X1).
+                    // This does NOT weaken V5: the load path is unchanged.
+                } else if (registry_size == 0 || in.meta.mod_id < 0 ||
                     uint32_t(in.meta.mod_id) >= registry_size) {
                     if (err) *err = "thin_ir_ser: validate: CallCrossModule mod_id out of range";
                     return false;
-                }
-                if (in.meta.slot < 0) {
+                } else if (in.meta.slot < 0) {
                     if (err) *err = "thin_ir_ser: validate: CallCrossModule slot out of range";
                     return false;
-                }
-                if (cross_module_slot_counts == nullptr) {
+                } else if (cross_module_slot_counts == nullptr) {
                     if (err) *err = "thin_ir_ser: validate: CallCrossModule slot out of range "
                                    "(no per-module dispatch size to validate against)";
                     return false;
-                }
-                const int64_t target_slot_count =
-                    cross_module_slot_counts[uint32_t(in.meta.mod_id)];
-                if (in.meta.slot >= target_slot_count) {
-                    if (err) *err = "thin_ir_ser: validate: CallCrossModule slot out of range "
-                                   "(>= target module dispatch size)";
-                    return false;
+                } else {
+                    const int64_t target_slot_count =
+                        cross_module_slot_counts[uint32_t(in.meta.mod_id)];
+                    if (in.meta.slot >= target_slot_count) {
+                        if (err) *err = "thin_ir_ser: validate: CallCrossModule slot out of range "
+                                       "(>= target module dispatch size)";
+                        return false;
+                    }
                 }
             }
             // P4 fix: Cmp predicate in [0,5] (Eq..Ge).
@@ -1156,7 +1166,8 @@ bool verify_thin_function_for_codegen(const ThinFunction& thf, std::string* err)
     std::string v;
     std::string* ep = err ? err : &v;
     if (!validate_thin_function(thf, ep, /*dispatch_size=*/0,
-                                /*registry_size=*/0, /*cross_module_slot_counts=*/nullptr)) {
+                                /*registry_size=*/0, /*cross_module_slot_counts=*/nullptr,
+                                /*skip_cross_module_range=*/true)) {
         if (err && !err->empty() && err->find("codegen") == std::string::npos)
             *err = "codegen verify: " + *err;
         return false;

@@ -230,7 +230,8 @@ bool deserialize_thin_function(const uint8_t*& cur, const uint8_t* end,
 bool validate_thin_function(const ThinFunction& thf, std::string* err,
                             uint32_t dispatch_size = 0,
                             uint32_t registry_size = 0,
-                            const int64_t* cross_module_slot_counts = nullptr);
+                            const int64_t* cross_module_slot_counts = nullptr,
+                            bool skip_cross_module_range = false);
 
 // ─── Red 5: the in-memory, codegen-facing verifier ───
 //

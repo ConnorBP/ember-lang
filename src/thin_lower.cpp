@@ -2555,6 +2555,7 @@ LoweredValue ThinLowerer::lower_call(const CallExpr& c, int32_t hidden_dest_off,
         in.op = ThinOp::CallCrossModule;
         in.meta.mod_id = int32_t(c.cross_module_id);
         in.meta.slot = int32_t(c.cross_module_slot);
+        in.meta.cross_module_target_mode = c.cross_module_target_mode;  // Red 7
         if (c.cross_module_unresolved) {
             // deferred trap (module/fn not registered) — mirrors emit_cross_module_call.
             set_term_trap(uint8_t(TrapReason::None));
