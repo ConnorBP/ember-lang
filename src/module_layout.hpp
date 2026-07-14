@@ -45,6 +45,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -111,6 +112,44 @@ struct PhysicalEntry {
     uint32_t domain_index = 0;             // index into ModuleLayoutPlan::domains
     uint32_t ordinal = 0;                  // ordinal within the domain
 };
+
+// ─── Runtime physical-entry descriptor (Red 4, §10.1, §10.4, §14.2) ──────
+// Plain data describing ONE physical dispatch slot at RUNTIME. This is the
+// per-entry metadata that lives on the immutable ModuleDispatchRecord so the
+// strict whole-record validator can verify, BEFORE publication, that each
+// stored target matches its domain's ABI fingerprint, visibility, calling
+// mode, and dispatch-domain label, and that the record can distinguish a REAL
+// callable entry from a PADDING/trap-stub entry. It mirrors the build-time
+// PhysicalEntry field set but is a distinct runtime type so the record is
+// self-describing: a host that publishes a keyed record supplies one
+// PhysicalEntryDescriptor per physical slot (indexed by physical_slot, size ==
+// physical_slot_count), and validate_dispatch_record cross-checks each
+// descriptor against its domain identity and against the entry pointer stored
+// at that physical slot (when the record's padding-stub identity is known via
+// is_padding_target()).
+//
+// A padding descriptor is a NON-NULL same-ABI target (§7.3): its ABI
+// fingerprint, visibility, calling mode, and dispatch-domain label match its
+// domain exactly, is_padding == true, and logical_slot == kPaddingLogicalSlot
+// (0xFFFFFFFFu). The runtime padding trap stub (ember_keyed_padding_trap)
+// NEVER performs a key comparison — it has no key parameter; it only records
+// TrapReason::KeyedDispatchPadding on the context and returns/traps.
+struct PhysicalEntryDescriptor {
+    uint32_t physical_slot = 0;            // index in the physical dispatch table
+    uint64_t abi_fingerprint = 0;          // matches its domain's fingerprint
+    Visibility visibility = Visibility::Public;
+    CallingMode calling_mode = CallingMode::LegacyContext;
+    std::string dispatch_domain;           // matches its domain's label
+    bool is_padding = false;               // real callable vs padding/trap-stub entry
+    uint32_t logical_slot = 0;             // real: served logical slot; padding: 0xFFFFFFFFu
+    uint32_t domain_index = 0;             // index into record.domains
+    uint32_t ordinal = 0;                  // ordinal within the domain
+};
+
+// Sentinel logical_slot for a padding entry (serves no callable). Same value
+// the build-time PhysicalEntry uses (kPaddingLogicalSlot in module_layout.cpp);
+// spelled here for the runtime descriptor.
+inline constexpr uint32_t kPaddingLogicalSlotRuntime = 0xFFFFFFFFu;
 
 // ─── Padding target descriptor (§7.3) ────────────────────────────────────
 // Plain data describing the one ABI-compatible padding target for a keyed
@@ -335,6 +374,31 @@ struct ModuleDispatchRecord {
     // validation); an empty (0-count) module has a null/0-byte allowlist.
     const uint8_t* logical_allowlist = nullptr;
     uint32_t logical_allowlist_bytes = 0;
+    // Runtime physical-entry descriptors (Red 4, §10.1, §10.4, §14.2): one per
+    // physical slot, indexed by physical_slot, size == physical_slot_count.
+    // These let the strict whole-record validator verify, BEFORE publication,
+    // that each stored target matches its domain's ABI fingerprint, visibility,
+    // calling mode, and dispatch-domain label, and distinguish a REAL callable
+    // entry from a PADDING/trap-stub entry. A non-null pointer with a count ==
+    // physical_slot_count is REQUIRED for a non-empty keyed record (validation
+    // rejects a null/short descriptor table); an identity record MAY omit them
+    // (the identity resolver indexes physical_slots[logical_slot] directly and
+    // needs no per-entry metadata to validate the permutation, but if present
+    // they must be consistent). For an empty module the pointer is null and
+    // the count is 0.
+    const PhysicalEntryDescriptor* physical_descriptors = nullptr;
+    uint32_t physical_descriptor_count = 0;
+    // The runtime identity of the ABI-compatible padding/trap stub installed at
+    // every padding physical slot (§7.3). When non-null, validate_dispatch_record
+    // treats an entry whose pointer equals padding_trap_target as a PADDING
+    // entry and cross-checks its descriptor (is_padding, ABI/visibility/mode/
+    // label match its domain, logical_slot == kPaddingLogicalSlotRuntime).
+    // A real callable entry must NOT equal this pointer. Null means the record
+    // does not declare a padding-trap identity (the validator then verifies each
+    // padding descriptor against its domain metadata only, not against the
+    // stored pointer). The padding target NEVER compares a key (§7.3) — it has
+    // no key parameter; ember_keyed_padding_trap is the reference implementation.
+    const void* padding_trap_target = nullptr;
 };
 
 // Strict whole-record validation BEFORE publication (§10.4, §14.2 should-fail
@@ -343,20 +407,33 @@ struct ModuleDispatchRecord {
 //   - mode is Identity or Keyed; strategy_version is supported;
 //   - counts are consistent (physical >= logical for keyed; physical == logical
 //     for identity with no domains);
-//   - every logical route is in range, dense, and matches its domain's ABI
-//     fingerprint, visibility, calling mode, and dispatch-domain label;
-//   - every route's domain_index is in range and its ordinal is a real (<
-//     logical_count) ordinal that the domain assigns to its logical slot;
+//   - every logical route is dense (route[i].logical_slot == i), in range, and
+//     matches its domain's ABI fingerprint, visibility, calling mode, and
+//     dispatch-domain label; route ordinal is a real (< logical_count) ordinal
+//     the domain assigns to that logical slot;
 //   - domains do not overlap and cover the physical range exactly for keyed;
 //   - the allowlist is non-null when logical_slot_count > 0 and has the right
 //     byte count, and every set bit indexes a present route;
+//   - the physical-descriptor table is present, sized == physical_slot_count,
+//     and each descriptor is inside its domain, matches its domain's ABI
+//     fingerprint/visibility/calling mode/dispatch-domain label, and is
+//     consistent (a real descriptor's ordinal < logical_count serves the
+//     domain's logical_slots[ordinal]; a padding descriptor's ordinal ==
+//     padding_ordinal and logical_slot == kPaddingLogicalSlotRuntime); every
+//     physical slot is covered exactly once;
+//   - every physical slot acquire-loads a NON-NULL finalized entry (§10.4 / §14.2
+//     "Physical table publication with null/unfinalized entry" is a should-fail);
+//     when padding_trap_target is non-null, an entry equal to it must be a
+//     padding descriptor and vice versa, and a real entry must NOT equal it;
 //   - no expected-key / fingerprint / digest / verifier field exists (the
 //     record's field set is the documented one — this is a structural shape
 //     check, not a value check).
 // Identity mode (§10.1 legacy path): a record with mode == Identity and zero
 // domains is accepted if counts match and physical_slots is non-null (or the
-// module is empty); the identity resolver indexes physical_slots[logical_slot]
-// directly.
+// module is empty) and every slot is non-null; physical_descriptors MAY be
+// null (identity needs no per-entry metadata) but if present must be sized ==
+// physical_slot_count and consistent. The identity resolver indexes
+// physical_slots[logical_slot] directly.
 ExtensionStatus validate_dispatch_record(const ModuleDispatchRecord& rec) noexcept;
 
 // Structured C++ resolver wrapper (for diagnostics). Validates the logical
@@ -391,6 +468,82 @@ ExtensionResult<void*> resolve_keyed_dispatch(
 extern "C" void* ember_resolve_keyed_dispatch(const ModuleDispatchRecord* rec,
                                               uint32_t logical_slot,
                                               uint64_t transient_route_word) noexcept;
+
+// ─── Runtime ABI-compatible padding/trap target (§7.3) ───────────────────
+// A REAL, callable, ABI-compatible padding target. The reference implementation
+// is a universal C-ABI stub whose entry ABI safely ignores every incoming
+// argument class (Win64 args live in registers/stack the stub never reads): it
+// reads only the context register (r14 = context_t*), records
+// TrapReason::KeyedDispatchPadding on it, and returns 0. It is the non-null
+// same-ABI target installed at every keyed domain's padding ordinal so a wrong
+// route word that lands there is memory-safe (a real call into finalized RX
+// code) and fires the recoverable keyed-padding trap.
+//
+// The padding target performs NO key comparison (§7.3): it has NO key
+// parameter, reads NO route word, and compares NO expected value. Its only
+// input is the context pointer. This is the architectural assertion the Red 4
+// test invokes: calling ember_keyed_padding_trap sets last_trap to
+// KeyedDispatchPadding and never consults a key.
+//
+// `context_t` is forward-declared here (defined in context.hpp) so this header
+// does not pull context.hpp into every module_layout consumer; the stub is
+// defined in module_layout.cpp where context.hpp is included.
+struct context_t;   // forward decl (src/context.hpp)
+
+// The universal padding-trap entry signature. It matches the host trap-stub
+// shape (context_t*, TrapReason, const char*) is NOT it — that is the TrapStub
+// the JIT calls. This is the ENTRY POINT installed in the physical dispatch
+// table at a padding ordinal: a callable that takes the context pointer (and
+// ignores all other ABI argument classes) and returns i64. The i64 return is a
+// neutral default for any domain whose callables return a GP scalar; the stub
+// records the trap on the context so a host with a checkpoint can recover.
+extern "C" int64_t ember_keyed_padding_trap(ember::context_t* ctx) noexcept;
+
+// The address of ember_keyed_padding_trap, as a void*, for setting a record's
+// padding_trap_target field. Returns the same pointer each call (the stub is a
+// single function). Use this instead of reinterpret_cast in host/test code.
+const void* ember_keyed_padding_trap_target() noexcept;
+
+// Is `entry` the runtime padding-trap target? Returns true iff entry is non-null
+// and equals ember_keyed_padding_trap_target(). Used by the validator (entry ==
+// padding_trap_target => padding descriptor) and by tests to recognize a padding
+// target without comparing a key.
+bool ember_is_padding_trap_target(const void* entry) noexcept;
+
+// ─── Record builder: assemble a runtime record from a layout plan ────────
+// Build an immutable ModuleDispatchRecord view over host-owned storage from a
+// Red 3 ModuleLayoutPlan. The caller owns `storage`, `routes`, `domains`,
+// `descriptors`, and `allowlist` (this helper fills them from the plan and
+// returns a record that borrows them; the caller must keep them alive for the
+// record's lifetime). The physical slot storage is populated with the encoded
+// entry pointers the caller supplies via `real_entry` (per real physical slot)
+// and the padding-trap stub at every padding slot — so the record is the §10.4
+// publication shape: validation MUST pass before the host publishes it.
+//
+// `real_entry(physical_slot)` returns the non-null finalized entry pointer for
+// a REAL physical slot; padding slots are filled with ember_keyed_padding_trap.
+// Returns the filled-out record (the borrows point at the caller's vectors).
+//
+// The record NEVER stores the route word: the plan's domains/salts are key-
+// independent (§8.4); only the entry PLACEMENT reflects the build key, and the
+// resolver re-derives the physical index from the per-call route word.
+struct RecordBuilderStorage {
+    std::vector<std::atomic<void*>> storage;        // physical slot storage
+    std::vector<LogicalRoute> routes;               // indexed by logical_slot
+    std::vector<DispatchDomain> domains;            // domain descriptors
+    std::vector<PhysicalEntryDescriptor> descriptors; // indexed by physical_slot
+    std::vector<uint8_t> allowlist;                 // ceil(logical_slot_count/8)
+};
+
+// Build the storage + a record view from a plan. `real_entry` is invoked once
+// per REAL physical slot to obtain its non-null finalized entry pointer;
+// padding slots are filled with ember_keyed_padding_trap. Returns the record
+// (borrowing st's vectors). On a malformed plan or a null real_entry, returns a
+// structured ExtensionError and leaves st untouched.
+ExtensionResult<ModuleDispatchRecord> build_module_dispatch_record(
+    RecordBuilderStorage& st,
+    const ModuleLayoutPlan& plan,
+    const std::function<void*(uint32_t physical_slot)>& real_entry) noexcept;
 
 // ─── Deterministic derivations (exposed for oracle cross-checking) ───────
 // Fold a BuildKeyView into a deterministic route word (pinned FNV-1a 64-bit

@@ -43,8 +43,15 @@ namespace ember {
 // already false OR the function has no register candidates, this is a no-op
 // (thf.ra.enabled stays false, emit_x64 uses the all-frame-slot path).
 //
-// num_regs: the number of pool registers to allow (0 = use the full pool of 6).
+// num_regs: the number of pool registers to allow (0 = use the full pool).
 // Defaults to 0 (full pool) — the host may pass a smaller number for testing.
-void run_regalloc(ThinFunction& thf, int32_t num_regs = 0);
+//
+// exclude_r15: when true, r15 is removed from the pool (Red 5 keyed mode,
+// plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §6.4: reserve r15 for the
+// transient route word). The pool drops from 6 registers (rbx/r12/r13/r15/rsi/
+// rdi) to 5 (rbx/r12/r13/rsi/rdi). Legacy mode (exclude_r15=false) retains the
+// existing six-register behavior and byte/value compatibility. Default false
+// = the legacy six-register pool unchanged.
+void run_regalloc(ThinFunction& thf, int32_t num_regs = 0, bool exclude_r15 = false);
 
 } // namespace ember

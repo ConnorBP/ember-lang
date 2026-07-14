@@ -25,6 +25,32 @@ class EmberAnalysisManager;
 
 struct CompiledFn;
 
+// ─── Red 5 keyed dispatch codegen descriptor (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md
+//   §9.3, §6.4) ───────────────────────────────────────────────────────────────
+// A borrowed immutable descriptor selecting keyed mode for a compile. Null in
+// CodeGenCtx::keyed_dispatch means EXACT legacy behavior (the tree-walker +
+// Thin IR emit are byte-identical to the pre-Red-5 path; r15 stays in the
+// regalloc pool; no keyed resolution is emitted). When non-null, keyed mode:
+//   - reserves r15 for the transient route word (removes r15 from the regalloc
+//     pool, §6.4); the JIT'd code treats r15 as read-only route material.
+//   - the keyed emit path is selected via CodeGenCtx (this descriptor), NOT by
+//     rewriting logical slot metadata (§9.4: Thin IR retains logical slots).
+//
+// `strategy` and `layout` are borrowed pointers to the configured strategy /
+// module-layout descriptors a future Red 6/7 emit consumes; null in this phase
+// (Red 5 is the outer thunk + regalloc reservation, not the call-lowering emit).
+// `runtime_key` pins WHERE the transient route word lives (r15 on Win64, §6.4).
+enum class RuntimeKeyLocation : uint8_t {
+    None = 0,   // legacy / unkeyed (no transient route register)
+    R15  = 1,   // Win64 x64: r15 reserved for the transient route word
+};
+
+struct KeyedDispatchCodegen {
+    const void* strategy = nullptr;        // configured DispatchStrategyConcept (borrowed; null in Red 5)
+    const void* layout = nullptr;          // configured ModuleDispatchLayout (borrowed; null in Red 5)
+    RuntimeKeyLocation runtime_key = RuntimeKeyLocation::None;
+};
+
 // Globals block: a TYPED layout (chunk c3) - one per-global (offset, size)
 // pair, addressed [base + offset]. Scalars are 8 bytes at an 8-aligned offset;
 // structs occupy StructLayout::size; fixed arrays occupy elem_size*array_len;
@@ -131,6 +157,16 @@ struct CodeGenCtx {
     // body serve N per-thread context_t's (no per-context recompile). Default
     // false = baked-ptr behavior unchanged (backward compat).
     bool use_context_reg = false;
+    // Red 5 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §9.3, §6.4): when
+    // non-null, keyed mode is selected for this compile. The descriptor is a
+    // BORROWED immutable pointer (the host owns it for the compile's lifetime);
+    // null = exact legacy behavior (byte-identical tree-walker + Thin IR emit,
+    // r15 stays in the regalloc pool, no keyed resolution emitted). When non-null
+    // with runtime_key == R15, the regalloc excludes r15 from the pool (§6.4) and
+    // the keyed emit path is selected via this descriptor (§9.4: Thin IR retains
+    // logical slots; keyed behavior is selected during emission, not by rewriting
+    // logical slot metadata).
+    const KeyedDispatchCodegen* keyed_dispatch = nullptr;
     // v1.0 thread-safety: the globals index/types threaded through CodeGenCtx so
     // compile_func no longer reads the process-wide g_globals_for_codegen pointer
     // (which races under parallel compilation). If null, falls back to the legacy

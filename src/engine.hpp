@@ -7,11 +7,18 @@
 #include "jit_memory.hpp"
 #include "context.hpp"   // context_t (v1.0 ember_call ctx-reg indirection)
 #include "ast.hpp"
+#include "key_provider.hpp"        // Red 5: DerivedMaterialProvider, DispatchKeyAdapter, ModuleId
+#include "module_layout.hpp"       // Red 5: DispatchMode (for ModuleInstance assembly)
 #include <cstdint>
 #include <vector>
 #include <string>
+#include <utility>
 
 namespace ember {
+
+// Forward decl: ModuleInstance (src/module_instance.hpp) — the host-owned
+// per-runtime container the safe keyed APIs consult.
+struct ModuleInstance;
 
 // A compiled function: its JIT'd bytes, the exec-memory pointer, and
 // the entry address. Lives as long as the owning module/engine.
@@ -94,8 +101,89 @@ int64_t call_i64_i64(void* entry);
 // r14 and script-to-script calls inherit ctx through that callee-saved register.
 // These helpers do NOT reset context_t and do NOT establish a setjmp checkpoint;
 // a host requiring recoverable traps must do that around the thunk call.
+//
+// Red 5 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §9.8): these raw
+// ember_call_* helpers are LEGACY-ONLY. They do NOT install r15 and are not a
+// sanctioned keyed entry path. A keyed ModuleInstance must use the safe
+// ember_call_keyed_* APIs below (which derive the route word, install r14/r15,
+// establish a checkpoint, invoke, clean route state, and restore the caller's
+// registers on every normal/trap path). The raw helpers remain for unkeyed
+// modules and for hosts that manage their own checkpoint/reload discipline.
 int64_t ember_call_void(void* entry, context_t* ctx);
 int64_t ember_call_i64(void* entry, context_t* ctx, int64_t a);
 int64_t ember_call_i64_i64(void* entry, context_t* ctx, int64_t a, int64_t b);
+
+// ─── Red 5: safe keyed host-to-script call APIs (§9.8, §6.3) ────────────────
+//
+// The structured result of a keyed host-to-script call. `ok` is true only when
+// the call was entered, ran, and returned normally; `value` carries the i64
+// return for the i64/i64_i64 forms (0 for the void form). `trapped` is true
+// when a trap fired and the trap stub longjmp'd back to the API's checkpoint —
+// in that case `reason` carries the trap reason string and `value` is 0. On a
+// pre-entry failure (provider failure, missing module/entry, bad logical
+// identity), `ok` is false, `trapped` is false, and `reason` carries a
+// structured diagnostic; the thunk was never entered and the caller's
+// registers are untouched (the API never reached the asm thunk).
+struct CallResult {
+    bool ok = false;            // entered + returned normally
+    bool trapped = false;       // a trap fired + longjmp'd back to the checkpoint
+    int64_t value = 0;          // i64 return (void form: 0)
+    std::string reason;         // structured diagnostic on failure/trap
+};
+
+// Safe keyed outer-call APIs (§9.8). They establish:
+//   1. derive the transient route word once from the provider via the adapter
+//      (§6.3 step 1) — provider failure -> structured CallResult failure, the
+//      thunk is never entered;
+//   2. resolve the logical entry (the module's `main`/named export) against the
+//      instance's dispatch record — missing/bad identity -> structured failure;
+//   3. establish a setjmp checkpoint on the supplied context_t (when the
+//      instance has a trap stub) so a trap longjmps back here cleanly;
+//   4. install r14 = &ctx and r15 = route_word via the keyed asm thunk;
+//   5. invoke the entry; nested script calls inherit r15 directly (§6.5);
+//   6. on normal return, clear the transient r15 (xor r15,r15) and restore the
+//      caller's original r14/r15 (the thunk pushes/pops them) (§6.3 step 5);
+//   7. on a trapped exit, the trap stub longjmps to the checkpoint; the API's
+//      own callee-saved r14/r15 are restored by the C++ epilogue (the thunk's
+//      transient r15 is in the abandoned thunk frame), so the caller's values
+//      survive and the transient r15 is cleared (§6.3 step 5).
+//
+// `name` resolves against the module's export name directory (the host's
+// CompiledFn table); "main" is the conventional entry. The instance's mode +
+// counts select identity or keyed resolution; the route word participates in
+// keyed resolution (Red 4's resolver) and in r15 installation regardless of
+// mode (the thunk reserves r15 for the whole call tree, §6.4).
+CallResult ember_call_keyed_void(ModuleInstance& inst, const std::string& name,
+                                 context_t& ctx, const DispatchKeyAdapter& adapter);
+CallResult ember_call_keyed_i64(ModuleInstance& inst, const std::string& name,
+                                context_t& ctx, int64_t a,
+                                const DispatchKeyAdapter& adapter);
+CallResult ember_call_keyed_i64_i64(ModuleInstance& inst, const std::string& name,
+                                    context_t& ctx, int64_t a, int64_t b,
+                                    const DispatchKeyAdapter& adapter);
+
+// Keyed re-entry thunk (§6.5): a native that re-enters the script under the
+// SAME route word calls this instead of a raw ember_call_*. It installs r14 =
+// ctx and r15 = route_word, invokes `entry`, clears r15, restores the caller's
+// r14/r15, and returns the i64 result. It does NOT derive the route word (the
+// caller supplies it — the outer thunk's route word, captured by the native) and
+// does NOT establish a checkpoint (the enclosing outer call's checkpoint is
+// still live). A native re-entry MUST use this thunk so the keyed r15 invariant
+// holds across native->script re-entry (§6.5: "a native-to-script re-entry must
+// use a keyed re-entry thunk that preserves or explicitly reinstalls the same
+// route word"). The void/i64 forms cover the common re-entry shapes.
+int64_t ember_keyed_reentry_void(void* entry, context_t* ctx, uint64_t route_word);
+int64_t ember_keyed_reentry_i64(void* entry, context_t* ctx, int64_t a, uint64_t route_word);
+int64_t ember_keyed_reentry_i64_i64(void* entry, context_t* ctx, int64_t a, int64_t b,
+                                    uint64_t route_word);
+
+// ─── Red 5: test/observation asm helpers ───────────────────────────────────
+// Read/set the caller's r15. Used by the Red 5 focused test to observe the
+// transient route register (reentry_probe reads r15) and to seed a distinctive
+// caller r15 before a call so the test can assert it's restored after. These
+// are NOT part of the keyed runtime contract; they are test scaffolding exposed
+// here so the test does not need its own inline asm.
+uint64_t ember_read_r15();
+void ember_set_r15(uint64_t v);
 
 } // namespace ember

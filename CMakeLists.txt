@@ -115,6 +115,7 @@ add_library(ember STATIC
     # stays in the core lib with no ember_frontend dependency (one-way link
     # direction), matching thin_ir.cpp / thin_ir_ser.cpp / em_type_codec.cpp.
     src/keyed_dispatch.cpp
+    src/key_provider.cpp          # Red 5: immutable provider boundary + dispatch key adapter (§6.1)
     src/gc.cpp              # GC: tracing mark-sweep core (foundational infra for lambdas/coroutines)
     src/safety.cpp          # process-wide failsafes: RSS memory cap, recursion depth guard, deadline
 )
@@ -1183,6 +1184,33 @@ target_link_libraries(module_layout_test PRIVATE ember ember_frontend)
 # the gate.
 add_executable(keyed_dispatch_runtime examples/keyed_dispatch_runtime_test.cpp)
 target_link_libraries(keyed_dispatch_runtime PRIVATE ember ember_frontend)
+
+# keyed_dispatch_outer_thunk - Red 5 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md
+# §6, §9.8, §10.3, §14.2, §14.3): the keyed outer thunk / provider boundary /
+# ModuleInstance / safe keyed host-call API gate. Pins the §6 key lifecycle and
+# the §9.8 / §14.2 mandatory buckets: the provider is invoked exactly once per
+# outer call and never for recursive/nested script edges; provider failure
+# prevents entry; r14 contains the supplied context_t*; r15 contains the
+# transient route word throughout direct recursion and native re-entry; the
+# caller's original r14/r15 are restored; transient r15 is cleared before
+# restoring the caller value on normal and trapped exits; route words 0 and
+# UINT64_MAX work; try/throw/catch preserves the keyed r15 invariant (slot 5
+# restore); and two concurrent callers using different providers do not share
+# route state. Links ember (keyed_dispatch.* — Red 1, context.hpp, engine.* —
+# Red 5 thunks, dispatch_table.hpp, key_provider.* — Red 5 provider/adapter)
+# + ember_frontend (module_layout.* — Red 3/4, module_instance.hpp — Red 5,
+# codegen.* — the keyed CodeGenCtx, regalloc.* — r15 exclusion, the standard
+# six-extension harness for native registration). NOT a CTest entry: the
+# filtered suite count must stay 67 (§14.1); the target building cleanly + the
+# executable passing IS the gate.
+add_executable(keyed_dispatch_outer_thunk examples/keyed_dispatch_outer_thunk_test.cpp)
+target_link_libraries(keyed_dispatch_outer_thunk PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_vec ember_ext_quat ember_ext_mat
+    ember_ext_string ember_ext_array ember_ext_math)
+if(WIN32)
+    target_link_libraries(keyed_dispatch_outer_thunk PRIVATE kernel32)
+endif()
 
 # thin_ir_ser_test - Stage B c1b (IL-.em): the IR SERIALIZER round-trip gate.
 # Hand-builds a ThinFunction + uses the real lower_function path (fib) to

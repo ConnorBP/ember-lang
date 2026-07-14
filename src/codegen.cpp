@@ -5463,7 +5463,15 @@ static CompileResult compile_impl_(const FuncDecl& f, const CodeGenCtx& ctx,
                 stage(CompileStage::StaleRegallocClear, /*reached=*/true, /*ok=*/true,
                       "cleared (ra.enabled=false before allocation)");
                 if (ctx.enable_regalloc) {
-                    run_regalloc(thf);
+                    // Red 5 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §6.4):
+                    // when the keyed CodeGenCtx descriptor is present with
+                    // runtime_key == R15, exclude r15 from the regalloc pool (the
+                    // transient route word lives there). Legacy mode (no keyed
+                    // descriptor) retains the existing six-register behavior and
+                    // byte/value compatibility.
+                    bool exclude_r15 = (ctx.keyed_dispatch != nullptr &&
+                                        ctx.keyed_dispatch->runtime_key == RuntimeKeyLocation::R15);
+                    run_regalloc(thf, 0, exclude_r15);
                     stage(CompileStage::Regalloc, /*reached=*/true, /*ok=*/true,
                           std::string("ran once (enabled=") +
                           (thf.ra.enabled ? "true" : "false") +

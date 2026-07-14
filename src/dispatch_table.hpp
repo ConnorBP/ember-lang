@@ -7,6 +7,7 @@
 #include <vector>
 #include <atomic>
 #include <cstddef>
+#include <set>
 #include <stdexcept>
 
 namespace ember {
@@ -120,20 +121,56 @@ struct KeyedDispatchStorage {
     }
 
     // Strict batch publication: validate EVERY (slot, entry) pair FIRST (slot
-    // in range + entry non-null), then commit all with release ordering.
-    // Returns false on a validation failure with NO slot mutated — the storage
-    // is left byte-for-byte unchanged, so a host that staged its compiled
-    // functions into private ownership can free them and report a clean
-    // publication failure with no partial record visible to callers. This is
-    // the §10.4 publication invariant: no keyed module becomes reachable until
-    // every physical position is filled with a non-null finalized entry.
+    // in range + entry non-null + NO duplicate slot), then commit all with
+    // release ordering. Returns false on a validation failure with NO slot
+    // mutated — the storage is left byte-for-byte unchanged, so a host that
+    // staged its compiled functions into private ownership can free them and
+    // report a clean publication failure with no partial record visible to
+    // callers. A duplicate slot in the batch is rejected (the second occurrence
+    // would overwrite the first within the same publish, masking an incomplete
+    // batch). This is the §10.4 publication invariant: no keyed module becomes
+    // reachable until every physical position is filled with a non-null
+    // finalized entry.
     bool publish_keyed(const std::vector<std::pair<size_t, void*>>& entries) {
+        // First pass: range + non-null + no duplicate slot. Track seen slots in
+        // a sorted set so duplicate detection is deterministic and O(n log n).
+        std::set<size_t> seen;
         for (const auto& [slot, fn] : entries) {
             if (slot >= slots.size()) return false;   // out of range -> reject, no mutation
             if (!fn) return false;                    // null/unfinalized -> reject, no mutation
+            auto [it, ok] = seen.insert(slot);
+            if (!ok) return false;                    // duplicate slot -> reject, no mutation
         }
+        // All pairs validated: commit atomically (release ordering).
         for (const auto& [slot, fn] : entries)
             slots[slot].store(fn, std::memory_order_release);
+        return true;
+    }
+
+    // STRICT FULL-COVERAGE publication (§10.4, coupled to record validation).
+    // Requires the batch to cover EVERY physical slot EXACTLY ONCE: complete
+    // (no missing slot), unique (no duplicate), non-null (no unfinalized
+    // entry), and in range. Returns false on ANY incompleteness with NO slot
+    // mutated. This is the publication path a keyed host uses BEFORE calling
+    // validate_dispatch_record on the assembled record: the storage is fully
+    // populated (every slot non-null) and then the whole record is validated,
+    // so strict whole-record validation before publication is enforced. A
+    // half-filled or duplicate batch never reaches a readable state.
+    bool publish_keyed_strict(const std::vector<std::pair<size_t, void*>>& entries) {
+        if (entries.size() != slots.size()) return false;   // incomplete or extra
+        if (!publish_keyed(entries)) return false;            // range + non-null + unique
+        // publish_keyed already committed; confirm every slot is now non-null
+        // (defensive — publish_keyed's checks imply this, but assert the
+        // publication is observably complete so a caller can rely on it).
+        return all_filled();
+    }
+
+    // True iff EVERY physical slot is non-null (a complete, published table).
+    // The §10.4 invariant: every physical position is filled with a non-null
+    // finalized entry. Used by publish_keyed_strict and by tests/hosts to
+    // confirm a keyed table is fully published before binding a record to it.
+    bool all_filled() const {
+        for (const auto& s : slots) if (s.load(std::memory_order_acquire) == nullptr) return false;
         return true;
     }
 

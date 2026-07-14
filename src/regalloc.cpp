@@ -39,6 +39,9 @@ namespace {
 //
 // Order: rbx first (no extra save cost), then the rest. The order matters for
 // which registers get used first (and thus which need save slots).
+//
+// Red 5 keyed mode (§6.4): r15 is reserved for the transient route word and
+// removed from the pool (see KEYED_REG_POOL below).
 constexpr Reg REG_POOL[] = {
     Reg::rbx,  // 3  — already saved (no extra save slot)
     Reg::r12,  // 12
@@ -48,6 +51,16 @@ constexpr Reg REG_POOL[] = {
     Reg::rdi,  // 7
 };
 constexpr int32_t POOL_SIZE = int32_t(sizeof(REG_POOL) / sizeof(REG_POOL[0]));
+
+// The keyed pool: r15 removed (§6.4). 5 registers: rbx/r12/r13/rsi/rdi.
+constexpr Reg KEYED_REG_POOL[] = {
+    Reg::rbx,  // 3
+    Reg::r12,  // 12
+    Reg::r13,  // 13
+    Reg::rsi,  // 6
+    Reg::rdi,  // 7
+};
+constexpr int32_t KEYED_POOL_SIZE = int32_t(sizeof(KEYED_REG_POOL) / sizeof(KEYED_REG_POOL[0]));
 
 // rbx is at index 0 and is already saved by the standard prologue.
 constexpr int32_t RBX_POOL_IDX = 0;
@@ -132,7 +145,7 @@ struct LiveInterval {
 
 } // namespace
 
-void run_regalloc(ThinFunction& thf, int32_t num_regs) {
+void run_regalloc(ThinFunction& thf, int32_t num_regs, bool exclude_r15) {
     thf.ra.enabled = false;
     thf.ra.map.clear();
     thf.ra.frame_reg_map.clear();
@@ -141,7 +154,13 @@ void run_regalloc(ThinFunction& thf, int32_t num_regs) {
 
     if (thf.blocks.empty()) return;
 
-    int32_t pool = (num_regs > 0 && num_regs <= POOL_SIZE) ? num_regs : POOL_SIZE;
+    // Select the active pool: the legacy six-register pool (default, byte/value
+    // compatible with the pre-Red-5 path) or the keyed five-register pool with
+    // r15 removed (Red 5 §6.4). RBX_POOL_IDX (0) is the same in both pools —
+    // rbx is first and already saved by the standard prologue.
+    const Reg* active_pool = exclude_r15 ? KEYED_REG_POOL : REG_POOL;
+    const int32_t active_pool_size = exclude_r15 ? KEYED_POOL_SIZE : POOL_SIZE;
+    int32_t pool = (num_regs > 0 && num_regs <= active_pool_size) ? num_regs : active_pool_size;
     if (pool <= 0) return;
     thf.ra.num_regs = pool;
 
@@ -260,7 +279,7 @@ void run_regalloc(ThinFunction& thf, int32_t num_regs) {
                 // free the pool index that this interval's reg_id corresponds to
                 int32_t rid = thf.ra.map[(*it)->vreg].reg_id;
                 for (int32_t pi = 0; pi < pool; ++pi)
-                    if (int32_t(REG_POOL[pi]) == rid) { free_regs.push_back(pi); break; }
+                    if (int32_t(active_pool[pi]) == rid) { free_regs.push_back(pi); break; }
                 it = active.erase(it);
             } else {
                 ++it;
@@ -272,7 +291,7 @@ void run_regalloc(ThinFunction& thf, int32_t num_regs) {
             int32_t reg_idx = free_regs.back();
             free_regs.pop_back();
             thf.ra.map[li.vreg].in_reg = true;
-            thf.ra.map[li.vreg].reg_id = int32_t(REG_POOL[reg_idx]);
+            thf.ra.map[li.vreg].reg_id = int32_t(active_pool[reg_idx]);
             active.push_back(&li);
         } else {
             // spill: find the farthest-reaching active interval
@@ -314,7 +333,7 @@ void run_regalloc(ThinFunction& thf, int32_t num_regs) {
     for (const auto& [v, a] : thf.ra.map) {
         if (a.in_reg && a.reg_id >= 0)
             for (int32_t i = 0; i < pool; ++i)
-                if (int32_t(REG_POOL[i]) == a.reg_id) { reg_used[i] = true; break; }
+                if (int32_t(active_pool[i]) == a.reg_id) { reg_used[i] = true; break; }
     }
 
     std::unordered_map<int32_t, int32_t> frame_accesses;
@@ -368,7 +387,7 @@ void run_regalloc(ThinFunction& thf, int32_t num_regs) {
             if (!reg_used[i]) { free_idx = i; break; }
         }
         if (free_idx < 0) break;
-        thf.ra.frame_reg_map[off] = int32_t(REG_POOL[free_idx]);
+        thf.ra.frame_reg_map[off] = int32_t(active_pool[free_idx]);
         reg_used[free_idx] = true;
     }
 
@@ -383,13 +402,13 @@ void run_regalloc(ThinFunction& thf, int32_t num_regs) {
         if (!reg_used[i]) continue;
         if (i == RBX_POOL_IDX) {
             // rbx is already saved; record the existing offset (no new slot)
-            thf.ra.used_reg_ids.push_back(int32_t(REG_POOL[i]));
+            thf.ra.used_reg_ids.push_back(int32_t(active_pool[i]));
             thf.ra.save_offsets.push_back(thf.frame.rbx_save_offset);
             continue;
         }
         save_top += 8;
         int32_t off = -save_top;
-        thf.ra.used_reg_ids.push_back(int32_t(REG_POOL[i]));
+        thf.ra.used_reg_ids.push_back(int32_t(active_pool[i]));
         thf.ra.save_offsets.push_back(off);
     }
 

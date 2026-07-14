@@ -11,6 +11,7 @@
 // §2, §5, §7, §9.2, §14.3.
 
 #include "module_layout.hpp"
+#include "context.hpp"          // context_t, TrapReason (padding trap stub)
 
 #include <algorithm>
 #include <atomic>
@@ -905,6 +906,30 @@ ExtensionStatus validate_dispatch_record(const ModuleDispatchRecord& rec) noexce
                     std::to_string(i))};
             }
         }
+        // Every identity physical slot must be non-null (§10.4 / §14.2).
+        for (uint32_t s = 0; s < rec.physical_slot_count; ++s) {
+            if (rec.physical_slots[s].load(std::memory_order_acquire) == nullptr) {
+                return ExtensionStatus{err("", "identity record: null/unfinalized entry at slot " +
+                    std::to_string(s))};
+            }
+        }
+        // Physical descriptors are OPTIONAL in identity mode (the identity
+        // resolver needs no per-entry metadata to validate the permutation),
+        // but if present they must be sized == physical_slot_count and each
+        // be a real (non-padding) descriptor serving its own slot.
+        if (rec.physical_descriptors != nullptr) {
+            if (rec.physical_descriptor_count != rec.physical_slot_count) {
+                return ExtensionStatus{err("", "identity record: physical_descriptor_count != physical_slot_count")};
+            }
+            for (uint32_t s = 0; s < rec.physical_slot_count; ++s) {
+                const auto& pd = rec.physical_descriptors[s];
+                if (pd.physical_slot != s || pd.is_padding ||
+                    pd.logical_slot != s) {
+                    return ExtensionStatus{err("", "identity record: descriptor[" + std::to_string(s) +
+                        "] not identity (slot s, real, serves s)")};
+                }
+            }
+        }
         return ExtensionStatus{};
     }
 
@@ -1027,6 +1052,118 @@ ExtensionStatus validate_dispatch_record(const ModuleDispatchRecord& rec) noexce
         }
     }
 
+    // ---- Physical-entry descriptors (Red 4, §10.1, §10.4, §14.2) ----
+    // The descriptor table must be present and sized == physical_slot_count so
+    // the validator can verify each stored target matches its domain's ABI
+    // fingerprint/visibility/calling mode/dispatch-domain label and distinguish
+    // a REAL callable from a PADDING/trap-stub entry. The test consults the
+    // RUNTIME record's descriptors, not the build-time ModuleLayoutPlan.
+    if (rec.physical_descriptors == nullptr) {
+        return ExtensionStatus{err("", "keyed record: null physical_descriptors")};
+    }
+    if (rec.physical_descriptor_count != rec.physical_slot_count) {
+        return ExtensionStatus{err("", "keyed record: physical_descriptor_count != physical_slot_count")};
+    }
+    const void* pad_target = rec.padding_trap_target;  // may be null
+    {
+        std::set<uint32_t> seen_desc_slots;
+        for (uint32_t s = 0; s < rec.physical_slot_count; ++s) {
+            const auto& pd = rec.physical_descriptors[s];
+            if (pd.physical_slot != s) {
+                return ExtensionStatus{err("", "keyed record: descriptor[" + std::to_string(s) +
+                    "].physical_slot != index")};
+            }
+            auto [it, ok] = seen_desc_slots.insert(pd.physical_slot);
+            if (!ok) {
+                return ExtensionStatus{err("", "keyed record: duplicate descriptor physical slot " +
+                    std::to_string(pd.physical_slot))};
+            }
+            if (pd.domain_index >= rec.domain_count) {
+                return ExtensionStatus{err("", "keyed record: descriptor[" + std::to_string(s) +
+                    "] domain_index OOB")};
+            }
+            const auto& d = rec.domains[pd.domain_index];
+            // Descriptor must lie inside its domain's physical range.
+            if (pd.physical_slot < d.physical_base ||
+                pd.physical_slot >= d.physical_base + d.physical_count) {
+                return ExtensionStatus{err("", "keyed record: descriptor[" + std::to_string(s) +
+                    "] outside its domain range")};
+            }
+            // Cross-ABI / cross-visibility / cross-mode / cross-label membership:
+            // each stored target's metadata must match its domain's identity.
+            if (pd.abi_fingerprint != d.abi_fingerprint) {
+                return ExtensionStatus{err("", "keyed record: descriptor[" + std::to_string(s) +
+                    "] ABI fingerprint != domain")};
+            }
+            if (pd.visibility != d.visibility) {
+                return ExtensionStatus{err("", "keyed record: descriptor[" + std::to_string(s) +
+                    "] visibility != domain")};
+            }
+            if (pd.calling_mode != d.calling_mode) {
+                return ExtensionStatus{err("", "keyed record: descriptor[" + std::to_string(s) +
+                    "] calling_mode != domain")};
+            }
+            if (pd.dispatch_domain != d.dispatch_domain) {
+                return ExtensionStatus{err("", "keyed record: descriptor[" + std::to_string(s) +
+                    "] dispatch_domain != domain")};
+            }
+            // Real vs padding consistency against the domain.
+            if (pd.is_padding) {
+                if (pd.ordinal != d.padding_ordinal) {
+                    return ExtensionStatus{err("", "keyed record: padding descriptor[" + std::to_string(s) +
+                        "] ordinal != domain padding_ordinal")};
+                }
+                if (pd.logical_slot != kPaddingLogicalSlotRuntime) {
+                    return ExtensionStatus{err("", "keyed record: padding descriptor[" + std::to_string(s) +
+                        "] logical_slot != padding sentinel")};
+                }
+            } else {
+                if (pd.ordinal >= d.logical_count) {
+                    return ExtensionStatus{err("", "keyed record: real descriptor[" + std::to_string(s) +
+                        "] ordinal >= domain logical_count")};
+                }
+                if (pd.ordinal >= d.logical_slots.size() ||
+                    d.logical_slots[pd.ordinal] != pd.logical_slot) {
+                    return ExtensionStatus{err("", "keyed record: real descriptor[" + std::to_string(s) +
+                        "] ordinal/logical_slots mismatch")};
+                }
+            }
+            // Cross-check the stored entry pointer against the padding-trap
+            // identity, when declared. A padding descriptor's entry must equal
+            // the padding target; a real descriptor's entry must NOT.
+            if (pad_target != nullptr) {
+                void* entry = rec.physical_slots[s].load(std::memory_order_acquire);
+                if (pd.is_padding) {
+                    if (entry != const_cast<void*>(pad_target)) {
+                        return ExtensionStatus{err("", "keyed record: padding descriptor[" + std::to_string(s) +
+                            "] entry != padding_trap_target")};
+                    }
+                } else {
+                    if (entry == const_cast<void*>(pad_target)) {
+                        return ExtensionStatus{err("", "keyed record: real descriptor[" + std::to_string(s) +
+                            "] entry == padding_trap_target (real entry must not be the padding stub)")};
+                    }
+                }
+            }
+        }
+        if (seen_desc_slots.size() != rec.physical_slot_count) {
+            return ExtensionStatus{err("", "keyed record: physical descriptor coverage gap")};
+        }
+    }
+
+    // ---- Null / unfinalized physical entries (§10.4 / §14.2 should-fail) ----
+    // Every physical slot must acquire-load a NON-NULL finalized entry. A null
+    // slot is a publication-invariant violation: strict publication rejects a
+    // null entry with no slot mutated, so a published record must be complete.
+    // This is the runtime half of the strict-publication coupling.
+    for (uint32_t s = 0; s < rec.physical_slot_count; ++s) {
+        void* entry = rec.physical_slots[s].load(std::memory_order_acquire);
+        if (entry == nullptr) {
+            return ExtensionStatus{err("", "keyed record: null/unfinalized entry at physical slot " +
+                std::to_string(s))};
+        }
+    }
+
     return ExtensionStatus{};
 }
 
@@ -1067,6 +1204,17 @@ static bool resolve_core(const ModuleDispatchRecord* rec, uint32_t logical_slot,
     }
     const LogicalRoute& r = rec->logical_routes[logical_slot];
 
+    // Strengthened resolver guards (Red 4 feedback): validate the route's
+    // logical identity and, for keyed mode, its metadata against its domain
+    // BEFORE any permutation/physical read, so a malformed record resolves to
+    // a structured failure instead of a wrong entry. A validated record passes
+    // these trivially; the guards exist so an unvalidated/corrupted record
+    // never silently resolves.
+    if (r.logical_slot != logical_slot) {
+        out_err = err("", "resolve: route logical_slot != requested logical_slot");
+        return false;
+    }
+
     uint32_t physical_index = 0;
     if (rec->mode == DispatchMode::Identity) {
         // Legacy path: physical_slots[logical_slot] directly. No permutation,
@@ -1088,10 +1236,37 @@ static bool resolve_core(const ModuleDispatchRecord* rec, uint32_t logical_slot,
             return false;
         }
         const DispatchDomain& d = rec->domains[r.domain_index];
+        // Route metadata must match its domain identity (ABI fingerprint,
+        // visibility, calling mode, dispatch-domain label). A malformed record
+        // whose route disagrees with its domain resolves to a structured
+        // failure, never a wrong entry.
+        if (r.abi_fingerprint != d.abi_fingerprint) {
+            out_err = err("", "resolve: route ABI fingerprint != domain");
+            return false;
+        }
+        if (r.visibility != d.visibility) {
+            out_err = err("", "resolve: route visibility != domain");
+            return false;
+        }
+        if (r.calling_mode != d.calling_mode) {
+            out_err = err("", "resolve: route calling_mode != domain");
+            return false;
+        }
+        if (r.dispatch_domain != d.dispatch_domain) {
+            out_err = err("", "resolve: route dispatch_domain != domain");
+            return false;
+        }
         // The route's ordinal must be a real (non-padding) ordinal of the
-        // domain. A validated record guarantees this; check defensively.
+        // domain, and the domain must assign that ordinal to this logical
+        // slot. A validated record guarantees this; check defensively so a
+        // malformed record never resolves to a wrong entry.
         if (r.ordinal >= d.logical_count) {
             out_err = err("", "resolve: route ordinal >= domain logical_count");
+            return false;
+        }
+        if (r.ordinal >= d.logical_slots.size() ||
+            d.logical_slots[r.ordinal] != r.logical_slot) {
+            out_err = err("", "resolve: route ordinal/logical_slots mismatch");
             return false;
         }
         // The domain must publish the same strategy version as the record.
@@ -1166,6 +1341,122 @@ extern "C" void* ember_resolve_keyed_dispatch(const ModuleDispatchRecord* rec,
         return entry;
     }
     return nullptr;
+}
+
+// ============================================================================
+// Red 4: runtime ABI-compatible padding/trap target (§7.3) + record builder.
+// ============================================================================
+
+// The universal padding-trap entry point. Its entry ABI safely ignores every
+// incoming argument class (Win64 args live in rcx/rdx/r8/r9/xmm/stack which
+// this stub never reads); it reads only the context pointer (passed in r14 by
+// the keyed outer thunk, or here directly as the first Win64 GP arg) and
+// records TrapReason::KeyedDispatchPadding on it. Returns 0 (a neutral i64
+// for any GP-scalar-returning domain). This is a REAL callable same-ABI target:
+// a wrong route word that lands on a padding ordinal calls into finalized RX
+// code, fires the recoverable trap reason, and NEVER compares a key. There is
+// no key parameter and no expected-value comparison anywhere in this stub —
+// proving it is a one-line read of the context's last_trap field.
+extern "C" int64_t ember_keyed_padding_trap(ember::context_t* ctx) noexcept {
+    if (ctx) {
+        ctx->last_trap = TrapReason::KeyedDispatchPadding;
+        ctx->last_error = "keyed dispatch padding";
+    }
+    return 0;
+}
+
+const void* ember_keyed_padding_trap_target() noexcept {
+    return reinterpret_cast<const void*>(&ember_keyed_padding_trap);
+}
+
+bool ember_is_padding_trap_target(const void* entry) noexcept {
+    if (entry == nullptr) return false;
+    return entry == ember_keyed_padding_trap_target();
+}
+
+// Build a runtime record view over host-owned storage from a Red 3 plan. Fills
+// st's vectors (storage/routes/domains/descriptors/allowlist) from the plan and
+// returns a ModuleDispatchRecord borrowing them. Real physical slots are
+// populated via real_entry(physical_slot); padding slots are filled with the
+// padding-trap stub. The record's padding_trap_target is set so the validator
+// can cross-check padding entries against the stub identity. The record NEVER
+// stores the route word.
+ExtensionResult<ModuleDispatchRecord> build_module_dispatch_record(
+    RecordBuilderStorage& st,
+    const ModuleLayoutPlan& plan,
+    const std::function<void*(uint32_t physical_slot)>& real_entry) noexcept {
+    if (!plan.keyed) {
+        return ExtensionResult<ModuleDispatchRecord>{err("",
+            "build_module_dispatch_record: plan is not keyed")};
+    }
+    if (plan.logical_slot_count == 0) {
+        return ExtensionResult<ModuleDispatchRecord>{err("",
+            "build_module_dispatch_record: empty keyed plan")};
+    }
+    if (!real_entry) {
+        return ExtensionResult<ModuleDispatchRecord>{err("",
+            "build_module_dispatch_record: null real_entry callback")};
+    }
+
+    st.routes = plan.logical_routes;
+    st.domains = plan.domains;
+    st.allowlist.assign((plan.logical_slot_count + 7u) >> 3, 0);
+    for (uint32_t i = 0; i < plan.logical_slot_count; ++i)
+        st.allowlist[i >> 3] |= (uint8_t(1) << (i & 7u));
+
+    // Physical descriptors: one per physical slot, transcribed from the plan's
+    // build-time PhysicalEntry into the runtime PhysicalEntryDescriptor.
+    st.descriptors.assign(plan.physical_slot_count, PhysicalEntryDescriptor{});
+    for (uint32_t s = 0; s < plan.physical_slot_count; ++s) {
+        const auto& pe = plan.physical_entries[s];
+        PhysicalEntryDescriptor& pd = st.descriptors[s];
+        pd.physical_slot = pe.physical_slot;
+        pd.abi_fingerprint = pe.abi_fingerprint;
+        pd.visibility = pe.visibility;
+        pd.calling_mode = pe.calling_mode;
+        pd.dispatch_domain = pe.dispatch_domain;
+        pd.is_padding = pe.is_padding;
+        pd.logical_slot = pe.logical_slot;
+        pd.domain_index = pe.domain_index;
+        pd.ordinal = pe.ordinal;
+    }
+
+    // Physical storage: real entries via the callback, padding slots via the
+    // padding-trap stub. Reject a null real_entry callback result up front so
+    // the storage never holds a null slot.
+    st.storage = std::vector<std::atomic<void*>>(plan.physical_slot_count);
+    const void* pad_stub = ember_keyed_padding_trap_target();
+    for (uint32_t s = 0; s < plan.physical_slot_count; ++s) {
+        const auto& pe = plan.physical_entries[s];
+        void* entry = nullptr;
+        if (pe.is_padding) {
+            entry = const_cast<void*>(pad_stub);
+        } else {
+            entry = real_entry(s);
+            if (entry == nullptr) {
+                return ExtensionResult<ModuleDispatchRecord>{err("",
+                    "build_module_dispatch_record: real_entry returned null for physical slot " +
+                    std::to_string(s))};
+            }
+        }
+        st.storage[s].store(entry, std::memory_order_release);
+    }
+
+    ModuleDispatchRecord rec{};
+    rec.mode = DispatchMode::Keyed;
+    rec.strategy_version = 1;
+    rec.physical_slots = st.storage.data();
+    rec.physical_slot_count = plan.physical_slot_count;
+    rec.logical_slot_count = plan.logical_slot_count;
+    rec.logical_routes = st.routes.data();
+    rec.domains = st.domains.data();
+    rec.domain_count = static_cast<uint32_t>(st.domains.size());
+    rec.logical_allowlist = st.allowlist.data();
+    rec.logical_allowlist_bytes = static_cast<uint32_t>(st.allowlist.size());
+    rec.physical_descriptors = st.descriptors.data();
+    rec.physical_descriptor_count = static_cast<uint32_t>(st.descriptors.size());
+    rec.padding_trap_target = pad_stub;
+    return ExtensionResult<ModuleDispatchRecord>{rec};
 }
 
 } // namespace ember
