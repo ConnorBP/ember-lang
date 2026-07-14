@@ -831,6 +831,8 @@ endif()
 # baseline compile + the 24 timed cells. See bench/run_bench.sh.
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/bench_codegen_paths.cpp)
     add_executable(bench_codegen_paths bench/bench_codegen_paths.cpp)
+    target_include_directories(bench_codegen_paths PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/bench)  # bench_output_names.hpp (deterministic results naming)
     target_link_libraries(bench_codegen_paths PRIVATE
         ember ember_frontend ember_import
         ember_ext_vec ember_ext_quat ember_ext_mat
@@ -863,6 +865,16 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/bench_codegen_paths.cpp)
     set_tests_properties(bench_codegen_paths PROPERTIES TIMEOUT 600
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 endif()
+
+# bench_output_names_test — focused coverage for the benchmark results-artifact
+# naming fix (bench/bench_output_names.hpp). A manual --passes run and the
+# CTest-registered no-passes run previously clobbered each other's CWD-relative
+# results_codegen_paths.csv/.md. The helper makes the names deterministic and
+# distinct on passes_flag; this test pins that invariant without running the
+# 60-second harness (header-only, links no ember libs).
+add_executable(bench_output_names_test examples/bench_output_names_test.cpp)
+add_test(NAME bench_output_names COMMAND bench_output_names_test)
+set_tests_properties(bench_output_names PROPERTIES TIMEOUT 30)
 
 # These correctness/integration tests do not use AngelScript. Keep only the
 # actual comparison benchmark conditional on SDK availability.

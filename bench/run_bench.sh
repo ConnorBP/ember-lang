@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # run_bench.sh — build the g++ -O2 baseline DLL (stale-probe: from source each
-# run) + run the per-path codegen bench harness. Writes:
+# run) + run the per-path codegen bench harness. Writes (no --passes):
 #   bench/results_codegen_paths.csv   (machine-readable matrix)
 #   bench/results_codegen_paths.md   (human-readable table + safety overhead)
+# A manual `--passes` run instead writes results_codegen_paths_passes.csv/.md
+# (distinct names so the two runs never clobber each other; see
+# bench/bench_output_names.hpp).
 #
 # Gate: this is a "ran + wrote results = pass" bench (the bench_ember_vs_as
 # shape), NOT an assertion bench. It never fails on a ratio; only on a

@@ -23,6 +23,11 @@
 // PASS = ran + wrote results. NEVER fails on a ratio (this is data, not an
 // assertion). Fails only on a compile/run/IO error.
 //
+// Output files are deterministic on `--passes`: a `--passes` run writes
+// results_codegen_paths_passes.csv/.md; the no-passes run writes the original
+// results_codegen_paths.csv/.md. The two never clobber each other (see
+// bench/bench_output_names.hpp + examples/bench_output_names_test.cpp).
+//
 // 6 prototype paths (one per category): int_div, call_overhead, loop_overhead,
 // slice_bounds, string_decrypt, struct_by_value. Adding a path = one PathBench
 // struct + one extern "C" fn in baseline_paths.cpp (see the design doc §5.1).
@@ -43,6 +48,7 @@
 #include "ember_pass_pipeline.hpp" // Stage C: build_pipeline_from_string
 #include "safety.hpp"          // RSS ceiling + per-path wall-clock deadline
 #include "ext_opt.hpp"         // Stage C: register_passes
+#include "bench_output_names.hpp"  // deterministic results-artifact naming (--passes/no-passes)
 
 #include "ext_vec.hpp"
 #include "ext_quat.hpp"
@@ -751,8 +757,13 @@ int main(int argc, char** argv) {
     if (cells.empty()) { std::fprintf(stderr, "\nbench: FAIL (no cells measured)\n"); return 1; }
 
     // ---- write CSV (cwd-relative; run_bench.sh cds into bench/) ----
-    FILE* f = std::fopen("results_codegen_paths.csv", "w");
-    if (!f) std::fprintf(stderr, "WARN: could not open results_codegen_paths.csv for write\n");
+    // Filename is deterministic on passes_flag: a manual --passes run writes
+    // results_codegen_paths_passes.csv while the CTest-registered no-passes
+    // run writes results_codegen_paths.csv — the two never clobber each other
+    // (the artifact-clobber fix; see bench/bench_output_names.hpp).
+    const std::string csv_path = ember::bench::results_csv_path(passes_flag);
+    FILE* f = std::fopen(csv_path.c_str(), "w");
+    if (!f) std::fprintf(stderr, "WARN: could not open %s for write\n", csv_path.c_str());
     if (f) {
         std::fprintf(f, "path,safety,engine,config,iters,warmup,min_ns,median_ns,mean_ns,p99_ns,stddev_ns,cv_pct,result,compile_ns,code_bytes,ir_instrs,note\n");
         // notes map per path (one note per path; safety/engine/config share it)
@@ -770,12 +781,15 @@ int main(int argc, char** argv) {
                 (long long)c.st.result, c.compile_ns, c.code_bytes, c.ir_instrs, note);
         }
         std::fclose(f);
-        std::printf("\nwrote results_codegen_paths.csv\n");
+        std::printf("\nwrote %s\n", csv_path.c_str());
     }
 
     // ---- write markdown ----
-    f = std::fopen("results_codegen_paths.md", "w");
-    if (!f) std::fprintf(stderr, "WARN: could not open results_codegen_paths.md for write\n");
+    // Same passes_flag-keyed naming as the CSV (see bench_output_names.hpp):
+    // --passes -> results_codegen_paths_passes.md; no-passes -> the original .md.
+    const std::string md_path = ember::bench::results_md_path(passes_flag);
+    f = std::fopen(md_path.c_str(), "w");
+    if (!f) std::fprintf(stderr, "WARN: could not open %s for write\n", md_path.c_str());
     if (f) {
         std::fprintf(f, "# ember per-path codegen bench (prototype) — results\n\n");
         std::fprintf(f, "Machine: %s %s, %s-bit. Date: %s %s.\n",
@@ -866,7 +880,7 @@ int main(int argc, char** argv) {
             }
         }
         std::fclose(f);
-        std::printf("wrote results_codegen_paths.md\n");
+        std::printf("wrote %s\n", md_path.c_str());
     }
 
     // ---- stdout: slowest paths vs g++ -O2 (the headline evidence) ----
