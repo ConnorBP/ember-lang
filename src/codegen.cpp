@@ -2,6 +2,7 @@
 #include "stmt_walk.hpp"  // walk_if: shared IfStmt traversal for prescan/count passes
 #include "engine.hpp"
 #include "context.hpp"   // TrapReason (unified trap surface, v0.4)
+#include "module_layout.hpp"  // Red 6: ember_resolve_keyed_dispatch (keyed call lowering)
 #include "peephole.hpp"  // Stage 1: post-emit peephole pipeline (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4.5)
 #include "thin_lower.hpp"  // Stage A c2: AST -> ThinFunction lowering (the IR-backend path)
 #include "thin_emit.hpp"   // Stage A c3: ThinFunction -> x86-64 emit (the IR-backend path)
@@ -594,6 +595,39 @@ struct CG {
     // hop then the same indirect call as intra-module. `mod_id` and `slot` are
     // baked as displacements; only `registry_base` is a reloc (kind 2, filled
     // with ctx.registry_base at JIT time / patched at .em load). If the call
+    // Red 6 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §9.4, §14.3):
+    // emit the keyed same-module call resolution. Resolves a logical slot to
+    // a non-null physical entry via ember_resolve_keyed_dispatch(record,
+    // logical_slot, r15) and leaves the entry in r11, ready for `call r11`.
+    // The resolver call needs 32 bytes of Win64 shadow space; a fresh sub
+    // rsp,32 / add rsp,32 allocates it below the arg stash.
+    void emit_keyed_resolve(uint32_t logical_slot, bool logical_slot_in_rax) {
+        const ModuleDispatchRecord* rec = ctx.keyed_dispatch->module_record;
+        e.sub_reg_imm32(Reg::rsp, 32);
+        e.mov_reg_imm64(Reg::rcx, int64_t(reinterpret_cast<uintptr_t>(rec)));
+        if (logical_slot_in_rax) {
+            e.mov_reg_reg(Reg::rdx, Reg::rax);
+        } else {
+            e.byte(0x48); e.byte(0xC7); e.byte(0xC2); e.imm32(int32_t(logical_slot));  // mov rdx, imm32
+        }
+        e.mov_reg_reg(Reg::r8, Reg::r15);
+        e.mov_reg_imm64(Reg::r11, int64_t(reinterpret_cast<uintptr_t>(
+            &ember_resolve_keyed_dispatch)));
+        e.call_reg(Reg::r11);
+        e.add_reg_imm32(Reg::rsp, 32);
+        e.cmp_reg_imm32(Reg::rax, 0);
+        Label trap = e.alloc_label(), after = e.alloc_label();
+        e.jcc(Cond::e, trap);
+        e.mov_reg_reg(Reg::r11, Reg::rax);
+        e.jmp(after);
+        e.bind(trap);
+        emit_trap(int(TrapReason::BadCallTarget),
+                  "keyed dispatch: resolver returned null (malformed record or bad logical slot)");
+        e.bind(after);
+        if (non_serializable_reason.empty())
+            non_serializable_reason = "keyed dispatch resolution requires process-local module record";
+    }
+
     // was unresolved at sema (the module/fn not yet registered), emit a trap
     // stub call instead — the call traps gracefully until a relink resolves it
     // (docs/MODULES.md §5 step 3). Args are already stashed by the caller; this only
@@ -3110,6 +3144,14 @@ void CG::eval(const Expr& ex) {
             emit_depth_check();
             e.load_reg_mem(Reg::rax, Reg::rsp, slot_scratch_off);  // reload slot
             emit_call_target_guard();
+            // Red 6: keyed same-module lambda call resolution. After the guard,
+            // rax = the logical slot (survives the guard). Resolve it through
+            // ember_resolve_keyed_dispatch(record, slot, r15) → r11 = entry.
+            const bool keyed_lambda =
+                ctx.keyed_dispatch && ctx.keyed_dispatch->module_record;
+            if (keyed_lambda) {
+                emit_keyed_resolve(0, /*logical_slot_in_rax=*/true);
+            }
             // place words 0..3 into registers. word 0 = env_ptr (always int).
             static const Reg int_regs[4] = {Reg::rcx, Reg::rdx, Reg::r8, Reg::r9};
             static const Xmm flt_regs[4] = {Xmm::xmm0, Xmm::xmm1, Xmm::xmm2, Xmm::xmm3};
@@ -3132,11 +3174,16 @@ void CG::eval(const Expr& ex) {
                     e.store_reg_mem(Reg::rsp, dst, Reg::rax);
                 }
             }
-            // r11 = [dispatch_base + slot*8]; call r11 (slot still in rax)
-            e.mov_reg_imm64_external(Reg::r11, AbsFixup::DispatchTableBase);
-            e.lea_reg_mem_sib(Reg::r11, Reg::r11, Reg::rax, 3);  // lea r11, [r11 + rax*8]
-            e.load_reg_mem(Reg::r11, Reg::r11, 0);               // mov r11, [r11] (entry)
-            e.call_reg(Reg::r11);
+            // r11 = [dispatch_base + slot*8]; call r11 (slot still in rax).
+            // Red 6: keyed lambda — the entry is already in r11 (resolved above).
+            if (keyed_lambda) {
+                e.call_reg(Reg::r11);
+            } else {
+                e.mov_reg_imm64_external(Reg::r11, AbsFixup::DispatchTableBase);
+                e.lea_reg_mem_sib(Reg::r11, Reg::r11, Reg::rax, 3);  // lea r11, [r11 + rax*8]
+                e.load_reg_mem(Reg::r11, Reg::r11, 0);               // mov r11, [r11] (entry)
+                e.call_reg(Reg::r11);
+            }
             emit_depth_leave();
             e.add_reg_imm32(Reg::rsp, total);
             if (ex.ty && ex.ty->is_int()) normalize_rax(ex.ty);
@@ -3270,6 +3317,23 @@ void CG::eval(const Expr& ex) {
                 phys_slots.push_back({w, false, 0});
         }
         int n_phys = int(phys_slots.size());
+        // Red 6: keyed same-module resolution. For a keyed direct or indirect
+        // (non-native, non-cross-module) call, resolve the logical slot through
+        // ember_resolve_keyed_dispatch(record, logical_slot, r15) BEFORE placing
+        // args into registers (the resolver clobbers rcx/rdx/r8). The entry
+        // lands in r11, which survives the arg register placement below.
+        const bool keyed_same_module =
+            ctx.keyed_dispatch && ctx.keyed_dispatch->module_record &&
+            !c->is_native && c->module_alias.empty();
+        if (keyed_same_module) {
+            emit_depth_check();
+            if (c->is_indirect) {
+                e.load_reg_mem(Reg::rax, Reg::rsp, stash_size);
+                emit_keyed_resolve(0, /*logical_slot_in_rax=*/true);
+            } else {
+                emit_keyed_resolve(uint32_t(c->script_slot), /*logical_slot_in_rax=*/false);
+            }
+        }
         // Load physical slots 0..3 into registers.
         for (int p = 0; p < n_phys && p < 4; ++p) {
             const auto& ps = phys_slots[size_t(p)];
@@ -3313,6 +3377,13 @@ void CG::eval(const Expr& ex) {
         } else if (c->is_indirect) {
             if (non_serializable_reason.empty())
                 non_serializable_reason = "function-reference call requires process-local allowlist storage";
+            // Red 6: keyed same-module indirect call — the resolve already
+            // happened before arg placement (emit_keyed_resolve left the entry
+            // in r11). Just call r11 + depth leave. Legacy path below.
+            if (keyed_same_module) {
+                e.call_reg(Reg::r11);
+                emit_depth_leave();
+            } else {
             // v1.0 Tier 2 first-class call (docs/planning/plan_FUNCTION_REFS.md §5.1): dispatch
             // through the runtime handle. emit_depth_check may clobber rax
             // (non-B1 mode), so RELOAD the handle from [rsp+stash_size] AFTER it
@@ -3350,7 +3421,15 @@ void CG::eval(const Expr& ex) {
                 e.call_reg(Reg::r11);                                  // call r11
             }
             emit_depth_leave();
+            } // end legacy indirect
         } else {
+            // Red 6: keyed same-module direct call — the resolve already
+            // happened before arg placement (emit_keyed_resolve left the entry
+            // in r11). Just call r11 + depth leave. Legacy path below.
+            if (keyed_same_module) {
+                e.call_reg(Reg::r11);
+                emit_depth_leave();
+            } else {
             // call [dispatch_base + slot*8] - dispatch-table base is a
             // relocatable imm64 (docs/BUNDLING_AND_EM_MODULES.md Section 2.4): emit 8 zero
             // placeholders + a DispatchTableBase AbsFixup; compile_func fills
@@ -3360,6 +3439,7 @@ void CG::eval(const Expr& ex) {
             e.mov_reg_imm64_external(Reg::r11, AbsFixup::DispatchTableBase);
             e.call_mem(Reg::r11, int32_t(c->script_slot) * 8);
             emit_depth_leave();
+            } // end legacy direct
         }
         e.add_reg_imm32(Reg::rsp, total);
         // Normalize narrow integer returns at every call boundary.

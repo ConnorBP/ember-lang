@@ -637,8 +637,14 @@ int main() {
             context_t ctx{};
             ctx.last_trap = TrapReason::None;
             ctx.last_error.clear();
+            // Red 6: the padding entry installed in the keyed record reads the
+            // context from r14 (the keyed context register), not rcx. The C-ABI
+            // variant (ember_keyed_padding_trap, ctx in rcx) remains for direct
+            // host invocation. Test the C-ABI variant here (the record's r14
+            // variant is exercised through the JIT'd code in Red 6's codegen
+            // test).
             using PaddingEntryFn = int64_t(*)(context_t*);
-            PaddingEntryFn pfn = reinterpret_cast<PaddingEntryFn>(padding_entry_found);
+            PaddingEntryFn pfn = reinterpret_cast<PaddingEntryFn>(&ember_keyed_padding_trap);
             int64_t ret = pfn(&ctx);
             ck(ctx.last_trap == TrapReason::KeyedDispatchPadding,
                "padding stub invocation: sets last_trap == KeyedDispatchPadding");

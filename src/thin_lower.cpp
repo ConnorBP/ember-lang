@@ -139,7 +139,7 @@ struct ThinLowerer {
 
     static int32_t value_bytes(const Type* t, const StructLayoutTable* structs) {
         if (!t) return 8;
-        if (t->is_slice) return 16;
+        if (t->is_slice || t->is_lambda) return 16;
         if (t->array_len > 0)
             return int32_t(t->array_len) * value_bytes(t->elem.get(), structs);
         if (!t->struct_name.empty() && structs) {
@@ -154,13 +154,13 @@ struct ThinLowerer {
         }
     }
     static int32_t local_width_bytes(const Type* t, const StructLayoutTable* structs) {
-        if (t && (t->is_slice || t->array_len > 0 ||
+        if (t && (t->is_slice || t->is_lambda || t->array_len > 0 ||
                   (!t->struct_name.empty() && structs && structs->count(t->struct_name))))
             return value_bytes(t, structs);
         return 8;
     }
     static int32_t words_for_type(const Type* t, const StructLayoutTable* structs) {
-        if (t && t->is_slice) return 2;
+        if (t && (t->is_slice || t->is_lambda)) return 2;
         if (t && !t->struct_name.empty() && structs) {
             auto it = structs->find(t->struct_name);
             if (it != structs->end()) return (it->second.size + 7) / 8;
@@ -861,7 +861,8 @@ struct ThinLowerer {
 
     // Load a scalar/float local slot into a fresh vreg. For a slice, use load_slice_local.
     LoweredValue load_scalar_local(int32_t off, const Type* t, Loc loc) {
-        if (t && t->is_slice) {
+        if (t && (t->is_slice || t->is_lambda)) {
+            // A lambda value is {slot, env_ptr} — same 2-vreg shape as a slice.
             VReg ptr = new_slice_vregs(t);
             ThinInstr& p = emit(ThinOp::LoadFrame, ptr, 0, 0, loc);
             p.meta.frame_off = off; p.meta.type = t; p.meta.width = 8;
@@ -2449,6 +2450,38 @@ LoweredValue ThinLowerer::lower_call(const CallExpr& c, int32_t hidden_dest_off,
     }
     in.ret_type = ret_ty;
 
+    // Red 6: lambda call (is_lambda_call). A lambda value is {slot, env_ptr};
+    // the call prepends env_ptr as the hidden first arg (word 0) + dispatches
+    // via the slot. Lower the lambda target → {slot_vreg, env_ptr_vreg}, then
+    // prepend env_ptr as args[0] (or args[1] if ret_struct) and set src1 =
+    // slot_vreg. The op is refined to CallIndirect below (the slot is a runtime
+    // value, like a function handle); emit_call's CallIndirect path loads src1,
+    // runs the guard, stashes the handle, + dispatches (via the keyed resolver
+    // in keyed mode or the dispatch table in legacy mode). This reuses the
+    // existing CallIndirect infrastructure — the only difference is the
+    // prepended env_ptr arg.
+    if (c.is_lambda_call) {
+        LoweredValue lv = lower_expr(*c.lambda_target);
+        VReg env_ptr_vreg = lv.vreg + 1;  // the second vreg (env_ptr)
+        VReg slot_vreg = lv.vreg;          // the first vreg (slot)
+        // Prepend env_ptr as the hidden first user arg. For ret_struct,
+        // args[0] is already the hidden dest ptr; env_ptr goes at args[1].
+        if (ret_struct) {
+            in.args.insert(in.args.begin() + 1, env_ptr_vreg);
+            in.arg_frame_offs.insert(in.arg_frame_offs.begin() + 1, -1);
+            in.arg_types.insert(in.arg_types.begin() + 1, &type_i64());
+        } else {
+            in.args.insert(in.args.begin(), env_ptr_vreg);
+            in.arg_frame_offs.insert(in.arg_frame_offs.begin(), -1);
+            in.arg_types.insert(in.arg_types.begin(), &type_i64());
+        }
+        // Shift the ops' slot0 values up by 1 to account for env_ptr at word 0.
+        for (auto& op : ops) op.slot0 += 1;
+        // Set src1 = slot_vreg (the logical slot; the guard validates it in
+        // emit_call's CallIndirect path).
+        in.src1 = slot_vreg;
+    }
+
     // For an indirect call: lower the target + guard BEFORE args (mirrors tree-walker).
     if (c.is_indirect) {
         LoweredValue ht = lower_expr(*c.indirect_target);
@@ -2529,7 +2562,7 @@ LoweredValue ThinLowerer::lower_call(const CallExpr& c, int32_t hidden_dest_off,
         }
         in.meta.base_kind = AbsFixup::ModuleRegistryBase;
         emit_depth_check(loc);
-    } else if (c.is_indirect) {
+    } else if (c.is_indirect || c.is_lambda_call) {
         in.op = ThinOp::CallIndirect;
         in.meta.base_kind = AbsFixup::DispatchTableBase;
         emit_depth_check(loc);

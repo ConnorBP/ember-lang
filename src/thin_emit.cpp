@@ -13,6 +13,7 @@
 #include "codegen.hpp"    // CodeGenCtx, GlobalsBlock, ObfOptions
 #include "engine.hpp"     // CompiledFn, CompiledNativeBinding
 #include "context.hpp"    // TrapReason, context_offsets
+#include "module_layout.hpp"  // Red 6: ember_resolve_keyed_dispatch (keyed call lowering)
 #include "peephole.hpp"   // PeepholeGuardedRegions, make_stage1_pipeline, PeepholeCtx
 #include "x64_emitter.hpp"
 #include "thin_ir.hpp"
@@ -38,7 +39,7 @@ inline int32_t round16(int32_t n) { return (n + 15) & ~15; }
 
 static int32_t value_bytes(const Type* t, const StructLayoutTable* structs) {
     if (!t) return 8;
-    if (t->is_slice) return 16;
+    if (t->is_slice || t->is_lambda) return 16;
     if (t->array_len > 0)
         return int32_t(t->array_len) * value_bytes(t->elem.get(), structs);
     if (!t->struct_name.empty() && structs) {
@@ -54,7 +55,7 @@ static int32_t value_bytes(const Type* t, const StructLayoutTable* structs) {
 }
 
 static int32_t words_for_type(const Type* t, const StructLayoutTable* structs) {
-    if (t && t->is_slice) return 2;
+    if (t && (t->is_slice || t->is_lambda)) return 2;
     if (t && !t->struct_name.empty() && structs) {
         auto it = structs->find(t->struct_name);
         if (it != structs->end()) return (it->second.size + 7) / 8;
@@ -173,7 +174,8 @@ struct EmitCtx {
     }
     bool vreg_is_slice(VReg v) const {
         auto it = vregs.find(v);
-        return it != vregs.end() && it->second.type && it->second.type->is_slice;
+        return it != vregs.end() && it->second.type &&
+               (it->second.type->is_slice || it->second.type->is_lambda);
     }
     const Type* vreg_type(VReg v) const {
         auto it = vregs.find(v);
@@ -361,6 +363,37 @@ struct EmitCtx {
                   "call-target provenance: handle is not a registered function");
         e.bind(after);
     }
+    // Red 6: whether same-module keyed resolution is active for this compile.
+    bool keyed_same_module() const {
+        return ctx.keyed_dispatch && ctx.keyed_dispatch->module_record;
+    }
+    // Red 6: emit the keyed same-module resolution.
+    void emit_keyed_resolve_thin(uint32_t logical_slot, bool logical_slot_in_rax) {
+        const ModuleDispatchRecord* rec = ctx.keyed_dispatch->module_record;
+        e.sub_reg_imm32(Reg::rsp, 32);
+        e.mov_reg_imm64(Reg::rcx, int64_t(reinterpret_cast<uintptr_t>(rec)));
+        if (logical_slot_in_rax) {
+            e.mov_reg_reg(Reg::rdx, Reg::rax);
+        } else {
+            e.byte(0x48); e.byte(0xC7); e.byte(0xC2); e.imm32(int32_t(logical_slot));
+        }
+        e.mov_reg_reg(Reg::r8, Reg::r15);
+        e.mov_reg_imm64(Reg::r11, int64_t(reinterpret_cast<uintptr_t>(
+            &ember_resolve_keyed_dispatch)));
+        e.call_reg(Reg::r11);
+        e.add_reg_imm32(Reg::rsp, 32);
+        e.cmp_reg_imm32(Reg::rax, 0);
+        Label trap = e.alloc_label(), after = e.alloc_label();
+        e.jcc(Cond::e, trap);
+        e.mov_reg_reg(Reg::r11, Reg::rax);
+        e.jmp(after);
+        e.bind(trap);
+        emit_trap(int(TrapReason::BadCallTarget),
+                  "keyed dispatch: resolver returned null (malformed record or bad logical slot)");
+        e.bind(after);
+        if (non_serializable_reason.empty())
+            non_serializable_reason = "keyed dispatch resolution requires process-local module record";
+    }
     void emit_bounds_check_reg(Reg idx_reg, Reg len_reg) {
         e.cmp_reg_reg(idx_reg, len_reg);
         Label ok = e.alloc_label();
@@ -476,7 +509,7 @@ struct EmitCtx {
         if (meta.frame_off != 0) {
             info.frame_off = meta.frame_off;
             // store the result to the frame slot
-            if (meta.type && meta.type->is_slice) {
+            if (meta.type && (meta.type->is_slice || meta.type->is_lambda)) {
                 e.store_reg_mem(Reg::rbp, meta.frame_off, Reg::rax);
                 e.store_reg_mem(Reg::rbp, meta.frame_off + 8, Reg::rdx);
                 // also record the len VReg's frame slot
@@ -647,10 +680,10 @@ struct EmitCtx {
                     byte_pos += word_bytes;
                 }
                 // struct: no VReg assigned (structs are frame slots)
-            } else if (pt && pt->is_slice) {
+            } else if (pt && (pt->is_slice || pt->is_lambda)) {
                 spill_word(param_word, p.off, nullptr);
                 spill_word(param_word + 1, p.off + 8, nullptr);
-                // record the slice's two VRegs
+                // record the lambda/slice's two VRegs
                 vregs[next_vreg] = {p.off, pt};
                 vregs[next_vreg + 1] = {p.off + 8, pt};
                 next_vreg += 2;
@@ -702,11 +735,11 @@ struct EmitCtx {
                 int w = words_for_type(ty, structs());
                 ops.push_back({v, ty, next_slot, w, true, afo});
                 next_slot += w;
-            } else if (ty && ty->is_slice) {
-                // slice: 2 words (ptr at this vreg, len at next vreg)
+            } else if (ty && (ty->is_slice || ty->is_lambda)) {
+                // slice/lambda: 2 words (ptr/slot at this vreg, len/env_ptr at next vreg)
                 ops.push_back({v, ty, next_slot, 2, false, -1});
                 next_slot += 2;
-                ++i;  // consume the len VReg too
+                ++i;  // consume the len/env_ptr VReg too
             } else {
                 ops.push_back({v, ty, next_slot, 1, false, -1});
                 next_slot += 1;
@@ -788,6 +821,15 @@ struct EmitCtx {
             widx += op.words;
         }
         // place words 0..3 into regs
+        if (keyed_same_module() &&
+            (in.op == ThinOp::CallScript || in.op == ThinOp::CallIndirect)) {
+            if (in.op == ThinOp::CallIndirect) {
+                e.load_reg_mem(Reg::rax, Reg::rsp, stash_size);
+                emit_keyed_resolve_thin(0, /*logical_slot_in_rax=*/true);
+            } else {
+                emit_keyed_resolve_thin(uint32_t(in.meta.slot), /*logical_slot_in_rax=*/false);
+            }
+        }
         static const Reg int_regs[4] = {Reg::rcx, Reg::rdx, Reg::r8, Reg::r9};
         static const Xmm flt_regs[4] = {Xmm::xmm0, Xmm::xmm1, Xmm::xmm2, Xmm::xmm3};
         for (int w = 0; w < n && w < 4; ++w) {
@@ -853,6 +895,11 @@ struct EmitCtx {
     // Emit a script call: dispatch table + call + depth leave. (Depth check is
     // the separate DepthCheck ThinInstr; see emit_native_call for the rationale.)
     void emit_script_call(const ThinInstr& in) {
+        if (keyed_same_module()) {
+            e.call_reg(Reg::r11);
+            emit_depth_leave();
+            return;
+        }
         e.mov_reg_imm64_external(Reg::r11, AbsFixup::DispatchTableBase);
         e.call_mem(Reg::r11, int32_t(in.meta.slot) * 8);
         emit_depth_leave();
@@ -870,6 +917,11 @@ struct EmitCtx {
     // depth leave. (Depth check is the separate DepthCheck ThinInstr.) The
     // handle was stashed at [rsp+stash_size] by emit_call_arg_stash.
     void emit_indirect_call() {
+        if (keyed_same_module()) {
+            e.call_reg(Reg::r11);
+            emit_depth_leave();
+            return;
+        }
         e.load_reg_mem(Reg::rax, Reg::rsp, last_call_stash_size);  // reload handle
         e.mov_reg_imm64_external(Reg::r11, AbsFixup::DispatchTableBase);
         e.lea_reg_mem_sib(Reg::r11, Reg::r11, Reg::rax, 3);  // lea r11, [r11 + rax*8]
@@ -1010,7 +1062,7 @@ struct EmitCtx {
             emit_epilogue();
             return;
         }
-        if (rt->is_slice) {
+        if (rt->is_slice || rt->is_lambda) {
             load_slice_vreg(term.ret);
             emit_epilogue();
             return;
@@ -1141,7 +1193,7 @@ struct EmitCtx {
                     store_xmm0_to_rbp(e, in.meta.frame_off, ty);
                     vregs[in.dst].frame_off = in.meta.frame_off;
                 }
-            } else if (ty && ty->is_slice) {
+            } else if (ty && (ty->is_slice || ty->is_lambda)) {
                 load_slice_vreg(in.src1);
                 record_dst_rax(in.dst, ty);
                 if (in.meta.frame_off != 0 && in.dst != 0) {
@@ -1184,7 +1236,7 @@ struct EmitCtx {
                     store_xmm0_to_rbp(e, in.meta.frame_off, ty);
                     vregs[in.dst].frame_off = in.meta.frame_off;
                 }
-            } else if (ty && ty->is_slice) {
+            } else if (ty && (ty->is_slice || ty->is_lambda)) {
                 e.load_reg_mem(Reg::rax, base_reg, load_off);
                 e.load_reg_mem(Reg::rdx, base_reg, load_off + 8);
                 record_dst_rax(in.dst, ty);
@@ -1211,7 +1263,7 @@ struct EmitCtx {
             if (in.dst != 0 && in.src1 == 0) {
                 vregs[in.dst].frame_off = in.meta.frame_off;
                 vregs[in.dst].type = ty;
-                if (ty && ty->is_slice) {
+                if (ty && (ty->is_slice || ty->is_lambda)) {
                     vregs[in.dst + 1].frame_off = in.meta.frame_off + 8;
                     vregs[in.dst + 1].type = ty;
                 }
@@ -1235,7 +1287,7 @@ struct EmitCtx {
                 } else {
                     store_xmm0_to_rbp(e, in.meta.frame_off, ty);
                 }
-            } else if (ty && ty->is_slice) {
+            } else if (ty && (ty->is_slice || ty->is_lambda)) {
                 load_slice_vreg(in.src1);
                 if (in.src2 != 0) base_reg = Reg::r10;
                 e.store_reg_mem(base_reg, in.meta.frame_off, Reg::rax);
@@ -1262,7 +1314,7 @@ struct EmitCtx {
             if (in.src1 != 0 && in.src2 == 0) {
                 vregs[in.src1].frame_off = in.meta.frame_off;
                 vregs[in.src1].type = ty;
-                if (ty && ty->is_slice) {
+                if (ty && (ty->is_slice || ty->is_lambda)) {
                     vregs[in.src1 + 1].frame_off = in.meta.frame_off + 8;
                     vregs[in.src1 + 1].type = ty;
                 }
@@ -1280,7 +1332,7 @@ struct EmitCtx {
                 load_float_vreg(in.src1);
                 if (ty->prim == Prim::F64) e.movsd_mem_xmm(Reg::r10, in.meta.frame_off, Xmm::xmm0);
                 else e.movss_mem_xmm(Reg::r10, in.meta.frame_off, Xmm::xmm0);
-            } else if (ty && ty->is_slice) {
+            } else if (ty && (ty->is_slice || ty->is_lambda)) {
                 load_slice_vreg(in.src1);
                 e.store_reg_mem(Reg::r10, in.meta.frame_off, Reg::rax);
                 e.store_reg_mem(Reg::r10, in.meta.frame_off + 8, Reg::rdx);
@@ -1438,7 +1490,7 @@ struct EmitCtx {
         case ThinOp::LoadGlobal: {
             // dst = [globals_base + meta.addend] (with type-based load)
             const Type* ty = in.meta.type;
-            if (ty && ty->is_slice) {
+            if (ty && (ty->is_slice || ty->is_lambda)) {
                 // slice global: load {ptr,len}, absolute-ize the ptr
                 load_global_to_rax(e, int32_t(in.meta.addend));       // rax = relative ptr
                 e.mov_reg_reg(Reg::rdx, Reg::rax);                      // rdx = ptr (saved)
@@ -1470,7 +1522,7 @@ struct EmitCtx {
             if (ty && ty->is_float()) {
                 load_float_vreg(in.src1);
                 store_xmm0_to_global(e, int32_t(in.meta.addend), ty);
-            } else if (ty && ty->is_slice) {
+            } else if (ty && (ty->is_slice || ty->is_lambda)) {
                 load_slice_vreg(in.src1);
                 // store ptr (relative) and len
                 // The tree-walker stores the relative ptr for slice globals. But
@@ -1751,7 +1803,7 @@ struct EmitCtx {
             if (ft && ft->is_float()) {
                 load_float_vreg(in.src1);
                 store_xmm0_to_rbp(e, addr, ft);
-            } else if (ft && ft->is_slice) {
+            } else if (ft && (ft->is_slice || ft->is_lambda)) {
                 load_slice_vreg(in.src1);
                 e.store_reg_mem(Reg::rbp, addr, Reg::rax);
                 e.store_reg_mem(Reg::rbp, addr + 8, Reg::rdx);
@@ -1774,7 +1826,7 @@ struct EmitCtx {
             if (et && et->is_float()) {
                 load_float_vreg(in.src1);
                 store_xmm0_to_rbp(e, addr, et);
-            } else if (et && et->is_slice) {
+            } else if (et && (et->is_slice || et->is_lambda)) {
                 load_slice_vreg(in.src1);
                 e.store_reg_mem(Reg::rbp, addr, Reg::rax);
                 e.store_reg_mem(Reg::rbp, addr + 8, Reg::rdx);
@@ -2211,7 +2263,7 @@ struct EmitCtx {
                     store_xmm0_to_rbp(e, in.meta.frame_off, in.ret_type);
                     vregs[in.dst].frame_off = in.meta.frame_off;
                 }
-            } else if (in.ret_type && in.ret_type->is_slice) {
+            } else if (in.ret_type && (in.ret_type->is_slice || in.ret_type->is_lambda)) {
                 // slice result: frame-slot path (regalloc v1: slices not register candidates)
                 if (in.meta.frame_off != 0) {
                     e.store_reg_mem(Reg::rbp, in.meta.frame_off, Reg::rax);

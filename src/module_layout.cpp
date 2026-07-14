@@ -1365,13 +1365,45 @@ extern "C" int64_t ember_keyed_padding_trap(ember::context_t* ctx) noexcept {
     return 0;
 }
 
+// Red 6: the keyed JIT-path padding trap. When the JIT'd code's keyed resolver
+// returns a padding entry (a wrong route word), the JIT calls it via `call r11`
+// with the user args in rcx/rdx/r8 + the context in r14 (the keyed context
+// register). This asm stub reads the context from r14 (NOT rcx, which holds the
+// first user arg), records TrapReason::KeyedDispatchPadding on it, and returns 0.
+// It has NO key parameter and performs NO key comparison (§7.3). The C-ABI
+// `ember_keyed_padding_trap` above (ctx in rcx) remains for the host/Red 4 test
+// path; this r14 variant is what the keyed record installs at padding slots.
+#if defined(__x86_64__) || defined(_M_X64)
+extern "C" int64_t ember_keyed_padding_trap_r14(ember::context_t* /*unused*/) noexcept;
+asm(
+    ".p2align 4\n"
+    ".globl ember_keyed_padding_trap_r14\n"
+    "ember_keyed_padding_trap_r14:\n"
+    "  movq %r14, %rcx\n"            // ctx = r14 (the keyed context register)
+    "  testq %rcx, %rcx\n"           // null ctx?
+    "  je 1f\n"                      // skip if null
+    "  movb $8, 16(%rcx)\n"          // ctx->last_trap = KeyedDispatchPadding (8)
+    "1:\n"
+    "  xorl %eax, %eax\n"           // return 0
+    "  retq\n"
+);
+#else
+extern "C" int64_t ember_keyed_padding_trap_r14(ember::context_t* ctx) noexcept {
+    return ember_keyed_padding_trap(ctx);
+}
+#endif
+
 const void* ember_keyed_padding_trap_target() noexcept {
-    return reinterpret_cast<const void*>(&ember_keyed_padding_trap);
+    // Red 6: the keyed record installs the r14-reading variant at padding
+    // slots (the JIT calls it with ctx in r14, not rcx). The C-ABI variant
+    // (ember_keyed_padding_trap, ctx in rcx) remains for the host/Red 4 test.
+    return reinterpret_cast<const void*>(&ember_keyed_padding_trap_r14);
 }
 
 bool ember_is_padding_trap_target(const void* entry) noexcept {
     if (entry == nullptr) return false;
-    return entry == ember_keyed_padding_trap_target();
+    return entry == reinterpret_cast<const void*>(&ember_keyed_padding_trap_r14) ||
+           entry == reinterpret_cast<const void*>(&ember_keyed_padding_trap);
 }
 
 // Build a runtime record view over host-owned storage from a Red 3 plan. Fills

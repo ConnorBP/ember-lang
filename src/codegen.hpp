@@ -25,6 +25,9 @@ class EmberAnalysisManager;
 
 struct CompiledFn;
 
+// Forward decl: the immutable module dispatch record (module_layout.hpp).
+struct ModuleDispatchRecord;
+
 // ─── Red 5 keyed dispatch codegen descriptor (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md
 //   §9.3, §6.4) ───────────────────────────────────────────────────────────────
 // A borrowed immutable descriptor selecting keyed mode for a compile. Null in
@@ -40,6 +43,9 @@ struct CompiledFn;
 // module-layout descriptors a future Red 6/7 emit consumes; null in this phase
 // (Red 5 is the outer thunk + regalloc reservation, not the call-lowering emit).
 // `runtime_key` pins WHERE the transient route word lives (r15 on Win64, §6.4).
+// `module_record` (Red 6) is the borrowed typed pointer to the current
+// module's immutable ModuleDispatchRecord; same-module call sites resolve
+// logical slots through ember_resolve_keyed_dispatch(record, slot, r15).
 enum class RuntimeKeyLocation : uint8_t {
     None = 0,   // legacy / unkeyed (no transient route register)
     R15  = 1,   // Win64 x64: r15 reserved for the transient route word
@@ -49,6 +55,17 @@ struct KeyedDispatchCodegen {
     const void* strategy = nullptr;        // configured DispatchStrategyConcept (borrowed; null in Red 5)
     const void* layout = nullptr;          // configured ModuleDispatchLayout (borrowed; null in Red 5)
     RuntimeKeyLocation runtime_key = RuntimeKeyLocation::None;
+    // Red 6 (§9.4, §14.3): the stable, borrowed, typed pointer to the CURRENT
+    // module's immutable ModuleDispatchRecord. Same-module call sites (direct,
+    // indirect, lambda) resolve their logical slots through
+    // ember_resolve_keyed_dispatch(record, logical_slot, r15) instead of
+    // indexing the dispatch table by physical slot. Null in Red 5; when non-null
+    // in Red 6, the tree-walker + Thin IR emit select the keyed resolution path
+    // for every same-module script/indirect/lambda call. The record's ADDRESS is
+    // baked as a raw imm64; the physical slot storage may be populated AFTER
+    // compilation (the JIT only bakes the address; the resolver reads storage at
+    // RUNTIME), so a host may compile first + populate entries second.
+    const ModuleDispatchRecord* module_record = nullptr;
 };
 
 // Globals block: a TYPED layout (chunk c3) - one per-global (offset, size)

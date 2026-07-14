@@ -1212,6 +1212,27 @@ if(WIN32)
     target_link_libraries(keyed_dispatch_outer_thunk PRIVATE kernel32)
 endif()
 
+# keyed_dispatch_codegen - Red 6 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md
+# §9.4, §14.3, §14.2): the same-module keyed call lowering gate for BOTH the
+# tree-walker backend and the Thin IR backend. Pins direct calls, recursive
+# calls, indirect function handles, and lambda calls through both backends;
+# mixed GP/XMM argument cases; depth accounting (balanced, no leak); correct-
+# key routing; safe wrong-key alternate/padding routing (no crash, in-domain,
+# KeyedDispatchPadding trap); logical handle stability (handle is a logical
+# slot, never a physical slot); edge route words 0 and UINT64_MAX; and
+# identity-layout behavior/bytes when CodeGenCtx::keyed_dispatch is null (the
+# disabled path is byte-identical to legacy, no resolver address in the
+# bytes). Links ember (keyed_dispatch.* — Red 1, context.hpp, engine.* — Red 5
+# thunks, dispatch_table.hpp) + ember_frontend (module_layout.* — Red 3/4,
+# codegen.* — the keyed CodeGenCtx, thin_lower.*, thin_emit.*, dispatch_abi.*).
+# NOT a CTest entry: the filtered suite count must stay 67 (§14.1); the target
+# building cleanly + the executable passing IS the gate.
+add_executable(keyed_dispatch_codegen examples/keyed_dispatch_codegen_test.cpp)
+target_link_libraries(keyed_dispatch_codegen PRIVATE ember ember_frontend ember_import)
+if(WIN32)
+    target_link_libraries(keyed_dispatch_codegen PRIVATE kernel32)
+endif()
+
 # thin_ir_ser_test - Stage B c1b (IL-.em): the IR SERIALIZER round-trip gate.
 # Hand-builds a ThinFunction + uses the real lower_function path (fib) to
 # prove serialize->deserialize->validate->re-emit->execute works end-to-end,
