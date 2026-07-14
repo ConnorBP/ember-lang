@@ -1,15 +1,46 @@
-// ext_obf.cpp — Stage C Step 5: IR-level obfuscation passes.
-// See ext_obf.hpp for the design. Obfuscation passes INCREASE code complexity
-// (more instructions, harder to reverse-engineer) while preserving the result.
+// ext_obf.cpp — Stage C Step 5 / Red 6: IR-level obfuscation passes.
+//
+// Red 6 (plan_POLYMORPHIC_CODE_ENGINE.md §4–§6, §9.3): every pass is a
+// CONFIGURED pass. The configured `run`:
+//   - fast-paths to a deterministic no-op when `options.seed_deriver == null`
+//     OR `options.site_probability_ppm == 0` (the bare `add<T>()` legacy path
+//     and the zero-density configured path);
+//   - otherwise derives INDEPENDENT per-site, per-purpose streams through
+//     src/seed_derivation.hpp (stable ORIGINAL block IDs + instruction
+//     ordinals + separate purposes: select | variant | constant | truth |
+//     junk-count), so a draw for one site never reshuffles a later site and
+//     there is no single advancing function-wide RNG;
+//   - mutates through the shared ThinIRMutation (reserve_site /
+//     allocate_scalar / allocate_pair / allocate_frame_bytes / split_block /
+//     canonicalize_block_ids / commit), preflying each site's worst case and
+//     snapshotting the original candidates so inserted instructions are not
+//     recursively transformed;
+//   - obeys the configured density (site_probability_ppm) and growth limits
+//     (PassGrowthLimits), stopping before a site whose worst case would
+//     exceed a soft ceiling (atomic — no partial site).
+//
+// The private FNV-1a / SplitMix64 / StableRng / MutationState / CFG
+// bookkeeping that previously lived here is REMOVED. Seed derivation is
+// delegated to the shared SeedDeriver; RNG is the shared StableRng; mutation
+// is the shared ThinIRMutation.
+//
+// `str_encrypt` is registered through the configured factory and has its
+// no-op scaffolding (zero density / no candidates → no-op), but its final
+// seeded key, rodata rebuild, and ThinIRMutation conversion are deferred to
+// Red 7 (blob v2 is the hard gate for that migration). Its `run` keeps the
+// existing fixed-key rodata transform gated by the configured density.
 
 #include "ext_obf.hpp"
 
-#include "../src/thin_ir_mutation.hpp"   // ThinIRMutation (shared mutation helper)
+#include "../src/seed_derivation.hpp"      // SeedRequest, SeedDeriver, StableRng
+#include "../src/thin_ir_mutation.hpp"     // ThinIRMutation, PassGrowthLimits
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iterator>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -17,108 +48,83 @@ namespace ember::ext_obf {
 
 namespace {
 
-// Compute the max VReg in the function (for allocating new VRegs).
-uint32_t compute_max_vreg(const ThinFunction& f) {
-    uint32_t max = 1;
-    auto bump = [&](uint32_t v) { if (v >= max) max = v + 1; };
-    for (const auto& blk : f.blocks) {
-        for (const auto& in : blk.instrs) {
-            bump(in.dst); bump(in.src1); bump(in.src2);
-            // Slices and lambdas occupy a pair even when the second word has
-            // no explicit instruction at this point in the function.
-            if (in.dst != 0 && in.meta.type &&
-                (in.meta.type->is_slice || in.meta.type->is_lambda))
-                bump(in.dst + 1);
-            for (uint32_t a : in.args) bump(a);
-        }
-        bump(blk.term.cond); bump(blk.term.ret);
-    }
-    return std::max(max, f.declared_max_vreg);
+// ─── Per-site, per-purpose stream derivation ───
+// Build a SeedRequest for one (pass, function, site, purpose) and derive a
+// 256-bit result through the shared immutable SeedDeriver. The site identity
+// uses the STABLE ORIGINAL block ID + instruction ordinal (the ordinal the
+// candidate occupied in the snapshot before any mutation), so two runs of the
+// same function produce identical streams regardless of how earlier sites
+// shifted indices. `purpose` domain-separates the streams (select / variant /
+// constant / truth / junk-count) so a draw for one purpose never reshuffles
+// another.
+//
+// Returns the 32-byte derivation on success. On failure (a null deriver or a
+// deriver error), returns false and leaves `out` zeroed; the caller treats
+// this as "skip this site" (a no-op for that site, not a whole-pass abort).
+bool derive_site(const PolymorphicPassOptions& opts, const char* pass_name,
+                 const ThinFunction& f, uint32_t block_id,
+                 uint32_t instruction_ordinal, const char* purpose,
+                 std::array<uint8_t, 32>& out) {
+    if (!opts.seed_deriver) return false;
+    SeedRequest req;
+    req.engine_version = opts.engine_version;
+    req.module_id = opts.module_id;
+    req.build_profile_id = opts.build_profile_id;
+    req.pass_name = pass_name;
+    req.pass_algorithm_version = opts.algorithm_version;
+    req.function_name = f.name;
+    req.logical_slot = static_cast<uint32_t>(f.slot);
+    req.block_id = block_id;
+    req.instruction_ordinal = instruction_ordinal;
+    req.purpose = purpose;
+    auto dr = opts.seed_deriver->derive(req);
+    if (!dr) return false;
+    out = std::move(dr.value.value());
+    return true;
 }
 
-// Fixed, implementation-independent seed derivation. Obfuscation output is
-// reproducible for a function/pass pair and does not depend on compile order.
-uint64_t fnv1a(uint64_t h, const char* s) {
-    while (*s) {
-        h ^= static_cast<uint8_t>(*s++);
-        h *= 1099511628211ULL;
-    }
-    return h;
+// Read a little-endian uint64 from a byte pointer (lane extraction).
+uint64_t lane_u64(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= uint64_t(p[i]) << (8 * i);
+    return v;
 }
 
-uint64_t pass_seed(const ThinFunction& f, const char* pass_name) {
-    uint64_t h = 1469598103934665603ULL;
-    h = fnv1a(h, "ember-obf-v1");
-    h = fnv1a(h, pass_name);
-    h = fnv1a(h, f.name.c_str());
-    h ^= static_cast<uint32_t>(f.slot);
-    h *= 1099511628211ULL;
-    return h;
+// Build a local StableRng for one (site, purpose) from lane 0 of the
+// derivation. On derivation failure, returns a StableRng seeded 0 (the caller
+// checks the returned `ok`).
+StableRng site_rng(const PolymorphicPassOptions& opts, const char* pass_name,
+                   const ThinFunction& f, uint32_t block_id,
+                   uint32_t instruction_ordinal, const char* purpose,
+                   bool& ok) {
+    std::array<uint8_t, 32> bytes{};
+    ok = derive_site(opts, pass_name, f, block_id, instruction_ordinal, purpose, bytes);
+    return StableRng{lane_u64(bytes.data())};
 }
 
-struct StableRng {
-    uint64_t state;
-
-    explicit StableRng(uint64_t seed) : state(seed) {}
-
-    uint64_t next() {
-        // SplitMix64: small, deterministic, and fully specified here rather
-        // than delegated to a standard-library distribution.
-        uint64_t z = (state += 0x9E3779B97F4A7C15ULL);
-        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-        return z ^ (z >> 31);
-    }
-
-    size_t index(size_t n) { return n == 0 ? 0 : static_cast<size_t>(next() % n); }
-};
-
-struct MutationState {
-    ThinFunction& f;
-    uint32_t next_vreg;
-    int32_t next_off;
-    bool changed = false;
-
-    explicit MutationState(ThinFunction& fn)
-        : f(fn), next_vreg(compute_max_vreg(fn)), next_off(fn.frame.next_local_off) {}
-
-    std::pair<VReg, int32_t> scalar() {
-        VReg v = next_vreg++;
-        next_off += 8;
-        changed = true;
-        return {v, -next_off};
-    }
-
-    void finish() {
-        if (!changed) return;
-        f.frame.next_local_off = next_off;
-        f.declared_max_vreg = std::max(f.declared_max_vreg, next_vreg);
-        // Match the lowerer's conservative frame reserve and retain 16-byte
-        // alignment. Existing frame_size may already be larger.
-        const int32_t needed = next_off + 16;
-        if (needed > f.frame.frame_size)
-            f.frame.frame_size = (needed + 15) & ~15;
-        // Passes run before regalloc normally. If a host applies one later,
-        // stale assignments must not survive the newly allocated VRegs.
-        f.ra = {};
-    }
-};
-
-ThinInstr make_value_instr(ThinOp op, VReg dst, int32_t off,
-                           VReg src1, VReg src2, int64_t imm,
-                           int32_t width, const Type* type, Loc loc) {
-    ThinInstr in;
-    in.op = op;
-    in.dst = dst;
-    in.src1 = src1;
-    in.src2 = src2;
-    in.imm.i = imm;
-    in.meta.frame_off = off;
-    in.meta.width = width;
-    in.meta.type = type;
-    in.loc = loc;
-    return in;
+// Per-site selection: derive the "select" purpose stream and accept the site
+// iff a rejection-sampled draw in [0, 1_000_000) is below the configured
+// density. At ppm == 0 nothing is selected (the caller fast-paths this); at
+// ppm == 1_000_000 every site is selected; at 500_000 ~50% (the compat
+// default, matching the legacy `(rng.next() & 1U) == 0` eligibility).
+bool site_selected(const PolymorphicPassOptions& opts, const char* pass_name,
+                   const ThinFunction& f, uint32_t block_id,
+                   uint32_t instruction_ordinal) {
+    bool ok = false;
+    StableRng rng = site_rng(opts, pass_name, f, block_id, instruction_ordinal,
+                             "select", ok);
+    if (!ok) return false;
+    return rng.bounded(1000000ull) < opts.site_probability_ppm;
 }
+
+// A configured pass is a no-op when it cannot derive: null deriver or zero
+// density. This is the bare `add<T>()` legacy path (default-constructed
+// PolymorphicPassOptions{}) AND the zero-density configured path.
+bool configured_noop(const PolymorphicPassOptions& opts) {
+    return !opts.seed_deriver || opts.site_probability_ppm == 0;
+}
+
+// ─── Candidate predicates (shared with the legacy predicates) ───
 
 bool is_plain_integer(const ThinInstr& in) {
     return in.dst != 0 && in.meta.type && in.meta.type->is_int() &&
@@ -128,165 +134,150 @@ bool is_plain_integer(const ThinInstr& in) {
             in.meta.width == 4 || in.meta.width == 8);
 }
 
-// Keep block vector order and block IDs in lock-step. Besides satisfying the
-// emitter's label indexing contract, inserting continuations adjacent to their
-// source preserves the order expected by the current linear-scan allocator.
-void canonicalize_block_ids(ThinFunction& f) {
-    std::vector<uint32_t> old_ids;
-    old_ids.reserve(f.blocks.size());
-    for (const auto& block : f.blocks) old_ids.push_back(block.id);
+// A candidate for the integer-arithmetic passes (subst / mba_expand): an Add
+// or Sub or Mul-by-two over a plain integer width with a real first operand.
+bool is_arith_candidate(const ThinInstr& in) {
+    const bool add_or_sub = in.op == ThinOp::Add || in.op == ThinOp::Sub;
+    const bool mul_two = in.op == ThinOp::Mul && in.src1 != 0 &&
+                         in.src2 == 0 && in.imm.i == 2;
+    return (add_or_sub || mul_two) && in.src1 != 0 && is_plain_integer(in);
+}
 
-    auto remap = [&](uint32_t old_id) -> uint32_t {
-        for (size_t i = 0; i < old_ids.size(); ++i)
-            if (old_ids[i] == old_id) return static_cast<uint32_t>(i);
-        return old_id;
-    };
-
-    for (size_t i = 0; i < f.blocks.size(); ++i) {
-        ThinBlock& block = f.blocks[i];
-        if (block.term.kind == TermKind::Jmp) {
-            block.term.target = remap(block.term.target);
-        } else if (block.term.kind == TermKind::Branch) {
-            block.term.target = remap(block.term.target);
-            block.term.false_target = remap(block.term.false_target);
-        }
-        block.id = static_cast<uint32_t>(i);
+// A candidate for block_split: a split point that is NOT inseparable (the
+// lowering pairs that rely on immediate producer/consumer adjacency). Returns
+// the list of valid split indices in [1, count).
+std::vector<size_t> split_candidates(const std::vector<ThinInstr>& instrs) {
+    std::vector<size_t> out;
+    const size_t count = instrs.size();
+    out.reserve(count > 0 ? count - 1 : 0);
+    for (size_t split = 1; split < count; ++split) {
+        const ThinInstr& before = instrs[split - 1];
+        const ThinInstr& after = instrs[split];
+        bool coupled = false;
+        if ((before.op == ThinOp::FieldAddr || before.op == ThinOp::IndexAddr) &&
+            before.dst != 0 &&
+            (after.src1 == before.dst || after.src2 == before.dst))
+            coupled = true;
+        if (before.op == ThinOp::DivOverflowCheck &&
+            (after.op == ThinOp::Div || after.op == ThinOp::Mod))
+            coupled = true;
+        if (before.op == ThinOp::CallTargetGuard &&
+            after.op == ThinOp::CallIndirect)
+            coupled = true;
+        if (before.op == ThinOp::DepthCheck &&
+            (after.op == ThinOp::CallNative || after.op == ThinOp::CallScript ||
+             after.op == ThinOp::CallIndirect ||
+             after.op == ThinOp::CallCrossModule))
+            coupled = true;
+        if (!coupled) out.push_back(split);
     }
+    return out;
 }
 
 } // namespace
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SubstitutionPass: MBA instruction substitution
+// SubstitutionPass: MBA instruction substitution (a + b → (a^b) + 2*(a&b))
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Replaces simple integer arithmetic with equivalent MBA expressions:
-//   a + b  →  (a ^ b) + 2*(a & b)       [the classic MBA identity for Add]
-//   a - b  →  (a ^ ~b) + 2*(a & ~b) + 1  [Sub via Add + complement — but this
-//                                         is complex; for now only Add]
-//
-// Only substitutes Add (the most common op). Future: Sub, Mul, Xor.
-// Conservative: only substitutes when both operands are VRegs (not the
-// immediate form src2==0), so the MBA expansion has real values to work with.
-// Skips side-effecting ops, calls, guards, etc.
+// Eligibility: every integer Add with two VReg operands (not the immediate
+// form) and a nonzero width. Density gates the whole pass on/off (ppm == 0 →
+// no-op; ppm > 0 → substitute EVERY eligible Add). There is no per-site
+// probabilistic selection — the identity is unique, so no "variant" stream is
+// needed, and the result is fully deterministic per function. This preserves
+// the legacy "substitute every eligible site" eligibility exactly.
 
 EmberPreserved SubstitutionPass::run(ThinFunction& f, EmberAnalysisManager&) {
-    // Migrated to ThinIRMutation (plan_POLYMORPHIC_CODE_ENGINE.md §7.2): the
-    // hand-rolled fresh-VReg / frame-growth path is replaced by the shared
-    // transactional helper, which updates declared_max_vreg and clears stale
-    // regalloc on commit. The MBA identity and pipeline name ("subst") are
-    // preserved exactly.
-    //
-    // Per §6.1 + the Red 4 feedback fix: each site is atomically prefighted
-    // via reserve_site BEFORE any resource is consumed. This prevents an
-    // orphan partial-site allocation where a later limit failure (e.g. the
-    // 2nd of 3 VRegs) commits earlier VRegs/frame slots while the site is
-    // only partially built. If reserve_site passes, the 3 subsequent
-    // allocate_scalar calls are guaranteed to succeed.
-    ThinIRMutation mut(f, PassGrowthLimits{});
+    if (configured_noop(options)) return EmberPreserved::all();
+
+    ThinIRMutation mut(f, options.limits);
     bool changed = false;
 
     for (auto& blk : f.blocks) {
-        auto& instrs = blk.instrs;
-        for (auto it = instrs.begin(); it != instrs.end(); ++it) {
-            ThinInstr& in = *it;
-
-            // Only substitute integer Add with two VReg operands (not immediate).
+        // Snapshot the original Add-candidate ordinals BEFORE any insert, so
+        // the per-site selection stream uses stable ordinals and inserted
+        // instructions are not recursively transformed.
+        struct Cand { size_t ordinal; };
+        std::vector<Cand> cands;
+        for (size_t i = 0; i < blk.instrs.size(); ++i) {
+            const ThinInstr& in = blk.instrs[i];
             if (in.op != ThinOp::Add) continue;
             if (in.src1 == 0 || in.src2 == 0) continue;  // need two real VRegs
-            if (in.meta.width == 0) continue;  // skip if width unspecified
+            if (in.meta.width == 0) continue;
+            cands.push_back({i});
+        }
 
-            // Atomic per-site preflight: 3 VRegs + 24 frame bytes (3×8) + 3
-            // instructions. If any limit would be exceeded, stop before this
-            // site (§6.1 soft-ceiling semantics) and commit what we have.
+        size_t inserted_so_far = 0;
+        for (const Cand& c : cands) {
+            const size_t idx = c.ordinal + inserted_so_far;
+            if (idx >= blk.instrs.size()) break;
+            ThinInstr& in = blk.instrs[idx];
+            if (in.op != ThinOp::Add || in.src1 == 0 || in.src2 == 0 ||
+                in.meta.width == 0)
+                continue;
+
+            // Per-site selection (density) over the ORIGINAL block id + ordinal.
+            if (!site_selected(options, pass_name, f, blk.id, c.ordinal))
+                continue;
+
+            // Atomic per-site preflight: 3 VRegs + 24 frame bytes + 3 instrs.
             auto rs = mut.reserve_site(3, 24, 3, 0);
             if (!rs.ok()) goto subst_done;
 
-            // MBA: a + b = (a ^ b) + 2*(a & b). Allocate three fresh scalars
-            // via the shared helper (guaranteed to succeed after preflight).
-            auto r_xor = mut.allocate_scalar(in.meta.type, in.meta.width);
+            // Capture stable fields BEFORE any insert (the insert below
+            // invalidates the `in` reference).
+            const VReg src_a = in.src1;
+            const VReg src_b = in.src2;
+            const int32_t width = in.meta.width;
+            const Type* ty = in.meta.type;
+            const Loc loc = in.loc;
+
+            auto r_xor = mut.allocate_scalar(ty, width);
             if (!r_xor.ok()) goto subst_done;
-            auto r_and = mut.allocate_scalar(in.meta.type, in.meta.width);
+            auto r_and = mut.allocate_scalar(ty, width);
             if (!r_and.ok()) goto subst_done;
-            auto r_shl = mut.allocate_scalar(in.meta.type, in.meta.width);
+            auto r_shl = mut.allocate_scalar(ty, width);
             if (!r_shl.ok()) goto subst_done;
 
             const VReg v_xor = r_xor.get().vreg;
             const VReg v_and = r_and.get().vreg;
             const VReg v_shl = r_shl.get().vreg;
-            const int32_t off_xor = r_xor.get().frame_off;
-            const int32_t off_and = r_and.get().frame_off;
-            const int32_t off_shl = r_shl.get().frame_off;
-            const VReg src_a = in.src1;
-            const VReg src_b = in.src2;
-            const int32_t width = in.meta.width;
-            const Type* ty = in.meta.type;
 
-            // 1. v_xor = a ^ b
-            ThinInstr i_xor;
-            i_xor.op = ThinOp::Xor;
-            i_xor.dst = v_xor;
-            i_xor.src1 = src_a;
-            i_xor.src2 = src_b;
-            i_xor.meta.width = width;
-            i_xor.meta.type = ty;
-            i_xor.meta.frame_off = off_xor;  // spill slot for v_xor
-            i_xor.loc = in.loc;
+            // Rewrite the original (in is still valid — no insert yet).
+            in.src1 = v_xor; in.src2 = v_shl; in.imm.i = 0;
 
-            // 2. v_and = a & b
-            ThinInstr i_and;
-            i_and.op = ThinOp::And;
-            i_and.dst = v_and;
-            i_and.src1 = src_a;
-            i_and.src2 = src_b;
-            i_and.meta.width = width;
-            i_and.meta.type = ty;
-            i_and.meta.frame_off = off_and;  // spill slot for v_and
-            i_and.loc = in.loc;
+            // Build the 3 MBA instructions.
+            ThinInstr i_xor; i_xor.op = ThinOp::Xor; i_xor.dst = v_xor;
+            i_xor.src1 = src_a; i_xor.src2 = src_b; i_xor.meta.width = width;
+            i_xor.meta.type = ty; i_xor.meta.frame_off = r_xor.get().frame_off;
+            i_xor.loc = loc;
+            ThinInstr i_and; i_and.op = ThinOp::And; i_and.dst = v_and;
+            i_and.src1 = src_a; i_and.src2 = src_b; i_and.meta.width = width;
+            i_and.meta.type = ty; i_and.meta.frame_off = r_and.get().frame_off;
+            i_and.loc = loc;
+            ThinInstr i_shl; i_shl.op = ThinOp::Shl; i_shl.dst = v_shl;
+            i_shl.src1 = v_and; i_shl.src2 = 0; i_shl.imm.i = 1;
+            i_shl.meta.width = width; i_shl.meta.type = ty;
+            i_shl.meta.frame_off = r_shl.get().frame_off; i_shl.loc = loc;
 
-            // 3. v_shl = v_and << 1 (immediate form: src2=0, imm.i=1)
-            ThinInstr i_shl;
-            i_shl.op = ThinOp::Shl;
-            i_shl.dst = v_shl;
-            i_shl.src1 = v_and;
-            i_shl.src2 = 0;
-            i_shl.imm.i = 1;
-            i_shl.meta.width = width;
-            i_shl.meta.type = ty;
-            i_shl.meta.frame_off = off_shl;  // spill slot for v_shl
-            i_shl.loc = in.loc;
-
-            // 4. dst = v_xor + v_shl (reuse the original instr)
-            in.op = ThinOp::Add;
-            in.src1 = v_xor;
-            in.src2 = v_shl;
-            in.imm.i = 0;
-            // meta stays the same (dst VReg + its frame_off are unchanged).
-
-            // Insert the 3 new instructions BEFORE the modified original.
-            it = instrs.insert(it, std::move(i_xor));
-            ++it;
-            it = instrs.insert(it, std::move(i_and));
-            ++it;
-            it = instrs.insert(it, std::move(i_shl));
-            ++it;
-
-            // Record the 3 added instructions for growth-ratio accounting.
+            // Insert the 3 new instructions BEFORE the rewritten original.
+            // The original's current position is c.ordinal + inserted_so_far;
+            // each insert bumps inserted_so_far so the next insert lands right
+            // before the (still-last) original.
+            const size_t base_pos = c.ordinal + inserted_so_far;
+            blk.instrs.insert(blk.instrs.begin() + ptrdiff_t(base_pos),
+                              std::move(i_xor)); ++inserted_so_far;
+            blk.instrs.insert(blk.instrs.begin() + ptrdiff_t(base_pos + 1),
+                              std::move(i_and)); ++inserted_so_far;
+            blk.instrs.insert(blk.instrs.begin() + ptrdiff_t(base_pos + 2),
+                              std::move(i_shl)); ++inserted_so_far;
             mut.record_added_instructions(3);
-
             changed = true;
         }
     }
 subst_done:
-    if (!changed) {
-        // No site was rewritten: abandon the mutation (restores the snapshot,
-        // though nothing was staged) and report all-preserved.
-        return EmberPreserved::all();
-    }
+    if (!changed) return EmberPreserved::all();
     auto rc = mut.commit();
-    // commit() only fails if the aligned frame_size would exceed the hard
-    // ceiling; on that failure the snapshot is restored and the function is
-    // unchanged, so report all-preserved.
     if (!rc.ok()) return EmberPreserved::all();
     return EmberPreserved::none();
 }
@@ -295,294 +286,443 @@ subst_done:
 // MBAExpansionPass: seeded mixed boolean/arithmetic expansion
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Candidate sites are selected by a stable per-function RNG. Add/Sub accept
-// either the VReg or immediate IR form; immediate operands are first
-// materialized into fresh VRegs. Each identity is valid modulo 2^N, matching
-// Ember's fixed-width integer normalization:
-//
-//   a + b = (a ^ b) + ((a & b) << 1)
-//   a + b = (a | b) + (a & b)
-//   a - b = (a ^ b) - ((~a & b) << 1)
-//   a - b = a + (~b + 1)
-//   a * 2 = a << 1
-//
-// New instructions are deliberately not revisited during this invocation, so
-// one pass run always terminates and does not recursively expand itself.
+// Per-site streams: "select" gates the site (density); "variant" picks the
+// MBA identity. Add/Sub accept either the VReg or immediate IR form; an
+// immediate operand is first materialized into a fresh VReg. Each identity is
+// valid modulo 2^N. New instructions are NOT revisited (snapshot the original
+// candidate list so inserted instructions are not recursively transformed).
 
 EmberPreserved MBAExpansionPass::run(ThinFunction& f, EmberAnalysisManager&) {
-    StableRng rng(pass_seed(f, pass_name));
-    MutationState mut(f);
+    if (configured_noop(options)) return EmberPreserved::all();
+
+    ThinIRMutation mut(f, options.limits);
+    bool changed = false;
 
     for (auto& blk : f.blocks) {
-        std::vector<ThinInstr> expanded;
-        expanded.reserve(blk.instrs.size() * 2);
+        // Snapshot the original candidate ordinals BEFORE inserting any new
+        // instruction, so inserted instructions (the expansion) are not
+        // recursively transformed this run.
+        struct Cand { size_t ordinal; };
+        std::vector<Cand> cands;
+        for (size_t i = 0; i < blk.instrs.size(); ++i)
+            if (is_arith_candidate(blk.instrs[i])) cands.push_back({i});
 
-        for (auto& in : blk.instrs) {
-            const bool add_or_sub = in.op == ThinOp::Add || in.op == ThinOp::Sub;
-            const bool mul_two = in.op == ThinOp::Mul && in.src1 != 0 &&
-                                 in.src2 == 0 && in.imm.i == 2;
-            if ((!add_or_sub && !mul_two) || in.src1 == 0 ||
-                !is_plain_integer(in) || (rng.next() & 1U) == 0) {
-                expanded.push_back(std::move(in));
+        // Walk the original ordinals; the block grows as we insert, so we
+        // re-locate each original by a running offset. Because each expansion
+        // inserts BEFORE the modified original and we process ordinals in
+        // ascending order, the ordinals of not-yet-processed originals shift
+        // by the cumulative inserted count.
+        size_t inserted_so_far = 0;
+        for (const Cand& c : cands) {
+            const size_t idx = c.ordinal + inserted_so_far;
+            if (idx >= blk.instrs.size()) break;  // defensive
+            ThinInstr& in = blk.instrs[idx];
+            if (!is_arith_candidate(in)) continue;  // may have been rewritten
+
+            // Per-site selection (density) over the ORIGINAL block id + ordinal.
+            if (!site_selected(options, pass_name, f, blk.id, c.ordinal))
                 continue;
-            }
 
             const VReg a = in.src1;
             VReg b = in.src2;
             const int32_t width = in.meta.width;
             const Type* ty = in.meta.type;
             const Loc loc = in.loc;
+            const int64_t orig_imm = in.imm.i;  // capture before any insert
+            const ThinOp orig_op = in.op;
 
-            auto append_fresh = [&](ThinOp op, VReg src1, VReg src2,
-                                    int64_t imm = 0) -> VReg {
-                auto [dst, off] = mut.scalar();
-                expanded.push_back(make_value_instr(
-                    op, dst, off, src1, src2, imm, width, ty, loc));
-                return dst;
+            // Per-site "variant" stream picks the MBA identity.
+            bool vok = false;
+            StableRng vrng = site_rng(options, pass_name, f, blk.id, c.ordinal,
+                                      "variant", vok);
+            if (!vok) continue;
+
+            const bool mul_two = orig_op == ThinOp::Mul;
+            // Worst-case preflight: materialize b (1) + up to 5 expansion VRegs
+            // (Add xor/and/shl or Sub xor/not/and/shl) = 6 VRegs, 48 frame
+            // bytes, 6 instructions. (Mul-by-two rewrites in place: 0 added.)
+            const uint32_t wc_vregs = mul_two ? 0 : 6;
+            const uint32_t wc_frame = mul_two ? 0 : 48;
+            const uint32_t wc_instrs = mul_two ? 0 : 6;
+            auto rs = mut.reserve_site(wc_vregs, wc_frame, wc_instrs, 0);
+            if (!rs.ok()) continue;
+
+            auto append_fresh = [&](ThinOp op, VReg s1, VReg s2,
+                                   int64_t imm = 0) -> VReg {
+                auto r = mut.allocate_scalar(ty, width);
+                if (!r.ok()) return 0;
+                ThinInstr ni; ni.op = op; ni.dst = r.get().vreg;
+                ni.src1 = s1; ni.src2 = s2; ni.imm.i = imm;
+                ni.meta.width = width; ni.meta.type = ty;
+                ni.meta.frame_off = r.get().frame_off; ni.loc = loc;
+                // Insert before the original candidate. The original's CURRENT
+                // position is c.ordinal + inserted_so_far (inserted_so_far has
+                // been bumped by every earlier insert this run, including the
+                // ones earlier append_fresh calls in this same site made).
+                // NOTE: a vector insert invalidates the `in` reference; the
+                // caller re-acquires it after all appends for this site.
+                blk.instrs.insert(blk.instrs.begin() +
+                                     ptrdiff_t(c.ordinal + inserted_so_far),
+                                 std::move(ni));
+                ++inserted_so_far;
+                mut.record_added_instructions(1);
+                return r.get().vreg;
             };
 
             if (mul_two) {
-                in.op = ThinOp::Shl;
-                in.src2 = 0;
-                in.imm.i = 1;
-                expanded.push_back(std::move(in));
-                mut.changed = true;
+                // No insert: rewrite the original in place (in is still valid).
+                in.op = ThinOp::Shl; in.src2 = 0; in.imm.i = 1;
+                changed = true;
                 continue;
             }
 
-            // The immediate form uses VReg 0 as its sentinel. Materializing it
-            // makes the two operands available to all MBA identities.
+            // Materialize the immediate operand if needed.
             if (b == 0) {
-                b = append_fresh(ThinOp::ConstInt, 0, 0, in.imm.i);
+                b = append_fresh(ThinOp::ConstInt, 0, 0, orig_imm);
+                if (b == 0) continue;
             }
 
-            if (in.op == ThinOp::Add) {
-                if ((rng.next() & 1U) == 0) {
+            // Compute the new operands + op for the original, inserting the
+            // expansion VRegs BEFORE the original. `in` is INVALID after the
+            // first append_fresh; we re-acquire the original below.
+            VReg new_s1 = 0, new_s2 = 0;
+            ThinOp new_op = orig_op;
+            bool ok_site = true;
+            if (orig_op == ThinOp::Add) {
+                if ((vrng.next() & 1ULL) == 0) {
                     const VReg x = append_fresh(ThinOp::Xor, a, b);
                     const VReg carry = append_fresh(ThinOp::And, a, b);
-                    const VReg twice_carry = append_fresh(ThinOp::Shl, carry, 0, 1);
-                    in.src1 = x;
-                    in.src2 = twice_carry;
+                    const VReg twice = append_fresh(ThinOp::Shl, carry, 0, 1);
+                    if (x == 0 || carry == 0 || twice == 0) { ok_site = false; }
+                    else { new_s1 = x; new_s2 = twice; }
                 } else {
                     const VReg either = append_fresh(ThinOp::Or, a, b);
                     const VReg both = append_fresh(ThinOp::And, a, b);
-                    in.src1 = either;
-                    in.src2 = both;
+                    if (either == 0 || both == 0) { ok_site = false; }
+                    else { new_s1 = either; new_s2 = both; }
                 }
-                in.imm.i = 0;
-            } else if ((rng.next() & 1U) == 0) {
-                const VReg x = append_fresh(ThinOp::Xor, a, b);
-                const VReg not_a = append_fresh(ThinOp::BitNot, a, 0);
-                const VReg borrow = append_fresh(ThinOp::And, not_a, b);
-                const VReg twice_borrow = append_fresh(ThinOp::Shl, borrow, 0, 1);
-                in.src1 = x;
-                in.src2 = twice_borrow;
-                in.imm.i = 0;
-            } else {
-                const VReg not_b = append_fresh(ThinOp::BitNot, b, 0);
-                const VReg neg_b = append_fresh(ThinOp::Add, not_b, 0, 1);
-                in.op = ThinOp::Add;
-                in.src1 = a;
-                in.src2 = neg_b;
-                in.imm.i = 0;
+            } else {  // Sub
+                if ((vrng.next() & 1ULL) == 0) {
+                    const VReg x = append_fresh(ThinOp::Xor, a, b);
+                    const VReg not_a = append_fresh(ThinOp::BitNot, a, 0);
+                    const VReg borrow = append_fresh(ThinOp::And, not_a, b);
+                    const VReg twice = append_fresh(ThinOp::Shl, borrow, 0, 1);
+                    if (x == 0 || not_a == 0 || borrow == 0 || twice == 0) { ok_site = false; }
+                    else { new_s1 = x; new_s2 = twice; }
+                } else {
+                    const VReg not_b = append_fresh(ThinOp::BitNot, b, 0);
+                    const VReg neg_b = append_fresh(ThinOp::Add, not_b, 0, 1);
+                    if (not_b == 0 || neg_b == 0) { ok_site = false; }
+                    else { new_op = ThinOp::Add; new_s1 = a; new_s2 = neg_b; }
+                }
             }
+            if (!ok_site) continue;
 
-            expanded.push_back(std::move(in));
-            mut.changed = true;
+            // Re-acquire the original (its current position is c.ordinal +
+            // inserted_so_far after all this site's appends) and rewrite it.
+            ThinInstr& in2 = blk.instrs[c.ordinal + inserted_so_far];
+            in2.op = new_op; in2.src1 = new_s1; in2.src2 = new_s2; in2.imm.i = 0;
+            changed = true;
         }
-        blk.instrs = std::move(expanded);
     }
 
-    mut.finish();
-    return mut.changed ? EmberPreserved::none() : EmberPreserved::all();
+    if (!changed) return EmberPreserved::all();
+    auto rc = mut.commit();
+    if (!rc.ok()) return EmberPreserved::all();
+    return EmberPreserved::none();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ConstantEncodingPass: seeded integer constant encoding
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Replaces each selected ConstInt c (except 0/1) with one of four exact forms:
-//   c = (c - k) + k
-//   c = (c + k) - k
-//   c = (c ^ k) ^ k
-//   c = (c << 1) >> 1       (only when that signed/unsigned shift round-trip
-//                             is valid for the destination width)
-// The first three identities are valid modulo 2^N and therefore include all
-// signed/unsigned values without invoking host-language signed arithmetic.
+// Per-site streams: "select" gates the site (density); "constant" derives the
+// encoding key; "variant" picks the form. Replaces each selected ConstInt c
+// (except 0/1) with one of four exact forms (c=(c-k)+k, c=(c+k)-k, c=(c^k)^k,
+// c=(c<<1)>>1 when shift-safe). All identities are modulo 2^N.
 
 EmberPreserved ConstantEncodingPass::run(ThinFunction& f, EmberAnalysisManager&) {
-    StableRng rng(pass_seed(f, pass_name));
-    MutationState mut(f);
+    if (configured_noop(options)) return EmberPreserved::all();
+
+    ThinIRMutation mut(f, options.limits);
+    bool changed = false;
 
     for (auto& blk : f.blocks) {
-        std::vector<ThinInstr> encoded;
-        encoded.reserve(blk.instrs.size() * 2);
+        struct Cand { size_t ordinal; };
+        std::vector<Cand> cands;
+        for (size_t i = 0; i < blk.instrs.size(); ++i) {
+            const ThinInstr& in = blk.instrs[i];
+            if (in.op == ThinOp::ConstInt && in.imm.i != 0 && in.imm.i != 1 &&
+                is_plain_integer(in))
+                cands.push_back({i});
+        }
 
-        for (auto& in : blk.instrs) {
+        size_t inserted_so_far = 0;
+        for (const Cand& c : cands) {
+            const size_t idx = c.ordinal + inserted_so_far;
+            if (idx >= blk.instrs.size()) break;
+            ThinInstr& in = blk.instrs[idx];
             if (in.op != ThinOp::ConstInt || in.imm.i == 0 || in.imm.i == 1 ||
-                !is_plain_integer(in) || (rng.next() & 1U) == 0) {
-                encoded.push_back(std::move(in));
+                !is_plain_integer(in))
                 continue;
-            }
+
+            if (!site_selected(options, pass_name, f, blk.id, c.ordinal))
+                continue;
+
+            bool cok = false, vok = false;
+            StableRng crng = site_rng(options, pass_name, f, blk.id, c.ordinal,
+                                       "constant", cok);
+            StableRng vrng = site_rng(options, pass_name, f, blk.id, c.ordinal,
+                                      "variant", vok);
+            if (!cok || !vok) continue;
 
             const int32_t bits = in.meta.width * 8;
             const uint64_t mask = bits == 64 ? ~uint64_t{0}
                                              : ((uint64_t{1} << bits) - 1);
             const uint64_t value = static_cast<uint64_t>(in.imm.i) & mask;
-            uint64_t key = rng.next() & mask;
+            uint64_t key = crng.next() & mask;
             if (key == 0 || key == 1) key = (uint64_t{0x5a} & mask);
             if (key == 0 || key == 1) key = 2;
+            const uint64_t sign_bit = uint64_t{1} << (bits - 1);
 
-            size_t form = rng.index(4);
-            const uint64_t top_two = value >> (bits - 2);
+            size_t form = vrng.bounded(4);
             const bool shift_safe = in.meta.type && in.meta.type->is_uint()
-                ? (value & (uint64_t{1} << (bits - 1))) == 0
-                : (top_two == 0 || top_two == 3);
-            if (form == 3 && !shift_safe) form = rng.index(3);
+                ? (value & sign_bit) == 0
+                : ((value >> (bits - 2)) == 0 || (value >> (bits - 2)) == 3);
+            if (form == 3 && !shift_safe) form = vrng.bounded(3);
+
+            // Worst case: form 3 (shift) adds a Shl + the base ConstInt (2
+            // VRegs, 16 frame, 2 instr); forms 0-2 add 1 VReg, 8 frame, 1
+            // instr. Preflight the worst case.
+            auto rs = mut.reserve_site(2, 16, 2, 0);
+            if (!rs.ok()) continue;
 
             const uint64_t base_bits = form == 0 ? ((value - key) & mask)
                                       : form == 1 ? ((value + key) & mask)
                                       : form == 2 ? ((value ^ key) & mask)
                                                   : value;
-            const uint64_t sign_bit = uint64_t{1} << (bits - 1);
             const int64_t base = (bits < 64 && (base_bits & sign_bit) != 0)
                 ? static_cast<int64_t>(base_bits | ~mask)
                 : static_cast<int64_t>(base_bits);
             const int64_t encoded_key = (bits < 64 && (key & sign_bit) != 0)
                 ? static_cast<int64_t>(key | ~mask)
                 : static_cast<int64_t>(key);
-            auto [base_v, base_off] = mut.scalar();
-            encoded.push_back(make_value_instr(
-                ThinOp::ConstInt, base_v, base_off, 0, 0, base,
-                in.meta.width, in.meta.type, in.loc));
 
-            in.src1 = base_v;
-            in.src2 = 0;
-            if (form == 0) {
-                in.op = ThinOp::Add;
-                in.imm.i = encoded_key;
-            } else if (form == 1) {
-                in.op = ThinOp::Sub;
-                in.imm.i = encoded_key;
-            } else if (form == 2) {
-                in.op = ThinOp::Xor;
-                in.imm.i = encoded_key;
-            } else {
-                auto [shifted_v, shifted_off] = mut.scalar();
-                encoded.push_back(make_value_instr(
-                    ThinOp::Shl, shifted_v, shifted_off, base_v, 0, 1,
-                    in.meta.width, in.meta.type, in.loc));
-                in.op = ThinOp::Shr;
-                in.src1 = shifted_v;
-                in.imm.i = 1;
+            // Capture the original's stable fields into locals BEFORE any
+            // insert: a vector insert invalidates the `in` reference, so we
+            // must not touch `in` after the first insert this site makes.
+            const int32_t in_width = in.meta.width;
+            const Type* in_type = in.meta.type;
+            const Loc in_loc = in.loc;
+
+            auto r_base = mut.allocate_scalar(in_type, in_width);
+            if (!r_base.ok()) continue;
+            const VReg base_v = r_base.get().vreg;
+            const int32_t base_off = r_base.get().frame_off;
+
+            // Build the base ConstInt (not yet inserted).
+            ThinInstr base_i; base_i.op = ThinOp::ConstInt;
+            base_i.dst = base_v; base_i.imm.i = base;
+            base_i.meta.width = in_width; base_i.meta.type = in_type;
+            base_i.meta.frame_off = base_off; base_i.loc = in_loc;
+
+            // For form 3 (shift), allocate the shift result + build the Shl
+            // (consumes the base ConstInt, feeds the rewritten original).
+            VReg shift_v = 0; int32_t shift_off = 0; ThinInstr sh_i;
+            if (form == 3) {
+                auto r_sh = mut.allocate_scalar(in_type, in_width);
+                if (!r_sh.ok()) continue;
+                shift_v = r_sh.get().vreg; shift_off = r_sh.get().frame_off;
+                sh_i.op = ThinOp::Shl; sh_i.dst = shift_v; sh_i.src1 = base_v;
+                sh_i.src2 = 0; sh_i.imm.i = 1; sh_i.meta.width = in_width;
+                sh_i.meta.type = in_type; sh_i.meta.frame_off = shift_off;
+                sh_i.loc = in_loc;
             }
-            encoded.push_back(std::move(in));
-            mut.changed = true;
+
+            // Rewrite the original (in is still valid — no insert yet).
+            in.src1 = (form == 3) ? shift_v : base_v;
+            in.src2 = 0;
+            if (form == 0) { in.op = ThinOp::Add; in.imm.i = encoded_key; }
+            else if (form == 1) { in.op = ThinOp::Sub; in.imm.i = encoded_key; }
+            else if (form == 2) { in.op = ThinOp::Xor; in.imm.i = encoded_key; }
+            else { in.op = ThinOp::Shr; in.imm.i = 1; }
+
+            // Now insert the new instructions BEFORE the (rewritten) original.
+            // The original's current position is c.ordinal + inserted_so_far.
+            // Insert the base first, then (for form 3) the shift, so the block
+            // order is [base, (shift), rewritten-original].
+            const size_t base_pos = c.ordinal + inserted_so_far;
+            blk.instrs.insert(blk.instrs.begin() + ptrdiff_t(base_pos),
+                              std::move(base_i));
+            ++inserted_so_far;
+            mut.record_added_instructions(1);
+            if (form == 3) {
+                const size_t sh_pos = c.ordinal + inserted_so_far;
+                blk.instrs.insert(blk.instrs.begin() + ptrdiff_t(sh_pos),
+                                  std::move(sh_i));
+                ++inserted_so_far;
+                mut.record_added_instructions(1);
+            }
+            changed = true;
         }
-        blk.instrs = std::move(encoded);
     }
 
-    mut.finish();
-    return mut.changed ? EmberPreserved::none() : EmberPreserved::all();
+    if (!changed) return EmberPreserved::all();
+    auto rc = mut.commit();
+    if (!rc.ok()) return EmberPreserved::all();
+    return EmberPreserved::none();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// OpaquePredicatesPass: fixed predicates with a harmless rejoining path
+// OpaquePredicatesPass: fixed predicate + harmless rejoining bogus path
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// For an integer x, (x | 1) is nonzero in every fixed-width representation.
-// One deterministic site is split into:
-//
-//   p = x | 1
-//   c = p != 0                 (or p == 0 for the always-false variant)
-//   branch c, continuation, bogus
-// bogus: pure arithmetic only; jmp continuation
-//
-// The bogus edge is semantically harmless even independently of the identity:
-// it changes no existing VReg or visible memory and rejoins the real path.
+// Per-site streams: "select" gates the chosen site (density); "truth" picks
+// always-true vs always-false. For an integer x, (x | 1) is nonzero in every
+// fixed-width representation. One site is split: p = x|1; c = p != 0 (or ==0);
+// branch c, continuation, bogus; bogus: pure arithmetic; jmp continuation.
 
 EmberPreserved OpaquePredicatesPass::run(ThinFunction& f, EmberAnalysisManager&) {
-    struct Site {
-        size_t block;
-        size_t instr;
-        VReg source;
-        int32_t width;
-        const Type* type;
-        Loc loc;
-    };
+    if (configured_noop(options)) return EmberPreserved::all();
 
+    // Collect candidate sites (plain-integer defs) with their ORIGINAL block
+    // id + ordinal, snapshot before any mutation.
+    struct Site { uint32_t block_id; size_t block_idx; size_t ordinal;
+                  VReg source; int32_t width; const Type* type; Loc loc; };
     std::vector<Site> sites;
     for (size_t bi = 0; bi < f.blocks.size(); ++bi) {
-        const auto& instrs = f.blocks[bi].instrs;
-        for (size_t ii = 0; ii < instrs.size(); ++ii) {
-            if (is_plain_integer(instrs[ii])) {
-                sites.push_back({bi, ii, instrs[ii].dst, instrs[ii].meta.width,
-                                 instrs[ii].meta.type, instrs[ii].loc});
-            }
+        for (size_t ii = 0; ii < f.blocks[bi].instrs.size(); ++ii) {
+            if (is_plain_integer(f.blocks[bi].instrs[ii]))
+                sites.push_back({f.blocks[bi].id, bi, ii,
+                                f.blocks[bi].instrs[ii].dst,
+                                f.blocks[bi].instrs[ii].meta.width,
+                                f.blocks[bi].instrs[ii].meta.type,
+                                f.blocks[bi].instrs[ii].loc});
         }
     }
     if (sites.empty()) return EmberPreserved::all();
 
-    StableRng rng(pass_seed(f, pass_name));
-    const Site site = sites[rng.index(sites.size())];
-    const bool always_true = (rng.next() & 1U) != 0;
-    MutationState mut(f);
+    ThinIRMutation mut(f, options.limits);
+    bool changed = false;
 
-    // Save references only until vector growth; all data required below was
-    // copied into Site. The continuation receives the suffix and old term.
-    ThinBlock& original = f.blocks[site.block];
-    std::vector<ThinInstr> suffix;
-    auto split = original.instrs.begin() + static_cast<ptrdiff_t>(site.instr + 1);
-    suffix.insert(suffix.end(), std::make_move_iterator(split),
-                  std::make_move_iterator(original.instrs.end()));
-    original.instrs.erase(split, original.instrs.end());
-    ThinTerm old_term = original.term;
+    for (const Site& s : sites) {
+        if (!site_selected(options, pass_name, f, s.block_id, s.ordinal))
+            continue;
 
-    auto [pred_v, pred_off] = mut.scalar();
-    auto [cond_v, cond_off] = mut.scalar();
-    original.instrs.push_back(make_value_instr(
-        ThinOp::Or, pred_v, pred_off, site.source, 0, 1,
-        site.width, site.type, site.loc));
-    ThinInstr cmp = make_value_instr(
-        ThinOp::Cmp, cond_v, cond_off, pred_v, 0, 0,
-        site.width, site.type, site.loc);
-    cmp.meta.cmp = always_true ? 1 : 0; // Neq zero (true), or Eq zero (false)
-    original.instrs.push_back(std::move(cmp));
+        bool tok = false;
+        StableRng truth = site_rng(options, pass_name, f, s.block_id, s.ordinal,
+                                   "truth", tok);
+        if (!tok) continue;
+        const bool always_true = (truth.next() & 1ULL) != 0;
 
-    const uint32_t continuation_id = static_cast<uint32_t>(f.blocks.size());
-    const uint32_t bogus_id = continuation_id + 1;
-    original.term = {};
-    original.term.kind = TermKind::Branch;
-    original.term.cond = cond_v;
-    original.term.target = always_true ? continuation_id : bogus_id;
-    original.term.false_target = always_true ? bogus_id : continuation_id;
+        // Worst case: 2 scalar VRegs (pred, cond) in the original + 2 junk
+        // VRegs in the bogus block + 1 split (the continuation). The split
+        // moves the suffix into a new block; the bogus block is inserted
+        // directly (counted as +2 added blocks: continuation + bogus, but
+        // split_block only mints 1 — we insert the bogus block directly as a
+        // second block, so preflight 2 blocks). Preflight: 4 VRegs, 32 frame,
+        // 4 instrs (or/ cmp / junk-xor / junk-add), 2 blocks.
+        auto rs = mut.reserve_site(4, 32, 4, 2);
+        if (!rs.ok()) continue;
 
-    ThinBlock continuation;
-    continuation.id = continuation_id;
-    continuation.instrs = std::move(suffix);
-    continuation.term = old_term;
+        // Re-locate the block (its index may have shifted if an earlier site
+        // in this same block inserted a continuation). The block is found by
+        // its ORIGINAL id, which canonicalize has not yet remapped (we remap
+        // once at the end). However, an earlier split in this run may have
+        // inserted a continuation block AFTER this block, shifting later
+        // block indices but not this block's id. Find by id.
+        size_t bi = f.blocks.size();
+        for (size_t i = 0; i < f.blocks.size(); ++i)
+            if (f.blocks[i].id == s.block_id) { bi = i; break; }
+        if (bi == f.blocks.size()) continue;
+        // The ordinal may have shifted if an earlier site in THIS block split
+        // it. To stay robust, re-scan: find the instruction whose dst matches
+        // the original source VReg.
+        ThinBlock& original = f.blocks[bi];
+        size_t ii = original.instrs.size();
+        for (size_t k = 0; k < original.instrs.size(); ++k)
+            if (original.instrs[k].dst == s.source &&
+                is_plain_integer(original.instrs[k])) { ii = k; break; }
+        if (ii == original.instrs.size()) continue;
 
-    // The untaken path contains convincing but pure work. Its destinations and
-    // spill slots are fresh, and it rejoins without touching program state.
-    ThinBlock bogus;
-    bogus.id = bogus_id;
-    auto [junk1_v, junk1_off] = mut.scalar();
-    auto [junk2_v, junk2_off] = mut.scalar();
-    bogus.instrs.push_back(make_value_instr(
-        ThinOp::Xor, junk1_v, junk1_off, site.source, site.source, 0,
-        site.width, site.type, site.loc));
-    bogus.instrs.push_back(make_value_instr(
-        ThinOp::Add, junk2_v, junk2_off, junk1_v, 0,
-        static_cast<int64_t>((rng.next() & 0x7fffU) | 1U),
-        site.width, site.type, site.loc));
-    bogus.term.kind = TermKind::Jmp;
-    bogus.term.target = continuation_id;
+        // Split the block at ii+1 (the suffix moves to a continuation).
+        auto sp = mut.split_block(s.block_id, ii + 1);
+        if (!sp.ok()) continue;
+        const uint32_t continuation_id = sp.get();
 
-    auto insert_at = f.blocks.begin() + static_cast<ptrdiff_t>(site.block + 1);
-    insert_at = f.blocks.insert(insert_at, std::move(bogus));
-    f.blocks.insert(std::next(insert_at), std::move(continuation));
-    canonicalize_block_ids(f);
-    mut.finish();
+        auto r_pred = mut.allocate_scalar(s.type, s.width);
+        if (!r_pred.ok()) continue;
+        auto r_cond = mut.allocate_scalar(s.type, s.width);
+        if (!r_cond.ok()) continue;
+
+        // Re-find the original block (split inserted the continuation after
+        // it; the original block is still at `bi` with its original id).
+        ThinBlock& orig = f.blocks[bi];
+        orig.instrs.push_back(ThinInstr{});
+        ThinInstr& or_i = orig.instrs.back();
+        or_i.op = ThinOp::Or; or_i.dst = r_pred.get().vreg;
+        or_i.src1 = s.source; or_i.src2 = 0; or_i.imm.i = 1;
+        or_i.meta.width = s.width; or_i.meta.type = s.type;
+        or_i.meta.frame_off = r_pred.get().frame_off; or_i.loc = s.loc;
+
+        orig.instrs.push_back(ThinInstr{});
+        ThinInstr& cmp = orig.instrs.back();
+        cmp.op = ThinOp::Cmp; cmp.dst = r_cond.get().vreg;
+        cmp.src1 = r_pred.get().vreg; cmp.src2 = 0; cmp.imm.i = 0;
+        cmp.meta.width = s.width; cmp.meta.type = s.type;
+        cmp.meta.frame_off = r_cond.get().frame_off; cmp.meta.cmp =
+            always_true ? 1 : 0;  // Neq zero (true) / Eq zero (false)
+        cmp.loc = s.loc;
+        mut.record_added_instructions(2);
+
+        const uint32_t bogus_id = [&]() -> uint32_t {
+            uint32_t m = 0;
+            for (const auto& b : f.blocks) if (b.id >= m) m = b.id + 1;
+            return m;
+        }();
+
+        orig.term = {};
+        orig.term.kind = TermKind::Branch;
+        orig.term.cond = r_cond.get().vreg;
+        orig.term.target = always_true ? continuation_id : bogus_id;
+        orig.term.false_target = always_true ? bogus_id : continuation_id;
+
+        // The bogus block: pure work, rejoins the continuation.
+        auto r_j1 = mut.allocate_scalar(s.type, s.width);
+        if (!r_j1.ok()) continue;
+        auto r_j2 = mut.allocate_scalar(s.type, s.width);
+        if (!r_j2.ok()) continue;
+        bool jok = false;
+        StableRng junk = site_rng(options, pass_name, f, s.block_id, s.ordinal,
+                                  "junk-count", jok);
+        const int64_t junk_imm = jok
+            ? static_cast<int64_t>((junk.next() & 0x7fffULL) | 1ULL) : 1;
+
+        ThinBlock bogus;
+        bogus.id = bogus_id;
+        ThinInstr j1; j1.op = ThinOp::Xor; j1.dst = r_j1.get().vreg;
+        j1.src1 = s.source; j1.src2 = s.source; j1.meta.width = s.width;
+        j1.meta.type = s.type; j1.meta.frame_off = r_j1.get().frame_off;
+        j1.loc = s.loc; bogus.instrs.push_back(std::move(j1));
+        ThinInstr j2; j2.op = ThinOp::Add; j2.dst = r_j2.get().vreg;
+        j2.src1 = r_j1.get().vreg; j2.src2 = 0; j2.imm.i = junk_imm;
+        j2.meta.width = s.width; j2.meta.type = s.type;
+        j2.meta.frame_off = r_j2.get().frame_off; j2.loc = s.loc;
+        bogus.instrs.push_back(std::move(j2));
+        bogus.term.kind = TermKind::Jmp; bogus.term.target = continuation_id;
+        mut.record_added_instructions(2);
+
+        // Insert the bogus block right after the original block (before the
+        // continuation, preserving linear order). The continuation is at bi+1.
+        f.blocks.insert(f.blocks.begin() + ptrdiff_t(bi + 1),
+                        std::move(bogus));
+        changed = true;
+    }
+
+    if (!changed) return EmberPreserved::all();
+    mut.canonicalize_block_ids();
+    auto rc = mut.commit();
+    if (!rc.ok()) return EmberPreserved::all();
     return EmberPreserved::none();
 }
 
@@ -590,71 +730,120 @@ EmberPreserved OpaquePredicatesPass::run(ThinFunction& f, EmberAnalysisManager&)
 // DeadCodeInjectionPass: pure junk kept live by a same-target branch
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// DCE correctly removes an unused pure chain. To retain injected work without
-// lying about side effects, its final value drives a Branch whose two edges
-// both reach the same continuation. The branch outcome is irrelevant, while
-// ordinary DCE sees a real terminator use and therefore retains the chain.
+// Per-site streams: "select" gates the chosen (block, split-point) site;
+// "constant" derives the junk chain keys. The injected chain's final value
+// drives a Branch whose two edges both reach the same continuation, so the
+// branch outcome is irrelevant while ordinary DCE sees a real terminator use.
 
 EmberPreserved DeadCodeInjectionPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    if (configured_noop(options)) return EmberPreserved::all();
     if (f.blocks.empty()) return EmberPreserved::all();
 
-    StableRng rng(pass_seed(f, pass_name));
-    const size_t block_index = rng.index(f.blocks.size());
-    MutationState mut(f); // scan all VRegs before temporarily moving the suffix
-    ThinBlock& original = f.blocks[block_index];
-    const size_t split_index = rng.index(original.instrs.size() + 1);
+    // Snapshot candidate (block, split-index) sites with ORIGINAL block id +
+    // ordinal-ish identity (block id + a stable split index). The split index
+    // is chosen by a per-site "select" stream bounded by (instrs+1).
+    struct Site { uint32_t block_id; size_t block_idx; };
+    std::vector<Site> sites;
+    for (size_t bi = 0; bi < f.blocks.size(); ++bi)
+        sites.push_back({f.blocks[bi].id, bi});
 
-    std::vector<ThinInstr> suffix;
-    auto split = original.instrs.begin() + static_cast<ptrdiff_t>(split_index);
-    suffix.insert(suffix.end(), std::make_move_iterator(split),
-                  std::make_move_iterator(original.instrs.end()));
-    original.instrs.erase(split, original.instrs.end());
-    ThinTerm old_term = original.term;
+    ThinIRMutation mut(f, options.limits);
+    bool changed = false;
 
-    const Type* ty = &type_i64();
-    const Loc loc = !suffix.empty() ? suffix.front().loc
-                                    : (!original.instrs.empty() ? original.instrs.back().loc : Loc{});
-    const int64_t key1 = static_cast<int64_t>(rng.next() | 1ULL);
-    const int64_t key2 = static_cast<int64_t>(rng.next() | 1ULL);
+    for (const Site& s : sites) {
+        // Per-site selection over the original block id + a 0 ordinal (the
+        // site is the whole block; use ordinal 0 as the stable identity).
+        if (!site_selected(options, pass_name, f, s.block_id, 0))
+            continue;
 
-    auto [seed_v, seed_off] = mut.scalar();
-    auto [xor_v, xor_off] = mut.scalar();
-    auto [mul_v, mul_off] = mut.scalar();
-    auto [add_v, add_off] = mut.scalar();
-    auto [cond_v, cond_off] = mut.scalar();
+        bool cok = false;
+        StableRng crng = site_rng(options, pass_name, f, s.block_id, 0,
+                                  "constant", cok);
+        if (!cok) continue;
 
-    original.instrs.push_back(make_value_instr(
-        ThinOp::ConstInt, seed_v, seed_off, 0, 0, key1, 8, ty, loc));
-    original.instrs.push_back(make_value_instr(
-        ThinOp::Xor, xor_v, xor_off, seed_v, 0, key2, 8, ty, loc));
-    original.instrs.push_back(make_value_instr(
-        ThinOp::Mul, mul_v, mul_off, xor_v, 0,
-        static_cast<int64_t>((rng.next() & 0xffffU) | 1U), 8, ty, loc));
-    original.instrs.push_back(make_value_instr(
-        ThinOp::Add, add_v, add_off, mul_v, 0,
-        static_cast<int64_t>(rng.next()), 8, ty, loc));
-    ThinInstr cmp = make_value_instr(
-        ThinOp::Cmp, cond_v, cond_off, add_v, 0,
-        static_cast<int64_t>(rng.next()), 8, ty, loc);
-    cmp.meta.cmp = 1; // Neq; either result is safe because both edges coincide.
-    original.instrs.push_back(std::move(cmp));
+        // Worst case: 5 scalar VRegs (seed, xor, mul, add, cond) + 1 split
+        // (continuation) + 5 instrs. Preflight 5 VRegs, 40 frame, 5 instrs, 1
+        // block.
+        auto rs = mut.reserve_site(5, 40, 5, 1);
+        if (!rs.ok()) continue;
 
-    const uint32_t continuation_id = static_cast<uint32_t>(f.blocks.size());
-    original.term = {};
-    original.term.kind = TermKind::Branch;
-    original.term.cond = cond_v;
-    original.term.target = continuation_id;
-    original.term.false_target = continuation_id;
+        // Re-find the block by original id (an earlier split may have shifted
+        // indices; the id is stable until canonicalize).
+        size_t bi = f.blocks.size();
+        for (size_t i = 0; i < f.blocks.size(); ++i)
+            if (f.blocks[i].id == s.block_id) { bi = i; break; }
+        if (bi == f.blocks.size()) continue;
 
-    ThinBlock continuation;
-    continuation.id = continuation_id;
-    continuation.instrs = std::move(suffix);
-    continuation.term = old_term;
-    f.blocks.insert(f.blocks.begin() + static_cast<ptrdiff_t>(block_index + 1),
-                    std::move(continuation));
-    canonicalize_block_ids(f);
+        // Capture stable fields BEFORE the split (a split inserts into
+        // f.blocks and may invalidate the block reference).
+        const size_t instrs_size = f.blocks[bi].instrs.size();
+        const Loc loc = instrs_size != 0 ? f.blocks[bi].instrs.back().loc : Loc{};
 
-    mut.finish();
+        // Choose a split index in [0, instrs.size()] from the select stream
+        // (re-derive for a stable, bounded choice).
+        bool sok = false;
+        StableRng srng = site_rng(options, pass_name, f, s.block_id, 0,
+                                  "select", sok);
+        if (!sok) continue;
+        const size_t split_index = instrs_size == 0
+            ? 0 : static_cast<size_t>(srng.bounded(instrs_size + 1));
+
+        auto sp = mut.split_block(s.block_id, split_index);
+        if (!sp.ok()) continue;
+        const uint32_t continuation_id = sp.get();
+
+        const Type* ty = &type_i64();
+        const int64_t key1 = static_cast<int64_t>(crng.next() | 1ULL);
+        const int64_t key2 = static_cast<int64_t>(crng.next() | 1ULL);
+        const int64_t mul_imm = static_cast<int64_t>((crng.next() & 0xffffULL) | 1ULL);
+        const int64_t add_imm = static_cast<int64_t>(crng.next());
+        const int64_t cmp_imm = static_cast<int64_t>(crng.next());
+
+        auto r_seed = mut.allocate_scalar(ty, 8); if (!r_seed.ok()) continue;
+        auto r_xor  = mut.allocate_scalar(ty, 8); if (!r_xor.ok())  continue;
+        auto r_mul  = mut.allocate_scalar(ty, 8); if (!r_mul.ok())  continue;
+        auto r_add  = mut.allocate_scalar(ty, 8); if (!r_add.ok())  continue;
+        auto r_cond = mut.allocate_scalar(ty, 8); if (!r_cond.ok()) continue;
+
+        // Re-acquire the (now-split) original block by id; the split moved
+        // the suffix into a continuation but left the prefix block with the
+        // same id at the same index.
+        size_t bi2 = f.blocks.size();
+        for (size_t i = 0; i < f.blocks.size(); ++i)
+            if (f.blocks[i].id == s.block_id) { bi2 = i; break; }
+        if (bi2 == f.blocks.size()) continue;
+        ThinBlock& original = f.blocks[bi2];
+
+        auto put = [&](ThinOp op, VReg dst, int32_t off, VReg s1, VReg s2,
+                       int64_t imm) {
+            ThinInstr ni; ni.op = op; ni.dst = dst; ni.src1 = s1; ni.src2 = s2;
+            ni.imm.i = imm; ni.meta.width = 8; ni.meta.type = ty;
+            ni.meta.frame_off = off; ni.loc = loc;
+            original.instrs.push_back(std::move(ni));
+        };
+        put(ThinOp::ConstInt, r_seed.get().vreg, r_seed.get().frame_off, 0, 0, key1);
+        put(ThinOp::Xor, r_xor.get().vreg, r_xor.get().frame_off, r_seed.get().vreg, 0, key2);
+        put(ThinOp::Mul, r_mul.get().vreg, r_mul.get().frame_off, r_xor.get().vreg, 0, mul_imm);
+        put(ThinOp::Add, r_add.get().vreg, r_add.get().frame_off, r_mul.get().vreg, 0, add_imm);
+        ThinInstr cmp; cmp.op = ThinOp::Cmp; cmp.dst = r_cond.get().vreg;
+        cmp.src1 = r_add.get().vreg; cmp.src2 = 0; cmp.imm.i = cmp_imm;
+        cmp.meta.width = 8; cmp.meta.type = ty;
+        cmp.meta.frame_off = r_cond.get().frame_off; cmp.meta.cmp = 1; cmp.loc = loc;
+        original.instrs.push_back(std::move(cmp));
+        mut.record_added_instructions(5);
+
+        original.term = {};
+        original.term.kind = TermKind::Branch;
+        original.term.cond = r_cond.get().vreg;
+        original.term.target = continuation_id;
+        original.term.false_target = continuation_id;
+        changed = true;
+    }
+
+    if (!changed) return EmberPreserved::all();
+    mut.canonicalize_block_ids();
+    auto rc = mut.commit();
+    if (!rc.ok()) return EmberPreserved::all();
     return EmberPreserved::none();
 }
 
@@ -662,27 +851,24 @@ EmberPreserved DeadCodeInjectionPass::run(ThinFunction& f, EmberAnalysisManager&
 // StringEncryptionPass: plaintext rodata to inline stack decryption
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// ConstStringRef and StringDecrypt have the same slice result shape. This pass
-// encrypts each referenced rodata byte with one fixed nonzero key, rewrites the
-// producer, and gives the decryptor two fresh, nonoverlapping frame regions:
-// the byte buffer and the {ptr,len} result. A single key lets shared/overlapping
-// ConstStringRef ranges remain representable while each physical byte is XORed
-// exactly once.
+// Red 6 part one: registered through the configured factory with no-op
+// scaffolding (zero density / no ConstStringRef → no-op). The body keeps the
+// existing fixed-key (0xA5) rodata transform, GATED by the configured density,
+// so a full-density run still rewrites ConstStringRef references. The final
+// SEEDED key, rodata rebuild, and ThinIRMutation conversion (distinct
+// data/slice slots via allocate_frame_bytes) are deferred to Red 7: the plan
+// makes Thin IR blob v2 a hard gate for that migration, and Red 6 part one is
+// not complete until the next chunk finishes it.
 
 EmberPreserved StringEncryptionPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    if (configured_noop(options)) return EmberPreserved::all();
+
     constexpr uint8_t key = 0xA5;
 
-    struct Site {
-        ThinInstr* in;
-        uint32_t addend;
-        uint32_t len;
-    };
+    struct Site { ThinInstr* in; uint32_t addend; uint32_t len; };
     std::vector<Site> sites;
     std::vector<uint8_t> encrypt_byte(f.rodata.size(), 0);
 
-    // Plan the complete rodata mutation first. Malformed references are left
-    // untouched for the normal IR validator to diagnose; the pass itself must
-    // never index outside rodata or half-rewrite such an instruction.
     for (auto& block : f.blocks) {
         for (auto& in : block.instrs) {
             if (in.op != ThinOp::ConstStringRef || in.meta.len < 0) continue;
@@ -703,12 +889,10 @@ EmberPreserved StringEncryptionPass::run(ThinFunction& f, EmberAnalysisManager&)
     int32_t next_off = f.frame.next_local_off;
     for (const Site& site : sites) {
         ThinInstr& in = *site.in;
-
         next_off += static_cast<int32_t>(site.len);
         const int32_t data_temp_off = -next_off;
         next_off += 16;
         const int32_t slice_off = -next_off;
-
         in.op = ThinOp::StringDecrypt;
         in.imm.i = key;
         in.meta.addend = site.addend;
@@ -721,8 +905,6 @@ EmberPreserved StringEncryptionPass::run(ThinFunction& f, EmberAnalysisManager&)
     const int32_t needed = next_off + 16;
     if (needed > f.frame.frame_size)
         f.frame.frame_size = (needed + 15) & ~15;
-    // Frame locations changed, so a result from an out-of-band pre-pass
-    // register allocation cannot be reused safely.
     f.ra = {};
     return EmberPreserved::none();
 }
@@ -731,99 +913,105 @@ EmberPreserved StringEncryptionPass::run(ThinFunction& f, EmberAnalysisManager&)
 // BlockSplittingPass: explicit continuation blocks
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Each original long block is split at most once. Continuations are inserted
-// directly after their prefixes: this retains the emitter's established
-// linear block order and keeps register-only address producer/consumer pairs
-// adjacent in emitted code. Block IDs and every old CFG edge are remapped only
-// after all insertions are complete.
+// Per-site streams: "select" gates the chosen long block (density) + picks the
+// deterministic split point. Each original long block is split at most once.
+// Continuations are inserted directly after their prefixes (preserves the
+// emitter's linear block order + register-only producer/consumer adjacency).
+// Inseparable boundaries (FieldAddr/IndexAddr/DivOverflowCheck/CallTargetGuard/
+// DepthCheck pairs) are excluded. Block IDs + every old CFG edge are remapped
+// only after all insertions (canonicalize_block_ids).
 
 EmberPreserved BlockSplittingPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    if (configured_noop(options)) return EmberPreserved::all();
     constexpr size_t min_instructions = 8;
-    StableRng rng(pass_seed(f, pass_name));
-    const size_t original_block_count = f.blocks.size();
+
+    // Snapshot the original long blocks (id + candidate split indices) BEFORE
+    // any mutation, so the streams are stable.
+    struct Site { uint32_t block_id; std::vector<size_t> cands; };
+    std::vector<Site> sites;
+    for (const auto& blk : f.blocks) {
+        if (blk.instrs.size() <= min_instructions) continue;
+        auto cands = split_candidates(blk.instrs);
+        if (cands.empty()) continue;
+        sites.push_back({blk.id, std::move(cands)});
+    }
+    if (sites.empty()) return EmberPreserved::all();
+
+    ThinIRMutation mut(f, options.limits);
     bool changed = false;
 
-    // Temporary IDs are outside the original ID domain and unique. The final
-    // canonicalization maps both old CFG edges and these new jumps to vector
-    // indices, as required by thin_emit's block_labels indexing contract.
-    uint32_t next_id = static_cast<uint32_t>(f.blocks.size());
-    size_t block_index = 0;
-    for (size_t original_index = 0;
-         original_index < original_block_count;
-         ++original_index, ++block_index) {
-        ThinBlock& block = f.blocks[block_index];
-        const size_t count = block.instrs.size();
-        if (count <= min_instructions) continue;
+    for (const Site& s : sites) {
+        if (!site_selected(options, pass_name, f, s.block_id, 0))
+            continue;
 
-        // Every ThinInstr is an IR-level atomic operation, but a few lowering
-        // pairs deliberately rely on immediate producer/consumer adjacency.
-        // Exclude their boundary while selecting a deterministic random point.
-        std::vector<size_t> candidates;
-        candidates.reserve(count - 1);
-        for (size_t split = 1; split < count; ++split) {
-            const ThinInstr& before = block.instrs[split - 1];
-            const ThinInstr& after = block.instrs[split];
-            bool coupled = false;
+        // Per-site "select" stream picks the split point among the candidates.
+        bool sok = false;
+        StableRng srng = site_rng(options, pass_name, f, s.block_id, 0,
+                                  "select", sok);
+        if (!sok) continue;
+        const size_t pick = s.cands.size() > 1
+            ? static_cast<size_t>(srng.bounded(s.cands.size())) : 0;
+        const size_t split_index = s.cands[pick];
 
-            if ((before.op == ThinOp::FieldAddr || before.op == ThinOp::IndexAddr) &&
-                before.dst != 0 &&
-                (after.src1 == before.dst || after.src2 == before.dst))
-                coupled = true;
-            if (before.op == ThinOp::DivOverflowCheck &&
-                (after.op == ThinOp::Div || after.op == ThinOp::Mod))
-                coupled = true;
-            if (before.op == ThinOp::CallTargetGuard &&
-                after.op == ThinOp::CallIndirect)
-                coupled = true;
-            if (before.op == ThinOp::DepthCheck &&
-                (after.op == ThinOp::CallNative || after.op == ThinOp::CallScript ||
-                 after.op == ThinOp::CallIndirect ||
-                 after.op == ThinOp::CallCrossModule))
-                coupled = true;
+        // Worst case: 1 split, 0 VRegs, 0 frame, 0 instrs added (the split
+        // moves instructions; it adds 0 net instructions). Preflight 1 block.
+        auto rs = mut.reserve_site(0, 0, 0, 1);
+        if (!rs.ok()) continue;
 
-            if (!coupled) candidates.push_back(split);
-        }
-        if (candidates.empty()) continue;
+        // Re-find the block by original id (a prior split may have shifted
+        // indices). The block's instruction count is unchanged by other
+        // splits (they touch other blocks), so split_index stays valid.
+        size_t bi = f.blocks.size();
+        for (size_t i = 0; i < f.blocks.size(); ++i)
+            if (f.blocks[i].id == s.block_id) { bi = i; break; }
+        if (bi == f.blocks.size()) continue;
+        if (split_index > f.blocks[bi].instrs.size()) continue;
 
-        const size_t split_index = candidates[rng.index(candidates.size())];
-        ThinTerm old_term = block.term;
-        ThinBlock continuation;
-        continuation.id = next_id++;
-        continuation.instrs.insert(
-            continuation.instrs.end(),
-            std::make_move_iterator(block.instrs.begin() +
-                                    static_cast<ptrdiff_t>(split_index)),
-            std::make_move_iterator(block.instrs.end()));
-        block.instrs.erase(block.instrs.begin() +
-                           static_cast<ptrdiff_t>(split_index),
-                           block.instrs.end());
-        continuation.term = old_term;
-
-        block.term = {};
-        block.term.kind = TermKind::Jmp;
-        block.term.target = continuation.id;
-
-        f.blocks.insert(f.blocks.begin() +
-                        static_cast<ptrdiff_t>(block_index + 1),
-                        std::move(continuation));
-        ++block_index; // skip the new continuation; split originals only
+        auto sp = mut.split_block(s.block_id, split_index);
+        if (!sp.ok()) continue;
         changed = true;
     }
 
     if (!changed) return EmberPreserved::all();
-    canonicalize_block_ids(f);
-    f.ra = {};
+    mut.canonicalize_block_ids();
+    auto rc = mut.commit();
+    if (!rc.ok()) return EmberPreserved::all();
     return EmberPreserved::none();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Registration
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Configured registration: each pass is registered through a factory that
+// captures `options` by value and returns a fresh PassConcept on every
+// create(). Strict: rejects empty names, null factories, and duplicates.
+void register_passes(EmberPassRegistry& reg, const PolymorphicPassOptions& options) {
+    reg.add_factory("subst",        [options]() { return ember::make_pass_concept(SubstitutionPass{options}); });
+    reg.add_factory("mba_expand",   [options]() { return ember::make_pass_concept(MBAExpansionPass{options}); });
+    reg.add_factory("const_encode", [options]() { return ember::make_pass_concept(ConstantEncodingPass{options}); });
+    reg.add_factory("opaque_pred",  [options]() { return ember::make_pass_concept(OpaquePredicatesPass{options}); });
+    reg.add_factory("deadcode",     [options]() { return ember::make_pass_concept(DeadCodeInjectionPass{options}); });
+    reg.add_factory("str_encrypt",  [options]() { return ember::make_pass_concept(StringEncryptionPass{options}); });
+    reg.add_factory("block_split",  [options]() { return ember::make_pass_concept(BlockSplittingPass{options}); });
+}
+
+// Compatibility wrapper: DETERMINISTIC DEFAULTS that retain the existing
+// pipeline names + eligibility behavior. A fixed-root seed deriver (seed 0,
+// fully deterministic) + the legacy 50% site selection density (500_000 ppm,
+// matching the legacy `(rng.next() & 1U) == 0` eligibility). Existing
+// `register_passes(reg)` callers keep working unchanged; the pipeline names
+// and the eligibility behavior are preserved.
 void register_passes(EmberPassRegistry& reg) {
-    reg.add<SubstitutionPass>("subst");
-    reg.add<MBAExpansionPass>("mba_expand");
-    reg.add<ConstantEncodingPass>("const_encode");
-    reg.add<OpaquePredicatesPass>("opaque_pred");
-    reg.add<DeadCodeInjectionPass>("deadcode");
-    reg.add<StringEncryptionPass>("str_encrypt");
-    reg.add<BlockSplittingPass>("block_split");
+    PolymorphicPassOptions defaults;
+    defaults.seed_deriver = std::make_shared<FixedRootSeedDeriver>(u64_to_root(0));
+    defaults.algorithm_version = 1;
+    defaults.engine_version = "ember";
+    defaults.module_id = "default";
+    defaults.build_profile_id = "default";
+    defaults.site_probability_ppm = 500'000;
+    defaults.limits = PassGrowthLimits{};
+    register_passes(reg, defaults);
 }
 
 } // namespace ember::ext_obf

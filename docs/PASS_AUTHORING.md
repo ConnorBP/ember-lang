@@ -444,6 +444,110 @@ it equals itself. Changing any constant above (domain string, lane tags,
 constants, field order, or endianness) breaks those literals and is a deliberate
 algorithm-version bump.
 
+### Per-purpose streams
+
+A pass never derives a single stream for all of a site's choices. Each choice
+has its own **purpose** string, domain-separated inside the `SeedRequest`, so a
+draw for one purpose never reshuffles another and there is no single advancing
+function-wide RNG. The purposes the shipped obfuscation passes use are:
+
+| Purpose       | Used by                  | Picks                                       |
+|---------------|--------------------------|---------------------------------------------|
+| `select`      | every transform          | whether the site is selected (density)      |
+| `variant`     | subst, mba_expand, const_encode | which identity / encoding form        |
+| `constant`    | const_encode, deadcode   | the encoding key / junk-chain keys          |
+| `truth`       | opaque_pred              | always-true vs always-false predicate       |
+| `junk-count`  | opaque_pred              | the bogus-path junk immediate               |
+| `string-key`  | str_encrypt (Red 7)      | the per-string encryption key               |
+
+Site identity is the **stable original block ID + instruction ordinal** the
+candidate occupied in the snapshot before any mutation. Snapshot the
+candidate list before inserting any new instruction (so inserted instructions
+are not recursively transformed this run) and re-locate each original by a
+running inserted-count as the block grows. Two runs of the same function then
+produce identical per-site streams regardless of how earlier sites shifted
+indices.
+
+```cpp
+// Per-site selection: derive the "select" stream and accept the site iff a
+// rejection-sampled draw in [0, 1_000_000) is below the configured density.
+bool selected = (select_rng.bounded(1'000'000) < options.site_probability_ppm);
+// Per-purpose variant stream (independent of the select stream):
+ember::StableRng vrng = per_site_rng(options, pass_name, f, blk.id,
+                                    original_ordinal, "variant");
+uint64_t identity = vrng.next() & 1ULL;
+```
+
+### PolymorphicPassOptions and configured polymorphic factories
+
+The immutable option record every configured obfuscation pass factory captures
+lives in `src/polymorphic_options.hpp`:
+
+```cpp
+#include "polymorphic_options.hpp"
+
+struct ember::PolymorphicPassOptions {
+    std::shared_ptr<const ember::SeedDeriver> seed_deriver;
+    uint32_t algorithm_version = 1;            // independent per pass
+    std::string engine_version;                // stable module/profile identities
+    std::string module_id;                       //   needed by SeedRequest
+    std::string build_profile_id;
+    uint32_t site_probability_ppm = 0;         // 0 = no-op; 1'000'000 = all sites
+    ember::PassGrowthLimits limits{};          // soft per-pass growth ceilings
+};
+```
+
+`validate_polymorphic_options(opts)` / `make_polymorphic_options(...)` check the
+record and return a structured `ExtensionStatus` / `ExtensionResult` (registry
+`ember-polymorphic-options`) on:
+- `site_probability_ppm > 1_000_000` (above 100%);
+- `limits.growth_denominator == 0`;
+- a growth ratio that overflows the instruction ceiling.
+A null `seed_deriver` is **not** rejected by validation (the no-op compatibility
+wrapper legitimately carries a null deriver); a configured factory that would
+derive treats a null deriver as a per-site skip.
+
+A configured pass is a no-op when it cannot derive — `seed_deriver == nullptr`
+**or** `site_probability_ppm == 0`. This is both the bare `reg.add<T>()`
+legacy path (default-constructed `PolymorphicPassOptions{}`) and the
+zero-density configured path, so a default-constructed obfuscation pass is a
+deterministic no-op and never accidentally transforms.
+
+Register a whole obfuscation extension with deterministic defaults through the
+configured factory entry point, then expose a no-argument compatibility wrapper
+that retains the existing pipeline names and eligibility behavior:
+
+```cpp
+// extensions/obf/ext_obf.hpp
+namespace ember::ext_obf {
+void register_passes(ember::EmberPassRegistry& reg,
+                     const ember::PolymorphicPassOptions& options);
+void register_passes(ember::EmberPassRegistry& reg);  // compat wrapper
+}
+
+// extensions/obf/ext_obf.cpp
+void ext_obf::register_passes(ember::EmberPassRegistry& reg,
+                              const ember::PolymorphicPassOptions& options) {
+    reg.add_factory("mba_expand", [options]() {
+        return ember::make_pass_concept(MBAExpansionPass{options});
+    });
+    // ...one add_factory per pass...
+}
+void ext_obf::register_passes(ember::EmberPassRegistry& reg) {
+    ember::PolymorphicPassOptions defaults;
+    defaults.seed_deriver =
+        std::make_shared<const ember::FixedRootSeedDeriver>(ember::u64_to_root(0));
+    defaults.site_probability_ppm = 500'000;   // retain 50% eligibility
+    register_passes(reg, defaults);
+}
+```
+
+The factory captures `options` **by value**; every `create("mba_expand")`
+returns a fresh `PassConcept` carrying its own constructed pass. The compat
+wrapper's deterministic defaults (a fixed-root seed deriver + the legacy
+eligibility density) preserve the existing pipeline names and selection
+density, so existing `register_passes(reg)` callers keep working unchanged.
+
 ## Registration and invocation
 
 Expose one extension-shaped function:
@@ -475,7 +579,11 @@ if (auto st = reg.add<MyPass>("my-pass"); !st) {
 
 When a pass needs immutable constructor options (a seed, density, growth
 caps, or any other configuration), register a configured factory with
-`add_factory` and `make_pass_concept` instead of `add<T>`:
+`add_factory` and `make_pass_concept` instead of `add<T>`. The shipped
+obfuscation passes share one such option record — `ember::PolymorphicPassOptions`
+(see [PolymorphicPassOptions and configured polymorphic
+factories](#polymorphicpassoptions-and-configured-polymorphic-factories));
+custom passes may use their own option type with the same pattern:
 
 ```cpp
 struct MyPass : ember::EmberPassInfoMixin<MyPass> {
@@ -706,3 +814,15 @@ At minimum cover unchanged/changed preservation results, value and trap
  equivalence, validation, serialization round-trip, same-seed equality,
 pinned-seed variation, compilation-order independence, instrumentation skip
 behavior for optional passes, and growth limits.
+
+The `polymorphic_pass_test` executable (`examples/polymorphic_pass_test.cpp`)
+is the Red 6 coverage driver for the six migrated obfuscation transforms
+(subst, mba_expand, const_encode, opaque_pred, deadcode, block_split) plus the
+`str_encrypt` no-op scaffolding. It is built by CMakeLists.txt **without**
+`add_test` so the filtered CTest total is unchanged; run it explicitly, e.g.
+`./buildt/polymorphic_pass_test`. It covers options validation, configured
+factory registration, no-op/changed preservation, same-seed serialized Thin IR
+equality, two-pinned-seed structural variation, baseline differential
+execution, serialize/deserialize round-trip, stale-regalloc invalidation, exact
+growth boundaries + stop-before-site atomicity, widths 1/2/4/8, empty and
+no-candidate functions, and straight-line / diamond / loop / long-block CFGs.

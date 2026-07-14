@@ -170,6 +170,12 @@ add_library(ember_frontend STATIC
     # ember_frontend -> ember) and dispatch_abi.hpp (Red 2 header-only enum types).
     # No cycle: the core lib never depends on ember_frontend.
     src/module_layout.cpp
+    # Red 6 (plan_POLYMORPHIC_CODE_ENGINE.md §4.2, §9.3): the immutable, shared
+    # PolymorphicPassOptions record + its validation. A compile-time pass concern
+    # that depends only on extension_registry.hpp + seed_derivation.hpp +
+    # thin_ir_mutation.hpp (header-only types) + the C++ standard library. Lives
+    # in ember_frontend alongside seed_derivation.cpp / ember_pass.cpp.
+    src/polymorphic_options.cpp
 )
 target_include_directories(ember_frontend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ember_frontend PUBLIC ember)
@@ -1198,6 +1204,23 @@ add_test(NAME em_v5_ir COMMAND em_v5_ir_test)
 add_executable(ember_pass_test examples/ember_pass_test.cpp)
 target_link_libraries(ember_pass_test PRIVATE ember ember_frontend ember_ext_opt)
 add_test(NAME ember_pass COMMAND ember_pass_test)
+
+# polymorphic_pass_test - Red 6 part one (plan_POLYMORPHIC_CODE_ENGINE.md §9.3
+# Red 6): the configured polymorphic obfuscation pass test. Pins options
+# validation, configured factory registration, no-op/changed preservation,
+# same-seed serialized Thin IR equality, two-pinned-seed structural variation,
+# baseline differential execution, serialize/deserialize round-trip, stale-
+# regalloc invalidation, and exact growth boundaries + stop-before-site
+# atomicity for the six migrated transforms (subst, mba_expand, const_encode,
+# opaque_pred, deadcode, block_split) plus str_encrypt no-op scaffolding. Built
+# as a standalone executable WITHOUT add_test so the filtered CTest total
+# stays 67; run explicitly: ./buildt/polymorphic_pass_test. Links ember +
+# ember_frontend + ember_ext_obf (the configured obf factories).
+add_executable(polymorphic_pass_test examples/polymorphic_pass_test.cpp)
+target_link_libraries(polymorphic_pass_test PRIVATE ember ember_frontend ember_ext_obf)
+if(WIN32)
+    target_link_libraries(polymorphic_pass_test PRIVATE kernel32)
+endif()
 
 # host_struct_test - proof-of-concept: host C++ struct types as first-class
 # by-value script arguments (register_struct + C++-compatible layout).
