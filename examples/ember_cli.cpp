@@ -675,7 +675,19 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
 
     // ---- v0.4/v1.0 safe-execution context ----
     context_t ectx;
-    ectx.budget_remaining = 100000000;
+    // 1e9 instruction budget. The self-hosted compiler (lex/parse/sema/codegen
+    // in ember) compiles a ~1k-line program through all four stages within ONE
+    // top-level call; the stages re-lex/re-parse internally so a single
+    // compile_and_run does ~10 full-tree walks. budget_remaining is a monotonic
+    // per-call work counter (reset_for_call deliberately does NOT reset it), so
+    // all of that work shares this one budget. The previous 1e8 default was
+    // exhausted mid-stage-3 (sema's internal re-parse) on the lex.ember
+    // bootstrap, trapping with BudgetExceeded. 1e9 gives the self-hosting
+    // workload headroom (a 317-line program's full pipeline costs ~7e7; a 918-
+    // line one costs ~3e8) while staying a finite bound backed by the host's
+    // wall-clock timeout. Consumption scales linearly with program size (no
+    // leak), so this is a workload-size fix, not masking a missing decrement.
+    ectx.budget_remaining = 1000000000;
     ectx.max_call_depth = 512;
     ectx.has_checkpoint = false;
     if (opts.emit_em_path.empty()) ctx.trap_stub = reinterpret_cast<void*>(&ember_cli_trap);
@@ -1003,10 +1015,15 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
     ember::ext_gc::gc_attach_context(&ectx, gc_global_roots.empty() ? nullptr : &gc_global_roots);
     ectx.call_mutex.lock();
     if (EMBER_SETJMP(ectx.checkpoint)) {
+        // Capture the trap reason + detail BEFORE reset_for_call() clears
+        // last_trap/last_error (the stub ember_cli_trap set them just before
+        // the longjmp landed here). Printing after the reset yields "(none)".
+        ember::TrapReason cap_trap = ectx.last_trap;
+        std::string cap_err = ectx.last_error;
         ectx.call_mutex.unlock();
         ember::ext_gc::gc_detach_context(&ectx); ectx.reset_for_call();
         std::fprintf(stderr, "ember: RUNTIME TRAP: %s (%s)\n",
-                     ectx.last_error.c_str(), ember::trap_reason_str(ectx.last_trap));
+                     cap_err.c_str(), ember::trap_reason_str(cap_trap));
         exit_code = 70;
     } else {
         entry_ret = ember::ember_call_void(entry, &ectx);
