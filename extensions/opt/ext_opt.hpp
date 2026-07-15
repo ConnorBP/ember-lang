@@ -1,6 +1,6 @@
 // ext_opt.hpp — Stage C: the IR optimization passes extension.
 //
-// Sixteen IR→IR optimization passes over ThinFunction, registered by name via
+// Seventeen IR→IR optimization passes over ThinFunction, registered by name via
 // register_passes (the extension-style discovery pattern, mirroring
 // register_natives). The host wires it:
 //   EmberPassRegistry reg;
@@ -23,6 +23,25 @@
 //   each block. Equivalent operands share value numbers, so expressions remain
 //   recognizable through copies. Frame stores invalidate aliasing LoadFrame
 //   entries and calls invalidate every memory-derived entry.
+// - GVNPass ("gvn"): global value numbering — CSE extended across blocks via
+//   dominance. Equivalent expressions share a value number, so a redundant
+//   recomputation in a block dominated by an earlier computation is removed
+//   and its uses forwarded to the dominating definition's VReg. Availability
+//   follows the dominator tree: an expression computed in a dominating block
+//   is available at a dominated use, and a join with no dominating producer is
+//   left unchanged. Thin IR is non-SSA, so cross-block forwarding is
+//   conservative — it rejects ambiguous reaching definitions, representative
+//   or destination redefinitions, uses outside the dominated region, and any
+//   case where a VReg's meaning may differ along incoming paths. Memory
+//   invalidation is byte-range aware: a StoreFrame invalidates overlapping
+//   LoadFrame entries, a StoreGlobal invalidates the matching LoadGlobal, and
+//   computed stores (StoreFrame src2!=0), calls, StoreAddr, CopyBytes,
+//   aggregate/string initialization, and implicit producer frame-home writes
+//   flush aliasing memory conservatively. An explicitly read spill home
+//   (meta.frame_off in the read-slot set) is never erased, so an observable
+//   restoring write is preserved. Trapping arithmetic (Div/Mod/FMod) IS
+//   eliminated when the first occurrence dominates the redundant one (if it
+//   traps the second is unreachable; if not the values are identical).
 // - LICMPass ("licm"): conservative loop-invariant code motion. Detects
 //   natural loops with dominance-qualified backedges and hoists only safe-to-
 //   speculate constants and integer Add/Sub/Mul with invariant operands.
@@ -70,7 +89,7 @@
 // - BranchFoldingPass ("branch_folding"): replaces a conditional Branch whose
 //   true and false targets are identical with an unconditional Jmp.
 //
-// All sixteen are VALUE-PRESERVING: after the pass, emit_x64 produces the same
+// All seventeen are VALUE-PRESERVING: after the pass, emit_x64 produces the same
 // i64 result. They return EmberPreserved::none() if they changed the IR,
 // Preserved::all() if they did nothing.
 #pragma once
@@ -98,6 +117,11 @@ struct SimplifyCFGPass : EmberPassInfoMixin<SimplifyCFGPass> {
 
 struct CSEPass : EmberPassInfoMixin<CSEPass> {
     static constexpr const char* pass_name = "cse";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+struct GVNPass : EmberPassInfoMixin<GVNPass> {
+    static constexpr const char* pass_name = "gvn";
     EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
 };
 

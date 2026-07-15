@@ -28,6 +28,7 @@
 #include "../src/thin_emit.hpp"       // emit_x64
 #include "../src/ember_pass.hpp"      // EmberPassManager, EmberAnalysisManager
 #include "../src/ember_pass_registry.hpp" // EmberPassRegistry
+#include "../src/ember_pass_pipeline.hpp" // build_pipeline_from_string
 #include "../src/thin_effects.hpp"        // classify_thin_effects, removable_if_result_dead
 #include "../src/thin_ir_mutation.hpp"    // ThinIRMutation, PassGrowthLimits
 #include "../extensions/opt/ext_opt.hpp"  // register_passes (opt)
@@ -181,6 +182,38 @@ static size_t total_instrs(const ThinFunction& f) {
     size_t n = 0;
     for (const auto& blk : f.blocks) n += blk.instrs.size();
     return n;
+}
+
+// ─── GVN helpers (hand-built ThinFunction pass tests) ───
+// Count instrs with a specific opcode across all blocks.
+static size_t count_op(const ThinFunction& f, ThinOp op) {
+    size_t n = 0;
+    for (const auto& blk : f.blocks)
+        for (const auto& in : blk.instrs)
+            if (in.op == op) ++n;
+    return n;
+}
+// Count instrs with a specific opcode in one block (by index).
+static size_t count_op_in_block(const ThinFunction& f, size_t blk_idx, ThinOp op) {
+    if (blk_idx >= f.blocks.size()) return 0;
+    size_t n = 0;
+    for (const auto& in : f.blocks[blk_idx].instrs)
+        if (in.op == op) ++n;
+    return n;
+}
+// Does any instruction in the function define VReg v (dst == v)?
+static bool vreg_is_defined(const ThinFunction& f, VReg v) {
+    for (const auto& blk : f.blocks)
+        for (const auto& in : blk.instrs)
+            if (in.dst == v) return true;
+    return false;
+}
+// Find the first instruction with dst == v; returns nullptr if not found.
+static const ThinInstr* find_def(const ThinFunction& f, VReg v) {
+    for (const auto& blk : f.blocks)
+        for (const auto& in : blk.instrs)
+            if (in.dst == v) return &in;
+    return nullptr;
 }
 
 // Run a single named pass on a COPY of f (the original is untouched).
@@ -2018,6 +2051,1053 @@ int main() {
         tf.declared_max_vreg = 7;  // correct
         std::string verr;
         ck(validate_thin_function(tf, &verr), "R4-F6b: correct slice bound validates");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // RED phase: Global Value Numbering (GVN) — failing tests for a pass
+    // that does NOT yet exist. Every assertion below fails because the "gvn"
+    // name is not registered (reg.has("gvn") == false, reg.create("gvn")
+    // returns nullptr). Tests safely handle the null pass concept: the guard
+    // `if (pc)` prevents any dereference, so the IR is left untransformed and
+    // the structural assertions (redundant-op-count-decreased, uses-forwarded)
+    // fail for the expected missing-pass reason. Once GVN is implemented and
+    // registered in ext_opt::register_passes, these tests turn green.
+    // ═══════════════════════════════════════════════════════════════════════
+    std::printf("\n--- RED: Global Value Numbering (gvn) ---\n");
+
+    // ─── GVN-REG: register_passes registers the name "gvn" ───
+    {
+        ck(reg.has("gvn"), "GVN-REG: register_passes registers \"gvn\"");
+    }
+
+    // ─── GVN-PIPE: build_pipeline_from_string accepts "gvn" ───
+    // The generic registry-backed parser must resolve "gvn" through the same
+    // has()/create() path as every other pass. In RED this fails with
+    // `unknown pass: "gvn"`.
+    {
+        EmberPassRegistry pipe_reg;
+        ext_opt::register_passes(pipe_reg);
+        EmberPassManager pm;
+        std::string err;
+        bool ok = build_pipeline_from_string("gvn", pipe_reg, pm, &err);
+        ck(ok, "GVN-PIPE: build_pipeline_from_string(\"gvn\") succeeds");
+        if (!ok) {
+            std::printf("         (pipeline error: %s)\n", err.c_str());
+        }
+        // A second check: gvn in a multi-pass string should also resolve.
+        EmberPassManager pm2;
+        std::string err2;
+        bool ok2 = build_pipeline_from_string("constprop,gvn,dce", pipe_reg, pm2, &err2);
+        ck(ok2, "GVN-PIPE: build_pipeline_from_string(\"constprop,gvn,dce\") succeeds");
+    }
+
+    // ─── GVN-SB1: same-block redundant expression elimination + instruction-use forwarding ───
+    //   block0:
+    //     v1 = ConstInt 10
+    //     v2 = ConstInt 20
+    //     v3 = Add v1, v2        (first)
+    //     v4 = Add v1, v2        (redundant — should be eliminated)
+    //     v5 = Mul v4, v3        (instruction use of v4 — forwarded to v3)
+    //     Return v5
+    // After GVN: the second Add (v4) is removed; v5 = Mul v3, v3.
+    {
+        ThinFunction tf; tf.name = "gvn_same_block_instr_use";
+        const VReg v1=1, v2=2, v3=3, v4=4, v5=5;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        auto bin = [&](ThinOp op, VReg d, VReg s1, VReg s2)->ThinInstr { ThinInstr x; x.op=op; x.dst=d; x.src1=s1; x.src2=s2; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 10));
+        b0.instrs.push_back(ci(v2, 20));
+        b0.instrs.push_back(bin(ThinOp::Add, v3, v1, v2));
+        b0.instrs.push_back(bin(ThinOp::Add, v4, v1, v2));  // redundant
+        b0.instrs.push_back(bin(ThinOp::Mul, v5, v4, v3));  // uses v4
+        b0.term.kind = TermKind::Return; b0.term.ret = v5;
+        tf.blocks.push_back(std::move(b0));
+
+        size_t add_before = count_op(tf, ThinOp::Add);
+        ck(add_before == 2, "GVN-SB1: two Add instrs before gvn");
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-SB1: gvn pass registered");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t add_after = count_op(tf, ThinOp::Add);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-SB1: redundant Add eliminated (before=%zu after=%zu)", add_before, add_after);
+        ck(add_after < add_before, msg);
+        // v4 should no longer be defined (its Add was removed).
+        ck(!vreg_is_defined(tf, v4), "GVN-SB1: redundant Add dst v4 is no longer defined");
+        // v5's instruction use of v4 should be forwarded to v3.
+        const ThinInstr* v5_def = find_def(tf, v5);
+        bool v5_uses_v3 = v5_def && v5_def->op == ThinOp::Mul && v5_def->src1 == v3;
+        ck(v5_uses_v3, "GVN-SB1: instruction use of v4 forwarded to v3 (v5.src1 == v3)");
+    }
+
+    // ─── GVN-SB2: same-block forwarding of terminator use ───
+    //   block0:
+    //     v1 = ConstInt 10, v2 = ConstInt 20
+    //     v3 = Cmp(Eq) v1, v2     (first)
+    //     v4 = Cmp(Eq) v1, v2     (redundant — eliminated)
+    //     Branch v4 ? block1 : block2  (terminator use of v4 — forwarded to v3)
+    //   block1: Return v1
+    //   block2: Return v2
+    // After GVN: v4 removed; Branch v3 ? block1 : block2.
+    {
+        ThinFunction tf; tf.name = "gvn_same_block_term_use";
+        const VReg v1=1, v2=2, v3=3, v4=4;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 10));
+        b0.instrs.push_back(ci(v2, 20));
+        { ThinInstr x; x.op=ThinOp::Cmp; x.dst=v3; x.src1=v1; x.src2=v2; x.meta.width=8; x.meta.cmp=0; b0.instrs.push_back(std::move(x)); } // Eq
+        { ThinInstr x; x.op=ThinOp::Cmp; x.dst=v4; x.src1=v1; x.src2=v2; x.meta.width=8; x.meta.cmp=0; b0.instrs.push_back(std::move(x)); } // Eq (redundant)
+        b0.term.kind = TermKind::Branch; b0.term.cond = v4; b0.term.target = 1; b0.term.false_target = 2;
+        tf.blocks.push_back(std::move(b0));
+        ThinBlock b1; b1.id = 1; b1.term.kind = TermKind::Return; b1.term.ret = v1;
+        tf.blocks.push_back(std::move(b1));
+        ThinBlock b2; b2.id = 2; b2.term.kind = TermKind::Return; b2.term.ret = v2;
+        tf.blocks.push_back(std::move(b2));
+
+        size_t cmp_before = count_op(tf, ThinOp::Cmp);
+        ck(cmp_before == 2, "GVN-SB2: two Cmp instrs before gvn");
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-SB2: gvn pass registered");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t cmp_after = count_op(tf, ThinOp::Cmp);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-SB2: redundant Cmp eliminated (before=%zu after=%zu)", cmp_before, cmp_after);
+        ck(cmp_after < cmp_before, msg);
+        // The branch condition should be forwarded from v4 to v3.
+        ck(tf.blocks[0].term.cond == v3, "GVN-SB2: terminator use of v4 forwarded to v3 (term.cond == v3)");
+    }
+
+    // ─── GVN-XB1: cross-block elimination when the first expression dominates ───
+    //   block0 (dominates block1):
+    //     v1 = ConstInt 10, v2 = ConstInt 20
+    //     v3 = Add v1, v2        (first, in dominating block)
+    //     Jmp -> block1
+    //   block1 (dominated by block0):
+    //     v4 = Add v1, v2        (redundant — eliminated, forwarded to v3)
+    //     v5 = Mul v4, v3        (use forwarded: v5 = Mul v3, v3)
+    //     Return v5
+    {
+        ThinFunction tf; tf.name = "gvn_cross_block_dom";
+        const VReg v1=1, v2=2, v3=3, v4=4, v5=5;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 10));
+        b0.instrs.push_back(ci(v2, 20));
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v3; x.src1=v1; x.src2=v2; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        b0.term.kind = TermKind::Jmp; b0.term.target = 1;
+        tf.blocks.push_back(std::move(b0));
+
+        ThinBlock b1; b1.id = 1;
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v4; x.src1=v1; x.src2=v2; x.meta.width=8; b1.instrs.push_back(std::move(x)); } // redundant
+        { ThinInstr x; x.op=ThinOp::Mul; x.dst=v5; x.src1=v4; x.src2=v3; x.meta.width=8; b1.instrs.push_back(std::move(x)); }
+        b1.term.kind = TermKind::Return; b1.term.ret = v5;
+        tf.blocks.push_back(std::move(b1));
+
+        size_t add_before = count_op(tf, ThinOp::Add);
+        ck(add_before == 2, "GVN-XB1: two Add instrs before gvn (one per block)");
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-XB1: gvn pass registered");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t add_after = count_op(tf, ThinOp::Add);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-XB1: cross-block redundant Add eliminated (before=%zu after=%zu)", add_before, add_after);
+        ck(add_after < add_before, msg);
+        // The redundant Add (v4) should be gone from block1.
+        ck(count_op_in_block(tf, 1, ThinOp::Add) == 0, "GVN-XB1: block1 no longer has the redundant Add");
+        // v5's use of v4 should be forwarded to v3.
+        const ThinInstr* v5_def = find_def(tf, v5);
+        bool v5_uses_v3 = v5_def && v5_def->op == ThinOp::Mul && v5_def->src1 == v3;
+        ck(v5_uses_v3, "GVN-XB1: cross-block use of v4 forwarded to v3 (v5.src1 == v3)");
+    }
+
+    // ─── GVN-XB2: no elimination when the earlier expression does not dominate a join ───
+    //   block0:
+    //     v1 = ConstInt 10, v2 = ConstInt 20, ConstBool v_c=1
+    //     Branch v_c ? block1 : block2
+    //   block1: v3 = Add v1, v2, Jmp -> block3   (on one branch)
+    //   block2: v4 = Add v1, v2, Jmp -> block3   (on other branch)
+    //   block3 (join — NOT dominated by block1 or block2):
+    //     v5 = Add v1, v2   (NOT eliminated — neither v3 nor v4 dominates block3)
+    //     Return v5
+    {
+        ThinFunction tf; tf.name = "gvn_no_dom_join";
+        const VReg v1=1, v2=2, v3=3, v4=4, v5=5, vc=6;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 10));
+        b0.instrs.push_back(ci(v2, 20));
+        { ThinInstr x; x.op=ThinOp::ConstBool; x.dst=vc; x.imm.i=1; b0.instrs.push_back(std::move(x)); }
+        b0.term.kind = TermKind::Branch; b0.term.cond = vc; b0.term.target = 1; b0.term.false_target = 2;
+        tf.blocks.push_back(std::move(b0));
+
+        auto add_blk = [&](uint32_t id, VReg dst, uint32_t jmp_target) {
+            ThinBlock b; b.id = id;
+            { ThinInstr x; x.op=ThinOp::Add; x.dst=dst; x.src1=v1; x.src2=v2; x.meta.width=8; b.instrs.push_back(std::move(x)); }
+            b.term.kind = TermKind::Jmp; b.term.target = jmp_target;
+            tf.blocks.push_back(std::move(b));
+        };
+        add_blk(1, v3, 3);  // block1
+        add_blk(2, v4, 3);  // block2
+
+        ThinBlock b3; b3.id = 3;
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v5; x.src1=v1; x.src2=v2; x.meta.width=8; b3.instrs.push_back(std::move(x)); }
+        b3.term.kind = TermKind::Return; b3.term.ret = v5;
+        tf.blocks.push_back(std::move(b3));
+
+        size_t add_before = count_op(tf, ThinOp::Add);
+        ck(add_before == 3, "GVN-XB2: three Add instrs before gvn");
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-XB2: gvn pass registered");
+        EmberPreserved pres = EmberPreserved::all();
+        if (pc) { EmberAnalysisManager am; pres = pc->run(tf, am); }
+        size_t add_after = count_op(tf, ThinOp::Add);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-XB2: join Add NOT eliminated (before=%zu after=%zu)", add_before, add_after);
+        ck(add_after == add_before, msg);
+        // v5 should still be defined (not eliminated).
+        ck(vreg_is_defined(tf, v5), "GVN-XB2: join-block Add (v5) still defined (not eliminated)");
+        // No transformation occurred -> Preserved::all().
+        ck(pres.all_preserved(), "GVN-XB2: gvn returns Preserved::all() (no dominating expr)");
+    }
+
+    // ─── GVN-ARITH: equivalent arithmetic expressions (Add/Sub/Mul/Div) ───
+    // For each of Add, Sub, Mul, Div: two identical ops in the same block.
+    // The second should be eliminated.
+    {
+        struct ArithCase { ThinOp op; const char* name; };
+        ArithCase cases[] = {
+            {ThinOp::Add, "Add"}, {ThinOp::Sub, "Sub"},
+            {ThinOp::Mul, "Mul"}, {ThinOp::Div, "Div"},
+        };
+        for (const auto& ac : cases) {
+            ThinFunction tf; tf.name = "gvn_arith";
+            tf.name += ac.name;
+            const VReg v1=1, v2=2, v3=3, v4=4;
+            ThinBlock b0; b0.id = 0;
+            auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+            auto bin = [&](ThinOp op, VReg d, VReg s1, VReg s2)->ThinInstr { ThinInstr x; x.op=op; x.dst=d; x.src1=s1; x.src2=s2; x.meta.width=8; return x; };
+            b0.instrs.push_back(ci(v1, 100));
+            b0.instrs.push_back(ci(v2, 5));
+            b0.instrs.push_back(bin(ac.op, v3, v1, v2));
+            b0.instrs.push_back(bin(ac.op, v4, v1, v2));  // redundant
+            b0.term.kind = TermKind::Return; b0.term.ret = v3;
+            tf.blocks.push_back(std::move(b0));
+
+            size_t before = count_op(tf, ac.op);
+            ck(before == 2, "GVN-ARITH: two identical ops before gvn");
+            auto pc = reg.create("gvn");
+            ck(pc != nullptr, "GVN-ARITH: gvn pass registered");
+            if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+            size_t after = count_op(tf, ac.op);
+            char msg[160];
+            std::snprintf(msg, sizeof msg, "GVN-ARITH: redundant %s eliminated (before=%zu after=%zu)", ac.name, before, after);
+            ck(after < before, msg);
+        }
+    }
+
+    // ─── GVN-CMP: comparisons with matching opcode metadata ───
+    // Two Cmp with the same predicate (Eq) — the second is eliminated.
+    {
+        ThinFunction tf; tf.name = "gvn_cmp";
+        const VReg v1=1, v2=2, v3=3, v4=4;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 10));
+        b0.instrs.push_back(ci(v2, 20));
+        { ThinInstr x; x.op=ThinOp::Cmp; x.dst=v3; x.src1=v1; x.src2=v2; x.meta.width=8; x.meta.cmp=0; b0.instrs.push_back(std::move(x)); } // Eq
+        { ThinInstr x; x.op=ThinOp::Cmp; x.dst=v4; x.src1=v1; x.src2=v2; x.meta.width=8; x.meta.cmp=0; b0.instrs.push_back(std::move(x)); } // Eq (redundant)
+        b0.term.kind = TermKind::Return; b0.term.ret = v3;
+        tf.blocks.push_back(std::move(b0));
+
+        size_t before = count_op(tf, ThinOp::Cmp);
+        ck(before == 2, "GVN-CMP: two Cmp instrs before gvn");
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-CMP: gvn pass registered");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::Cmp);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-CMP: redundant Cmp(Eq) eliminated (before=%zu after=%zu)", before, after);
+        ck(after < before, msg);
+    }
+
+    // ─── GVN-BIT: bitwise And/Or/Xor ───
+    // For each of And, Or, Xor: two identical ops — the second is eliminated.
+    {
+        struct BitCase { ThinOp op; const char* name; };
+        BitCase cases[] = {
+            {ThinOp::And, "And"}, {ThinOp::Or, "Or"}, {ThinOp::Xor, "Xor"},
+        };
+        for (const auto& bc : cases) {
+            ThinFunction tf; tf.name = "gvn_bit_";
+            tf.name += bc.name;
+            const VReg v1=1, v2=2, v3=3, v4=4;
+            ThinBlock b0; b0.id = 0;
+            auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+            auto bin = [&](ThinOp op, VReg d, VReg s1, VReg s2)->ThinInstr { ThinInstr x; x.op=op; x.dst=d; x.src1=s1; x.src2=s2; x.meta.width=8; return x; };
+            b0.instrs.push_back(ci(v1, 0xF0));
+            b0.instrs.push_back(ci(v2, 0x0F));
+            b0.instrs.push_back(bin(bc.op, v3, v1, v2));
+            b0.instrs.push_back(bin(bc.op, v4, v1, v2));  // redundant
+            b0.term.kind = TermKind::Return; b0.term.ret = v3;
+            tf.blocks.push_back(std::move(b0));
+
+            size_t before = count_op(tf, bc.op);
+            auto pc = reg.create("gvn");
+            ck(pc != nullptr, "GVN-BIT: gvn pass registered");
+            if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+            size_t after = count_op(tf, bc.op);
+            char msg[160];
+            std::snprintf(msg, sizeof msg, "GVN-BIT: redundant %s eliminated (before=%zu after=%zu)", bc.name, before, after);
+            ck(after < before, msg);
+        }
+    }
+
+    // ─── GVN-COMM: commutative operand canonicalization ───
+    // Add(v2,v1) is the same value as Add(v1,v2) — eliminated (commutative).
+    // Sub(v2,v1) is NOT the same as Sub(v1,v2) — NOT eliminated.
+    // Div(v2,v1) is NOT the same as Div(v1,v2) — NOT eliminated.
+    // Cmp(Lt,v2,v1) is NOT the same as Cmp(Lt,v1,v2) — NOT eliminated (ordered).
+    {
+        // Commutative: Add(v1,v2) then Add(v2,v1) — eliminated.
+        ThinFunction tf; tf.name = "gvn_comm_add";
+        const VReg v1=1, v2=2, v3=3, v4=4;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        auto bin = [&](ThinOp op, VReg d, VReg s1, VReg s2)->ThinInstr { ThinInstr x; x.op=op; x.dst=d; x.src1=s1; x.src2=s2; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 10));
+        b0.instrs.push_back(ci(v2, 20));
+        b0.instrs.push_back(bin(ThinOp::Add, v3, v1, v2));
+        b0.instrs.push_back(bin(ThinOp::Add, v4, v2, v1));  // commutative swap — same value
+        b0.term.kind = TermKind::Return; b0.term.ret = v3;
+        tf.blocks.push_back(std::move(b0));
+        size_t add_before = count_op(tf, ThinOp::Add);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-COMM: gvn pass registered");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t add_after = count_op(tf, ThinOp::Add);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-COMM: commutative Add(v2,v1) eliminated (before=%zu after=%zu)", add_before, add_after);
+        ck(add_after < add_before, msg);
+    }
+    {
+        // Non-commutative: Sub(v1,v2) then Sub(v2,v1) — NOT eliminated.
+        ThinFunction tf; tf.name = "gvn_noncomm_sub";
+        const VReg v1=1, v2=2, v3=3, v4=4;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        auto bin = [&](ThinOp op, VReg d, VReg s1, VReg s2)->ThinInstr { ThinInstr x; x.op=op; x.dst=d; x.src1=s1; x.src2=s2; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 10));
+        b0.instrs.push_back(ci(v2, 20));
+        b0.instrs.push_back(bin(ThinOp::Sub, v3, v1, v2));
+        b0.instrs.push_back(bin(ThinOp::Sub, v4, v2, v1));  // NOT same value
+        b0.term.kind = TermKind::Return; b0.term.ret = v3;
+        tf.blocks.push_back(std::move(b0));
+        size_t sub_before = count_op(tf, ThinOp::Sub);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-COMM: gvn pass registered (Sub)");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t sub_after = count_op(tf, ThinOp::Sub);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-COMM: non-commutative Sub(v2,v1) NOT eliminated (before=%zu after=%zu)", sub_before, sub_after);
+        ck(sub_after == sub_before, msg);
+    }
+    {
+        // Non-commutative: Div(v1,v2) then Div(v2,v1) — NOT eliminated.
+        ThinFunction tf; tf.name = "gvn_noncomm_div";
+        const VReg v1=1, v2=2, v3=3, v4=4;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        auto bin = [&](ThinOp op, VReg d, VReg s1, VReg s2)->ThinInstr { ThinInstr x; x.op=op; x.dst=d; x.src1=s1; x.src2=s2; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 100));
+        b0.instrs.push_back(ci(v2, 5));
+        b0.instrs.push_back(bin(ThinOp::Div, v3, v1, v2));
+        b0.instrs.push_back(bin(ThinOp::Div, v4, v2, v1));  // NOT same value
+        b0.term.kind = TermKind::Return; b0.term.ret = v3;
+        tf.blocks.push_back(std::move(b0));
+        size_t div_before = count_op(tf, ThinOp::Div);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-COMM: gvn pass registered (Div)");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t div_after = count_op(tf, ThinOp::Div);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-COMM: non-commutative Div(v2,v1) NOT eliminated (before=%zu after=%zu)", div_before, div_after);
+        ck(div_after == div_before, msg);
+    }
+    {
+        // Ordered comparison: Cmp(Lt,v1,v2) then Cmp(Lt,v2,v1) — NOT eliminated.
+        ThinFunction tf; tf.name = "gvn_noncomm_cmp";
+        const VReg v1=1, v2=2, v3=3, v4=4;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 10));
+        b0.instrs.push_back(ci(v2, 20));
+        { ThinInstr x; x.op=ThinOp::Cmp; x.dst=v3; x.src1=v1; x.src2=v2; x.meta.width=8; x.meta.cmp=2; b0.instrs.push_back(std::move(x)); } // Lt
+        { ThinInstr x; x.op=ThinOp::Cmp; x.dst=v4; x.src1=v2; x.src2=v1; x.meta.width=8; x.meta.cmp=2; b0.instrs.push_back(std::move(x)); } // Lt (swapped — NOT same)
+        b0.term.kind = TermKind::Return; b0.term.ret = v3;
+        tf.blocks.push_back(std::move(b0));
+        size_t cmp_before = count_op(tf, ThinOp::Cmp);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-COMM: gvn pass registered (Cmp-Lt)");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t cmp_after = count_op(tf, ThinOp::Cmp);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-COMM: ordered Cmp(Lt,v2,v1) NOT eliminated (before=%zu after=%zu)", cmp_before, cmp_after);
+        ck(cmp_after == cmp_before, msg);
+    }
+
+    // ─── GVN-META: metadata distinctions (width, signedness, cmp predicate) ───
+    // Expressions that differ ONLY in width/signedness/predicate must NOT be merged.
+    {
+        // Width: Add width=8 vs Add width=4 — NOT merged.
+        ThinFunction tf; tf.name = "gvn_meta_width";
+        const VReg v1=1, v2=2, v3=3, v4=4;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 10));
+        b0.instrs.push_back(ci(v2, 20));
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v3; x.src1=v1; x.src2=v2; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v4; x.src1=v1; x.src2=v2; x.meta.width=4; b0.instrs.push_back(std::move(x)); } // different width
+        b0.term.kind = TermKind::Return; b0.term.ret = v3;
+        tf.blocks.push_back(std::move(b0));
+        size_t before = count_op(tf, ThinOp::Add);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-META: gvn pass registered (width)");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::Add);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-META: different-width Adds NOT merged (before=%zu after=%zu)", before, after);
+        ck(after == before, msg);
+    }
+    {
+        // Signedness: Shr is_unsigned=0 vs is_unsigned=1 — NOT merged.
+        ThinFunction tf; tf.name = "gvn_meta_signed";
+        const VReg v1=1, v2=2, v3=3, v4=4;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, -1));
+        b0.instrs.push_back(ci(v2, 4));
+        { ThinInstr x; x.op=ThinOp::Shr; x.dst=v3; x.src1=v1; x.src2=v2; x.meta.width=8; x.meta.is_unsigned=0; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::Shr; x.dst=v4; x.src1=v1; x.src2=v2; x.meta.width=8; x.meta.is_unsigned=1; b0.instrs.push_back(std::move(x)); } // different signedness
+        b0.term.kind = TermKind::Return; b0.term.ret = v3;
+        tf.blocks.push_back(std::move(b0));
+        size_t before = count_op(tf, ThinOp::Shr);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-META: gvn pass registered (signedness)");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::Shr);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-META: different-signedness Shrs NOT merged (before=%zu after=%zu)", before, after);
+        ck(after == before, msg);
+    }
+    {
+        // Predicate: Cmp(Eq) vs Cmp(Lt) — NOT merged.
+        ThinFunction tf; tf.name = "gvn_meta_pred";
+        const VReg v1=1, v2=2, v3=3, v4=4;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 10));
+        b0.instrs.push_back(ci(v2, 20));
+        { ThinInstr x; x.op=ThinOp::Cmp; x.dst=v3; x.src1=v1; x.src2=v2; x.meta.width=8; x.meta.cmp=0; b0.instrs.push_back(std::move(x)); } // Eq
+        { ThinInstr x; x.op=ThinOp::Cmp; x.dst=v4; x.src1=v1; x.src2=v2; x.meta.width=8; x.meta.cmp=2; b0.instrs.push_back(std::move(x)); } // Lt (different predicate)
+        b0.term.kind = TermKind::Return; b0.term.ret = v3;
+        tf.blocks.push_back(std::move(b0));
+        size_t before = count_op(tf, ThinOp::Cmp);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-META: gvn pass registered (predicate)");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::Cmp);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-META: different-predicate Cmps NOT merged (before=%zu after=%zu)", before, after);
+        ck(after == before, msg);
+    }
+
+    // ─── GVN-LOAD: equivalent LoadFrame and LoadGlobal at fixed addresses ───
+    // Two LoadFrame of the same offset (no intervening store) — second eliminated.
+    // Two LoadGlobal of the same addend (no intervening store) — second eliminated.
+    {
+        // LoadFrame: two loads of slot -8, no intervening store.
+        ThinFunction tf; tf.name = "gvn_load_frame";
+        const VReg v1=1, v2=2;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v1; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v2; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // redundant
+        b0.term.kind = TermKind::Return; b0.term.ret = v1;
+        tf.blocks.push_back(std::move(b0));
+        size_t before = count_op(tf, ThinOp::LoadFrame);
+        ck(before == 2, "GVN-LOAD: two LoadFrame before gvn");
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-LOAD: gvn pass registered (LoadFrame)");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::LoadFrame);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-LOAD: redundant LoadFrame(-8) eliminated (before=%zu after=%zu)", before, after);
+        ck(after < before, msg);
+    }
+    {
+        // LoadGlobal: two loads of addend=16, no intervening store.
+        ThinFunction tf; tf.name = "gvn_load_global";
+        const VReg v1=1, v2=2;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr x; x.op=ThinOp::LoadGlobal; x.dst=v1; x.meta.addend=16; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::LoadGlobal; x.dst=v2; x.meta.addend=16; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // redundant
+        b0.term.kind = TermKind::Return; b0.term.ret = v1;
+        tf.blocks.push_back(std::move(b0));
+        size_t before = count_op(tf, ThinOp::LoadGlobal);
+        ck(before == 2, "GVN-LOAD: two LoadGlobal before gvn");
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-LOAD: gvn pass registered (LoadGlobal)");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::LoadGlobal);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-LOAD: redundant LoadGlobal(16) eliminated (before=%zu after=%zu)", before, after);
+        ck(after < before, msg);
+    }
+
+    // ─── GVN-INVAL: invalidation by intervening writes ───
+    // StoreFrame, StoreGlobal, StoreAddr, CopyBytes, and all call forms each
+    // invalidate the available load expression so a second load is NOT eliminated.
+    // Calls are memory-only barriers: pure arithmetic across a call IS still
+    // eliminated.
+    {
+        // StoreFrame between two LoadFrame of the same slot.
+        ThinFunction tf; tf.name = "gvn_inval_storeframe";
+        const VReg v1=1, v2=2, v3=3;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v1; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::StoreFrame; x.src1=v3; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // invalidates
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v2; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // NOT eliminated
+        b0.term.kind = TermKind::Return; b0.term.ret = v2;
+        tf.blocks.push_back(std::move(b0));
+        size_t before = count_op(tf, ThinOp::LoadFrame);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-INVAL: gvn pass registered (StoreFrame)");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::LoadFrame);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-INVAL: StoreFrame prevents LoadFrame merge (before=%zu after=%zu)", before, after);
+        ck(after == before, msg);
+    }
+    {
+        // StoreGlobal between two LoadGlobal of the same addend.
+        ThinFunction tf; tf.name = "gvn_inval_storeglobal";
+        const VReg v1=1, v2=2, v3=3;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr x; x.op=ThinOp::LoadGlobal; x.dst=v1; x.meta.addend=16; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::StoreGlobal; x.src1=v3; x.meta.addend=16; b0.instrs.push_back(std::move(x)); } // invalidates
+        { ThinInstr x; x.op=ThinOp::LoadGlobal; x.dst=v2; x.meta.addend=16; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // NOT eliminated
+        b0.term.kind = TermKind::Return; b0.term.ret = v2;
+        tf.blocks.push_back(std::move(b0));
+        size_t before = count_op(tf, ThinOp::LoadGlobal);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-INVAL: gvn pass registered (StoreGlobal)");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::LoadGlobal);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-INVAL: StoreGlobal prevents LoadGlobal merge (before=%zu after=%zu)", before, after);
+        ck(after == before, msg);
+    }
+    {
+        // StoreAddr (unknown write) between two LoadFrame — flushes all memory.
+        ThinFunction tf; tf.name = "gvn_inval_storeaddr";
+        const VReg v1=1, v2=2, v3=3, v4=4;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v1; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::StoreAddr; x.src1=v3; x.src2=v4; x.meta.frame_off=0; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // aliases unknown
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v2; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // NOT eliminated
+        b0.term.kind = TermKind::Return; b0.term.ret = v2;
+        tf.blocks.push_back(std::move(b0));
+        size_t before = count_op(tf, ThinOp::LoadFrame);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-INVAL: gvn pass registered (StoreAddr)");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::LoadFrame);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-INVAL: StoreAddr prevents LoadFrame merge (before=%zu after=%zu)", before, after);
+        ck(after == before, msg);
+    }
+    {
+        // CopyBytes (frame write) between two LoadFrame — flushes memory.
+        ThinFunction tf; tf.name = "gvn_inval_copybytes";
+        const VReg v1=1, v2=2;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v1; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::CopyBytes; x.dst=0; x.src1=0; x.meta.frame_off=-16; x.meta.field_off=-24; x.meta.len=8; b0.instrs.push_back(std::move(x)); } // frame write
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v2; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // NOT eliminated
+        b0.term.kind = TermKind::Return; b0.term.ret = v2;
+        tf.blocks.push_back(std::move(b0));
+        size_t before = count_op(tf, ThinOp::LoadFrame);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-INVAL: gvn pass registered (CopyBytes)");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::LoadFrame);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-INVAL: CopyBytes prevents LoadFrame merge (before=%zu after=%zu)", before, after);
+        ck(after == before, msg);
+    }
+    {
+        // CallNative between two LoadFrame — call is a memory barrier.
+        ThinFunction tf; tf.name = "gvn_inval_call_load";
+        const VReg v1=1, v2=2, v3=3;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v1; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::CallNative; x.dst=v3; x.args={}; x.meta.native_name="side"; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v2; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // NOT eliminated
+        b0.term.kind = TermKind::Return; b0.term.ret = v2;
+        tf.blocks.push_back(std::move(b0));
+        size_t before = count_op(tf, ThinOp::LoadFrame);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-INVAL: gvn pass registered (call-load)");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::LoadFrame);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-INVAL: call prevents LoadFrame merge (before=%zu after=%zu)", before, after);
+        ck(after == before, msg);
+    }
+    {
+        // CallNative between two Add — call is memory-only barrier, pure
+        // arithmetic across a call IS still eliminated.
+        ThinFunction tf; tf.name = "gvn_inval_call_arith";
+        const VReg v1=1, v2=2, v3=3, v4=4, v5=5;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 10));
+        b0.instrs.push_back(ci(v2, 20));
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v3; x.src1=v1; x.src2=v2; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::CallNative; x.dst=v5; x.args={}; x.meta.native_name="side"; b0.instrs.push_back(std::move(x)); } // memory barrier only
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v4; x.src1=v1; x.src2=v2; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // STILL eliminated (pure arith)
+        b0.term.kind = TermKind::Return; b0.term.ret = v3;
+        tf.blocks.push_back(std::move(b0));
+        size_t before = count_op(tf, ThinOp::Add);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-INVAL: gvn pass registered (call-arith)");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::Add);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-INVAL: pure Add across call IS eliminated (before=%zu after=%zu)", before, after);
+        ck(after < before, msg);
+    }
+
+    // ─── GVN-REDEF: conservative behavior around VReg redefinitions (non-SSA) ───
+    // Same-block: the representative is redefined AFTER the redundant instr →
+    // forwarding would be unsafe, so the redundant instr is NOT eliminated.
+    {
+        ThinFunction tf; tf.name = "gvn_redef_same_block";
+        const VReg v1=1, v2=2, v3=3, v4=4;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 10));
+        b0.instrs.push_back(ci(v2, 20));
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v3; x.src1=v1; x.src2=v2; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // representative
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v4; x.src1=v1; x.src2=v2; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // redundant
+        { ThinInstr x; x.op=ThinOp::Mul; x.dst=v3; x.src1=v1; x.src2=v2; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // REDEFINITION of v3
+        b0.term.kind = TermKind::Return; b0.term.ret = v4;
+        tf.blocks.push_back(std::move(b0));
+        size_t before = count_op(tf, ThinOp::Add);
+        ck(before == 2, "GVN-REDEF: two Add instrs before gvn");
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-REDEF: gvn pass registered");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::Add);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-REDEF: representative redefined -> no elimination (before=%zu after=%zu)", before, after);
+        ck(after == before, msg);
+    }
+    // Cross-block: the representative (v3 from dominating block0) is redefined
+    // in the dominated block before the redundant use → forwarding is unsafe.
+    {
+        ThinFunction tf; tf.name = "gvn_redef_cross_block";
+        const VReg v1=1, v2=2, v3=3, v4=4;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 10));
+        b0.instrs.push_back(ci(v2, 20));
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v3; x.src1=v1; x.src2=v2; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // representative in block0
+        b0.term.kind = TermKind::Jmp; b0.term.target = 1;
+        tf.blocks.push_back(std::move(b0));
+
+        ThinBlock b1; b1.id = 1;
+        { ThinInstr x; x.op=ThinOp::Mul; x.dst=v3; x.src1=v1; x.src2=v2; x.meta.width=8; b1.instrs.push_back(std::move(x)); } // REDEFINITION of v3
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v4; x.src1=v1; x.src2=v2; x.meta.width=8; b1.instrs.push_back(std::move(x)); } // redundant Add, but v3 redefined
+        b1.term.kind = TermKind::Return; b1.term.ret = v4;
+        tf.blocks.push_back(std::move(b1));
+
+        size_t before = count_op(tf, ThinOp::Add);
+        ck(before == 2, "GVN-REDEF-XB: two Add instrs before gvn");
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-REDEF-XB: gvn pass registered");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::Add);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-REDEF-XB: cross-block redefined representative -> no elimination (before=%zu after=%zu)", before, after);
+        ck(after == before, msg);
+        // The redundant Add in block1 (v4) should still be defined.
+        ck(vreg_is_defined(tf, v4), "GVN-REDEF-XB: redundant Add (v4) still defined (representative was redefined)");
+    }
+
+    // ─── GVN-PRES: Preserved::all() for no-op, Preserved::none() when transformed ───
+    {
+        // No-op: trivial function with no redundancy.
+        ThinFunction tf; tf.name = "gvn_noop";
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=1; x.imm.i=7; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        b0.term.kind = TermKind::Return; b0.term.ret = 1;
+        tf.blocks.push_back(std::move(b0));
+        size_t orig = total_instrs(tf);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-PRES: gvn pass registered (noop)");
+        EmberPreserved pres = EmberPreserved::all();
+        if (pc) { EmberAnalysisManager am; pres = pc->run(tf, am); }
+        ck(pres.all_preserved(), "GVN-PRES: no-op input returns Preserved::all()");
+        ck(total_instrs(tf) == orig, "GVN-PRES: no-op input unchanged");
+    }
+    {
+        // Transformed: redundant Add eliminated → Preserved::none().
+        ThinFunction tf; tf.name = "gvn_transformed";
+        const VReg v1=1, v2=2, v3=3, v4=4;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 10));
+        b0.instrs.push_back(ci(v2, 20));
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v3; x.src1=v1; x.src2=v2; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v4; x.src1=v1; x.src2=v2; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // redundant
+        b0.term.kind = TermKind::Return; b0.term.ret = v3;
+        tf.blocks.push_back(std::move(b0));
+        size_t orig = total_instrs(tf);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-PRES: gvn pass registered (transformed)");
+        EmberPreserved pres = EmberPreserved::all();
+        if (pc) { EmberAnalysisManager am; pres = pc->run(tf, am); }
+        ck(!pres.all_preserved(), "GVN-PRES: transformed input returns Preserved::none()");
+        ck(total_instrs(tf) < orig, "GVN-PRES: transformed input instr count decreased");
+    }
+
+    // ─── GVN-RUN: emitted/runtime workload — value-preserving + redundant count decreases ───
+    // A source with a redundant computation (i*7 computed twice in the loop
+    // body). GVN must be value-preserving (same return with/without the pass)
+    // and must reduce the redundant Mul count.
+    {
+        static const char* SRC_GVN_REDUNDANT =
+            "fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; "
+            "while (i < 100) { let a: i64 = i * 7; let b: i64 = i * 7; "
+            "s = s + a + b; i = i + 1; } return s; }\n";
+
+        // (a) Structural: lower the function, count Mul, run gvn, count Mul.
+        // We lower manually (mirroring compile_with's internal path) so we can
+        // inspect the ThinFunction before and after the pass.
+        auto lower_main = [&](ThinFunction& thf) -> bool {
+            auto lr = tokenize(SRC_GVN_REDUNDANT, "<gvn_run>");
+            if (!lr.ok) return false;
+            auto pr = parse(std::move(lr.toks));
+            if (!pr.ok) return false;
+            Program prog = std::move(pr.program);
+            std::unordered_map<std::string, int> slots;
+            int si = 0;
+            for (auto& fn : prog.funcs) { slots[fn.name] = si++; fn.slot = si - 1; }
+            std::unordered_map<std::string, NativeSig> natives;
+            OpOverloadTable overloads;
+            StructLayoutTable layouts = build_struct_layouts(prog);
+            prog.string_xor_key = 0;
+            auto sr = sema(prog, natives, slots, 0, &overloads, &layouts);
+            if (!sr.ok) return false;
+            GlobalsBlock gb; gb.base = 0;
+            g_globals_for_codegen = &gb;
+            CodeGenCtx ctx;
+            ctx.globals_base = 0;
+            ctx.natives = &natives;
+            ctx.script_slots = &slots;
+            ctx.structs = &layouts;
+            ctx.use_context_reg = true;
+            ctx.enable_ir_backend = false;
+            for (auto& fn : prog.funcs) {
+                if (fn.name == "main") {
+                    thf = lower_function(fn, ctx);
+                    return !thf.blocks.empty();
+                }
+            }
+            return false;
+        };
+
+        ThinFunction thf;
+        bool lowered = lower_main(thf);
+        ck(lowered, "GVN-RUN: workload lowered to ThinFunction");
+        if (lowered) {
+            size_t mul_before = count_op(thf, ThinOp::Mul);
+            // There should be at least two Mul(i*7) in the loop body.
+            ck(mul_before >= 2, "GVN-RUN: workload has >=2 Mul instrs before gvn");
+            auto pc = reg.create("gvn");
+            ck(pc != nullptr, "GVN-RUN: gvn pass registered");
+            if (pc) { EmberAnalysisManager am; pc->run(thf, am); }
+            size_t mul_after = count_op(thf, ThinOp::Mul);
+            char msg[160];
+            std::snprintf(msg, sizeof msg, "GVN-RUN: redundant Mul count decreased (before=%zu after=%zu)", mul_before, mul_after);
+            ck(mul_after < mul_before, msg);
+        }
+
+        // (b) Runtime value-preservation: compile with and without gvn, call,
+        // and assert the same i64 return value. This only runs when gvn is
+        // registered (GREEN phase); in RED the pass concept is null and the
+        // pass manager is left empty so no pass runs.
+        auto mb = compile_with(SRC_GVN_REDUNDANT, nullptr);
+        ck(mb != nullptr, "GVN-RUN: baseline compiles");
+        int64_t rb = mb ? call0_i64(*mb, "main") : -1;
+
+        EmberPassManager pm;
+        auto pc2 = reg.create("gvn");
+        ck(pc2 != nullptr, "GVN-RUN: gvn pass registered (runtime)");
+        if (pc2) pm.add_pass_concept(std::move(pc2));
+        // Only run the pass manager if it actually has the gvn pass; otherwise
+        // compile without a pass (trivially value-preserving, no RED failure
+        // here — the RED failure is the registered + count-decreased checks).
+        auto mp = compile_with(SRC_GVN_REDUNDANT, pm.empty() ? nullptr : &pm);
+        ck(mp != nullptr, "GVN-RUN: pass compile ok");
+        if (mp) {
+            int64_t rp = call0_i64(*mp, "main");
+            char msg[160];
+            std::snprintf(msg, sizeof msg, "GVN-RUN: value-preserving (baseline=%lld pass=%lld)",
+                          (long long)rb, (long long)rp);
+            ck(rb == rp, msg);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // GVN safety regressions — the conservative fixes that keep non-SSA
+    // cross-block forwarding and memory invalidation sound.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ─── GVN-REG1: StoreFrame invalidation is byte-range aware, not exact-offset ───
+    // A StoreFrame whose byte span overlaps the LoadFrame's 8-byte frame cell
+    // (even at a different but overlapping offset) must invalidate the load.
+    // Here a LoadFrame(-8) is followed by a narrow StoreFrame(-12,width=4) —
+    // the store spans [-12,-8), which abuts the [-8,0) cell. To exercise the
+    // overlap path decisively, use StoreFrame(-8,width=4) which writes into the
+    // [-8,0) cell, then a second LoadFrame(-8) that must NOT be eliminated.
+    {
+        ThinFunction tf; tf.name = "gvn_reg1_overlap_storeframe";
+        const VReg v1=1, v2=2, v3=3;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v1; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        // A narrow (width=4) store INTO the [-8,0) cell — overlaps the load cell.
+        { ThinInstr x; x.op=ThinOp::StoreFrame; x.src1=v3; x.meta.frame_off=-8; x.meta.width=4; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v2; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // NOT eliminated
+        b0.term.kind = TermKind::Return; b0.term.ret = v2;
+        tf.blocks.push_back(std::move(b0));
+        size_t before = count_op(tf, ThinOp::LoadFrame);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-REG1: gvn pass registered");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::LoadFrame);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-REG1: overlapping narrow StoreFrame prevents LoadFrame merge (before=%zu after=%zu)", before, after);
+        ck(after == before, msg);
+    }
+    // A StoreFrame to a NON-overlapping offset must NOT kill an unrelated load.
+    // LoadFrame(-8), StoreFrame(-24,width=8) spans [-24,-16) — no overlap with
+    // [-8,0). A second LoadFrame(-8) IS eliminated (the store did not alias).
+    {
+        ThinFunction tf; tf.name = "gvn_reg1_nonoverlap_storeframe";
+        const VReg v1=1, v2=2, v3=3;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v1; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::StoreFrame; x.src1=v3; x.meta.frame_off=-24; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // no overlap
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v2; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // eliminated
+        b0.term.kind = TermKind::Return; b0.term.ret = v2;
+        tf.blocks.push_back(std::move(b0));
+        size_t before = count_op(tf, ThinOp::LoadFrame);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-REG1b: gvn pass registered");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::LoadFrame);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-REG1b: non-overlapping StoreFrame allows LoadFrame merge (before=%zu after=%zu)", before, after);
+        ck(after < before, msg);
+    }
+
+    // ─── GVN-REG2: computed StoreFrame (src2 != 0) flushes all memory ───
+    // A computed store [src2 + frame_off] aliases unknown memory, so it must
+    // invalidate EVERY available load (not just an exact offset). Two
+    // LoadFrame(-8) with a computed StoreFrame between them must NOT merge.
+    {
+        ThinFunction tf; tf.name = "gvn_reg2_computed_storeframe";
+        const VReg v1=1, v2=2, v3=3, v4=4;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v1; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        // Computed store: src2 != 0 -> indirect/unknown-address write.
+        { ThinInstr x; x.op=ThinOp::StoreFrame; x.src1=v3; x.src2=v4; x.meta.frame_off=0; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v2; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); } // NOT eliminated
+        b0.term.kind = TermKind::Return; b0.term.ret = v2;
+        tf.blocks.push_back(std::move(b0));
+        size_t before = count_op(tf, ThinOp::LoadFrame);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-REG2: gvn pass registered");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::LoadFrame);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-REG2: computed StoreFrame (src2!=0) prevents LoadFrame merge (before=%zu after=%zu)", before, after);
+        ck(after == before, msg);
+    }
+
+    // ─── GVN-REG3: implicit producer frame-home write invalidates an overlapping load ───
+    // A pure producer (Add) whose result is pinned to meta.frame_off writes that
+    // spill cell. A LoadFrame of the same cell before the producer is stale once
+    // the producer writes it, so a second LoadFrame after the producer must NOT
+    // be CSE'd with the first (the producer's implicit write invalidated it).
+    {
+        ThinFunction tf; tf.name = "gvn_reg3_implicit_producer_write";
+        const VReg v1=1, v2=2, v3=3, v5=5, v6=6;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v5, 1));
+        b0.instrs.push_back(ci(v6, 2));
+        // First load of slot -8.
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v1; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        // A producer pinned to the SAME cell -8 (implicit frame-home write).
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v3; x.src1=v5; x.src2=v6; x.meta.width=8; x.meta.frame_off=-8; b0.instrs.push_back(std::move(x)); }
+        // Second load of slot -8 — the producer overwrote it, so NOT eliminated.
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v2; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        b0.term.kind = TermKind::Return; b0.term.ret = v2;
+        tf.blocks.push_back(std::move(b0));
+        size_t before = count_op(tf, ThinOp::LoadFrame);
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-REG3: gvn pass registered");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::LoadFrame);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-REG3: implicit producer write prevents LoadFrame merge (before=%zu after=%zu)", before, after);
+        ck(after == before, msg);
+    }
+
+    // ─── GVN-REG4: an explicitly read spill home is never erased ───
+    // Two equivalent Adds both pinned to a spill home (-8) that IS explicitly
+    // read (a later LoadFrame -8). The redundant Add's spill home is observable,
+    // so it must NOT be erased (erasing could remove a restoring write). Both
+    // Adds survive.
+    {
+        ThinFunction tf; tf.name = "gvn_reg4_read_home_not_erased";
+        const VReg v1=1, v2=2, v3=3, v4=4, v5=5;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 10));
+        b0.instrs.push_back(ci(v2, 20));
+        // First Add pinned to read slot -8.
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v3; x.src1=v1; x.src2=v2; x.meta.width=8; x.meta.frame_off=-8; b0.instrs.push_back(std::move(x)); }
+        // Redundant Add ALSO pinned to read slot -8.
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v4; x.src1=v1; x.src2=v2; x.meta.width=8; x.meta.frame_off=-8; b0.instrs.push_back(std::move(x)); }
+        // An explicit reader of slot -8 makes the spill home observable.
+        { ThinInstr x; x.op=ThinOp::LoadFrame; x.dst=v5; x.meta.frame_off=-8; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        b0.term.kind = TermKind::Return; b0.term.ret = v5;
+        tf.blocks.push_back(std::move(b0));
+        size_t before = count_op(tf, ThinOp::Add);
+        ck(before == 2, "GVN-REG4: two Add instrs before gvn");
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-REG4: gvn pass registered");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::Add);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-REG4: read-spill-home redundant Add NOT erased (before=%zu after=%zu)", before, after);
+        ck(after == before, msg);
+        ck(vreg_is_defined(tf, v4), "GVN-REG4: redundant Add (v4) still defined (read spill home preserved)");
+    }
+
+    // ─── GVN-REG5: cross-block forwarding refused for a non-dominated use ───
+    // block0 (dominates block1): v3 = Add v1,v2.
+    // block1 (dominated by block0): v4 = Add v1,v2 (redundant), Jmp -> block2.
+    // block2 (dominated by block1): uses v4 in an Add. Because v4 is used in a
+    // block OTHER than block1 (where it is defined), forwarding only block1's
+    // uses would leave block2's non-dominated non-SSA use pointing at v3 —
+    // unsafe. GVN must retain the redundant v4.
+    {
+        ThinFunction tf; tf.name = "gvn_reg5_nondom_use";
+        const VReg v1=1, v2=2, v3=3, v4=4, v5=5;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 10));
+        b0.instrs.push_back(ci(v2, 20));
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v3; x.src1=v1; x.src2=v2; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        b0.term.kind = TermKind::Jmp; b0.term.target = 1;
+        tf.blocks.push_back(std::move(b0));
+
+        ThinBlock b1; b1.id = 1;
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v4; x.src1=v1; x.src2=v2; x.meta.width=8; b1.instrs.push_back(std::move(x)); } // redundant, but used in block2
+        b1.term.kind = TermKind::Jmp; b1.term.target = 2;
+        tf.blocks.push_back(std::move(b1));
+
+        ThinBlock b2; b2.id = 2;
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v5; x.src1=v4; x.src2=v3; x.meta.width=8; b2.instrs.push_back(std::move(x)); } // uses v4
+        b2.term.kind = TermKind::Return; b2.term.ret = v5;
+        tf.blocks.push_back(std::move(b2));
+
+        size_t before = count_op(tf, ThinOp::Add);
+        ck(before == 3, "GVN-REG5: three Add instrs before gvn");
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-REG5: gvn pass registered");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::Add);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-REG5: redundant Add with non-dominated use NOT eliminated (before=%zu after=%zu)", before, after);
+        ck(after == before, msg);
+        ck(vreg_is_defined(tf, v4), "GVN-REG5: redundant Add (v4) still defined (used in another block)");
+    }
+
+    // ─── GVN-REG6: a destination used BEFORE its redundant definition is not rewritten ───
+    // Non-SSA hole: a VReg may be a live-in/use before its sole later (redundant)
+    // definition. The earlier use sees the live-in value, NOT the redundant
+    // computation's value, so it must NOT be rewritten to the representative.
+    //   block0 (dominates block1):
+    //     v1 = const 10; v2 = const 20; v3 = Add v1,v2; v4 = const 99; Jmp -> b1
+    //   block1 (dominated by block0):
+    //     v5 = Add v4, v1     // use of v4 BEFORE its redundant def — sees v4=99
+    //     v4 = Add v1, v2     // redundant (== v3) — eliminated, uses forwarded
+    //     v6 = Add v4, v3     // use of v4 AFTER redundant def — forwarded to v3
+    //     Return v6
+    // After GVN: the redundant v4=Add is removed; v5 STILL uses v4 (the live-in
+    // 99, not v3=30); v6 uses v3. If GVN wrongly rewrote the pre-definition use
+    // (v5.src1 v4 -> v3) the semantics would change (v5 would compute 30+10
+    // instead of 99+10).
+    {
+        ThinFunction tf; tf.name = "gvn_reg6_use_before_def";
+        const VReg v1=1, v2=2, v3=3, v4=4, v5=5, v6=6;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(v1, 10));
+        b0.instrs.push_back(ci(v2, 20));
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v3; x.src1=v1; x.src2=v2; x.meta.width=8; b0.instrs.push_back(std::move(x)); }
+        b0.instrs.push_back(ci(v4, 99));  // live-in value for block1's pre-def use
+        b0.term.kind = TermKind::Jmp; b0.term.target = 1;
+        tf.blocks.push_back(std::move(b0));
+
+        ThinBlock b1; b1.id = 1;
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v5; x.src1=v4; x.src2=v1; x.meta.width=8; b1.instrs.push_back(std::move(x)); } // use v4 BEFORE def
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v4; x.src1=v1; x.src2=v2; x.meta.width=8; b1.instrs.push_back(std::move(x)); } // redundant, eliminated
+        { ThinInstr x; x.op=ThinOp::Add; x.dst=v6; x.src1=v4; x.src2=v3; x.meta.width=8; b1.instrs.push_back(std::move(x)); } // use v4 AFTER def -> forwarded
+        b1.term.kind = TermKind::Return; b1.term.ret = v6;
+        tf.blocks.push_back(std::move(b1));
+
+        size_t before = count_op(tf, ThinOp::Add);
+        ck(before == 4, "GVN-REG6: four Add instrs before gvn");
+        auto pc = reg.create("gvn");
+        ck(pc != nullptr, "GVN-REG6: gvn pass registered");
+        if (pc) { EmberAnalysisManager am; pc->run(tf, am); }
+        size_t after = count_op(tf, ThinOp::Add);
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "GVN-REG6: redundant Add eliminated (before=%zu after=%zu)", before, after);
+        ck(after < before, msg);
+        // The pre-definition use of v4 (in v5) must survive — it sees the live-in
+        // value (99), not the representative v3 (30). A buggy forward_all_uses
+        // that rewrote every use would turn v5.src1 into v3.
+        const ThinInstr* v5_def = find_def(tf, v5);
+        ck(v5_def != nullptr, "GVN-REG6: v5 still defined");
+        if (v5_def) {
+            ck(v5_def->src1 == v4, "GVN-REG6: pre-definition use of v4 preserved (v5.src1 == v4, not v3)");
+            ck(v5_def->src1 != v3, "GVN-REG6: pre-definition use NOT rewritten to representative v3");
+        }
+        // The post-definition use (in v6) IS forwarded to v3.
+        const ThinInstr* v6_def = find_def(tf, v6);
+        ck(v6_def != nullptr, "GVN-REG6: v6 still defined");
+        if (v6_def) {
+            ck(v6_def->src1 == v3, "GVN-REG6: post-definition use forwarded to v3 (v6.src1 == v3)");
+        }
     }
 
     std::printf("\n%s\n", g_fail ? "FAIL" : "PASS");

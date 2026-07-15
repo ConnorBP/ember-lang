@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -1000,6 +1001,590 @@ EmberPreserved CSEPass::run(ThinFunction& f, EmberAnalysisManager&) {
             changed = true;
         }
     }
+
+    return changed ? EmberPreserved::none() : EmberPreserved::all();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GVNPass: global value numbering — CSE extended across blocks via dominance
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// GVN extends CSE's block-local value numbering ACROSS blocks using the
+// dominator tree. An expression computed in a dominating block is available at
+// a dominated use, so a redundant recomputation in the dominated block is
+// eliminated and its uses forwarded to the dominating definition's VReg.
+//
+// The value-number key shape (op + value-numbered operands + full metadata:
+// width, signedness, cmp predicate, is_f32, frame/global addrs, etc.) and the
+// memory-invalidation model mirror CSE, but availability is scoped by the
+// dominator tree instead of reset per block. The pass walks the dominator tree
+// in DFS preorder with a shared expression table that is checkpointed on entry
+// to each block and restored on exit, so a block sees exactly the expressions
+// from its dominators (the ancestor path) — nothing from siblings. This makes
+// "available" synonymous with "dominates the use" without a separate query.
+//
+// Thin IR is explicitly NON-SSA, so cross-block forwarding is conservative:
+//   - a VReg redefinition (in a dominating block after the first computation,
+//     or in the current block before the redundant use) removes the available
+//     expression, so a stale representative is never forwarded;
+//   - uses are only ever rewritten within the redundant instruction's own
+//     block (instructions after it + the terminator); a VReg used in any other
+//     block is left untouched (its meaning may differ along non-dominated
+//     paths), so no non-dominated non-SSA use is ever rewritten;
+//   - the representative and the eliminated destination must not be redefined
+//     between the redundant instruction and a forwarded use (the intra-block
+//     scan stops at either redefinition, and the terminator is forwarded only
+//     when neither is redefined before it);
+//   - a join with no dominating producer simply has no available entry, so its
+//     recomputation is retained (ambiguous reaching definitions are rejected
+//     by construction — only dominator-scoped entries are visible).
+//
+// Memory invalidation is byte-range aware (stronger than CSE's exact-offset
+// check): a StoreFrame to an exact local slot invalidates LoadFrame entries
+// whose 8-byte frame cell overlaps the store's byte span; a StoreGlobal
+// invalidates the matching LoadGlobal; and computed stores (StoreFrame src2!=0),
+// calls, StoreAddr, CopyBytes, aggregate/string initialization, try/catch/throw,
+// and implicit producer frame-home writes (a producer pins its result to
+// meta.frame_off) flush aliasing memory conservatively. A loop-carried clobber
+// cannot make a preheader load appear permanently available because the
+// clobbering write removes the entry within the loop body's scope, and the
+// scope is restored on exit so the preheader's (unclobbered) view is reused on
+// the next iteration's dom-tree walk.
+//
+// An explicitly read spill home (meta.frame_off in the read-slot set) is never
+// erased: dropping a redundant producer whose spill home is read could remove
+// an observable restoring write (the representative may have written the same
+// slot, but if the slot was clobbered between the two computations the second
+// write is the one the later read observes). Side-effecting instructions
+// (calls, stores, guards, BoundsCheck, DivOverflowCheck, etc.) are never
+// coalesced. Trapping arithmetic (Div/Mod/FMod) IS eliminated when the first
+// occurrence dominates the redundant one: if the first traps, the redundant
+// instruction is unreachable; if it does not, the values are identical.
+EmberPreserved GVNPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    bool changed = false;
+    const size_t num_blocks = f.blocks.size();
+    if (num_blocks == 0) return EmberPreserved::all();
+
+    // Build a block-id → index map (block ids may not be sequential).
+    std::unordered_map<uint32_t, size_t> id_to_idx;
+    for (size_t i = 0; i < num_blocks; ++i)
+        id_to_idx[f.blocks[i].id] = i;
+
+    // Build predecessor/successor maps (invalid targets ignored — the
+    // validator diagnoses them; an optimization pass must not index past the
+    // block vector on malformed hand-built IR).
+    std::vector<std::vector<uint32_t>> preds(num_blocks), succs(num_blocks);
+    for (size_t i = 0; i < num_blocks; ++i) {
+        const auto& blk = f.blocks[i];
+        auto add_edge = [&](uint32_t target) {
+            auto found = id_to_idx.find(target);
+            if (found == id_to_idx.end()) return;
+            const uint32_t target_idx = static_cast<uint32_t>(found->second);
+            succs[i].push_back(target_idx);
+            preds[target_idx].push_back(static_cast<uint32_t>(i));
+        };
+        if (blk.term.kind == TermKind::Jmp) {
+            add_edge(blk.term.target);
+        } else if (blk.term.kind == TermKind::Branch) {
+            add_edge(blk.term.target);
+            add_edge(blk.term.false_target);
+        }
+    }
+
+    // Entry reachability (blocks[0] is entry) and dominators, mirroring LICM.
+    std::vector<uint8_t> reachable(num_blocks, 0);
+    std::vector<uint32_t> work{0};
+    reachable[0] = 1;
+    while (!work.empty()) {
+        const uint32_t block = work.back();
+        work.pop_back();
+        for (uint32_t succ : succs[block]) {
+            if (!reachable[succ]) {
+                reachable[succ] = 1;
+                work.push_back(succ);
+            }
+        }
+    }
+
+    std::vector<std::vector<uint8_t>> dominates(
+        num_blocks, std::vector<uint8_t>(num_blocks, 0));
+    for (size_t block = 0; block < num_blocks; ++block) {
+        if (!reachable[block]) continue;
+        if (block == 0) {
+            dominates[block][0] = 1;
+        } else {
+            for (size_t candidate = 0; candidate < num_blocks; ++candidate)
+                dominates[block][candidate] = reachable[candidate];
+        }
+    }
+    bool dom_changed = true;
+    while (dom_changed) {
+        dom_changed = false;
+        for (size_t block = 1; block < num_blocks; ++block) {
+            if (!reachable[block]) continue;
+            std::vector<uint8_t> next(num_blocks, 1);
+            bool have_pred = false;
+            for (uint32_t pred : preds[block]) {
+                if (!reachable[pred]) continue;
+                if (!have_pred) {
+                    next = dominates[pred];
+                    have_pred = true;
+                } else {
+                    for (size_t candidate = 0; candidate < num_blocks; ++candidate)
+                        next[candidate] &= dominates[pred][candidate];
+                }
+            }
+            if (!have_pred) std::fill(next.begin(), next.end(), uint8_t{0});
+            next[block] = 1;
+            if (next != dominates[block]) {
+                dominates[block] = std::move(next);
+                dom_changed = true;
+            }
+        }
+    }
+
+    // Immediate dominators → dominator-tree children. dominates[x][y] == 1
+    // means y dominates x (y is a dominator of x) — the LICM convention. The
+    // immediate dominator of b is the unique dominator d != b that is dominated
+    // by every other dominator of b (the one closest to b).
+    std::vector<std::vector<uint32_t>> dom_children(num_blocks);
+    for (size_t b = 0; b < num_blocks; ++b) {
+        if (!reachable[b] || b == 0) continue;
+        uint32_t idom = UINT32_MAX;
+        for (size_t d = 0; d < num_blocks; ++d) {
+            if (d == b || !dominates[b][d]) continue;  // d dominates b
+            // idom should be the dominator closest to b: if the current idom
+            // dominates d, then d is closer to b, so prefer d.
+            if (idom == UINT32_MAX || dominates[d][idom]) idom = static_cast<uint32_t>(d);
+        }
+        if (idom != UINT32_MAX) dom_children[idom].push_back(static_cast<uint32_t>(b));
+    }
+
+    const auto read_slots = compute_read_slots(f);
+
+    // ─── Value-numbering state ───
+    // The expression key mirrors CSE's GVNKey: op + value-numbered operands
+    // (lhs/rhs) + every metadata field that affects the computed value
+    // (width, signedness, cmp predicate, is_f32, frame/global addrs, len,
+    // slot, mod_id, field_off, data_temp_off, base_kind, trap_reason, addend,
+    // type). frame_off is masked out for ordinary value producers whose spill
+    // home is not an explicit reader (it is only the destination home, not part
+    // of the value); load/address offsets are retained.
+    struct GVNKey {
+        uint16_t op;
+        uint64_t lhs, rhs;
+        int64_t imm_i;
+        uint64_t imm_f_bits;
+        int32_t width, frame_off, len, slot, mod_id, field_off, data_temp_off;
+        uint8_t cmp, base_kind, is_unsigned, is_f32, trap_reason;
+        uint32_t addend;
+        const Type* type;
+        bool operator==(const GVNKey& o) const {
+            return op == o.op && lhs == o.lhs && rhs == o.rhs &&
+                   imm_i == o.imm_i && imm_f_bits == o.imm_f_bits &&
+                   width == o.width && frame_off == o.frame_off &&
+                   len == o.len && slot == o.slot && mod_id == o.mod_id &&
+                   field_off == o.field_off && data_temp_off == o.data_temp_off &&
+                   cmp == o.cmp && base_kind == o.base_kind &&
+                   is_unsigned == o.is_unsigned && is_f32 == o.is_f32 &&
+                   trap_reason == o.trap_reason && addend == o.addend &&
+                   type == o.type;
+        }
+    };
+    struct GVNKeyHash {
+        size_t operator()(const GVNKey& k) const {
+            size_t h = k.op;
+            auto mix = [&h](size_t value) {
+                h ^= value + 0x9e3779b9u + (h << 6) + (h >> 2);
+            };
+            mix(std::hash<uint64_t>()(k.lhs));
+            mix(std::hash<uint64_t>()(k.rhs));
+            mix(std::hash<int64_t>()(k.imm_i));
+            mix(std::hash<uint64_t>()(k.imm_f_bits));
+            mix(uint32_t(k.width)); mix(uint32_t(k.frame_off)); mix(uint32_t(k.len));
+            mix(uint32_t(k.slot)); mix(uint32_t(k.mod_id)); mix(uint32_t(k.field_off));
+            mix(uint32_t(k.data_temp_off)); mix(k.cmp); mix(k.base_kind);
+            mix(k.is_unsigned); mix(k.is_f32); mix(k.trap_reason); mix(k.addend);
+            mix(std::hash<const Type*>()(k.type));
+            return h;
+        }
+    };
+    struct Available { uint64_t value_number; VReg representative; size_t block_idx; };
+
+    // vreg_number / expressions / representative are scoped per dominator-tree
+    // block (checkpointed on entry, restored on exit) so a block sees exactly
+    // its dominators' expressions. livein_number is global: a function live-in
+    // (a VReg used before any dominating definition) gets one stable number
+    // everywhere, and it is never scoped out. next_number is a global counter
+    // (uniqueness is all that is required; spent numbers are not reused).
+    std::unordered_map<VReg, uint64_t> vreg_number;
+    std::unordered_map<GVNKey, Available, GVNKeyHash> expressions;
+    std::unordered_map<uint64_t, VReg> representative;
+    std::unordered_map<VReg, uint64_t> livein_number;
+    uint64_t next_number = 1;
+
+    auto number_of = [&](VReg v) -> uint64_t {
+        if (v == 0) return 0;
+        auto found = vreg_number.find(v);
+        if (found != vreg_number.end()) return found->second;
+        auto lf = livein_number.find(v);
+        if (lf != livein_number.end()) return lf->second;
+        const uint64_t number = next_number++;
+        livein_number[v] = number;
+        representative[number] = v;
+        return number;
+    };
+
+    // Does a byte span [wbegin, wbegin+wspan) overlap the 8-byte frame cell at
+    // `off`? Mirrors instr_writes_off's `overlaps` (the backend treats each
+    // scalar slot as a full eight-byte cell, so a partial/packed write still
+    // invalidates the cell).
+    auto frame_cell_overlaps = [](int32_t off, int32_t wbegin, int32_t wspan) -> bool {
+        return wspan > 0 && wbegin < off + 8 && off < wbegin + wspan;
+    };
+
+    // Invalidate available MEMORY expressions (LoadFrame/LoadGlobal) for a
+    // memory-writing instruction. Pure arithmetic expressions are NEVER
+    // invalidated by a memory write — a call is a memory-only barrier, so a
+    // pure Add across a call is still equivalent and is eliminated.
+    //   - An unknown/aliasing writer (is_frame_alias_barrier: computed StoreFrame
+    //     src2!=0, CopyBytes, calls, StoreAddr, aggregate init, try/catch/throw)
+    //     flushes ALL memory expressions (frame + global).
+    //   - StringDecrypt writes a temp buffer + slice slot through rodata-base
+    //     relocation; treat it as a full memory barrier (matches CSE).
+    //   - An exact StoreFrame invalidates overlapping LoadFrame entries.
+    //   - A StoreGlobal invalidates the matching LoadGlobal.
+    //   - An implicit producer frame-home write (a producer dst with
+    //     meta.frame_off, excluding a direct LoadFrame which only reads) is a
+    //     write to its own spill cell, so it invalidates an overlapping
+    //     LoadFrame of that cell — the producer's result is a new value for the
+    //     slot, so a prior load of the same cell is stale.
+    auto invalidate_memory = [&](const ThinInstr& in) {
+        auto flush_all_memory = [&]() {
+            for (auto it = expressions.begin(); it != expressions.end(); ) {
+                if (it->first.op == static_cast<uint16_t>(ThinOp::LoadFrame) ||
+                    it->first.op == static_cast<uint16_t>(ThinOp::LoadGlobal))
+                    it = expressions.erase(it);
+                else ++it;
+            }
+        };
+        if (is_frame_alias_barrier(in) || in.op == ThinOp::StringDecrypt) {
+            flush_all_memory();
+            return;
+        }
+        if (in.op == ThinOp::StoreFrame) {
+            const int32_t wspan = std::max(in.meta.width, 1);
+            for (auto it = expressions.begin(); it != expressions.end(); ) {
+                if (it->first.op == static_cast<uint16_t>(ThinOp::LoadFrame) &&
+                    frame_cell_overlaps(it->first.frame_off, in.meta.frame_off, wspan))
+                    it = expressions.erase(it);
+                else ++it;
+            }
+            return;
+        }
+        if (in.op == ThinOp::StoreGlobal) {
+            for (auto it = expressions.begin(); it != expressions.end(); ) {
+                if (it->first.op == static_cast<uint16_t>(ThinOp::LoadGlobal) &&
+                    it->first.addend == in.meta.addend)
+                    it = expressions.erase(it);
+                else ++it;
+            }
+            // Fall through: a producer with a frame_off below may also write.
+        }
+        // Implicit producer frame-home write: a producer (dst != 0) with a
+        // meta.frame_off that is not a direct LoadFrame write its result spill
+        // cell. Invalidate an overlapping LoadFrame of that cell.
+        if (in.dst != 0 && in.meta.frame_off != 0 &&
+            (in.op != ThinOp::LoadFrame || in.src1 != 0)) {
+            const int32_t wspan = std::max(in.meta.width, 1);
+            for (auto it = expressions.begin(); it != expressions.end(); ) {
+                if (it->first.op == static_cast<uint16_t>(ThinOp::LoadFrame) &&
+                    frame_cell_overlaps(it->first.frame_off, in.meta.frame_off, wspan))
+                    it = expressions.erase(it);
+                else ++it;
+            }
+        }
+    };
+
+    // Is `op` a value-numberable expression for GVN? Pure value producers,
+    // the trapping-but-dominance-safe arithmetic (Div/Mod/FMod), and the fixed-
+    // address memory loads (direct LoadFrame src1==0, LoadGlobal). Computed
+    // loads (LoadFrame src1!=0) read through an unknown pointer and are not
+    // CSE'd; side-effecting ops (calls, stores, guards, addresses, aggregates)
+    // are never coalesced.
+    auto is_gvn_expr_op = [](ThinOp op, VReg src1) -> bool {
+        switch (op) {
+        case ThinOp::ConstInt: case ThinOp::ConstFloat: case ThinOp::ConstBool:
+        case ThinOp::Move:
+        case ThinOp::Add: case ThinOp::Sub: case ThinOp::Mul:
+        case ThinOp::Div: case ThinOp::Mod:
+        case ThinOp::And: case ThinOp::Or: case ThinOp::Xor:
+        case ThinOp::Shl: case ThinOp::Shr:
+        case ThinOp::Neg: case ThinOp::Not: case ThinOp::BitNot:
+        case ThinOp::FAdd: case ThinOp::FSub: case ThinOp::FMul:
+        case ThinOp::FDiv: case ThinOp::FMod:
+        case ThinOp::Cmp: case ThinOp::LAnd: case ThinOp::LOr:
+        case ThinOp::Cast:
+            return true;
+        case ThinOp::LoadFrame:
+            return src1 == 0;  // direct rbp-relative load only
+        case ThinOp::LoadGlobal:
+            return true;
+        default:
+            return false;
+        }
+    };
+
+    auto is_commutative = [](ThinOp op) -> bool {
+        switch (op) {
+        case ThinOp::Add: case ThinOp::Mul:
+        case ThinOp::And: case ThinOp::Or: case ThinOp::Xor:
+        case ThinOp::FAdd: case ThinOp::FMul:
+            return true;
+        default:
+            return false;
+        }
+    };
+
+    // Erasing this instruction would remove an observable frame-home write when
+    // its result is pinned to a spill home that is an explicit reader. Decline
+    // in that case — the representative may have written the same slot, but a
+    // clobber between the two computations makes the redundant write the one a
+    // later read observes (a restoring write). A direct LoadFrame (src1==0)
+    // only READS frame_off, so erasing it removes no frame write.
+    auto erasing_removes_observable_home = [&](const ThinInstr& in) -> bool {
+        if (in.dst == 0 || in.meta.frame_off == 0) return false;
+        if (in.op == ThinOp::LoadFrame && in.src1 == 0) return false;
+        return read_slots.count(in.meta.frame_off) != 0;
+    };
+
+    // Forward uses of old_vreg to new_vreg within blk.instrs[from..end],
+    // stopping before either name is redefined (non-SSA: a redefinition changes
+    // the name's meaning). Mirrors CSE's replace_uses.
+    auto replace_uses = [](std::vector<ThinInstr>& instrs, size_t from,
+                           VReg old_vreg, VReg new_vreg) {
+        for (size_t i = from; i < instrs.size(); ++i) {
+            ThinInstr& use = instrs[i];
+            if (use.dst == old_vreg || use.dst == new_vreg) break;
+            if (use.src1 == old_vreg) use.src1 = new_vreg;
+            if (use.src2 == old_vreg) use.src2 = new_vreg;
+            for (VReg& arg : use.args)
+                if (arg == old_vreg) arg = new_vreg;
+        }
+    };
+
+    // Does VReg v have any use (src1/src2/args/term.cond/term.ret) in a block
+    // other than exclude_idx? Used to refuse cross-block forwarding in non-SSA
+    // IR — a use outside the redundant instruction's own block may see a
+    // different reaching definition, so it must not be rewritten.
+    auto used_in_other_blocks = [&](size_t exclude_idx, VReg v) -> bool {
+        for (size_t bi = 0; bi < num_blocks; ++bi) {
+            if (bi == exclude_idx) continue;
+            for (const auto& in : f.blocks[bi].instrs) {
+                if (in.src1 == v || in.src2 == v) return true;
+                for (VReg a : in.args) if (a == v) return true;
+                if (in.op == ThinOp::CopyBytes && in.dst == v) return true;
+            }
+            if (f.blocks[bi].term.cond == v || f.blocks[bi].term.ret == v)
+                return true;
+        }
+        return false;
+    };
+
+    // Process one block's instructions against the inherited (dominator-scoped)
+    // expression table, then recurse into dominator-tree children.
+    std::function<void(size_t)> process = [&](size_t bi) {
+        auto& blk = f.blocks[bi];
+
+        // Checkpoint the scoped state so this block's additions (and its
+        // subtree's) are removed when the scope exits — siblings see the
+        // pre-block state, so availability == domination.
+        auto saved_vreg_number = vreg_number;
+        auto saved_expressions = expressions;
+        auto saved_representative = representative;
+
+        for (size_t i = 0; i < blk.instrs.size(); ) {
+            ThinInstr& in = blk.instrs[i];
+
+            // A VReg redefinition removes available expressions whose
+            // representative is that name (the name now holds a new value, so
+            // the prior computation cannot stand in for it).
+            if (in.dst != 0) {
+                for (auto it = expressions.begin(); it != expressions.end(); ) {
+                    if (it->second.representative == in.dst)
+                        it = expressions.erase(it);
+                    else ++it;
+                }
+            }
+
+            // Memory invalidation for this instruction's writes happens BEFORE
+            // the instruction is considered as an available expression, so a
+            // store between two loads correctly kills the first load.
+            invalidate_memory(in);
+
+            if (!is_gvn_expr_op(in.op, in.src1) || in.dst == 0) {
+                if (in.dst != 0) {
+                    const uint64_t fresh = next_number++;
+                    vreg_number[in.dst] = fresh;
+                    representative[fresh] = in.dst;
+                }
+                ++i;
+                continue;
+            }
+
+            // Moves carry the source's value number and need no expression key.
+            if (in.op == ThinOp::Move && in.src1 != 0) {
+                const uint64_t number = number_of(in.src1);
+                vreg_number[in.dst] = number;
+                auto rep = representative.find(number);
+                if (rep == representative.end()) representative[number] = in.dst;
+                ++i;
+                continue;
+            }
+
+            uint64_t float_bits = 0;
+            static_assert(sizeof(float_bits) == sizeof(in.imm.f));
+            std::memcpy(&float_bits, &in.imm.f, sizeof(float_bits));
+            uint64_t lhs_number = number_of(in.src1);
+            uint64_t rhs_number = number_of(in.src2);
+            if (is_commutative(in.op) && rhs_number != 0 && rhs_number < lhs_number)
+                std::swap(lhs_number, rhs_number);
+
+            // frame_off is only the destination spill home for ordinary value
+            // producers, not part of the computed value; ignore it when that
+            // home has no explicit IR reader. Address/load offsets are retained.
+            int32_t value_frame_off = in.meta.frame_off;
+            switch (in.op) {
+            case ThinOp::ConstInt: case ThinOp::ConstFloat: case ThinOp::ConstBool:
+            case ThinOp::Add: case ThinOp::Sub: case ThinOp::Mul:
+            case ThinOp::Div: case ThinOp::Mod: case ThinOp::And:
+            case ThinOp::Or: case ThinOp::Xor: case ThinOp::Shl: case ThinOp::Shr:
+            case ThinOp::Neg: case ThinOp::Not: case ThinOp::BitNot:
+            case ThinOp::FAdd: case ThinOp::FSub: case ThinOp::FMul:
+            case ThinOp::FDiv: case ThinOp::FMod: case ThinOp::Cmp:
+            case ThinOp::LAnd: case ThinOp::LOr: case ThinOp::Cast:
+                if (!read_slots.count(in.meta.frame_off)) value_frame_off = 0;
+                break;
+            case ThinOp::LoadFrame:
+                // A computed-address LoadFrame uses field_off as its source;
+                // frame_off is only its result spill home. (Computed loads are
+                // not CSE'd, but keep the masking consistent if reached.)
+                if (in.src1 != 0 && !read_slots.count(in.meta.frame_off))
+                    value_frame_off = 0;
+                break;
+            default:
+                break;
+            }
+            GVNKey key{
+                static_cast<uint16_t>(in.op), lhs_number, rhs_number,
+                in.imm.i, float_bits, in.meta.width, value_frame_off,
+                in.meta.len, in.meta.slot, in.meta.mod_id, in.meta.field_off,
+                in.meta.data_temp_off, in.meta.cmp,
+                static_cast<uint8_t>(in.meta.base_kind), in.meta.is_unsigned,
+                in.meta.is_f32, in.meta.trap_reason, in.meta.addend, in.meta.type
+            };
+
+            auto found = expressions.find(key);
+            if (found == expressions.end()) {
+                const uint64_t number = next_number++;
+                expressions.emplace(key, Available{number, in.dst, bi});
+                vreg_number[in.dst] = number;
+                representative[number] = in.dst;
+                ++i;
+                continue;
+            }
+
+            // Found an available equivalent expression. The representative's
+            // block dominates this one (availability is dominator-scoped), so
+            // the first computation executes before this redundant one. Now
+            // apply the non-SSA safety checks before eliminating.
+            const VReg old_dst = in.dst;
+            const VReg new_dst = found->second.representative;
+
+            // Do not erase a redundant producer whose spill home is an explicit
+            // reader — that could remove an observable restoring write.
+            if (erasing_removes_observable_home(in)) {
+                const uint64_t number = next_number++;
+                vreg_number[old_dst] = number;
+                representative[number] = old_dst;
+                expressions[key] = {number, old_dst, bi};
+                ++i;
+                continue;
+            }
+
+            // The representative must keep its meaning through every remapped
+            // use. If it is redefined later IN THIS BLOCK, retain this
+            // expression rather than perform a partial substitution. (A
+            // redefinition in a dominating block after the first computation
+            // already removed the available entry, so it cannot reach here.)
+            bool representative_redefined = false;
+            for (size_t j = i + 1; j < blk.instrs.size(); ++j) {
+                if (blk.instrs[j].dst == new_dst) {
+                    representative_redefined = true;
+                    break;
+                }
+            }
+            if (representative_redefined) {
+                const uint64_t number = next_number++;
+                vreg_number[old_dst] = number;
+                representative[number] = old_dst;
+                expressions[key] = {number, old_dst, bi};
+                ++i;
+                continue;
+            }
+
+            // Refuse cross-block forwarding: if the eliminated destination is
+            // used in any other block, rewriting only this block's uses would
+            // leave a non-dominated non-SSA use pointing at a name whose
+            // meaning may differ along incoming paths. Retain the computation.
+            if (used_in_other_blocks(bi, old_dst)) {
+                const uint64_t number = next_number++;
+                vreg_number[old_dst] = number;
+                representative[number] = old_dst;
+                expressions[key] = {number, old_dst, bi};
+                ++i;
+                continue;
+            }
+
+            // The eliminated destination must not be redefined later in this
+            // block before a forwarded terminator use (a redefinition would
+            // mean the terminator sees a different value).
+            bool old_dst_redefined = false;
+            for (size_t j = i + 1; j < blk.instrs.size(); ++j) {
+                if (blk.instrs[j].dst == old_dst) {
+                    old_dst_redefined = true;
+                    break;
+                }
+            }
+
+            // Eliminate the redundant computation and forward its uses within
+            // this block to the dominating representative.
+            replace_uses(blk.instrs, i + 1, old_dst, new_dst);
+            if (!old_dst_redefined && !representative_redefined &&
+                blk.term.cond == old_dst)
+                blk.term.cond = new_dst;
+            if (!old_dst_redefined && !representative_redefined &&
+                blk.term.ret == old_dst)
+                blk.term.ret = new_dst;
+            vreg_number[old_dst] = found->second.value_number;
+            blk.instrs.erase(blk.instrs.begin() + static_cast<ptrdiff_t>(i));
+            changed = true;
+            // Do not advance i: the next instruction shifted into position i.
+        }
+
+        // Recurse into dominator-tree children (they inherit this block's
+        // scoped table — exactly the dominator's expressions).
+        for (uint32_t child : dom_children[bi])
+            process(child);
+
+        // Restore the scoped state: remove this block's (and its subtree's)
+        // expressions so siblings do not see non-dominating availability.
+        vreg_number = std::move(saved_vreg_number);
+        expressions = std::move(saved_expressions);
+        representative = std::move(saved_representative);
+    };
+
+    process(0);
 
     return changed ? EmberPreserved::none() : EmberPreserved::all();
 }
@@ -2899,6 +3484,7 @@ void register_passes(EmberPassRegistry& reg) {
     reg.add<DeadCodeElimPass>("dce");
     reg.add<SimplifyCFGPass>("simplifycfg");
     reg.add<CSEPass>("cse");
+    reg.add<GVNPass>("gvn");
     reg.add<LICMPass>("licm");
     reg.add<LoopStrengthReductionPass>("lsr");
     reg.add<StoreToLoadForwardPass>("forward");
