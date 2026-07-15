@@ -675,19 +675,17 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
 
     // ---- v0.4/v1.0 safe-execution context ----
     context_t ectx;
-    // 1e9 instruction budget. The self-hosted compiler (lex/parse/sema/codegen
-    // in ember) compiles a ~1k-line program through all four stages within ONE
+    // 2e10 instruction budget. The self-hosted compiler (lex/parse/sema/codegen
+    // in ember) compiles a program through all four stages within ONE
     // top-level call; the stages re-lex/re-parse internally so a single
     // compile_and_run does ~10 full-tree walks. budget_remaining is a monotonic
     // per-call work counter (reset_for_call deliberately does NOT reset it), so
-    // all of that work shares this one budget. The previous 1e8 default was
-    // exhausted mid-stage-3 (sema's internal re-parse) on the lex.ember
-    // bootstrap, trapping with BudgetExceeded. 1e9 gives the self-hosting
-    // workload headroom (a 317-line program's full pipeline costs ~7e7; a 918-
-    // line one costs ~3e8) while staying a finite bound backed by the host's
-    // wall-clock timeout. Consumption scales linearly with program size (no
-    // leak), so this is a workload-size fix, not masking a missing decrement.
-    ectx.budget_remaining = 1000000000;
+    // all of that work shares this one budget. The previous 1e9 budget was
+    // sufficient for the lex.ember bootstrap (918 lines, ~3e8) but the two-
+    // generation bootstrap compiles the FULL self-hosted compiler (~12.7k
+    // lines), which costs ~1e10. 2e10 gives headroom for the full bootstrap
+    // while staying a finite bound backed by the host's wall-clock timeout.
+    ectx.budget_remaining = 20000000000;
     ectx.max_call_depth = 512;
     ectx.has_checkpoint = false;
     if (opts.emit_em_path.empty()) ctx.trap_stub = reinterpret_cast<void*>(&ember_cli_trap);
