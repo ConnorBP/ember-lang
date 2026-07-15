@@ -110,11 +110,23 @@ static int64_t n_read_line() {
         if (nl != std::string::npos) {
             line.erase(nl);  // strip the newline (and anything after, which
                              // can't happen -- fgets stops at the first \n)
+            // Strip a trailing \r (Windows CRLF): file(WRITE) on Windows
+            // produces \r\n, and read_line only stripped \n above. A
+            // trailing \r in a file path breaks file_read_text matching.
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
             break;
         }
     }
     return ext_string::alloc(std::move(line));
 }
+
+// Helper: strip a trailing \r (Windows CRLF line ending) from a path or line.
+// read_line strips \n but not \r; on Windows, CMake's file(WRITE) and other
+// tools produce CRLF, leaving a trailing \r that breaks file_read_text path
+// matching. This is called after the \n strip above.
+// (Inlined below rather than a separate function to keep the fix minimal.)
 
 // ---------------------------------------------------------------------------
 // FILE I/O natives (one-shot whole-file ops; no persistent file handle in the

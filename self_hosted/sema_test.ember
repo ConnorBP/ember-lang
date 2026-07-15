@@ -140,10 +140,12 @@ fn test_for_loop() -> i64 {
 fn test_global() -> i64 {
     let r: i64 = sema("global C: i64 = 7; fn main() -> i64 { return C; }");
     if (r != 0) { return 11000 + r; }
-    // a global with a non-constant initializer is out-of-subset (Phase 1 needs
-    // a compile-time constant IntLit/neg-IntLit to bake into the data section)
+    // A global with a constant-expression initializer (e.g. `1 + 2`) is now
+    // ACCEPTED: the constexpr folding added in the self-hosting completion
+    // folds `1 + 2` to 3 at sema time, so the codegen can bake it into the
+    // data section. Previously this was rejected with -317 (non-constant init).
     let r2: i64 = sema("global D: i64 = 1 + 2; fn main() -> i64 { return 0; }");
-    if (r2 != -317) { return 11001; }
+    if (r2 != 0) { return 11001; }
     g_pass = g_pass + 1;
     return 0;
 }
@@ -309,9 +311,10 @@ fn test_unsupported_features() -> i64 {
     r = sema("fn f(x: i64) -> i64 { switch (x) { default: return 0; } }"); if (r != 0) { return 31040; }
     r = sema("fn f() -> i64 { let mut i: i64 = 0; do { i = i + 1; } while (i < 3); return i; }"); if (r != 0) { return 31042; }
     r = sema("fn f() -> i64 { defer f(); return 0; }"); if (r != 0) { return 31043; }
-    r = reject("fn f() -> i64 { try { return 1; } catch (e) { return 0; } }", -306, 31051); if (r != 0) { return r; }
-    r = reject("fn f() -> i64 { let x = fn() -> i64 { return 1; }; return 0; }", -307, 31061); if (r != 0) { return r; }
-    r = reject("fn f() -> i64 { yield 1; return 0; }", -308, 31071); if (r != 0) { return r; }
+    // try/catch, lambdas, and coroutines are now SUPPORTED (sema accepts them).
+    r = sema("fn f() -> i64 { try { return 1; } catch (e) { return 0; } }"); if (r != 0) { return 31051; }
+    r = sema("fn f() -> i64 { let x = fn() -> i64 { return 1; }; return 0; }"); if (r != 0) { return 31061; }
+    r = sema("fn g() -> i64 { yield 1; return 0; } fn f() -> i64 { return 0; }"); if (r != 0) { return 31071; }
     r = reject("fn f() -> i64 { let a = [1, 2]; return 0; }", 1, 31091); if (r != 0) { return r; }
     r = reject("fn f(a: i64[]) -> i64 { return 0; }", -310, 31101); if (r != 0) { return r; }
     r = reject("@realtime fn f() -> i64 { return 0; }", -318, 31111); if (r != 0) { return r; }
