@@ -1108,9 +1108,43 @@ struct EmitCtx {
         for (size_t bi = 0; bi < thf.blocks.size(); ++bi) {
             const ThinBlock& blk = thf.blocks[bi];
             e.bind(block_labels[blk.id]);
-            for (const ThinInstr& in : blk.instrs)
+            // Tail-call emission unit: a block whose FINAL instruction is a
+            // CallScript marked is_tail_call with a Return terminator. The
+            // tailcall IR pass marks such a call and leaves the Return (ret ==
+            // the call's dst) intact; emit it as one tail-emission unit
+            // (indirect JMP to the dispatch target) instead of a CALL + result
+            // spill + epilogue + RET, and skip the DepthCheck immediately
+            // preceding the marked call (a tail JMP does not grow the stack /
+            // must not bump call depth). The annotation is nonserialized, so a
+            // marked call that is NOT in tail position (not last, or no Return
+            // term) falls back to the ordinary call path below.
+            bool tail_unit_emitted = false;
+            for (size_t ii = 0; ii < blk.instrs.size(); ++ii) {
+                const ThinInstr& in = blk.instrs[ii];
+                const bool is_marked_tail_call =
+                    in.op == ThinOp::CallScript && in.is_tail_call &&
+                    ii + 1 == blk.instrs.size() &&
+                    blk.term.kind == TermKind::Return;
+                if (is_marked_tail_call) {
+                    emit_tail_call(in);
+                    tail_unit_emitted = true;
+                    break;  // control leaves via JMP; do not emit the Return term
+                }
+                // Skip a DepthCheck that immediately precedes the marked tail
+                // call (the last instr). The DepthCheck stays in the IR
+                // (nonserialized annotation) but is not emitted on the tail path.
+                if (in.op == ThinOp::DepthCheck &&
+                    ii + 1 < blk.instrs.size() &&
+                    blk.instrs[ii + 1].op == ThinOp::CallScript &&
+                    blk.instrs[ii + 1].is_tail_call &&
+                    ii + 2 == blk.instrs.size() &&
+                    blk.term.kind == TermKind::Return) {
+                    continue;
+                }
                 emit_instr(in);
-            emit_term(blk.term);
+            }
+            if (!tail_unit_emitted)
+                emit_term(blk.term);
         }
 
         // resolve label fixups
@@ -2423,6 +2457,85 @@ struct EmitCtx {
                 // int/bool result: pin to regalloc home (register or frame slot)
                 pin_int_dst(in.dst, in.meta, in.ret_type);
             }
+        }
+    }
+
+    // ─── tail-call emission (the tailcall IR pass's counterpart) ───
+    // Emit a marked tail CallScript as one tail-emission unit: marshal the
+    // register-only arguments with the existing ABI stash machinery, balance
+    // the temporary stash allocation, restore every regalloc-used callee-saved
+    // register plus rbx, tear down rsp/rbp, and emit an indirect JMP to the
+    // resolved CallScript dispatch target — with no CALL, no result spill, no
+    // depth-leave, no RET, and no return-value normalization. The callee
+    // returns directly to this function's caller.
+    //
+    // Eligibility (enforced by the pass) guarantees: a direct same-module
+    // CallScript, a register-only argument ABI of at most four Win64 words
+    // with no slice/lambda/struct/hidden-return/unknown/stack operands, and
+    // compatible primitive scalar return types. So ret_struct is false, there
+    // are no outgoing stack args, and the arg registers (rcx/rdx/r8/r9,
+    // xmm0-xmm3) — all caller-saved/volatile — survive the callee-saved
+    // restore and the rsp/rbp teardown. The resolved target (r11) also
+    // survives: restoring rbx/rsi/rdi/r12/r13/r15 and `mov rsp, rbp; pop rbp`
+    // do not touch r11.
+    //
+    // Keyed same-module dispatch: emit_call_arg_stash already ran
+    // emit_keyed_resolve_thin, so r11 holds the resolved target → jmp_reg(r11).
+    // Identity (non-keyed) dispatch: load the dispatch-table base into r11 and
+    // jmp_mem(r11, slot*8) — the JMP form of emit_script_call's call_mem.
+    void emit_tail_call(const ThinInstr& in) {
+        // The pass rejects aggregate returns (dst==0 / struct ret_type), so
+        // ret_struct is always false here. Compute it defensively anyway.
+        const bool ret_struct = call_returns_struct_by_ptr(in.ret_type);
+        // Build the operand layout (no hidden dest since ret_struct is false).
+        std::vector<CallArg> ops = build_call_args(in, ret_struct);
+        // Marshal args: sub rsp, total; stash; load into ABI registers; (keyed
+        // resolve → r11 = target when keyed_same_module()). No stack args are
+        // possible (eligibility capped the ABI at four register words).
+        emit_call_arg_stash(in, ops, ret_struct, /*hidden_dest_vreg=*/0,
+                            /*hidden_dest_off=*/0, /*is_indirect=*/false);
+        // Balance the temporary stash allocation (the JMP never returns, so the
+        // matching add rsp must precede it). rsp is now back at the frame base.
+        e.add_reg_imm32(Reg::rsp, last_call_total);
+        // The stash/resolve clobbered rax (and rcx/rdx/r8 for keyed); the args
+        // now live in the ABI registers. Reset the result-register tracking so
+        // no later materialization takes a stale-rax shortcut (there is no
+        // later instruction — the JMP ends the block — but keep the tracker
+        // consistent in case emit() extends the block in the future).
+        rax_vreg = 0;
+        xmm0_vreg = 0;
+        // Restore every regalloc-used callee-saved register (mirrors
+        // emit_epilogue, minus rbx which is restored next). These are saved at
+        // rbp-relative offsets, so they must be read BEFORE `pop rbp`. None of
+        // them (rbx/rsi/rdi/r12/r13/r15) is an argument register, so the args
+        // in rcx/rdx/r8/r9/xmm0-xmm3 survive.
+        if (ra && ra->enabled) {
+            for (size_t i = 0; i < ra->used_reg_ids.size(); ++i) {
+                Reg r = Reg(ra->used_reg_ids[i]);
+                if (r == Reg::rbx) continue;  // restored below
+                e.load_reg_mem(r, Reg::rbp, ra->save_offsets[i]);
+            }
+        }
+        // Restore rbx (always saved by the prologue at rbx_save_offset).
+        e.load_reg_mem(Reg::rbx, Reg::rbp, thf.frame.rbx_save_offset);
+        // Tear down the frame: mov rsp, rbp ; pop rbp. The callee now sees the
+        // return address (this function's caller's return address) on top of
+        // the stack — exactly the layout a normal RET would have left, so the
+        // callee's prologue/epilogue behave as if it were CALLed.
+        e.mov_reg_reg(Reg::rsp, Reg::rbp);
+        e.pop(Reg::rbp);
+        // Resolve the CallScript dispatch target and JMP (no CALL, no RET).
+        if (keyed_same_module()) {
+            // r11 already holds the resolved target (emit_call_arg_stash ran
+            // emit_keyed_resolve_thin before arg placement).
+            e.jmp_reg(Reg::r11);
+        } else {
+            // Identity dispatch: load the table base and jmp [r11 + slot*8].
+            // This is the JMP form of emit_script_call's call_mem — same
+            // mov_reg_imm64_external(DispatchTableBase) preamble, jmp_mem
+            // instead of call_mem.
+            e.mov_reg_imm64_external(Reg::r11, AbsFixup::DispatchTableBase);
+            e.jmp_mem(Reg::r11, int32_t(in.meta.slot) * 8);
         }
     }
 };

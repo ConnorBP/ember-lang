@@ -228,6 +228,223 @@ static SinglePassResult run_single_pass(const EmberPassRegistry& reg,
     return {pres.all_preserved(), total_instrs(f)};
 }
 
+// ─── Tail-call optimization (tailcall) helpers ───
+//
+// The tail-call pass converts a direct tail CallScript (a CallScript whose
+// dst is the enclosing block's Return value, with no intervening work) into a
+// JMP to the script target, dropping the caller's epilogue/RET so the callee
+// returns directly to the caller's caller (no stack growth). These helpers
+// build the RED-phase assertions for a pass that does NOT yet exist: every
+// reg.create("tailcall") is guarded so a missing pass reports a failed ck()
+// assertion instead of dereferencing null.
+
+// Find a CompiledFn in an M by FUNCTION NAME (emit_x64 stamps cf.name =
+// thf.name). Returns nullptr if not found. Used so byte checks inspect the
+// INTENDED function and never accidentally match bytes from unrelated code.
+static CompiledFn* find_fn_by_name(M& m, const std::string& name) {
+    for (auto& fn : m.fns)
+        if (fn.name == name) return &fn;
+    return nullptr;
+}
+
+// Count "tail-call-eligible" CallScript/Return pairs in a ThinFunction: a
+// CallScript that is the LAST instruction of a block whose terminator is a
+// plain Return with ret == the call's dst. This is exactly the shape the
+// tail-call pass must dissolve (the call becomes a JMP, the Return goes away).
+// A conservative pass leaves any non-matching shape alone, so this counter is
+// the RED/GREEN discriminator: 1 before the pass, 0 after.
+static size_t count_tail_eligible_pairs(const ThinFunction& f) {
+    size_t n = 0;
+    for (const auto& blk : f.blocks) {
+        if (blk.term.kind != TermKind::Return) continue;
+        if (blk.instrs.empty()) continue;
+        const ThinInstr& last = blk.instrs.back();
+        if (last.op != ThinOp::CallScript) continue;
+        if (last.dst == 0) continue;            // void/aggregate call — not a scalar tail
+        if (last.dst != blk.term.ret) continue;  // result must flow straight to Return
+        n += 1;
+    }
+    return n;
+}
+
+// Count CallScript instrs the tailcall pass has MARKED (is_tail_call == true)
+// in tail position (a block's final instr with a Return terminator). The pass
+// does NOT dissolve the IR pair — it leaves the CallScript and its enclosing
+// Return (ret == dst) intact and only sets the transient, nonserialized
+// is_tail_call codegen annotation. So this marker counter (NOT the eligible-
+// pair counter) is the GREEN discriminator: 0 before the pass, 1 after.
+static size_t count_tail_marked(const ThinFunction& f) {
+    size_t n = 0;
+    for (const auto& blk : f.blocks) {
+        if (blk.term.kind != TermKind::Return) continue;
+        if (blk.instrs.empty()) continue;
+        const ThinInstr& last = blk.instrs.back();
+        if (last.op == ThinOp::CallScript && last.is_tail_call) ++n;
+    }
+    return n;
+}
+
+// Count CallScript instrs in the whole function.
+static size_t count_call_script(const ThinFunction& f) {
+    size_t n = 0;
+    for (const auto& blk : f.blocks)
+        for (const auto& in : blk.instrs)
+            if (in.op == ThinOp::CallScript) ++n;
+    return n;
+}
+
+// True if the function contains any try/catch/throw barrier op. A function
+// with one of these must be left UNCHANGED by the tail-call pass (a tail JMP
+// would skip the catch unwinding / setjmp restore).
+static bool has_exception_op(const ThinFunction& f) {
+    for (const auto& blk : f.blocks)
+        for (const auto& in : blk.instrs)
+            if (in.op == ThinOp::TryCatch || in.op == ThinOp::CatchCleanup ||
+                in.op == ThinOp::CatchEntry || in.op == ThinOp::Throw)
+                return true;
+    return false;
+}
+
+// ─── x86-64 byte-pattern scanners (specific to the emitter's encodings) ───
+// The default (non-keyed) emit_script_call path lowers a direct script call as:
+//     mov r11, imm64 DispatchTableBase   -> 49 BB <8 placeholder bytes>
+//     call [r11 + slot*8]                -> 41 FF 93 <slot*8 as imm32 LE>
+// (call_mem: FF /2, mod=10 disp32, base=r11 -> REX.B 0x41, ModRM 0x93.)
+// A tail-call to the same dispatch slot is the indirect JMP form:
+//     jmp  [r11 + slot*8]                -> 41 FF A3 <slot*8 as imm32 LE>
+// (jmp_mem: FF /4, mod=10 disp32, base=r11 -> REX.B 0x41, ModRM 0xA3.)
+// The standard epilogue+RET tail is:
+//     mov rsp, rbp ; pop rbp ; ret       -> 48 89 EC 5D C3
+// These signatures are specific enough that scanning ONE function's bytes for
+// them cannot accidentally match unrelated code in another function.
+static bool find_bytes(const std::vector<uint8_t>& b, const std::vector<uint8_t>& pat) {
+    if (pat.empty() || pat.size() > b.size()) return false;
+    for (size_t i = 0; i + pat.size() <= b.size(); ++i) {
+        bool ok = true;
+        for (size_t j = 0; j < pat.size(); ++j)
+            if (b[i + j] != pat[j]) { ok = false; break; }
+        if (ok) return true;
+    }
+    return false;
+}
+// The dispatch CALL signature for slot `slot`: 41 FF 93 <slot*8 LE imm32>.
+static bool has_dispatch_call(const std::vector<uint8_t>& b, int32_t slot) {
+    int32_t disp = slot * 8;
+    std::vector<uint8_t> pat = {0x41, 0xFF, 0x93,
+        uint8_t(disp), uint8_t(disp >> 8), uint8_t(disp >> 16), uint8_t(disp >> 24)};
+    return find_bytes(b, pat);
+}
+// The dispatch JMP signature for slot `slot`: 41 FF A3 <slot*8 LE imm32>.
+static bool has_dispatch_jmp(const std::vector<uint8_t>& b, int32_t slot) {
+    int32_t disp = slot * 8;
+    std::vector<uint8_t> pat = {0x41, 0xFF, 0xA3,
+        uint8_t(disp), uint8_t(disp >> 8), uint8_t(disp >> 16), uint8_t(disp >> 24)};
+    return find_bytes(b, pat);
+}
+// The standard epilogue + RET: mov rsp,rbp (48 89 EC) ; pop rbp (5D) ; ret (C3).
+static bool has_epilogue_ret(const std::vector<uint8_t>& b) {
+    return find_bytes(b, {0x48, 0x89, 0xEC, 0x5D, 0xC3});
+}
+
+// Call a one-arg script fn returning i64 (e.g. wrapper(x) / loop_sum(n, acc)).
+static int64_t call1_i64(M& m, const std::string& fn, int64_t a) {
+    auto it = m.slots.find(fn);
+    if (it == m.slots.end()) return -1;
+    void* e = m.table->get(it->second);
+    using F = int64_t (*)(int64_t);
+    return reinterpret_cast<F>(e)(a);
+}
+// Call a two-arg script fn returning i64 (e.g. loop_sum(n, acc)).
+static int64_t call2_i64(M& m, const std::string& fn, int64_t a, int64_t b) {
+    auto it = m.slots.find(fn);
+    if (it == m.slots.end()) return -1;
+    void* e = m.table->get(it->second);
+    using F = int64_t (*)(int64_t, int64_t);
+    return reinterpret_cast<F>(e)(a, b);
+}
+// Call a one-arg script fn returning i64 by DISPATCH SLOT directly (used by
+// the serialize/deserialize round-trip test, which installs a re-emitted
+// function into a DispatchTable without an M wrapper).
+static int64_t call1_i64_impl(DispatchTable& table, int slot, int64_t a) {
+    void* e = table.get(size_t(slot));
+    if (!e) return -1;
+    using F = int64_t (*)(int64_t);
+    return reinterpret_cast<F>(e)(a);
+}
+
+// Compile a (possibly multi-function) source with an optional pass manager
+// AND optional call-depth-check configuration. Mirrors compile_with but
+// exposes ctx.emit_depth_checks / depth_ptr / max_call_depth so the tail-call
+// depth tests can prove the optimized tail path does not increment depth.
+struct DepthCfg {
+    bool enabled = false;
+    int32_t* ptr = nullptr;
+    int32_t max_depth = 512;
+};
+static std::unique_ptr<M> compile_tail(const std::string& src,
+                                       EmberPassManager* pm,
+                                       DepthCfg depth = {}) {
+    auto m = std::make_unique<M>();
+    auto lr = tokenize(src, "<ir_passes_tail>");
+    if (!lr.ok) { std::printf("FAIL: lex: %s\n", lr.error.c_str()); return nullptr; }
+    auto pr = parse(std::move(lr.toks));
+    if (!pr.ok) { std::printf("FAIL: parse: %s\n", pr.error.c_str()); return nullptr; }
+    m->prog = std::move(pr.program);
+    int si = 0;
+    for (auto& fn : m->prog.funcs) { m->slots[fn.name] = si++; fn.slot = si - 1; }
+
+    std::unordered_map<std::string, NativeSig> natives;
+    OpOverloadTable overloads;
+    m->layouts = build_struct_layouts(m->prog);
+    m->prog.string_xor_key = 0;
+    auto sr = sema(m->prog, natives, m->slots, 0, &overloads, &m->layouts);
+    if (!sr.ok) {
+        std::printf("FAIL: sema: %s\n", sr.errors.empty() ? "<unknown>" : sr.errors[0].msg.c_str());
+        return nullptr;
+    }
+
+    m->gbs.assign(0, 0);
+    m->gb.base = 0;
+    g_globals_for_codegen = &m->gb;
+    m->table = std::make_unique<DispatchTable>(m->prog.funcs.size());
+
+    CodeGenCtx ctx;
+    ctx.globals_base = 0;
+    ctx.dispatch_base = int64_t(m->table->base());
+    ctx.natives = &natives;
+    ctx.script_slots = &m->slots;
+    ctx.structs = &m->layouts;
+    ctx.use_context_reg = false;  // depth test uses baked depth_ptr mode (no r14)
+    ctx.enable_ir_backend = false;
+    if (depth.enabled) {
+        ctx.emit_depth_checks = true;
+        ctx.depth_ptr = depth.ptr;
+        ctx.max_call_depth = depth.max_depth;
+    }
+
+    EmberAnalysisManager am;
+    for (auto& fn : m->prog.funcs) {
+        ThinFunction thf = lower_function(fn, ctx);
+        if (thf.blocks.empty()) {
+            std::printf("FAIL: lower_function gave empty blocks for %s\n", fn.name.c_str());
+            return nullptr;
+        }
+        if (pm) pm->run(thf, am);
+        CompiledFn cf = emit_x64(thf, ctx);
+        if (cf.bytes.empty()) {
+            std::printf("FAIL: emit_x64 gave empty bytes for %s\n", fn.name.c_str());
+            return nullptr;
+        }
+        if (!finalize(cf)) {
+            std::printf("FAIL: alloc_executable for %s\n", fn.name.c_str());
+            return nullptr;
+        }
+        m->table->set(fn.slot, cf.entry);
+        m->fns.push_back(std::move(cf));
+    }
+    return m;
+}
+
 int main() {
     std::printf("=== ir_passes_test: Stage C IR optimization passes ===\n");
 
@@ -3098,6 +3315,1055 @@ int main() {
         if (v6_def) {
             ck(v6_def->src1 == v3, "GVN-REG6: post-definition use forwarded to v3 (v6.src1 == v3)");
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // RED phase: Tail-Call Optimization (tailcall).
+    // A pass that does NOT yet exist. It must convert a direct tail CallScript
+    // (a CallScript whose dst is the enclosing block's Return value, with no
+    // intervening work, ≤4 ABI words, no stack args, scalar compatible return,
+    // no try/catch/throw) into a JMP to the script target so the callee returns
+    // straight to the caller's caller (no stack growth, no call-depth bump).
+    // Every reg.create("tailcall") is guarded: a missing pass reports a failed
+    // ck() assertion instead of a null dereference. Once TailCallPass is
+    // implemented and registered in ext_opt::register_passes, these go green.
+    // ═══════════════════════════════════════════════════════════════════════
+    std::printf("\n--- RED: Tail-Call Optimization (tailcall) ---\n");
+
+    // ─── TC-REG: register_passes exposes the name "tailcall" ───
+    {
+        ck(reg.has("tailcall"), "TC-REG: register_passes registers \"tailcall\"");
+    }
+
+    // ─── TC-PIPE: build_pipeline_from_string resolves "tailcall" ───
+    // The generic registry-backed parser must resolve "tailcall" through the
+    // same has()/create() path as every other pass. In RED this fails with
+    // `unknown pass: "tailcall"`.
+    {
+        EmberPassRegistry pipe_reg;
+        ext_opt::register_passes(pipe_reg);
+        EmberPassManager pm;
+        std::string err;
+        bool ok = build_pipeline_from_string("tailcall", pipe_reg, pm, &err);
+        ck(ok, "TC-PIPE: build_pipeline_from_string(\"tailcall\") succeeds");
+        if (!ok) std::printf("         (pipeline error: %s)\n", err.c_str());
+        // A multi-pass string containing tailcall must also resolve.
+        EmberPassManager pm2;
+        std::string err2;
+        bool ok2 = build_pipeline_from_string("constprop,tailcall,dce", pipe_reg, pm2, &err2);
+        ck(ok2, "TC-PIPE: build_pipeline_from_string(\"constprop,tailcall,dce\") succeeds");
+    }
+
+    // ─── TC-OPT: a direct CallScript whose dst is the enclosing block's ───
+    // Return value is optimized. Hand-built ThinFunction mirroring the lowered
+    // shape of `fn wrapper(x: i64) -> i64 { return target(x); }`:
+    //   block0: CallScript dst=vR args=[vX] slot=<target>, Return ret=vR.
+    // The eligible-pair counter is 1 before the pass and must be 0 after.
+    {
+        ThinFunction tf; tf.name = "wrapper";
+        const VReg vX = 1, vR = 2;
+        ThinBlock b0; b0.id = 0;
+        // vX = the incoming arg (a stand-in vreg; the pass only inspects the
+        // call/return shape, not arg provenance).
+        { ThinInstr ci; ci.op = ThinOp::ConstInt; ci.dst = vX; ci.imm.i = 0;
+          ci.meta.width = 8; b0.instrs.push_back(std::move(ci)); }
+        // vR = target(x) — a direct script call whose dst IS the return value.
+        { ThinInstr cs; cs.op = ThinOp::CallScript; cs.dst = vR; cs.args = {vX};
+          cs.arg_frame_offs = {-1}; cs.arg_types = {&type_i64()};
+          cs.meta.slot = 7; cs.meta.base_kind = AbsFixup::DispatchTableBase;
+          cs.ret_type = &type_i64(); cs.meta.width = 8;
+          b0.instrs.push_back(std::move(cs)); }
+        b0.term.kind = TermKind::Return; b0.term.ret = vR;
+        tf.blocks.push_back(std::move(b0));
+        tf.ret_type = &type_i64();
+
+        ck(count_tail_eligible_pairs(tf) == 1, "TC-OPT: one eligible tail pair before tailcall");
+        ck(count_tail_marked(tf) == 0, "TC-OPT: no call marked before tailcall");
+        size_t call_before = count_call_script(tf);
+        ck(call_before == 1, "TC-OPT: one CallScript before tailcall");
+
+        auto pc = reg.create("tailcall");
+        ck(pc != nullptr, "TC-OPT: tailcall pass registered");
+        EmberPreserved pres = EmberPreserved::all();
+        if (pc) { EmberAnalysisManager am; pres = pc->run(tf, am); }
+        // The pass must report a change.
+        ck(!pres.all_preserved(), "TC-OPT: tailcall returns Preserved::none() (transformed)");
+        // The pass does NOT dissolve the IR pair: the CallScript and its
+        // enclosing Return (ret == dst) stay intact, and only the transient,
+        // nonserialized is_tail_call codegen annotation is set. The eligible-
+        // pair counter therefore stays 1; the MARKED counter goes 0 -> 1.
+        ck(count_tail_eligible_pairs(tf) == 1,
+           "TC-OPT: IR pair intact after tailcall (ret preserved, not dissolved)");
+        char msg[160];
+        std::snprintf(msg, sizeof msg,
+            "TC-OPT: call marked is_tail_call after tailcall (before=0 after=%zu)",
+            count_tail_marked(tf));
+        ck(count_tail_marked(tf) == 1, msg);
+        // The Return's ret is UNCHANGED (still vR == the call's dst): the
+        // annotation is nonserialized, so the IR must remain an ordinary
+        // call-of-return-result shape that ordinary emission handles correctly
+        // when the annotation is absent (e.g. after a round trip).
+        bool ret_preserved = (!tf.blocks.empty() &&
+            tf.blocks.back().term.kind == TermKind::Return &&
+            tf.blocks.back().term.ret == vR);
+        ck(ret_preserved, "TC-OPT: Return ret preserved (== call dst) after tailcall");
+        // Idempotence depends on is_tail_call alone: a second run is a no-op.
+        EmberPreserved pres2 = EmberPreserved::all();
+        if (pc) { EmberAnalysisManager am2; pres2 = pc->run(tf, am2); }
+        ck(pres2.all_preserved(), "TC-OPT: tailcall idempotent (second run Preserved::all())");
+        ck(count_tail_marked(tf) == 1, "TC-OPT: still one marked call after idempotent rerun");
+    }
+
+    // ─── TC-EMIT: emitted x86-64 for an eligible wrapper contains a JMP to ───
+    // the script target instead of the original CALL + epilogue/RET.
+    // Source: target(x)=x+1 ; wrapper(x)=target(x). wrapper is tail-eligible.
+    // Inspect wrapper's CompiledFn bytes by name (no accidental matches in
+    // target's bytes). Without the pass: dispatch CALL (41 FF 93 <slot*8>) +
+    // epilogue/RET (48 89 EC 5D C3). With the pass: dispatch JMP (41 FF A3
+    // <slot*8>), no dispatch CALL for the target slot, no epilogue/RET.
+    {
+        static const char* SRC_TAIL_WRAPPER =
+            "fn target(x: i64) -> i64 { return x + 1; }\n"
+            "fn wrapper(x: i64) -> i64 { return target(x); }\n";
+
+        // Baseline (no pass): wrapper keeps the CALL + epilogue/RET.
+        auto mb = compile_tail(SRC_TAIL_WRAPPER, nullptr);
+        ck(mb != nullptr, "TC-EMIT: baseline compiles");
+        if (mb) {
+            CompiledFn* wfn = find_fn_by_name(*mb, "wrapper");
+            ck(wfn != nullptr, "TC-EMIT: wrapper CompiledFn found by name (baseline)");
+            if (wfn) {
+                int32_t target_slot = mb->slots["target"];
+                ck(has_dispatch_call(wfn->bytes, target_slot),
+                   "TC-EMIT: baseline wrapper has dispatch CALL to target slot");
+                ck(has_epilogue_ret(wfn->bytes),
+                   "TC-EMIT: baseline wrapper ends in epilogue + RET");
+                ck(!has_dispatch_jmp(wfn->bytes, target_slot),
+                   "TC-EMIT: baseline wrapper has NO dispatch JMP (no tail-call yet)");
+            }
+        }
+
+        // With pass: wrapper tail-JMPs to target; CALL + epilogue/RET gone.
+        EmberPassManager pm;
+        auto pc = reg.create("tailcall");
+        ck(pc != nullptr, "TC-EMIT: tailcall pass registered");
+        if (pc) pm.add_pass_concept(std::move(pc));
+        auto mp = compile_tail(SRC_TAIL_WRAPPER, pm.empty() ? nullptr : &pm);
+        ck(mp != nullptr, "TC-EMIT: pass compile ok");
+        if (mp) {
+            CompiledFn* wfn = find_fn_by_name(*mp, "wrapper");
+            ck(wfn != nullptr, "TC-EMIT: wrapper CompiledFn found by name (pass)");
+            if (wfn) {
+                int32_t target_slot = mp->slots["target"];
+                ck(has_dispatch_jmp(wfn->bytes, target_slot),
+                   "TC-EMIT: pass wrapper has dispatch JMP to target slot (tail-call)");
+                ck(!has_dispatch_call(wfn->bytes, target_slot),
+                   "TC-EMIT: pass wrapper has NO dispatch CALL to target slot");
+                ck(!has_epilogue_ret(wfn->bytes),
+                   "TC-EMIT: pass wrapper has NO epilogue + RET (callee returns directly)");
+            }
+        }
+    }
+
+    // ─── TC-VAL: execution with and without the pass returns the same value ───
+    // (value-preserving). In RED the pass concept is null so the pass manager
+    // is empty and both compiles are identical -> trivially equal. In GREEN the
+    // pass tail-JMPs but the observable i64 result is unchanged.
+    {
+        static const char* SRC_TAIL_WRAPPER =
+            "fn target(x: i64) -> i64 { return x + 1; }\n"
+            "fn wrapper(x: i64) -> i64 { return target(x); }\n";
+        auto mb = compile_tail(SRC_TAIL_WRAPPER, nullptr);
+        ck(mb != nullptr, "TC-VAL: baseline compiles");
+        int64_t rb = mb ? call1_i64(*mb, "wrapper", 5) : -1;
+        EmberPassManager pm;
+        auto pc = reg.create("tailcall");
+        ck(pc != nullptr, "TC-VAL: tailcall pass registered");
+        if (pc) pm.add_pass_concept(std::move(pc));
+        auto mp = compile_tail(SRC_TAIL_WRAPPER, pm.empty() ? nullptr : &pm);
+        ck(mp != nullptr, "TC-VAL: pass compile ok");
+        int64_t rp = mp ? call1_i64(*mp, "wrapper", 5) : -1;
+        char msg[160];
+        std::snprintf(msg, sizeof msg,
+            "TC-VAL: wrapper(5) value-preserving (baseline=%lld pass=%lld)",
+            (long long)rb, (long long)rp);
+        ck(rb == rp && rb == 6, msg);
+    }
+
+    // ─── TC-DEEP: deep tail recursion completes with the pass without stack ───
+    // growth. A tail-recursive loop_sum(n, acc) that recurses n times. With the
+    // pass the recursion is a JMP (constant stack); without the pass it is a
+    // real CALL chain. The deep run is GUARDED on the pass being registered so
+    // RED reports the missing-pass assertion cleanly instead of overflowing.
+    {
+        static const char* SRC_TAIL_RECUR =
+            "fn loop_sum(n: i64, acc: i64) -> i64 { "
+            "if (n == 0) { return acc; } return loop_sum(n - 1, acc + n); }\n";
+        // Small-N baseline + pass value-preservation (safe in both RED/GREEN).
+        auto mb = compile_tail(SRC_TAIL_RECUR, nullptr);
+        ck(mb != nullptr, "TC-DEEP: baseline compiles");
+        int64_t rb = mb ? call2_i64(*mb, "loop_sum", 100, 0) : -1;  // 5050
+        EmberPassManager pm;
+        auto pc = reg.create("tailcall");
+        ck(pc != nullptr, "TC-DEEP: tailcall pass registered");
+        // Save a PRE-MOVE boolean: pc is moved into pm below, so testing pc
+        // after the move would always be false and the deep-recursion guard
+        // would never fire in GREEN. Capture the registered state first.
+        const bool pass_registered = (pc != nullptr);
+        if (pc) pm.add_pass_concept(std::move(pc));
+        auto mp = compile_tail(SRC_TAIL_RECUR, pm.empty() ? nullptr : &pm);
+        ck(mp != nullptr, "TC-DEEP: pass compile ok");
+        int64_t rp_small = mp ? call2_i64(*mp, "loop_sum", 100, 0) : -1;
+        char msg[160];
+        std::snprintf(msg, sizeof msg,
+            "TC-DEEP: loop_sum(100,0) value-preserving (baseline=%lld pass=%lld)",
+            (long long)rb, (long long)rp_small);
+        ck(rb == rp_small && rb == 5050, msg);
+        // Deep run ONLY when the pass is actually registered (GREEN). With the
+        // pass the tail recursion is a JMP, so a large N completes without stack
+        // growth. In RED pass_registered is false -> this block is skipped (no
+        // overflow). Uses the pre-move boolean, NOT the moved-from pc.
+        if (pass_registered && mp) {
+            int64_t rp_deep = call2_i64(*mp, "loop_sum", 100000, 0);
+            std::snprintf(msg, sizeof msg,
+                "TC-DEEP: deep loop_sum(100000,0) completes with pass (=%lld)",
+                (long long)rp_deep);
+            ck(rp_deep == 5000050000LL, msg);
+        }
+    }
+
+    // ─── TC-DEPTH: depth-check-enabled case — the optimized tail path must ───
+    // NOT increment call depth. Lower loop_sum with emit_depth_checks on; the
+    // lowered IR has a DepthCheck ThinInstr before each recursive CallScript.
+    // The tail-call pass marks the tail call with a transient, nonserialized
+    // is_tail_call codegen annotation (leaving the enclosing Return's ret ==
+    // the call's dst INTACT) and KEEPS the DepthCheck in the IR — the
+    // annotation is not serialized, so removing the DepthCheck would lose
+    // depth-safety across a serialize/deserialize round trip. emit_x64 skips
+    // that DepthCheck ONLY during tail emission. IR-level: the DepthCheck
+    // count is preserved, the call is marked, and the tail-eligible block's
+    // Return ret is preserved (== call dst). Runtime (guarded on the pass):
+    // with a tiny max_call_depth, the deep tail recursion completes (depth
+    // stays flat) — proving the emit-level skip does not increment depth.
+    {
+        static const char* SRC_TAIL_RECUR =
+            "fn loop_sum(n: i64, acc: i64) -> i64 { "
+            "if (n == 0) { return acc; } return loop_sum(n - 1, acc + n); }\n";
+        // IR-level: lower with depth checks on, run the pass, assert the
+        // DepthCheck preceding the tail-eligible recursive call is PRESERVED
+        // in the IR (the nonserialized annotation is emit-time only), the call
+        // is marked is_tail_call, and the tail-eligible block's Return ret is
+        // preserved (== call dst, not cleared).
+        // Lower manually (mirroring compile_tail) so we can inspect the IR.
+        auto lower_with_depth = [&](ThinFunction& thf) -> bool {
+            auto lr = tokenize(SRC_TAIL_RECUR, "<tc_depth>");
+            if (!lr.ok) return false;
+            auto pr = parse(std::move(lr.toks));
+            if (!pr.ok) return false;
+            Program prog = std::move(pr.program);
+            std::unordered_map<std::string, int> slots;
+            int si = 0;
+            for (auto& fn : prog.funcs) { slots[fn.name] = si++; fn.slot = si - 1; }
+            std::unordered_map<std::string, NativeSig> natives;
+            OpOverloadTable overloads;
+            StructLayoutTable layouts = build_struct_layouts(prog);
+            prog.string_xor_key = 0;
+            auto sr = sema(prog, natives, slots, 0, &overloads, &layouts);
+            if (!sr.ok) return false;
+            GlobalsBlock gb; gb.base = 0;
+            g_globals_for_codegen = &gb;
+            CodeGenCtx ctx;
+            ctx.globals_base = 0;
+            ctx.natives = &natives;
+            ctx.script_slots = &slots;
+            ctx.structs = &layouts;
+            ctx.use_context_reg = false;  // baked depth_ptr mode (no r14)
+            ctx.enable_ir_backend = false;
+            ctx.emit_depth_checks = true;
+            int32_t dummy_depth = 0;
+            ctx.depth_ptr = &dummy_depth;
+            ctx.max_call_depth = 4096;
+            for (auto& fn : prog.funcs) {
+                if (fn.name == "loop_sum") {
+                    thf = lower_function(fn, ctx);
+                    return !thf.blocks.empty();
+                }
+            }
+            return false;
+        };
+        ThinFunction thf;
+        bool lowered = lower_with_depth(thf);
+        ck(lowered, "TC-DEPTH: loop_sum lowered with depth checks on");
+        if (lowered) {
+            size_t dc_before = count_op(thf, ThinOp::DepthCheck);
+            size_t pair_before = count_tail_eligible_pairs(thf);
+            size_t marked_before = count_tail_marked(thf);
+            ck(dc_before >= 1, "TC-DEPTH: recursive call has a DepthCheck before tailcall");
+            ck(pair_before >= 1, "TC-DEPTH: loop_sum has an eligible tail pair before tailcall");
+            ck(marked_before == 0, "TC-DEPTH: no call marked before tailcall");
+            auto pc = reg.create("tailcall");
+            ck(pc != nullptr, "TC-DEPTH: tailcall pass registered");
+            EmberPreserved pres = EmberPreserved::all();
+            if (pc) { EmberAnalysisManager am; pres = pc->run(thf, am); }
+            ck(!pres.all_preserved(), "TC-DEPTH: tailcall transforms loop_sum (changed)");
+            size_t dc_after = count_op(thf, ThinOp::DepthCheck);
+            size_t pair_after = count_tail_eligible_pairs(thf);
+            size_t marked_after = count_tail_marked(thf);
+            // The pass does NOT dissolve the IR pair: the eligible-pair counter
+            // stays the same (ret is preserved, not cleared), and the MARKED
+            // counter goes 0 -> >=1.
+            char msg[160];
+            std::snprintf(msg, sizeof msg,
+                "TC-DEPTH: IR pair intact (ret preserved) (before=%zu after=%zu)",
+                pair_before, pair_after);
+            ck(pair_after == pair_before, msg);
+            std::snprintf(msg, sizeof msg,
+                "TC-DEPTH: recursive call marked is_tail_call (before=0 after=%zu)",
+                marked_after);
+            ck(marked_after >= 1, msg);
+            // The DepthCheck that preceded the tail-eligible recursive call is
+            // PRESERVED in the IR: the tail-call annotation is a transient,
+            // nonserialized codegen hint, so removing the DepthCheck would
+            // lose depth-safety across a serialize/deserialize round trip.
+            // emit_x64 skips it ONLY during tail emission (validated by the
+            // runtime check below).
+            std::snprintf(msg, sizeof msg,
+                "TC-DEPTH: DepthCheck preserved in IR for tail path (before=%zu after=%zu)",
+                dc_before, dc_after);
+            ck(dc_after == dc_before, msg);
+            // The tail-eligible recursive block's Return ret is UNCHANGED: the
+            // pass sets the transient is_tail_call annotation and leaves ret ==
+            // the call's dst intact, so the IR stays an ordinary call-of-
+            // return-result shape that ordinary emission handles correctly
+            // when the annotation is absent (e.g. after a round trip). This is
+            // the observable IR-level effect: ret is preserved AND the call is
+            // marked (checked via count_tail_marked above).
+            size_t preserved_ret = 0;
+            for (const auto& b : thf.blocks) {
+                if (b.term.kind != TermKind::Return) continue;
+                if (b.instrs.empty()) continue;
+                const ThinInstr& last = b.instrs.back();
+                if (last.op == ThinOp::CallScript && last.is_tail_call &&
+                    last.dst != 0 && b.term.ret == last.dst) ++preserved_ret;
+            }
+            std::snprintf(msg, sizeof msg,
+                "TC-DEPTH: tail-eligible Return ret preserved (== call dst) (count=%zu)",
+                preserved_ret);
+            ck(preserved_ret >= 1, msg);
+        }
+
+        // Runtime (guarded on the pass): with a tiny max_call_depth (16), a
+        // deep tail recursion completes ONLY if the tail path does not bump
+        // depth. Without the pass the real CALL chain would overflow depth at
+        // 16 and trap; with the pass the JMP keeps depth flat. Skipped in RED.
+        auto pc2 = reg.create("tailcall");
+        ck(pc2 != nullptr, "TC-DEPTH: tailcall pass registered (runtime)");
+        if (pc2) {
+            EmberPassManager pm;
+            pm.add_pass_concept(std::move(pc2));
+            int32_t depth_counter = 0;
+            DepthCfg dc{true, &depth_counter, 16};
+            auto mp = compile_tail(SRC_TAIL_RECUR, &pm, dc);
+            ck(mp != nullptr, "TC-DEPTH: depth-enabled pass compile ok");
+            if (mp) {
+                int64_t r = call2_i64(*mp, "loop_sum", 5000, 0);
+                char msg[160];
+                std::snprintf(msg, sizeof msg,
+                    "TC-DEPTH: deep tail recursion completes under depth limit 16 (=%lld)",
+                    (long long)r);
+                ck(r == 12502500LL, msg);
+                // The depth counter never grew past a tiny bound: the tail path
+                // does not increment call depth.
+                std::snprintf(msg, sizeof msg,
+                    "TC-DEPTH: call-depth stayed flat under tail-call (max=%d)",
+                    (int)depth_counter);
+                ck(depth_counter <= 2, msg);
+            }
+        }
+    }
+
+    // ─── TC-SER: the tail-call annotation is transient / nonserialized. ───
+    // Run tailcall on a lowered wrapper, serialize/deserialize, and confirm:
+    //   (a) is_tail_call defaults false after deserialize (NOT serialized),
+    //   (b) the Return ret is preserved across the round trip (== call dst),
+    //   (c) ordinary CALL+RET value preservation: emitting the DESERIALIZED
+    //       function WITHOUT re-running the pass returns the correct value
+    //       (the IR is still an ordinary call-of-return-result shape),
+    //   (d) successful re-annotation: re-running tailcall on the deserialized
+    //       IR re-derives the annotation (is_tail_call -> true, Preserved::none),
+    //   (e) idempotence: a third run is a no-op (Preserved::all).
+    // This is the regression test for the earlier design that CLEARED ret: a
+    // cleared ret IS serialized, so after a round trip the call was unmarked
+    // AND the return value was lost. Keeping ret unchanged fixes both.
+    {
+        static const char* SRC_TAIL_WRAPPER =
+            "fn target(x: i64) -> i64 { return x + 1; }\n"
+            "fn wrapper(x: i64) -> i64 { return target(x); }\n";
+        // Lower both functions from source (mirroring compile_tail's setup)
+        // so we can inspect/serialize wrapper's IR and re-emit it.
+        auto lr = tokenize(SRC_TAIL_WRAPPER, "<tc_ser>");
+        ck(lr.ok, "TC-SER: lex ok");
+        if (!lr.ok) { std::printf("         (lex: %s)\n", lr.error.c_str()); }
+        auto pr = parse(std::move(lr.toks));
+        ck(pr.ok, "TC-SER: parse ok");
+        if (!pr.ok) { std::printf("         (parse: %s)\n", pr.error.c_str()); }
+        Program prog = std::move(pr.program);
+        std::unordered_map<std::string, int> slots;
+        int si = 0;
+        for (auto& fn : prog.funcs) { slots[fn.name] = si++; fn.slot = si - 1; }
+        std::unordered_map<std::string, NativeSig> natives;
+        OpOverloadTable overloads;
+        StructLayoutTable layouts = build_struct_layouts(prog);
+        prog.string_xor_key = 0;
+        auto sr = sema(prog, natives, slots, 0, &overloads, &layouts);
+        ck(sr.ok, "TC-SER: sema ok");
+        if (!sr.ok) { std::printf("         (sema: %s)\n", sr.errors[0].msg.c_str()); }
+
+        GlobalsBlock gb; gb.base = 0;
+        g_globals_for_codegen = &gb;
+        auto table = std::make_unique<DispatchTable>(prog.funcs.size());
+        CodeGenCtx ctx;
+        ctx.globals_base = 0;
+        ctx.dispatch_base = int64_t(table->base());
+        ctx.natives = &natives;
+        ctx.script_slots = &slots;
+        ctx.structs = &layouts;
+        ctx.use_context_reg = false;
+        ctx.enable_ir_backend = false;
+
+        // Pull wrapper's lowered IR + compile target into the dispatch table
+        // so the round-tripped wrapper can call it.
+        bool have_wrapper = false, have_target = false;
+        ThinFunction wrapper_thf;
+        EmberAnalysisManager am;
+        for (auto& fn : prog.funcs) {
+            ThinFunction thf = lower_function(fn, ctx);
+            ck(!thf.blocks.empty(), "TC-SER: lower_function gave non-empty blocks");
+            if (fn.name == "wrapper") { wrapper_thf = std::move(thf); have_wrapper = true; continue; }
+            // Compile + install every other fn (target) into the table.
+            CompiledFn cf = emit_x64(thf, ctx);
+            ck(!cf.bytes.empty(), "TC-SER: emit_x64 gave non-empty bytes");
+            ck(finalize(cf), "TC-SER: alloc_executable ok");
+            table->set(fn.slot, cf.entry);
+            if (fn.name == "target") have_target = true;
+        }
+        ck(have_wrapper, "TC-SER: wrapper lowered");
+        ck(have_target, "TC-SER: target compiled into dispatch table");
+
+        if (have_wrapper && have_target) {
+            const VReg orig_ret = wrapper_thf.blocks.back().term.ret;
+            ck(count_tail_eligible_pairs(wrapper_thf) == 1,
+               "TC-SER: wrapper has one eligible tail pair before tailcall");
+            ck(count_tail_marked(wrapper_thf) == 0,
+               "TC-SER: no call marked before tailcall");
+
+            // Run tailcall: the call is marked, ret is preserved.
+            auto pc = reg.create("tailcall");
+            ck(pc != nullptr, "TC-SER: tailcall pass registered");
+            EmberPreserved pres = EmberPreserved::all();
+            if (pc) pres = pc->run(wrapper_thf, am);
+            ck(!pres.all_preserved(), "TC-SER: tailcall transforms wrapper (changed)");
+            ck(count_tail_marked(wrapper_thf) == 1, "TC-SER: wrapper call marked is_tail_call");
+            ck(wrapper_thf.blocks.back().term.ret == orig_ret,
+               "TC-SER: Return ret preserved after tailcall (not cleared)");
+
+            // Serialize -> deserialize. is_tail_call is NOT serialized, so the
+            // deserialized function defaults is_tail_call=false; ret IS
+            // serialized, so it is preserved across the round trip.
+            std::vector<uint8_t> blob;
+            std::string serr;
+            ck(serialize_thin_function(wrapper_thf, blob, &serr),
+               "TC-SER: serialize marked wrapper ok");
+            ThinFunction loaded;
+            const uint8_t* cur = blob.data();
+            std::string derr;
+            ck(deserialize_thin_function(cur, blob.data() + blob.size(),
+                                         "wrapper", wrapper_thf.slot, loaded, &derr),
+               "TC-SER: deserialize wrapper ok");
+            // (a) the annotation is NOT serialized.
+            ck(count_tail_marked(loaded) == 0,
+               "TC-SER: is_tail_call defaults false after deserialize (not serialized)");
+            // (b) the Return ret is preserved across the round trip.
+            ck(!loaded.blocks.empty() &&
+               loaded.blocks.back().term.kind == TermKind::Return &&
+               loaded.blocks.back().term.ret == orig_ret,
+               "TC-SER: Return ret preserved across serialize/deserialize round trip");
+            ck(count_tail_eligible_pairs(loaded) == 1,
+               "TC-SER: deserialized wrapper still eligible (dst == ret preserved)");
+
+            // (c) ordinary CALL+RET value preservation: emit the DESERIALIZED
+            // function WITHOUT re-running the pass. is_tail_call is false, so
+            // emit_x64 takes the ordinary call path (CALL + result spill +
+            // epilogue + RET) and returns the call result. Install it in the
+            // dispatch table at wrapper's slot and call wrapper(5) -> 6.
+            CompiledFn wcf = emit_x64(loaded, ctx);
+            ck(!wcf.bytes.empty(), "TC-SER: emit deserialized wrapper (no pass) ok");
+            // The ordinary path must still have a dispatch CALL + epilogue/RET
+            // (the annotation is absent), proving byte-compatibility.
+            int32_t target_slot = slots["target"];
+            ck(has_dispatch_call(wcf.bytes, target_slot),
+               "TC-SER: deserialized wrapper (no pass) has ordinary dispatch CALL");
+            ck(has_epilogue_ret(wcf.bytes),
+               "TC-SER: deserialized wrapper (no pass) has epilogue + RET");
+            ck(!has_dispatch_jmp(wcf.bytes, target_slot),
+               "TC-SER: deserialized wrapper (no pass) has NO tail JMP (annotation absent)");
+            ck(finalize(wcf), "TC-SER: alloc_executable for deserialized wrapper ok");
+            table->set(wrapper_thf.slot, wcf.entry);
+            int64_t r_no_pass = call1_i64_impl(*table, slots["wrapper"], 5);
+            char msg[160];
+            std::snprintf(msg, sizeof msg,
+                "TC-SER: deserialized wrapper (no pass) returns correct value (=%lld)",
+                (long long)r_no_pass);
+            ck(r_no_pass == 6, msg);
+
+            // (d) successful re-annotation: re-running tailcall on the
+            // deserialized IR re-derives the annotation (dst == ret still
+            // holds), and reports Preserved::none().
+            auto pc2 = reg.create("tailcall");
+            ck(pc2 != nullptr, "TC-SER: tailcall pass registered (re-annotate)");
+            EmberPreserved pres2 = EmberPreserved::all();
+            if (pc2) pres2 = pc2->run(loaded, am);
+            ck(!pres2.all_preserved(),
+               "TC-SER: re-annotation transforms deserialized wrapper (Preserved::none)");
+            ck(count_tail_marked(loaded) == 1,
+               "TC-SER: re-annotation marks the call is_tail_call again");
+            // (e) idempotence: a third run is a no-op.
+            EmberPreserved pres3 = EmberPreserved::all();
+            if (pc2) pres3 = pc2->run(loaded, am);
+            ck(pres3.all_preserved(),
+               "TC-SER: third tailcall run is a no-op (Preserved::all)");
+            ck(count_tail_marked(loaded) == 1,
+               "TC-SER: still one marked call after idempotent third run");
+
+            // The re-annotated deserialized function, when emitted, takes the
+            // tail path (dispatch JMP, no CALL/RET) — proving the round-tripped
+            // annotation drives tail emission just like the JIT-time one.
+            CompiledFn wcf2 = emit_x64(loaded, ctx);
+            ck(!wcf2.bytes.empty(), "TC-SER: emit re-annotated wrapper ok");
+            ck(has_dispatch_jmp(wcf2.bytes, target_slot),
+               "TC-SER: re-annotated wrapper has dispatch JMP (tail-call)");
+            ck(!has_dispatch_call(wcf2.bytes, target_slot),
+               "TC-SER: re-annotated wrapper has NO dispatch CALL");
+            ck(!has_epilogue_ret(wcf2.bytes),
+               "TC-SER: re-annotated wrapper has NO epilogue + RET");
+            ck(finalize(wcf2), "TC-SER: alloc_executable for re-annotated wrapper ok");
+            table->set(wrapper_thf.slot, wcf2.entry);
+            int64_t r_tail = call1_i64_impl(*table, slots["wrapper"], 5);
+            std::snprintf(msg, sizeof msg,
+                "TC-SER: re-annotated wrapper tail value-preserving (=%lld)",
+                (long long)r_tail);
+            ck(r_tail == 6, msg);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Tail-call NEGATIVE cases — shapes the pass must NOT transform.
+    // Each asserts the IR is UNCHANGED (Preserved::all() + eligible-pair count
+    // stays the same + the CallScript survives). In RED the pass is null so the
+    // IR is trivially unchanged -> these PASS (guards). In GREEN the pass must
+    // correctly refuse each shape -> these PASS meaningfully.
+    // ═══════════════════════════════════════════════════════════════════════
+    std::printf("\n--- RED: Tail-Call Optimization negative cases ---\n");
+
+    // Helper: run tailcall on a COPY, expect the IR UNCHANGED. This proves
+    // the pass made NO structural change via THREE independent checks:
+    //   (1) Preserved::all() — the pass itself reports it did nothing.
+    //   (2) A full structural IR comparison: dump(orig) vs dump(copy) must be
+    //       byte-identical. dump() serializes every block, every instruction
+    //       (dst/src1/src2/imm/all meta fields/args+arg_frame_offs/
+    //       ret_type-via-type_tag), and every terminator (kind/cond/target/
+    //       false_target/ret/trap_reason). Identical dumps => no instruction
+    //       was added/removed/rewritten and no terminator field touched. This
+    //       is strictly stronger than pair/call counts: a pass could keep the
+    //       same counts but still rewrite an instruction's operands or clear a
+    //       Return ret (both caught here).
+    //   (3) eligible-pair count + CallScript count unchanged (redundant with
+    //       the structural check but kept as a fast human-readable signal).
+    // This does NOT assert the pass is registered: a negative case is
+    // satisfied trivially when the pass is absent (RED) AND meaningfully when
+    // the pass exists but correctly refuses (GREEN). Either way the IR must be
+    // structurally unchanged.
+    auto expect_unchanged = [&](const ThinFunction& orig, const char* label) {
+        ThinFunction copy = orig;
+        const std::string dump_before = dump(orig);
+        size_t pair_before = count_tail_eligible_pairs(copy);
+        size_t call_before = count_call_script(copy);
+        auto pc = reg.create("tailcall");
+        EmberPreserved pres = EmberPreserved::all();
+        if (pc) { EmberAnalysisManager am; pres = pc->run(copy, am); }
+        char msg[200];
+        std::snprintf(msg, sizeof msg, "%s: Preserved::all() (unchanged)", label);
+        ck(pres.all_preserved(), msg);
+        // Structural IR comparison: the full dump must be byte-identical.
+        const std::string dump_after = dump(copy);
+        std::snprintf(msg, sizeof msg,
+            "%s: structural IR unchanged (dump %zu -> %zu bytes)",
+            label, dump_before.size(), dump_after.size());
+        ck(dump_before == dump_after, msg);
+        std::snprintf(msg, sizeof msg, "%s: eligible pair count unchanged (%zu->%zu)",
+                      label, pair_before, count_tail_eligible_pairs(copy));
+        ck(count_tail_eligible_pairs(copy) == pair_before, msg);
+        std::snprintf(msg, sizeof msg, "%s: CallScript count unchanged (%zu->%zu)",
+                      label, call_before, count_call_script(copy));
+        ck(count_call_script(copy) == call_before, msg);
+    };
+
+    // ─── TC-NEG-RETV: transformed/non-direct return value. The call result is ───
+    // NOT the return value — `return target(x) + 1` adds a BinOp after the
+    // call, so the call is not the tail. The CallScript is NOT the last instr
+    // and its dst != term.ret.
+    {
+        ThinFunction tf; tf.name = "not_tail_retv";
+        const VReg vX = 1, vR = 2, vS = 3;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr ci; ci.op = ThinOp::ConstInt; ci.dst = vX; ci.imm.i = 0;
+          ci.meta.width = 8; b0.instrs.push_back(std::move(ci)); }
+        { ThinInstr cs; cs.op = ThinOp::CallScript; cs.dst = vR; cs.args = {vX};
+          cs.arg_frame_offs = {-1}; cs.arg_types = {&type_i64()};
+          cs.meta.slot = 7; cs.ret_type = &type_i64(); cs.meta.width = 8;
+          b0.instrs.push_back(std::move(cs)); }
+        // BinOp after the call — the return value is vS, not vR.
+        { ThinInstr ci; ci.op = ThinOp::ConstInt; ci.dst = 4; ci.imm.i = 1;
+          ci.meta.width = 8; b0.instrs.push_back(std::move(ci)); }
+        { ThinInstr add; add.op = ThinOp::Add; add.dst = vS; add.src1 = vR; add.src2 = 4;
+          add.meta.width = 8; b0.instrs.push_back(std::move(add)); }
+        b0.term.kind = TermKind::Return; b0.term.ret = vS;  // ret != call dst
+        tf.blocks.push_back(std::move(b0));
+        tf.ret_type = &type_i64();
+        ck(count_tail_eligible_pairs(tf) == 0, "TC-NEG-RETV: not tail-eligible before (ret != call dst)");
+        expect_unchanged(tf, "TC-NEG-RETV: non-direct return value left unchanged");
+    }
+
+    // ─── TC-NEG-CALLNOTLAST: call is not the last instr (intervening work ───
+    // after it, even if term.ret == call dst). A StoreFrame after the call
+    // means the call is not the tail.
+    {
+        ThinFunction tf; tf.name = "not_tail_last";
+        const VReg vX = 1, vR = 2;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr ci; ci.op = ThinOp::ConstInt; ci.dst = vX; ci.imm.i = 0;
+          ci.meta.width = 8; b0.instrs.push_back(std::move(ci)); }
+        { ThinInstr cs; cs.op = ThinOp::CallScript; cs.dst = vR; cs.args = {vX};
+          cs.arg_frame_offs = {-1}; cs.arg_types = {&type_i64()};
+          cs.meta.slot = 7; cs.ret_type = &type_i64(); cs.meta.width = 8;
+          b0.instrs.push_back(std::move(cs)); }
+        // Intervening store after the call (side effect) — call is not the tail.
+        { ThinInstr st; st.op = ThinOp::StoreFrame; st.src1 = vR; st.meta.frame_off = -8;
+          st.meta.width = 8; b0.instrs.push_back(std::move(st)); }
+        // Reload the stored value into the return vreg so term.ret == vR but
+        // the call is NOT the last instr.
+        { ThinInstr ld; ld.op = ThinOp::LoadFrame; ld.dst = vR; ld.meta.frame_off = -8;
+          ld.meta.width = 8; b0.instrs.push_back(std::move(ld)); }
+        b0.term.kind = TermKind::Return; b0.term.ret = vR;
+        tf.blocks.push_back(std::move(b0));
+        tf.ret_type = &type_i64();
+        ck(count_tail_eligible_pairs(tf) == 0, "TC-NEG-CALLNOTLAST: not eligible (call not last instr)");
+        expect_unchanged(tf, "TC-NEG-CALLNOTLAST: call with trailing work left unchanged");
+    }
+
+    // ─── TC-NEG-MANYARGS: more than four ABI words (5 scalar i64 args) — the ───
+    // Win64 register ABI only passes 4 GP words; a 5th spills to the stack,
+    // which a tail JMP cannot preserve. The pass must refuse.
+    {
+        ThinFunction tf; tf.name = "too_many_args";
+        const VReg a0=1,a1=2,a2=3,a3=4,a4=5, vR=6;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=0; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(a0)); b0.instrs.push_back(ci(a1)); b0.instrs.push_back(ci(a2));
+        b0.instrs.push_back(ci(a3)); b0.instrs.push_back(ci(a4));
+        { ThinInstr cs; cs.op = ThinOp::CallScript; cs.dst = vR;
+          cs.args = {a0,a1,a2,a3,a4};  // 5 words > 4
+          cs.arg_frame_offs = {-1,-1,-1,-1,-1};
+          cs.arg_types = {&type_i64(),&type_i64(),&type_i64(),&type_i64(),&type_i64()};
+          cs.meta.slot = 7; cs.ret_type = &type_i64(); cs.meta.width = 8;
+          b0.instrs.push_back(std::move(cs)); }
+        b0.term.kind = TermKind::Return; b0.term.ret = vR;
+        tf.blocks.push_back(std::move(b0));
+        tf.ret_type = &type_i64();
+        ck(count_tail_eligible_pairs(tf) == 1, "TC-NEG-MANYARGS: eligible shape before (5 args)");
+        expect_unchanged(tf, "TC-NEG-MANYARGS: >4 ABI words left unchanged");
+    }
+
+    // ─── TC-NEG-SLICEARG: a slice arg is 2 words but a slice CALLEE may need ───
+    // the caller's frame-backed slice memory to remain valid across the JMP.
+    // Conservatively, ANY slice/aggregate arg (a stack-memory-backed operand)
+    // makes the call non-tail. Here one slice arg (ptr,len = 2 words) + one i64
+    // = 3 ABI words but the slice ptr points at a caller-local buffer -> refuse.
+    // The slice arg is encoded per the Thin IR call convention: arg_types[0]
+    // is a slice type covering the {ptr,len} vreg pair, arg_types[2] is i64.
+    {
+        ThinFunction tf; tf.name = "slice_arg";
+        auto slice_ty = std::make_shared<Type>();
+        slice_ty->prim = Prim::I64; slice_ty->is_slice = true;
+        slice_ty->elem = std::make_shared<Type>(); slice_ty->elem->prim = Prim::I64;
+        tf.owned_types.push_back(slice_ty);
+        const VReg vPtr=1, vLen=2, vK=3, vR=4;
+        ThinBlock b0; b0.id = 0;
+        auto ci = [&](VReg d, int64_t i)->ThinInstr { ThinInstr x; x.op=ThinOp::ConstInt; x.dst=d; x.imm.i=i; x.meta.width=8; return x; };
+        b0.instrs.push_back(ci(vPtr, 0));
+        b0.instrs.push_back(ci(vLen, 0));
+        b0.instrs.push_back(ci(vK, 0));
+        { ThinInstr cs; cs.op = ThinOp::CallScript; cs.dst = vR;
+          cs.args = {vPtr, vLen, vK};  // slice = {ptr,len} (2 words) + i64 = 3 words
+          cs.arg_frame_offs = {-1,-1,-1};
+          cs.arg_types = {slice_ty.get(), slice_ty.get(), &type_i64()};
+          cs.meta.slot = 7; cs.ret_type = &type_i64(); cs.meta.width = 8;
+          b0.instrs.push_back(std::move(cs)); }
+        b0.term.kind = TermKind::Return; b0.term.ret = vR;
+        tf.blocks.push_back(std::move(b0));
+        tf.ret_type = &type_i64();
+        ck(count_tail_eligible_pairs(tf) == 1, "TC-NEG-SLICEARG: eligible shape before (slice arg)");
+        expect_unchanged(tf, "TC-NEG-SLICEARG: slice (stack-backed) arg left unchanged");
+    }
+
+    // ─── TC-NEG-NATIVE: a CallNative is never a tail-JMP target (the native ───
+    // has a different ABI / is not dispatched through the script table).
+    {
+        ThinFunction tf; tf.name = "native_tail";
+        const VReg vX = 1, vR = 2;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr ci; ci.op = ThinOp::ConstInt; ci.dst = vX; ci.imm.i = 0;
+          ci.meta.width = 8; b0.instrs.push_back(std::move(ci)); }
+        { ThinInstr cs; cs.op = ThinOp::CallNative; cs.dst = vR; cs.args = {vX};
+          cs.arg_frame_offs = {-1}; cs.arg_types = {&type_i64()};
+          cs.meta.native_name = "some_native"; cs.ret_type = &type_i64(); cs.meta.width = 8;
+          b0.instrs.push_back(std::move(cs)); }
+        b0.term.kind = TermKind::Return; b0.term.ret = vR;
+        tf.blocks.push_back(std::move(b0));
+        tf.ret_type = &type_i64();
+        ck(count_tail_eligible_pairs(tf) == 0, "TC-NEG-NATIVE: CallNative is not tail-eligible (not CallScript)");
+        expect_unchanged(tf, "TC-NEG-NATIVE: CallNative (not a script call) left unchanged");
+    }
+
+    // ─── TC-NEG-INDIRECT: a CallIndirect (fn handle / lambda) is not a ───
+    // direct script call -> not tail-eligible.
+    {
+        ThinFunction tf; tf.name = "indirect_tail";
+        const VReg vH = 1, vR = 2;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr ci; ci.op = ThinOp::ConstInt; ci.dst = vH; ci.imm.i = 0;
+          ci.meta.width = 8; b0.instrs.push_back(std::move(ci)); }
+        { ThinInstr cs; cs.op = ThinOp::CallIndirect; cs.dst = vR; cs.src1 = vH;
+          cs.args = {}; cs.arg_frame_offs = {}; cs.arg_types = {};
+          cs.meta.base_kind = AbsFixup::DispatchTableBase; cs.ret_type = &type_i64(); cs.meta.width = 8;
+          b0.instrs.push_back(std::move(cs)); }
+        b0.term.kind = TermKind::Return; b0.term.ret = vR;
+        tf.blocks.push_back(std::move(b0));
+        tf.ret_type = &type_i64();
+        ck(count_tail_eligible_pairs(tf) == 0, "TC-NEG-INDIRECT: CallIndirect not tail-eligible");
+        expect_unchanged(tf, "TC-NEG-INDIRECT: indirect call left unchanged");
+    }
+
+    // ─── TC-NEG-XMOD: a CallCrossModule is not a same-module script call -> ───
+    // not tail-eligible (the dispatch is through the module registry, not the
+    // local table).
+    {
+        ThinFunction tf; tf.name = "xmod_tail";
+        const VReg vX = 1, vR = 2;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr ci; ci.op = ThinOp::ConstInt; ci.dst = vX; ci.imm.i = 0;
+          ci.meta.width = 8; b0.instrs.push_back(std::move(ci)); }
+        { ThinInstr cs; cs.op = ThinOp::CallCrossModule; cs.dst = vR; cs.args = {vX};
+          cs.arg_frame_offs = {-1}; cs.arg_types = {&type_i64()};
+          cs.meta.mod_id = 2; cs.meta.slot = 0;
+          cs.meta.base_kind = AbsFixup::ModuleRegistryBase; cs.ret_type = &type_i64(); cs.meta.width = 8;
+          b0.instrs.push_back(std::move(cs)); }
+        b0.term.kind = TermKind::Return; b0.term.ret = vR;
+        tf.blocks.push_back(std::move(b0));
+        tf.ret_type = &type_i64();
+        ck(count_tail_eligible_pairs(tf) == 0, "TC-NEG-XMOD: CallCrossModule not tail-eligible");
+        expect_unchanged(tf, "TC-NEG-XMOD: cross-module call left unchanged");
+    }
+
+    // ─── TC-NEG-AGGRET: an aggregate (struct) return is not a scalar tail — ───
+    // the callee returns through a hidden pointer, so the caller's frame must
+    // stay alive. The call dst == 0 (aggregate) and term.ret is a hidden-ptr
+    // load -> not tail-eligible. Use a hand-built struct return shape.
+    {
+        ThinFunction tf; tf.name = "aggret_tail";
+        // Build a named struct type so ret_type looks like a struct return.
+        auto st = std::make_shared<Type>();
+        st->prim = Prim::Void; st->struct_name = "Pt";
+        tf.owned_types.push_back(st);
+        const VReg vHptr = 1;
+        ThinBlock b0; b0.id = 0;
+        // Load the hidden return ptr (simulating the incoming hidden arg).
+        { ThinInstr ld; ld.op = ThinOp::LoadFrame; ld.dst = vHptr; ld.meta.frame_off = -16;
+          ld.meta.width = 8; b0.instrs.push_back(std::move(ld)); }
+        // Aggregate-returning call: dst == 0 (struct-by-ptr), args[0] = hidden ptr.
+        { ThinInstr cs; cs.op = ThinOp::CallScript; cs.dst = 0; cs.args = {vHptr};
+          cs.arg_frame_offs = {-1}; cs.arg_types = {&type_i64()};
+          cs.meta.slot = 7; cs.meta.type = st.get(); cs.ret_type = st.get();
+          b0.instrs.push_back(std::move(cs)); }
+        // Return the hidden ptr (struct-by-ptr ABI: rax = hidden ptr).
+        b0.term.kind = TermKind::Return; b0.term.ret = vHptr;
+        tf.blocks.push_back(std::move(b0));
+        tf.ret_type = st.get();
+        tf.frame.returns_struct_by_ptr = true;
+        tf.frame.struct_ret_ptr_offset = -16;
+        ck(count_tail_eligible_pairs(tf) == 0, "TC-NEG-AGGRET: aggregate-return call not tail-eligible (dst==0)");
+        expect_unchanged(tf, "TC-NEG-AGGRET: aggregate return left unchanged");
+    }
+
+    // ─── TC-NEG-INCOMPAT: incompatible scalar return — the call returns f64 ───
+    // but the function returns i64 (or vice versa). The tail JMP would deliver
+    // the result in the wrong register (xmm0 vs rax) -> refuse. Here ret_type
+    // is i64 but the call's ret_type is f64.
+    {
+        ThinFunction tf; tf.name = "incompat_ret";
+        const VReg vX = 1, vR = 2;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr ci; ci.op = ThinOp::ConstInt; ci.dst = vX; ci.imm.i = 0;
+          ci.meta.width = 8; b0.instrs.push_back(std::move(ci)); }
+        { ThinInstr cs; cs.op = ThinOp::CallScript; cs.dst = vR; cs.args = {vX};
+          cs.arg_frame_offs = {-1}; cs.arg_types = {&type_i64()};
+          cs.meta.slot = 7; cs.ret_type = &type_f64(); cs.meta.is_f32 = 0; cs.meta.width = 8;
+          b0.instrs.push_back(std::move(cs)); }
+        b0.term.kind = TermKind::Return; b0.term.ret = vR;
+        tf.blocks.push_back(std::move(b0));
+        tf.ret_type = &type_i64();  // function returns i64, call returns f64 -> mismatch
+        ck(count_tail_eligible_pairs(tf) == 1, "TC-NEG-INCOMPAT: shape looks eligible before (type mismatch)");
+        expect_unchanged(tf, "TC-NEG-INCOMPAT: incompatible return type left unchanged");
+    }
+
+    // ─── TC-NEG-TRY: a function containing any TryCatch/CatchCleanup/ ───
+    // CatchEntry/Throw must remain unchanged (a tail JMP would skip the catch ───
+    // unwinding / setjmp restore). Build an eligible tail pair in a function
+    // that ALSO has a TryCatch barrier in an earlier block.
+    {
+        ThinFunction tf; tf.name = "try_tail";
+        const VReg vX = 1, vR = 2;
+        // block0: a TryCatch barrier (opaque to the pass).
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr tc; tc.op = ThinOp::TryCatch; tc.meta.slot = 2; tc.meta.frame_off = -32;
+          tc.meta.width = 8; b0.instrs.push_back(std::move(tc)); }
+        b0.term.kind = TermKind::Jmp; b0.term.target = 1;
+        tf.blocks.push_back(std::move(b0));
+        // block1: an eligible tail pair — BUT the function has a TryCatch, so
+        // the whole function must be left unchanged.
+        ThinBlock b1; b1.id = 1;
+        { ThinInstr ci; ci.op = ThinOp::ConstInt; ci.dst = vX; ci.imm.i = 0;
+          ci.meta.width = 8; b1.instrs.push_back(std::move(ci)); }
+        { ThinInstr cs; cs.op = ThinOp::CallScript; cs.dst = vR; cs.args = {vX};
+          cs.arg_frame_offs = {-1}; cs.arg_types = {&type_i64()};
+          cs.meta.slot = 7; cs.ret_type = &type_i64(); cs.meta.width = 8;
+          b1.instrs.push_back(std::move(cs)); }
+        b1.term.kind = TermKind::Return; b1.term.ret = vR;
+        tf.blocks.push_back(std::move(b1));
+        tf.ret_type = &type_i64();
+        ck(has_exception_op(tf), "TC-NEG-TRY: function has a TryCatch barrier");
+        ck(count_tail_eligible_pairs(tf) == 1, "TC-NEG-TRY: an eligible pair exists (but function has try)");
+        expect_unchanged(tf, "TC-NEG-TRY: function with TryCatch left unchanged");
+    }
+
+    // ─── TC-NEG-THROW: a Throw anywhere in the function also blocks the ───
+    // transform (same barrier reason).
+    {
+        ThinFunction tf; tf.name = "throw_tail";
+        const VReg vX = 1, vR = 2, vThrow = 3;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr ci; ci.op = ThinOp::ConstInt; ci.dst = vThrow; ci.imm.i = 99;
+          ci.meta.width = 8; b0.instrs.push_back(std::move(ci)); }
+        { ThinInstr t; t.op = ThinOp::Throw; t.src1 = vThrow; t.meta.width = 8;
+          b0.instrs.push_back(std::move(t)); }
+        { ThinInstr ci; ci.op = ThinOp::ConstInt; ci.dst = vX; ci.imm.i = 0;
+          ci.meta.width = 8; b0.instrs.push_back(std::move(ci)); }
+        { ThinInstr cs; cs.op = ThinOp::CallScript; cs.dst = vR; cs.args = {vX};
+          cs.arg_frame_offs = {-1}; cs.arg_types = {&type_i64()};
+          cs.meta.slot = 7; cs.ret_type = &type_i64(); cs.meta.width = 8;
+          b0.instrs.push_back(std::move(cs)); }
+        b0.term.kind = TermKind::Return; b0.term.ret = vR;
+        tf.blocks.push_back(std::move(b0));
+        tf.ret_type = &type_i64();
+        ck(has_exception_op(tf), "TC-NEG-THROW: function has a Throw barrier");
+        ck(count_tail_eligible_pairs(tf) == 1, "TC-NEG-THROW: an eligible pair exists (but function has throw)");
+        expect_unchanged(tf, "TC-NEG-THROW: function with Throw left unchanged");
+    }
+
+    // ─── TC-NEG-CATCHENTRY: CatchEntry (the catch-block prologue) alone is ───
+    // an exception barrier. A function with a CatchEntry (but NO CatchCleanup,
+    // no TryCatch, no Throw) must remain unchanged even if a later block has
+    // an eligible tail pair — tested INDEPENDENTLY from CatchCleanup so a pass
+    // that only guards the pair cannot slip through.
+    {
+        ThinFunction tf; tf.name = "catchentry_tail";
+        const VReg vX = 1, vR = 2;
+        // block0: CatchEntry ONLY (no TryCatch/CatchCleanup/Throw anywhere).
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr ce; ce.op = ThinOp::CatchEntry; ce.meta.frame_off = -40;
+          ce.meta.width = 8; b0.instrs.push_back(std::move(ce)); }
+        b0.term.kind = TermKind::Jmp; b0.term.target = 1;
+        tf.blocks.push_back(std::move(b0));
+        // block1: an eligible tail pair — BUT the function has a CatchEntry,
+        // so the whole function must be left unchanged.
+        ThinBlock b1; b1.id = 1;
+        { ThinInstr ci; ci.op = ThinOp::ConstInt; ci.dst = vX; ci.imm.i = 0;
+          ci.meta.width = 8; b1.instrs.push_back(std::move(ci)); }
+        { ThinInstr cs; cs.op = ThinOp::CallScript; cs.dst = vR; cs.args = {vX};
+          cs.arg_frame_offs = {-1}; cs.arg_types = {&type_i64()};
+          cs.meta.slot = 7; cs.ret_type = &type_i64(); cs.meta.width = 8;
+          b1.instrs.push_back(std::move(cs)); }
+        b1.term.kind = TermKind::Return; b1.term.ret = vR;
+        tf.blocks.push_back(std::move(b1));
+        tf.ret_type = &type_i64();
+        // Prove this case is INDEPENDENT: it has CatchEntry but none of the
+        // other three exception ops.
+        size_t n_ce = 0, n_cc = 0, n_tc = 0, n_th = 0;
+        for (const auto& b : tf.blocks) for (const auto& in : b.instrs) {
+            if (in.op == ThinOp::CatchEntry) ++n_ce;
+            else if (in.op == ThinOp::CatchCleanup) ++n_cc;
+            else if (in.op == ThinOp::TryCatch) ++n_tc;
+            else if (in.op == ThinOp::Throw) ++n_th;
+        }
+        ck(n_ce == 1, "TC-NEG-CATCHENTRY: has exactly one CatchEntry");
+        ck(n_cc == 0, "TC-NEG-CATCHENTRY: has NO CatchCleanup (independent)");
+        ck(n_tc == 0, "TC-NEG-CATCHENTRY: has NO TryCatch (independent)");
+        ck(n_th == 0, "TC-NEG-CATCHENTRY: has NO Throw (independent)");
+        ck(has_exception_op(tf), "TC-NEG-CATCHENTRY: function has a CatchEntry barrier");
+        ck(count_tail_eligible_pairs(tf) == 1, "TC-NEG-CATCHENTRY: an eligible pair exists (but function has CatchEntry)");
+        expect_unchanged(tf, "TC-NEG-CATCHENTRY: function with CatchEntry alone left unchanged");
+    }
+
+    // ─── TC-NEG-CATCHCLEANUP: CatchCleanup (the try-completion pop) alone is ───
+    // an exception barrier. A function with a CatchCleanup (but NO CatchEntry,
+    // no TryCatch, no Throw) must remain unchanged even if a later block has
+    // an eligible tail pair — tested INDEPENDENTLY from CatchEntry.
+    {
+        ThinFunction tf; tf.name = "catchcleanup_tail";
+        const VReg vX = 1, vR = 2;
+        // block0: CatchCleanup ONLY (no TryCatch/CatchEntry/Throw anywhere).
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr cc; cc.op = ThinOp::CatchCleanup; cc.imm.i = 1; cc.meta.width = 8;
+          b0.instrs.push_back(std::move(cc)); }
+        b0.term.kind = TermKind::Jmp; b0.term.target = 1;
+        tf.blocks.push_back(std::move(b0));
+        // block1: an eligible tail pair — BUT the function has a CatchCleanup,
+        // so the whole function must be left unchanged.
+        ThinBlock b1; b1.id = 1;
+        { ThinInstr ci; ci.op = ThinOp::ConstInt; ci.dst = vX; ci.imm.i = 0;
+          ci.meta.width = 8; b1.instrs.push_back(std::move(ci)); }
+        { ThinInstr cs; cs.op = ThinOp::CallScript; cs.dst = vR; cs.args = {vX};
+          cs.arg_frame_offs = {-1}; cs.arg_types = {&type_i64()};
+          cs.meta.slot = 7; cs.ret_type = &type_i64(); cs.meta.width = 8;
+          b1.instrs.push_back(std::move(cs)); }
+        b1.term.kind = TermKind::Return; b1.term.ret = vR;
+        tf.blocks.push_back(std::move(b1));
+        tf.ret_type = &type_i64();
+        // Prove this case is INDEPENDENT: it has CatchCleanup but none of the
+        // other three exception ops.
+        size_t n_ce = 0, n_cc = 0, n_tc = 0, n_th = 0;
+        for (const auto& b : tf.blocks) for (const auto& in : b.instrs) {
+            if (in.op == ThinOp::CatchEntry) ++n_ce;
+            else if (in.op == ThinOp::CatchCleanup) ++n_cc;
+            else if (in.op == ThinOp::TryCatch) ++n_tc;
+            else if (in.op == ThinOp::Throw) ++n_th;
+        }
+        ck(n_cc == 1, "TC-NEG-CATCHCLEANUP: has exactly one CatchCleanup");
+        ck(n_ce == 0, "TC-NEG-CATCHCLEANUP: has NO CatchEntry (independent)");
+        ck(n_tc == 0, "TC-NEG-CATCHCLEANUP: has NO TryCatch (independent)");
+        ck(n_th == 0, "TC-NEG-CATCHCLEANUP: has NO Throw (independent)");
+        ck(has_exception_op(tf), "TC-NEG-CATCHCLEANUP: function has a CatchCleanup barrier");
+        ck(count_tail_eligible_pairs(tf) == 1, "TC-NEG-CATCHCLEANUP: an eligible pair exists (but function has CatchCleanup)");
+        expect_unchanged(tf, "TC-NEG-CATCHCLEANUP: function with CatchCleanup alone left unchanged");
+    }
+
+    // ─── TC-NEG-ZEROARG: an argument with args[i] == 0 (an invalid vreg — ───
+    // also the struct-by-value sentinel / hidden-return dest encoding) must be
+    // rejected even when arg_frame_offs[i] == -1. The earlier design only
+    // rejected args[i]==0 when afo != -1, letting a bare zero vreg slip through
+    // as a "register word". This shape looks eligible by the pair counter but
+    // must NOT be marked.
+    {
+        ThinFunction tf; tf.name = "zero_arg";
+        const VReg vR = 2;
+        ThinBlock b0; b0.id = 0;
+        // arg 0 is args[0] == 0 with arg_frame_offs[0] == -1 (a malformed /
+        // invalid operand, NOT a struct-by-value sentinel which would carry a
+        // frame offset). The pass must reject it.
+        { ThinInstr cs; cs.op = ThinOp::CallScript; cs.dst = vR;
+          cs.args = {0};
+          cs.arg_frame_offs = {-1}; cs.arg_types = {&type_i64()};
+          cs.meta.slot = 7; cs.ret_type = &type_i64(); cs.meta.width = 8;
+          b0.instrs.push_back(std::move(cs)); }
+        b0.term.kind = TermKind::Return; b0.term.ret = vR;
+        tf.blocks.push_back(std::move(b0));
+        tf.ret_type = &type_i64();
+        ck(count_tail_eligible_pairs(tf) == 1,
+           "TC-NEG-ZEROARG: shape looks eligible before (args[0]==0)");
+        expect_unchanged(tf, "TC-NEG-ZEROARG: invalid vreg arg (args[i]==0) left unchanged");
+    }
+
+    // ─── TC-NEG-FRAMEOFF: a scalar argument carrying a non-(-1) ───
+    // arg_frame_offs is a memory/stack operand, not a register word. A scalar
+    // register word never carries a frame offset; the pass must reject it (a
+    // tail JMP cannot keep a caller-frame-backed operand alive).
+    {
+        ThinFunction tf; tf.name = "frameoff_arg";
+        const VReg vX = 1, vR = 2;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr ci; ci.op = ThinOp::ConstInt; ci.dst = vX; ci.imm.i = 0;
+          ci.meta.width = 8; b0.instrs.push_back(std::move(ci)); }
+        // vX is a scalar i64 but arg_frame_offs[0] = -16 (a frame-backed /
+        // memory operand) — the pass must reject it.
+        { ThinInstr cs; cs.op = ThinOp::CallScript; cs.dst = vR; cs.args = {vX};
+          cs.arg_frame_offs = {-16}; cs.arg_types = {&type_i64()};
+          cs.meta.slot = 7; cs.ret_type = &type_i64(); cs.meta.width = 8;
+          b0.instrs.push_back(std::move(cs)); }
+        b0.term.kind = TermKind::Return; b0.term.ret = vR;
+        tf.blocks.push_back(std::move(b0));
+        tf.ret_type = &type_i64();
+        ck(count_tail_eligible_pairs(tf) == 1,
+           "TC-NEG-FRAMEOFF: shape looks eligible before (scalar with frame off)");
+        expect_unchanged(tf, "TC-NEG-FRAMEOFF: scalar arg with non-(-1) frame_off left unchanged");
+    }
+
+    // ─── TC-NEG-ARGMETA: inconsistent parallel argument metadata ───
+    // (arg_types / arg_frame_offs shorter than args) must be rejected as
+    // malformed rather than treated as register-only. The lowering always
+    // populates the three vectors in lockstep; a mismatch is a structural
+    // defect and the pass must refuse instead of guessing.
+    {
+        ThinFunction tf; tf.name = "argmeta_mismatch";
+        const VReg vX = 1, vR = 2;
+        ThinBlock b0; b0.id = 0;
+        { ThinInstr ci; ci.op = ThinOp::ConstInt; ci.dst = vX; ci.imm.i = 0;
+          ci.meta.width = 8; b0.instrs.push_back(std::move(ci)); }
+        // args has 1 entry but arg_types is EMPTY (missing type). The pass
+        // must reject the inconsistent metadata, NOT treat the arg as a
+        // register-only word.
+        { ThinInstr cs; cs.op = ThinOp::CallScript; cs.dst = vR; cs.args = {vX};
+          cs.arg_frame_offs = {-1}; cs.arg_types = {};  // shorter than args
+          cs.meta.slot = 7; cs.ret_type = &type_i64(); cs.meta.width = 8;
+          b0.instrs.push_back(std::move(cs)); }
+        b0.term.kind = TermKind::Return; b0.term.ret = vR;
+        tf.blocks.push_back(std::move(b0));
+        tf.ret_type = &type_i64();
+        ck(count_tail_eligible_pairs(tf) == 1,
+           "TC-NEG-ARGMETA: shape looks eligible before (missing arg type)");
+        expect_unchanged(tf, "TC-NEG-ARGMETA: inconsistent arg metadata left unchanged");
+    }
+
+    // ─── TC-NEG-SRC: source-level negative — `return target(x) + 1` is not a ───
+    // tail call (BinOp after the call). Lowered from source, the pass must ───
+    // leave it unchanged (value-preserving too).
+    {
+        static const char* SRC_NOT_TAIL =
+            "fn target(x: i64) -> i64 { return x + 1; }\n"
+            "fn wrapper(x: i64) -> i64 { return target(x) + 1; }\n";
+        auto mb = compile_tail(SRC_NOT_TAIL, nullptr);
+        ck(mb != nullptr, "TC-NEG-SRC: baseline compiles");
+        int64_t rb = mb ? call1_i64(*mb, "wrapper", 5) : -1;  // (5+1)+1 = 7
+        EmberPassManager pm;
+        auto pc = reg.create("tailcall");
+        if (pc) pm.add_pass_concept(std::move(pc));
+        auto mp = compile_tail(SRC_NOT_TAIL, pm.empty() ? nullptr : &pm);
+        ck(mp != nullptr, "TC-NEG-SRC: pass compile ok");
+        int64_t rp = mp ? call1_i64(*mp, "wrapper", 5) : -1;
+        char msg[160];
+        std::snprintf(msg, sizeof msg,
+            "TC-NEG-SRC: non-tail wrapper value-preserving & unchanged (b=%lld p=%lld)",
+            (long long)rb, (long long)rp);
+        ck(rb == rp && rb == 7, msg);
     }
 
     std::printf("\n%s\n", g_fail ? "FAIL" : "PASS");

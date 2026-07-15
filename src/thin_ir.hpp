@@ -266,6 +266,37 @@ struct ThinInstr {
                                      // meta.native_name at load time.
     Loc loc{};                       // source location for debug / errors
                                      // (AST-free otherwise).
+    // CODEGEN ANNOTATION — NOT SERIALIZED. Set by the tailcall IR pass on a
+    // direct tail-position CallScript (a block's final instr whose nonzero
+    // dst is the enclosing Return terminator's ret, with a register-only
+    // argument ABI and a compatible primitive scalar return type). It is a
+    // transient, JIT-time hint consumed ONLY by emit_x64: when the emitter
+    // sees a marked final CallScript plus a Return terminator, it emits one
+    // tail-emission unit (marshal args, restore callee-saved regs + rbx,
+    // tear down rsp/rbp, JMP to the script target) instead of a CALL + result
+    // spill + epilogue + RET.
+    //
+    // The pass does NOT rewrite the call or the Return: the CallScript and
+    // its enclosing Return (with ret == the call's dst) are left INTACT in
+    // the IR. Idempotence therefore depends on this flag alone — a second run
+    // sees is_tail_call already set and reports Preserved::all() without
+    // touching the (unchanged) ret. This is what makes the annotation safe
+    // across a serialize/deserialize round trip: the serializer never reads
+    // or writes is_tail_call, so a deserialized ThinFunction has
+    // is_tail_call=false and a Return ret that still equals the call's dst;
+    // re-running the pass re-derives the annotation (dst == ret still holds),
+    // and if the host does NOT re-run the pass the ordinary CALL + RET path
+    // emits unchanged and returns the correct value. Clearing ret (an earlier
+    // design) broke both properties: the cleared ret IS serialized, so after
+    // a round trip the call was unmarked AND the return value was lost.
+    //
+    // It is intentionally NOT part of the .em format (thin_ir_ser.cpp never
+    // reads or writes it), which keeps the stable ThinOp numeric IDs and the
+    // .em byte layout unchanged. The pass keeps the call's preceding
+    // DepthCheck in the IR (the annotation is nonserialized, so removing the
+    // DepthCheck would lose depth-safety across a round trip); emit_x64 skips
+    // that DepthCheck ONLY during tail emission.
+    bool is_tail_call = false;
 };
 
 // Block terminator. Every ThinBlock has term.kind != TermKind::None (the

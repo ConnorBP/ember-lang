@@ -1,6 +1,6 @@
 // ext_opt.hpp — Stage C: the IR optimization passes extension.
 //
-// Seventeen IR→IR optimization passes over ThinFunction, registered by name via
+// Eighteen IR→IR optimization passes over ThinFunction, registered by name via
 // register_passes (the extension-style discovery pattern, mirroring
 // register_natives). The host wires it:
 //   EmberPassRegistry reg;
@@ -88,8 +88,32 @@
 //   storage-free). Arithmetic identities remain handled by instcombine.
 // - BranchFoldingPass ("branch_folding"): replaces a conditional Branch whose
 //   true and false targets are identical with an unconditional Jmp.
+// - TailCallPass ("tailcall"): marks a direct same-module tail CallScript
+//   (a CallScript that is a block's final instr whose nonzero dst is the
+//   enclosing Return's ret, with a register-only argument ABI of at most the
+//   four Win64 register words, no slice/lambda/struct/hidden-return/unknown/
+//   stack operands, compatible primitive scalar return types between the call
+//   and the enclosing function, and no TryCatch/CatchCleanup/CatchEntry/Throw
+//   anywhere in the function) with a transient, nonserialized is_tail_call
+//   codegen annotation. It does NOT rewrite the call or the Return: the
+//   CallScript and its enclosing Return (ret == the call's dst) stay intact,
+//   so idempotence depends on is_tail_call alone (a second run is a no-op).
+//   emit_x64 recognizes the marked final call + Return as one tail-emission
+//   unit: it marshals the register-only args with the existing ABI machinery,
+//   skips the call's immediately preceding DepthCheck (a tail JMP must not
+//   bump call depth), restores every regalloc-used callee-saved register plus
+//   rbx, tears down rsp/rbp, and emits an indirect JMP to the script dispatch
+//   target with no CALL, no result spill, no depth-leave, no RET, and no
+//   return-value normalization. Native, indirect, cross-module, aggregate-
+//   return, void/non-direct, mismatched-type, and otherwise uncertain calls
+//   are left unchanged. The annotation is NOT serialized (a deserialized
+//   function re-derives it by re-running the pass; if the host does not, the
+//   ordinary CALL + RET path emits unchanged and returns the correct value),
+//   and stable ThinOp numeric IDs / the .em format are untouched. Returns
+//   Preserved::none() when a new annotation is made, Preserved::all() on a
+//   no-op.
 //
-// All seventeen are VALUE-PRESERVING: after the pass, emit_x64 produces the same
+// All eighteen are VALUE-PRESERVING: after the pass, emit_x64 produces the same
 // i64 result. They return EmberPreserved::none() if they changed the IR,
 // Preserved::all() if they did nothing.
 #pragma once
@@ -182,6 +206,11 @@ struct PeepholePass : EmberPassInfoMixin<PeepholePass> {
 
 struct BranchFoldingPass : EmberPassInfoMixin<BranchFoldingPass> {
     static constexpr const char* pass_name = "branch_folding";
+    EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
+};
+
+struct TailCallPass : EmberPassInfoMixin<TailCallPass> {
+    static constexpr const char* pass_name = "tailcall";
     EmberPreserved run(ThinFunction& f, EmberAnalysisManager& am);
 };
 

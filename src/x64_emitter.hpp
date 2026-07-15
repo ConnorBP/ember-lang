@@ -429,6 +429,27 @@ public:
         byte(modrm(0b11, Reg(4), r));
     }
 
+    // jmp [r64 + disp32] (indirect jump through memory, e.g. a dispatch-table
+    // slot for a tail-call). FF /4 with mod=10 disp32, base=base — the JMP
+    // form of call_mem (FF /2). Mirrors call_mem's encoding with the /4
+    // opcode extension so a tail-call to the same dispatch slot emits the
+    // JMP of the CALL.
+    //   REX.B when base is an extended register (r11 -> 0x41).
+    //   ModRM = mod=10 | reg=4(/4) | rm=base. r11 -> 0xA3.
+    //   rsp/r12 (rm=4) need a SIB byte (base=4, index=none=4, scale=0).
+    // For base=r11, disp=slot*8: 41 FF A3 <slot*8 LE imm32>.
+    void jmp_mem(Reg base, int32_t disp) {
+        if (is_extended(base)) byte(rex(false, false, false, true));
+        byte(0xFF);
+        if ((uint8_t(base) & 7) == 4) {  // rsp/r12 need a SIB byte
+            byte(modrm(0b10, Reg(4), Reg(4)));
+            byte(0x24);
+        } else {
+            byte(modrm(0b10, Reg(4), base));
+        }
+        imm32(disp);
+    }
+
     // script->native call: mov rax, imm64; call rax
     void call_imm64(int64_t target) {
         mov_reg_imm64(Reg::rax, target);

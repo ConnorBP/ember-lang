@@ -273,6 +273,7 @@ std::string dump(const ThinFunction& f) {
                 out += " ret:";
                 out += type_tag(in.ret_type);
             }
+            if (in.is_tail_call) out += " [tail-call]";
             out += "  @line ";
             out += std::to_string(in.loc.line);
             out += ":";

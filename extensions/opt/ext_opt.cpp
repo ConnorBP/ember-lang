@@ -3476,6 +3476,163 @@ EmberPreserved BranchFoldingPass::run(ThinFunction& f,
     return changed ? EmberPreserved::none() : EmberPreserved::all();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// TailCallPass: mark direct same-module tail CallScript sites for tail emission
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The pass does NOT rewrite the call into a JMP at the IR level, and it does
+// NOT touch the enclosing Return terminator: the CallScript and its Return
+// (ret == the call's dst) stay intact in the IR. It only sets a transient,
+// nonserialized is_tail_call codegen annotation on the call. emit_x64 then
+// recognizes a marked final CallScript + Return as one tail-emission unit and
+// emits an indirect JMP to the script dispatch target (no CALL, no result
+// spill, no depth-leave, no RET, no return-value normalization), skipping the
+// call's immediately preceding DepthCheck so the tail path does not bump the
+// call-depth counter.
+//
+// Because the IR is left intact, idempotence depends on is_tail_call alone:
+// a second run sees the flag already set and reports Preserved::all() without
+// touching ret. This is what makes the annotation safe across a serialize /
+// deserialize round trip — the serializer never reads is_tail_call, so a
+// deserialized ThinFunction has is_tail_call=false and a Return ret that still
+// equals the call's dst; re-running the pass re-derives the annotation (dst ==
+// ret still holds), and if the host does NOT re-run the pass the ordinary
+// CALL + RET path emits unchanged and returns the correct value.
+//
+// The DepthCheck is intentionally KEPT in the IR: the annotation is not
+// serialized, so removing the DepthCheck would lose depth-safety across a
+// serialize/deserialize round trip (a reloaded function re-runs this pass to
+// re-derive the annotation, and the still-present DepthCheck is re-emitted if
+// the host does not re-run the pass). The emit skips it ONLY during tail
+// emission.
+//
+// Eligibility is deliberately narrow and conservative — when in doubt, the
+// pass leaves the call as an ordinary CALL + RET (byte-compatible with the
+// unmarked path). See ext_opt.hpp for the full rule.
+
+namespace {
+
+// A primitive scalar that travels in a single result register (rax for
+// int/bool, xmm0 for float). Excludes slice/lambda/struct/array/fn-handle/void.
+bool is_scalar_result(const Type* t) {
+    if (!t) return false;
+    if (t->is_slice || t->is_lambda) return false;
+    if (!t->struct_name.empty()) return false;
+    if (t->array_len > 0) return false;
+    if (t->is_fn_handle) return false;
+    return t->is_int() || t->is_bool() || t->is_float();
+}
+
+// The call's return register class must match the enclosing function's so the
+// tail JMP delivers the result where the caller's caller expects it. int/bool
+// both travel in rax (the call site normalizes width, so any int width matches
+// any int width); float travels in xmm0 and the width must match (a call site
+// stores xmm0 with the function's float width, so f32 vs f64 would read the
+// wrong half of the register). int vs float is always a mismatch.
+bool compatible_return(const Type* call_ret, const Type* fn_ret) {
+    if (!is_scalar_result(call_ret) || !is_scalar_result(fn_ret)) return false;
+    bool call_int = call_ret->is_int() || call_ret->is_bool();
+    bool fn_int   = fn_ret->is_int()   || fn_ret->is_bool();
+    if (call_int != fn_int) return false;          // rax vs xmm0 mismatch
+    if (!call_int) {                               // both float: require same width
+        if ((call_ret->prim == Prim::F32) != (fn_ret->prim == Prim::F32))
+            return false;
+    }
+    return true;
+}
+
+// A primitive scalar call argument that travels in a single Win64 register
+// word (rcx/rdx/r8/r9 for int/bool, xmm0-xmm3 for float). This is the strict,
+// conservative gate: it rejects everything that spills to the stack or
+// references caller-local memory a tail JMP cannot keep alive.
+//   - args[i] == 0      : an invalid vreg (also the struct-by-value sentinel
+//     and a hidden-return dest encoding — neither is a register operand).
+//   - arg_frame_offs[i] != -1 : a memory/stack operand (a struct-by-value
+//     frame slot, or any frame-backed arg). A scalar register word never
+//     carries a frame offset.
+//   - missing/inconsistent parallel metadata : arg_types/arg_frame_offs
+//     shorter than args (treated as malformed, NOT as register-only).
+//   - slice/lambda (2 words + caller-frame-backed memory), struct-by-value,
+//     array, fn-handle, unknown (null type), and non-int/bool/float types.
+bool arg_is_register_word(const ThinInstr& in, size_t i) {
+    if (in.args[i] == 0) return false;                 // invalid vreg / sentinel
+    const int32_t afo =
+        i < in.arg_frame_offs.size() ? in.arg_frame_offs[i] : -1;
+    if (afo != -1) return false;                        // memory/stack operand
+    const Type* ty = i < in.arg_types.size() ? in.arg_types[i] : nullptr;
+    if (!ty) return false;                              // unknown type
+    if (ty->is_slice || ty->is_lambda) return false;
+    if (!ty->struct_name.empty()) return false;
+    if (ty->array_len > 0) return false;
+    if (ty->is_fn_handle) return false;
+    return ty->is_int() || ty->is_bool() || ty->is_float();
+}
+
+// The complete argument ABI must be consistent and register-only: every
+// parallel metadata vector must be exactly args.size() (the lowering always
+// populates them in lockstep; a mismatch is malformed), and every arg must be
+// a single register word with at most four words total (a 5th spills to the
+// stack, which a tail JMP cannot preserve).
+bool args_are_register_only(const ThinInstr& in) {
+    if (in.arg_frame_offs.size() != in.args.size()) return false;
+    if (in.arg_types.size() != in.args.size()) return false;
+    size_t words = 0;
+    for (size_t i = 0; i < in.args.size(); ++i) {
+        if (!arg_is_register_word(in, i)) return false;
+        ++words;
+        if (words > 4) return false;                   // >4 words spills to stack
+    }
+    return true;
+}
+
+bool function_has_exception_op(const ThinFunction& f) {
+    for (const auto& blk : f.blocks)
+        for (const auto& in : blk.instrs)
+            if (in.op == ThinOp::TryCatch || in.op == ThinOp::CatchCleanup ||
+                in.op == ThinOp::CatchEntry || in.op == ThinOp::Throw)
+                return true;
+    return false;
+}
+
+} // namespace
+
+EmberPreserved TailCallPass::run(ThinFunction& f, EmberAnalysisManager&) {
+    // A function containing any try/catch/throw barrier is wholly ineligible:
+    // a tail JMP would skip the catch unwinding / setjmp restore.
+    if (function_has_exception_op(f)) return EmberPreserved::all();
+
+    bool changed = false;
+    for (auto& blk : f.blocks) {
+        if (blk.term.kind != TermKind::Return) continue;
+        if (blk.instrs.empty()) continue;
+        ThinInstr& last = blk.instrs.back();
+        if (last.op != ThinOp::CallScript) continue;       // direct same-module only
+        if (last.is_tail_call) continue;                   // already marked -> no-op
+        if (last.dst == 0) continue;                       // void / aggregate return
+        if (last.dst != blk.term.ret) continue;            // result must flow to Return
+        if (!compatible_return(last.ret_type, f.ret_type)) continue;
+        // A hidden-return dest only appears on an aggregate-returning call
+        // (already excluded by dst==0); defend against it anyway by rejecting
+        // a struct ret_type.
+        if (last.ret_type && !last.ret_type->struct_name.empty()) continue;
+        // The complete argument ABI must use at most the four register words
+        // with no slice/lambda/struct/hidden-return/unknown/stack operands and
+        // consistent parallel metadata.
+        if (!args_are_register_only(last)) continue;
+
+        // Eligible. Mark the call. The Return terminator's ret is left
+        // UNCHANGED (ret == dst stays), so the IR remains an ordinary
+        // call-of-return-result shape that ordinary emission handles
+        // correctly when the annotation is absent (e.g. after a serialize /
+        // deserialize round trip without re-running this pass). Idempotence
+        // depends on is_tail_call: a subsequent run sees the flag set and
+        // skips this block.
+        last.is_tail_call = true;
+        changed = true;
+    }
+    return changed ? EmberPreserved::none() : EmberPreserved::all();
+}
+
 // register_passes
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -3497,6 +3654,7 @@ void register_passes(EmberPassRegistry& reg) {
     reg.add<DeadSpillElimPass>("spill_elim");
     reg.add<PeepholePass>("peephole");
     reg.add<BranchFoldingPass>("branch_folding");
+    reg.add<TailCallPass>("tailcall");
 }
 
 } // namespace ember::ext_opt
