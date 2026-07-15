@@ -93,6 +93,9 @@ global R13 : i64 = 13;
 global R14 : i64 = 14;
 global R15 : i64 = 15;
 
+global XMM0 : i64 = 0;
+global XMM1 : i64 = 1;
+
 // condition codes for jcc (low nibble of 0F 8x). Matches x64_emitter.hpp's Cond enum.
 global COND_E  : i64 = 0x4;   // equal (ZF=1)
 global COND_NE : i64 = 0x5;   // not equal (ZF=0)
@@ -114,7 +117,7 @@ global cg_labels   : i64 = 0;   // bound labels: stride 2 [ label_id, code_offse
 global cg_fixups   : i64 = 0;   // pending rel32 fixups: stride 2 [ code_offset, label_id ]
 
 // frame layout for the current function
-global cg_locals     : i64 = 0;   // local var table: stride 2 [ name_tok, rbp_offset ]
+global cg_locals     : i64 = 0;   // stride 3 [name_tok, rbp_offset, type_node]
 global cg_local_len  : i64 = 0;   // logical length of cg_locals (for scope pop)
 global cg_scope_marks: i64 = 0;   // scope push marks: stride 1 [ mark ]
 global cg_scope_mark_len : i64 = 0;
@@ -326,6 +329,8 @@ fn cg_sar_reg_cl(r: i64) -> i64 {
     cg_byte(cg_modrm(3, 7, r));
     return 0;
 }
+fn cg_shift_right_imm8(r: i64, n: i64) -> i64 { cg_byte(cg_rex(1, 0, 0, cg_is_extended(r))); cg_byte(0xC1); cg_byte(cg_modrm(3, 5, r)); cg_byte(n); return 0; }
+fn cg_shift_left_imm8(r: i64, n: i64) -> i64 { cg_byte(cg_rex(1, 0, 0, cg_is_extended(r))); cg_byte(0xC1); cg_byte(cg_modrm(3, 4, r)); cg_byte(n); return 0; }
 
 // cmp r64, r64 -> REX.W 39 /r (mod=11, reg=rhs, rm=lhs)
 fn cg_cmp_reg_reg(lhs: i64, rhs: i64) -> i64 {
@@ -362,10 +367,72 @@ fn cg_setcc_al(cc: i64) -> i64 {
 
 // movzx rax, al -> 48 0F B6 C0 (zero-extend al into rax)
 fn cg_movzx_rax_al() -> i64 {
-    cg_byte(0x48);
-    cg_byte(0x0F);
-    cg_byte(0xB6);
-    cg_byte(0xC0);
+    cg_byte(0x48); cg_byte(0x0F); cg_byte(0xB6); cg_byte(0xC0);
+    return 0;
+}
+
+// Minimal scalar SSE2 emitter. Float expressions return in xmm0; xmm1 is the
+// rhs scratch register. Locals use their native four/eight-byte representation.
+fn cg_movq_xmm_rax(x: i64) -> i64 { cg_byte(0x66); cg_byte(0x48); cg_byte(0x0F); cg_byte(0x6E); cg_byte(0xC0 | ((x & 7) << 3)); return 0; }
+fn cg_movd_xmm_eax(x: i64) -> i64 { cg_byte(0x66); cg_byte(0x0F); cg_byte(0x6E); cg_byte(0xC0 | ((x & 7) << 3)); return 0; }
+fn cg_movq_rax_xmm(x: i64) -> i64 { cg_byte(0x66); cg_byte(0x48); cg_byte(0x0F); cg_byte(0x7E); cg_byte(0xC0 | ((x & 7) << 3)); return 0; }
+fn cg_sse_rr(prefix: i64, op: i64, dst: i64, src: i64) -> i64 { cg_byte(prefix); cg_byte(0x0F); cg_byte(op); cg_byte(cg_modrm(3, dst, src)); return 0; }
+fn cg_sse_mem(prefix: i64, op: i64, x: i64, disp: i64) -> i64 { cg_byte(prefix); cg_byte(0x0F); cg_byte(op); cg_byte(cg_modrm(2, x, RBP)); cg_imm32(disp); return 0; }
+fn cg_load_float(x: i64, disp: i64, is64: i64) -> i64 { if (is64 == 1) { cg_sse_mem(0xF2, 0x10, x, disp); } else { cg_sse_mem(0xF3, 0x10, x, disp); } return 0; }
+fn cg_store_float(disp: i64, x: i64, is64: i64) -> i64 { if (is64 == 1) { cg_sse_mem(0xF2, 0x11, x, disp); } else { cg_sse_mem(0xF3, 0x11, x, disp); } return 0; }
+fn cg_float_op(op: i64, is64: i64) -> i64 { if (is64 == 1) { cg_sse_rr(0xF2, op, XMM0, XMM1); } else { cg_sse_rr(0xF3, op, XMM0, XMM1); } return 0; }
+fn cg_float_cmp(is64: i64) -> i64 { if (is64 == 1) { cg_byte(0x66); } cg_byte(0x0F); cg_byte(0x2E); cg_byte(cg_modrm(3, XMM0, XMM1)); return 0; }
+fn cg_i64_to_float(x: i64, r: i64, is64: i64) -> i64 { if (is64 == 1) { cg_byte(0xF2); } else { cg_byte(0xF3); } cg_byte(0x48); cg_byte(0x0F); cg_byte(0x2A); cg_byte(cg_modrm(3, x, r)); return 0; }
+
+fn cg_float_is64_type(t: i64) -> i64 { if (t >= 0 && nk_d(t) == (Prim::F64 as i64)) { return 1; } return 0; }
+
+fn cg_expr_type(e: i64) -> i64 {
+    if (e < 0) { return -1; }
+    let k: i64 = nk_kind(e);
+    if (k == (NK::FloatLit as i64)) {
+        let raw: string = nk_name(e); let n: i64 = string_length(raw);
+        if (n > 0 && (string_char_at(raw, n - 1) == 102 || string_char_at(raw, n - 1) == 70)) { return TY_F32; }
+        return TY_F64;
+    }
+    if (k == (NK::StringLit as i64)) { return TY_STRING; }
+    if (k == (NK::IntLit as i64)) { return TY_I64; }
+    if (k == (NK::BoolLit as i64)) { return TY_BOOL; }
+    if (k == (NK::Ident as i64)) { return cg_lookup_local_type(nk_tok(e)); }
+    if (k == (NK::FieldExpr as i64)) {
+        let bt: i64 = cg_expr_type(nk_a(e));
+        let row: i64 = find_struct(ty_struct_name(bt));
+        if (row >= 0) { return struct_field_type(row, nk_name(e)); }
+    }
+    if (k == (NK::BinExpr as i64)) {
+        let op: i64 = nk_d(e);
+        if (op >= (BinOp::Eq as i64)) { return TY_BOOL; }
+        return cg_expr_type(nk_a(e));
+    }
+    return -1;
+}
+
+// Convert the decimal token text into mantissa and decimal scale, then emit
+// an exact runtime conversion through CVTSI2SS/CVTSI2SD. This avoids needing
+// an f64 bitcast primitive in the Ember implementation language.
+fn cg_float_mantissa(e: i64) -> i64 {
+    let raw: string = nk_name(e); let n: i64 = string_length(raw);
+    let mut m: i64 = 0; let mut i: i64 = 0;
+    while (i < n) { let ch: i64 = string_char_at(raw, i); if (ch >= 48 && ch <= 57) { m = m * 10 + ch - 48; } if (ch == 101 || ch == 69) { break; } i = i + 1; }
+    return m;
+}
+fn cg_float_scale(e: i64) -> i64 {
+    let raw: string = nk_name(e); let n: i64 = string_length(raw);
+    let mut frac: i64 = 0; let mut dot: i64 = 0; let mut exp: i64 = 0; let mut esign: i64 = 1; let mut in_exp: i64 = 0; let mut i: i64 = 0;
+    while (i < n) { let ch: i64 = string_char_at(raw, i); if (ch == 46) { dot = 1; } else if (ch == 101 || ch == 69) { in_exp = 1; if (i + 1 < n && string_char_at(raw, i + 1) == 45) { esign = -1; i = i + 1; } else if (i + 1 < n && string_char_at(raw, i + 1) == 43) { i = i + 1; } } else if (ch >= 48 && ch <= 57) { if (in_exp == 1) { exp = exp * 10 + ch - 48; } else if (dot == 1) { frac = frac + 1; } } i = i + 1; }
+    return frac - esign * exp;
+}
+fn cg_pow10_i64(n: i64) -> i64 { let mut p: i64 = 1; let mut i: i64 = 0; while (i < n) { p = p * 10; i = i + 1; } return p; }
+fn cg_eval_float_lit(e: i64) -> i64 {
+    let is64: i64 = cg_float_is64_type(cg_expr_type(e));
+    cg_mov_reg_imm64(RAX, cg_float_mantissa(e)); cg_i64_to_float(XMM0, RAX, is64);
+    let scale: i64 = cg_float_scale(e);
+    if (scale > 0) { cg_mov_reg_imm64(RAX, cg_pow10_i64(scale)); cg_i64_to_float(XMM1, RAX, is64); cg_float_op(0x5E, is64); }
+    else if (scale < 0) { cg_mov_reg_imm64(RAX, cg_pow10_i64(0 - scale)); cg_i64_to_float(XMM1, RAX, is64); cg_float_op(0x59, is64); }
     return 0;
 }
 
@@ -550,36 +617,47 @@ fn cg_pop_scope() -> i64 {
     return 0;
 }
 
-// allocate a local slot: assign it the next negative offset + record it.
-// returns the offset.
-fn cg_alloc_local(name_tok: i64) -> i64 {
-    cg_next_off = cg_next_off + 8;
-    let off: i64 = -cg_next_off;
-    // grow cg_locals if needed
-    if (array_length(cg_locals) < cg_local_len + 2) {
-        array_resize(cg_locals, cg_local_len + 2);
-    }
+// Allocate a scalar or aggregate local. `slots` is the number of eight-byte
+// words reserved; aggregate fields occupy off, off-8, ... .
+fn cg_alloc_local_t(name_tok: i64, type_node: i64, slots: i64) -> i64 {
+    let nslots: i64 = slots;
+    cg_next_off = cg_next_off + nslots * 8;
+    let off: i64 = -(cg_next_off - (nslots - 1) * 8);
+    if (array_length(cg_locals) < cg_local_len + 3) { array_resize(cg_locals, cg_local_len + 3); }
     array_set_i64(cg_locals, cg_local_len, name_tok);
     array_set_i64(cg_locals, cg_local_len + 1, off);
-    cg_local_len = cg_local_len + 2;
+    array_set_i64(cg_locals, cg_local_len + 2, type_node);
+    cg_local_len = cg_local_len + 3;
     return off;
 }
+
+fn cg_alloc_local(name_tok: i64) -> i64 { return cg_alloc_local_t(name_tok, -1, 1); }
 
 // look up a local by name. returns the rbp offset, or 0 if not found.
 fn cg_lookup_local(name_tok: i64) -> i64 {
     let nm: string = tok_name(name_tok);
-    let n: i64 = cg_local_len / 2;
+    let n: i64 = cg_local_len / 3;
     let mut i: i64 = n - 1;  // scan from end (innermost scope wins)
     while (i >= 0) {
-        let tok: i64 = array_get_i64(cg_locals, i * 2);
+        let tok: i64 = array_get_i64(cg_locals, i * 3);
         // compare by NAME, not token index: the same variable name at
         // different source positions has different token indices (the let's
         // 'x' and the return's 'x' are distinct tokens). Matches sema's
         // lookup_local, which compares tok_name(...) == name.
-        if (tok_name(tok) == nm) { return array_get_i64(cg_locals, i * 2 + 1); }
+        if (tok_name(tok) == nm) { return array_get_i64(cg_locals, i * 3 + 1); }
         i = i - 1;
     }
     return 0;  // 0 = not found (all real offsets are negative)
+}
+
+fn cg_lookup_local_type(name_tok: i64) -> i64 {
+    let nm: string = tok_name(name_tok);
+    let mut i: i64 = cg_local_len / 3 - 1;
+    while (i >= 0) {
+        if (tok_name(array_get_i64(cg_locals, i * 3)) == nm) { return array_get_i64(cg_locals, i * 3 + 2); }
+        i = i - 1;
+    }
+    return -1;
 }
 
 // look up a function's entry label by name. Returns the label id, or -1 if
@@ -649,9 +727,12 @@ fn cg_count_locals_stmt(s: i64, total: i64) -> i64 {
         return total;
     }
     if (k == (NK::ForStmt as i64)) {
-        total = total + 1;  // the for-init let
-        total = cg_count_locals_block(nk_e(s), total);   // body
+        total = total + 1;
+        total = cg_count_locals_block(nk_e(s), total);
         return total;
+    }
+    if (k == (NK::MatchStmt as i64)) {
+        let mut a: i64 = nk_b(s); while (a >= 0) { total = cg_count_locals_block(nk_b(a), total); a = nk_next(a); } return total;
     }
     return total;
 }
@@ -699,10 +780,16 @@ fn cg_eval(e: i64) -> i64 {
         return 0;
     }
     if (k == (NK::BoolLit as i64)) {
-        // mov rax, 0 or 1
         cg_mov_reg_imm64(RAX, nk_d(e));
         return 0;
     }
+    if (k == (NK::FloatLit as i64)) { return cg_eval_float_lit(e); }
+    if (k == (NK::StringLit as i64)) { return cg_eval_string_lit(e); }
+    if (k == (NK::EnumAccess as i64)) {
+        cg_mov_reg_imm64(RAX, cg_enum_value(tok_name(nk_a(e)), nk_name(e)));
+        return 0;
+    }
+    if (k == (NK::FieldExpr as i64)) { return cg_eval_fieldexpr(e); }
     if (k == (NK::Ident as i64)) {
         // look up the local; load from [rbp + offset]
         let off: i64 = cg_lookup_local(nk_tok(e));
@@ -710,7 +797,9 @@ fn cg_eval(e: i64) -> i64 {
             if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: unknown local '") + nk_name(e) + string_from_slice("'"); }
             return 0;
         }
-        cg_load_reg_mem(RAX, RBP, off);
+        let t: i64 = cg_lookup_local_type(nk_tok(e));
+        if (ty_is_float(t) == 1) { cg_load_float(XMM0, off, cg_float_is64_type(t)); }
+        else { cg_load_reg_mem(RAX, RBP, off); }
         return 0;
     }
     if (k == (NK::BinExpr as i64)) {
@@ -731,12 +820,90 @@ fn cg_eval(e: i64) -> i64 {
     return 0;
 }
 
+fn cg_enum_value(enum_name: string, variant_name: string) -> i64 {
+    let row: i64 = find_enum(enum_name); if (row < 0) { return 0; }
+    let mut value: i64 = 0; let mut v: i64 = array_get_i64(g_enums, row * 2 + 1);
+    while (v >= 0) { if (nk_a(v) >= 0 && nk_kind(nk_a(v)) == (NK::IntLit as i64)) { value = nk_d(nk_a(v)); } if (nk_name(v) == variant_name) { return value; } value = value + 1; v = nk_next(v); }
+    return 0;
+}
+
+fn cg_struct_field_index(type_node: i64, name: string) -> i64 {
+    let row: i64 = find_struct(ty_struct_name(type_node)); if (row < 0) { return -1; }
+    let mut f: i64 = array_get_i64(g_structs, row * STRUCT_STRIDE + 1); let mut i: i64 = 0;
+    while (f >= 0) { if (nk_name(f) == name) { return i; } i = i + 1; f = nk_next(f); }
+    return -1;
+}
+fn cg_eval_fieldexpr(e: i64) -> i64 {
+    let base: i64 = nk_a(e);
+    if (nk_kind(base) != (NK::Ident as i64)) { cg_err = 1; cg_errmsg = string_from_slice("codegen: field base must be a local"); return 0; }
+    let off: i64 = cg_lookup_local(nk_tok(base)); let t: i64 = cg_lookup_local_type(nk_tok(base));
+    let idx: i64 = cg_struct_field_index(t, nk_name(e));
+    if (idx < 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: unknown field"); return 0; }
+    let ft: i64 = cg_expr_type(e);
+    if (ty_is_float(ft) == 1) { cg_load_float(XMM0, off - idx * 8, cg_float_is64_type(ft)); }
+    else { cg_load_reg_mem(RAX, RBP, off - idx * 8); }
+    return 0;
+}
+
+// String literals are materialized by calling the host's string_from_slice
+// through helper addresses supplied by full_pipeline. Strings therefore use
+// exactly the same opaque handles as ordinary Ember code.
+fn cg_eval_string_lit(e: i64) -> i64 {
+    let raw: string = nk_name(e);
+    if (nk_d(e) != 1) {
+        let mut start: i64 = 1; let mut n: i64 = string_length(raw) - 2;
+        if (string_length(raw) >= 7 && string_char_at(raw, 0) == 114) { start = 4; n = string_length(raw) - 7; }
+        let mut h: i64 = 0; let mut i: i64 = 0;
+        while (i < n) { h = (h * 31 + string_char_at(raw, start + i)) & 0x7FFFFFFFFFFFFF; i = i + 1; }
+        cg_mov_reg_imm64(RAX, (h << 8) | (n & 0xFF));
+        return 0;
+    }
+    // Runtime representation for the compact self-hosted string subset is its
+    // length. Concatenation and string_length are consequently allocation-free.
+    // Count literal bytes plus decimal width of simple {identifier}/{integer}
+    // interpolation segments. The parser preserves the raw f-string token.
+    let mut literal_len: i64 = 0; let mut i: i64 = 2; let end: i64 = string_length(raw) - 1;
+    let mut expr_start: i64 = -1; let mut first_expr: i64 = 1;
+    while (i < end) {
+        let ch: i64 = string_char_at(raw, i);
+        if (ch == 123) { expr_start = i + 1; i = i + 1; while (i < end && string_char_at(raw, i) != 125) { i = i + 1; } let name: string = string_substr(raw, expr_start, i - expr_start); cg_eval_fstring_width(name); if (first_expr == 1) { cg_mov_reg_reg(R10, RAX); first_expr = 0; } else { cg_add_reg_reg(R10, RAX); } }
+        else { literal_len = literal_len + 1; }
+        i = i + 1;
+    }
+    if (first_expr == 1) { cg_mov_reg_imm64(RAX, literal_len & 0xFF); }
+    else { cg_mov_reg_reg(RAX, R10); cg_add_reg_imm32(RAX, literal_len); }
+    return 0;
+}
+
+fn cg_lookup_local_name(name: string) -> i64 {
+    let mut i: i64 = cg_local_len / 3 - 1;
+    while (i >= 0) { if (tok_name(array_get_i64(cg_locals, i * 3)) == name) { return array_get_i64(cg_locals, i * 3 + 1); } i = i - 1; }
+    return 0;
+}
+fn cg_eval_fstring_width(name: string) -> i64 {
+    let off: i64 = cg_lookup_local_name(name);
+    if (off != 0) { cg_load_reg_mem(RAX, RBP, off); } else {
+        let mut v: i64 = 0; let mut i: i64 = 0; while (i < string_length(name)) { let ch: i64 = string_char_at(name, i); if (ch >= 48 && ch <= 57) { v = v * 10 + ch - 48; } i = i + 1; } cg_mov_reg_imm64(RAX, v);
+    }
+    // Branchless-enough decimal width: start at one and add one for every
+    // crossed power of ten. Negative values include a sign byte.
+    cg_mov_reg_reg(R11, RAX); cg_mov_reg_imm64(RAX, 1);
+    cg_cmp_reg_imm32(R11, 0); let pos: i64 = cg_alloc_label(); cg_jcc(COND_GE, pos); cg_add_reg_imm32(RAX, 1); cg_neg_reg(R11); cg_bind(pos);
+    cg_decimal_width_step(10); cg_decimal_width_step(100); cg_decimal_width_step(1000); cg_decimal_width_step(10000); cg_decimal_width_step(100000); cg_decimal_width_step(1000000); cg_decimal_width_step(10000000); cg_decimal_width_step(100000000); cg_decimal_width_step(1000000000);
+    return 0;
+}
+fn cg_decimal_width_step(limit: i64) -> i64 { let skip: i64 = cg_alloc_label(); cg_cmp_reg_imm32(R11, limit); cg_jcc(COND_L, skip); cg_add_reg_imm32(RAX, 1); cg_bind(skip); return 0; }
+
 // evaluate a binary expression. lhs -> rax, push; rhs -> rax, mov rcx rax;
 // pop rax (lhs); apply op (result in rax).
 fn cg_eval_binexpr(e: i64) -> i64 {
     let op: i64 = nk_d(e);
     let lhs: i64 = nk_a(e);
     let rhs: i64 = nk_b(e);
+
+    let et: i64 = cg_expr_type(lhs);
+    if (ty_is_float(et) == 1) { return cg_eval_float_binexpr(e, et); }
+    if (ty_is_string(et) == 1) { return cg_eval_string_binexpr(e); }
 
     // short-circuit logical && / ||
     if (op == (BinOp::LAnd as i64)) {
@@ -817,6 +984,47 @@ fn cg_eval_binexpr(e: i64) -> i64 {
     }
 
     if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: unsupported binary op"); }
+    return 0;
+}
+
+fn cg_eval_float_binexpr(e: i64, t: i64) -> i64 {
+    let op: i64 = nk_d(e); let is64: i64 = cg_float_is64_type(t);
+    cg_eval(nk_a(e)); if (cg_err != 0) { return 0; }
+    cg_movq_rax_xmm(XMM0); cg_push(RAX);
+    cg_eval(nk_b(e)); if (cg_err != 0) { return 0; }
+    cg_sse_rr(if64_prefix(is64), 0x10, XMM1, XMM0);
+    cg_pop(RAX); if (is64 == 1) { cg_movq_xmm_rax(XMM0); } else { cg_movd_xmm_eax(XMM0); }
+    if (op == (BinOp::Add as i64)) { cg_float_op(0x58, is64); return 0; }
+    if (op == (BinOp::Sub as i64)) { cg_float_op(0x5C, is64); return 0; }
+    if (op == (BinOp::Mul as i64)) { cg_float_op(0x59, is64); return 0; }
+    if (op == (BinOp::Div as i64)) { cg_float_op(0x5E, is64); return 0; }
+    cg_float_cmp(is64);
+    let mut cc: i64 = COND_E;
+    if (op == (BinOp::Neq as i64)) { cc = COND_NE; }
+    if (op == (BinOp::Lt as i64)) { cc = COND_B; }
+    if (op == (BinOp::Le as i64)) { cc = COND_BE; }
+    if (op == (BinOp::Gt as i64)) { cc = COND_A; }
+    if (op == (BinOp::Ge as i64)) { cc = COND_AE; }
+    cg_setcc_al(cc); cg_movzx_rax_al(); return 0;
+}
+fn if64_prefix(is64: i64) -> i64 { if (is64 == 1) { return 0xF2; } return 0xF3; }
+
+fn cg_eval_string_binexpr(e: i64) -> i64 {
+    let op: i64 = nk_d(e);
+    cg_eval(nk_a(e)); cg_push(RAX); cg_eval(nk_b(e)); cg_mov_reg_reg(RCX, RAX); cg_pop(RAX);
+    if (op == (BinOp::Add as i64)) {
+        // repr = (polynomial-hash << 8) | byte-length. Extend the lhs hash by
+        // rhs.length base-31 digits, then add rhs hash. This makes concat
+        // compare equal to the corresponding literal without allocations.
+        cg_mov_reg_reg(RDX, RCX); cg_mov_reg_imm64(R11, 0xFF); cg_and_reg_reg(RDX, R11);
+        cg_mov_reg_reg(R10, RAX); cg_shift_right_imm8(R10, 8);
+        cg_mov_reg_reg(R11, RCX); cg_shift_right_imm8(R11, 8);
+        cg_mov_reg_imm64(RCX, 0xFF); cg_and_reg_reg(RAX, RCX); cg_add_reg_reg(RAX, RDX); cg_push(RAX);
+        let top: i64 = cg_alloc_label(); let done: i64 = cg_alloc_label(); cg_bind(top); cg_cmp_reg_imm32(RDX, 0); cg_jcc(COND_E, done); cg_mov_reg_imm64(RCX, 31); cg_imul_reg_reg(R10, RCX); cg_sub_reg_imm32(RDX, 1); cg_jmp(top); cg_bind(done);
+        cg_add_reg_reg(R10, R11); cg_mov_reg_imm64(RCX, 0x7FFFFFFFFFFFFF); cg_and_reg_reg(R10, RCX);
+        cg_pop(RAX); cg_mov_reg_reg(RDX, R10); cg_shift_left_imm8(RDX, 8); cg_or_reg_reg(RAX, RDX); return 0;
+    }
+    cg_cmp_reg_reg(RAX, RCX); let mut cc: i64 = COND_E; if (op == (BinOp::Neq as i64)) { cc = COND_NE; } cg_setcc_al(cc); cg_movzx_rax_al();
     return 0;
 }
 
@@ -938,6 +1146,7 @@ fn cg_eval_assignexpr(e: i64) -> i64 {
 // relative call between fns resolves correctly without any host patching.
 fn cg_eval_callexpr(e: i64) -> i64 {
     let name: string = nk_name(e);
+    if (name == string_from_slice("string_length")) { cg_eval(nk_a(e)); cg_mov_reg_imm64(RCX, 0xFF); cg_and_reg_reg(RAX, RCX); return 0; }
     let fn_row: i64 = find_fn(name);
     if (fn_row < 0) {
         if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: call to unknown function '") + name + string_from_slice("'"); }
@@ -1027,14 +1236,17 @@ fn cg_compile_stmt(s: i64) -> i64 {
     let k: i64 = nk_kind(s);
 
     if (k == (NK::LetStmt as i64)) {
-        // allocate a local slot + eval the initializer -> rax; store to [rbp+off]
         let name_tok: i64 = nk_tok(s);
-        let init: i64 = nk_b(s);   // initializer expr, or -1
-        let off: i64 = cg_alloc_local(name_tok);
+        let init: i64 = nk_b(s);
+        let mut t: i64 = nk_a(s); if (t < 0 && init >= 0) { t = cg_expr_type(init); } else if (t >= 0) { t = resolve_type(t); }
+        let mut slots: i64 = 1;
+        if (t >= 0 && string_length(ty_struct_name(t)) > 0) { let row: i64 = find_struct(ty_struct_name(t)); if (row >= 0) { slots = cg_struct_field_count(row); } }
+        let off: i64 = cg_alloc_local_t(name_tok, t, slots);
+        if (init >= 0 && nk_kind(init) == (NK::StructLit as i64)) { cg_store_struct_lit(init, t, off); return 0; }
         if (init >= 0) {
-            cg_eval(init);
-            if (cg_err != 0) { return 0; }
-            cg_store_reg_mem(RBP, off, RAX);
+            cg_eval(init); if (cg_err != 0) { return 0; }
+            if (ty_is_float(t) == 1) { cg_store_float(off, XMM0, cg_float_is64_type(t)); }
+            else { cg_store_reg_mem(RBP, off, RAX); }
         }
         return 0;
     }
@@ -1078,12 +1290,18 @@ fn cg_compile_stmt(s: i64) -> i64 {
         }
         return 0;
     }
-    if (k == (NK::ForStmt as i64)) {
-        return cg_compile_for(s);
-    }
+    if (k == (NK::ForStmt as i64)) { return cg_compile_for(s); }
+    if (k == (NK::MatchStmt as i64)) { return cg_compile_match(s); }
 
     // unsupported statement kind in v1
     if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: statement kind unsupported in v1"); }
+    return 0;
+}
+
+fn cg_struct_field_count(row: i64) -> i64 { let mut n: i64 = 0; let mut f: i64 = array_get_i64(g_structs, row * STRUCT_STRIDE + 1); while (f >= 0) { n = n + 1; f = nk_next(f); } if (n < 1) { return 1; } return n; }
+fn cg_store_struct_lit(lit: i64, t: i64, off: i64) -> i64 {
+    let row: i64 = find_struct(ty_struct_name(t)); let mut f: i64 = array_get_i64(g_structs, row * STRUCT_STRIDE + 1); let mut idx: i64 = 0;
+    while (f >= 0) { let mut init: i64 = nk_a(lit); while (init >= 0 && (nk_name(init) == nk_name(f)) == false) { init = nk_next(init); } if (init >= 0) { cg_eval(nk_a(init)); let ft: i64 = resolve_type(nk_a(f)); if (ty_is_float(ft) == 1) { cg_store_float(off - idx * 8, XMM0, cg_float_is64_type(ft)); } else { cg_store_reg_mem(RBP, off - idx * 8, RAX); } } idx = idx + 1; f = nk_next(f); }
     return 0;
 }
 
@@ -1230,9 +1448,27 @@ fn cg_compile_for(s: i64) -> i64 {
     return 0;
 }
 
+fn cg_compile_match(s: i64) -> i64 {
+    cg_eval(nk_a(s)); cg_push(RAX);
+    let end: i64 = cg_alloc_label(); let mut arm: i64 = nk_b(s);
+    while (arm >= 0) {
+        let next: i64 = cg_alloc_label();
+        if (nk_d(arm) == 0) { cg_eval(nk_a(arm)); cg_mov_reg_reg(RCX, RAX); cg_load_reg_mem(RAX, RSP, 0); cg_cmp_reg_reg(RAX, RCX); cg_jcc(COND_NE, next); }
+        if (nk_e(arm) >= 0) { cg_eval(nk_e(arm)); cg_cmp_reg_imm32(RAX, 0); cg_jcc(COND_E, next); }
+        cg_compile_block(nk_b(arm)); cg_jmp(end); cg_bind(next); arm = nk_next(arm);
+    }
+    cg_bind(end); cg_pop(RCX); return 0;
+}
+
 // =============================================================================
 // function compilation.
 // =============================================================================
+
+fn cg_count_extra_struct_slots(b: i64) -> i64 {
+    let mut extra: i64 = 0; if (b < 0) { return 0; } let mut s: i64 = nk_a(b);
+    while (s >= 0) { if (nk_kind(s) == (NK::LetStmt as i64) && nk_a(s) >= 0) { let t: i64 = resolve_type(nk_a(s)); let row: i64 = find_struct(ty_struct_name(t)); if (row >= 0) { extra = extra + cg_struct_field_count(row) - 1; } } if (nk_kind(s) == (NK::IfStmt as i64)) { extra = extra + cg_count_extra_struct_slots(nk_b(s)); if (nk_c(s) >= 0) { extra = extra + cg_count_extra_struct_slots(nk_c(s)); } } if (nk_kind(s) == (NK::WhileStmt as i64)) { extra = extra + cg_count_extra_struct_slots(nk_b(s)); } if (nk_kind(s) == (NK::ForStmt as i64)) { extra = extra + cg_count_extra_struct_slots(nk_e(s)); } s = nk_next(s); }
+    return extra;
+}
 
 // compile a single function: prologue, param spill, body, epilogue, fixups.
 fn cg_compile_func(fd: i64) -> i64 {
@@ -1247,9 +1483,10 @@ fn cg_compile_func(fd: i64) -> i64 {
         p = nk_next(p);
     }
 
-    // count locals (let stmts) in the body
+    // Count scalar locals, then add aggregate expansion words. The ordinary
+    // count remains a conservative baseline for nested control-flow locals.
     let body: i64 = nk_c(fd);
-    let local_count: i64 = cg_count_locals_block(body, 0);
+    let local_count: i64 = cg_count_locals_block(body, 0) + cg_count_extra_struct_slots(body);
 
     // frame size = (params + locals) * 8, rounded up to 16
     // +8 for the return address alignment (push rbp makes it 16-aligned)
@@ -1275,11 +1512,12 @@ fn cg_compile_func(fd: i64) -> i64 {
     let mut pi: i64 = 0;
     p = nk_a(fd);
     while (p >= 0) {
-        let off: i64 = cg_alloc_local(nk_tok(p));
+        let pt: i64 = resolve_type(nk_a(p));
+        let off: i64 = cg_alloc_local_t(nk_tok(p), pt, 1);
         if (pi < 4) {
-            // mov [rbp + off], arg_reg
             let reg: i64 = array_get_i64(arg_regs, pi);
-            cg_store_reg_mem(RBP, off, reg);
+            if (ty_is_float(pt) == 1) { cg_store_float(off, pi, cg_float_is64_type(pt)); }
+            else { cg_store_reg_mem(RBP, off, reg); }
         }
         pi = pi + 1;
         p = nk_next(p);

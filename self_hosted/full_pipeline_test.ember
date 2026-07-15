@@ -278,6 +278,31 @@ fn test_call_four_args() -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// Expanded language features — each program is compiled by the Ember-written
+// frontend and then executed. These are intentionally result-based tests: they
+// cover parser, sema, ABI selection, x64 emission, and runtime behavior.
+// ---------------------------------------------------------------------------
+fn test_fstring_and_string() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { let n: i64 = 42; let a: string = f\"v={n}\"; let b: string = \"em\" + \"ber\"; if (string_length(a) == 4 && b == \"ember\") { return 42; } return 0; }"));
+    return ck(r, 42, 1210);
+}
+
+fn test_floats() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("fn main() -> i64 { let a: f64 = 1.5; let b: f64 = a * 2.0; let c: f32 = 2.5f; if (b == 3.0 && c + 0.5f == 3.0f) { return 42; } return 0; }"));
+    return ck(r, 42, 1220);
+}
+
+fn test_struct_values() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("struct Pair { x: i64; y: i64; } fn main() -> i64 { let p: Pair = Pair { x: 20, y: 22 }; return p.x + p.y; }"));
+    return ck(r, 42, 1230);
+}
+
+fn test_enum_match() -> i64 {
+    let r: i64 = compile_and_run(string_from_slice("enum State { Off = 0, On = 1 } fn main() -> i64 { let s: i64 = State::On; match (s) { State::Off => { return 0; }, State::On => { return 42; }, _ => { return 1; } } return 2; }"));
+    return ck(r, 42, 1240);
+}
+
+// ---------------------------------------------------------------------------
 // Test N1 (negative) — a sema error: returning bool from an i64 fn.
 //   fn main() -> i64 { return true; }
 // compile_and_run must return a NEGATIVE code (the sema stage fails), not 0
@@ -331,6 +356,11 @@ fn main() -> i64 {
     r = test_recursion();            if (r != 0) { return r; }
     r = test_forward_call();         if (r != 0) { return r; }
     r = test_call_four_args();       if (r != 0) { return r; }
+
+    r = test_fstring_and_string();   if (r != 0) { return r; }
+    r = test_floats();               if (r != 0) { return r; }
+    r = test_struct_values();        if (r != 0) { return r; }
+    r = test_enum_match();           if (r != 0) { return r; }
 
     // negative (error-path) checks
     r = test_neg_sema_error();  if (r != 0) { return r; }

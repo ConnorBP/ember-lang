@@ -526,6 +526,18 @@ fn test_sema_error() -> i64 {
     return 0;
 }
 
+fn test_expanded_features() -> i64 {
+    let b1: i64 = codegen("fn main() -> i64 { let a: f64 = 1.5; if (a + 1.5 == 3.0) { return 42; } return 0; }");
+    if (codegen_failed() != 0 || array_length(b1) == 0) { return 22001; }
+    let b2: i64 = codegen("fn main() -> i64 { let s: string = f\"x={42}\"; return string_length(s); }");
+    if (codegen_failed() != 0 || array_length(b2) == 0) { return 22002; }
+    let b3: i64 = codegen("struct P { x: i64; y: i64; } fn main() -> i64 { let p: P = P { x: 1, y: 2 }; return p.x + p.y; }");
+    if (codegen_failed() != 0 || array_length(b3) == 0) { return 22003; }
+    let b4: i64 = codegen("enum E { A, B } fn main() -> i64 { let e: i64 = E::B; match (e) { E::B => { return 1; }, _ => { return 0; } } return 0; }");
+    if (codegen_failed() != 0 || array_length(b4) == 0) { return 22004; }
+    return 0;
+}
+
 // ===========================================================================
 // byte-pattern search helpers (for verifying x64 instruction encoding).
 // ===========================================================================
@@ -641,6 +653,7 @@ fn main() -> i64 {
     r = test_div();             if (r != 0) { return r; }
     r = test_nested_calls();    if (r != 0) { return r; }
     r = test_sema_error();      if (r != 0) { return r; }
+    r = test_expanded_features(); if (r != 0) { return r; }
 
     // every check passed
     return 0;

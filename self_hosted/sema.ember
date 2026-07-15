@@ -73,15 +73,19 @@ import "parse.ember";
 // the common case). These are appended to the parser's g_nodes array, so they
 // live for the lifetime of the AST.
 // -----------------------------------------------------------------------------
-global TY_I64  : i64 = 0;
-global TY_BOOL : i64 = 0;
-global TY_VOID : i64 = 0;
+global TY_I64   : i64 = 0;
+global TY_BOOL  : i64 = 0;
+global TY_VOID  : i64 = 0;
+global TY_F32   : i64 = 0;
+global TY_F64   : i64 = 0;
+global TY_STRING: i64 = 0;
 
 // -----------------------------------------------------------------------------
 // symbol tables (flat i64 arrays).
 // -----------------------------------------------------------------------------
 global g_fns     : i64 = 0;   // array, stride FN_STRIDE
 global g_structs : i64 = 0;   // array, stride STRUCT_STRIDE
+global g_enums   : i64 = 0;   // array, stride 2 [name_tok, first_variant]
 global g_globals : i64 = 0;   // array, stride GLOBAL_STRIDE
 global g_scope   : i64 = 0;   // array, stride SCOPE_STRIDE (local vars)
 global g_marks   : i64 = 0;   // array, stride 1 (scope-push marks)
@@ -124,6 +128,7 @@ fn s_init() -> i64 {
     s_toks = parse_tokens();
     g_fns = array_new(8, 0);
     g_structs = array_new(8, 0);
+    g_enums = array_new(8, 0);
     g_globals = array_new(8, 0);
     g_scope = array_new(8, 0);
     g_marks = array_new(8, 0);
@@ -146,6 +151,15 @@ fn s_init() -> i64 {
 
     TY_VOID = alloc_node(NK::Type as i64);
     set_d(TY_VOID, Prim::Void as i64);
+
+    TY_F32 = alloc_node(NK::Type as i64);
+    set_d(TY_F32, Prim::F32 as i64);
+    TY_F64 = alloc_node(NK::Type as i64);
+    set_d(TY_F64, Prim::F64 as i64);
+    // `string` is a builtin opaque handle. Prim 12 is private to the
+    // self-hosted compiler and deliberately does not collide with v1 Prim.
+    TY_STRING = alloc_node(NK::Type as i64);
+    set_d(TY_STRING, 12);
     return 0;
 }
 
@@ -286,6 +300,12 @@ fn ty_is_void(t: i64) -> i64 {
     return 1;
 }
 
+fn ty_is_string(t: i64) -> i64 {
+    if (t < 0 || nk_kind(t) != (NK::Type as i64)) { return 0; }
+    if (nk_d(t) == 12 && nk_tok(t) < 0) { return 1; }
+    return 0;
+}
+
 // is this a numeric type (int or float)? floats are Prim F32=10 / F64=11.
 fn ty_is_float(t: i64) -> i64 {
     if (t < 0) { return 0; }
@@ -306,8 +326,9 @@ fn type_eq(t1: i64, t2: i64) -> i64 {
     if (nk_kind(t1) != (NK::Type as i64)) { return 0; }
     if (nk_kind(t2) != (NK::Type as i64)) { return 0; }
     if (nk_d(t1) != nk_d(t2)) { return 0; }
-    // struct name: compare by text (two different tokens with the same text)
-    if (tok_name(nk_tok(t1)) != tok_name(nk_tok(t2))) { return 0; }
+    // Avoid `!=` on string handles: the host overload path is reliable for
+    // `==`, while direct handle inequality is identity-based in some builds.
+    if ((tok_name(nk_tok(t1)) == tok_name(nk_tok(t2))) == false) { return 0; }
     if (nk_f(t1) != nk_f(t2)) { return 0; }
     if (nk_e(t1) != nk_e(t2)) { return 0; }
     // element type for array/slice — recurse
@@ -340,6 +361,7 @@ fn ty_name(t: i64) -> string {
     if (p == (Prim::I32 as i64)) { return string_from_slice("i32"); }
     if (p == (Prim::F32 as i64)) { return string_from_slice("f32"); }
     if (p == (Prim::F64 as i64)) { return string_from_slice("f64"); }
+    if (p == 12) { return string_from_slice("string"); }
     return string_from_slice("?");
 }
 
@@ -362,10 +384,8 @@ fn resolve_type(t: i64) -> i64 {
     // marker). Look it up in the struct table.
     if (nk_tok(t) >= 0) {
         let nm: string = tok_name(nk_tok(t));
-        if (find_struct(nm) >= 0) { return t; }
-        // not a declared struct — v1 reports an error (no opaque host handles
-        // in the subset). The C++ sema accepts opaque handles; v1 keeps it
-        // strict so an unknown name is always caught.
+        if (nm == string_from_slice("string")) { return TY_STRING; }
+        if (find_struct(nm) >= 0 || find_enum(nm) >= 0) { return t; }
         return serr(string_from_slice("unknown type '") + nm + string_from_slice("'"),
                     node_line(t), node_col(t));
     }
@@ -374,9 +394,8 @@ fn resolve_type(t: i64) -> i64 {
     if (p == (Prim::I64 as i64)) { return TY_I64; }
     if (p == (Prim::Bool as i64)) { return TY_BOOL; }
     if (p == (Prim::Void as i64)) { return TY_VOID; }
-    if (p == (Prim::F32 as i64) || p == (Prim::F64 as i64)) {
-        return unsupported(-303, string_from_slice("floating-point type"), t);
-    }
+    if (p == (Prim::F32 as i64)) { return TY_F32; }
+    if (p == (Prim::F64 as i64)) { return TY_F64; }
     return unsupported(-315, string_from_slice("non-i64 integer or function-handle type"), t);
 }
 
@@ -396,6 +415,35 @@ fn find_struct(name: string) -> i64 {
 }
 
 // register a struct decl: append (name_tok, first_field) to g_structs.
+fn find_enum(name: string) -> i64 {
+    let n: i64 = array_length(g_enums) / 2;
+    let mut i: i64 = 0;
+    while (i < n) {
+        if (tok_name(array_get_i64(g_enums, i * 2)) == name) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn register_enum(ed: i64) -> i64 {
+    let nm: string = nk_name(ed);
+    if (find_enum(nm) >= 0) {
+        return serr(string_from_slice("duplicate enum declaration '") + nm + string_from_slice("'"), node_line(ed), node_col(ed));
+    }
+    array_push_i64(g_enums, nk_tok(ed));
+    array_push_i64(g_enums, nk_b(ed));
+    return 0;
+}
+
+fn enum_variant_exists(row: i64, name: string) -> i64 {
+    let mut v: i64 = array_get_i64(g_enums, row * 2 + 1);
+    while (v >= 0) {
+        if (nk_name(v) == name) { return 1; }
+        v = nk_next(v);
+    }
+    return 0;
+}
+
 fn register_struct(sd: i64) -> i64 {
     let nm_tok: i64 = nk_tok(sd);
     let nm: string = tok_name(nm_tok);
@@ -654,17 +702,32 @@ fn check_expr(e: i64) -> i64 {
         return check_assignexpr(e);
     }
 
-    if (k == (NK::FloatLit as i64)) { return unsupported(-303, string_from_slice("float literal"), e); }
-    if (k == (NK::StringLit as i64)) { return unsupported(-309, string_from_slice("string literal"), e); }
+    if (k == (NK::FloatLit as i64)) {
+        let raw: string = nk_name(e);
+        let n: i64 = string_length(raw);
+        if (n > 0) {
+            let last: i64 = string_char_at(raw, n - 1);
+            if (last == 102 || last == 70) { return TY_F32; }
+        }
+        return TY_F64;
+    }
+    if (k == (NK::StringLit as i64)) { return TY_STRING; }
     if (k == (NK::ArrayLit as i64)) { return unsupported(-310, string_from_slice("array literal"), e); }
     if (k == (NK::LambdaExpr as i64)) { return unsupported(-307, string_from_slice("lambda"), e); }
-    if (k == (NK::StructLit as i64) || k == (NK::FieldExpr as i64)) {
-        return unsupported(-301, string_from_slice("struct value"), e);
-    }
+    if (k == (NK::StructLit as i64)) { return check_structlit(e); }
+    if (k == (NK::FieldExpr as i64)) { return check_fieldexpr(e); }
     if (k == (NK::IndexExpr as i64) || k == (NK::ViewExpr as i64)) {
         return unsupported(-310, string_from_slice("array/slice expression"), e);
     }
-    if (k == (NK::EnumAccess as i64)) { return unsupported(-302, string_from_slice("enum value"), e); }
+    if (k == (NK::EnumAccess as i64)) {
+        let ename: string = tok_name(nk_a(e));
+        let row: i64 = find_enum(ename);
+        if (row < 0) { return serr(string_from_slice("unknown enum '") + ename + string_from_slice("'"), node_line(e), node_col(e)); }
+        if (enum_variant_exists(row, nk_name(e)) == 0) {
+            return serr(string_from_slice("unknown enum variant '") + nk_name(e) + string_from_slice("'"), node_line(e), node_col(e));
+        }
+        return TY_I64;
+    }
     return unsupported(-313, string_from_slice("expression kind"), e);
 }
 
@@ -692,6 +755,11 @@ fn check_binop_result(op: i64, lt: i64, rt: i64, e: i64) -> i64 {
                         node_line(e), node_col(e));
         }
         return TY_BOOL;
+    }
+
+    // String concatenation is the string overload of '+'.
+    if (op == (BinOp::Add as i64) && ty_is_string(lt) == 1 && ty_is_string(rt) == 1) {
+        return TY_STRING;
     }
 
     // comparison == != < <= > >= : same-type operands -> bool
@@ -786,6 +854,15 @@ fn check_unaryexpr(e: i64) -> i64 {
 // handles direct named calls only (no fn-handle / indirect / cross-module).
 fn check_callexpr(e: i64) -> i64 {
     let nm: string = nk_name(e);
+    // Intrinsics implemented directly by the self-hosted emitter. Keeping
+    // them here avoids depending on the host compiler's NativeSig table.
+    if (nm == string_from_slice("string_length")) {
+        let a: i64 = nk_a(e);
+        if (a < 0 || nk_next(a) >= 0 || ty_is_string(check_expr(a)) == 0) {
+            return serr(string_from_slice("string_length expects one string"), node_line(e), node_col(e));
+        }
+        return TY_I64;
+    }
     let row: i64 = find_fn(nm);
     if (row < 0) {
         // not a declared fn. v1 has no natives / fn-handles in the subset, so
@@ -822,6 +899,26 @@ fn check_callexpr(e: i64) -> i64 {
         i = i + 1;
     }
     return fn_ret_type(row);
+}
+
+fn check_structlit(e: i64) -> i64 {
+    let row: i64 = find_struct(nk_name(e));
+    if (row < 0) { return serr(string_from_slice("unknown struct '") + nk_name(e) + string_from_slice("'"), node_line(e), node_col(e)); }
+    let mut field: i64 = array_get_i64(g_structs, row * STRUCT_STRIDE + 1);
+    while (field >= 0) {
+        let mut init: i64 = nk_a(e);
+        let mut seek: i64 = 1;
+        while (init >= 0 && seek == 1) { if (nk_name(init) == nk_name(field)) { seek = 0; } else { init = nk_next(init); } }
+        if (init < 0) { return serr(string_from_slice("missing struct field '") + nk_name(field) + string_from_slice("'"), node_line(e), node_col(e)); }
+        let want: i64 = resolve_type(nk_a(field));
+        let got: i64 = check_expr(nk_a(init));
+        if (type_eq(want, got) == 0) { return serr(string_from_slice("struct field type mismatch"), node_line(init), node_col(init)); }
+        field = nk_next(field);
+    }
+    let t: i64 = alloc_node(NK::Type as i64);
+    set_tok(t, array_get_i64(g_structs, row * STRUCT_STRIDE));
+    set_d(t, Prim::Void as i64);
+    return t;
 }
 
 // check a field access base.field. base must be a struct type; the field must
@@ -1015,7 +1112,21 @@ fn check_stmt(s: i64) -> i64 {
 
     if (k == (NK::ForEachStmt as i64)) { unsupported(-311, string_from_slice("for-each"), s); return 0; }
     if (k == (NK::SwitchStmt as i64)) { unsupported(-305, string_from_slice("switch"), s); return 0; }
-    if (k == (NK::MatchStmt as i64)) { unsupported(-304, string_from_slice("match"), s); return 0; }
+    if (k == (NK::MatchStmt as i64)) {
+        let subject_ty: i64 = check_expr(nk_a(s));
+        let mut arm: i64 = nk_b(s);
+        while (arm >= 0) {
+            if (nk_d(arm) == 0) {
+                let pt: i64 = check_expr(nk_a(arm));
+                if (type_eq(subject_ty, pt) == 0) { serr(string_from_slice("match pattern type mismatch"), node_line(arm), node_col(arm)); return 0; }
+            }
+            if (nk_e(arm) >= 0 && ty_is_bool(check_expr(nk_e(arm))) == 0) { serr(string_from_slice("match guard must be bool"), node_line(arm), node_col(arm)); return 0; }
+            check_block(nk_b(arm));
+            if (s_err != 0) { return 0; }
+            arm = nk_next(arm);
+        }
+        return 0;
+    }
     if (k == (NK::TryCatchStmt as i64) || k == (NK::ThrowStmt as i64)) {
         unsupported(-306, string_from_slice("try/catch or throw"), s); return 0;
     }
@@ -1176,15 +1287,22 @@ fn check_program(prog: i64) -> i64 {
         return serr(string_from_slice("expected a program node"), 0, 0);
     }
 
-    // pass 1: reject unsupported declaration families, then register every
-    // supported signature. No top-level node is silently ignored.
+    // First collect nominal declarations so function signatures may refer to
+    // structs/enums declared anywhere in the file.
     let mut d: i64 = nk_a(prog);
     while (d >= 0) {
+        if (nk_kind(d) == (NK::StructDecl as i64)) { register_struct(d); }
+        else if (nk_kind(d) == (NK::EnumDecl as i64)) { register_enum(d); }
+        if (s_err != 0) { return s_errcode; }
+        d = nk_next(d);
+    }
+
+    // Then register callable/value declarations.
+    d = nk_a(prog);
+    while (d >= 0) {
         let k: i64 = nk_kind(d);
-        if (k == (NK::StructDecl as i64)) {
-            unsupported(-301, string_from_slice("struct declaration"), d);
-        } else if (k == (NK::EnumDecl as i64)) {
-            unsupported(-302, string_from_slice("enum declaration"), d);
+        if (k == (NK::StructDecl as i64) || k == (NK::EnumDecl as i64)) {
+            // already collected above
         } else if (k == (NK::FnDecl as i64)) {
             register_fn(d);
         } else if (k == (NK::GlobalDecl as i64)) {

@@ -9,13 +9,14 @@
 //   echo self_hosted/preview_smoke_input.ember | ember_selfhost_preview.exe
 //
 // Supported source subset:
-//   i64/bool/void; let/let mut; if/else; while; C-style for; return;
-//   arithmetic, bitwise, comparison and logical operators; direct calls of up
-//   to four i64 arguments; multiple functions, recursion and forward calls.
+//   i64/bool/void/f32/f64/string; let/let mut; if/else; while; C-style
+//   for; return; arithmetic and comparisons; string concat/equality/length;
+//   f-string interpolation of scalar locals; flat struct literals/field reads;
+//   enums and variant matching; direct calls of up to four scalar arguments;
+//   multiple functions, recursion and forward calls.
 // The input must define `fn main() -> i64` and currently must be ASCII text.
-// structs, enums, floats, match, switch, try/catch, lambdas, coroutines/yield,
-// strings, arrays, slices, for-each, defer and other unsupported constructs are
-// rejected by sema with stable -3xx codes before codegen.
+// Arrays, slices, switch, try/catch, lambdas, coroutines/yield, for-each,
+// defer and other unsupported constructs are rejected before codegen.
 //
 // The current io extension exposes whole-file bytes rather than a text-read
 // native, so this preview performs an explicit checked ASCII byte-to-string
@@ -58,7 +59,7 @@ fn compile_file_and_run(path: string) -> i64 {
 
 fn main() -> i64 {
     println("ember self-host preview: enter an ASCII .ember path");
-    println("subset: i64/bool/void, let, if/while/for, return, scalar ops, direct calls, recursion");
+    println("subset: scalar/string ops, f-strings, floats, flat structs, enums/match, calls/recursion");
     let path: string = read_line();
     let result: i64 = compile_file_and_run(path);
     if (result < 0) {

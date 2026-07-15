@@ -676,6 +676,18 @@ fn test_fn_handle() -> i64 {
     return 0;
 }
 
+fn test_expanded_literals() -> i64 {
+    let prog: i64 = parse("fn f() -> f64 { let s: string = f\"value={42}\"; return 1.5; }");
+    if (parse_failed() != 0) { return 15001; }
+    let fd: i64 = nk_a(prog);
+    if (type_prim(nk_b(fd)) != (Prim::F64 as i64)) { return 15002; }
+    let first: i64 = nk_a(nk_c(fd));
+    if (nk_kind(nk_b(first)) != (NK::StringLit as i64) || nk_d(nk_b(first)) != 1) { return 15003; }
+    let ret: i64 = nk_next(first);
+    if (nk_kind(nk_a(ret)) != (NK::FloatLit as i64)) { return 15004; }
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // main — run every test in order; bail on the first nonzero return.
 // ---------------------------------------------------------------------------
@@ -697,6 +709,7 @@ fn main() -> i64 {
     r = test_do_defer_yield();        if (r != 0) { return r; }
     r = test_match();                 if (r != 0) { return r; }
     r = test_fn_handle();             if (r != 0) { return r; }
+    r = test_expanded_literals();     if (r != 0) { return r; }
 
     // every check passed
     return 0;
