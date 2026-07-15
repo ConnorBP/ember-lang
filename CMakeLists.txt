@@ -141,6 +141,10 @@ add_library(ember STATIC
     src/key_provider.cpp          # Red 5: immutable provider boundary + dispatch key adapter (§6.1)
     src/gc.cpp              # GC: tracing mark-sweep core (foundational infra for lambdas/coroutines)
     src/safety.cpp          # process-wide failsafes: RSS memory cap, recursion depth guard, deadline
+    # VST3 Phase 9: editor-side audio node graph model, JSON persistence, and
+    # deterministic .ember source generation. These have no VST SDK dependency.
+    src/node_graph.cpp
+    src/node_codegen.cpp
 )
 target_include_directories(ember PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ember PUBLIC ember_ed25519)  # F2 .em content authentication
@@ -339,6 +343,13 @@ enable_testing()
 add_executable(em_roundtrip_test examples/em_roundtrip_test.cpp)
 target_link_libraries(em_roundtrip_test PRIVATE ember ember_frontend)
 add_test(NAME em_roundtrip COMMAND em_roundtrip_test)
+
+# VST3 Phase 9 editor-side graph/model + JSON + .ember source generator.
+# Intentionally not registered with add_test so the established ctest count
+# remains unchanged; the executable is still part of the default build.
+add_executable(node_graph_test examples/node_graph_test.cpp)
+target_link_libraries(node_graph_test PRIVATE
+    ember ember_frontend ember_ext_audio ember_ext_math)
 
 # em_bytes_test: unit test for the in-memory .em round-trip (write_em_bytes /
 # load_em_bytes — the APIs the standalone exe bundler + stub use). Covers the
