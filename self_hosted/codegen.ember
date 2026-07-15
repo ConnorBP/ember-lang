@@ -157,7 +157,7 @@ global cg_frame_size : i64 = 0;   // the current fn's frame size
 // fixup patched after all fns are compiled. This replaces the v1 placeholder
 // `mov rax, 0; call rax` (which branched to address 0 under make_executable)
 // with a real in-buffer relative call, so multi-fn programs execute.
-global cg_fn_labels : i64 = 0;   // array, stride 2 [ name_tok, label_id ]
+global cg_fn_labels : i64 = 0;   // array, stride 3 [ name_tok, label_id, ns_tok ]
 
 // error state
 global cg_err     : i64 = 0;
@@ -411,6 +411,23 @@ fn cg_float_op(op: i64, is64: i64) -> i64 { if (is64 == 1) { cg_sse_rr(0xF2, op,
 fn cg_float_cmp(is64: i64) -> i64 { if (is64 == 1) { cg_byte(0x66); } cg_byte(0x0F); cg_byte(0x2E); cg_byte(cg_modrm(3, XMM0, XMM1)); return 0; }
 fn cg_i64_to_float(x: i64, r: i64, is64: i64) -> i64 { if (is64 == 1) { cg_byte(0xF2); } else { cg_byte(0xF3); } cg_byte(0x48); cg_byte(0x0F); cg_byte(0x2A); cg_byte(cg_modrm(3, x, r)); return 0; }
 
+// emit an implicit float widening/narrowing so a value of width `from` is
+// converted to width `to` in xmm0 before a store/return/arg-pass that expects
+// `to`. f32->f64 (cvtss2sd) is the one implicit widening; f64->f32 (cvtsd2ss)
+// is narrowing (only reached via an explicit `as` cast, which has its own
+// path). Same-width or non-float -> no-op. Mirrors the native sema synthesizing
+// a CastExpr for f32->f64 at the use site.
+fn cg_convert_float(from: i64, to: i64) -> i64 {
+    if (ty_is_float(from) == 0 || ty_is_float(to) == 0) { return 0; }
+    if (nk_d(from) == nk_d(to)) { return 0; }   // same width
+    if (nk_d(from) == (Prim::F32 as i64) && nk_d(to) == (Prim::F64 as i64)) {
+        // cvtss2sd xmm0, xmm0 -> F3 0F 5A C0
+        cg_byte(0xF3); cg_byte(0x0F); cg_byte(0x5A); cg_byte(0xC0);
+        return 0;
+    }
+    return 0;
+}
+
 fn cg_float_is64_type(t: i64) -> i64 { if (t >= 0 && nk_d(t) == (Prim::F64 as i64)) { return 1; } return 0; }
 
 // -----------------------------------------------------------------------------
@@ -613,6 +630,9 @@ fn cg_expr_type(e: i64) -> i64 {
     if (e < 0) { return -1; }
     let k: i64 = nk_kind(e);
     if (k == (NK::FloatLit as i64)) {
+        // an adapted f32 literal (sema's try_adapt_float_lit annotated slot c)
+        let ann: i64 = nk_c(e);
+        if (ann == TY_F32) { return TY_F32; }
         let raw: string = nk_name(e); let n: i64 = string_length(raw);
         if (n > 0 && (string_char_at(raw, n - 1) == 102 || string_char_at(raw, n - 1) == 70)) { return TY_F32; }
         return TY_F64;
@@ -624,6 +644,12 @@ fn cg_expr_type(e: i64) -> i64 {
     // untyped enum variant, or the typed-enum type for `enum E : T`.
     if (k == (NK::EnumAccess as i64)) {
         let ename: string = tok_name(nk_a(e));
+        // a namespace-global access (Foo::val) has the global's type.
+        if (is_namespace_name(ename) == 1) {
+            let g: i64 = cg_find_global_qualified(nk_name(e), ename);
+            if (g >= 0) { return global_type(g); }
+            return TY_I64;
+        }
         if (is_typed_enum_name(ename) == 1) { return typed_enum_type(ename); }
         return TY_I64;
     }
@@ -651,6 +677,14 @@ fn cg_expr_type(e: i64) -> i64 {
         let bt: i64 = cg_expr_type(nk_a(e));
         if (bt >= 0) { let et: i64 = nk_a(bt); if (et >= 0) { return resolve_type(et); } }
         return -1;
+    }
+    if (k == (NK::UnaryExpr as i64)) {
+        // Neg/BitNot preserve the operand's (integer) type; Not yields bool.
+        // Mirrors sema's check_unaryexpr result. Used by cast dispatch so
+        // `(-1) as u8` sees from=i64 (the operand's type).
+        let op: i64 = nk_d(e);
+        if (op == (UnOp::Not as i64)) { return TY_BOOL; }
+        return cg_expr_type(nk_a(e));
     }
     if (k == (NK::BinExpr as i64)) {
         let op: i64 = nk_d(e);
@@ -1170,13 +1204,40 @@ fn cg_lookup_local_type(name_tok: i64) -> i64 {
 // look up a function's entry label by name. Returns the label id, or -1 if
 // the name is not in cg_fn_labels (i.e. the fn was not declared in the
 // program). Names are stored as token indices and compared by text via
-// tok_name (same trick as cg_lookup_local + sema's tables).
+// tok_name (same trick as cg_lookup_local + sema's tables). This bare lookup
+// matches a TOP-LEVEL fn (ns_tok < 0); namespaced fns are found via
+// cg_lookup_fn_label_qualified (Ns::fn).
 fn cg_lookup_fn_label(name: string) -> i64 {
-    let n: i64 = array_length(cg_fn_labels) / 2;
+    let n: i64 = array_length(cg_fn_labels) / 3;
     let mut i: i64 = 0;
     while (i < n) {
-        let tok: i64 = array_get_i64(cg_fn_labels, i * 2);
-        if (tok_name(tok) == name) { return array_get_i64(cg_fn_labels, i * 2 + 1); }
+        let tok: i64 = array_get_i64(cg_fn_labels, i * 3);
+        if (tok_name(tok) == name) {
+            if (array_get_i64(cg_fn_labels, i * 3 + 2) < 0) { return array_get_i64(cg_fn_labels, i * 3 + 1); }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// look up a function's entry label by qualified name (Ns::fn). ns_name ""
+// matches a top-level fn; a nonempty ns_name matches a fn whose ns_tok names
+// ns_name. Returns the label id, or -1.
+fn cg_lookup_fn_label_qualified(name: string, ns_name: string) -> i64 {
+    let n: i64 = array_length(cg_fn_labels) / 3;
+    let mut i: i64 = 0;
+    while (i < n) {
+        let tok: i64 = array_get_i64(cg_fn_labels, i * 3);
+        if (tok_name(tok) == name) {
+            let ns_tok: i64 = array_get_i64(cg_fn_labels, i * 3 + 2);
+            let mut ok: i64 = 0;
+            if (ns_tok < 0) {
+                if (string_length(ns_name) == 0) { ok = 1; }
+            } else {
+                if (tok_name(ns_tok) == ns_name) { ok = 1; }
+            }
+            if (ok == 1) { return array_get_i64(cg_fn_labels, i * 3 + 1); }
+        }
         i = i + 1;
     }
     return -1;
@@ -1396,12 +1457,36 @@ fn cg_eval_const_i64(e: i64) -> i64 {
     return 0;
 }
 
-// find a codegen global by name. Returns the row index, or -1 if not declared.
+// find a codegen global by bare name. Returns the row index, or -1 if not
+// declared. Stride 3 [name_tok, addend, ns_tok]; matches any global with the
+// bare name (mirrors sema registering a namespaced global under both bare +
+// qualified names).
 fn cg_find_global(name: string) -> i64 {
     let mut i: i64 = 0;
-    while (i < cg_globals_len) {
-        let tok: i64 = array_get_i64(cg_globals, i * 2);
+    while (i * 3 < cg_globals_len) {
+        let tok: i64 = array_get_i64(cg_globals, i * 3);
         if (tok_name(tok) == name) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// find a codegen global by qualified name (Ns::name). ns_name "" matches a
+// top-level global; a nonempty ns_name matches a global whose ns_tok names it.
+fn cg_find_global_qualified(name: string, ns_name: string) -> i64 {
+    let mut i: i64 = 0;
+    while (i * 3 < cg_globals_len) {
+        let tok: i64 = array_get_i64(cg_globals, i * 3);
+        if (tok_name(tok) == name) {
+            let ns_tok: i64 = array_get_i64(cg_globals, i * 3 + 2);
+            let mut ok: i64 = 0;
+            if (ns_tok < 0) {
+                if (string_length(ns_name) == 0) { ok = 1; }
+            } else {
+                if (tok_name(ns_tok) == ns_name) { ok = 1; }
+            }
+            if (ok == 1) { return i; }
+        }
         i = i + 1;
     }
     return -1;
@@ -1409,47 +1494,65 @@ fn cg_find_global(name: string) -> i64 {
 
 // a global's data-section byte addend (its slot offset within cg_data).
 fn cg_global_addend(row: i64) -> i64 {
-    return array_get_i64(cg_globals, row * 2 + 1);
+    return array_get_i64(cg_globals, row * 3 + 1);
 }
 
 // walk the program's GlobalDecls + allocate a data slot for each
 // constant-initialized i64 global (mirroring sema's global_is_const_i64 gate).
 // Writes the constant's 8 LE bytes into cg_data + records (name -> addend).
-// Must run BEFORE compiling functions so global references resolve.
+// Must run BEFORE compiling functions so global references resolve. Descends
+// into NamespaceDecl members (namespaced globals get their ns_tok recorded so
+// Ns::global reads resolve).
 fn cg_compile_globals(prog: i64) -> i64 {
     let mut d: i64 = nk_a(prog);
     while (d >= 0) {
-        if (nk_kind(d) == (NK::GlobalDecl as i64)) {
-            // only constant-initialized i64 globals are registered by sema;
-            // mirror that gate here so the codegen allocates exactly those.
-            let gty: i64 = resolve_type(nk_a(d));
-            let init: i64 = nk_b(d);
-            let mut is_const: i64 = 0;
-            if (gty >= 0 && ty_is_i64(gty) == 1 && init >= 0) {
-                if (nk_kind(init) == (NK::IntLit as i64)) { is_const = 1; }
-                if (nk_kind(init) == (NK::UnaryExpr as i64) && nk_d(init) == (UnOp::Neg as i64)) {
-                    if (nk_kind(nk_a(init)) == (NK::IntLit as i64)) { is_const = 1; }
-                }
+        if (nk_kind(d) == (NK::NamespaceDecl as i64)) {
+            let ns_tok: i64 = nk_tok(d);
+            let mut m: i64 = nk_a(d);
+            while (m >= 0) {
+                if (nk_kind(m) == (NK::GlobalDecl as i64)) { cg_compile_one_global(m, ns_tok); }
+                if (cg_err != 0) { return 0; }
+                m = nk_next(m);
             }
-            if (is_const == 1) {
-                let addend: i64 = cg_data_alloc(8);
-                let val: i64 = cg_eval_const_i64(init);
-                // write the 8 LE bytes of the initial value into cg_data
-                let mut b: i64 = 0;
-                while (b < 8) {
-                    array_set_u8(cg_data, addend + b, (val >> (b * 8)) & 0xFF);
-                    b = b + 1;
-                }
-                // record (name_tok -> addend)
-                if (array_length(cg_globals) < cg_globals_len + 2) {
-                    array_resize(cg_globals, cg_globals_len + 2);
-                }
-                array_set_i64(cg_globals, cg_globals_len, nk_tok(d));
-                array_set_i64(cg_globals, cg_globals_len + 1, addend);
-                cg_globals_len = cg_globals_len + 2;
-            }
+        } else if (nk_kind(d) == (NK::GlobalDecl as i64)) {
+            cg_compile_one_global(d, -1);
+            if (cg_err != 0) { return 0; }
         }
         d = nk_next(d);
+    }
+    return 0;
+}
+
+// allocate a data slot for one constant-initialized i64 global + record
+// (name_tok, addend, ns_tok) in cg_globals. Mirrors sema's global_is_const_i64
+// gate so the codegen allocates exactly the globals sema registered.
+fn cg_compile_one_global(d: i64, ns_tok: i64) -> i64 {
+    let gty: i64 = resolve_type(nk_a(d));
+    let init: i64 = nk_b(d);
+    let mut is_const: i64 = 0;
+    if (gty >= 0 && ty_is_i64(gty) == 1 && init >= 0) {
+        if (nk_kind(init) == (NK::IntLit as i64)) { is_const = 1; }
+        if (nk_kind(init) == (NK::UnaryExpr as i64) && nk_d(init) == (UnOp::Neg as i64)) {
+            if (nk_kind(nk_a(init)) == (NK::IntLit as i64)) { is_const = 1; }
+        }
+    }
+    if (is_const == 1) {
+        let addend: i64 = cg_data_alloc(8);
+        let val: i64 = cg_eval_const_i64(init);
+        // write the 8 LE bytes of the initial value into cg_data
+        let mut b: i64 = 0;
+        while (b < 8) {
+            array_set_u8(cg_data, addend + b, (val >> (b * 8)) & 0xFF);
+            b = b + 1;
+        }
+        // record (name_tok, addend, ns_tok) at stride 3
+        if (array_length(cg_globals) < cg_globals_len + 3) {
+            array_resize(cg_globals, cg_globals_len + 3);
+        }
+        array_set_i64(cg_globals, cg_globals_len, nk_tok(d));
+        array_set_i64(cg_globals, cg_globals_len + 1, addend);
+        array_set_i64(cg_globals, cg_globals_len + 2, ns_tok);
+        cg_globals_len = cg_globals_len + 3;
     }
     return 0;
 }
@@ -1575,11 +1678,26 @@ fn cg_eval(e: i64) -> i64 {
     if (k == (NK::FloatLit as i64)) { return cg_eval_float_lit(e); }
     if (k == (NK::StringLit as i64)) { return cg_eval_string_lit(e); }
     if (k == (NK::EnumAccess as i64)) {
+        let ename: string = tok_name(nk_a(e));
+        // Tier 1 namespaces: Foo::val where Foo is a namespace (not an enum) is
+        // a namespace-global read. Emit the same ABS64_DATA load as a global
+        // Ident (mirrors src/sema.cpp rewriting Foo::val to an Ident with the
+        // qualified name, then codegen's global Ident load).
+        if (is_namespace_name(ename) == 1) {
+            let g: i64 = cg_find_global_qualified(nk_name(e), ename);
+            if (g >= 0) {
+                let addend: i64 = cg_global_addend(g);
+                cg_emit_abs64_reloc_reg(RAX, CG_RELOC_DATA, 0, addend);  // mov rax, <data ptr>
+                cg_byte(0x48); cg_byte(0x8B); cg_byte(0x00);              // mov rax, [rax]
+                return 0;
+            }
+            if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: namespace '") + ename + string_from_slice("' has no global '") + nk_name(e) + string_from_slice("'"); }
+            return 0;
+        }
         cg_mov_reg_imm64(RAX, cg_enum_value(tok_name(nk_a(e)), nk_name(e)));
         // Phase 3b: a typed-enum variant normalizes to the backing width (a
         // typed enum is a real type; its value is the backing int). An
         // untyped enum variant is a plain i64 constant (no normalize needed).
-        let ename: string = tok_name(nk_a(e));
         if (is_typed_enum_name(ename) == 1) {
             let et: i64 = typed_enum_type(ename);
             if (et >= 0) { cg_normalize_rax(et); }
@@ -2401,6 +2519,20 @@ fn cg_eval_assignexpr(e: i64) -> i64 {
     if (cop < 0 && postfix != 1) {
         cg_eval(value);
         if (cg_err != 0) { return 0; }
+        if (ty_is_float(tt) == 1) {
+            // float value is in XMM0; store with the target's width (movsd f64
+            // / movss f32). Mirror the compound float path's store.
+            let is64: i64 = cg_float_is64_type(tt);
+            if (is_global == 1) {
+                // float globals are not in Phase 1; defend anyway via rax.
+                if (is64 == 1) { cg_movq_rax_xmm(XMM0); } else { cg_movq_rax_xmm(XMM0); }
+                cg_emit_abs64_reloc_reg(RCX, CG_RELOC_DATA, 0, g_addend);
+                cg_byte(0x48); cg_byte(0x89); cg_byte(0x01);  // mov [rcx], rax
+            } else {
+                cg_store_float(off, XMM0, is64);
+            }
+            return 0;
+        }
         cg_normalize_rax(tt);
         if (is_global == 1) {
             cg_emit_abs64_reloc_reg(RCX, CG_RELOC_DATA, 0, g_addend);
@@ -2794,7 +2926,7 @@ fn cg_eval_castexpr(e: i64) -> i64 {
         return 0;
     }
     // unreachable: sema's cast matrix rejects anything else
-    if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: invalid cast reached codegen"); }
+    if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: invalid cast from ") + ty_name(from) + string_from_slice(" to ") + ty_name(to); }
     return 0;
 }
 
@@ -2889,7 +3021,26 @@ fn cg_eval_callexpr(e: i64) -> i64 {
         }
     }
 
-    let fn_row: i64 = find_fn(name);
+    // determine script vs native + the fn row. Tier 1 namespaces: a Foo::bar()
+    // call (base name tok in slot e) resolves to the qualified Ns::fn row; a
+    // bare call inside a namespaced fn first tries the sibling Ns::fn row.
+    let mut fn_row: i64 = -1;
+    let mut is_ns_call: i64 = 0;
+    let mod_tok: i64 = nk_e(e);
+    if (mod_tok >= 0) {
+        let mod_name: string = tok_text_at(mod_tok);
+        if (is_namespace_name(mod_name) == 1) {
+            is_ns_call = 1;
+            fn_row = find_fn_qualified(name, mod_name);
+        }
+    }
+    if (is_ns_call == 0) {
+        fn_row = find_fn(name);
+        if (fn_row < 0 && cg_cur_ns >= 0) {
+            let qrow: i64 = find_fn_qualified(name, tok_name(cg_cur_ns));
+            if (qrow >= 0) { fn_row = qrow; }
+        }
+    }
     let mut is_native: i64 = 0;
     if (fn_row < 0) { is_native = 1; }
 
@@ -3033,8 +3184,22 @@ fn cg_eval_callexpr(e: i64) -> i64 {
     // offset; the rel32 fixup is patched after all fns are compiled. This
     // resolves to the callee's real entry within the same code region, so
     // multi-fn programs execute correctly (the loader copies the code section
-    // verbatim and does not patch rel32).
-    let callee_label: i64 = cg_lookup_fn_label(name);
+    // verbatim and does not patch rel32). Tier 1 namespaces: Foo::bar() (the
+    // base name tok in slot e) resolves to the qualified Ns::fn label; a bare
+    // call inside a namespaced fn first tries the sibling Ns::fn label.
+    let mut callee_label: i64 = -1;
+    if (is_ns_call == 1) {
+        // Foo::bar(): resolve the qualified Ns::fn label (mod_name already used
+        // above to find the fn row; recompute the label here in parallel).
+        let mod_name: string = tok_text_at(mod_tok);
+        callee_label = cg_lookup_fn_label_qualified(name, mod_name);
+    } else {
+        callee_label = cg_lookup_fn_label(name);
+        if (callee_label < 0 && cg_cur_ns >= 0) {
+            let qlab: i64 = cg_lookup_fn_label_qualified(name, tok_name(cg_cur_ns));
+            if (qlab >= 0) { callee_label = qlab; }
+        }
+    }
     if (callee_label < 0) {
         if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: no entry label for function '") + name + string_from_slice("'"); }
         return 0;
@@ -3081,8 +3246,12 @@ fn cg_compile_stmt(s: i64) -> i64 {
                 cg_store_reg_mem(RBP, off + 8, RDX);
             } else {
                 cg_eval(init); if (cg_err != 0) { return 0; }
-                if (ty_is_float(t) == 1) { cg_store_float(off, XMM0, cg_float_is64_type(t)); }
-                else { cg_normalize_rax(t); cg_store_reg_mem(RBP, off, RAX); }
+                if (ty_is_float(t) == 1) {
+                    // implicit f32->f64 widening when the init is f32 and the
+                    // target is f64 (a same-type or same-width store is a no-op).
+                    cg_convert_float(cg_expr_type(init), t);
+                    cg_store_float(off, XMM0, cg_float_is64_type(t));
+                } else { cg_normalize_rax(t); cg_store_reg_mem(RBP, off, RAX); }
             }
         } else {
             // no initializer: zero-fill an aggregate's whole extent (a fixed
@@ -3295,6 +3464,10 @@ global g_defers        : i64 = 0;   // array of deferred expr node indices
 global g_defer_marks   : i64 = 0;   // array of mark depths (g_defers length)
 global g_defer_mark_len: i64 = 0;   // live mark-stack depth
 global cg_cur_ret      : i64 = 0;   // current fn's resolved return type (-1 none)
+// Tier 1 namespaces: the namespace name token of the fn currently being
+// compiled (-1 = top-level). Set in cg_compile_func so a bare call inside a
+// namespaced fn resolves to the sibling Ns::fn label (mirrors sema's s_cur_ns).
+global cg_cur_ns : i64 = -1;
 // per-loop/switch saved defer-mark depth, so break/continue clean up only the
 // scopes opened inside the current loop/switch (mirrors src/codegen.cpp's
 // cleanup_scopes.size() captured in the LoopFrame).
@@ -3579,15 +3752,131 @@ fn cg_compile_for(s: i64) -> i64 {
     return 0;
 }
 
-// compile a for-each statement: for (x in iter) { body } where iter is a slice
-// T[] (sema rejects a fixed array; use a[..] first). Mirrors src/codegen.cpp's
-// ForEachStmt slice path: eval iter -> {rax=ptr, rdx=len}; stash ptr, len, idx
-// into hidden frame slots; loop i=0..len, load elem [ptr + i*esz] into the
-// loop var, run the body, i++. break -> end, continue -> latch (the i++ step).
+// compile a for-each statement: for (x in iter) { body }. Two iterable kinds
+// (the iterable() hook, mirroring src/codegen.cpp's ForEachStmt):
+//   - array<T> handle (sema stored the inferred elem type in slot c)
+//     -> len = array_length(h); while i<len { x = array_get_*(h,i); body; i++ }
+//   - slice T[] (slot c is -1, the unchanged shipped path)
+//        -> eval iter -> {rax=ptr, rdx=len}; stash ptr,len,idx; loop i=0..len,
+//           load elem [ptr + i*esz] into the loop var, run the body, i++.
+// break -> end, continue -> latch (the i++ step) for both paths.
 fn cg_compile_foreach(s: i64) -> i64 {
     let vtok: i64 = nk_tok(s);     // loop var name token
-    let iter: i64 = nk_a(s);       // iterable expr (a slice)
+    let iter: i64 = nk_a(s);       // iterable expr
     let body: i64 = nk_b(s);       // body block
+    let arr_elem: i64 = nk_c(s);   // inferred array elem type (-1 = slice path)
+
+    if (arr_elem >= 0) {
+        return cg_compile_foreach_array(s, vtok, iter, body, arr_elem);
+    }
+    return cg_compile_foreach_slice(s, vtok, iter, body);
+}
+
+// array-handle for-each: len = array_length(h); i = 0;
+// while (i < len) { x = array_get_*(h, i); body; i = i + 1; }
+// Mirrors src/codegen.cpp's ForEachStmt array branch. The handle is an i64
+// opaque value (from array_new); array_length + array_get_* are host natives
+// emitted via ABS64_NATIVE. Win64: rcx = handle, rdx = index, 32-byte shadow.
+fn cg_compile_foreach_array(s: i64, vtok: i64, iter: i64, body: i64, elem_ty: i64) -> i64 {
+    // dispatch the typed get native from the inferred element type
+    // (1 -> u8/array_get_u8, 4 -> f32/array_get_f32, 8 -> i64/array_get_i64).
+    let mut get_name: string = string_from_slice("array_get_i64");
+    if (ty_is_uint(elem_ty) == 1 && cg_value_bytes(elem_ty) == 1) {
+        get_name = string_from_slice("array_get_u8");
+    } else if (ty_is_float(elem_ty) == 1 && cg_float_is64_type(elem_ty) == 0) {
+        get_name = string_from_slice("array_get_f32");
+    }
+
+    // hidden frame slots: handle, len, idx (each 8 bytes) + the loop var (1 slot).
+    let h_off: i64 = cg_alloc_local_t(-1, TY_I64, 1);
+    let len_off: i64 = cg_alloc_local_t(-1, TY_I64, 1);
+    let idx_off: i64 = cg_alloc_local_t(-1, TY_I64, 1);
+    let var_off: i64 = cg_alloc_local_t(vtok, elem_ty, 1);
+
+    // eval the iterable -> rax = the i64 array handle; stash it.
+    cg_eval(iter); if (cg_err != 0) { return 0; }
+    cg_store_reg_mem(RBP, h_off, RAX);
+
+    // len = array_length(h).  Win64: rcx = handle, 32-byte shadow, result in rax.
+    cg_sub_reg_imm32(RSP, 32);
+    cg_load_reg_mem(RCX, RBP, h_off);
+    let len_sym: i64 = cg_sym_index(string_from_slice("array_length"));
+    let len_pt: i64 = array_new(8, 4);
+    array_set_i64(len_pt, 0, native_param_type(string_from_slice("array_length"), 0));
+    let len_fp: i64 = cg_abi_fingerprint(len_pt, 1, native_ret_type(string_from_slice("array_length")), native_perm(string_from_slice("array_length")));
+    cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, len_sym, len_fp);
+    cg_call_reg(RAX);
+    cg_add_reg_imm32(RSP, 32);
+    cg_store_reg_mem(RBP, len_off, RAX);
+
+    // i = 0.
+    cg_mov_reg_imm64(RAX, 0);
+    cg_store_reg_mem(RBP, idx_off, RAX);
+
+    let top: i64 = cg_alloc_label();
+    let latch: i64 = cg_alloc_label();
+    let end: i64 = cg_alloc_label();
+    cg_bind(top);
+    // if (idx >= len) goto end
+    cg_load_reg_mem(RAX, RBP, idx_off);
+    cg_load_reg_mem(RDX, RBP, len_off);
+    cg_cmp_reg_reg(RAX, RDX);
+    cg_jcc(COND_GE, end);
+
+    // x = array_get_*(h, i).  rcx = handle, rdx = index, 32-byte shadow.
+    // result: rax (u8/i64) or xmm0 (f32).
+    cg_sub_reg_imm32(RSP, 32);
+    cg_load_reg_mem(RCX, RBP, h_off);
+    cg_load_reg_mem(RDX, RBP, idx_off);
+    let get_sym: i64 = cg_sym_index(get_name);
+    let get_pt: i64 = array_new(8, 4);
+    array_set_i64(get_pt, 0, native_param_type(get_name, 0));
+    array_set_i64(get_pt, 1, native_param_type(get_name, 1));
+    let get_fp: i64 = cg_abi_fingerprint(get_pt, 2, native_ret_type(get_name), native_perm(get_name));
+    cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, get_sym, get_fp);
+    cg_call_reg(RAX);
+    cg_add_reg_imm32(RSP, 32);
+    // store the element into the loop var slot (int via rax, f32 via xmm0).
+    if (ty_is_float(elem_ty) == 1) {
+        cg_store_float(var_off, XMM0, cg_float_is64_type(elem_ty));
+    } else {
+        cg_normalize_rax(elem_ty);
+        cg_store_reg_mem(RBP, var_off, RAX);
+    }
+
+    // set up break/continue targets + run the body.
+    let saved_depth: i64 = cg_loop_depth;
+    let saved_break: i64 = cg_loop_break;
+    let saved_cont: i64 = cg_loop_continue;
+    let saved_dmark: i64 = cg_loop_defer_mark;
+    cg_loop_depth = 1;
+    cg_loop_break = end;
+    cg_loop_continue = latch;
+    cg_loop_defer_mark = g_defer_mark_len;
+    cg_push_scope();
+    cg_compile_block(body);
+    cg_pop_scope();
+    cg_loop_depth = saved_depth;
+    cg_loop_break = saved_break;
+    cg_loop_continue = saved_cont;
+    cg_loop_defer_mark = saved_dmark;
+    if (cg_err != 0) { return 0; }
+
+    // latch: idx = idx + 1; jmp top
+    cg_bind(latch);
+    cg_load_reg_mem(RAX, RBP, idx_off);
+    cg_add_reg_imm32(RAX, 1);
+    cg_store_reg_mem(RBP, idx_off, RAX);
+    cg_jmp(top);
+    cg_bind(end);
+    return 0;
+}
+
+// slice for-each: eval iter -> {rax=ptr, rdx=len}; stash ptr, len, idx into
+// hidden frame slots; loop i=0..len, load elem [ptr + i*esz] into the loop
+// var, run the body, i++. break -> end, continue -> latch (the i++ step).
+// Mirrors src/codegen.cpp's ForEachStmt slice path (unchanged shipped path).
+fn cg_compile_foreach_slice(s: i64, vtok: i64, iter: i64, body: i64) -> i64 {
 
     // element type + stride from the iter's type (a slice)
     let it: i64 = cg_expr_type(iter);
@@ -3850,7 +4139,8 @@ fn cg_count_extra_struct_slots(b: i64) -> i64 {
 }
 
 // compile a single function: prologue, param spill, body, epilogue, fixups.
-fn cg_compile_func(fd: i64) -> i64 {
+fn cg_compile_func(fd: i64, ns_tok: i64) -> i64 {
+    cg_cur_ns = ns_tok;
     // init the local table for this function
     cg_locals_init();
     // Phase 3b: reset the defer cleanup stack for this function (defers are
@@ -4000,13 +4290,27 @@ fn codegen(source: string) -> i64 {
 
     // Allocate an entry label for every function up front, so a call to a fn
     // declared later (forward reference) gets a fixup for a label that will be
-    // bound when that fn is compiled. Stored in cg_fn_labels (name_tok, label).
+    // bound when that fn is compiled. Stored in cg_fn_labels stride 3
+    // (name_tok, label, ns_tok). Descends into NamespaceDecl members.
     let mut d: i64 = nk_a(prog);
     while (d >= 0) {
-        if (nk_kind(d) == (NK::FnDecl as i64)) {
+        if (nk_kind(d) == (NK::NamespaceDecl as i64)) {
+            let ns_tok: i64 = nk_tok(d);
+            let mut m: i64 = nk_a(d);
+            while (m >= 0) {
+                if (nk_kind(m) == (NK::FnDecl as i64)) {
+                    let lab: i64 = cg_alloc_label();
+                    array_push_i64(cg_fn_labels, nk_tok(m));
+                    array_push_i64(cg_fn_labels, lab);
+                    array_push_i64(cg_fn_labels, ns_tok);
+                }
+                m = nk_next(m);
+            }
+        } else if (nk_kind(d) == (NK::FnDecl as i64)) {
             let lab: i64 = cg_alloc_label();
             array_push_i64(cg_fn_labels, nk_tok(d));
             array_push_i64(cg_fn_labels, lab);
+            array_push_i64(cg_fn_labels, -1);
         }
         d = nk_next(d);
     }
@@ -4014,13 +4318,29 @@ fn codegen(source: string) -> i64 {
     // compile each function declaration in the program, binding its entry
     // label at its prologue offset (the current code position) first so any
     // call to it — including a self-recursive call inside its own body —
-    // resolves to the right entry offset.
+    // resolves to the right entry offset. Namespaced fns bind via the
+    // qualified label lookup. A namespace is a sema/scope concern, not a
+    // codegen concern: fns have entry labels regardless of namespace.
     d = nk_a(prog);
     while (d >= 0) {
-        if (nk_kind(d) == (NK::FnDecl as i64)) {
+        if (nk_kind(d) == (NK::NamespaceDecl as i64)) {
+            let ns_tok: i64 = nk_tok(d);
+            let mut m: i64 = nk_a(d);
+            while (m >= 0) {
+                if (nk_kind(m) == (NK::FnDecl as i64)) {
+                    let mut ns_name: string = string_from_slice("");
+                    if (ns_tok >= 0) { ns_name = tok_name(ns_tok); }
+                    let lab: i64 = cg_lookup_fn_label_qualified(nk_name(m), ns_name);
+                    if (lab >= 0) { cg_bind(lab); }   // entry = current code offset
+                    cg_compile_func(m, ns_tok);
+                    if (cg_err != 0) { return 0; }
+                }
+                m = nk_next(m);
+            }
+        } else if (nk_kind(d) == (NK::FnDecl as i64)) {
             let lab: i64 = cg_lookup_fn_label(nk_name(d));
             if (lab >= 0) { cg_bind(lab); }   // entry = current code offset
-            cg_compile_func(d);
+            cg_compile_func(d, -1);
             if (cg_err != 0) { return 0; }
         }
         d = nk_next(d);

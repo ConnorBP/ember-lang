@@ -1,0 +1,14 @@
+// now_namespace — a namespace with a fn + global, called from main.
+// expect: 52
+namespace Math {
+    global val: i64 = 42;
+    fn double_it(x: i64) -> i64 {
+        return x * 2;
+    }
+}
+
+fn main() -> i64 {
+    let a: i64 = Math::double_it(5);
+    let b: i64 = Math::val;
+    return a + b;
+}
