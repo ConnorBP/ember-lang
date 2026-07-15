@@ -65,12 +65,17 @@ extern "C" {
         std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* x=m4_slot(a); auto* y=m4_slot(b);
         if (!x || !y) return 0;
+        // m4_new_zero may reallocate g_mat4s, invalidating x/y. Copy both
+        // operands before appending the result so multiplication remains valid
+        // at every vector capacity boundary.
+        const Mat4 lhs = *x;
+        const Mat4 rhs = *y;
         int64_t h = m4_new_zero();
         auto* out = m4_slot(h);
         if (!out) return 0;
         for (int r=0;r<4;++r) for (int c=0;c<4;++c) {
             float sum=0;
-            for (int k=0;k<4;++k) sum += x->m[size_t(r*4+k)] * y->m[size_t(k*4+c)];
+            for (int k=0;k<4;++k) sum += lhs.m[size_t(r*4+k)] * rhs.m[size_t(k*4+c)];
             out->m[size_t(r*4+c)] = sum;
         }
         return h;

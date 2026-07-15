@@ -376,6 +376,36 @@ add_executable(ext_runtime_test examples/ext_runtime_test.cpp)
 target_link_libraries(ext_runtime_test PRIVATE ember ember_frontend ember_ext_math)
 add_test(NAME ext_runtime COMMAND ext_runtime_test)
 
+# Focused direct-native coverage for the lowest-covered language extensions.
+add_executable(coroutine_coverage_test examples/coroutine_coverage_test.cpp)
+target_link_libraries(coroutine_coverage_test PRIVATE
+    ember ember_frontend ember_ext_coroutine)
+if(WIN32)
+    target_link_libraries(coroutine_coverage_test PRIVATE kernel32)
+endif()
+add_test(NAME coroutine_coverage COMMAND coroutine_coverage_test)
+
+add_executable(io_coverage_test examples/io_coverage_test.cpp)
+target_link_libraries(io_coverage_test PRIVATE
+    ember ember_frontend ember_ext_io ember_ext_array ember_ext_string)
+add_test(NAME io_coverage COMMAND io_coverage_test)
+
+add_executable(audio_coverage_test examples/audio_coverage_test.cpp)
+target_link_libraries(audio_coverage_test PRIVATE ember ember_frontend ember_ext_audio)
+add_test(NAME audio_coverage COMMAND audio_coverage_test)
+
+add_executable(mat_coverage_test examples/mat_coverage_test.cpp)
+target_link_libraries(mat_coverage_test PRIVATE ember ember_frontend ember_ext_mat)
+add_test(NAME mat_coverage COMMAND mat_coverage_test)
+
+add_executable(math_coverage_test examples/math_coverage_test.cpp)
+target_link_libraries(math_coverage_test PRIVATE ember ember_frontend ember_ext_math)
+add_test(NAME math_coverage COMMAND math_coverage_test)
+
+add_executable(gc_coverage_test examples/gc_coverage_test.cpp)
+target_link_libraries(gc_coverage_test PRIVATE ember ember_frontend ember_ext_gc)
+add_test(NAME gc_coverage COMMAND gc_coverage_test)
+
 # call_raw_test: runtime coverage for the call_raw native (extensions/call_raw,
 # the self-hosting Stage 4 gap from plan_SELF_HOSTING.md). Exercises call_raw
 # through the full lex->parse->sema->codegen->JIT->call path AND directly at
