@@ -529,6 +529,24 @@ if(WIN32)
 endif()
 add_test(NAME ext_bounds COMMAND ext_bounds_test)
 
+# Additional string host-store coverage: converters, overload dispatch,
+# formatting specifiers/fallbacks, invalid handles, binary slices, and reset.
+add_executable(string_extension_edge_test examples/string_extension_edge_test.cpp)
+target_link_libraries(string_extension_edge_test PRIVATE ember ember_frontend ember_ext_string)
+add_test(NAME string_extension_edges COMMAND string_extension_edge_test)
+
+# Process/compiler safety helper coverage: RSS query, configurable memory
+# limit, balanced/throwing DepthGuard paths, and deadline boundaries.
+add_executable(safety_test examples/safety_test.cpp)
+target_link_libraries(safety_test PRIVATE ember)
+add_test(NAME safety_helpers COMMAND safety_test)
+
+# Hand-built engine helper coverage: arithmetic/native JIT helpers, label
+# failures, and finalization with rodata relocations (including malformed ones).
+add_executable(engine_edge_test examples/engine_edge_test.cpp)
+target_link_libraries(engine_edge_test PRIVATE ember ember_frontend)
+add_test(NAME engine_edges COMMAND engine_edge_test)
+
 # Extension registration smoke test (RESTRUCTURE_PLAN.md Section 6): validates the
 # relocated non-cheat extensions (vec/quat/mat/string/array/math/sync/lifecycle) register
 # their NativeSig + OpOverloadTable entries via the extension entry points.
@@ -1249,11 +1267,10 @@ target_link_libraries(keyed_dispatch_math PRIVATE ember)
 # identity layout (slot i -> physical i, counts match, no padding), and the
 # configured KeyedDispatchRegistry (implicit-keyed-v1) with structured
 # diagnostics. Links ember (keyed_dispatch.* — Red 1 helper) + ember_frontend
-# (dispatch_abi.* — Red 2 classifier, module_layout.* — Red 3 planner). NOT a
-# CTest entry: the filtered suite count must stay 67 (§14.1); the target
-# building cleanly + the executable passing IS the gate.
+# (dispatch_abi.* — Red 2 classifier, module_layout.* — Red 3 planner).
 add_executable(module_layout_test examples/module_layout_test.cpp)
 target_link_libraries(module_layout_test PRIVATE ember ember_frontend)
+add_test(NAME module_layout COMMAND module_layout_test)
 
 # keyed_dispatch_runtime - Red 4 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md
 # §2.4, §5.5, §7.3, §10, §14.2, §14.3, §14.5, §14.6): the runtime resolver +
@@ -1432,12 +1449,13 @@ endif()
 # the ordinary pipeline profile CLI regression harness. Shells out to the real
 # ember_cli.exe as a subprocess and verifies --profile light|balanced|heavy,
 # --pass-seed (decimal/hex/0/UINT64_MAX + malformed/overflow rejection),
-# --passes-replaces-profile, and no-profile behavior preservation. Built as a
-# standalone executable WITHOUT add_test so the filtered CTest total is
-# unchanged (run explicitly: ./buildt/polymorphic_cli_test <ember_cli> <src>).
-# Does NOT link ember — it only invokes the CLI as a subprocess, like
+# --passes-replaces-profile, and no-profile behavior preservation. Does NOT
+# link ember — it only invokes the CLI as a subprocess, like
 # ember_cli_pipe_live_test / em_cli_emit_test.
 add_executable(polymorphic_cli_test examples/polymorphic_cli_test.cpp)
+add_test(NAME polymorphic_cli
+    COMMAND polymorphic_cli_test $<TARGET_FILE:ember_cli> ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(polymorphic_cli PROPERTIES TIMEOUT 60)
 if(WIN32)
     # No ember linkage: the harness only invokes ember_cli as a subprocess
     # (CreateProcess + std::filesystem). It needs only the C++ stdlib + the
@@ -1521,6 +1539,8 @@ target_link_libraries(em_v6_keyed PRIVATE ember ember_frontend)
 if(WIN32)
     target_link_libraries(em_v6_keyed PRIVATE kernel32)
 endif()
+add_test(NAME em_v6_keyed COMMAND em_v6_keyed)
+set_tests_properties(em_v6_keyed PROPERTIES TIMEOUT 60)
 
 # keyed_dispatch_extensions - Red 8 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md
 # §6.5-§6.7, §9.8, §10.3, §12.4, §14.2, §14.3 Red 8): the host / lifecycle /
