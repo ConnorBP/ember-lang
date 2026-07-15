@@ -29,10 +29,28 @@ namespace ember::ext_gc {
 // it. The slot is separately heap-allocated (not inside a vector) so its
 // address is stable across other pin/unpin ops (the GcHeap root API holds the
 // slot address raw).
+//
+// PRECISE ROOT SCANNING: in addition to the legacy pin layer (still used by
+// the script-visible gc_new/gc_delete), a context can be ATTACHED via
+// gc_attach_context, which registers a trace callback that walks the JIT'd
+// active-frame chain (context_t::gc_frame_head) + the context's global-root
+// descriptor (context_t::gc_global_roots) and reports each mapped slot's
+// value as a root. This is the precise path for lambda environments: they are
+// NOT pinned at alloc (see gc_alloc_env) and reach the collector only via the
+// frame chain (while the owning frame is live) or the global-root descriptor
+// (if stored to a typed global). One attached context per thread at a time
+// (mirrors context_t's per-thread model); re-attach on a different context
+// detaches the previous one.
 struct GcRuntime {
     gc::GcHeap heap;
     std::unordered_map<void*, void**> pinned;  // env_ptr -> root slot (a heap-allocated void* holding env_ptr)
     int64_t threshold = 1024;                  // auto-collect when live >= threshold (0 = off)
+    // Precise root scanning: the currently-attached context (its trace callback
+    // is registered on `heap`, capturing &ctx as user_data). nullptr = no
+    // context attached (legacy pin-only behavior). The token lets detach
+    // unregister the callback.
+    context_t* attached_ctx = nullptr;
+    gc::GcTraceToken frame_cb_token = 0;
 };
 
 static thread_local std::unique_ptr<GcRuntime> g_rt;
@@ -62,6 +80,14 @@ void gc_reset() {
         delete kv.second;
     }
     g_rt->pinned.clear();
+    // If a context is still attached (the host called gc_reset without
+    // detaching first), clear its global-roots pointer so it does not dangle
+    // after the heap's registrations are dropped. The trace callback is gone
+    // after heap.clear() below, so no collect would dereference it anyway, but
+    // a clean pointer is safer for a host that inspects the context post-reset.
+    if (g_rt->attached_ctx) g_rt->attached_ctx->gc_global_roots = nullptr;
+    g_rt->attached_ctx = nullptr;
+    g_rt->frame_cb_token = 0;
     g_rt->heap.clear();
 }
 
@@ -100,23 +126,43 @@ bool gc_unroot_env(int64_t ptr) {
 }
 
 // ---- the managed-allocation API ----
+// PRECISE ROOT SCANNING (lambda env path): a freshly-allocated env is NOT
+// permanently pinned. Instead, the env reaches the collector via the JIT'd
+// active-frame chain (the env_ptr is stored into a frame slot the frame's
+// GcFrameMap lists, so while the owning frame is live the collector marks it)
+// or, if the lambda escapes to a typed global, via the global-root descriptor.
+// The caller's generated code stores the returned ptr into the rooted frame
+// slot IMMEDIATELY after the alloc returns, before any other allocation, so the
+// env is reachable by the next collect.
+//
+// AUTO-COLLECT WINDOW: to avoid a collect firing between the alloc and the
+// first rooted store (which would reap an unrooted env), the threshold check
+// runs BEFORE the alloc (collect-then-alloc), never after. A collect-then-alloc
+// means the new env is the newest object and the next collect is at the NEXT
+// alloc (or an explicit gc_collect), by which time the env is stored in a frame
+// slot and reachable via the chain. This closes the allocation-to-first-store
+// window without a pin.
+//
+// SCRIPT-VISIBLE gc_new keeps the legacy pin path (alloc + pin): a script-held
+// raw i64 handle is typed i64 to the compiler, so the frame map cannot track it
+// (the slot is not a known GC pointer). gc_delete unpins. This is the user-
+// facing new/delete and is separate from the precise lambda-env tracking.
 int64_t gc_alloc_env(int64_t size) {
     GcRuntime* r = rt();
     if (!r || size <= 0) return 0;
     // v1: lambda captures are scalars (i64/f64), so an env has no outgoing GC
     // pointers -> refmap_none. See ext_gc.hpp WHAT REMAINS #2 for the
     // capture-is-a-GC-object follow-up (sema-typed RefMap at alloc time).
-    void* env = r->heap.alloc(size_t(size), gc::refmap_none());
-    if (!env) return 0;
-    // Pin BEFORE the threshold check so the just-allocated env survives the
-    // auto-collect (it is reachable from the JIT'd code that asked for it).
-    pin_env(env);
-    // Collection trigger: if the heap has reached the threshold, collect now.
-    // Pinned envs (including this one) survive; only previously-unpinned envs
-    // are swept. threshold == 0 disables auto-collect.
+    // Collect-then-alloc (see the comment above): close the auto-collect window
+    // between alloc and the first rooted store. threshold == 0 disables auto.
     if (r->threshold > 0 && int64_t(r->heap.stats().live_objects) >= r->threshold) {
         r->heap.collect();
     }
+    void* env = r->heap.alloc(size_t(size), gc::refmap_none());
+    if (!env) return 0;
+    // NOT pinned: reachability is determined by the frame chain / global-root
+    // descriptor / explicit pin (gc_root_env). Returning here is safe because
+    // the next collect is at the next alloc, by which point the env is stored.
     return int64_t(reinterpret_cast<uintptr_t>(env));
 }
 
@@ -149,6 +195,121 @@ bool gc_is_live(int64_t ptr) {
 int64_t gc_freed_count() {
     GcRuntime* r = rt();
     return r ? int64_t(r->heap.stats().freed_objects) : 0;
+}
+
+// Cumulative write-barrier call count (stats().barrier_calls) — the count of
+// valid (live owner + live child) barrier events. Test helper for verifying
+// generated code emits barrier calls at GC-child-into-GC-object store sites.
+int64_t gc_barrier_count() {
+    GcRuntime* r = rt();
+    return r ? int64_t(r->heap.stats().barrier_calls) : 0;
+}
+
+// ---- thread-runtime facade: trace-callback + write-barrier access for ----
+// ---- other extensions (operates on the current thread-local heap).    ----
+// These forward to r->heap without exposing GcRuntime to the caller (rt() is
+// file-static; the header only declares these functions + the gc:: types).
+// gc_reset() calls heap.clear(), which invalidates every outstanding token.
+
+gc::GcTraceToken gc_register_trace_callback(void* user_data, gc::GcTraceFn fn) {
+    GcRuntime* r = rt();
+    if (!r) return 0;
+    return r->heap.register_trace_callback(user_data, fn);
+}
+
+bool gc_unregister_trace_callback(gc::GcTraceToken token) {
+    GcRuntime* r = rt();
+    if (!r) return false;
+    return r->heap.unregister_trace_callback(token);
+}
+
+void gc_write_barrier(void* owner, void* child) {
+    GcRuntime* r = rt();
+    if (!r) return;  // no thread-local heap yet -> safe no-op
+    r->heap.write_barrier(owner, child);
+}
+
+gc::GcBarrierToken gc_register_barrier_observer(void* user_data,
+                                                 gc::GcBarrierObserver obs) {
+    GcRuntime* r = rt();
+    if (!r) return 0;
+    return r->heap.register_barrier_observer(user_data, obs);
+}
+
+bool gc_unregister_barrier_observer(gc::GcBarrierToken token) {
+    GcRuntime* r = rt();
+    if (!r) return false;
+    return r->heap.unregister_barrier_observer(token);
+}
+
+// Non-creating existence probe: returns whether the thread-local GC runtime
+// exists WITHOUT lazily creating it (unlike rt(), which every other facade
+// function calls). Other extensions gate their GC work (trace-callback
+// registration + write barriers) on this so a thread that never called gc_init
+// stays in pure non-GC mode -- no inert GcHeap is ever materialized there.
+bool gc_runtime_initialized() {
+    return g_rt != nullptr;
+}
+
+// ---- precise root scanning: the frame-chain + global-roots trace callback ----
+// Registered on the heap by gc_attach_context with user_data = &ctx. On every
+// collect() the heap invokes this callback; it walks the JIT'd active-frame
+// chain (ctx->gc_frame_head) and the context's global-root descriptor
+// (ctx->gc_global_roots) and reports each mapped slot's value as a root
+// candidate via the visitor. The GC validates each candidate (live?) and feeds
+// valid ones into the mark worklist (the c1 trace-callback contract). Stale
+// slots (a freed env still referenced by a not-yet-unlinked frame record after a
+// trap longjmp) are safely ignored by the visitor's liveness check.
+static void context_roots_trace_cb(void* user_data, gc::GcTraceVisitor& visitor) {
+    auto* ctx = reinterpret_cast<context_t*>(user_data);
+    if (!ctx) return;
+    // Walk the shadow stack: each active frame's mapped GC-pointer slots.
+    for (gc::GcFrameRecord* rec = ctx->gc_frame_head; rec != nullptr; rec = rec->prev) {
+        if (!rec->map || rec->map->offs.empty()) continue;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(rec->frame_base);
+        for (int32_t off : rec->map->offs) {
+            // The slot address is base + off (off is rbp-relative, negative).
+            void* const* slot = reinterpret_cast<void* const*>(base + intptr_t(off));
+            visitor.report(*slot);
+        }
+    }
+    // Walk the typed-global GC-pointer words.
+    if (ctx->gc_global_roots && !ctx->gc_global_roots->empty()) {
+        const uint64_t gbase = ctx->gc_global_roots->base;
+        for (int32_t off : ctx->gc_global_roots->offs) {
+            void* const* slot = reinterpret_cast<void* const*>(uintptr_t(gbase) + intptr_t(off));
+            visitor.report(*slot);
+        }
+    }
+}
+
+bool gc_attach_context(context_t* ctx, gc::GcGlobalRoots* global_roots) {
+    GcRuntime* r = rt();
+    if (!r || !ctx) return false;
+    // Re-attach on a DIFFERENT context detaches the previous one first (one
+    // attached context per thread). Re-attach on the SAME context just updates
+    // the global-roots pointer (idempotent, no double-registration).
+    if (r->attached_ctx && r->attached_ctx != ctx && r->frame_cb_token != 0) {
+        r->heap.unregister_trace_callback(r->frame_cb_token);
+        r->frame_cb_token = 0;
+    }
+    if (r->frame_cb_token == 0) {
+        r->frame_cb_token = r->heap.register_trace_callback(ctx, &context_roots_trace_cb);
+    }
+    r->attached_ctx = ctx;
+    ctx->gc_global_roots = global_roots;
+    return r->frame_cb_token != 0;
+}
+
+void gc_detach_context(context_t* ctx) {
+    GcRuntime* r = g_rt.get();  // no lazy create: detach is a teardown path
+    if (!r) return;
+    if (r->frame_cb_token != 0) {
+        r->heap.unregister_trace_callback(r->frame_cb_token);
+        r->frame_cb_token = 0;
+    }
+    if (ctx) ctx->gc_global_roots = nullptr;
+    r->attached_ctx = nullptr;
 }
 
 // ---- the natives (JIT'd code calls these by name) ----
@@ -186,12 +347,35 @@ static int64_t n_gc_live() {
 // `new Type{...}` syntax with typed field access needs a pointer type system
 // (ember's structs are value types today) — that is the documented follow-up;
 // these natives are the heap-management substrate it would build on.
+//
+// NOTE: a gc_new'd object is NOT tracked by the precise frame-chain scanner (its
+// script-held handle is typed i64 to the compiler, so the frame map does not
+// list it as a GC pointer). It uses the LEGACY pin layer: alloc + pin, gc_delete
+// unpins. This is separate from the lambda-env precise path (which does NOT pin
+// and relies on the frame chain / global roots). gc_alloc_env itself no longer
+// pins (the lambda-env path), so gc_new pins explicitly here.
 static int64_t n_gc_new(int64_t size) {
-    return gc_alloc_env(size);  // alloc + pin (survives auto-collect)
+    int64_t p = gc_alloc_env(size);  // alloc (NOT pinned by gc_alloc_env anymore)
+    if (p != 0) gc_root_env(p);     // legacy pin: script-held i64 handles need it
+    return p;
 }
 
 static int64_t n_gc_delete(int64_t ptr) {
     return gc_unroot_env(ptr) ? 1 : 0;  // unpin -> collectable; 1 if it was pinned
+}
+
+// __ember_gc_write_barrier(i64 owner, i64 child) -> i64 (0)
+// The c1 write barrier, called by generated code whenever it stores a GC child
+// into a GC-managed object. Safely ignores null / non-live owner or child (the
+// c1 contract), so it is safe to call unconditionally from generated write
+// sites. The current non-generational collector does not need a remembered set,
+// so the observable effect is only a registered barrier observer +
+// stats().barrier_calls — the extension surface a future generational collector
+// would build on. Returns 0 (the i64 placeholder so the native has a stable
+// i64(i64,i64) Win64 binding the codegen can resolve by name).
+static int64_t n_gc_write_barrier(int64_t owner, int64_t child) {
+    gc_write_barrier(reinterpret_cast<void*>(owner), reinterpret_cast<void*>(child));
+    return 0;
 }
 
 } // extern "C"
@@ -207,6 +391,9 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
     b.add("__ember_gc_alloc_env", T, {T}, (void*)&n_gc_alloc_env);
     b.add("__ember_gc_collect",    T, {}, (void*)&n_gc_collect);
     b.add("__ember_gc_live",       T, {}, (void*)&n_gc_live);
+    // Write barrier native (c1): generated code calls this when storing a GC
+    // child into a GC-managed object. i64(i64,i64) Win64 binding.
+    b.add("__ember_gc_write_barrier", T, {T, T}, (void*)&n_gc_write_barrier);
     // Script-visible new/delete (full GC integration): gc_new(size)->ptr
     // (alloc+pin), gc_delete(ptr)->i64 (unroot), gc_collect()->freed,
     // gc_live()->count. User-facing names (no __ember_ prefix) so a script

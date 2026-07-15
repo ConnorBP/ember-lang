@@ -347,6 +347,26 @@ struct ThinFramePlan {
     // site), forwarded to CompiledFn::native_fixups so the .em serializer can
     // repoint them at load time. c3 populates this; c2 does not.
     std::vector<std::string> native_fixup_names;
+    // ── Precise GC root scanning (#20) ───────────────────────────────────
+    // The rbp-relative ABSOLUTE (negative) byte offsets of every frame slot
+    // that holds a GC object pointer: a lambda env_ptr temp (__envptr$N), the
+    // env_ptr half (second word, off+8) of a lambda-typed local/param, or the
+    // __env param of a synthetic lambda fn. Populated by the lowering (c2) and
+    // consumed by emit (c3) to build the CompiledFn's GcFrameMap (the shadow-
+    // stack frame record's `map`). Empty = this frame holds no GC pointers.
+    // SERIALIZED (Stage B): the offsets are stable frame-layout data, so the
+    // serializer writes them and the deserializer reconstructs them (a
+    // deserialized ThinFunction re-derives the runtime GcFrameMap at load
+    // time). The runtime map POINTER is a JIT-time concern (baked into the
+    // prologue), NOT serialized.
+    std::vector<int32_t> gc_ptr_frame_offs;
+    // The 24-byte GcFrameRecord region's field offsets (0 when precise GC is
+    // off). Reserved right after rbx_save so they are deterministic. The
+    // prologue links a record at gc_rec_off onto context_t::gc_frame_head; the
+    // epilogue unlinks it. SERIALIZED (stable frame-layout data).
+    int32_t gc_rec_off = 0;       // record's `prev` field (record base addr)
+    int32_t gc_rec_base_off = 0;  // record's `frame_base` field
+    int32_t gc_rec_map_off = 0;   // record's `map` field
 };
 
 // Stage 3: the result of linear-scan register allocation over the

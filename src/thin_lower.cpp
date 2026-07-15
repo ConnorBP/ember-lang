@@ -196,7 +196,22 @@ struct ThinLowerer {
         int32_t off = -next_local_off;
         locals[n] = off;
         local_types[n] = t;
+        // Precise GC: a lambda-typed local/param is 16 bytes {slot, env_ptr};
+        // the env_ptr (second word at off+8) is a GC object pointer when the
+        // env is on the GC heap (use_gc_env). A no-capture lambda's env_ptr is
+        // null (safely ignored), so recording every lambda slot's env_ptr word
+        // is conservative + correct. Matches the tree-walker's alloc_local hook.
+        if (ctx.use_gc_env && t && t->is_lambda) add_gc_ptr_slot(off + 8);
         return off;
+    }
+    // Record a frame slot (rbp-relative ABSOLUTE negative offset) holding a GC
+    // object pointer into the frame plan's gc_ptr_frame_offs (dedup'd). No-op
+    // when precise GC is off (use_gc_env false). Consumed by emit (c3) to build
+    // the CompiledFn's GcFrameMap.
+    void add_gc_ptr_slot(int32_t off) {
+        if (!ctx.use_gc_env) return;
+        for (int32_t o : out.frame.gc_ptr_frame_offs) if (o == off) return;  // dedup
+        out.frame.gc_ptr_frame_offs.push_back(off);
     }
     int32_t alloc_struct_temp(const Type* t) {
         std::string name = "__tmp$" + std::to_string(temp_counter++);
@@ -1121,8 +1136,20 @@ struct ThinLowerer {
         next_local_off = 0;
         next_local_off += 8;            // rbx save slot
         rbx_save_offset = -next_local_off;  // -8
+        // Precise GC: reserve a 24-byte GcFrameRecord region (prev/frame_base/
+        // map) right after rbx_save so its offsets are deterministic. Only when
+        // use_gc_env (the GC heap env backend); otherwise no record + no
+        // maintenance (byte-identical to the pre-GC IR path).
+        int32_t gc_rec_off = 0, gc_rec_base_off = 0, gc_rec_map_off = 0;
+        if (ctx.use_gc_env) {
+            next_local_off += 24;
+            gc_rec_off = -next_local_off;
+            gc_rec_base_off = gc_rec_off + 8;
+            gc_rec_map_off = gc_rec_off + 16;
+        }
 
         int32_t locals_area = 8;        // rbx save
+        if (ctx.use_gc_env) locals_area += 24;  // GC frame record region
         for (size_t i = 0; i < f.params.size(); ++i)
             locals_area += local_width_bytes(f.params[i].ty.get(), ctx.structs);
         if (returns_struct_by_ptr()) locals_area += 8;
@@ -1219,6 +1246,9 @@ struct ThinLowerer {
 
         out.frame.frame_size = frame_size;
         out.frame.rbx_save_offset = rbx_save_offset;
+        out.frame.gc_rec_off = gc_rec_off;
+        out.frame.gc_rec_base_off = gc_rec_base_off;
+        out.frame.gc_rec_map_off = gc_rec_map_off;
         out.frame.struct_ret_ptr_offset = returns_struct_by_ptr() ? struct_ret_ptr_offset : 0;
         out.frame.arg_temps_base = arg_temps_base;
         out.frame.next_local_off = next_local_off;  // body lowering continues from here

@@ -150,6 +150,20 @@ struct EmitCtx {
 
     std::string non_serializable_reason;
 
+    // ── Precise GC root scanning (shadow stack) ──────────────────────────
+    // Active only when ctx.use_gc_env. The frame reserves a 24-byte
+    // GcFrameRecord region (prev/frame_base/map) at gc_rec_off; the prologue
+    // links it onto context_t::gc_frame_head, the epilogue unlinks it. gc_map
+    // is the compile-time GcFrameMap built from thf.frame.gc_ptr_frame_offs;
+    // its ADDRESS is baked into the prologue. Moved into the CompiledFn at the
+    // end. gc_rec_off / gc_rec_base_off / gc_rec_map_off are the rbp-relative
+    // (negative) offsets of the record's three fields.
+    std::shared_ptr<gc::GcFrameMap> gc_map;
+    int32_t gc_rec_off = 0;
+    int32_t gc_rec_base_off = 0;
+    int32_t gc_rec_map_off = 0;
+    bool gc_active() const { return ctx.use_gc_env; }
+
     EmitCtx(const ThinFunction& f, const CodeGenCtx& c) : thf(f), ctx(c), ra(&f.ra) {}
 
     // ─── type / width helpers ───
@@ -671,6 +685,47 @@ struct EmitCtx {
     }
 
     // ─── prologue / epilogue ───
+    // Precise GC: shadow-stack frame-record maintenance. The prologue links a
+    // GcFrameRecord (in the frame's reserved 24-byte region) onto
+    // context_t::gc_frame_head; the epilogue unlinks it. The collector walks
+    // the chain from the head. Emitted only when gc_active() (use_gc_env) AND
+    // a record region was reserved (gc_rec_off != 0). The head is addressed
+    // via [r14 + off] when use_context_reg, else via the baked
+    // gc_frame_head_ptr. CRITICAL: the epilogue must NOT clobber rax (the i64
+    // return value) — uses r11 as the scratch (volatile, not rax).
+    void emit_load_gc_head(Reg dst) {
+        if (ctx.use_context_reg) {
+            e.load_reg_mem(dst, Reg::r14, context_offsets::gc_frame_head());
+        } else {
+            e.mov_reg_imm64(dst, reinterpret_cast<int64_t>(ctx.gc_frame_head_ptr));
+            e.load_reg_mem(dst, dst, 0);
+        }
+    }
+    void emit_store_gc_head(Reg src) {
+        if (ctx.use_context_reg) {
+            e.store_reg_mem(Reg::r14, context_offsets::gc_frame_head(), src);
+        } else {
+            Reg scratch = (src == Reg::r11) ? Reg::r10 : Reg::r11;
+            e.mov_reg_imm64(scratch, reinterpret_cast<int64_t>(ctx.gc_frame_head_ptr));
+            e.store_reg_mem(scratch, 0, src);
+        }
+    }
+    void emit_gc_frame_record_prologue() {
+        if (!gc_active() || thf.frame.gc_rec_off == 0 || !gc_map) return;
+        emit_load_gc_head(Reg::rax);
+        e.store_reg_mem(Reg::rbp, thf.frame.gc_rec_off, Reg::rax);          // prev = head
+        e.store_reg_mem(Reg::rbp, thf.frame.gc_rec_base_off, Reg::rbp);     // frame_base = rbp
+        e.mov_reg_imm64(Reg::rax, reinterpret_cast<int64_t>(gc_map.get())); // map ptr
+        e.store_reg_mem(Reg::rbp, thf.frame.gc_rec_map_off, Reg::rax);
+        e.mov_reg_reg(Reg::rax, Reg::rbp);                                   // rax = &record
+        e.add_reg_imm32(Reg::rax, thf.frame.gc_rec_off);
+        emit_store_gc_head(Reg::rax);                                      // head = &record
+    }
+    void emit_gc_frame_record_epilogue() {
+        if (!gc_active() || thf.frame.gc_rec_off == 0 || !gc_map) return;
+        e.load_reg_mem(Reg::r11, Reg::rbp, thf.frame.gc_rec_off);            // r11 = prev (NOT rax)
+        emit_store_gc_head(Reg::r11);                                      // head = prev
+    }
     void emit_prologue() {
         e.push(Reg::rbp);
         e.mov_reg_reg(Reg::rbp, Reg::rsp);
@@ -686,8 +741,15 @@ struct EmitCtx {
                 e.store_reg_mem(Reg::rbp, ra->save_offsets[i], r);
             }
         }
+        // Precise GC: link this frame's record onto the shadow stack. rax is
+        // volatile + free here (no value live yet).
+        emit_gc_frame_record_prologue();
     }
     void emit_epilogue() {
+        // Precise GC: unlink this frame's record BEFORE tearing down the frame
+        // (the record lives in this frame). Uses r11 (NOT rax, which holds the
+        // i64 return value at every exit).
+        emit_gc_frame_record_epilogue();
         // Stage 3: restore callee-saved registers used by the regalloc (rbx below).
         if (ra && ra->enabled) {
             for (size_t i = 0; i < ra->used_reg_ids.size(); ++i) {
@@ -1084,6 +1146,18 @@ struct EmitCtx {
         for (size_t i = 0; i < thf.blocks.size(); ++i)
             block_labels[i] = e.alloc_label();
 
+        // Precise GC: build the GcFrameMap from the frame plan's GC-pointer
+        // slot offsets BEFORE the prologue so its address can be baked into the
+        // frame-record link. The map's `offs` are stable once emit completes.
+        if (gc_active() && thf.frame.gc_rec_off != 0 && !thf.frame.gc_ptr_frame_offs.empty()) {
+            gc_map = std::make_shared<gc::GcFrameMap>();
+            gc_map->offs = thf.frame.gc_ptr_frame_offs;
+        } else if (gc_active() && thf.frame.gc_rec_off != 0) {
+            // Reserve a map even when empty so the frame record's `map` field
+            // is non-null (the collector iterates an empty map as no slots).
+            gc_map = std::make_shared<gc::GcFrameMap>();
+        }
+
         // prologue
         emit_prologue();
         // param spills + VReg map init
@@ -1193,6 +1267,7 @@ struct EmitCtx {
         if (non_serializable_reason.empty() && !thf.non_serializable_reason.empty())
             non_serializable_reason = thf.non_serializable_reason;
         out.non_serializable_reason = std::move(non_serializable_reason);
+        out.gc_frame_map = std::move(gc_map);  // precise GC frame map (null when off)
         out.bytes = std::move(e.code);
         return out;
     }
@@ -1612,6 +1687,15 @@ struct EmitCtx {
             // catch_name i64 slot (meta.frame_off). The throw's longjmp already
             // restored registers + rsp + rip to land at this block's label.
             if (!ctx.use_context_reg) break;
+            // Precise GC: a cross-frame throw longjmp'd past abandoned inner
+            // frames (no epilogues ran), so their records are still linked on
+            // gc_frame_head. Restore head to THIS catching frame's record
+            // (rbp + gc_rec_off), unlinking the stale records. No-op when off.
+            if (gc_active() && thf.frame.gc_rec_off != 0 && gc_map) {
+                e.mov_reg_reg(Reg::rax, Reg::rbp);
+                e.add_reg_imm32(Reg::rax, thf.frame.gc_rec_off);
+                emit_store_gc_head(Reg::rax);
+            }
             e.load_reg_mem(Reg::rax, Reg::r14, context_offsets::thrown_value());
             if (in.meta.frame_off != 0) {
                 store_rax_to_rbp(e, in.meta.frame_off);

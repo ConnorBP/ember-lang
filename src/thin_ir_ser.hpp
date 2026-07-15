@@ -125,7 +125,10 @@ namespace ember {
 
 // ir_blob magic + version.
 constexpr uint32_t IR_BLOB_MAGIC    = 0x4952464Eu;  // "IRFN" (LE: 'N','F','R','I')
-constexpr uint16_t IR_BLOB_VERSION  = 2u;
+constexpr uint16_t IR_BLOB_VERSION  = 3u;  // v3 adds the precise-GC frame-plan
+                                           // fields (gc_ptr_frame_offs + the
+                                           // 24-byte GcFrameRecord region
+                                           // offsets) after native_fixup_names.
 
 // Hard maxima (bounded counts — checked before any resize/reserve).
 constexpr uint32_t IR_MAX_BLOCKS   = 65535u;
@@ -133,6 +136,7 @@ constexpr uint32_t IR_MAX_INSTRS   = 65535u;
 constexpr uint32_t IR_MAX_ARGS     = 255u;
 constexpr uint32_t IR_MAX_PARAMS   = 1024u;
 constexpr uint32_t IR_MAX_NFIXUPS  = 1024u;
+constexpr uint32_t IR_MAX_GC_OFFS = 4096u;  // precise-GC frame-slot offsets per fn
 constexpr uint32_t IR_MAX_VREGS    = (1u << 24);  // 16M — generous; checked against blob size
 
 // Serialize a ThinFunction into `out`. The function's name is NOT written

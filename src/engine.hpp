@@ -15,6 +15,7 @@
 #include <string>
 #include <utility>
 #include <string_view>             // Red 8: resolve_entry_by_name_keyed
+#include <memory>                  // std::shared_ptr (CompiledFn::gc_frame_map)
 
 namespace ember {
 
@@ -46,6 +47,16 @@ struct CompiledFn {
     std::vector<CompiledNativeBinding> native_fixups; // symbolic host-native binding slots
     std::vector<uint8_t> rodata;      // function-local bytes appended to loaded page
     std::string non_serializable_reason;
+    // Precise GC root scanning: this function's compile-time GC-pointer
+    // frame-slot map (the shadow-stack frame record's `map`). A heap-allocated
+    // GcFrameMap whose ADDRESS is baked into the prologue (so it must live at a
+    // stable address for the function's lifetime — shared_ptr guarantees
+    // that). Null when precise GC is off (CodeGenCtx::use_gc_env == false): the
+    // prologue emits no frame-record maintenance and the bytes are byte-
+    // identical to the pre-precise-GC path. The backing `offs` vector is
+    // filled during codegen and stable once compile completes (before any
+    // call), so the collector may iterate it directly.
+    std::shared_ptr<gc::GcFrameMap> gc_frame_map;
 };
 
 // v0.1: build the compiled form of `fn add(a: i64, b: i64) -> i64 { return a + b; }`

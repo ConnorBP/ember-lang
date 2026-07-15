@@ -116,6 +116,7 @@ static void register_standard_bindings(
 static uint32_t host_value_bytes(const ember::Type* t, const ember::StructLayoutTable* structs) {
     if (!t) return 8;
     if (t->is_slice) return 16;
+    if (t->is_lambda) return 16;   // {fn_slot, env_ptr} (#20)
     if (t->array_len > 0)
         return uint32_t(t->array_len) * host_value_bytes(t->elem.get(), structs);
     if (!t->struct_name.empty() && structs) {

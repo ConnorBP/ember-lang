@@ -30,9 +30,16 @@ exactly one of these)
 There is deliberately **no** category for "script-owned heap object
 with unknown lifetime" - that category is what a GC would exist to
 manage, and ../planning/DESIGN.md Section 1 excludes a **script-visible** GC
-heap from v1 (a tracing GC **core** has shipped as foundational infra —
-`src/gc.{hpp,cpp}` — but is not yet wired into codegen; see Section 8).
-Every category above
+heap from v1. A tracing GC **core** has shipped (`src/gc.{hpp,cpp}`) and is
+**wired into the engine** for lambda closure environments (#20): precise
+stack-frame root maps (the shadow stack) + precise typed-global root maps +
+extension trace-callback root providers + a stop-the-world write barrier
+(see Section 8). The GC manages lambda env lifetimes (an env that escapes
+its frame — returned / stored to a global / held in an `array`/`map` — is
+traced from the frame chain / global-root descriptor / extension callback
+and reaped when no root reaches it); it does NOT expose a script-visible
+`new Type{...}` pointer-type surface yet (`gc_new`/`gc_delete` raw-handle
+natives are the substrate). Every category above
 has a lifetime that's either lexically scoped (1), externally owned
 (2), or engine-object-scoped (3/4) - no case requires tracing.
 
@@ -271,21 +278,101 @@ No array representation in this language ever implies heap ownership
  -  consistent with "no script-managed heap" (../planning/DESIGN.md Section 7) holding all
 the way down.
 
-## 8. GC status - core shipped; full integration deferred (not just "later")
+## 8. GC status - core shipped + precise root scanning wired into codegen
 
-> **Status update (2026-07-11):** a tracing mark-sweep **GC core has shipped**
-> as foundational infrastructure for lambdas-with-capture (#20) and coroutines
-> (#21): `src/gc.{hpp,cpp}` (`ember::gc::GcHeap` — `alloc`/`collect`/
-> `add_root`/`remove_root`, precise root scanning via `RefMap`, mark-sweep,
-> cycle collection, stats), pinned by `examples/gc_test.cpp` (ctest `gc_core`).
-> The core is **not yet wired into codegen/sema** — lambdas currently use a
-> frame-based env_ptr (by-value capture is a struct copy into a temp frame
-> slot, category 1), and coroutines use Windows fibers, so no script-visible
-> heap object requires tracing yet. The deferral rationale below now applies
-> to the **integration** (root scanning across JIT frames + a write-barrier /
-> safepoint collection strategy + a script-visible `new`/`delete` or
-> by-reference-capture surface), not to the core itself. See `../ROADMAP.md`
-> Tier 3 (Tracing GC — ✓ core shipped).
+> **Status update (2026-07-15):** the tracing mark-sweep **GC core**
+> (`src/gc.{hpp,cpp}`, `ember::gc::GcHeap` — `alloc`/`collect`/`add_root`/
+> `remove_root`, precise root scanning via `RefMap`, mark-sweep, stats) is
+> shipped AND **wired into the engine** with precise stack + global root
+> scanning + extension trace-callback root providers + a stop-the-world write
+> barrier. This is no longer "core shipped, integration deferred" — the
+> integration is done. The pieces:
+>
+> **Precise stack root maps (the shadow stack).** Both backends (the
+> tree-walker `src/codegen.cpp` + the Thin IR `src/thin_lower.cpp`/
+> `src/thin_emit.cpp`) emit, when `CodeGenCtx::use_gc_env` is set, a
+> per-function compile-time `GcFrameMap` (`src/gc_roots.hpp`) listing the
+> rbp-relative byte offsets of every frame slot that holds a GC object
+> pointer (a lambda env_ptr temp, the env_ptr half of a lambda-valued
+> local/param at offset+8). At runtime each active JIT frame links a
+> 24-byte `GcFrameRecord` (prev / frame_base / map) onto a singly-linked
+> chain whose head lives in `context_t::gc_frame_head`; the prologue links,
+> the epilogue unlinks, and a catch entry restores the head to the catching
+> frame's record after a cross-frame throw (so abandoned frames' stale
+> records are not walked). `context_t::reset_for_call()` clears the head
+> after a host trap longjmp (the abandoned frames' epilogues never ran). The
+> collector walks the chain + reports each mapped slot's value as a root.
+> This is NOT conservative stack scanning — it is exact: only the mapped GC
+> pointer slots are read, and their offsets are a compile-time fact.
+>
+> **Precise global root maps.** The typed globals block (`Section 4`) carries
+> a host-built `GcGlobalRoots` descriptor (`src/gc_roots.hpp`) listing the
+> byte offsets of every globals-block word that holds a GC object pointer
+> (notably the env_ptr half of a lambda-typed global at offset+8). The host
+> (CLI / harness) builds it from `GlobalsBlock` + attaches it to
+> `context_t::gc_global_roots` before the call; the collector reports each
+> `*(base + off)` as a root. Replacing/clearing the global removes the only
+> root -> the old env is reclaimed on the next collect.
+>
+> **Extension root callbacks (external root providers).** The c1 trace-
+> callback facade (`extensions/gc/ext_gc.{hpp,cpp}`) lets an extension
+> register ONE callback that reports its owned GC-pointer-bearing storage as
+> roots during `collect()` — without exposing its internals. The
+> `array`/`map` host-store extensions register callbacks (idempotent:
+> unregister-stale + register on the first pointer-capable mutation, only
+> when the GC runtime is initialized on the thread) that walk their stores
+> under their `g_store_mutex` + report each aligned `i64` slot / each map
+> entry's key AND value as root candidates; the heap visitor validates each
+> (live GC object?) + rejects ordinary integers, null, and stale addresses,
+> so a plain-integer slot or a `u8` array NEVER creates a false root. The
+> `vec`/`string` extensions register no-op LEAF callbacks (report nothing)
+> so their float/char bytes are never reinterpreted as pointers. Each
+> extension's `reset()` unregisters its callback; `gc_reset()` invalidates
+> every token; the next mutation re-registers. The callback cannot outlive
+> the store or the runtime.
+>
+> **Stop-the-world write-barrier semantics.** `gc_write_barrier(owner,
+> child)` records that `owner` (a GC object) now references `child` (another
+> GC object). The current **stop-the-world, non-generational** collector does
+> NOT need a remembered set, so the barrier is a **behavioural no-op on
+> collection itself** — it does not change reachability and is not required
+> for correctness today. It exists as the **observability/extension surface**
+> a future generational or concurrent collector would build on: a registered
+> **barrier observer** is notified of every valid (live owner + live child)
+> barrier event, and `stats().barrier_calls` counts them. Null / non-live
+> owner or child are SAFELY IGNORED (no observer fire, no counter bump), so
+> the barrier is safe to call unconditionally from generated write sites.
+> Generated code (both backends) emits `__ember_gc_write_barrier` calls at
+> the env capture-store sites when `use_gc_env`; the `array`/`map` extensions
+> call the facade on `set_i64`/`map_set`. For today's scalar captures +
+> non-GC extension owners those calls are no-ops (owner or child is not a
+> live GC pair), zero-cost when GC is disabled (`gc_active()` false). The
+> barrier is the surface, not a current correctness requirement.
+>
+> **Lifetime model.** A lambda env is NO LONGER permanently pinned at alloc
+> (`gc_alloc_env` allocates without pinning; a collect-then-alloc closes the
+> alloc-to-first-rooted-store window). Reachability is determined by the
+> frame chain (while the owning frame is live) / the global-root descriptor
+> (if stored to a typed global) / extension trace callbacks (if stored in
+> `array`/`map`) / an explicit pin (`gc_root_env`, still used by the
+> script-visible `gc_new`/`gc_delete` surface — a script-held `i64` handle is
+> typed `i64` to the compiler so the frame map cannot track it). An env is
+> reaped once none of those reach it. Pinned by `gc_core` (the core unit
+> test), `gc_integration` (Parts A–G: host API, codegen, new/delete, precise
+> root scanning, IR backend, try/catch safety, extension trace callbacks),
+> and `gc_full` (by-reference capture + new/delete + the cross-layer
+> one-collection-sequence covering all five behaviors on both backends).
+>
+> The residual deferral is now narrower: (1) the IR backend does not yet
+> lower `LambdaExpr` (a lambda-creating function falls back to the tree-
+> walker — the IR path's frame-record maintenance + frame-map emit are
+> implemented + tested via the `gc_new`/`delete` surface, ready for when it
+> does); (2) `new Type{...}` syntax with typed field access (a pointer-type
+> system; ember structs are value types today) — the `gc_new`/`gc_delete`
+> natives are the heap-management substrate it would build on; (3) coroutine
+> suspended-frame rooting (#21); (4) per-context shared heaps. See
+> `extensions/gc/ext_gc.hpp` (the design + WHAT REMAINS) + `../ROADMAP.md`
+> Tier 3 (Tracing GC — ✓ core shipped + integration shipped).
 
 Recorded here so the reasoning isn't lost: a tracing GC would be
 needed only if script code could create heap references with

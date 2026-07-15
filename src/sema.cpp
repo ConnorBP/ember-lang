@@ -4773,6 +4773,26 @@ SemaResult sema(Program& prog,
         for (auto& g : prog.globals) if (g.ty) resolve_type(*g.ty);
     }
 
+    // #20 precise GC: a `fn(Args)->Ret`-typed global whose initializer is a
+    // matching LambdaExpr holds a 16-byte lambda value {slot, env_ptr}. Convert
+    // its declared type to is_lambda BEFORE interning it into the globals map
+    // (mirroring the local-declaration conversion), so the global is 16 bytes +
+    // codegen treats it as a two-word lambda value (the env_ptr half is a GC
+    // root via the global-root descriptor). Without this the global stays an
+    // 8-byte fn-handle slot and a stored lambda's env_ptr is truncated/lost.
+    for (auto& g : prog.globals) {
+        if (g.init && g.ty && g.ty->is_fn_handle && g.ty->has_recorded_sig &&
+            dynamic_cast<LambdaExpr*>(g.init.get())) {
+            auto* le = dynamic_cast<LambdaExpr*>(g.init.get());
+            if (le->ret && g.ty->recorded_ret && g.ty->recorded_ret->same(*le->ret) &&
+                g.ty->recorded_params.size() == le->params.size()) {
+                bool sig_match = true;
+                for (size_t j = 0; j < le->params.size(); ++j)
+                    if (!g.ty->recorded_params[j]->same(*le->params[j].ty)) { sig_match = false; break; }
+                if (sig_match) { g.ty->is_fn_handle = false; g.ty->is_lambda = true; }
+            }
+        }
+    }
     // register globals (stable type pointers via intern)
     for (auto& g : prog.globals) {
         if (!c.globals.count(g.name)) c.globals[g.name] = {c.intern(*g.ty), g.is_const};

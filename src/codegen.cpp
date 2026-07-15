@@ -135,6 +135,32 @@ struct CG {
     int max_args = 0;
     std::vector<uint8_t> rodata;
     std::string non_serializable_reason;
+    // ── Precise GC root scanning (shadow stack) ──────────────────────────
+    // Active only when ctx.use_gc_env (the GC heap env backend). The frame
+    // reserves a 24-byte GcFrameRecord region (prev/frame_base/map) at
+    // gc_rec_off; the prologue links it onto context_t::gc_frame_head, the
+    // epilogue unlinks it. gc_map is the compile-time GcFrameMap (the record's
+    // `map` field) listing every frame slot holding a GC object pointer; its
+    // ADDRESS is baked into the prologue (allocated before the prologue so the
+    // address is known), its `offs` are filled during body emission and stable
+    // once compile completes. gc_map is moved into the CompiledFn at the end.
+    // gc_rec_off / gc_rec_base_off / gc_rec_map_off are the rbp-relative
+    // (negative) offsets of the record's three fields.
+    std::shared_ptr<gc::GcFrameMap> gc_map;
+    int32_t gc_rec_off = 0;       // record's `prev` field (the record's base addr)
+    int32_t gc_rec_base_off = 0;  // record's `frame_base` field
+    int32_t gc_rec_map_off = 0;   // record's `map` field
+    // Record a frame slot (rbp-relative ABSOLUTE negative offset) that holds a
+    // GC object pointer. Called for lambda env_ptr slots + the second word of
+    // lambda-valued locals/params + the __env param of a lambda fn. Dedup'd
+    // (the same offset may be recorded for the envptr temp + the lambda local
+    // that copies it). No-op when precise GC is off (gc_map == nullptr).
+    void add_gc_ptr_slot(int32_t off) {
+        if (!gc_map) return;
+        for (int32_t o : gc_map->offs) if (o == off) return;  // dedup
+        gc_map->offs.push_back(off);
+    }
+    bool gc_active() const { return ctx.use_gc_env; }
     // #20 lambda capture map (set when compiling a synthetic lambda fn):
     // capture name -> (byte offset within env, type, by_ref). The env_ptr is
     // the __env param (params[0]), whose frame slot is in `locals["__env"]`.
@@ -889,6 +915,11 @@ struct CG {
         int32_t off = -next_local_off;
         locals[n] = off;
         local_types[n] = t;
+        // Precise GC: a lambda-typed local/param is 16 bytes {slot, env_ptr};
+        // the env_ptr (second word at off+8) is a GC object pointer when the
+        // env is on the GC heap (use_gc_env). A no-capture lambda's env_ptr is
+        // null (safely ignored by the collector), so recording every lambda\n        // slot's env_ptr word is conservative + correct.
+        if (gc_active() && t && t->is_lambda) add_gc_ptr_slot(off + 8);
         return off;
     }
 
@@ -1486,7 +1517,110 @@ struct CG {
     // Actually the above hand-encoded store is fragile; use a helper via emitter.
     // (Replaced below by a proper emitter method call.)
 
+    // ── Precise GC: shadow-stack frame-record maintenance ───────────────
+    // The prologue links a GcFrameRecord (living in this frame's reserved
+    // 24-byte region at gc_rec_off) onto context_t::gc_frame_head; the
+    // epilogue unlinks it (restores the head to the record's `prev`). The
+    // collector (ext_gc's trace callback) walks the chain from the head and
+    // reports each frame's mapped GC-pointer slots. Emitted only when
+    // gc_active() (use_gc_env). The head is addressed via [r14 + off] when
+    // use_context_reg, else via the baked gc_frame_head_ptr (a void** pointing
+    // at &ctx.gc_frame_head). Safe across try/catch (the catch longjmp restores
+    // rsp/rbp to the catching frame, which re-runs no prologue, but its record
+    // is already linked; an abandoned frame's record stays linked only until a
+    // host trap longjmp, which reset_for_call() clears).
+    // ── Precise GC: write barrier emission ───────────────────────────────
+    // Emit a call to the c1 write barrier (__ember_gc_write_barrier) recording
+    // that `owner` (a GC-managed object, e.g. a lambda env) now references
+    // `child`. Called by generated code whenever it stores a GC child into a
+    // GC-managed object. The barrier is a no-op on the current non-generational
+    // collector for null/non-live pairs (the c1 contract), so it is SAFE to
+    // call unconditionally from these store sites even when the stored value is
+    // a scalar (the barrier ignores it). Emitted only when gc_active()
+    // (use_gc_env) AND the barrier native is registered; otherwise no bytes
+    // (byte-identical to the pre-barrier path, so the default-off / GC-disabled
+    // path is zero-cost). Caller contract: on entry rcx = owner (the GC object
+    // ptr), rax = child (the just-stored value); both are volatile and free
+    // after this (the capture loop reloads them next iteration). Stack is
+    // 16-aligned at entry (frame base); the sub rsp,32 shadow keeps it so.
+    void emit_gc_write_barrier_call() {
+        if (!gc_active()) return;
+        const NativeSig* bsig = native_named("__ember_gc_write_barrier");
+        if (!bsig || !bsig->fn_ptr) return;  // native not registered -> no barrier
+        // Win64 i64(i64,i64): owner in rcx (already there), child in rdx.
+        e.mov_reg_reg(Reg::rdx, Reg::rax);   // arg 1 = child (the stored value)
+        // arg 0 = owner already in rcx (the env base). sub rsp,32 shadow space
+        // (keeps rsp%16==0 before the call). call + add rsp,32.
+        e.sub_reg_imm32(Reg::rsp, 32);
+        // Load the fn ptr via the symbolic native fixup (relocatable + .em-safe).
+        e.mov_reg_native(Reg::rax, "__ember_gc_write_barrier");
+        PendingNative pending;
+        pending.binding.code_offset = e.native_fixups().back().code_offset;
+        pending.binding.name = "__ember_gc_write_barrier";
+        pending.binding.ret = bsig->ret;
+        pending.binding.params = bsig->params;
+        pending.target = bsig->fn_ptr;
+        pending_natives.push_back(std::move(pending));
+        e.call_reg(Reg::rax);
+        e.add_reg_imm32(Reg::rsp, 32);
+    }
+
+    void emit_gc_frame_record_prologue() {
+        if (!gc_active() || !gc_map) return;
+        // record.prev = current head
+        emit_load_gc_head(Reg::rax);
+        e.store_reg_mem(Reg::rbp, gc_rec_off, Reg::rax);
+        // record.frame_base = rbp
+        e.store_reg_mem(Reg::rbp, gc_rec_base_off, Reg::rbp);
+        // record.map = &gc_map (baked imm64; process-local, stable for fn life)
+        e.mov_reg_imm64(Reg::rax, reinterpret_cast<int64_t>(gc_map.get()));
+        e.store_reg_mem(Reg::rbp, gc_rec_map_off, Reg::rax);
+        // new head = &record (lea rbp + gc_rec_off)
+        e.mov_reg_reg(Reg::rax, Reg::rbp);
+        e.add_reg_imm32(Reg::rax, gc_rec_off);
+        emit_store_gc_head(Reg::rax);
+    }
+    void emit_gc_frame_record_epilogue() {
+        if (!gc_active() || !gc_map) return;
+        // head = record.prev (unlink this frame). CRITICAL: do NOT clobber rax
+        // (it holds the i64 return value at every ReturnStmt + fallthrough exit).
+        // Use r11 as the scratch (volatile, not the return reg, not rbx/rbp). The
+        // unlink loads record.prev into r11, then stores r11 into the head.
+        e.load_reg_mem(Reg::r11, Reg::rbp, gc_rec_off);
+        emit_store_gc_head(Reg::r11);
+    }
+    // Load context_t::gc_frame_head into `dst`. use_context_reg reads
+    // [r14 + off]; else reads the baked [*gc_frame_head_ptr] (a mov r,[imm64]).
+    void emit_load_gc_head(Reg dst) {
+        if (ctx.use_context_reg) {
+            e.load_reg_mem(dst, Reg::r14, context_offsets::gc_frame_head());
+        } else {
+            // mov dst, imm64(&gc_frame_head); mov dst, [dst]
+            e.mov_reg_imm64(dst, reinterpret_cast<int64_t>(ctx.gc_frame_head_ptr));
+            e.load_reg_mem(dst, dst, 0);
+        }
+    }
+    // Store `src` into context_t::gc_frame_head. Uses r11 as the address
+    // scratch in baked mode (r11 is volatile + free in BOTH the prologue (no
+    // value live yet) and the epilogue (rax holds the i64 return value there
+    // and MUST NOT be clobbered)); if src == r11, falls back to r10. This keeps
+    // the return value in rax safe at every exit.
+    void emit_store_gc_head(Reg src) {
+        if (ctx.use_context_reg) {
+            e.store_reg_mem(Reg::r14, context_offsets::gc_frame_head(), src);
+        } else {
+            Reg scratch = (src == Reg::r11) ? Reg::r10 : Reg::r11;
+            e.mov_reg_imm64(scratch, reinterpret_cast<int64_t>(ctx.gc_frame_head_ptr));
+            e.store_reg_mem(scratch, 0, src);
+        }
+    }
+
     void emit_epilogue() {
+        // Precise GC: unlink this frame's record BEFORE tearing down the frame
+        // (the record lives in this frame, so it must be unlinked while rbp
+        // still points at it). Runs at the single shared exit path so every
+        // normal return (every ReturnStmt + implicit fallthrough) is covered.
+        emit_gc_frame_record_epilogue();
         // Unconditional rbx restore (Item E, register-pinning prerequisite):
         // every function saves rbx to a reserved frame slot in its prologue
         // regardless of whether it personally uses the hot-local pin, so rbx
@@ -2078,6 +2212,16 @@ void store_rax_to_global(CG& cg, int64_t /*base*/, int32_t off) {
     cg.e.byte(0x49); cg.e.byte(0x89); cg.e.byte(0x83); cg.e.imm32(off);
 }
 
+// store rdx (the second word of a slice {ptr,len} / lambda {slot, env_ptr})
+// to a global slot [globals_base + off]. Mirrors store_rax_to_global with rdx
+// as the source. Used by the two-word global store (AssignExpr to a slice/
+// lambda-typed global) so the len / env_ptr word is not lost.
+void store_rdx_to_global(CG& cg, int64_t /*base*/, int32_t off) {
+    cg.e.mov_reg_imm64_external(Reg::r11, AbsFixup::GlobalsBase);
+    // mov [r11 + disp32], rdx: REX.WB (49), 89, modrm(10, rdx=2, r11=3) = 0x93, disp32
+    cg.e.byte(0x49); cg.e.byte(0x89); cg.e.byte(0x93); cg.e.imm32(off);
+}
+
 // store xmm0 (a float) to a global slot [globals_base + off]. Mirrors
 // store_xmm0_to_rbp but through the relocatable globals base. movss [r11+disp32],
 // xmm0: r11 is reg 11, so the rm field needs REX.B (0x41) to extend rm=011 -> r11.
@@ -2118,6 +2262,8 @@ void CG::eval(const Expr& ex) {
             // frame only needs to hold the pointer, not env_size bytes).
             std::string name = "__envptr$" + std::to_string(temp_counter++);
             envptr_off = alloc_local(name, &type_i64());
+            // Precise GC: envptr_off holds the heap env pointer (a GC object\n            // pointer) for this lambda's whole frame lifetime. Record it so the\n            // collector marks it as a root while the frame is live.
+            add_gc_ptr_slot(envptr_off);
             // Call __ember_gc_alloc_env(env_size) -> rax = heap env ptr.
             // Win64: arg 0 in rcx, 32 bytes shadow space (keeps rsp%16==0).
             // The depth check inside emit_counted_named_native clobbers eax
@@ -2244,6 +2390,12 @@ void CG::eval(const Expr& ex) {
                     normalize_rax(ct);
                     e.load_reg_mem(Reg::rcx, Reg::rbp, envptr_off);
                     e.store_rax_elem(Reg::rcx, coff, 8);
+                    // c1 write barrier: the env (a GC-managed object, in rcx)
+                    // now references the captured value (in rax). For a scalar
+                    // capture the barrier no-ops (rax is not a live GC object);
+                    // for a future GC-object capture it records the edge. No-op
+                    // + zero-cost when GC is disabled (gc_active() false).
+                    emit_gc_write_barrier_call();
                 }
             }
         } else if (le->env_size > 0) {
@@ -2497,6 +2649,16 @@ void CG::eval(const Expr& ex) {
                     e.mov_reg_imm64_external(Reg::r11, AbsFixup::GlobalsBase);
                     e.add_reg_reg(Reg::rax, Reg::r11);             // rax = absolute ptr
                     e.mov_reg_reg(Reg::rdx, Reg::rcx);             // rdx = len
+                } else if (t && t->is_lambda) {
+                    // lambda global read: load {slot, env_ptr} (16 bytes). The
+                    // env_ptr (word1 at off+8) is an ABSOLUTE GC heap pointer
+                    // (not a relative block offset like a slice ptr), so it is
+                    // loaded verbatim — NO globals_base add. ABI {rax=slot,
+                    // rdx=env_ptr}.
+                    load_global_to_rax(*this, gbase, off);        // rax = slot
+                    load_global_to_rax(*this, gbase, off + 8);    // rax = env_ptr
+                    e.mov_reg_reg(Reg::rdx, Reg::rax);             // rdx = env_ptr
+                    load_global_to_rax(*this, gbase, off);        // rax = slot (reload)
                 } else {
                     load_global_to_rax(*this, gbase, off);
                     if (t && t->prim == Prim::F64) {
@@ -3098,7 +3260,16 @@ void CG::eval(const Expr& ex) {
                     if (found) {
                         auto tit = gtypes->find(id->name);
                         const Type* gt = (tit != gtypes->end()) ? tit->second : nullptr;
-                        if (gt && gt->is_float()) store_xmm0_to_global(*this, ctx.globals_base, off, gt);
+                        if (gt && (gt->is_slice || gt->is_lambda)) {
+                            // A slice ({ptr,len}) / lambda ({slot, env_ptr}) is a
+                            // TWO-WORD value (rax=word0, rdx=word1). Store both
+                            // to the global slot (word0 at off, word1 at off+8).
+                            // Storing only rax (the pre-fix path) lost the
+                            // lambda env_ptr / slice len, so a global lambda's
+                            // env was never rooted + a global slice's len was 0.
+                            store_rax_to_global(*this, ctx.globals_base, off);
+                            store_rdx_to_global(*this, ctx.globals_base, off + 8);
+                        } else if (gt && gt->is_float()) store_xmm0_to_global(*this, ctx.globals_base, off, gt);
                         else { normalize_rax(gt); store_rax_to_global(*this, ctx.globals_base, off); }
                     }
                 }
@@ -4916,6 +5087,18 @@ void CG::exec_stmt(const Stmt& s) {
         // On entry here: rbx/rbp/r12-r15/rsp are restored to the try-entry
         // state, call_depth is restored (by the throw), and thrown_value has
         // the thrown i64. Bind thrown_value to the catch variable's frame slot.
+        // Precise GC: a cross-frame throw longjmp'd past the abandoned inner
+        // frames WITHOUT running their epilogues, so their GcFrameRecords are
+        // still linked onto gc_frame_head (and their stack memory is now
+        // reclaimed). Restore head to THIS (catching) frame's record, unlinking
+        // the stale intermediate records so a subsequent collect does not walk
+        // freed frames. rbp is the catching frame's base; the record is at
+        // rbp + gc_rec_off. No-op when precise GC is off.
+        if (gc_active() && gc_map) {
+            e.mov_reg_reg(Reg::rax, Reg::rbp);
+            e.add_reg_imm32(Reg::rax, gc_rec_off);
+            emit_store_gc_head(Reg::rax);
+        }
         // The catch_name was declared as an i64 local by sema in the catch
         // block's scope; exec_block will push a scope and the catch_name is
         // the first local. But exec_block uses alloc_local for lets inside
@@ -5308,6 +5491,20 @@ static CompiledFn compile_tree_walker_(const FuncDecl& f, const CodeGenCtx& ctx)
     // computation the rest of this function already depends on.
     cg.next_local_off += 8;
     cg.rbx_save_offset = -cg.next_local_off;
+    // Precise GC: allocate the GcFrameMap NOW (before the prologue) so its
+    // address is known + can be baked into the prologue, then reserve the
+    // 24-byte GcFrameRecord region (prev/frame_base/map) right after rbx_save
+    // so its offsets are deterministic. The map's `offs` are filled during
+    // body emission (add_gc_ptr_slot) and stable once compile completes. Only
+    // when use_gc_env (the GC heap env backend); otherwise gc_map stays null
+    // and the prologue/epilogue maintenance is a no-op (byte-identical path).
+    if (ctx.use_gc_env) {
+        cg.gc_map = std::make_shared<gc::GcFrameMap>();
+        cg.next_local_off += 24;
+        cg.gc_rec_off = -cg.next_local_off;            // prev field (record base)
+        cg.gc_rec_base_off = cg.gc_rec_off + 8;        // frame_base field
+        cg.gc_rec_map_off = cg.gc_rec_off + 16;        // map field
+    }
     // locals + arg temps (arg temps = max_args * 8, after locals)
     // We alloc locals during exec. But frame size must be known up front.
     // Simplification: give a generous fixed frame based on a quick count of let-stmts.
@@ -5316,6 +5513,10 @@ static CompiledFn compile_tree_walker_(const FuncDecl& f, const CodeGenCtx& ctx)
     // rather than a flat per-local count*8 - needed now that locals can be
     // wider than 8 bytes (slice ABI / fixed arrays).
     int32_t locals_area = 8; // rbx_save_offset's reservation above (Item E) - must track next_local_off's starting bump
+    // Precise GC: reserve a 24-byte GcFrameRecord region (prev/frame_base/map)
+    // in the frame, reserved right after rbx_save so its offsets are
+    // deterministic. Only when use_gc_env (the GC heap env backend).
+    if (ctx.use_gc_env) locals_area += 24;
     for (size_t i = 0; i < f.params.size(); ++i) locals_area += CG::local_width_bytes(f.params[i].ty.get(), ctx.structs);
     if (cg.returns_struct_by_ptr()) locals_area += 8; // hidden return-pointer slot (struct_ret_ptr_offset)
     std::function<void(const Block&)> sum_bytes = [&](const Block& b) {
@@ -5428,6 +5629,13 @@ static CompiledFn compile_tree_walker_(const FuncDecl& f, const CodeGenCtx& ctx)
     // there is NO callee-saved save/restore in the prologue — zero tax on any
     // function. A RHS containing a call falls back to push/pop since r10 is
     // volatile; a no-call RHS uses r10 with no prologue cost.)
+    // Precise GC: link this frame's GcFrameRecord onto context_t::gc_frame_head
+    // (the shadow stack). The record (prev/frame_base/map) lives in the frame
+    // at gc_rec_off; the collector walks the chain from the head. Emitted only
+    // when use_gc_env; a no-op otherwise (byte-identical to the pre-GC path).
+    // Done after the frame is live (sub rsp) + rbx save, before the body. rax
+    // is volatile + free here (no value live yet).
+    cg.emit_gc_frame_record_prologue();
 
     // spill incoming params to frame slots (Win64: rcx/rdx/r8/r9 int, xmm0-3 float).
     // Done BEFORE the CPUID gate (cpuid clobbers rcx/rdx) and before the body.
@@ -5492,7 +5700,12 @@ static CompiledFn compile_tree_walker_(const FuncDecl& f, const CodeGenCtx& ctx)
         int wcount = CG::words_for_type(pt, ctx.structs);
         bool is_struct = pt && !pt->struct_name.empty() && ctx.structs && ctx.structs->count(pt->struct_name) != 0;
         int32_t off = cg.alloc_local(f.params[i].name, pt);
-        if (f.is_lambda && i == 0) cg.lambda_env_off = off;  // #20: record __env's frame slot
+        if (f.is_lambda && i == 0) {
+            cg.lambda_env_off = off;  // #20: record __env's frame slot
+            // Precise GC: the __env param holds the heap env pointer (a GC
+            // object pointer) for the lambda fn's whole frame. Record it.
+            if (cg.gc_active()) cg.add_gc_ptr_slot(off);
+        }
         if (is_struct) {
             // A struct param's byte size is frequently NOT a multiple of 8
             // (e.g. Mixed: i64+f32+u8+bool = 14 bytes, wcount=2 words). The
@@ -5637,6 +5850,7 @@ static CompiledFn compile_tree_walker_(const FuncDecl& f, const CodeGenCtx& ctx)
 
     out.rodata = std::move(cg.rodata);
     out.non_serializable_reason = std::move(cg.non_serializable_reason);
+    out.gc_frame_map = std::move(cg.gc_map);  // precise GC frame map (null when off)
     out.bytes = std::move(cg.e.code);
     return out;
 }
