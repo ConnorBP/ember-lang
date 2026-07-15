@@ -1,0 +1,12 @@
+// Self-hosted positive: a >16-byte struct (6 fields, 48 bytes) passed by value
+// as a function argument (ceil(48/8) = 6 words), then field reads inside the
+// callee. kind=1, line=2, col=3, ivalue=4 -> 1+2+3+4 = 10.
+// expect: 10
+struct Token { kind: i64; text: string; line: i64; col: i64; ivalue: i64; fvalue: f64; }
+fn sum_fields(tk: Token) -> i64 {
+    return tk.kind + tk.line + tk.col + tk.ivalue;
+}
+fn main() -> i64 {
+    let tk: Token = Token { kind: 1, text: string_from_slice("x"), line: 2, col: 3, ivalue: 4, fvalue: 5.0 };
+    return sum_fields(tk);
+}

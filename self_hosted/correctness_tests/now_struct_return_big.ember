@@ -1,0 +1,13 @@
+// Self-hosted positive: a 6-field struct (48 bytes, like the lexer Token)
+// returned by value via the hidden-pointer sret convention, then field access
+// on the result local. kind=1, line=2, col=3, ivalue=4 -> 1+2+3+4 = 10.
+// expect: 10
+struct Token { kind: i64; text: string; line: i64; col: i64; ivalue: i64; fvalue: f64; }
+fn get_token(k: i64, t: string, ln: i64, co: i64, iv: i64, fv: f64) -> Token {
+    let tk: Token = Token { kind: k, text: t, line: ln, col: co, ivalue: iv, fvalue: fv };
+    return tk;
+}
+fn main() -> i64 {
+    let tk: Token = get_token(1, string_from_slice("x"), 2, 3, 4, 5.0);
+    return tk.kind + tk.line + tk.col + tk.ivalue;
+}

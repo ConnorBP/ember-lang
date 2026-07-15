@@ -1,0 +1,12 @@
+// Self-hosted positive: struct return by value (16 bytes -> 2-word return via
+// hidden pointer, mirroring the native Win64 sret convention). A 2-field i64
+// struct returned from a fn + field access on the result.
+// expect: 42
+struct Pair { x: i64; y: i64; }
+fn make(a: i64, b: i64) -> Pair {
+    return Pair { x: a, y: b };
+}
+fn main() -> i64 {
+    let p: Pair = make(20, 22);
+    return p.x + p.y;
+}

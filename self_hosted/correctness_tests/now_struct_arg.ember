@@ -1,0 +1,12 @@
+// Self-hosted positive: struct passed by value as a function argument (a
+// 2-field i64 struct = 16 bytes -> 2 words), then field reads inside the
+// callee. Mirrors the native script ABI (struct arg = ceil(size/8) words).
+// expect: 42
+struct Pair { x: i64; y: i64; }
+fn sum(p: Pair) -> i64 {
+    return p.x + p.y;
+}
+fn main() -> i64 {
+    let p: Pair = Pair { x: 20, y: 22 };
+    return sum(p);
+}

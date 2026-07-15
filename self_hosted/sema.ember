@@ -152,6 +152,18 @@ global s_errmsg  : string = "";
 // the current function's return type (for return-stmt checking). -1 = not in a fn.
 global s_cur_ret : i64 = 0;
 
+// struct-returning-call allowance flag. Mirrors src/sema.cpp's
+// allow_struct_ret_call parameter: a struct-returning CallExpr is only valid
+// as a LetStmt initializer or a ReturnStmt value (the two positions where
+// codegen has a concrete destination address for the callee's hidden return
+// pointer), OR as a struct-by-value call argument of the matching struct
+// type (gated in check_callexpr by the param type). Set to 1 around the
+// check_expr of a let-init / return-value, 0 elsewhere. A struct-returning
+// call in any other position (e.g. a discarded expr stmt, or the base of a
+// field access) is rejected here so codegen never has to materialize a
+// struct-returning call's result into a register.
+global s_allow_struct_ret_call : i64 = 0;
+
 // Logical scope-mark depth and current loop nesting. The backing arrays cannot
 // shrink, so live stack depth must be tracked independently of physical size.
 global s_mark_len  : i64 = 0;
@@ -328,21 +340,42 @@ fn ty_array_len(t: i64) -> i64 { return nk_e(t); }
 // element type (the `a` slot) for array/slice types.
 fn ty_elem(t: i64) -> i64 { return nk_a(t); }
 
-// is this an aggregate type (slice, fixed array, or struct) that the
-// self-hosted call ABI cannot pass/return by value? Scalars (int/float/bool/
-// void/handle) are NOT aggregates. Used to reject aggregate fn params/returns
-// (-310) since the call ABI is one-word-per-operand.
+// is this type a REGISTERED struct? Mirrors src/sema.cpp's
+// is_registered_struct: a Type whose struct_name resolves in g_structs.
+// Used by the struct by-value arg/return ABI (check_callexpr's struct-arg
+// shape gate + register_fn's allowance of struct returns/params).
+fn ty_is_struct(t: i64) -> i64 {
+    if (t < 0) { return 0; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 0; }
+    if (nk_tok(t) < 0) { return 0; }
+    let nm: string = tok_name(nk_tok(t));
+    if (nm == string_from_slice("string")) { return 0; }   // opaque handle
+    if (find_struct(nm) >= 0) { return 1; }
+    return 0;
+}
+
+// is this an aggregate type (slice, fixed array, or struct)? Scalars
+// (int/float/bool/void/handle) are NOT aggregates. Used by check_let's
+// array-literal target validation. (Struct fn params/returns are now ALLOWED
+// — register_fn only rejects slice/fixed-array aggregates via
+// ty_is_slice_or_array, so structs flow through the by-value ABI.)
 fn ty_is_aggregate(t: i64) -> i64 {
     if (t < 0) { return 0; }
     if (nk_kind(t) != (NK::Type as i64)) { return 0; }
     if (nk_f(t) == 1) { return 1; }          // slice
     if (nk_e(t) > 0) { return 1; }           // fixed array
-    if (nk_tok(t) >= 0) {
-        let nm: string = tok_name(nk_tok(t));
-        if (nm == string_from_slice("string")) { return 0; }   // opaque handle
-        if (find_struct(nm) >= 0) { return 1; }                // struct
-        return 0;
-    }
+    if (ty_is_struct(t) == 1) { return 1; }  // struct
+    return 0;
+}
+
+// is this a slice or fixed-array aggregate (NOT a struct)? register_fn
+// rejects these as fn params/returns (-310) since the self-hosted call ABI
+// has the struct by-value path but not the slice/array by-value path yet.
+fn ty_is_slice_or_array(t: i64) -> i64 {
+    if (t < 0) { return 0; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 0; }
+    if (nk_f(t) == 1) { return 1; }          // slice
+    if (nk_e(t) > 0) { return 1; }           // fixed array
     return 0;
 }
 
@@ -1191,18 +1224,20 @@ fn register_fn(fd: i64, ns_tok: i64) -> i64 {
     }
     let rt: i64 = resolve_type(nk_b(fd));
     if (s_err != 0) { return TY_VOID; }
-    // The self-hosted call ABI passes one 8-byte word per param/return and has
-    // no hidden-pointer / 2-word-slice path, so aggregate (slice / fixed-array
-    // / struct) params + returns are out-of-subset. Mirror the -310 contract
-    // (a slice/array type in a signature) so the sema_test rejection stays.
-    if (ty_is_aggregate(rt) == 1) {
+    // The self-hosted call ABI now supports struct by-value params + returns
+    // (the hidden-pointer sret return + ceil(size/8)-word arg path, mirroring
+    // the native codegen). Slice / fixed-array params + returns are still
+    // out-of-subset (no slice/array by-value ABI), so reject those (-310) and
+    // let structs through. A struct return type + struct param types are
+    // type-checked downstream (check_return / check_callexpr).
+    if (ty_is_slice_or_array(rt) == 1) {
         return unsupported(-310, string_from_slice("aggregate return type"), fd);
     }
     let mut pp: i64 = nk_a(fd);
     while (pp >= 0) {
         let pt: i64 = resolve_type(nk_a(pp));
         if (s_err != 0) { return TY_VOID; }
-        if (ty_is_aggregate(pt) == 1) {
+        if (ty_is_slice_or_array(pt) == 1) {
             return unsupported(-310, string_from_slice("aggregate parameter type"), pp);
         }
         pp = nk_next(pp);
@@ -1896,19 +1931,82 @@ fn check_callexpr(e: i64) -> i64 {
     while (ai >= 0) {
         let want: i64 = fn_param_type(row, i);
         try_adapt_float_lit(ai, want);
+        // A struct-by-value arg slot permits a struct-returning CallExpr of
+        // the matching struct (mirrors src/sema.cpp's `expected`-matching
+        // gate): set the allowance flag around the arg's check_expr so a
+        // nested struct-returning call is not rejected by its own gate. The
+        // flag is restored immediately after (the allowance is per-arg-slot,
+        // not propagated to siblings).
+        let saved_allow: i64 = s_allow_struct_ret_call;
+        if (ty_is_struct(want) == 1) { s_allow_struct_ret_call = 1; }
         let got: i64 = check_expr(ai);
+        s_allow_struct_ret_call = saved_allow;
+        if (s_err != 0) { return TY_VOID; }
         if (lit_fits_int_type(ai, want) == 0 && types_compatible(want, got) == 0) {
             return serr(string_from_slice("arg ") + int_to_str(i + 1) + string_from_slice(" of '") + nm
                         + string_from_slice("': expected ") + ty_name(want) + string_from_slice(", got ")
                         + ty_name(got),
                         node_line(ai), node_col(ai));
         }
+        // struct-arg shape gate (mirrors src/sema.cpp's check_struct_arg_shape):
+        // a struct-by-value argument must be a bare local Ident, a StructLit of
+        // the matching struct, or a CallExpr returning the matching struct.
+        // Any other shape (e.g. a field access) has no single source address /
+        // concrete destination for the hidden-pointer materialization, so the
+        // codegen cannot stash it. The type already matched above; this gate
+        // restricts the SHAPE.
+        if (ty_is_struct(want) == 1) {
+            if (check_struct_arg_shape(ai, want) == 0) {
+                return serr(string_from_slice("a struct-by-value argument (type '") + ty_name(want)
+                            + string_from_slice("') must be a plain local variable, a struct literal of '")
+                            + ty_name(want) + string_from_slice("', or a call returning '") + ty_name(want)
+                            + string_from_slice("'"),
+                            node_line(ai), node_col(ai));
+            }
+        }
         ai = nk_next(ai);
         i = i + 1;
     }
     let srt: i64 = fn_ret_type(row);
+    // A struct-returning CallExpr is only allowed as a let-init / return value
+    // / struct-by-value arg of the matching struct (mirrors src/sema.cpp's
+    // allow_struct_ret_call + expected-matching gate). check_let / check_return
+    // set s_allow_struct_ret_call=1 around the init/value check_expr; the
+    // struct-arg slot above sets it for a matching struct param. In any other
+    // position (a discarded expr stmt, a field-access base, a binexpr operand)
+    // the flag is 0 and the struct-returning call is rejected — codegen has no
+    // register form for a multi-word struct result.
+    if (ty_is_struct(srt) == 1 && s_allow_struct_ret_call == 0) {
+        return serr(string_from_slice("a call returning struct '") + ty_name(srt)
+                    + string_from_slice("' is only allowed as a `let x: ") + ty_name(srt)
+                    + string_from_slice(" = ") + nm + string_from_slice("(...);` initializer, a `return ")
+                    + nm + string_from_slice("(...);` value, or a struct-by-value argument of type '")
+                    + ty_name(srt) + string_from_slice("'"),
+                    node_line(e), node_col(e));
+    }
     set_c(e, srt);  // annotate return type for the codegen
     return srt;
+}
+
+// struct-arg shape gate (mirrors src/sema.cpp's check_struct_arg_shape):
+// returns 1 iff `arg` is a permitted struct-by-value call argument for a param
+// of struct type `want` — a bare local Ident, a StructLit of the matching
+// struct, or a CallExpr whose return type is the matching struct. The type
+// match itself is done by types_compatible in check_callexpr; this only
+// restricts the expression shape.
+fn check_struct_arg_shape(arg: i64, want: i64) -> i64 {
+    let k: i64 = nk_kind(arg);
+    if (k == (NK::Ident as i64)) { return 1; }
+    if (k == (NK::StructLit as i64)) {
+        if (ty_struct_name(want) == nk_name(arg)) { return 1; }
+        return 0;
+    }
+    if (k == (NK::CallExpr as i64)) {
+        let crt: i64 = nk_c(arg);
+        if (ty_is_struct(crt) == 1 && ty_struct_name(crt) == ty_struct_name(want)) { return 1; }
+        return 0;
+    }
+    return 0;
 }
 
 fn check_structlit(e: i64) -> i64 {
@@ -2125,7 +2223,17 @@ fn check_assignexpr(e: i64) -> i64 {
     }
 
     // plain '=' : the value's type must be compatible with the target's.
+    // A struct-typed target permits a struct-returning CallExpr value (mirrors
+    // src/sema.cpp's AssignExpr `expected`-matching gate: check_value(value,
+    // lt) lets a struct-returning call through when lt is the matching struct).
+    // Set the allowance flag around the value's check_expr when the target is
+    // a struct; the struct-arg-shape gate does not apply to an assignment
+    // value (the Ident/StructLit/CallExpr shapes are all stashed the same way
+    // as a let-init at codegen).
+    let saved_allow: i64 = s_allow_struct_ret_call;
+    if (ty_is_struct(lt) == 1) { s_allow_struct_ret_call = 1; }
     let rt: i64 = check_expr(value);
+    s_allow_struct_ret_call = saved_allow;
     if (s_err != 0) { return TY_VOID; }
     if (lit_fits_int_type(value, lt) == 0 && types_compatible(lt, rt) == 0) {
         return serr(string_from_slice("assignment type mismatch (") + ty_name(lt) + string_from_slice(" = ")
@@ -2763,7 +2871,14 @@ fn check_let(s: i64) -> i64 {
     // Annotate BEFORE check_expr so check_expr returns the adapted f32 type.
     if (ty_node >= 0) { try_adapt_float_lit(init, decl_ty); }
 
+    // A let-init is one of the two positions a struct-returning CallExpr is
+    // allowed (the local's frame slot is the concrete destination for the
+    // callee's hidden return pointer). Set the allowance flag around the
+    // init's check_expr, mirroring src/sema.cpp's check_value(..., true).
+    let saved_allow: i64 = s_allow_struct_ret_call;
+    s_allow_struct_ret_call = 1;
     let init_ty: i64 = check_expr(init);
+    s_allow_struct_ret_call = saved_allow;
     if (s_err != 0) { return 0; }
 
     if (ty_node >= 0) {
@@ -2798,7 +2913,14 @@ fn check_return(s: i64) -> i64 {
     let val: i64 = nk_a(s);
     if (val >= 0) {
         if (s_cur_ret >= 0) { try_adapt_float_lit(val, s_cur_ret); }
+        // A return value is one of the two positions a struct-returning
+        // CallExpr is allowed (this fn's own incoming hidden return pointer is
+        // the concrete destination). Set the allowance flag around the value's
+        // check_expr, mirroring src/sema.cpp's check_value(..., true).
+        let saved_allow: i64 = s_allow_struct_ret_call;
+        s_allow_struct_ret_call = 1;
         let vt: i64 = check_expr(val);
+        s_allow_struct_ret_call = saved_allow;
         if (s_err != 0) { return 0; }
         if (s_cur_ret < 0) {
             serr(string_from_slice("return outside a function"), node_line(s), node_col(s));

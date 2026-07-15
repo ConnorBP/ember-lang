@@ -587,6 +587,125 @@ fn cg_struct_local_slots(row: i64) -> i64 {
     return s;
 }
 
+// =============================================================================
+// Phase 4: struct by-value call ABI (mirrors src/codegen.cpp's hidden-pointer
+// sret return + ceil(size/8)-word arg passing). The self-hosted call ABI is
+// self-consistent (caller + callee are both emitted by this codegen) and
+// behaviorally matches the native compiler's results (parity is exit-code
+// based, not byte-identical). The convention:
+//
+//   struct RETURN: a fn whose return type is a registered struct gets an
+//     implicit word-0 param = the caller-allocated dest pointer (arrives in
+//     rcx, the first Win64 int arg reg). The callee spills it to a dedicated
+//     frame slot (cg_struct_ret_ptr_off), writes the struct through it at
+//     every `return`, and loads it back into rax at the epilogue (the sret
+//     ABI requires the dest ptr to be returned in rax). Real params start at
+//     word 1.
+//
+//   struct ARG (script-to-script): a struct arg occupies ceil(size/8)
+//     consecutive 8-byte words in the call's arg stash, copied directly from
+//     the source (a bare local, a struct literal materialized into a temp, or
+//     a struct-returning call materialized into a temp via the hidden ptr).
+//     The callee spills those words into the param local's frame slot.
+//
+//   struct-returning CALL SITE: the caller allocates a dest (a local's frame
+//     slot for a let-init / assignment, a temp for an arg, or the fn's own
+//     incoming hidden ptr for a `return f(...)` forward), loads its address
+//     into rax, then calls cg_eval_struct_returning_call which places the
+//     dest at word 0 + the real args from word 1 and calls. The callee writes
+//     the struct directly through the dest — no register result.
+// =============================================================================
+
+// is this type a REGISTERED struct (mirrors sema's ty_is_struct)?
+fn cg_ty_is_struct(t: i64) -> i64 {
+    if (t < 0) { return 0; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 0; }
+    if (nk_tok(t) < 0) { return 0; }
+    let nm: string = tok_name(nk_tok(t));
+    if (nm == string_from_slice("string")) { return 0; }
+    if (find_struct(nm) >= 0) { return 1; }
+    return 0;
+}
+
+// number of 8-byte words a call operand/param occupies in ember's private
+// ABI: 1 for a scalar/float/handle, 2 for a slice, ceil(size/8) for a
+// registered struct (min 1). Mirrors src/codegen.cpp's words_for_type.
+fn cg_words_for_type(t: i64) -> i64 {
+    if (t < 0) { return 1; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 1; }
+    if (nk_f(t) == 1) { return 2; }                       // slice {ptr,len}
+    if (cg_ty_is_struct(t) == 1) {
+        let w: i64 = cg_value_bytes(t);
+        let mut s: i64 = (w + 7) / 8;
+        if (s < 1) { s = 1; }
+        return s;
+    }
+    return 1;
+}
+
+// the callee-side hidden return-pointer frame slot offset (0 = this fn does
+// not return a struct by pointer). Set in cg_compile_func when the fn's
+// resolved return type is a registered struct; read by the ReturnStmt path +
+// the epilogue's rax reload.
+global cg_struct_ret_ptr_off : i64 = 0;
+
+// caller-side flag: set to 1 by a context that has loaded a struct-returning
+// call's destination address into rax BEFORE calling cg_eval on the call
+// (LetStmt init / ReturnStmt value / AssignExpr value / struct-arg stash).
+// cg_eval_callexpr checks this to route a struct-returning call to
+// cg_eval_struct_returning_call (which consumes rax as the hidden dest). It is
+// saved/restored around the eval so a nested non-struct call does not inherit
+// it, and cleared after the struct-returning call consumes it.
+global cg_struct_ret_dest_ready : i64 = 0;
+
+// hand out a fresh struct temp of `nbytes` from the per-function frame
+// pool (shared with user locals via cg_next_off, so temps + locals never
+// collide — each gets a distinct downward-growing offset). Returns the
+// temp's lowest rbp offset. Mirrors src/codegen.cpp's alloc_struct_temp
+// (alloc_local with a synthesized '$' name). The frame is pre-sized by
+// cg_count_struct_temps_block to hold these temps.
+fn cg_alloc_struct_temp(nbytes: i64) -> i64 {
+    let mut slots: i64 = (nbytes + 7) / 8;
+    if (slots < 1) { slots = 1; }
+    return cg_alloc_local_t(-1, -1, slots);
+}
+
+// Copy exactly `nbytes` from [src_base+src_off] to [dst_base+dst_off] via rax,
+// in 8/4/2/1-byte chunks (never a blind N-word copy). A struct's byte size is
+// frequently NOT a multiple of 8 (e.g. i64+i32+i8 = 13 bytes); a naive
+// word-granularity copy overruns past the struct's true extent and can
+// corrupt an adjacent saved rbp. Mirrors src/codegen.cpp's copy_bytes.
+fn cg_copy_bytes(dst_base: i64, dst_off: i64, src_base: i64, src_off: i64, nbytes: i64) -> i64 {
+    let mut done: i64 = 0;
+    while (done < nbytes) {
+        let remaining: i64 = nbytes - done;
+        let chunk: i64 = cg_chunk_for(remaining);
+        cg_load_elem_to_rax(src_base, src_off + done, chunk, 0);
+        cg_store_rax_elem(dst_base, dst_off + done, chunk);
+        done = done + chunk;
+    }
+    return 0;
+}
+
+// Write rax's low `nbytes` to [base+off], chunked, shifting rax right after
+// each chunk so the next unwritten bytes come down to the low end. Used when
+// a struct word's value is already in rax (moved out of an arg register) and
+// must be spilled to a partial last word. Mirrors src/codegen.cpp's
+// store_rax_bytes. Clobbers rax.
+fn cg_store_rax_bytes(base: i64, off: i64, nbytes: i64) -> i64 {
+    let mut done: i64 = 0;
+    while (done < nbytes) {
+        let chunk: i64 = cg_chunk_for(nbytes - done);
+        cg_store_rax_elem(base, off + done, chunk);
+        done = done + chunk;
+        if (done < nbytes) {
+            // shr rax, chunk*8 : REX.W C1 /5 ib  (modrm = 11 101 000 = 0xE8)
+            cg_byte(0x48); cg_byte(0xC1); cg_byte(0xE8); cg_byte(chunk * 8);
+        }
+    }
+    return 0;
+}
+
 // the byte size of a primitive type (kept for the sizeof/offsetof helpers;
 // delegates to the general cg_value_bytes so aggregates are sized correctly).
 fn cg_type_size(t: i64) -> i64 { return cg_value_bytes(t); }
@@ -1814,6 +1933,153 @@ fn codegen_globals_init_offset() -> i64 {
 // + params to size the stack frame. All slots are 8 bytes (v1: everything is i64).
 // =============================================================================
 
+// Phase 4: count compiler-hidden struct temp frame SLOTS needed by the fn
+// body (mirrors src/codegen.cpp's count_struct_temps_block/expr, in slots).
+// A temp is needed for (a) a struct-literal `return` value in a struct-returning
+// fn (materialized into a temp before being copied through the hidden return
+// pointer), and (b) a struct-by-value call argument that is a StructLit or a
+// struct-returning CallExpr (materialized into a temp before being copied into
+// the arg stash / forwarded as the hidden dest). A bare-Ident struct arg + a
+// struct-returning call let-init/return/assignment do NOT need a temp (they
+// have a concrete destination). The temp slots are added to the frame count so
+// cg_alloc_struct_temp (which shares cg_next_off with user locals) has room.
+fn cg_struct_temp_slots(t: i64) -> i64 {
+    let nb: i64 = cg_value_bytes(t);
+    let mut s: i64 = (nb + 7) / 8;
+    if (s < 1) { s = 1; }
+    return s;
+}
+
+fn cg_count_struct_temps_expr(e: i64, total: i64) -> i64 {
+    if (e < 0) { return total; }
+    let k: i64 = nk_kind(e);
+    if (k == (NK::CallExpr as i64)) {
+        // resolve the callee fn row to read param types (determines which args
+        // are struct-by-value slots). A struct arg that is NOT a bare Ident
+        // (StructLit / struct-returning CallExpr) needs a temp.
+        let nm: string = nk_name(e);
+        let mut fn_row: i64 = -1;
+        let mod_tok: i64 = nk_e(e);
+        let mut is_ns: i64 = 0;
+        if (mod_tok >= 0) {
+            let mn: string = tok_text_at(mod_tok);
+            if (is_namespace_name(mn) == 1) { is_ns = 1; fn_row = find_fn_qualified(nm, mn); }
+        }
+        if (is_ns == 0) {
+            fn_row = find_fn(nm);
+            if (fn_row < 0 && cg_cur_ns >= 0) {
+                let qr: i64 = find_fn_qualified(nm, tok_name(cg_cur_ns));
+                if (qr >= 0) { fn_row = qr; }
+            }
+        }
+        if (fn_row >= 0) {
+            let mut a: i64 = nk_a(e);
+            let mut i: i64 = 0;
+            while (a >= 0) {
+                let pt: i64 = fn_param_type(fn_row, i);
+                if (cg_ty_is_struct(pt) == 1 && nk_kind(a) != (NK::Ident as i64)) {
+                    total = total + cg_struct_temp_slots(pt);
+                }
+                total = cg_count_struct_temps_expr(a, total);
+                a = nk_next(a);
+                i = i + 1;
+            }
+        } else {
+            // native call or unresolved: just recurse into args (no struct
+            // arg temps; natives don't take structs in the subset)
+            let mut a: i64 = nk_a(e);
+            while (a >= 0) { total = cg_count_struct_temps_expr(a, total); a = nk_next(a); }
+        }
+        return total;
+    }
+    if (k == (NK::BinExpr as i64)) { total = cg_count_struct_temps_expr(nk_a(e), total); return cg_count_struct_temps_expr(nk_b(e), total); }
+    if (k == (NK::UnaryExpr as i64)) { return cg_count_struct_temps_expr(nk_a(e), total); }
+    if (k == (NK::CastExpr as i64)) { return cg_count_struct_temps_expr(nk_a(e), total); }
+    if (k == (NK::TernaryExpr as i64)) { total = cg_count_struct_temps_expr(nk_a(e), total); total = cg_count_struct_temps_expr(nk_b(e), total); return cg_count_struct_temps_expr(nk_c(e), total); }
+    if (k == (NK::AssignExpr as i64)) { total = cg_count_struct_temps_expr(nk_a(e), total); return cg_count_struct_temps_expr(nk_b(e), total); }
+    if (k == (NK::IndexExpr as i64)) { total = cg_count_struct_temps_expr(nk_a(e), total); return cg_count_struct_temps_expr(nk_b(e), total); }
+    if (k == (NK::FieldExpr as i64)) { return cg_count_struct_temps_expr(nk_a(e), total); }
+    if (k == (NK::ViewExpr as i64)) { return cg_count_struct_temps_expr(nk_a(e), total); }
+    if (k == (NK::StructLit as i64)) {
+        let mut init: i64 = nk_a(e);
+        while (init >= 0) { total = cg_count_struct_temps_expr(nk_a(init), total); init = nk_next(init); }
+        return total;
+    }
+    return total;
+}
+
+fn cg_count_struct_temps_stmt(s: i64, total: i64, ret_is_struct: i64) -> i64 {
+    let k: i64 = nk_kind(s);
+    if (k == (NK::LetStmt as i64)) {
+        if (nk_b(s) >= 0) { total = cg_count_struct_temps_expr(nk_b(s), total); }
+        return total;
+    }
+    if (k == (NK::ExprStmt as i64)) {
+        if (nk_a(s) >= 0) { total = cg_count_struct_temps_expr(nk_a(s), total); }
+        return total;
+    }
+    if (k == (NK::ReturnStmt as i64)) {
+        let val: i64 = nk_a(s);
+        if (val >= 0 && ret_is_struct == 1 && nk_kind(val) == (NK::StructLit as i64)) {
+            // a struct-literal return value materializes into a temp before
+            // being copied through the hidden return pointer.
+            total = total + cg_struct_temp_slots(cg_cur_ret);
+        }
+        if (val >= 0) { total = cg_count_struct_temps_expr(val, total); }
+        return total;
+    }
+    if (k == (NK::DeferStmt as i64)) {
+        if (nk_a(s) >= 0) { total = cg_count_struct_temps_expr(nk_a(s), total); }
+        return total;
+    }
+    if (k == (NK::IfStmt as i64)) {
+        if (nk_a(s) >= 0) { total = cg_count_struct_temps_expr(nk_a(s), total); }
+        total = cg_count_struct_temps_block(nk_b(s), total, ret_is_struct);
+        if (nk_c(s) >= 0) { total = cg_count_struct_temps_block(nk_c(s), total, ret_is_struct); }
+        return total;
+    }
+    if (k == (NK::WhileStmt as i64)) {
+        if (nk_b(s) >= 0) { total = cg_count_struct_temps_expr(nk_b(s), total); }
+        total = cg_count_struct_temps_block(nk_a(s), total, ret_is_struct);
+        return total;
+    }
+    if (k == (NK::DoWhileStmt as i64)) {
+        total = cg_count_struct_temps_block(nk_a(s), total, ret_is_struct);
+        if (nk_b(s) >= 0) { total = cg_count_struct_temps_expr(nk_b(s), total); }
+        return total;
+    }
+    if (k == (NK::BlockStmt as i64)) { return cg_count_struct_temps_block(s, total, ret_is_struct); }
+    if (k == (NK::ForStmt as i64)) {
+        if (nk_a(s) >= 0) { total = cg_count_struct_temps_stmt(nk_a(s), total, ret_is_struct); }
+        if (nk_b(s) >= 0) { total = cg_count_struct_temps_expr(nk_b(s), total); }
+        if (nk_d(s) >= 0) { total = cg_count_struct_temps_expr(nk_d(s), total); }
+        total = cg_count_struct_temps_block(nk_e(s), total, ret_is_struct);
+        return total;
+    }
+    if (k == (NK::ForEachStmt as i64)) {
+        if (nk_a(s) >= 0) { total = cg_count_struct_temps_expr(nk_a(s), total); }
+        total = cg_count_struct_temps_block(nk_b(s), total, ret_is_struct);
+        return total;
+    }
+    if (k == (NK::SwitchStmt as i64)) {
+        let mut c: i64 = nk_b(s); while (c >= 0) { total = cg_count_struct_temps_block(nk_b(c), total, ret_is_struct); c = nk_next(c); } return total;
+    }
+    if (k == (NK::MatchStmt as i64)) {
+        let mut a: i64 = nk_b(s); while (a >= 0) { total = cg_count_struct_temps_block(nk_b(a), total, ret_is_struct); a = nk_next(a); } return total;
+    }
+    return total;
+}
+
+fn cg_count_struct_temps_block(b: i64, total: i64, ret_is_struct: i64) -> i64 {
+    if (b < 0) { return total; }
+    let mut s: i64 = nk_a(b);
+    while (s >= 0) {
+        total = cg_count_struct_temps_stmt(s, total, ret_is_struct);
+        s = nk_next(s);
+    }
+    return total;
+}
+
 fn cg_count_locals_block(b: i64, total: i64) -> i64 {
     if (b < 0) { return total; }
     let mut s: i64 = nk_a(b);
@@ -2769,6 +3035,21 @@ fn cg_eval_assignexpr(e: i64) -> i64 {
 
     // ---- plain '=' (cop < 0, not postfix) ----
     if (cop < 0 && postfix != 1) {
+        // Phase 4: struct-reassignment `s = mk();` where mk() returns a struct
+        // and s is a struct-typed local. The target's frame slot is the
+        // concrete destination for the callee's hidden return pointer: lea
+        // rax, [rbp+off], then the callee writes the struct directly into the
+        // target (no register result). (Struct globals by-value assignment is
+        // out of the subset; the local path covers the supported cases.)
+        if (ty_is_float(tt) == 0 && cg_ty_is_struct(tt) == 1 && nk_kind(value) == (NK::CallExpr as i64)) {
+            if (is_global == 0) {
+                cg_lea_rax_rbp(off);
+                let saved: i64 = cg_struct_ret_dest_ready; cg_struct_ret_dest_ready = 1;
+                cg_eval_struct_returning_call(value);
+                cg_struct_ret_dest_ready = saved;
+                return 0;
+            }
+        }
         cg_eval(value);
         if (cg_err != 0) { return 0; }
         if (ty_is_float(tt) == 1) {
@@ -3296,6 +3577,23 @@ fn cg_eval_callexpr(e: i64) -> i64 {
     let mut is_native: i64 = 0;
     if (fn_row < 0) { is_native = 1; }
 
+    // Phase 4: a struct-returning script call uses the hidden-pointer sret
+    // ABI. The caller context (LetStmt init / ReturnStmt value / AssignExpr
+    // value / a struct-arg stash) has already loaded the destination address
+    // into rax. Route to cg_eval_struct_returning_call, which places the dest
+    // at word 0 + the real args from word 1 and calls; the callee writes the
+    // struct through the dest (no register result). sema guarantees a
+    // struct-returning call only appears in those contexts, so reaching here
+    // with rax unset is a sema gap (defensive: rax holds garbage, but the
+    // callee would write to a garbage address — flag an error instead).
+    if (is_native == 0 && cg_ty_is_struct(nk_c(e)) == 1) {
+        if (cg_struct_ret_dest_ready == 0) {
+            if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: struct-returning call used without a destination"); }
+            return 0;
+        }
+        return cg_eval_struct_returning_call(e);
+    }
+
     // count args (walk the sibling chain via nk_next). The arg node indices
     // are NOT pre-collected into an array — the previous design allocated a
     // fresh `args` array on every call expression and read it AFTER recursively
@@ -3311,65 +3609,33 @@ fn cg_eval_callexpr(e: i64) -> i64 {
             a = nk_next(a);
         }
     }
-    // Win64: first 4 int args in rcx/rdx/r8/r9; args 5+ are passed on the stack
-    // at [rsp+32 + (i-4)*8] (after the 32-byte shadow space). The temp layout
-    // below stores arg i at [rsp + i*8], so args 5+ (i >= 4) already land at the
-    // correct stack-arg positions; args 0-3 are loaded into registers. No arity
-    // cap (Step 4 lifts the v1 4-arg limit).
-
-    // Win64 calling convention: first 4 int args in rcx, rdx, r8, r9.
-    // Stack layout for the call (after sub rsp, call_frame):
-    //   [rsp + 0]      = arg 0 (temp)
-    //   [rsp + 8]      = arg 1 (temp)
-    //   [rsp + 16]     = arg 2 (temp)
-    //   [rsp + 24]     = arg 3 (temp)
-    //   [rsp + 32..63] = shadow space (32 bytes)
-    //
-    // call_frame = round16(argc*8 + 32), minimum 32.
-    let mut call_frame: i64 = argc * 8 + 32;
-    if (call_frame < 32) { call_frame = 32; }
-    call_frame = cg_round16(call_frame);
-
-    // sub rsp, call_frame
-    cg_sub_reg_imm32(RSP, call_frame);
-
-    // For a NATIVE call, each arg's register class (int reg vs xmm) + float
-    // width is derived from the native's declared param type ON DEMAND via
-    // cg_arg_is_float / cg_arg_is_f64 (pure native_param_type lookups, no
-    // codegen recursion) instead of pre-computing into arrays that leaked a
-    // slot per call and were read after recursive arg evaluation.
-
-    // eval each arg -> rax (int/handle) or xmm0 (float); store to [rsp + i*8].
-    // For a float arg, cg_eval leaves the value in xmm0; store it with the
-    // param's width (movsd f64 / movss f32) so the native receives the right
-    // precision. For an int/handle arg, cg_eval leaves rax. Re-walk the arg
-    // sibling chain (no scratch array) so nested call args cannot clobber this
-    // call's iteration state.
-    {
-        let mut i2: i64 = 0;
-        let mut a: i64 = nk_a(e);
-        while (a >= 0) {
-            cg_eval(a);
-            if (cg_err != 0) { return 0; }
-            if (is_native == 1 && cg_arg_is_float(name, i2) == 1) {
-                let is64: i64 = cg_arg_is_f64(name, i2);
-                cg_store_float_reg(RSP, i2 * 8, XMM0, is64);
-            } else {
-                cg_store_reg_mem(RSP, i2 * 8, RAX);
-            }
-            i2 = i2 + 1;
-            a = nk_next(a);
-        }
-    }
-
+    // ---- NATIVE call path (no struct args: natives don't take structs in
+    // the subset; args are 1 word each, rcx/rdx/r8/r9 + stack) ----
     if (is_native == 1) {
-        // NATIVE call: place args 0..3 into Win64 registers (xmm0..xmm3 for
-        // float params, rcx/rdx/r8/r9 for int/handle params), then mov rax,
-        // <fn_ptr> via an ABS64_NATIVE reloc + call rax. The fingerprint is
-        // computed from the native's declared param/return types + permission
-        // (the table mirrors the host's registered NativeSig EXACTLY, so the
-        // baked addend == abi_fingerprint(registered_sig) and the loader's
-        // check passes). io natives are perm 1; array/math/map/string perm 0.
+        // call_frame = round16(argc*8 + 32), minimum 32. Args stored at
+        // [rsp + i*8]; args 0-3 loaded to regs, args 4+ stay (callee reads at
+        // [rbp+48+(i-4)*8] = caller [rsp+32+(i-4)*8] = [rsp+i*8]).
+        let mut call_frame: i64 = argc * 8 + 32;
+        if (call_frame < 32) { call_frame = 32; }
+        call_frame = cg_round16(call_frame);
+        cg_sub_reg_imm32(RSP, call_frame);
+        // eval each arg -> rax (int/handle) or xmm0 (float); store to [rsp+i*8].
+        {
+            let mut i2: i64 = 0;
+            let mut a: i64 = nk_a(e);
+            while (a >= 0) {
+                cg_eval(a);
+                if (cg_err != 0) { return 0; }
+                if (cg_arg_is_float(name, i2) == 1) {
+                    let is64: i64 = cg_arg_is_f64(name, i2);
+                    cg_store_float_reg(RSP, i2 * 8, XMM0, is64);
+                } else {
+                    cg_store_reg_mem(RSP, i2 * 8, RAX);
+                }
+                i2 = i2 + 1;
+                a = nk_next(a);
+            }
+        }
         if (argc >= 1) {
             if (cg_arg_is_float(name, 0) == 1) { cg_load_float_reg(XMM0, RSP, 0,  cg_arg_is_f64(name, 0)); }
             else { cg_load_reg_mem(RCX, RSP, 0); }
@@ -3401,59 +3667,83 @@ fn cg_eval_callexpr(e: i64) -> i64 {
         let fp: i64 = cg_abi_fingerprint(param_types, argc, ret_type, perm);
         cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
         cg_call_reg(RAX);  // call rax (FF D0)
-        // add rsp, call_frame (restore the stack)
         cg_add_reg_imm32(RSP, call_frame);
-        // result convention: a float return arrives in xmm0 (leave it there so
-        // callers reading a float CallExpr see xmm0); an int/handle/u8 return
-        // arrives in rax (normalize narrow ints — u8 etc. — at the boundary);
-        // a void return has no result (nothing to normalize). Annotate the
-        // call's type on slot c so downstream consumers know the return type.
+        // result convention: float -> xmm0; int/handle/u8 -> rax (normalize
+        // narrow ints); void -> 0. Annotate the call's type on slot c.
         set_c(e, ret_type);
-        if (ty_is_float(ret_type) == 1) {
-            // float result in xmm0; no rax normalization (mirrors the C++
-            // codegen, which leaves a float CallExpr result in xmm0).
-            return 0;
-        }
-        if (ty_is_void(ret_type) == 1) {
-            cg_mov_reg_imm64(RAX, 0);  // void call expr value is 0
-            return 0;
-        }
+        if (ty_is_float(ret_type) == 1) { return 0; }
+        if (ty_is_void(ret_type) == 1) { cg_mov_reg_imm64(RAX, 0); return 0; }
         cg_normalize_rax(ret_type);
         return 0;
     }
 
-    // SCRIPT call: load args 0..3 into the Win64 int registers (the private
-    // ember call ABI passes one 8-byte word per param in rcx/rdx/r8/r9).
-    if (argc >= 1) { cg_load_reg_mem(RCX, RSP, 0); }
-    if (argc >= 2) { cg_load_reg_mem(RDX, RSP, 8); }
-    if (argc >= 3) { cg_load_reg_mem(R8, RSP, 16); }
-    if (argc >= 4) { cg_load_reg_mem(R9, RSP, 24); }
+    // ---- SCRIPT call path (Phase 4: word-slot-aware for struct args) ----
+    // Each operand occupies cg_words_for_type(pt) consecutive 8-byte words:
+    // 1 for a scalar/float/handle, 2 for a slice, ceil(size/8) for a struct.
+    // A struct arg is copied via cg_stash_struct_arg (a bare Ident copies from
+    // its frame slot; a StructLit / struct-returning CallExpr materializes into
+    // a fresh temp first). Words 0-3 -> rcx/rdx/r8/r9; words 4+ stay at
+    // [rsp+w*8] (callee reads at [rbp+48+(w-4)*8] = caller [rsp+w*8]).
+    let mut total_words: i64 = 0;
+    {
+        let mut i0: i64 = 0;
+        while (i0 < argc) { total_words = total_words + cg_words_for_type(fn_param_type(fn_row, i0)); i0 = i0 + 1; }
+    }
+    let mut call_frame: i64 = total_words * 8 + 32;
+    if (call_frame < 32) { call_frame = 32; }
+    call_frame = cg_round16(call_frame);
+    cg_sub_reg_imm32(RSP, call_frame);
+
+    // stash each arg operand to its cumulative word slot(s). next_slot is the
+    // running word index. A struct arg is copied via cg_stash_struct_arg (a
+    // bare Ident from its frame slot; a StructLit / struct-returning CallExpr
+    // materialized into a fresh temp via cg_alloc_struct_temp); a slice arg
+    // stores rax+rdx (2 words); a scalar/float arg evals + stores 1 word.
+    let mut next_slot: i64 = 0;
+    {
+        let mut a: i64 = nk_a(e);
+        let mut i2: i64 = 0;
+        while (a >= 0) {
+            let pt: i64 = fn_param_type(fn_row, i2);
+            let off: i64 = next_slot * 8;
+            if (cg_ty_is_struct(pt) == 1) {
+                cg_stash_struct_arg(a, pt, off);
+                if (cg_err != 0) { return 0; }
+                next_slot = next_slot + cg_words_for_type(pt);
+            } else if (nk_f(pt) == 1) {
+                // slice arg: {rax=ptr, rdx=len} (2 words)
+                cg_eval(a); if (cg_err != 0) { return 0; }
+                cg_store_reg_mem(RSP, off, RAX);
+                cg_store_reg_mem(RSP, off + 8, RDX);
+                next_slot = next_slot + 2;
+            } else if (ty_is_float(pt) == 1) {
+                cg_eval(a); if (cg_err != 0) { return 0; }
+                cg_store_float(off, XMM0, cg_float_is64_type(pt));
+                next_slot = next_slot + 1;
+            } else {
+                cg_eval(a); if (cg_err != 0) { return 0; }
+                cg_normalize_rax(pt);
+                cg_store_reg_mem(RSP, off, RAX);
+                next_slot = next_slot + 1;
+            }
+            a = nk_next(a);
+            i2 = i2 + 1;
+        }
+    }
+
+    // place words 0..3 into the Win64 int registers (struct words are always
+    // integer at the word level — a struct's float field lives inside the
+    // copied byte blob, not in an xmm arg slot).
+    if (total_words >= 1) { cg_load_reg_mem(RCX, RSP, 0); }
+    if (total_words >= 2) { cg_load_reg_mem(RDX, RSP, 8); }
+    if (total_words >= 3) { cg_load_reg_mem(R8, RSP, 16); }
+    if (total_words >= 4) { cg_load_reg_mem(R9, RSP, 24); }
 
     // SCRIPT call: a direct call rel32 to the callee's entry label.
     // cg_fn_labels maps the callee's name to a label bound at its prologue
-    // offset; the rel32 fixup is patched after all fns are compiled. This
-    // resolves to the callee's real entry within the same code region, so
-    // multi-fn programs execute correctly (the loader copies the code section
-    // verbatim and does not patch rel32). Tier 1 namespaces: Foo::bar() (the
-    // base name tok in slot e) resolves to the qualified Ns::fn label; a bare
-    // call inside a namespaced fn first tries the sibling Ns::fn label.
-    let mut callee_label: i64 = -1;
-    if (is_ns_call == 1) {
-        // Foo::bar(): resolve the qualified Ns::fn label (mod_name already used
-        // above to find the fn row; recompute the label here in parallel).
-        let mod_name: string = tok_text_at(mod_tok);
-        callee_label = cg_lookup_fn_label_qualified(name, mod_name);
-    } else {
-        callee_label = cg_lookup_fn_label(name);
-        if (callee_label < 0 && cg_cur_ns >= 0) {
-            let qlab: i64 = cg_lookup_fn_label_qualified(name, tok_name(cg_cur_ns));
-            if (qlab >= 0) { callee_label = qlab; }
-        }
-    }
-    if (callee_label < 0) {
-        if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: no entry label for function '") + name + string_from_slice("'"); }
-        return 0;
-    }
+    // offset; the rel32 fixup is patched after all fns are compiled.
+    let callee_label: i64 = cg_callee_label(e, is_ns_call, mod_tok);
+    if (cg_err != 0) { return 0; }
     cg_call_rel32(callee_label);
 
     // add rsp, call_frame (restore the stack)
@@ -3462,6 +3752,198 @@ fn cg_eval_callexpr(e: i64) -> i64 {
     // result is in rax; normalize narrow int returns at the call boundary.
     let sret: i64 = nk_c(e);
     cg_normalize_rax(sret);
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// Phase 4: struct by-value call ABI helpers.
+// -----------------------------------------------------------------------------
+
+// resolve a CallExpr's callee entry label (direct + namespace-qualified +
+// intra-namespace bare call). Returns the label id or -1 (sets cg_err).
+fn cg_callee_label(e: i64, is_ns_call: i64, mod_tok: i64) -> i64 {
+    let name: string = nk_name(e);
+    let mut lab: i64 = -1;
+    if (is_ns_call == 1) {
+        let mod_name: string = tok_text_at(mod_tok);
+        lab = cg_lookup_fn_label_qualified(name, mod_name);
+    } else {
+        lab = cg_lookup_fn_label(name);
+        if (lab < 0 && cg_cur_ns >= 0) {
+            let qlab: i64 = cg_lookup_fn_label_qualified(name, tok_name(cg_cur_ns));
+            if (qlab >= 0) { lab = qlab; }
+        }
+    }
+    if (lab < 0) {
+        if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: no entry label for function '") + name + string_from_slice("'"); }
+    }
+    return lab;
+}
+
+// Stash a struct-by-value call argument into the call's arg-stash region at
+// [rsp+off]. Mirrors src/codegen.cpp's stash_struct_arg. sema's
+// check_struct_arg_shape permits three shapes: a bare local Ident (copy from
+// its frame slot), a StructLit of the matching struct (materialize into a
+// fresh temp, then copy), or a struct-returning CallExpr of the matching
+// struct (lea the temp's address into rax, eval_struct_returning_call writes
+// through it into the temp, then copy). A non-Ident arg gets its OWN fresh
+// temp via cg_alloc_struct_temp (distinct per call site). Returns 0.
+fn cg_stash_struct_arg(arg_e: i64, t: i64, off: i64) -> i64 {
+    let k: i64 = nk_kind(arg_e);
+    let row: i64 = find_struct(ty_struct_name(t));
+    if (row < 0) { if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: struct arg of unknown struct"); } return 0; }
+    let nb: i64 = cg_struct_value_bytes(row);
+    if (k == (NK::Ident as i64)) {
+        let src_off: i64 = cg_lookup_local(nk_tok(arg_e));
+        if (src_off == 0) { if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: struct arg local not found"); } return 0; }
+        cg_copy_bytes(RSP, off, RBP, src_off, nb);
+        return 0;
+    }
+    if (k == (NK::StructLit as i64)) {
+        let temp_off: i64 = cg_alloc_struct_temp(nb);
+        cg_store_struct_lit(arg_e, t, temp_off);
+        if (cg_err != 0) { return 0; }
+        cg_copy_bytes(RSP, off, RBP, temp_off, nb);
+        return 0;
+    }
+    if (k == (NK::CallExpr as i64)) {
+        let temp_off: i64 = cg_alloc_struct_temp(nb);
+        // lea rax, [rbp+temp_off] (the hidden dest pointer), then the callee
+        // writes the struct directly into the temp.
+        cg_lea_rax_rbp(temp_off);
+        let saved: i64 = cg_struct_ret_dest_ready; cg_struct_ret_dest_ready = 1;
+        cg_eval_struct_returning_call(arg_e);
+        cg_struct_ret_dest_ready = saved;
+        if (cg_err != 0) { return 0; }
+        cg_copy_bytes(RSP, off, RBP, temp_off, nb);
+        return 0;
+    }
+    if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: struct-by-value arg is not a local/literal/call"); }
+    return 0;
+}
+
+// Evaluate a struct-returning CallExpr, forwarding the dest pointer (already
+// loaded into rax by the caller — a local's frame address via lea for a
+// let-init/assignment, a temp's address for a struct arg, or this fn's own
+// incoming hidden return pointer for a `return f(...)` forward) as the hidden
+// word-0 argument. Mirrors src/codegen.cpp's eval_struct_returning_call: real
+// args start at word 1, the dest occupies word 0. The callee writes the struct
+// through the dest — no register result is propagated. Returns 0 on success.
+fn cg_eval_struct_returning_call(e: i64) -> i64 {
+    let name: string = nk_name(e);
+    // resolve script fn row + callee label (the subset has no native that
+    // returns a struct; a struct-returning call is always a script fn).
+    let mut fn_row: i64 = -1;
+    let mut is_ns_call: i64 = 0;
+    let mod_tok: i64 = nk_e(e);
+    if (mod_tok >= 0) {
+        let mod_name: string = tok_text_at(mod_tok);
+        if (is_namespace_name(mod_name) == 1) { is_ns_call = 1; fn_row = find_fn_qualified(name, mod_name); }
+    }
+    if (is_ns_call == 0) {
+        fn_row = find_fn(name);
+        if (fn_row < 0 && cg_cur_ns >= 0) {
+            let qrow: i64 = find_fn_qualified(name, tok_name(cg_cur_ns));
+            if (qrow >= 0) { fn_row = qrow; }
+        }
+    }
+    if (fn_row < 0) { if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: struct-returning call to unknown function '") + name + string_from_slice("'"); } return 0; }
+
+    // Build the operand list with cumulative word slots. Word 0 is reserved
+    // for the hidden dest pointer (already in rax); real args start at word 1.
+    // The subset has no native struct-returning calls + no receiver, so the
+    // operand list is just the user args. We compute the per-arg word count +
+    // slot0 on the fly, mirroring the native add_operand/next_slot scheme.
+    let nargs: i64 = fn_param_count(fn_row);
+    // total words = 1 (dest) + sum of words_for_type over the params
+    let mut total_words: i64 = 1;
+    let mut ai0: i64 = 0;
+    while (ai0 < nargs) { total_words = total_words + cg_words_for_type(fn_param_type(fn_row, ai0)); ai0 = ai0 + 1; }
+    let stash_size: i64 = total_words * 8;
+    // Frame = round16(stash_size + 32). Words 0..total_words-1 live at
+    // [rsp+w*8] (word 0 = dest ptr); the +32 is the safety margin matching the
+    // regular script-call frame (round16(total_words*8 + 32)). Words 4+ stay
+    // at [rsp+w*8] = caller [rsp+32+(w-4)*8], where the callee reads them.
+    let total: i64 = cg_round16(stash_size + 32);
+    cg_sub_reg_imm32(RSP, total);
+
+    // word 0: the hidden dest pointer (already in rax)
+    cg_store_reg_mem(RSP, 0, RAX);
+
+    // stash each arg operand to its cumulative word slot(s). next_slot starts
+    // at 1 (word 0 = dest). A struct arg is copied via cg_stash_struct_arg
+    // (with a fresh temp per non-Ident struct arg); a slice arg stores rax+rdx
+    // (2 words); a scalar/float arg evals + stores 1 word.
+    let mut next_slot: i64 = 1;
+    let mut a: i64 = nk_a(e);
+    let mut i: i64 = 0;
+    while (a >= 0) {
+        let pt: i64 = fn_param_type(fn_row, i);
+        let off: i64 = next_slot * 8;
+        if (cg_ty_is_struct(pt) == 1) {
+            cg_stash_struct_arg(a, pt, off);
+            if (cg_err != 0) { return 0; }
+            next_slot = next_slot + cg_words_for_type(pt);
+        } else if (nk_f(pt) == 1) {
+            // slice arg: cg_eval yields {rax=ptr, rdx=len}
+            cg_eval(a); if (cg_err != 0) { return 0; }
+            cg_store_reg_mem(RSP, off, RAX);
+            cg_store_reg_mem(RSP, off + 8, RDX);
+            next_slot = next_slot + 2;
+        } else if (ty_is_float(pt) == 1) {
+            cg_eval(a); if (cg_err != 0) { return 0; }
+            cg_store_float(off, XMM0, cg_float_is64_type(pt));
+            next_slot = next_slot + 1;
+        } else {
+            cg_eval(a); if (cg_err != 0) { return 0; }
+            cg_store_reg_mem(RSP, off, RAX);
+            next_slot = next_slot + 1;
+        }
+        a = nk_next(a);
+        i = i + 1;
+    }
+
+    // place words 0..3 into rcx/rdx/r8/r9 (word 0 = dest ptr -> rcx). The
+    // subset's struct words are always integer (no float struct fields are
+    // passed in xmm at the word level — a struct's float field lives inside
+    // the copied byte blob), so no per-word float dispatch is needed.
+    if (total_words >= 1) { cg_load_reg_mem(RCX, RSP, 0); }
+    if (total_words >= 2) { cg_load_reg_mem(RDX, RSP, 8); }
+    if (total_words >= 3) { cg_load_reg_mem(R8, RSP, 16); }
+    if (total_words >= 4) { cg_load_reg_mem(R9, RSP, 24); }
+    // words 4+ stay at [rsp+w*8] (= caller [rsp+32+(w-4)*8]); the callee reads
+    // them at [rbp+48+(w-4)*8] = caller [rsp+32+(w-4)*8]. No move needed (the
+    // stash loop already placed each word at [rsp+next_slot*8] = [rsp+w*8]).
+
+    let callee_label: i64 = cg_callee_label(e, is_ns_call, mod_tok);
+    if (cg_err != 0) { return 0; }
+    cg_call_rel32(callee_label);
+
+    cg_add_reg_imm32(RSP, total);
+    // no register result to propagate — the callee wrote the struct through
+    // the dest pointer. Leave rax as-is (the caller will reload/read the dest).
+    return 0;
+}
+
+// max(0, n)
+fn cg_max0(n: i64) -> i64 { if (n < 0) { return 0; } return n; }
+
+// Spill a single integer arg word `w` (a global word index, 0-based including
+// the hidden return ptr at word 0) to [rbp+off]. Words 0-3 come from
+// rcx/rdx/r8/r9 (arg_regs); words 4+ come from the caller's outgoing stack
+// area at [rbp + 48 + (w-4)*8] (the caller stores words at [rsp+w*8]; words
+// 4+ stay there = caller [rsp+32+(w-4)*8] = callee [rbp+48+(w-4)*8]). Used
+// by the slice param spill
+// (two consecutive words). `arg_regs` is the 4-entry Win64 int-arg-reg array.
+fn cg_spill_word(w: i64, off: i64, arg_regs: i64, total_words: i64) -> i64 {
+    if (w < 4) {
+        let reg: i64 = array_get_i64(arg_regs, w);
+        cg_store_reg_mem(RBP, off, reg);
+    } else {
+        let src_off: i64 = 48 + (w - 4) * 8;
+        cg_load_reg_mem(RAX, RBP, src_off);
+        cg_store_reg_mem(RBP, off, RAX);
+    }
     return 0;
 }
 
@@ -3484,6 +3966,17 @@ fn cg_compile_stmt(s: i64) -> i64 {
         let off: i64 = cg_alloc_local_t(name_tok, t, slots);
         if (init >= 0 && nk_kind(init) == (NK::StructLit as i64)) { cg_store_struct_lit(init, t, off); return 0; }
         if (init >= 0 && nk_kind(init) == (NK::ArrayLit as i64)) { return cg_store_arraylit_let(init, t, off); }
+        if (init >= 0 && nk_kind(init) == (NK::CallExpr as i64) && cg_ty_is_struct(t) == 1) {
+            // Phase 4: struct-returning call init. The local's frame slot is
+            // the concrete destination for the callee's hidden return pointer:
+            // lea rax, [rbp+off], then the callee writes the struct directly
+            // into the local (no register result, no rax store).
+            cg_lea_rax_rbp(off);
+            let saved: i64 = cg_struct_ret_dest_ready; cg_struct_ret_dest_ready = 1;
+            cg_eval_struct_returning_call(init);
+            cg_struct_ret_dest_ready = saved;
+            return 0;
+        }
         if (init >= 0) {
             // slice-typed init (a ViewExpr, a slice Ident, etc.): cg_eval
             // yields the 2-word slice ABI {rax=ptr, rdx=len}; store both words
@@ -3517,8 +4010,56 @@ fn cg_compile_stmt(s: i64) -> i64 {
         return 0;
     }
     if (k == (NK::ReturnStmt as i64)) {
-        // eval the value -> rax (or xmm0 for float, {rax,rdx} for slice)
         let val: i64 = nk_a(s);
+        // Phase 4: struct-by-value return (hidden-pointer sret ABI). The fn's
+        // incoming hidden return pointer (spilled to cg_struct_ret_ptr_off in
+        // the prologue) is the destination; the struct value is copied there.
+        // sema guarantees val is a bare Ident, a struct-returning CallExpr, or
+        // a struct literal of the return type. There is no register result to
+        // stash across defers (the struct is written through the dest ptr),
+        // but the dest ptr must be reloaded into rax at the end (the sret ABI
+        // requires the dest ptr to be returned in rax).
+        if (cg_ty_is_struct(cg_cur_ret) == 1) {
+            let rptr: i64 = cg_struct_ret_ptr_off;
+            let ret_row: i64 = find_struct(ty_struct_name(cg_cur_ret));
+            let ret_bytes: i64 = (ret_row >= 0) ? cg_struct_value_bytes(ret_row) : (cg_words_for_type(cg_cur_ret) * 8);
+            if (val >= 0) {
+                let vk: i64 = nk_kind(val);
+                if (vk == (NK::Ident as i64)) {
+                    // copy the local's bytes to [rptr] (via r11 = rptr).
+                    let src_off: i64 = cg_lookup_local(nk_tok(val));
+                    if (src_off == 0) { if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: return struct local not found"); } return 0; }
+                    cg_load_reg_mem(R11, RBP, rptr);
+                    cg_copy_bytes(R11, 0, RBP, src_off, ret_bytes);
+                } else if (vk == (NK::CallExpr as i64)) {
+                    // forward: rax = rptr, the callee writes through it.
+                    cg_load_reg_mem(RAX, RBP, rptr);
+                    let saved: i64 = cg_struct_ret_dest_ready; cg_struct_ret_dest_ready = 1;
+                    cg_eval_struct_returning_call(val);
+                    cg_struct_ret_dest_ready = saved;
+                    if (cg_err != 0) { return 0; }
+                } else if (vk == (NK::StructLit as i64)) {
+                    // materialize the literal into a temp, copy to [rptr].
+                    let temp_off: i64 = cg_alloc_struct_temp(ret_bytes);
+                    cg_store_struct_lit(val, cg_cur_ret, temp_off);
+                    if (cg_err != 0) { return 0; }
+                    cg_load_reg_mem(R11, RBP, rptr);
+                    cg_copy_bytes(R11, 0, RBP, temp_off, ret_bytes);
+                } else {
+                    if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: unsupported struct return value shape"); }
+                    return 0;
+                }
+            }
+            // emit pending defers (LIFO). No register result to stash (the
+            // struct is already at the dest); defers may clobber rax/r11.
+            cg_defer_emit_all_nostash();
+            if (cg_err != 0) { return 0; }
+            // the sret ABI requires the dest pointer to be returned in rax.
+            cg_load_reg_mem(RAX, RBP, rptr);
+            cg_jmp(cg_epilogue_label);
+            return 0;
+        }
+        // eval the value -> rax (or xmm0 for float, {rax,rdx} for slice)
         if (val >= 0) {
             cg_eval(val);
             if (cg_err != 0) { return 0; }
@@ -3776,6 +4317,20 @@ fn cg_defer_emit_scope() -> i64 {
     // truncate the defer stack back to the mark (this scope's defers are spent)
     array_resize(g_defers, mark);
     g_defer_mark_len = g_defer_mark_len - 1;
+    return 0;
+}
+
+// emit all pending defers (the whole stack) in reverse with NO register
+// result to stash — used at a struct-by-value return (the struct is already
+// written through the hidden dest pointer; there is no rax/xmm0/rdx result
+// to preserve). The dest pointer is reloaded into rax by the caller AFTER
+// this. A defer's expr may clobber rax/r11/xmm, but none of those hold a
+// live struct-return value at this point. Mirrors the struct-return branch
+// of src/codegen.cpp's ReturnStmt (which calls emit_cleanups_to(0) with no
+// stash, then reloads the dest ptr into rax).
+fn cg_defer_emit_all_nostash() -> i64 {
+    if (array_length(g_defers) == 0) { return 0; }
+    cg_emit_defer_range(0, array_length(g_defers));
     return 0;
 }
 
@@ -4411,13 +4966,30 @@ fn cg_compile_func(fd: i64, ns_tok: i64) -> i64 {
     cg_loop_defer_mark = 0;
     let ret_ty_node: i64 = nk_b(fd);
     if (ret_ty_node >= 0) { cg_cur_ret = resolve_type(ret_ty_node); } else { cg_cur_ret = TY_VOID; }
+    // Phase 4: a fn whose return type is a registered struct uses the
+    // hidden-pointer sret ABI (word 0 = dest ptr, arrives in rcx). Reset the
+    // caller-side dest-ready flag for this fn's body.
+    let ret_is_struct: i64 = cg_ty_is_struct(cg_cur_ret);
+    cg_struct_ret_dest_ready = 0;
+    cg_struct_ret_ptr_off = 0;
 
-    // count params
+    // count params (and accumulate each param's word count for the spill map)
     let mut param_count: i64 = 0;
     let mut p: i64 = nk_a(fd);
     while (p >= 0) {
         param_count = param_count + 1;
         p = nk_next(p);
+    }
+    // total incoming words = (1 if struct return else 0) + sum(words_for_type
+    // over params). Used for the stack-arg source offset of words >= 4.
+    let mut total_words: i64 = 0;
+    if (ret_is_struct == 1) { total_words = 1; }
+    {
+        let mut pp: i64 = nk_a(fd);
+        while (pp >= 0) {
+            total_words = total_words + cg_words_for_type(resolve_type(nk_a(pp)));
+            pp = nk_next(pp);
+        }
     }
 
     // Count scalar locals, then add aggregate expansion words. The ordinary
@@ -4427,10 +4999,14 @@ fn cg_compile_func(fd: i64, ns_tok: i64) -> i64 {
     // (ceil(value_bytes/8) for aggregates, 1 for scalars), so the frame is
     // sized to hold every byte of every local. No separate struct-extra pass.
     let local_count: i64 = cg_count_locals_block(body, 0);
+    // Phase 4: add compiler-hidden struct temp slots (struct-literal returns +
+    // struct-by-value StructLit/CallExpr args) + the hidden return-pointer slot.
+    let struct_temp_slots: i64 = cg_count_struct_temps_block(body, 0, ret_is_struct);
+    let hidden_ptr_slots: i64 = (ret_is_struct == 1) ? 1 : 0;
 
-    // frame size = (params + locals) * 8, rounded up to 16
-    // +8 for the return address alignment (push rbp makes it 16-aligned)
-    let frame: i64 = cg_round16((param_count + local_count) * 8 + 8);
+    // frame size = (params + locals + struct temps + hidden ptr) * 8, rounded
+    // to 16, +8 for the return-address alignment (push rbp makes it 16-aligned).
+    let frame: i64 = cg_round16((param_count + local_count + struct_temp_slots + hidden_ptr_slots) * 8 + 8);
     cg_frame_size = frame;
 
     // epilogue label for this function
@@ -4439,13 +5015,24 @@ fn cg_compile_func(fd: i64, ns_tok: i64) -> i64 {
     // prologue
     cg_emit_prologue(frame);
 
-    // spill params to frame slots (Win64: rcx, rdx, r8, r9 for first 4 int args)
-    // Each param gets an 8-byte slot at [rbp - offset], allocated in order.
-    // We use a reusable constant scratch array (cg_arg_regs) holding the 4
-    // Win64 argument registers so we can index by param position. Replaces a
-    // per-function array_new that leaked a slot on every cg_compile_func; the
-    // array is a pure constant + read-only here (no recursive emission between
-    // set + read), so a single reused slot is safe.
+    // spill the hidden return pointer (word 0, rcx) to a dedicated frame slot
+    // BEFORE the real params (which shift to start at word 1). It is not a
+    // script-visible variable, so allocate it with a synthesized token (-1)
+    // and record its offset in cg_struct_ret_ptr_off for the ReturnStmt path.
+    let mut param_word: i64 = 0;
+    if (ret_is_struct == 1) {
+        let rptr_off: i64 = cg_alloc_local_t(-1, TY_I64, 1);
+        cg_struct_ret_ptr_off = rptr_off;
+        // word 0 arrives in rcx (the first Win64 int arg reg)
+        cg_store_reg_mem(RBP, rptr_off, RCX);
+        param_word = 1;
+    }
+
+    // spill params to frame slots. Each param occupies cg_words_for_type(pt)
+    // consecutive words; a struct param's bytes are spilled word-by-word into
+    // the param local's frame region (the last word may be partial — store only
+    // its real remaining bytes so a non-multiple-of-8 struct does not overrun
+    // into the next slot / the saved rbp). Mirrors src/codegen.cpp's prologue.
     let mut arg_regs: i64 = cg_arg_regs_get();
     array_set_i64(arg_regs, 0, RCX);
     array_set_i64(arg_regs, 1, RDX);
@@ -4456,20 +5043,69 @@ fn cg_compile_func(fd: i64, ns_tok: i64) -> i64 {
     p = nk_a(fd);
     while (p >= 0) {
         let pt: i64 = resolve_type(nk_a(p));
-        let off: i64 = cg_alloc_local_t(nk_tok(p), pt, 1);
-        if (pi < 4) {
-            // first 4 int args arrive in rcx/rdx/r8/r9; spill to the local slot
-            let reg: i64 = array_get_i64(arg_regs, pi);
-            if (ty_is_float(pt) == 1) { cg_store_float(off, pi, cg_float_is64_type(pt)); }
-            else { cg_store_reg_mem(RBP, off, reg); }
+        if (cg_ty_is_struct(pt) == 1) {
+            let row: i64 = find_struct(ty_struct_name(pt));
+            let struct_bytes: i64 = (row >= 0) ? cg_struct_value_bytes(row) : (cg_words_for_type(pt) * 8);
+            let wcount: i64 = cg_words_for_type(pt);
+            let off: i64 = cg_alloc_local_t(nk_tok(p), pt, wcount);
+            let mut byte_pos: i64 = 0;
+            let mut w: i64 = 0;
+            while (w < wcount) {
+                let word_bytes: i64 = (8 < struct_bytes - byte_pos) ? 8 : (struct_bytes - byte_pos);
+                let w_global: i64 = param_word + w;
+                if (word_bytes >= 8) {
+                    // full word: spill the arg reg (w_global < 4) or load from
+                    // the caller's outgoing stack area into the local slot.
+                    if (w_global < 4) {
+                        let reg: i64 = array_get_i64(arg_regs, w_global);
+                        cg_store_reg_mem(RBP, off + byte_pos, reg);
+                    } else {
+                        let src_off: i64 = 48 + (w_global - 4) * 8;
+                        cg_load_reg_mem(RAX, RBP, src_off);
+                        cg_store_reg_mem(RBP, off + byte_pos, RAX);
+                    }
+                } else {
+                    // partial last word: get the word's value into rax, then
+                    // store only its low `word_bytes` bytes.
+                    if (w_global < 4) {
+                        cg_mov_reg_reg(RAX, array_get_i64(arg_regs, w_global));
+                    } else {
+                        let src_off: i64 = 48 + (w_global - 4) * 8;
+                        cg_load_reg_mem(RAX, RBP, src_off);
+                    }
+                    cg_store_rax_bytes(RBP, off + byte_pos, word_bytes);
+                }
+                byte_pos = byte_pos + word_bytes;
+                w = w + 1;
+            }
+        } else if (nk_f(pt) == 1) {
+            // slice param: 2 consecutive integer words -> the local's 16-byte
+            // {ptr,len} slot (word 0 -> off, word 1 -> off+8).
+            let off: i64 = cg_alloc_local_t(nk_tok(p), pt, 2);
+            cg_spill_word(param_word, off, arg_regs, total_words);
+            cg_spill_word(param_word + 1, off + 8, arg_regs, total_words);
+        } else if (ty_is_float(pt) == 1) {
+            let off: i64 = cg_alloc_local_t(nk_tok(p), pt, 1);
+            if (param_word < 4) {
+                // float args arrive in xmm0..xmm3 (flt_arg_regs[param_word])
+                cg_store_float(off, param_word, cg_float_is64_type(pt));
+            } else {
+                let src_off: i64 = 48 + (param_word - 4) * 8;
+                cg_load_reg_mem(RAX, RBP, src_off);
+                cg_store_reg_mem(RBP, off, RAX);
+            }
         } else {
-            // args 5+ were passed on the caller's stack at [rbp + 48 + (pi-4)*8]
-            // (32-byte shadow at [rbp+16..47] + return addr at [rbp+8] + saved
-            // rbp at [rbp+0]). Load from there into the local slot (via rax).
-            let src_off: i64 = 48 + (pi - 4) * 8;
-            cg_load_reg_mem(RAX, RBP, src_off);
-            cg_store_reg_mem(RBP, off, RAX);
+            let off: i64 = cg_alloc_local_t(nk_tok(p), pt, 1);
+            if (param_word < 4) {
+                let reg: i64 = array_get_i64(arg_regs, param_word);
+                cg_store_reg_mem(RBP, off, reg);
+            } else {
+                let src_off: i64 = 48 + (param_word - 4) * 8;
+                cg_load_reg_mem(RAX, RBP, src_off);
+                cg_store_reg_mem(RBP, off, RAX);
+            }
         }
+        param_word = param_word + cg_words_for_type(pt);
         pi = pi + 1;
         p = nk_next(p);
     }
@@ -4487,6 +5123,9 @@ fn cg_compile_func(fd: i64, ns_tok: i64) -> i64 {
     // reference codegen emits emit_epilogue() inline at each return instead
     // of jumping to a shared label; this codegen uses the shared-label form,
     // which is equivalent only if the implicit zero is fallthrough-only.)
+    // Phase 4: a struct-returning fn's fallthrough has no struct to return;
+    // rax = 0 is harmless (the caller's dest was never written, but sema
+    // guarantees a struct-returning fn always has an explicit return).
     cg_mov_reg_imm64(RAX, 0);
     // bind the epilogue label + emit the epilogue (returns jump here, with
     // rax already holding their value)
