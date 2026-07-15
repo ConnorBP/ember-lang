@@ -642,6 +642,19 @@ endif()
 add_test(NAME in_context_threads COMMAND in_context_threads_test)
 set_tests_properties(in_context_threads PROPERTIES TIMEOUT 60)
 
+# Fast direct-native edge coverage for sync queues and legacy thread lifecycle.
+add_executable(sync_thread_coverage_test examples/sync_thread_coverage_test.cpp)
+# The sync/thread/GC static archives form a late-extraction chain through core
+# engine symbols; RESCAN gives MinGW's one-pass archive linker the usual group
+# semantics without changing the libraries' public dependency direction.
+target_link_libraries(sync_thread_coverage_test PRIVATE
+    "$<LINK_GROUP:RESCAN,ember,ember_frontend,ember_ext_sync,ember_ext_thread,ember_ext_gc>")
+if(WIN32)
+    target_link_libraries(sync_thread_coverage_test PRIVATE kernel32)
+endif()
+add_test(NAME sync_thread_coverage COMMAND sync_thread_coverage_test)
+set_tests_properties(sync_thread_coverage PROPERTIES TIMEOUT 20)
+
 # Win64 ABI regressions: switch volatile scratch, raw B1 thunk r14
 # preservation, and an aligned-SSE trap stub called from both stack parities.
 add_executable(win64_abi_test examples/win64_abi_test.cpp)
@@ -1209,6 +1222,16 @@ if(WIN32)
 endif()
 add_test(NAME type_stress COMMAND type_stress_test)
 
+# Focused lexer and sema diagnostic coverage for edge tokens and invalid
+# programs. These are frontend-only C++ tests with no runtime extensions.
+add_executable(lexer_coverage_test examples/lexer_coverage_test.cpp)
+target_link_libraries(lexer_coverage_test PRIVATE ember ember_frontend)
+add_test(NAME lexer_coverage COMMAND lexer_coverage_test)
+
+add_executable(sema_coverage_test examples/sema_coverage_test.cpp)
+target_link_libraries(sema_coverage_test PRIVATE ember ember_frontend)
+add_test(NAME sema_coverage COMMAND sema_coverage_test)
+
 # codegen_opt_test - pins the Stage 1 codegen-optimization peephole + local
 # regalloc rewrites' VALUE EQUIVALENCE (docs/spec/CODEGEN_OPTIMIZATION_DESIGN.md §4.7).
 # For each rewrite, compiles the SAME source with the Stage-1 flags OFF and ON,
@@ -1249,6 +1272,15 @@ if(WIN32)
     target_link_libraries(thin_ir_test PRIVATE kernel32)
 endif()
 add_test(NAME thin_ir COMMAND thin_ir_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# Focused lowering/emitter coverage: complex control flow, nested calls,
+# arrays/structs/floats, explicit fallback, and malformed ThinIR rejection.
+add_executable(thin_ir_coverage_test examples/thin_ir_coverage_test.cpp)
+target_link_libraries(thin_ir_coverage_test PRIVATE ember ember_frontend)
+if(WIN32)
+    target_link_libraries(thin_ir_coverage_test PRIVATE kernel32)
+endif()
+add_test(NAME thin_ir_coverage COMMAND thin_ir_coverage_test)
 
 # thin_ir_struct_test - Stage A c1 (IL-.em): pins the thin three-address IR
 # data-structure CONTRACT that the lowering (c2) and the emit (c3) will
@@ -1516,6 +1548,11 @@ if(WIN32)
     target_link_libraries(ir_passes_test PRIVATE kernel32)
 endif()
 add_test(NAME ir_passes COMMAND ir_passes_test)
+
+# Hand-built ThinIR edge cases for all eighteen optimization passes.
+add_executable(opt_pass_coverage_test examples/opt_pass_coverage_test.cpp)
+target_link_libraries(opt_pass_coverage_test PRIVATE ember ember_frontend ember_ext_opt)
+add_test(NAME opt_pass_coverage COMMAND opt_pass_coverage_test)
 
 # regalloc_test - Stage 3: the linear-scan register allocation value-preservation
 # + register-assignment gate. Compiles register-heavy workloads (recursion,
