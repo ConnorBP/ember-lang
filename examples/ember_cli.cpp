@@ -518,6 +518,11 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
     OpOverloadTable overloads;
     register_standard_bindings(natives,&overloads);
     // array, math, sync, and lifecycle expose natives but no operators.
+    // Wire the module loader's allowlisted native table + permission so that
+    // self-hosted code calling load_executable_module can resolve NATIVE
+    // relocations against this process's registered natives (PERM_FFI-gated
+    // so native relocations are only honored when --ffi is granted).
+    ember::ext_call_raw::set_loader_context(&natives, opts.ffi_mode ? PERM_FFI : 0u);
 
     // ---- struct layouts + string key + sema ----
     auto struct_layouts = build_struct_layouts(pr.program);

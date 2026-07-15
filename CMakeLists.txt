@@ -386,6 +386,22 @@ add_executable(call_raw_test examples/call_raw_test.cpp)
 target_link_libraries(call_raw_test PRIVATE ember ember_frontend ember_ext_call_raw)
 add_test(NAME call_raw COMMAND call_raw_test)
 
+# module_loader_test: runtime coverage for the EMBM v1 module image loader
+# (extensions/call_raw/ext_call_raw.cpp: load_executable_module /
+# module_entry_ptr / free_executable_module; spec:
+# self_hosted/MODULE_IMAGE_FORMAT.md §2/§7/§8/§9). Hand-builds a minimal EMBM
+# v1 image (code + rodata + data + symbols + 3 ABS64 relocs), loads it, calls
+# the entry via call_raw, and asserts the return; plus the full rejection
+# matrix (unknown native, ABI mismatch, OOB/overlap reloc, truncated/oversize,
+# bad magic/version, overlapping sections) and handle-lifetime (free then
+# invalidated entry, double-free, out-of-bounds entry). Links ember_ext_array
+# (the loader reads the image via ext_array::get_bytes; the test mints the
+# image handle via ext_array::alloc_bytes) alongside ember_ext_call_raw.
+add_executable(module_loader_test examples/module_loader_test.cpp)
+target_link_libraries(module_loader_test PRIVATE
+    ember ember_frontend ember_ext_call_raw ember_ext_array)
+add_test(NAME module_loader COMMAND module_loader_test)
+
 # VST3 Phase 2 headless DSP gate: compile the @realtime gain/delay scripts,
 # call them over host-owned stereo f32 buffers through ext_audio, compare to
 # C++ references, and prove block-partition invariance (1024/256/64/1).
