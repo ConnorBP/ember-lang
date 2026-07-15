@@ -268,7 +268,15 @@ target_link_libraries(ember_ext_map   PRIVATE ember_ext_gc)
 target_link_libraries(ember_ext_vec   PRIVATE ember_ext_gc)
 target_link_libraries(ember_ext_string PRIVATE ember_ext_gc)
 ember_add_extension(sync     extensions/sync/ext_sync.cpp)
-ember_add_extension(thread   extensions/thread/ext_thread.cpp)   # Tier 4: in-context threads (thread_spawn/join + call_mutex serialization)
+ember_add_extension(thread   extensions/thread/ext_thread.cpp)   # Tier 4: in-context threads (concurrent shared-context entry)
+# The thread extension's workers join the context-owned shared GC heap
+# (ext_gc::gc_thread_enter/exit) so spawned threads allocate into the ONE
+# shared heap + their shadow-stack heads are scanned by the cooperative
+# stop-the-world collector. PRIVATE: the gc_thread_enter/exit facade is an
+# implementation detail (not exposed in ext_thread.hpp). No cycle:
+# ember_ext_gc -> ember_frontend -> ember, and ember_ext_gc does NOT depend
+# on thread, so ember_ext_thread -> ember_ext_gc is one-way.
+target_link_libraries(ember_ext_thread PRIVATE ember_ext_gc)
 # coroutine extension is Windows-only (uses CreateFiber/SwitchToFiber). On
 # non-Windows we create an empty stub so link targets that reference
 # ember_ext_coroutine still resolve. A ucontext port is a TODO (ROADMAP).
@@ -537,16 +545,21 @@ add_test(NAME thread_safety COMMAND thread_safety_test)
 set_tests_properties(thread_safety PROPERTIES TIMEOUT 30)
 
 # in_context_threads_test: Tier 4 in-context threads (the `thread` addon +
-# aint* atomics). Two ember-calling OS threads on ONE context_t, serialized by
-# context_t::call_mutex. Links ember_ext_thread (thread_spawn/join) +
-# ember_ext_sync (aint* atomics for shared state). Mirrors thread_safety's
-# B1 harness + the lock-around-main-call contract.
+# aint* atomics). Two ember-calling OS threads entering JIT'd code
+# CONCURRENTLY through ONE shared dispatch context (each worker owns its own
+# per-call context_t seeded from the host's settings; no call_mutex
+# serialization). Links ember_ext_thread (thread_spawn/join, which joins the
+# shared GC heap) + ember_ext_sync (aint* atomics for shared state) +
+# ember_ext_gc (gc_new/gc_delete/gc_collect/gc_live + the host API) so the GC
+# shared-heap scenario can allocate into the context-owned heap, attach the
+# context for precise root scanning + cooperative stop-the-world collection,
+# and reset the heap between runs. Mirrors thread_safety's B1 harness.
 add_executable(in_context_threads_test examples/in_context_threads_test.cpp)
 target_link_libraries(in_context_threads_test PRIVATE
     ember ember_frontend ember_import
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
-    ember_ext_sync ember_ext_thread)
+    ember_ext_sync ember_ext_thread ember_ext_gc)
 if(WIN32)
     target_link_libraries(in_context_threads_test PRIVATE kernel32)
 endif()

@@ -44,23 +44,30 @@ constexpr int64_t MAX_MAPS = 100000;
 // rejects ordinary integers, null, and stale / non-live addresses -- so a
 // plain-integer key/value NEVER creates a false root.
 //
-// The token is THREAD-LOCAL (the GC runtime is thread-local); the callback
-// walks the process-wide, mutex-protected store. See ext_array.cpp for the full
-// synchronization / deadlock / lifecycle rationale (identical here): the
-// callback acquires g_store_mutex during collect(); mutations acquire it and
-// call gc_write_barrier (no mutex, never collects); gc_reset() invalidates
-// tokens and the next mutation re-registers; reset() unregisters + clears.
+// The token is THREAD-LOCAL (a worker re-registers on its own thread); the
+// callback walks the process-wide, mutex-protected store. See ext_array.cpp
+// for the full synchronization / deadlock / lifecycle rationale (identical
+// here): the callback acquires g_store_mutex during collect(); mutations
+// acquire it for the write + trace-callback registration, then RELEASE it
+// before calling gc_write_barrier (which parks under part_cv -- NOT the heap
+// m_lock -- while a collect is in progress, so never holds g_store_mutex when
+// the collect runs the callback); gc_reset() invalidates tokens and the next
+// mutation re-registers; reset() unregisters + clears.
 static thread_local ember::gc::GcTraceToken g_trace_token = 0;
 
 // The trace callback: walk every map, report each entry's key + value as root
 // candidates. user_data is unused (the callback walks the file-static store).
 // ACQUIRES g_store_mutex so the process-wide store is stable while it is
 // walked: collect() is invoked from gc_collect / gc_alloc_env on the owning
-// thread OUTSIDE any store-mutex-held mutation (a mutation holds g_store_mutex
-// and calls gc_write_barrier, which acquires NO mutex and never collects), so
-// locking here cannot self-deadlock + cannot nest with a mutation's lock.
-// Without this lock a concurrent mutation on another thread (g_maps is
-// process-wide) would race the callback's read of the entry table.
+// thread OUTSIDE any store-mutex-held mutation (a mutation releases
+// g_store_mutex before calling gc_write_barrier, which parks under part_cv --
+// NOT the heap m_lock -- while a collect is in progress, so it never holds
+// g_store_mutex when the collect runs the callback), so locking here cannot
+// self-deadlock + cannot nest with a mutation's lock. Under the strict
+// cooperative STW protocol every other participant is parked (not mutating)
+// when the callback runs. Without this lock a concurrent mutation on another
+// thread (g_maps is process-wide) would race the callback's read of the entry
+// table.
 static void map_trace_cb(void* /*user_data*/, ember::gc::GcTraceVisitor& visitor) {
     std::lock_guard<std::mutex> lock(g_store_mutex);
     for (const MapSlot& slot : g_maps) {
@@ -108,24 +115,33 @@ extern "C" {
         } catch (...) { return 0; }
     }
     static void n_map_set(int64_t h, int64_t k, int64_t v) {
-        std::lock_guard<std::mutex> lock(g_store_mutex);
-        auto* s = map_slot(h);
-        if (s) {
-            s->entries[k] = v;
-            // c1: the key AND value are i64 candidates for a managed pointer
-            // (insertion or replacement). Register the trace callback (idempotent)
-            // so a future collect sees this entry, and invoke the write barrier for
-            // both halves (owner = the external-root slot, a non-GC owner so the
-            // barrier is a ceremonial no-op today; children = the key + value,
-            // candidate GC pointers the visitor validates). A replacement also
-            // fires the barrier for the new value; the OLD value is simply no
-            // longer reported by the callback -> collected if otherwise unreachable.
-            ensure_gc_trace_cb();
-            void* owner = reinterpret_cast<void*>(s);
+        void* owner = nullptr;
+        int64_t key = 0, val = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_store_mutex);
+            auto* s = map_slot(h);
+            if (s) {
+                s->entries[k] = v;
+                // c1: the key AND value are i64 candidates for a managed pointer
+                // (insertion or replacement). Register the trace callback
+                // (idempotent) under the lock so a future collect sees this entry.
+                // The write barrier is invoked OUTSIDE g_store_mutex (below) so it
+                // can park at the cooperative-STW safepoint (under part_cv, NOT the
+                // heap m_lock) without AB-BA deadlocking the trace callback (which
+                // takes g_store_mutex under the heap m_lock during a collect). A
+                // replacement also fires the barrier for the new value; the OLD
+                // value is simply no longer reported by the callback -> collected
+                // if otherwise unreachable.
+                ensure_gc_trace_cb();
+                owner = reinterpret_cast<void*>(s);
+                key = k; val = v;
+            }
+        }
+        if (owner) {
             ember::ext_gc::gc_write_barrier(owner,
-                reinterpret_cast<void*>(static_cast<uintptr_t>(k)));
+                reinterpret_cast<void*>(static_cast<uintptr_t>(key)));
             ember::ext_gc::gc_write_barrier(owner,
-                reinterpret_cast<void*>(static_cast<uintptr_t>(v)));
+                reinterpret_cast<void*>(static_cast<uintptr_t>(val)));
         }
     }
     static int64_t n_map_get(int64_t h, int64_t k) {

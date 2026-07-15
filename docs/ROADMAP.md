@@ -566,21 +566,29 @@ lambdas-with-capture and coroutines, not classes.
   a host catch). Pinned by `examples/try_catch_test.cpp` (ctest `try_catch`)
   + `tests/lang/valid_try_catch`/`valid_nested_try_catch`/`valid_throw_*`/
   `valid_catch_return`/`valid_try_return`/`sema_invalid_throw_*`.
-- **In-context threads (`thread` addon, `aint*` atomics)** - **✓ PARTIALLY
-  SHIPPED** (Tier 4). The `thread` extension (`extensions/thread/`,
+- **In-context threads (`thread` addon, `aint*` atomics)** - **✓ SHIPPED** (Tier 4,
+  concurrent shared-context entry). The `thread` extension (`extensions/thread/`,
   `ember_ext_thread`) ships `thread_spawn(fn h, i64 data)` / `thread_join` /
-  `thread_trap_reason` — a script can spawn a worker that runs a fn handle on
-  its **own `context_t`**, serialized against the caller via a per-context
-  `call_mutex` (the multi-context model, not concurrent calls on one
-  context). Pinned by `examples/in_context_threads_test.cpp` (ctest
+  `thread_trap_reason`. A spawned worker enters JIT'd code **CONCURRENTLY** with
+  the host + sibling workers through the one shared dispatch context active at
+  `thread_spawn`: each worker owns its **own per-call `context_t`** seeded from
+  the host's settings (budget, max_call_depth, the shared typed-global root
+  descriptor, the shared GC runtime pointer), so checkpoint / budget / call
+  depth / catch stack / GC shadow-stack head are per-thread — **no `call_mutex`
+  serialization, no save/restore**. True parallel execution (>= 2 workers
+  inside JIT at once) + trap isolation (each worker's trap unwinds to its own
+  checkpoint) + catch/throw isolation across concurrent siblings + nested
+  spawn/join (deadlock-free — `thread_join` waits only on slot synchronization)
+  are all pinned by `examples/in_context_threads_test.cpp` (ctest
   `in_context_threads`). The `aint*` atomics live in the `sync` extension
   (`extensions/sync/`, shipped v1.0 — see the shipped bullet below). The
-  residual TODO is **true concurrent execution inside one `context_t`**
-  (two ember-calling threads on one context still races — the `call_mutex`
-  serializes, it does not parallelize); that needs GC thread-safety, a
-  per-context arena, and a relaxed memory model. Multi-context parallelism
-  (shipped) + the `thread` addon cover most real cases; true in-context
-  parallelism is the remaining compute-heavy-mod case.
+  workers join the **context-owned shared GC heap** (`ext_gc`'s
+  `gc_thread_enter`/`gc_thread_exit`) so their allocations land in ONE heap
+  visible from the host after they join, + the cooperative stop-the-world
+  collector scans every participant's per-thread shadow-stack head. The legacy
+  multi-context model (one `context_t` per thread, `call_mutex` uncontended) is
+  unchanged; `call_mutex` is retained for source compatibility but inert under
+  the concurrent-entry model.
 
   **Shipped v1.0 (the two pieces short of in-context threading):**
   - **Context thread-safety (Option D + B1).** A `context_t` is per-thread

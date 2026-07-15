@@ -2,16 +2,67 @@
 //
 // Foundational infrastructure for lambdas-with-capture (#20) and coroutines
 // (#21). Manages a GC heap of objects with known reference layouts (NOT
-// classes — OOP is a non-goal). Stop-the-world mark-sweep, single-threaded
-// (per-context heaps + mutexes are a follow-up, mirroring context_t is
-// per-thread). No ast.hpp/sema.hpp/codegen.hpp dependency — the `ember` core
-// lib must stay frontend-free (one-way link direction per CMakeLists.txt).
+// classes — OOP is a non-goal). Stop-the-world mark-sweep.
+//
+// CONCURRENCY MODEL (standalone collector core):
+//   All mutable GcHeap state (the live set, roots, trace-callback registry,
+//   barrier-observer registry, token counters, statistics, the RSS throttle,
+//   and the mark/sweep phases) is guarded by a single coarse recursive mutex
+//   `m_lock`. Every public mutating/querying method acquires `m_lock` and
+//   then performs its work through `*_locked` helpers that assume the lock is
+//   already held. The recursive mutex lets a trace callback / barrier observer
+//   re-enter register/unregister (or any other public API) from WITHIN its own
+//   invocation without self-deadlock.
+//
+//   CALLBACK / OBSERVER RE-ENTRY (deliberate, self-deadlock-free):
+//     collect() and write_barrier() do NOT range-iterate the live registries
+//     while invoking user code. They SNAPSHOT the callback / observer records
+//     into a local vector UNDER the lock, then invoke from the snapshot. A
+//     callback / observer that registers or unregisters ITSELF (or another
+//     entry) during invocation mutates the LIVE registry (under the recursive
+//     lock — no deadlock) but NOT the snapshot — so the active iteration is
+//     never invalidated (no same-thread iterator/reference invalidation, the
+//     bug a bare recursive mutex does NOT prevent).
+//     SNAPSHOT SEMANTICS (documented): a callback / observer registered DURING
+//     a collect() / write_barrier() invocation is NOT invoked in that same
+//     call (the snapshot was already taken); it IS invoked on the NEXT call.
+//     A callback / observer that unregisters itself DURING invocation may
+//     still be invoked in that same call (it was already in the snapshot) but
+//     is not invoked thereafter. This is the stable contract callers can rely
+//     on.
+//     A re-entrant collect() (a callback that calls collect() from within its
+//     own invocation) is gracefully short-circuited via the `m_collecting`
+//     guard: it returns a stats snapshot WITHOUT running a nested mark/sweep
+//     (a nested sweep would corrupt / double-free), so collection can never
+//     self-deadlock or self-corrupt.
+//
+//   STATISTICS SNAPSHOT API: stats() and collect() return GcStats BY VALUE (a
+//     locked copy), never a reference to the mutable m_stats. Exposing a
+//     reference would let another thread mutate the counters while a caller
+//     reads them (a torn / inconsistent read). The by-value snapshot is the
+//     safe API; callers that held `const GcStats&` bind to the returned
+//     temporary (lifetime-extended) and see a coherent point-in-time copy.
+//
+//   OBJECT-PAYLOAD ACCESS: the core lock protects HEAP ALLOCATION and COLLECTOR
+//   METADATA (the live set, headers, roots, registries, stats). It does NOT
+//   serialize direct reads/writes of object USER payloads (the bytes returned
+//   by alloc). Direct payload access is protected by the HIGHER-LEVEL
+//   EXECUTION STOP-THE-WORLD protocol implemented during integration (the
+//   engine's per-call mutex / the thread extension's call gate), which ensures
+//   no JIT'd code touches an object's payload while the collector is examining
+//   or freeing it. The core lock + the integration stop-the-world protocol are
+//   two distinct layers; the core lock alone is not sufficient for safe
+//   concurrent payload mutation.
+//
+// No ast.hpp/sema.hpp/codegen.hpp dependency — the `ember` core lib must stay
+// frontend-free (one-way link direction per CMakeLists.txt).
 #pragma once
 
 #include <cstdint>
 #include <cstddef>
 #include <vector>
 #include <unordered_set>
+#include <mutex>
 #include <initializer_list>
 
 namespace ember::gc {
@@ -160,9 +211,14 @@ public:
 
     // Mark from all registered roots AND all registered trace callbacks, trace
     // each reachable object's RefMap (recursively), then sweep (free) every
-    // unmarked object. Clears marks on survivors. Updates + returns stats.
-    const GcStats& collect();
-    const GcStats& stats() const;
+    // unmarked object. Clears marks on survivors. Returns a STATS SNAPSHOT (by
+    // value — a locked copy of m_stats); see the concurrency-model note at the
+    // top of this file for why stats are never returned by reference.
+    GcStats collect();
+    // Return a STATS SNAPSHOT (by value, locked copy) of the current counters.
+    // Never a reference to mutable m_stats (another thread could mutate the
+    // counters mid-read); the by-value copy is the safe, consistent API.
+    GcStats stats() const;
 
     // True iff `p` points at the user bytes of a currently-live GC object.
     bool is_live(const void* p) const;
@@ -221,13 +277,32 @@ private:
     // the per-alloc hot path while still catching runaway growth within ~64 MiB.
     size_t m_last_rss_check_bytes = 0;
 
-    // Mark `obj` (a live GC object's user bytes) + push onto `worklist` if not
-    // already marked. Used by both the root loop and the trace-visitor.
-    void mark_and_push(void* obj, std::vector<void*>& worklist);
+    // Coarse heap lock guarding ALL mutable state above (live set, roots,
+    // registries, stats, token counters, RSS throttle) + the mark/sweep phases.
+    // Recursive so a callback / observer can re-enter any public API from
+    // within its own invocation without self-deadlock. `mutable` so the const
+    // query methods (is_live, stats) can lock it.
+    mutable std::recursive_mutex m_lock;
+    // Re-entrancy guard for collect(): true while THIS thread is mid-collect.
+    // A callback that re-enters collect() from within its own invocation would
+    // otherwise run a NESTED mark/sweep (corrupting / double-freeing); the guard
+    // short-circuits a re-entrant collect() to a stats snapshot. Guarded by
+    // m_lock; only ever set/cleared by the collecting thread under the lock.
+    bool m_collecting = false;
 
-    // GcTraceVisitor::report() calls mark_and_push on validated candidates, so
-    // it needs access to this private helper (the visitor is the bridge between
-    // a callback's reported pointers and the heap's mark worklist).
+    // --- locked/unlocked helpers (assume m_lock is held) ---
+    // True iff `p` points at the user bytes of a currently-live GC object.
+    // Assumes m_lock is held (the public is_live() acquires it then calls here).
+    bool is_live_locked(const void* p) const;
+    // Mark `obj` (a live GC object's user bytes) + push onto `worklist` if not
+    // already marked. Used by both the root loop and the trace-visitor. Assumes
+    // m_lock is held (collect() acquires it; the visitor runs under collect()).
+    void mark_and_push_locked(void* obj, std::vector<void*>& worklist);
+
+    // GcTraceVisitor::report() calls is_live_locked + mark_and_push_locked on
+    // validated candidates, so it needs access to these private helpers (the
+    // visitor is the bridge between a callback's reported pointers and the
+    // heap's mark worklist). report() always runs under collect()'s held lock.
     friend struct GcTraceVisitor;
 };
 

@@ -15,32 +15,40 @@
 // A nested checkpoint stack remains deferred; hosts use single-call-per-entry
 // discipline and manage has_checkpoint around each raw B1 thunk invocation.
 //
-// THREAD-SAFETY (v1.0, Option D + B1): a context_t is NOT shared across
-// threads. Each concurrent caller thread allocates its own context_t (private
-// checkpoint/budget/combined depth); they share the dispatch table, JIT'd code,
-// and module registry (all read-only after compile). The JIT'd budget/depth/trap
-// reads go through a context pointer passed per-call (CodeGenCtx::use_context_reg),
-// so one compiled body serves N per-thread contexts — no per-context recompile.
-// The host's raw B1 thunk sets the context register before entry; script-to-script
-// calls forward it (callee-saved). SAFETY §8 + HOT_RELOAD §5 document this
-// multi-context model. Hot-reload participation is deliberately not stored in
-// context_t: the host wraps each OUTER host-to-script call in the reloadable
-// table's HotReloadDomain::ExecutionGuard. Nested script calls share that guard.
-// This keeps contexts independent of domains and avoids a global registry.
+// THREAD-SAFETY (v1.0, Option D + B1): the canonical model is one context_t
+// PER concurrently-entering OS thread. Each concurrent caller thread allocates
+// its own context_t (private checkpoint/budget/combined depth/catch stack/
+// GC shadow-stack head); they share the dispatch table, JIT'd code, and module
+// registry (all read-only after compile). The JIT'd budget/depth/trap reads go
+// through a context pointer passed per-call (CodeGenCtx::use_context_reg), so
+// one compiled body serves N per-thread contexts — no per-context recompile.
+// The host's raw B1 thunk sets the context register before entry; script-to-
+// script calls forward it (callee-saved). SAFETY §8 + HOT_RELOAD §5 document
+// this multi-context model. Hot-reload participation is deliberately not
+// stored in context_t: the host wraps each OUTER host-to-script call in the
+// reloadable table's HotReloadDomain::ExecutionGuard. Nested script calls
+// share that guard. This keeps contexts independent of domains and avoids a
+// global registry.
 //
 // IN-CONTEXT THREADS (v1 Tier 4, `thread` addon): the residual case where a
-// compute-heavy mod needs parallelism WITHIN ONE script context — two ember-
-// calling OS threads sharing ONE context_t. The single checkpoint/budget/depth
-// are not concurrently-safe, so context_t carries a coarse `call_mutex`. Every
-// ember_call into this context (the host's outer call AND each spawned thread's
-// call) locks it, serializing the script-side execution while the host + sibling
-// threads run concurrently off-context. A spawned thread additionally saves +
-// restores the per-call fields (budget/depth/catch/checkpoint) around its own
-// call so the caller's in-progress state survives the interleaving (a thread_join
-// releases the mutex while it waits, letting the spawned call run to completion).
-// This is the coarse-grained-but-correct option; per-thread persistent copies of
-// the fields remain a future refinement. The multi-context model above is
-// unchanged and `call_mutex` is uncontended there (one context per thread).
+// compute-heavy mod needs parallelism WITHIN ONE script module — two ember-
+// calling OS threads entering JIT'd code CONCURRENTLY through the one shared
+// dispatch context active at thread_spawn. The per-call fields
+// (checkpoint/budget/depth/catch stack/gc_frame_head) are NOT concurrently-
+// safe in a single context_t, so the thread extension gives each spawned
+// worker its OWN context_t seeded from the shared host context's settings
+// (budget, max_call_depth, the shared typed-global root descriptor, and the
+// shared GC runtime pointer below) while all workers + the host share the ONE
+// dispatch table + the ONE context-owned GC heap. This is GENUINE CONCURRENT
+// ENTRY: multiple OS threads run JIT'd code simultaneously (the test gate
+// observes >= 2 workers inside JIT at once), each with private per-call state,
+// each trap unwinding to its OWN checkpoint, and each registering its own
+// shadow-stack head with the shared heap's cooperative stop-the-world
+// collector. There is NO call_mutex serialization and NO save/restore of the
+// host's per-call fields: the host keeps its own context_t untouched while the
+// workers run concurrently. thread_join waits ONLY on slot synchronization
+// (done + the OS thread join), so nested spawn/join is deadlock-free. The
+// multi-context model above is unchanged (one context per thread).
 //
 // LAYOUT: the JIT-read fields (budget_remaining, call_depth, max_call_depth)
 // are in a POD PREFIX at the top, so [ctx_reg + offsetof(field)] is POD-safe
@@ -168,11 +176,26 @@ struct context_t {
     int64_t catch_bufs[MAX_CATCH_DEPTH][8]{};
     int32_t catch_saved_call_depths[MAX_CATCH_DEPTH]{};
 
-    // ---- IN-CONTEXT THREADS: coarse serialization mutex (Tier 4 `thread` addon).
-    //      NOT read by JIT'd [ctx_reg+off] code; host + spawned-thread calls lock
-    //      it around every ember_call into this context. Uncontended under the
-    //      multi-context model (one context_t per thread). Placed LAST so it does
-    //      not perturb the POD-prefix offsets the codegen bakes above. ----
+    // ---- IN-CONTEXT THREADS: shared-runtime back-pointer (Tier 4 `thread` addon).
+    //      NOT read by JIT'd [ctx_reg+off] code. When the host attaches this
+    //      context to a shared GC runtime (ext_gc::gc_attach_context), this is
+    //      the opaque pointer to that shared runtime (a ember::ext_gc::GcRuntime*,
+    //      cast by the GC extension — context_t stays layer-clean and only holds
+    //      the raw pointer). A spawned worker reads it off the host context and
+    //      hands it to ext_gc::gc_thread_enter so the worker's own context_t
+    //      joins the SAME shared heap + registers its shadow-stack head with the
+    //      cooperative stop-the-world collector. nullptr = no shared GC runtime
+    //      attached (the thread-local-heap fallback / non-GC operation). NOT read
+    //      by JIT'd code (no context_offsets entry); the extensions reach it via
+    //      the C++ struct. A host sets it once when attaching the context.
+    void* gc_runtime = nullptr;
+    // ---- Retained for ABI/source compatibility: the coarse mutex that the OLD
+    //      serialized in-context-thread model locked around every ember_call. It
+    //      is NO LONGER taken by the thread extension (concurrent entry replaced
+    //      serialization), and NO host should lock it around an outer call. Kept
+    //      so existing code that references it still links; it is uncontended and
+    //      inert under the concurrent-entry model. Placed LAST so it does not
+    //      perturb the POD-prefix offsets the codegen bakes above. ----
     std::mutex call_mutex{};
 
     void reset_for_call() {

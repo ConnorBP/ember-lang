@@ -142,10 +142,14 @@ struct ThreadRuntimeState {
     std::recursive_mutex                     setup_mutex;
     // The per-runtime context + dispatch table the spawned threads call into.
     // Set by the LEGACY thread_init(ctx, base, count) writing into THIS
-    // runtime's state. The KEYED worker does NOT use these — it owns its own
-    // context_t (§6.6: "Each independently entered OS thread owns its own
-    // context_t") and derives the entry from the ModuleInstance's dispatch
-    // record + provider. These carry NO route material.
+    // runtime's state: the legacy worker reads `ctx` as the SEED source for its
+    // own per-call context_t (it does NOT share the host's per-call state — it
+    // seeds a private context so it can run concurrently). The KEYED worker
+    // does NOT use `ctx` — it seeds its own per-call context from the shared
+    // host context captured at the keyed host boundary
+    // (ember_current_keyed_context) and derives the entry from the
+    // ModuleInstance's dispatch record + provider. These carry NO route
+    // material.
     context_t* ctx           = nullptr;
     void*      dispatch_base = nullptr;   // atomic<void*>[] base
     int64_t    slot_count    = 0;

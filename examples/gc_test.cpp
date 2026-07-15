@@ -6,6 +6,12 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <chrono>
+#include <vector>
+#include <algorithm>
 
 using namespace ember::gc;
 
@@ -22,7 +28,7 @@ int main() {
     // [1] alloc + collect (empty heap)
     {
         GcHeap h;
-        const GcStats& s0 = h.stats();
+        GcStats s0 = h.stats();
         h.collect();
         ck(s0.live_objects == 0, "[1a] empty heap collect: live_objects==0");
         ck(h.stats().collections == 1, "[1b] collections==1 after first collect");
@@ -479,7 +485,7 @@ int main() {
         ck(h.stats().total_allocated == 3, "[19i] total_allocated still 3");
         // collect: b is rooted -> survives; nothing else to free.
         size_t freed_before = h.stats().freed_objects;
-        const GcStats& s = h.collect();
+        GcStats s = h.collect();
         ck(s.collections == 1, "[19j] collections==1 after one collect");
         ck(h.is_live(b), "[19k] rooted b survives collect");
         ck(h.stats().live_objects == 1, "[19l] live_objects==1 (b survived)");
@@ -492,6 +498,533 @@ int main() {
         ck(!h.is_live(b), "[19p] b collected after root removed");
         ck(h.stats().live_objects == 0, "[19q] live_objects==0 at end");
         ck(h.stats().freed_objects == 3, "[19r] freed_objects==3 (a,c via free_object + b via collect)");
+    }
+
+    // ====================================================================
+    // [20]-[28]: CONCURRENCY + RE-ENTRY SAFETY (the standalone collector
+    // core under multiple OS threads + same-thread registry mutation during
+    // callback/observer invocation).
+    //
+    // These tests pin the thread-safety contract the collector core must hold:
+    //   - concurrent allocation / root registration+removal / liveness checks /
+    //     write barriers / callback registration / immediate deletion
+    //     (free_object) / repeated collection must complete WITHOUT container
+    //     corruption, invalid iterator use, double-free, or inconsistent
+    //     counters; and
+    //   - a trace callback or barrier observer that registers or unregisters
+    //     ITSELF (or another entry) DURING invocation must not invalidate the
+    //     active iteration over the registry (snapshot semantics).
+    //
+    // They are RED on the pre-synchronization implementation: the old core
+    // has no heap lock (concurrent mutation of m_live / m_roots / m_trace_cbs /
+    // m_barrier_obs / m_stats is a data race -> corruption/crash/lost counts)
+    // AND range-iterates the callback/observer vectors while invoking user code
+    // that can mutate that same vector (same-thread iterator invalidation). The
+    // assertions below encode the full GREEN behavior and fail honestly on the
+    // old implementation (crash or invariant violation).
+    //
+    // Invariants every multithreaded test checks after joining all workers:
+    //   (I1) the process did not crash (we reached the assertions);
+    //   (I2) live_objects + freed_objects == total_allocated (every allocated
+    //        object is either still live or has been freed exactly once);
+    //   (I3) no counter went negative / inconsistent (stats are sane).
+    // ====================================================================
+
+    // [20] Re-entry: a trace callback that UNREGISTERS ITSELF during collect().
+    //      Two callbacks A (first) + B (second) each keep an object alive; A
+    //      unregisters itself from inside its own invocation. On the old core,
+    //      collect() range-iterates m_trace_cbs while A erases from it -> the
+    //      active iterator/reference is invalidated (B is skipped or the loop
+    //      runs off the end -> UB/crash). The GREEN contract is SNAPSHOT
+    //      semantics: collect() snapshots the registry before invoking, so A
+    //      unregistering itself mutates the live registry but NOT the snapshot
+    //      -> B is still invoked -> BOTH objects survive.
+    {
+        GcHeap h;
+        void* objA = h.alloc(8, refmap_none());
+        void* objB = h.alloc(8, refmap_none());
+        void* reportedA = objA;
+        void* reportedB = objB;
+        // GcTraceFn is a plain function pointer, so we pack everything the
+        // callback needs into one user_data struct. dummies[] captures the
+        // tokens of the throwaway callbacks A registers to FORCE a
+        // reallocation of m_trace_cbs during collect() (a bare erase may not
+        // always crash on every libc++, but a reallocation invalidates EVERY
+        // iterator/reference collect() holds -> deterministic crash on the old
+        // core). On the new core the snapshot is independent of the live
+        // vector, so the reallocation is harmless.
+        struct ACtx {
+            void* reported;
+            GcHeap* heap;
+            GcTraceToken token;
+            int* ran_flag;
+            GcTraceToken* dummies;
+            int* dummy_n;
+        };
+        int ranA = 0;
+        GcTraceToken dummies[16] = {0};
+        int dummyN = 0;
+        ACtx ac{ reportedA, &h, 0, &ranA, dummies, &dummyN };
+        // A (registered FIRST): report objA, unregister ITSELF, AND register a
+        // burst of no-op callbacks to force m_trace_cbs reallocation while
+        // collect() is iterating it. On the old core this invalidates the
+        // active iterator/reference (B skipped or crash). On the new core the
+        // snapshot was taken before invocation, so A mutating the live registry
+        // (erase + push_backs) is safe + B is still invoked from the snapshot.
+        GcTraceToken realA = h.register_trace_callback(&ac,
+            [](void* ud, GcTraceVisitor& v) {
+                ACtx* c = static_cast<ACtx*>(ud);
+                v.report(c->reported);
+                *c->ran_flag = 1;
+                // Register ~12 no-op callbacks to force a reallocation of
+                // m_trace_cbs (capacity 2 -> must grow). This is the reliable
+                // iterator-invalidation trigger.
+                for (int i = 0; i < 12; ++i) {
+                    c->dummies[*c->dummy_n] =
+                        c->heap->register_trace_callback(nullptr,
+                            [](void*, GcTraceVisitor&) {});
+                    (*c->dummy_n)++;
+                }
+                c->heap->unregister_trace_callback(c->token);
+            });
+        ac.token = realA;
+        // B (registered SECOND): report objB. If A's mutations invalidated the
+        // iterator, B is skipped -> objB reaped.
+        h.register_trace_callback(&reportedB,
+            [](void* ud, GcTraceVisitor& v) {
+                v.report(*static_cast<void**>(ud));
+            });
+        h.collect();
+        ck(ranA == 1, "[20a] self-unregistering callback A ran");
+        ck(h.is_live(objA), "[20b] A's object survives (A reported it before unregister)");
+        ck(h.is_live(objB), "[20c] B's object survives (B not skipped by iterator invalidation)");
+        ck(h.stats().live_objects == 2, "[20d] live_objects==2 (snapshot: both callbacks invoked)");
+        // A is now unregistered; a second collect keeps B but reaps A (no root).
+        h.collect();
+        ck(!h.is_live(objA), "[20e] A's object collected after A unregistered");
+        ck(h.is_live(objB), "[20f] B's object still survives");
+        // Clean up the dummy callbacks A registered.
+        for (int i = 0; i < dummyN; ++i) h.unregister_trace_callback(dummies[i]);
+    }
+
+    // [21] Re-entry: a trace callback that REGISTERS A NEW CALLBACK during
+    //      collect(). On the old core, push_back on m_trace_cbs may reallocate
+    //      the vector while collect() holds an iterator/reference into it ->
+    //      dangling reference / crash. The GREEN contract (snapshot semantics):
+    //      a callback registered DURING a collect() cycle is NOT invoked in
+    //      that same cycle (the snapshot was already taken); it IS invoked in
+    //      the NEXT cycle. We assert exactly that.
+    {
+        GcHeap h;
+        void* objA = h.alloc(8, refmap_none());
+        void* objNew = h.alloc(8, refmap_none());
+        void* reportedA = objA;
+        // newSlot is the void** the newly-registered callback will report
+        // (*newSlot). The during-collect callback registers a new callback
+        // backed by &newSlot; we set newSlot BEFORE each collect to choose
+        // which object that callback should keep alive.
+        void* newSlot = objNew;
+        struct Ctx { void* reported; void** slot; GcHeap* heap; GcTraceToken* out_tok; bool* did_reg; };
+        GcTraceToken newTok = 0;
+        bool didReg = false;
+        Ctx c{ reportedA, &newSlot, &h, &newTok, &didReg };
+        h.register_trace_callback(&c,
+            [](void* ud, GcTraceVisitor& v) {
+                Ctx* c = static_cast<Ctx*>(ud);
+                v.report(c->reported);
+                // Register a NEW callback during invocation, ONCE. On the old
+                // core this push_back can reallocate m_trace_cbs while collect()
+                // iterates it -> crash. On the new core the snapshot is
+                // unaffected; the new callback is deferred to the next cycle.
+                if (!*c->did_reg) {
+                    *c->out_tok = c->heap->register_trace_callback(c->slot,
+                        [](void* ud2, GcTraceVisitor& v2) {
+                            v2.report(*static_cast<void**>(ud2));
+                        });
+                    *c->did_reg = true;
+                }
+            });
+        // First collect: A reported -> objA survives. objNew is NOT reported
+        // this cycle (the new callback was registered mid-cycle, AFTER the
+        // snapshot was taken) -> objNew collected.
+        h.collect();
+        ck(h.is_live(objA), "[21a] A survives first collect");
+        ck(!h.is_live(objNew), "[21b] new-callback object collected first cycle (snapshot: not yet invoked)");
+        ck(newTok != 0, "[21c] new callback registered with a valid token");
+        // Second collect: the new callback is now in the registry -> it reports
+        // *newSlot (still objNew). But objNew was already freed last cycle; the
+        // visitor safely ignores the freed pointer. So objNew stays gone.
+        h.collect();
+        ck(h.is_live(objA), "[21d] A survives second collect");
+        ck(!h.is_live(objNew), "[21e] freed pointer not resurrected by new callback");
+        // Point newSlot at a FRESH object + collect: the now-active new
+        // callback reports it -> it survives.
+        void* objNew2 = h.alloc(8, refmap_none());
+        newSlot = objNew2;  // the callback reads *newSlot
+        h.collect();
+        ck(h.is_live(objNew2), "[21f] new callback active: its object survives next cycle");
+        h.unregister_trace_callback(newTok);
+        h.collect();
+        ck(!h.is_live(objNew2), "[21g] new-callback object reaped after unregister");
+    }
+
+    // [22] Re-entry: a barrier observer that UNREGISTERS ITSELF during
+    //      write_barrier(). On the old core, write_barrier() range-iterates
+    //      m_barrier_obs while the observer erases from it -> iterator
+    //      invalidation (the same bug as [20] for the barrier path). GREEN:
+    //      write_barrier() snapshots the observers before invocation, so a
+    //      self-unregistering observer mutates the live registry but not the
+    //      snapshot -> the second observer is still invoked.
+    {
+        GcHeap h;
+        void* owner = h.alloc(16, refmap_words({0}));
+        void* child = h.alloc(8, refmap_none());
+        // dummies[] captures tokens of throwaway observers A registers to FORCE
+        // a reallocation of m_barrier_obs during write_barrier() (a bare erase
+        // may not always crash, but a reallocation invalidates every iterator/
+        // reference write_barrier() holds -> deterministic crash on the old
+        // core). On the new core the snapshot is independent of the live vector.
+        struct OCtx { GcHeap* heap; GcBarrierToken token; int* fired; GcBarrierToken* dummies; int* dummy_n; };
+        int firedA = 0, firedB = 0;
+        GcBarrierToken dummies[16] = {0};
+        int dummyN = 0;
+        OCtx oa{ &h, 0, &firedA, dummies, &dummyN };
+        GcBarrierToken tokA = h.register_barrier_observer(&oa,
+            [](void* ud, void* o, void* c) {
+                OCtx* x = static_cast<OCtx*>(ud);
+                (*x->fired)++;
+                // Register ~12 no-op observers to force m_barrier_obs to
+                // reallocate (capacity 2 -> must grow) while write_barrier()
+                // iterates it. Reliable iterator-invalidation trigger.
+                for (int i = 0; i < 12; ++i) {
+                    x->dummies[*x->dummy_n] =
+                        x->heap->register_barrier_observer(nullptr,
+                            [](void*, void*, void*) {});
+                    (*x->dummy_n)++;
+                }
+                x->heap->unregister_barrier_observer(x->token);  // self-unregister
+                (void)o; (void)c;
+            });
+        oa.token = tokA;
+        struct BRec { int* fired; } br{ &firedB };
+        h.register_barrier_observer(&br,
+            [](void* ud, void* o, void* c) {
+                (*static_cast<BRec*>(ud)->fired)++;
+                (void)o; (void)c;
+            });
+        h.write_barrier(owner, child);
+        ck(firedA == 1, "[22a] self-unregistering observer A fired");
+        ck(firedB == 1, "[22b] observer B fired (not skipped by iterator invalidation)");
+        ck(h.stats().barrier_calls == 1, "[22c] barrier_calls==1");
+        // A is now unregistered; a second barrier fires only B.
+        h.write_barrier(owner, child);
+        ck(firedA == 1, "[22d] A not fired after self-unregister");
+        ck(firedB == 2, "[22e] B fired again");
+        ck(h.stats().barrier_calls == 2, "[22f] barrier_calls==2");
+        for (int i = 0; i < dummyN; ++i) h.unregister_barrier_observer(dummies[i]);
+    }
+
+    // [23] Re-entry: a barrier observer that REGISTERS A NEW OBSERVER during
+    //      write_barrier(). On the old core, push_back on m_barrier_obs may
+    //      reallocate while write_barrier() iterates it -> crash. GREEN: the
+    //      new observer is deferred (not fired in this same call; snapshot
+    //      already taken).
+    {
+        GcHeap h;
+        void* owner = h.alloc(16, refmap_words({0}));
+        void* child = h.alloc(8, refmap_none());
+        struct Ctx { GcHeap* heap; GcBarrierToken* out; int* reg_fired; bool* did_reg; };
+        int regFired = 0;
+        GcBarrierToken newTok = 0;
+        bool didReg = false;
+        Ctx c{ &h, &newTok, &regFired, &didReg };
+        h.register_barrier_observer(&c,
+            [](void* ud, void* o, void* ch) {
+                Ctx* c = static_cast<Ctx*>(ud);
+                // Register a NEW observer during invocation, ONCE. On the old
+                // core this push_back can reallocate m_barrier_obs while
+                // write_barrier() iterates it -> crash. On the new core the
+                // snapshot is unaffected; the new observer is deferred.
+                if (!*c->did_reg) {
+                    *c->out = c->heap->register_barrier_observer(c->reg_fired,
+                        [](void* ud2, void*, void*) {
+                            (*static_cast<int*>(ud2))++;
+                        });
+                    *c->did_reg = true;
+                }
+                (void)o; (void)ch;
+            });
+        h.write_barrier(owner, child);
+        ck(newTok != 0, "[23a] new observer registered with valid token");
+        ck(regFired == 0, "[23b] new observer NOT fired in the same call (snapshot semantics)");
+        ck(h.stats().barrier_calls == 1, "[23c] barrier_calls==1");
+        // Next barrier: the new observer IS in the registry now -> fires.
+        h.write_barrier(owner, child);
+        ck(regFired == 1, "[23d] new observer fires on the next barrier");
+        ck(h.stats().barrier_calls == 2, "[23e] barrier_calls==2");
+        h.unregister_barrier_observer(newTok);
+    }
+
+    // --------------------------------------------------------------------
+    // Multithreaded tests. Each spawns N worker threads that hammer a shared
+    // GcHeap concurrently, then joins all + checks the (I1)/(I2)/(I3)
+    // invariants. On the old (unsynchronized) core these are data races on
+    // std::unordered_set / std::vector / size_t counters -> corruption,
+    // double-free, or crash. On the synchronized core (coarse heap lock) they
+    // complete with consistent state.
+    // --------------------------------------------------------------------
+    const int HW = std::max(2, int(std::thread::hardware_concurrency()));
+    // Cap the worker count so the test stays fast + deterministic-ish under
+    // the build-timeout; use at least 4 threads to force real contention even
+    // on low-core CI boxes.
+    const int NTHREADS = HW < 4 ? 4 : (HW > 8 ? 8 : HW);
+
+    // [24] concurrent allocation + repeated collection (no roots).
+    //      N-1 threads allocate K objects each (unrooted); 1 thread repeatedly
+    //      collects while they do. Invariant: completes; live+freed==total;
+    //      a final collect reaps every unrooted object -> live==0.
+    //
+    //      Stop protocol: the collect worker loops on `running` until the
+    //      alloc workers have ALL finished (we join them first), then the main
+    //      thread clears `running` and joins the collect worker. (Joining the
+    //      collect worker before signalling stop would deadlock: it would loop
+    //      forever waiting for a flag only set after its own join.)
+    {
+        GcHeap h;
+        const int K = 4000;
+        std::atomic<bool> running{true};
+        std::vector<std::thread> alloc_ths;
+        auto alloc_worker = [&]() {
+            for (int i = 0; i < K; ++i) {
+                void* p = h.alloc(16, refmap_none());
+                (void)p;  // unrooted -> collectable
+            }
+        };
+        auto collect_worker = [&]() {
+            while (running.load(std::memory_order_relaxed)) {
+                h.collect();
+            }
+        };
+        for (int t = 0; t < NTHREADS - 1; ++t) alloc_ths.emplace_back(alloc_worker);
+        std::thread collect_th(collect_worker);
+        for (auto& th : alloc_ths) th.join();   // alloc workers finish after K
+        running.store(false, std::memory_order_relaxed);  // signal collect worker to stop
+        collect_th.join();
+        GcStats s = h.stats();
+        ck(s.total_allocated == size_t((NTHREADS - 1) * K), "[24a] total_allocated == (N-1)*K");
+        ck(s.live_objects + s.freed_objects == s.total_allocated, "[24b] invariant: live+freed==total");
+        h.collect();  // reap any remaining unrooted
+        s = h.stats();
+        ck(s.live_objects == 0, "[24c] final collect reaped all unrooted -> live==0");
+        ck(s.freed_objects == s.total_allocated, "[24d] freed==total at end");
+    }
+
+    // [25] concurrent root registration/removal + liveness checks.
+    //      PHASED design (avoids the alloc-to-root sequence-atomicity window):
+    //      the core coarse lock makes individual ops (alloc / add_root /
+    //      collect / remove_root / is_live) atomic, but it does NOT make a
+    //      multi-op sequence (alloc -> add_root) atomic across ops — a
+    //      concurrent collect by another thread can reap an object in that
+    //      window (that is the higher-level stop-the-world protocol's job,
+    //      documented in gc.hpp). So we keep concurrent collect OUT of the
+    //      alloc-to-root window:
+    //        phase 1: N threads each alloc K objects + root them (no collect).
+    //        phase 2: main collects once -> every rooted object survives.
+    //        phase 3: N threads each unroot their K objects (no collect).
+    //        phase 4: main collects once -> every object reaped.
+    //      This exercises concurrent add_root / remove_root / is_live /
+    //      alloc (phase 1+3) + liveness after a real collect (phase 2+4)
+    //      without relying on sequence atomicity the core lock does not give.
+    //      Invariants: no crash; live+freed==total; phase2 live==N*K; phase4
+    //      live==0.
+    {
+        GcHeap h;
+        const int K = 1500;
+        // Each thread owns K (object, slot) pairs in its own vector so the
+        // root slots stay alive + stable across phases.
+        struct Slot { void* obj; void* ptr; };
+        std::vector<std::vector<Slot>> per_thread(NTHREADS);
+        auto root_worker = [&](int tid) {
+            auto& mine = per_thread[tid];
+            mine.reserve(K);  // no reallocation: &mine[i].ptr stays stable
+            for (int i = 0; i < K; ++i) {
+                void* obj = h.alloc(16, refmap_none());
+                mine.push_back(Slot{ obj, obj });  // stable address now
+                Slot& s = mine.back();
+                h.add_root(&s.ptr);   // root the STABLE vector slot (concurrent add_root)
+                if (!h.is_live(obj)) { g_fail = 1; std::printf("  [FAIL] [25] obj not live right after alloc+root\n"); }
+            }
+        };
+        std::vector<std::thread> ths;
+        for (int t = 0; t < NTHREADS; ++t) ths.emplace_back(root_worker, t);
+        for (auto& th : ths) th.join();   // phase 1 done: all rooted
+        GcStats s = h.stats();
+        ck(s.total_allocated == size_t(NTHREADS * K), "[25a] total_allocated == N*K after phase 1");
+        h.collect();                      // phase 2: every rooted object must survive
+        s = h.stats();
+        ck(s.live_objects == size_t(NTHREADS * K), "[25b] phase 2: all rooted objects survived collect");
+        ck(s.freed_objects == 0, "[25c] phase 2: nothing freed (all rooted)");
+        // verify every object is still live via is_live (concurrent-read safe)
+        for (auto& mine : per_thread) for (auto& sl : mine)
+            if (!h.is_live(sl.obj)) { g_fail = 1; std::printf("  [FAIL] [25] rooted obj not live after phase 2 collect\n"); }
+        ths.clear();
+        auto unroot_worker = [&](int tid) {
+            for (auto& sl : per_thread[tid]) h.remove_root(&sl.ptr);  // concurrent remove_root
+        };
+        for (int t = 0; t < NTHREADS; ++t) ths.emplace_back(unroot_worker, t);
+        for (auto& th : ths) th.join();   // phase 3 done: all unrooted
+        h.collect();                      // phase 4: every object reaped
+        s = h.stats();
+        ck(s.live_objects == 0, "[25d] phase 4: all objects reaped after unroot+collect");
+        ck(s.live_objects + s.freed_objects == s.total_allocated, "[25e] invariant: live+freed==total");
+        ck(s.freed_objects == s.total_allocated, "[25f] freed==total at end");
+    }
+
+    // [26] concurrent immediate deletion (free_object) + collection.
+    //      Each thread allocs K objects, free_object's the even-indexed ones
+    //      (each freed EXACTLY once — no re-free), and periodically collects
+    //      concurrently with the other threads. The odd-indexed objects are
+    //      left unrooted for the collectors to reap. Invariant: no crash; no
+    //      double-free / corruption (freed==total at end); live+freed==total.
+    //
+    //      NOTE: we do NOT re-free the same pointer here (unlike the
+    //      single-threaded [17]). Under concurrency the allocator may RECYCLE
+    //      a just-freed address into another thread's alloc, so a stale
+    //      free_object would free an UNRELATED live object (a use-after-free
+    //      that is the caller's contract per gc.hpp, not a GC bug). The
+    //      deterministic double-free-rejects contract is pinned single-
+    //      threaded in [17]; this test pins the CONCURRENT safety of
+    //      free_object (no corruption / inconsistent counters under load).
+    {
+        GcHeap h;
+        const int K = 2000;
+        std::atomic<size_t> freed_calls{0};
+        std::vector<std::thread> ths;
+        auto worker = [&]() {
+            std::vector<void*> objs;
+            objs.reserve(K);
+            for (int i = 0; i < K; ++i) objs.push_back(h.alloc(16, refmap_none()));
+            for (int i = 0; i < K; ++i) {
+                if (i % 2 == 0) {
+                    if (h.free_object(objs[i]))           // each freed exactly once
+                        freed_calls.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (i % 500 == 0) h.collect();  // concurrent collect while others free
+            }
+            h.collect();
+        };
+        for (int t = 0; t < NTHREADS; ++t) ths.emplace_back(worker);
+        for (auto& th : ths) th.join();
+        GcStats s = h.stats();
+        ck(s.total_allocated == size_t(NTHREADS * K), "[26a] total_allocated == N*K");
+        ck(s.live_objects + s.freed_objects == s.total_allocated, "[26b] invariant: live+freed==total");
+        ck(s.live_objects == 0, "[26c] all reaped by end (odd collected, even free_object'd)");
+        ck(s.freed_objects == s.total_allocated, "[26d] freed==total (no corruption/double-free)");
+        ck(freed_calls.load() <= size_t(NTHREADS * (K / 2)), "[26e] free_object succeeded <= N*(K/2) (rest reaped by concurrent collect)");
+    }
+
+    // [27] concurrent write barriers + observer registration/removal.
+    //      Each thread allocs an owner+child, registers an observer, hammers
+    //      write_barrier(owner,child), then unregisters. barrier_calls must
+    //      equal the total number of valid barrier events (each thread counts
+    //      its own). No crash; counter consistent.
+    {
+        GcHeap h;
+        const int K = 2000;
+        std::atomic<size_t> expected_barriers{0};
+        std::atomic<size_t> obs_fires{0};
+        std::vector<std::thread> ths;
+        struct Obs { std::atomic<size_t>* fires; };
+        auto worker = [&]() {
+            void* owner = h.alloc(16, refmap_words({0}));
+            void* child = h.alloc(8, refmap_none());
+            std::memcpy(owner, &child, 8);
+            Obs rec{ &obs_fires };
+            GcBarrierToken tok = h.register_barrier_observer(&rec,
+                [](void* ud, void*, void*) {
+                    static_cast<Obs*>(ud)->fires->fetch_add(1, std::memory_order_relaxed);
+                });
+            size_t mine = 0;
+            for (int i = 0; i < K; ++i) {
+                if (h.is_live(owner) && h.is_live(child)) {
+                    h.write_barrier(owner, child);
+                    ++mine;
+                }
+            }
+            expected_barriers.fetch_add(mine, std::memory_order_relaxed);
+            h.unregister_barrier_observer(tok);
+            // keep owner+child alive so the observer reads stay valid.
+        };
+        for (int t = 0; t < NTHREADS; ++t) ths.emplace_back(worker);
+        for (auto& th : ths) th.join();
+        GcStats s = h.stats();
+        // Each valid barrier bumps barrier_calls exactly once. With N threads
+        // each registering its OWN observer, a single barrier event fires every
+        // currently-registered observer (up to N), so obs_fires may be up to
+        // N*barrier_calls (NOT <= barrier_calls). barrier_calls itself is the
+        // authoritative per-event count.
+        ck(s.barrier_calls == expected_barriers.load(), "[27a] barrier_calls == sum of valid barriers per thread");
+        ck(obs_fires.load() <= size_t(NTHREADS) * s.barrier_calls, "[27b] observer fires <= N*barrier_calls (each barrier fires all registered observers)");
+        ck(obs_fires.load() > 0, "[27c] at least one observer fired");
+        ck(s.live_objects + s.freed_objects == s.total_allocated, "[27d] invariant: live+freed==total");
+    }
+
+    // [28] concurrent callback registration + collection (phased).
+    //      Same phased rationale as [25]: the core lock makes individual ops
+    //      atomic but NOT the alloc->register-callback sequence, so a
+    //      concurrent collect could reap an object in that window. We keep
+    //      concurrent collect out of the window:
+    //        phase 1: N threads each alloc K objects + register a trace
+    //                 callback reporting each (no collect).
+    //        phase 2: main collects once -> every callback-reported object
+    //                 survives (concurrent m_trace_cbs registration is now
+    //                 stable; the snapshot covers all N*K callbacks).
+    //        phase 3: N threads each unregister their K callbacks (no collect).
+    //        phase 4: main collects once -> every object reaped.
+    //      Exercises concurrent register_trace_callback / unregister_trace_callback
+    //      + a real collect over the full registry. No crash; live+freed==total.
+    {
+        GcHeap h;
+        const int K = 800;
+        struct Entry { void* obj; void* slot; GcTraceToken tok; };
+        std::vector<std::vector<Entry>> per_thread(NTHREADS);
+        auto reg_worker = [&](int tid) {
+            auto& mine = per_thread[tid];
+            mine.reserve(K);  // no reallocation: &mine[i].slot stays stable
+            for (int i = 0; i < K; ++i) {
+                void* obj = h.alloc(16, refmap_none());
+                mine.push_back(Entry{ obj, obj, 0 });   // stable address now
+                Entry& e = mine.back();
+                // Register the callback against the STABLE vector slot
+                // (&e.slot), not a local. The callback reports *slot == obj.
+                e.tok = h.register_trace_callback(&e.slot,
+                    [](void* ud, GcTraceVisitor& v) {
+                        v.report(*static_cast<void**>(ud));
+                    });
+            }
+        };
+        std::vector<std::thread> ths;
+        for (int t = 0; t < NTHREADS; ++t) ths.emplace_back(reg_worker, t);
+        for (auto& th : ths) th.join();   // phase 1 done: all callbacks registered
+        GcStats s = h.stats();
+        ck(s.total_allocated == size_t(NTHREADS * K), "[28a] total_allocated == N*K after phase 1");
+        h.collect();                      // phase 2: every callback-reported object survives
+        s = h.stats();
+        ck(s.live_objects == size_t(NTHREADS * K), "[28b] phase 2: all callback-reported objects survived collect");
+        ck(s.freed_objects == 0, "[28c] phase 2: nothing freed (all callback-rooted)");
+        for (auto& mine : per_thread) for (auto& e : mine)
+            if (!h.is_live(e.obj)) { g_fail = 1; std::printf("  [FAIL] [28] callback-reported obj not live after phase 2 collect\n"); }
+        ths.clear();
+        auto unreg_worker = [&](int tid) {
+            for (auto& e : per_thread[tid]) h.unregister_trace_callback(e.tok);  // concurrent unregister
+        };
+        for (int t = 0; t < NTHREADS; ++t) ths.emplace_back(unreg_worker, t);
+        for (auto& th : ths) th.join();   // phase 3 done: all unregistered
+        h.collect();                      // phase 4: every object reaped
+        s = h.stats();
+        ck(s.live_objects == 0, "[28d] phase 4: all objects reaped after unregister+collect");
+        ck(s.live_objects + s.freed_objects == s.total_allocated, "[28e] invariant: live+freed==total");
+        ck(s.freed_objects == s.total_allocated, "[28f] freed==total at end");
     }
 
     std::printf("\ngc_test: %s\n", g_fail ? "FAIL" : "PASS");

@@ -2,10 +2,10 @@
 //
 // An ember *extension* (see ember/extensions/README.md): a reusable, non-
 // cheat-specific addon. This wires the standalone ember::gc::GcHeap core
-// (src/gc.{hpp,cpp}) into the engine as a host-owned, process-wide managed
+// (src/gc.{hpp,cpp}) into the engine as a context-owned, shareable managed
 // heap for lambda closure environments (#20) and (future) coroutine suspended
-// frames (#21). It mirrors ext_coroutine's host-setup shape: a thread-local
-// host-owned store behind opaque i64 handles, register_natives/init/reset.
+// frames (#21). It mirrors ext_coroutine's host-setup shape: a host-owned
+// store behind opaque i64 handles, register_natives/init/reset.
 //
 // === WHY THIS EXISTS ======================================================
 //
@@ -204,10 +204,20 @@
 //    follow-up because coroutines currently run on Windows-fiber stacks (the
 //    frame is the fiber stack, not a heap object) and converting that needs a
 //    heap-allocated frame design.
-// 4. Per-context heaps: the GcHeap is thread-local today (one per OS thread),
-//    mirroring context_t's per-thread model. A shared multi-context heap with
-//    the GcHeap's own mutex (the core notes this as a follow-up) is a later
-//    refinement for the in-context-threads addon.
+// 4. DONE (concurrent-entry integration): the GcHeap is now context-OWNED +
+//    SHARABLE. gc_attach_context attaches a context to a shared GcRuntime (a
+//    GcHeap + pin layer + execution-participant registry) whose lifetime is
+//    held by shared_ptr across every attached thread; a spawned worker joins
+//    the SAME runtime via gc_thread_enter (capturing the host context's opaque
+//    gc_runtime back-pointer) so all workers + the host allocate into ONE heap
+//    visible from any participant after the workers join. The cooperative
+//    stop-the-world collector (gc_collect) blocks new entries, waits for every
+//    other active participant to park at a GC safepoint or exit, scans every
+//    participant's per-thread gc_frame_head plus the shared immutable global
+//    roots, collects under the synchronized GcHeap, then resumes the parked
+//    participants. Callers WITHOUT an attached context still get a private
+//    thread-local runtime (the inert fallback), so non-GC + single-threaded
+//    hosts are byte-identical to the pre-shared-heap behavior.
 
 #pragma once
 #include "sema.hpp"        // NativeSig
@@ -405,47 +415,94 @@ bool gc_unregister_barrier_observer(gc::GcBarrierToken token);
 bool gc_runtime_initialized();
 
 // ===========================================================================
-// Precise root scanning: context attachment (shadow stack + global roots).
+// Precise root scanning: context attachment (shadow stack + global roots) +
+// the cooperative stop-the-world participant protocol.
 //
 // The JIT'd code maintains a linked active-frame record chain (the "shadow
 // stack") whose head lives in context_t::gc_frame_head, and each frame's
 // compile-time GC-slot map is baked into its prologue. For the collector to
-// SEE those roots, a trace callback (the c1 mechanism) must walk the chain +
-// the context's global-root descriptor and report each mapped slot's value.
+// SEE those roots, a trace callback must walk the chain + the shared global-
+// root descriptor and report each mapped slot's value.
 //
-// gc_attach_context registers that trace callback on the current thread-local
-// heap with user_data = &ctx, and stores `global_roots` into ctx.gc_global_roots
-// so the callback can find the global GC-pointer words. It must be called BEFORE
-// running JIT'd code that may trigger a collection (an explicit gc_collect or
-// an auto-collect at the env-alloc threshold). gc_detach_context unregisters
-// the callback (e.g. before the context is destroyed) so the heap never holds
-// a dangling &ctx. gc_reset() does NOT auto-detach (it clears the heap's
-// registrations via clear(), which invalidates the token, but the host should
-// still call detach to keep its bookkeeping straight); calling detach after
-// gc_reset is a safe no-op.
+// gc_attach_context attaches `ctx` to a shared GcRuntime (a GcHeap + pin layer
+// + execution-participant registry), creating the runtime on demand, registers
+// `ctx` as a PARTICIPANT on that runtime, installs the shared `global_roots`
+// descriptor on the runtime (and on ctx.gc_global_roots), and records the
+// runtime's opaque pointer on ctx.gc_runtime so a spawned worker can capture
+// it. The runtime's trace callback (registered once at creation) walks every
+// registered participant's per-thread gc_frame_head + the shared immutable
+// global roots on each collect. gc_attach_context must be called BEFORE
+// running JIT'd code that may trigger a collection. gc_detach_context
+// unregisters the participant + clears ctx.gc_runtime so the runtime never
+// holds a dangling &ctx. gc_reset() clears the active runtime's heap +
+// participant list; calling detach after reset is a safe no-op.
 //
-// The collection natives (__ember_gc_collect / gc_collect) do NOT need the
-// context pointer directly: the trace callback registered here IS how they
-// obtain the active context's roots (the callback captures &ctx at attach
-// time). A host that never attaches a context gets the legacy behavior
-// (explicit pin roots only); a host that attaches gets precise stack + global
-// root scanning on every collect.
+// gc_thread_enter / gc_thread_exit are the WORKER-thread entry/exit pair: a
+// spawned OS thread (created by the thread extension) calls gc_thread_enter
+// with the host context's opaque gc_runtime back-pointer + the worker's OWN
+// per-call context_t before entering JIT'd code, so the worker joins the SAME
+// shared heap + registers its own shadow-stack head as a participant; it calls
+// gc_thread_exit on every normal + trapped exit so no abandoned participant
+// record remains registered. The collection natives obtain every participant's
+// roots via the runtime trace callback (no per-context pointer is passed to
+// them). A host that never attaches a context gets the inert thread-local
+// fallback (explicit pin roots only); a host that attaches gets precise stack
+// + global root scanning across every participant on every collect.
 // ===========================================================================
 
-// Attach a context (with its global-root descriptor) to the current thread-
-// local heap for precise root scanning. Registers the frame-chain + global-
-// roots trace callback. `global_roots` may be nullptr (stack-only scanning).
-// Returns true on success, false if there is no thread-local heap yet (call
-// gc_init() first) or the context is null. Idempotent re-attach on the SAME
-// context updates the global-roots pointer without double-registering; re-
-// attach on a DIFFERENT context detaches the previous one first.
+// Attach a context (with its global-root descriptor) to a shared GcRuntime for
+// precise root scanning + cooperative stop-the-world participation. Creates
+// the runtime on demand, registers `ctx` as a participant, installs the shared
+// `global_roots` descriptor, and records the runtime's opaque pointer on
+// ctx.gc_runtime. `global_roots` may be nullptr (stack-only scanning).
+// Idempotent re-attach on the SAME context updates the global-roots pointer
+// without double-registering; re-attach on a DIFFERENT context detaches the
+// previous one first. Returns true on success, false if `ctx` is null.
 bool gc_attach_context(context_t* ctx, gc::GcGlobalRoots* global_roots);
 
-// Detach the context from the current thread-local heap (unregister the
-// frame-chain + global-roots trace callback). Safe to call when no context is
-// attached (no-op). After this, collection finds no stack/global roots from
-// this context (only explicit pin roots remain). Does NOT touch the context
-// (the caller owns it).
+// Detach the context from its shared GcRuntime (unregister the participant +
+// clear ctx.gc_runtime). Safe to call when no context is attached (no-op).
+// After this, the runtime's collector no longer scans this context's stack
+// roots (only explicit pin roots + other participants' roots remain). Does NOT
+// touch the context (the caller owns it).
 void gc_detach_context(context_t* ctx);
+
+// Worker-thread entry: join the shared GcRuntime identified by
+// `runtime_opaque` (the host context's ctx.gc_runtime back-pointer, captured
+// at thread_spawn) + register `ctx` as a participant on it, so the worker
+// allocates into the SAME shared heap + its per-thread gc_frame_head is scanned
+// by the cooperative stop-the-world collector. Installs the runtime's shared
+// global-roots descriptor on ctx.gc_global_roots + the runtime pointer on
+// ctx.gc_runtime. Sets the calling thread's active runtime to the shared one.
+// Returns true on success, false if `runtime_opaque` is null/expired (the
+// runtime was destroyed) or `ctx` is null — in the failure case the worker
+// runs WITHOUT a shared heap (its allocations go to a private thread-local
+// fallback heap, never visible from the host, so a shared-heap test would
+// observe the loss; the worker still runs safely).
+bool gc_thread_enter(void* runtime_opaque, context_t* ctx);
+
+// Worker-thread exit: unregister `ctx` from its shared GcRuntime participant
+// list + clear ctx.gc_runtime so no abandoned participant record remains.
+// Called on EVERY worker exit (normal return AND trapped longjmp cleanup) so a
+// trap cannot leave a dangling participant. If a cooperative stop-the-world
+// collect is in progress on another thread, this marks the participant parked
+// + waits for the collect to finish before unregistering, so the collector
+// never scans a context that is being torn down. Safe to call when no
+// participant is registered (no-op). Does NOT touch the context.
+void gc_thread_exit(context_t* ctx);
+
+// Cooperative-STW safepoint for a participant blocked in a NON-GC native
+// (notably thread_join, which waits on a slot condition variable). A
+// participant blocked in thread_join is NOT executing JIT'd code, so its
+// gc_frame_head is stable -- it is a valid GC safepoint. thread_join calls
+// this in its wait loop so a concurrent gc_collect's unbounded wait observes
+// the joiner parked (within one poll interval) + can proceed, instead of
+// waiting forever for a joiner that is itself waiting for the collector's
+// worker to finish (a deadlock). No-op when no collect is in progress or this
+// thread is the collector / has no participant record. This is the "another
+// mechanism that guarantees all active participants quiesce": every
+// participant is either at a GC-native safepoint, at this join safepoint, or
+// exits -- so the collector's unbounded wait completes in bounded wall time.
+void gc_park();
 
 } // namespace ember::ext_gc

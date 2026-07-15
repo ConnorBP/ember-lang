@@ -143,6 +143,11 @@ struct CallResult {
     bool trapped = false;       // a trap fired + longjmp'd back to the checkpoint
     int64_t value = 0;          // i64 return (void form: 0)
     std::string reason;         // structured diagnostic on failure/trap
+    TrapReason trap_reason = TrapReason::None;  // numeric trap reason (set BEFORE
+                                // reset_for_call clears ctx.last_trap, so a
+                                // caller that needs the numeric code — e.g. a
+                                // keyed thread worker reporting the slot's
+                                // trap_reason — reads it here, not ctx.last_trap)
 };
 
 // Safe keyed outer-call APIs (§9.8). They establish:
@@ -221,8 +226,8 @@ CallResult ember_call_keyed_i64_i64_by_slot(ModuleInstance& inst, uint32_t logic
 // pointer escape a guarded region must use resolve_entry_keyed_leased below,
 // which holds the guard across the callback, or take its own guard). The route
 // word is a transient; it is never stored.
-// (LogicalCallableId + ember_current_keyed_runtime are declared in
-// module_instance.hpp.)
+// (LogicalCallableId + ember_current_keyed_runtime + ember_current_keyed_context
+// are declared in module_instance.hpp.)
 ExtensionResult<void*> resolve_entry_keyed(ModuleInstance& inst,
                                            const LogicalCallableId& id,
                                            const DispatchKeyAdapter& adapter);
@@ -254,6 +259,8 @@ struct LeaseResult {
     bool trapped = false;       // body trapped + longjmp'd back to the lease checkpoint
     int64_t value = 0;          // body's i64 return (normal)
     std::string reason;         // structured diagnostic on failure/trap
+    TrapReason trap_reason = TrapReason::None;  // numeric trap reason (set BEFORE
+                                // reset_for_call clears ctx.last_trap)
 };
 // The callback body signature: receives the resolved non-null entry + the
 // caller's context (so body can invoke via the keyed re-entry thunk or a raw

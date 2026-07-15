@@ -1,21 +1,31 @@
 // ext_thread.cpp - ember extension: in-context threads (Tier 4).
 // See ext_thread.hpp for the scope statement + correctness model.
 //
-// Red 8 (§6.6, §10.3, §12.4): DUAL-HOMED thread registry. The keyed path
-// targets a SPECIFIC ModuleInstance's per-runtime state; the worker:
-//   - captures a shared_ptr<ModuleInstance> (shared lifetime ownership, §6.6,
-//     §10.3) so the instance (dispatch record + provider + entry table) stays
-//     alive for the worker's whole execution — a host destroying the runtime
-//     while a worker is in-flight does not dangle the worker's borrowed refs;
-//   - owns its OWN context_t (§6.6: "Each independently entered OS thread owns
-//     its own context_t under the normal model") — no shared call_mutex, no
-//     host-context contention;
-//   - re-resolves its logical entry at EXECUTION time through the guarded
-//     core keyed-call API (ember_call_keyed_i64_by_slot, §9.8/§6.5) — NOT a
-//     raw ember_keyed_reentry_i64 thunk. The core API establishes the
-//     current-runtime TLS, the recoverable checkpoint, the reload/generation
-//     guard, and cleans up on every normal AND trapped exit. The raw thunk
-//     does NONE of those, so it MUST NOT be used here (task constraint).
+// CONCURRENT ENTRY (replaces the legacy save/restore + call_mutex
+// serialization + the keyed worker's disconnected private context_t). Both the
+// legacy + keyed workers now enter JIT'd code CONCURRENTLY through the one
+// shared dispatch context active at thread_spawn, each with its OWN per-call
+// context_t seeded from the host context's settings (budget, max_call_depth,
+// the shared typed-global root descriptor, the shared GC runtime pointer).
+// There is NO call_mutex + NO save/restore: the host's context_t is untouched
+// while workers run concurrently, so true parallel execution is possible
+// (>= 2 workers inside JIT at once) and catch stacks / call depth / trap
+// checkpoints do NOT cross threads.
+//
+//   * Legacy worker: seeds from the context supplied to thread_init (the
+//     host's context) + resolves its entry from the registered dispatch table
+//     (atomic acquire read). Enters via ember_call_i64 with its own context.
+//   * Keyed worker (§6.5, §6.6, §9.8, §10.3, §12.4): captures a
+//     shared_ptr<ModuleInstance> (shared lifetime ownership) so the instance
+//     + its borrowed dispatch record / provider / entry table stay alive for
+//     the worker's whole execution; captures the current shared context from
+//     the keyed host boundary (ember_current_keyed_context) as the seed
+//     source; re-resolves its logical entry at EXECUTION time through the
+//     GUARDED CORE keyed-call API (ember_call_keyed_i64_by_slot) — the core
+//     API establishes the current-runtime TLS, the recoverable checkpoint, the
+//     reload/generation guard, and cleans up on every normal AND trapped exit.
+//     The raw ember_keyed_reentry_i64 thunk does NONE of those and MUST NOT be
+//     used here (task constraint).
 //
 // KEYED FAIL-CLOSED (task constraint): when the TLS current-keyed-runtime is
 // active but ext_state is null, the keyed store selector does NOT fall back to
@@ -23,11 +33,16 @@
 // keyed runtime is active does the legacy identity path target the file-static
 // default store.
 //
-// JOIN LOCKING (task constraint): thread_join_keyed does NOT unconditionally
-// unlock a mutex it never locked. The keyed worker owns its own context (no
-// shared call_mutex), so join is a simple wait-for-done + thread-join + slot-
-// retire. The legacy n_thread_join still uses the shared-context call_mutex
-// model (lock/unlock ownership-explicit: it unlocks only what it locked).
+// JOIN LOCKING (task constraint): thread_join + thread_join_keyed wait ONLY on
+// slot synchronization (done + the OS thread join). They do NOT unlock/relock a
+// shared call_mutex (there is none), so nested spawn/join is deadlock-free.
+//
+// GC INTEGRATION: when the seed context carries a shared GC runtime
+// (ctx.gc_runtime), the worker joins it (ext_gc::gc_thread_enter) before
+// entering JIT + leaves it (ext_gc::gc_thread_exit) on every normal + trapped
+// exit, so the worker shares the ONE context-owned heap + its shadow-stack head
+// is scanned by the cooperative stop-the-world collector, and a trap cannot
+// leave an abandoned participant record.
 //
 // Layout-safety: both stores use the SAME ThreadSlot type
 // (ThreadRuntimeState::ThreadSlot), no reinterpret_cast aliasing.
@@ -38,7 +53,9 @@
 #include "module_instance.hpp"
 #include "key_provider.hpp"
 #include "runtime_extension_state.hpp"
+#include "../gc/ext_gc.hpp"     // gc_thread_enter / gc_thread_exit (shared heap)
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <limits>
@@ -134,71 +151,100 @@ static void* resolve_entry_legacy(int64_t handle, void* dispatch_base, int64_t s
     return slots[size_t(handle)].load(std::memory_order_acquire);
 }
 
-struct SavedState {
-    int64_t   budget_remaining;
-    int32_t   call_depth;
-    int32_t   max_call_depth;
-    TrapReason last_trap;
-    int32_t   catch_depth;
-    int32_t   catch_pad;
-    int64_t   thrown_value;
-    bool      has_checkpoint;
-    jmp_buf   checkpoint;
-    std::string last_error;
+// The worker seed settings, captured BY VALUE at thread_spawn time (Fix: the
+// previous version passed a raw host context_t* to the worker, which then read
+// budget/max_call_depth/gc fields from it LATER -- by which time the host could
+// have mutated budget/state between spawn and the worker's seed read, a data
+// race on the host context). Capturing the seed settings by value at spawn +
+// copying them into the std::thread's argument makes the worker's seed a
+// stable snapshot of the host context's settings at the spawn instant. The
+// gc_global_roots descriptor + the gc_runtime back-pointer are shared
+// (immutable / owned by the runtime) so copying the pointers is correct.
+struct SeedSettings {
+    int64_t budget_remaining = 2'000'000'000LL;
+    int32_t max_call_depth   = DEFAULT_MAX_CALL_DEPTH;
+    gc::GcGlobalRoots* gc_global_roots = nullptr;  // shared immutable descriptor
+    void*   gc_runtime = nullptr;                  // shared runtime back-pointer (or null)
+    bool    valid = false;                          // a seed context was captured
 };
 
-static void save_state(context_t* ctx, SavedState& s) {
-    s.budget_remaining = ctx->budget_remaining;
-    s.call_depth       = ctx->call_depth;
-    s.max_call_depth   = ctx->max_call_depth;
-    s.last_trap        = ctx->last_trap;
-    s.catch_depth      = ctx->catch_depth;
-    s.catch_pad        = ctx->_catch_pad;
-    s.thrown_value     = ctx->thrown_value;
-    s.has_checkpoint   = ctx->has_checkpoint;
-    std::memcpy(s.checkpoint, ctx->checkpoint, sizeof(jmp_buf));
-    s.last_error       = ctx->last_error;
+// Capture the seed settings BY VALUE from a host context (at spawn time).
+static SeedSettings capture_seed(const context_t* seed) {
+    SeedSettings s;
+    if (seed) {
+        s.budget_remaining = seed->budget_remaining;
+        s.max_call_depth   = seed->max_call_depth;
+        s.gc_global_roots  = seed->gc_global_roots;  // shared immutable descriptor
+        s.gc_runtime       = seed->gc_runtime;       // shared runtime back-pointer
+        s.valid = true;
+    }
+    return s;
 }
 
-static void restore_state(context_t* ctx, const SavedState& s) {
-    ctx->budget_remaining = s.budget_remaining;
-    ctx->call_depth       = s.call_depth;
-    ctx->max_call_depth   = s.max_call_depth;
-    ctx->last_trap        = s.last_trap;
-    ctx->catch_depth      = s.catch_depth;
-    ctx->_catch_pad       = s.catch_pad;
-    ctx->thrown_value     = s.thrown_value;
-    ctx->has_checkpoint   = s.has_checkpoint;
-    std::memcpy(ctx->checkpoint, s.checkpoint, sizeof(jmp_buf));
-    ctx->last_error       = s.last_error;
+// Seed a worker's OWN per-call context_t from the captured seed settings. The
+// worker gets private checkpoint / budget / call depth / catch stack /
+// gc_frame_head (so concurrent entry + trap isolation + catch isolation hold),
+// while sharing the host's max_call_depth, the shared typed-global root
+// descriptor, and the shared GC runtime back-pointer. The trap stub is baked
+// into the JIT'd code (a direct call address), so the worker's per-call context
+// does NOT carry it -- the stub receives the worker's context via r14 and
+// longjmps to THIS context's checkpoint (per-worker trap isolation). Returns
+// the shared GC runtime opaque pointer (or nullptr) so the worker can join the
+// shared heap.
+static void* seed_worker_context(context_t& wctx, const SeedSettings& seed) {
+    wctx.budget_remaining = seed.budget_remaining;
+    wctx.max_call_depth   = seed.max_call_depth;
+    wctx.gc_global_roots  = seed.gc_global_roots;  // shared immutable descriptor
+    return seed.gc_runtime;                        // shared runtime back-pointer (or null)
 }
 
-static void thread_worker_legacy(void* entry, context_t* ctx, int64_t arg,
+// ── Legacy worker: concurrent entry through the shared dispatch table ───────
+// Owns its OWN per-call context_t (seeded from the SeedSettings captured BY
+// VALUE at thread_spawn) so it runs CONCURRENTLY with the host + siblings -- no
+// call_mutex, no save/restore. Shares the immutable dispatch table (entry
+// resolved via an atomic acquire read) + the context-owned GC heap (joined via
+// gc_thread_enter when the seed carries a shared runtime). The trap stub
+// longjmps to THIS worker's checkpoint (setjmp below), so a trap unwinds to the
+// worker, never the host.
+static void thread_worker_legacy(void* entry, SeedSettings seed, int64_t arg,
                                  ThreadSlot* slot) {
-    SavedState saved;
+    context_t wctx;                         // the worker's OWN per-call context
+    void* gc_runtime = seed_worker_context(wctx, seed);
+
+    bool joined_gc = false;
+    if (gc_runtime) {
+        // Join the shared heap BEFORE entering JIT so the worker's allocations
+        // land in the ONE context-owned heap + its shadow-stack head is scanned.
+        joined_gc = ext_gc::gc_thread_enter(gc_runtime, &wctx);
+    }
+
     int64_t result = 0;
     bool trapped = false;
     int  reason  = 0;
 
-    ctx->call_mutex.lock();
-    save_state(ctx, saved);
-    ctx->reset_for_call();
-    ctx->has_checkpoint = true;
+    wctx.has_checkpoint = true;
     // EMBER_SETJMP (not raw setjmp): the JIT'd trap stub longjmps via
     // EMBER_LONGJMP (__builtin_longjmp on MinGW), which expects a
     // __builtin_setjmp-format buffer. Raw setjmp saves fewer registers and
     // uses an incompatible buffer layout, so mixing setjmp + __builtin_longjmp
     // corrupts callee-saved state across the trap unwind and segfaults the
     // worker. The macros in context.hpp resolve to the matching primitive.
-    if (EMBER_SETJMP(ctx->checkpoint)) {
+    if (EMBER_SETJMP(wctx.checkpoint)) {
+        // Trap unwound to THIS worker's checkpoint. The host's context is
+        // untouched (it has its own checkpoint). Record the trap + clean up.
         trapped = true;
-        reason  = int(ctx->last_trap);
-        ctx->has_checkpoint = false;
+        reason  = int(wctx.last_trap);
+        wctx.has_checkpoint = false;
+        wctx.reset_for_call();  // clear the abandoned shadow-stack head
     } else {
-        result = ember_call_i64(entry, ctx, arg);
-        ctx->has_checkpoint = false;
+        result = ember_call_i64(entry, &wctx, arg);
+        wctx.has_checkpoint = false;
     }
-    restore_state(ctx, saved);
+
+    // Leave the shared heap on EVERY exit (normal + trapped) so no abandoned
+    // participant record remains registered after a trap longjmp.
+    if (joined_gc) ext_gc::gc_thread_exit(&wctx);
+
     {
         std::lock_guard<std::mutex> g(slot->done_lock);
         slot->result      = result;
@@ -207,19 +253,22 @@ static void thread_worker_legacy(void* entry, context_t* ctx, int64_t arg,
         slot->done        = true;
     }
     slot->done_cv.notify_all();
-    ctx->call_mutex.unlock();
 }
 
 // ── Keyed worker (§6.5, §6.6, §9.8, §10.3, §12.4) ──────────────────────────
 // Captures shared_ptr<ModuleInstance> (shared lifetime ownership) so the
 // instance + its borrowed dispatch record / provider / entry table stay alive
-// for the worker's whole execution. Owns its OWN context_t (§6.6: each
-// independently entered OS thread owns its own context). Re-resolves the
-// logical handle at EXECUTION time through the GUARDED CORE keyed-call API
-// (ember_call_keyed_i64_by_slot) — the core API establishes the current-
-// runtime TLS, the recoverable checkpoint, the reload/generation guard, and
-// cleans up on every normal AND trapped exit. The raw ember_keyed_reentry_i64
-// thunk does NONE of those and MUST NOT be used here (task constraint).
+// for the worker's whole execution. Seeds its OWN per-call context_t from the
+// SeedSettings captured BY VALUE at the keyed host boundary at spawn (so the
+// host cannot mutate the worker's seed budget/state between spawn + the
+// worker's seed read). Re-resolves + invokes through the GUARDED core keyed-
+// call API (ember_call_keyed_i64_by_slot) — the core API sets the TLS current-
+// keyed-runtime on this worker thread (so any keyed native invoked by the
+// worker's script finds THIS runtime's per-runtime state), derives the route
+// word from the provider, resolves the logical slot through the instance's
+// immutable ModuleDispatchRecord, acquires the generation guard, establishes
+// the checkpoint, and cleans everything up on normal AND trapped exit. The raw
+// thunk would skip all of this and let keyed natives select legacy globals.
 //
 // The ThreadSlot* is valid for the worker's lifetime: the shared_ptr<ModuleInstance>
 // keeps ext_state (and thus the ThreadRuntimeState + the threads vector + this
@@ -227,6 +276,7 @@ static void thread_worker_legacy(void* entry, context_t* ctx, int64_t arg,
 // done), so the slot is never reset while the worker is still executing.
 static void thread_worker_keyed(std::shared_ptr<ModuleInstance> inst,
                                 int64_t logical_handle, int64_t arg,
+                                SeedSettings seed,
                                 ThreadRuntimeState::WorkerGate* gate,
                                 ThreadSlot* slot) {
     // If a test gate is installed, block here BEFORE resolving the entry — so
@@ -237,10 +287,17 @@ static void thread_worker_keyed(std::shared_ptr<ModuleInstance> inst,
         gate->cv.wait(lk, [&] { return gate->open.load(); });
     }
 
-    // The worker owns its own context (§6.6). No shared call_mutex.
-    context_t ctx;
-    ctx.budget_remaining = 1'000'000'000LL;
-    ctx.max_call_depth   = 64;
+    // The worker owns its own per-call context (§6.6), seeded from the
+    // SeedSettings captured BY VALUE at the keyed host boundary at spawn (a
+    // stable snapshot -- the host cannot mutate the worker's seed between spawn
+    // + this read). No shared call_mutex.
+    context_t wctx;
+    void* gc_runtime = seed_worker_context(wctx, seed);
+
+    bool joined_gc = false;
+    if (gc_runtime) {
+        joined_gc = ext_gc::gc_thread_enter(gc_runtime, &wctx);
+    }
 
     int64_t result  = 0;
     bool    trapped = false;
@@ -256,21 +313,28 @@ static void thread_worker_keyed(std::shared_ptr<ModuleInstance> inst,
     // of this and let keyed natives select legacy globals (the bug).
     DispatchKeyAdapter adapter(inst->provider);
     auto cr = ember_call_keyed_i64_by_slot(*inst, uint32_t(logical_handle),
-                                           ctx, arg, adapter);
+                                           wctx, arg, adapter);
     if (cr.ok) {
         result = cr.value;
     } else if (cr.trapped) {
         trapped = true;
-        // Extract the trap reason from the structured reason string; the core
-        // API already reset ctx via reset_for_call. We record a generic reason
-        // code (the structured reason string is the authoritative diagnostic).
-        reason = int(ctx.last_trap);  // reset_for_call clears this, but the
-        // structured cr.reason carries the trap name.
+        // The core API already reset wctx via reset_for_call on the trapped
+        // exit, which CLEARS wctx.last_trap -- so reading wctx.last_trap here
+        // would yield TrapReason::None (0), the bug where the keyed worker
+        // reported reason 0. The numeric reason is captured in cr.trap_reason
+        // (set inside keyed_call_core BEFORE reset_for_call clears ctx.last_trap);
+        // the structured cr.reason string is the authoritative diagnostic.
+        reason = int(cr.trap_reason);
     }
     // On a pre-entry failure (provider unavailable, resolve failed), cr.ok is
     // false and cr.trapped is false: result stays 0, trapped stays false. The
     // structured cr.reason carries the diagnostic (not stored on the slot,
     // but the join returns 0 / a failure indicator).
+
+    // Leave the shared heap on every exit (the keyed core already cleaned the
+    // TLS + guard + checkpoint on its normal/trapped exit; this cleans the GC
+    // participant record so a trap cannot leave it registered).
+    if (joined_gc) ext_gc::gc_thread_exit(&wctx);
 
     {
         std::lock_guard<std::mutex> g(slot->done_lock);
@@ -298,8 +362,12 @@ static int64_t n_thread_spawn(int64_t handle, int64_t arg) {
     // For the keyed path, lock the weak_ptr NOW (before acquiring the setup
     // mutex) so the worker's shared_ptr<ModuleInstance> is established before
     // the slot is allocated. The weak_ptr lives on the TLS runtime's
-    // ThreadRuntimeState; st does not carry it.
+    // ThreadRuntimeState; st does not carry it. Also capture the worker seed
+    // settings BY VALUE from the current shared context NOW (at spawn time) so
+    // the worker's seed is a stable snapshot -- the host cannot mutate the
+    // worker's budget/state between spawn + the worker's seed read.
     std::shared_ptr<ModuleInstance> inst_sp;
+    SeedSettings seed;
     if (st.keyed) {
         ModuleInstance* rt = ember_current_keyed_runtime();
         if (!rt || !rt->ext_state) return 0;
@@ -307,11 +375,17 @@ static int64_t n_thread_spawn(int64_t handle, int64_t arg) {
         if (!inst_sp) return 0;  // fail-closed: no shared ownership available
         if (!inst_sp->provider) return 0;
         if (handle < 0 || uint32_t(handle) >= inst_sp->logical_slot_count) return 0;
+        // Capture the seed settings from the shared host context active at the
+        // keyed host boundary (§6.6 concurrent-entry integration). A null
+        // boundary yields a default-seeded context (capture_seed handles it).
+        seed = capture_seed(ember_current_keyed_context());
     } else {
         // Legacy path: resolve the entry now (the legacy worker caches it).
+        // The seed context is the host context registered via thread_init.
         if (!*st.ctx_pp || !*st.dispatch_base_pp || *st.slot_count_p <= 0) return 0;
         void* entry = resolve_entry_legacy(handle, *st.dispatch_base_pp, *st.slot_count_p);
         if (!entry) return 0;
+        seed = capture_seed(*st.ctx_pp);
     }
 
     std::lock_guard<std::recursive_mutex> guard(*st.setup_mutex);
@@ -345,11 +419,11 @@ static int64_t n_thread_spawn(int64_t handle, int64_t arg) {
             ThreadRuntimeState::WorkerGate* gate = nullptr;
             ModuleInstance* rt = ember_current_keyed_runtime();
             if (rt && rt->ext_state) gate = rt->ext_state->thread.worker_gate.get();
-            raw->th = std::thread(thread_worker_keyed, inst_sp, handle, arg, gate, raw);
+            raw->th = std::thread(thread_worker_keyed, inst_sp, handle, arg,
+                                  seed, gate, raw);
         } else {
             void* entry = resolve_entry_legacy(handle, *st.dispatch_base_pp, *st.slot_count_p);
-            context_t* ctx  = *st.ctx_pp;
-            raw->th = std::thread(thread_worker_legacy, entry, ctx, arg, raw);
+            raw->th = std::thread(thread_worker_legacy, entry, seed, arg, raw);
         }
     } catch (const std::exception&) {
         raw->in_use = false;
@@ -371,27 +445,34 @@ static int64_t n_thread_join(int64_t handle) {
     }
     if (!s) return 0;
 
-    // Legacy in-context-thread model: the worker shares the host's context_t
-    // and locks call_mutex around its ember_call. The caller of thread_join
-    // (the script function) holds call_mutex (it was locked by the enclosing
-    // ember_call). The worker blocks on call_mutex.lock() in
-    // thread_worker_legacy. The join path must release call_mutex so the
-    // worker can proceed, then re-acquire it after the worker finishes.
-    // Ownership-explicit: we unlock what the caller (the enclosing ember_call
-    // for the script function calling thread_join) locked, and re-lock before
-    // returning so the caller's call_mutex invariant is preserved.
-    context_t* ctx = *st.ctx_pp;
-    ctx->call_mutex.unlock();
+    // CONCURRENT-ENTRY JOIN: wait ONLY on slot synchronization (the done flag
+    // + the OS thread join). There is NO shared call_mutex to release/relock
+    // (the worker owns its own per-call context + never serialized on the
+    // host's), so join never unlocks a mutex it did not lock. This keeps
+    // nested spawn/join deadlock-free (a worker that spawns + joins a
+    // grandchild does not contend on the outer context's lock).
+    //
+    // GC COOPERATION: the wait is a bounded-poll loop (done_cv.wait_for with a
+    // short interval) that calls ext_gc::gc_park() each iteration. A
+    // participant blocked in thread_join is NOT executing JIT'd code, so its
+    // gc_frame_head is stable -- it is a valid GC safepoint. Parking here lets
+    // a concurrent gc_collect's unbounded wait observe the joiner parked +
+    // proceed, instead of waiting forever for a joiner that is itself waiting
+    // for the collector's worker to finish (a deadlock). The poll interval is
+    // short so the collector's wait completes in bounded wall time.
     bool trapped = false;
     int64_t result = 0;
     {
         std::unique_lock<std::mutex> dlk(s->done_lock);
-        s->done_cv.wait(dlk, [&] { return s->done; });
+        while (!s->done) {
+            ext_gc::gc_park();  // park if a GC collect is in progress
+            s->done_cv.wait_for(dlk, std::chrono::milliseconds(1),
+                                [&] { return s->done; });
+        }
         trapped = s->trapped;
         result  = s->result;
     }
     if (s->th.joinable()) s->th.join();
-    ctx->call_mutex.lock();
     // Mark the slot as joined (the std::thread is now non-joinable). Keep
     // in_use=true so thread_trap_reason (called by the script AFTER join) can
     // still read the slot's trap_reason. The slot is NOT recycled to the free
@@ -465,7 +546,7 @@ bool thread_init_keyed(ember::ModuleInstance& inst) {
     }
     auto& s = inst.ext_state->thread;
     std::lock_guard<std::recursive_mutex> guard(s.setup_mutex);
-    s.ctx           = nullptr;  // keyed worker owns its own context
+    s.ctx           = nullptr;  // keyed worker seeds its own context from the host boundary
     s.dispatch_base = const_cast<void*>(static_cast<const void*>(inst.entry_table->slots.data()));
     s.slot_count    = int64_t(inst.logical_slot_count);
     s.instance      = &inst;
@@ -476,14 +557,13 @@ bool thread_init_keyed(ember::ModuleInstance& inst) {
     return true;
 }
 
-// thread_join_keyed (§6.6, §12.4): the keyed worker owns its own context (no
+// thread_join_keyed (§6.6, §12.4): the keyed worker seeds its own per-call
+// context from the shared host context captured at the keyed host boundary (no
 // shared call_mutex), so join is a simple wait-for-done + thread-join + slot-
-// retire. It does NOT unconditionally unlock a mutex it never locked (the bug
-// in the previous version: it called ctx.call_mutex.unlock() / .lock() around
-// the wait, but the keyed caller never locked call_mutex — UB). The context
-// parameter is retained for API compatibility but is NOT used for locking
-// (the keyed worker has its own context); the adapter is retained for API
-// compatibility (the worker re-derives its own adapter from the instance's
+// retire. It does NOT unconditionally unlock a mutex it never locked. The
+// context parameter is retained for API compatibility but is NOT used for
+// locking (the keyed worker has its own context); the adapter is retained for
+// API compatibility (the worker re-derives its own adapter from the instance's
 // provider).
 int64_t thread_join_keyed(ember::ModuleInstance& inst, int64_t handle,
                           ember::context_t& /*ctx*/,
@@ -502,13 +582,19 @@ int64_t thread_join_keyed(ember::ModuleInstance& inst, int64_t handle,
     if (!slot) return 0;
 
     // Wait for the worker to publish done. No call_mutex — the keyed worker
-    // owns its own context (§6.6), so there is no shared-context lock to
-    // manage. Ownership-explicit: we lock/unlock only slot->done_lock.
+    // owns its own per-call context (§6.6), so there is no shared-context lock
+    // to manage. Ownership-explicit: we lock/unlock only slot->done_lock.
+    // GC COOPERATION: a bounded-poll loop + gc_park() each iteration so a
+    // concurrent gc_collect observes the joiner parked (see n_thread_join).
     bool trapped = false;
     int64_t result = 0;
     {
         std::unique_lock<std::mutex> dlk(slot->done_lock);
-        slot->done_cv.wait(dlk, [&] { return slot->done; });
+        while (!slot->done) {
+            ext_gc::gc_park();
+            slot->done_cv.wait_for(dlk, std::chrono::milliseconds(1),
+                                   [&] { return slot->done; });
+        }
         trapped = slot->trapped;
         result  = slot->result;
     }

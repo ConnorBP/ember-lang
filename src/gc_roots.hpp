@@ -47,10 +47,16 @@
 // thin_ir, ext_gc, and (optionally) gc.cpp all reference them without creating
 // a cycle or dragging std::vector into context.hpp's minimal include set.
 //
-// THREAD-SAFETY: a context_t (and its gc_frame_head / gc_global_roots) is NOT
-// shared across threads (mirrors context_t's per-thread model). A GcFrameMap is
-// read-only after compile. A GcGlobalRoots is read-only after the host attaches
-// it. The collector walks them on the owning thread only.
+// THREAD-SAFETY: under the concurrent-entry model a context_t (and its
+// gc_frame_head / gc_global_roots) is per-thread — each concurrently-entering
+// OS thread owns its own context_t, so each shadow-stack head is single-thread
+// mutated by its owning thread's JIT prologue/epilogue. A GcFrameMap is read-
+// only after compile. A GcGlobalRoots is read-only after the host attaches it
+// and is SHARED across the workers of one module (the same typed-global block
+// descriptor). The cooperative stop-the-world collector (ext_gc) walks every
+// registered participant's per-thread gc_frame_head plus the shared immutable
+// global roots while the participants are parked at a safepoint or exited, so
+// the collector never races a participant's JIT root-chain mutation.
 #pragma once
 #include <cstdint>
 #include <vector>

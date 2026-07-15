@@ -483,6 +483,19 @@ namespace {
 // RuntimeExtensionState. Null when no keyed runtime is active on this thread.
 thread_local ModuleInstance* g_current_keyed_runtime = nullptr;
 
+// The current keyed-host context (§6.6 concurrent-entry integration). While a
+// keyed host boundary (keyed_call_core / resolve_entry_keyed_leased) is on this
+// thread, this is the context_t& it was handed — the ONE shared dispatch context
+// active at thread_spawn. The keyed thread worker (ext_thread) captures it at
+// spawn time (it runs under the keyed host when the script calls thread_spawn)
+// so it can seed its own per-call context_t from the host's settings (budget,
+// max_call_depth, the shared typed-global root descriptor, the shared GC runtime
+// pointer) instead of a hardcoded private context. Carries NO route material
+// (a bare context pointer). Set + cleared symmetrically with
+// g_current_keyed_runtime on every keyed host entry/exit so it never outlives the
+// boundary. Null when no keyed host boundary is active on this thread.
+thread_local context_t* g_current_keyed_context = nullptr;
+
 // Derive the route word once from the provider via the adapter. Fills `rw`
 // and returns true on success; on failure fills `reason` and returns false
 // (the thunk is never entered). Used by the call wrappers + the resolvers.
@@ -537,9 +550,13 @@ int64_t __attribute__((noinline)) keyed_call_core(ModuleInstance& inst, void* en
                         std::optional<HotReloadDomain::ExecutionGuard>& guard) {
     // Red 8 §6.6/§10.3: identify THIS runtime on the TLS so extension natives
     // running under the thunk find the correct per-runtime state. Cleared on
-    // every exit below (normal + trap). Carries NO route material.
+    // every exit below (normal + trap). Carries NO route material. Symmetrically
+    // publish the current host context so a keyed thread worker spawned from
+    // within this boundary can capture it (§6.6 concurrent-entry integration).
     ModuleInstance* prev_runtime = g_current_keyed_runtime;
     g_current_keyed_runtime = &inst;
+    context_t* prev_ctx = g_current_keyed_context;
+    g_current_keyed_context = &ctx;
     // Establish the recoverable checkpoint when the instance has a trap stub.
     // The trap stub longjmps to ctx.checkpoint; the wrapper records the trap,
     // cleans the TLS + guard, and returns. Without a trap stub, traps emit ud2
@@ -557,10 +574,12 @@ int64_t __attribute__((noinline)) keyed_call_core(ModuleInstance& inst, void* en
             // C++ epilogue at return), so the caller's registers survive and
             // the transient r15 is cleared (it never escaped the thunk frame).
             g_current_keyed_runtime = prev_runtime;
+            g_current_keyed_context = prev_ctx;
             guard.reset();
             out.ok = false;
             out.trapped = true;
             out.value = 0;
+            out.trap_reason = ctx.last_trap;  // capture BEFORE reset_for_call clears it
             out.reason = ctx.last_error.empty()
                 ? std::string(trap_reason_str(ctx.last_trap))
                 : (std::string(trap_reason_str(ctx.last_trap)) + ": " + ctx.last_error);
@@ -584,6 +603,7 @@ int64_t __attribute__((noinline)) keyed_call_core(ModuleInstance& inst, void* en
     if (inst.trap_stub) ctx.has_checkpoint = false;
     // Normal exit: clear the TLS + release the guard.
     g_current_keyed_runtime = prev_runtime;
+    g_current_keyed_context = prev_ctx;
     guard.reset();
     out.ok = true;
     out.trapped = false;
@@ -599,6 +619,16 @@ int64_t __attribute__((noinline)) keyed_call_core(ModuleInstance& inst, void* en
 // ember); reachable here by unqualified name. Carries NO route material.
 struct ModuleInstance* ember_current_keyed_runtime() noexcept {
     return g_current_keyed_runtime;
+}
+
+// ─── Concurrent-entry integration: the current keyed-host context accessor ──
+// g_current_keyed_context lives in the anonymous namespace above. Returns the
+// context_t* the active keyed host boundary was handed, or nullptr when no
+// keyed host boundary is active on this thread. The keyed thread worker
+// captures it at spawn time to seed its own per-call context_t from the host's
+// settings. Carries NO route material (a bare context pointer).
+context_t* ember_current_keyed_context() noexcept {
+    return g_current_keyed_context;
 }
 
 // ─── Red 8: assemble an identity ModuleDispatchRecord on a ModuleInstance ──
@@ -760,14 +790,18 @@ LeaseResult resolve_entry_keyed_leased(ModuleInstance& inst,
     // Identify THIS runtime on the TLS for body (extension natives may run).
     ModuleInstance* prev_runtime = g_current_keyed_runtime;
     g_current_keyed_runtime = &inst;
+    context_t* prev_ctx = g_current_keyed_context;
+    g_current_keyed_context = &ctx;
     if (inst.trap_stub) {
         ctx.has_checkpoint = true;
         if (EMBER_SETJMP(ctx.checkpoint)) {
             // Trapped inside body: clean TLS + guard (longjmp skipped them).
             g_current_keyed_runtime = prev_runtime;
+            g_current_keyed_context = prev_ctx;
             guard.reset();
             out.ok = false;
             out.trapped = true;
+            out.trap_reason = ctx.last_trap;  // capture BEFORE reset_for_call clears it
             out.reason = ctx.last_error.empty()
                 ? std::string(trap_reason_str(ctx.last_trap))
                 : (std::string(trap_reason_str(ctx.last_trap)) + ": " + ctx.last_error);
@@ -779,6 +813,7 @@ LeaseResult resolve_entry_keyed_leased(ModuleInstance& inst,
     int64_t v = body(entry, &ctx, arg);
     if (inst.trap_stub) ctx.has_checkpoint = false;
     g_current_keyed_runtime = prev_runtime;
+    g_current_keyed_context = prev_ctx;
     guard.reset();
     out.ok = true;
     out.value = v;

@@ -73,11 +73,18 @@ static bool checked_bytes(int64_t elem_size, int64_t count, size_t* out) {
 //
 // Synchronization / deadlock: the trace callback acquires g_store_mutex during
 // collect() (the store must be stable while it is walked). Mutations acquire
-// g_store_mutex and call gc_write_barrier (which acquires NO mutex and never
-// calls collect), so there is no nested lock across the two and no path holds
-// g_store_mutex while triggering a collect -> no deadlock. collect is invoked
-// only from gc_collect / gc_alloc_env (never from within a store-mutex-held
-// mutation), and the callback's visitor.report() does mark_and_push (no mutex).
+// g_store_mutex for the payload write + the trace-callback registration, then
+// RELEASE g_store_mutex before calling gc_write_barrier (which parks at the
+// cooperative-STW safepoint under part_cv, NOT the heap m_lock, while a collect
+// is in progress). collect is invoked only from gc_collect / gc_alloc_env
+// (never from within a store-mutex-held mutation), and the callback's
+// visitor.report() does mark_and_push (no mutex). Because no mutation holds
+// g_store_mutex across the barrier, the trace callback (g_store_mutex under
+// the heap m_lock) cannot AB-BA deadlock a parked mutator (which holds neither
+// g_store_mutex nor the heap m_lock while it waits on part_cv). The strict
+// cooperative STW protocol (the collector waits unbounded for every other
+// participant to park or exit) guarantees no mutation is mid-write when the
+// callback walks the store on this runtime.
 static thread_local ember::gc::GcTraceToken g_trace_token = 0;
 
 // The trace callback: walk every array slot, report aligned i64 elements of
@@ -85,10 +92,14 @@ static thread_local ember::gc::GcTraceToken g_trace_token = 0;
 // walks the file-static store). ACQUIRES g_store_mutex so the process-wide
 // store is stable while it is walked: collect() is invoked from gc_collect /
 // gc_alloc_env on the owning thread OUTSIDE any store-mutex-held mutation (a
-// mutation holds g_store_mutex and calls gc_write_barrier, which acquires NO
-// mutex and never collects), so locking here cannot self-deadlock + cannot
-// nest with a mutation's lock. Without this lock a concurrent mutation on
-// another thread (g_arrays is process-wide) would race the callback's read.
+// mutation releases g_store_mutex before calling gc_write_barrier, which parks
+// under part_cv -- NOT the heap m_lock -- while a collect is in progress, so it
+// never holds g_store_mutex while the collect runs the callback), so locking
+// here cannot self-deadlock + cannot nest with a mutation's lock. Under the
+// strict cooperative STW protocol every other participant is parked (not
+// mutating) when the callback runs, so the store walk is race-free. Without
+// this lock a concurrent mutation on another thread (g_arrays is process-wide)
+// would race the callback's read.
 static void array_trace_cb(void* /*user_data*/, ember::gc::GcTraceVisitor& visitor) {
     std::lock_guard<std::mutex> lock(g_store_mutex);
     for (const ArraySlot& slot : g_arrays) {
@@ -158,19 +169,25 @@ extern "C" {
     static void n_array_set_f32(int64_t h, int64_t i, float v) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s = arr_slot(h); if (s && i>=0 && s->elem_size==4 && size_t(i) < s->bytes.size()/s->elem_size) std::memcpy(&s->bytes[size_t(i)*4], &v, 4); }
     static float n_array_get_f32(int64_t h, int64_t i) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s = arr_slot(h); float v=0; if (s && i>=0 && s->elem_size==4 && size_t(i) < s->bytes.size()/s->elem_size) std::memcpy(&v, &s->bytes[size_t(i)*4], 4); return v; }
     static void n_array_set_i64(int64_t h, int64_t i, int64_t v) {
-        std::lock_guard<std::mutex> lock(g_store_mutex);
-        auto* s = arr_slot(h);
-        if (s && i>=0 && s->elem_size==8 && size_t(i) < s->bytes.size()/s->elem_size) {
-            std::memcpy(&s->bytes[size_t(i)*8], &v, 8);
-            // c1: an i64 slot can hold a managed pointer. Register the trace
-            // callback (idempotent) so a future collect sees this slot, and
-            // invoke the write barrier (owner = the external-root slot, a non-
-            // GC owner so the barrier is a ceremonial no-op today; child = the
-            // stored value, a candidate GC pointer the visitor validates).
-            ensure_gc_trace_cb();
-            ember::ext_gc::gc_write_barrier(reinterpret_cast<void*>(s),
-                                            reinterpret_cast<void*>(static_cast<uintptr_t>(v)));
+        void* owner = nullptr;
+        void* child = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_store_mutex);
+            auto* s = arr_slot(h);
+            if (s && i>=0 && s->elem_size==8 && size_t(i) < s->bytes.size()/s->elem_size) {
+                std::memcpy(&s->bytes[size_t(i)*8], &v, 8);
+                // c1: an i64 slot can hold a managed pointer. Register the trace
+                // callback (idempotent) so a future collect sees this slot. The
+                // write barrier is invoked OUTSIDE g_store_mutex (below) so it
+                // can park at the cooperative-STW safepoint without AB-BA
+                // deadlocking the trace callback (which takes g_store_mutex
+                // under the heap m_lock during a collect).
+                ensure_gc_trace_cb();
+                owner = reinterpret_cast<void*>(s);
+                child = reinterpret_cast<void*>(static_cast<uintptr_t>(v));
+            }
         }
+        if (owner) ember::ext_gc::gc_write_barrier(owner, child);
     }
     static int64_t n_array_get_i64(int64_t h, int64_t i) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s = arr_slot(h); int64_t v=0; if (s && i>=0 && s->elem_size==8 && size_t(i) < s->bytes.size()/s->elem_size) std::memcpy(&v, &s->bytes[size_t(i)*8], 8); return v; }
     static void n_array_push_u8(int64_t h, int64_t v) {
@@ -188,16 +205,24 @@ extern "C" {
         catch (const std::bad_alloc&) {} catch (const std::length_error&) {}
     }
     static void n_array_push_i64(int64_t h, int64_t v) {
-        std::lock_guard<std::mutex> lock(g_store_mutex);
-        auto* s = arr_slot(h);
-        if (!s || s->elem_size != 8 || s->bytes.size() + 8 > MAX_CONTAINER_BYTES) return;
-        try { size_t off = s->bytes.size(); s->bytes.resize(off + 8); std::memcpy(&s->bytes[off], &v, 8);
-              // c1: same as set_i64 -- a pushed i64 may be a managed pointer.
-              ensure_gc_trace_cb();
-              ember::ext_gc::gc_write_barrier(reinterpret_cast<void*>(s),
-                                              reinterpret_cast<void*>(static_cast<uintptr_t>(v)));
+        void* owner = nullptr;
+        void* child = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_store_mutex);
+            auto* s = arr_slot(h);
+            if (!s || s->elem_size != 8 || s->bytes.size() + 8 > MAX_CONTAINER_BYTES) return;
+            try { size_t off = s->bytes.size(); s->bytes.resize(off + 8); std::memcpy(&s->bytes[off], &v, 8);
+                  // c1: same as set_i64 -- a pushed i64 may be a managed pointer.
+                  // Register the trace callback under the lock; the write barrier
+                  // is invoked OUTSIDE g_store_mutex (below) so it can park at
+                  // the cooperative-STW safepoint without AB-BA deadlock.
+                  ensure_gc_trace_cb();
+                  owner = reinterpret_cast<void*>(s);
+                  child = reinterpret_cast<void*>(static_cast<uintptr_t>(v));
+            }
+            catch (const std::bad_alloc&) {} catch (const std::length_error&) {}
         }
-        catch (const std::bad_alloc&) {} catch (const std::length_error&) {}
+        if (owner) ember::ext_gc::gc_write_barrier(owner, child);
     }
     static int64_t n_array_pop_u8(int64_t h) {
         std::lock_guard<std::mutex> lock(g_store_mutex);

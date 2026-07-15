@@ -214,6 +214,14 @@ bool assemble_identity_dispatch_record(ModuleInstance& inst);
 // file-static default store).
 struct ModuleInstance* ember_current_keyed_runtime() noexcept;
 
+// ─── Concurrent-entry integration: the current keyed-host context accessor ──
+// (§6.6). Returns the context_t* the active keyed host boundary was handed, or
+// nullptr when no keyed host boundary is active on this thread. The keyed
+// thread worker captures it at spawn time to seed its own per-call context_t
+// from the host's settings (budget, max_call_depth, shared GC runtime). Carries
+// NO route material (a bare context pointer).
+struct context_t* ember_current_keyed_context() noexcept;
+
 // ─── Red 8: the logical callable identity for the keyed host boundary ──────
 // (§2.1, §9.8). A lightweight logical identity: the logical slot within the
 // module (the module is implied by the ModuleInstance the resolver is called
