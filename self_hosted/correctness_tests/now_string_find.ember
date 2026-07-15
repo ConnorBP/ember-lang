@@ -1,0 +1,10 @@
+// now_string_find — host string extension: string_from_slice builds a handle
+// from a literal, string_find returns the first index of a substring.
+// In "abcabc", "cab" first occurs at index 2. Verifies the string_from_slice
+// (StringLit -> slice ABI) + string_find (handle,handle -> i64) natives.
+// expect: 2
+fn main() -> i64 {
+    let h: string = string_from_slice("abcabc");
+    let p: i64 = string_find(h, string_from_slice("cab"));
+    return p;
+}

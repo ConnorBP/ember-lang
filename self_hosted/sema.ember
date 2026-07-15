@@ -102,6 +102,22 @@ global g_globals : i64 = 0;   // array, stride GLOBAL_STRIDE
 global g_scope   : i64 = 0;   // array, stride SCOPE_STRIDE (local vars)
 global g_marks   : i64 = 0;   // array, stride 1 (scope-push marks)
 
+// Host extension native signature table (array/math/map/string/io). A flat
+// i64 array, stride NAT_STRIDE = 7, one row per registered native:
+//   [ param_count, p0, p1, p2, p3, ret_type, perm ]
+// p0..p3 are sema Type node indices (TY_I64 / TY_F64 / TY_F32 / TY_BOOL /
+// TY_STRING / TY_U8, or -1 if unused). perm is 0 (none) for array/math/map/
+// string and 1 (PERM_FFI) for io. The row ORDER is fixed and matched 1:1 by
+// native_find's if-chain (the only source of truth for the name->row mapping;
+// ember's type system keeps `string` handles distinct from `i64`, so names
+// cannot live in this i64 array and are compared as string==string in the
+// chain). Built once at s_init by init_natives(); mirrors the host's
+// registered NativeSig table (extensions/{array,math,map,string,io}/ext_*.cpp)
+// EXACTLY so the sema type check + the codegen's ABS64_NATIVE fingerprint match
+// the loader's check.
+global g_natives : i64 = 0;
+global NAT_STRIDE : i64 = 7;
+
 global FN_STRIDE     : i64 = 4;
 global STRUCT_STRIDE : i64 = 2;
 global GLOBAL_STRIDE : i64 = 2;
@@ -183,6 +199,9 @@ fn s_init() -> i64 {
     // self-hosted compiler and deliberately does not collide with v1 Prim.
     TY_STRING = alloc_node(NK::Type as i64);
     set_d(TY_STRING, 12);
+    // build the host-extension native signature table (array/math/map/string/
+    // io). Must run after the canonical TY_* nodes exist (rows reference them).
+    init_natives();
     return 0;
 }
 
@@ -754,44 +773,264 @@ fn fn_param_count(fn_row: i64) -> i64 {
 // to these as ABS64_NATIVE relocations (EMBM v1 §7); the host loader resolves
 // them against the registered NativeSig table and validates the ABI fingerprint.
 // These signatures mirror the host's registered natives
-// (extensions/string/ext_string.cpp) EXACTLY so sema's type check + the
-// codegen's fingerprint match what the loader expects.
+// (extensions/{array,math,map,string,io}/ext_*.cpp) EXACTLY so sema's type check
+// + the codegen's fingerprint match what the loader expects.
 //
 // A `string` is an opaque i64 handle (host bind_handle("string"): prim I64 +
-// struct_name "string" -> ABI code 6). string_length / string_char_at take a
-// handle (+ an i64 index for char_at) and return an i64; string_substr takes a
-// handle + two i64s and returns a new handle. native_param_count returns -1 for
-// an unknown name (so check_callexpr falls through to the script-fn path).
+// struct_name "string" -> ABI code 6). Integer args are i64 (code 1); f64/f32
+// args are code 2/3; bool is code 4; u8 is code 8; void return is code 0.
+// Permission is 0 (none) for array/math/map/string and 1 (PERM_FFI) for io.
+//
+// NOTE on string_from_slice: the host registers it with a u8-slice param
+// (code 5, passed as two words ptr+len). The self-hosted subset has no
+// first-class slice value a user can name -- a string literal is typed
+// TY_STRING (a handle) here -- so the table records string_from_slice's param
+// as TY_STRING so a `string_from_slice("lit")` call type-checks. The codegen
+// special-cases that call (StringLit arg) to emit the real slice ABI + the
+// code-5 fingerprint; see cg_eval_callexpr. (A non-literal arg is an edge case
+// the subset does not support.)
 // -----------------------------------------------------------------------------
-fn native_param_count(name: string) -> i64 {
-    if (name == string_from_slice("string_length"))  { return 1; }
-    if (name == string_from_slice("string_char_at")) { return 2; }
-    if (name == string_from_slice("string_substr"))  { return 3; }
+
+// add one native row: param_count, up to 4 param type nodes, ret, perm.
+// Unused param slots are filled with -1. param_count is the real arity (<= 4
+// for every host native in v1). The row ORDER here is the single source of
+// truth for native_find's if-chain (names are compared as string==string in
+// the chain, since ember keeps `string` handles distinct from `i64`).
+fn nat_add(pc: i64, p0: i64, p1: i64, p2: i64, p3: i64, rt: i64, perm: i64) -> i64 {
+    array_push_i64(g_natives, pc);
+    array_push_i64(g_natives, p0);
+    array_push_i64(g_natives, p1);
+    array_push_i64(g_natives, p2);
+    array_push_i64(g_natives, p3);
+    array_push_i64(g_natives, rt);
+    array_push_i64(g_natives, perm);
+    return 0;
+}
+
+// build the full native table. Mirrors the host registrations verbatim. Called
+// once from s_init after the canonical TY_* nodes exist. The row ORDER here is
+// the single source of truth for native_find's if-chain (1:1 by index).
+fn init_natives() -> i64 {
+    g_natives = array_new(8, 0);
+    // ---- ARRAY (extensions/array/ext_array.cpp) — all perm 0 ----
+    nat_add(2, TY_I64, TY_I64, -1, -1, TY_I64,  0);  // 0 array_new
+    nat_add(1, TY_I64, -1, -1, -1, TY_I64,  0);      // 1 array_length
+    nat_add(2, TY_I64, TY_I64, -1, -1, TY_VOID, 0);  // 2 array_resize
+    nat_add(3, TY_I64, TY_I64, TY_I64, -1, TY_VOID, 0); // 3 array_set_u8
+    nat_add(2, TY_I64, TY_I64, -1, -1, TY_U8,   0);  // 4 array_get_u8
+    nat_add(3, TY_I64, TY_I64, TY_F32, -1, TY_VOID, 0); // 5 array_set_f32
+    nat_add(2, TY_I64, TY_I64, -1, -1, TY_F32,  0);  // 6 array_get_f32
+    nat_add(3, TY_I64, TY_I64, TY_I64, -1, TY_VOID, 0); // 7 array_set_i64
+    nat_add(2, TY_I64, TY_I64, -1, -1, TY_I64,  0);  // 8 array_get_i64
+    nat_add(2, TY_I64, TY_I64, -1, -1, TY_VOID, 0);  // 9 array_push_u8
+    nat_add(2, TY_I64, TY_F32, -1, -1, TY_VOID, 0);  // 10 array_push_f32
+    nat_add(2, TY_I64, TY_I64, -1, -1, TY_VOID, 0);  // 11 array_push_i64
+    nat_add(1, TY_I64, -1, -1, -1, TY_U8,   0);      // 12 array_pop_u8
+    nat_add(1, TY_I64, -1, -1, -1, TY_F32,  0);      // 13 array_pop_f32
+    nat_add(1, TY_I64, -1, -1, -1, TY_I64,  0);      // 14 array_pop_i64
+    nat_add(1, TY_I64, -1, -1, -1, TY_VOID, 0);      // 15 array_clear
+    nat_add(2, TY_I64, TY_I64, -1, -1, TY_VOID, 0);  // 16 array_remove
+    // ---- MATH (extensions/math/ext_math.cpp) — all perm 0 ----
+    nat_add(1, TY_F32, -1, -1, -1, TY_F32, 0);  // 17 sqrt
+    nat_add(1, TY_F32, -1, -1, -1, TY_F32, 0);  // 18 sin
+    nat_add(1, TY_F32, -1, -1, -1, TY_F32, 0);  // 19 cos
+    nat_add(1, TY_F32, -1, -1, -1, TY_F32, 0);  // 20 tan
+    nat_add(1, TY_F64, -1, -1, -1, TY_F64, 0);  // 21 sqrt_f64
+    nat_add(1, TY_F64, -1, -1, -1, TY_F64, 0);  // 22 sin_f64
+    nat_add(1, TY_F64, -1, -1, -1, TY_F64, 0);  // 23 cos_f64
+    nat_add(1, TY_F64, -1, -1, -1, TY_F64, 0);  // 24 tan_f64
+    nat_add(1, TY_F64, -1, -1, -1, TY_F64, 0);  // 25 floor_f64
+    nat_add(1, TY_F64, -1, -1, -1, TY_F64, 0);  // 26 ceil_f64
+    nat_add(1, TY_F64, -1, -1, -1, TY_F64, 0);  // 27 abs_f64
+    nat_add(1, TY_F64, -1, -1, -1, TY_F64, 0);  // 28 atan_f64
+    nat_add(1, TY_F64, -1, -1, -1, TY_F64, 0);  // 29 exp_f64
+    nat_add(1, TY_F64, -1, -1, -1, TY_F64, 0);  // 30 log_f64
+    nat_add(1, TY_F64, -1, -1, -1, TY_F64, 0);  // 31 log2_f64
+    nat_add(1, TY_F64, -1, -1, -1, TY_F64, 0);  // 32 log10_f64
+    nat_add(1, TY_F64, -1, -1, -1, TY_F64, 0);  // 33 round_f64
+    nat_add(1, TY_F64, -1, -1, -1, TY_F64, 0);  // 34 trunc_f64
+    nat_add(2, TY_F64, TY_F64, -1, -1, TY_F64, 0);  // 35 pow_f64
+    nat_add(2, TY_F64, TY_F64, -1, -1, TY_F64, 0);  // 36 atan2_f64
+    nat_add(2, TY_F64, TY_F64, -1, -1, TY_F64, 0);  // 37 fmod_f64
+    nat_add(2, TY_F64, TY_F64, -1, -1, TY_F64, 0);  // 38 min_f64
+    nat_add(2, TY_F64, TY_F64, -1, -1, TY_F64, 0);  // 39 max_f64
+    nat_add(3, TY_F64, TY_F64, TY_F64, -1, TY_F64, 0); // 40 clamp_f64
+    nat_add(1, TY_I64, -1, -1, -1, TY_I64, 0);  // 41 abs_i64
+    nat_add(2, TY_I64, TY_I64, -1, -1, TY_I64, 0);  // 42 min_i64
+    nat_add(2, TY_I64, TY_I64, -1, -1, TY_I64, 0);  // 43 max_i64
+    nat_add(3, TY_I64, TY_I64, TY_I64, -1, TY_I64, 0); // 44 clamp_i64
+    nat_add(1, TY_F32, -1, -1, -1, TY_F32, 0);  // 45 atan
+    nat_add(2, TY_F32, TY_F32, -1, -1, TY_F32, 0);  // 46 atan2
+    nat_add(1, TY_F32, -1, -1, -1, TY_F32, 0);  // 47 exp
+    nat_add(1, TY_F32, -1, -1, -1, TY_F32, 0);  // 48 log
+    nat_add(1, TY_F32, -1, -1, -1, TY_F32, 0);  // 49 floor
+    nat_add(1, TY_F32, -1, -1, -1, TY_F32, 0);  // 50 ceil
+    nat_add(1, TY_F32, -1, -1, -1, TY_F32, 0);  // 51 abs
+    nat_add(1, TY_F32, -1, -1, -1, TY_F32, 0);  // 52 round
+    // ---- MAP (extensions/map/ext_map.cpp) — all perm 0 ----
+    nat_add(0, -1, -1, -1, -1, TY_I64,  0);      // 53 map_new
+    nat_add(3, TY_I64, TY_I64, TY_I64, -1, TY_VOID, 0); // 54 map_set
+    nat_add(2, TY_I64, TY_I64, -1, -1, TY_I64,  0);  // 55 map_get
+    nat_add(2, TY_I64, TY_I64, -1, -1, TY_I64,  0);  // 56 map_contains
+    nat_add(1, TY_I64, -1, -1, -1, TY_I64,  0);      // 57 map_length
+    nat_add(2, TY_I64, TY_I64, -1, -1, TY_VOID, 0);  // 58 map_remove
+    nat_add(1, TY_I64, -1, -1, -1, TY_VOID, 0);      // 59 map_clear
+    // ---- STRING (extensions/string/ext_string.cpp) — all perm 0 ----
+    // string_from_slice's real param is a u8 slice (code 5); recorded here as
+    // TY_STRING so a literal arg type-checks (see the NOTE above + codegen).
+    nat_add(0, -1, -1, -1, -1, TY_STRING, 0);      // 60 string_new
+    nat_add(1, TY_STRING, -1, -1, -1, TY_STRING, 0); // 61 string_from_slice
+    nat_add(1, TY_STRING, -1, -1, -1, TY_I64,    0); // 62 string_length
+    nat_add(2, TY_STRING, TY_I64, -1, -1, TY_I64,  0); // 63 string_char_at
+    nat_add(1, TY_I64, -1, -1, -1, TY_STRING, 0);   // 64 string_from_i64
+    nat_add(1, TY_F32, -1, -1, -1, TY_STRING, 0);   // 65 string_from_f32
+    nat_add(1, TY_F64, -1, -1, -1, TY_STRING, 0);   // 66 string_from_f64
+    nat_add(1, TY_BOOL, -1, -1, -1, TY_STRING, 0);  // 67 string_from_bool
+    nat_add(1, TY_STRING, -1, -1, -1, TY_STRING, 0); // 68 string_identity
+    nat_add(2, TY_STRING, TY_STRING, -1, -1, TY_I64, 0); // 69 string_find
+    nat_add(3, TY_STRING, TY_I64, TY_I64, -1, TY_STRING, 0); // 70 string_substr
+    // ---- IO (extensions/io/ext_io.cpp) — all perm 1 (PERM_FFI) ----
+    nat_add(1, TY_STRING, -1, -1, -1, TY_VOID, 1);  // 71 print
+    nat_add(1, TY_STRING, -1, -1, -1, TY_VOID, 1);  // 72 println
+    nat_add(1, TY_I64, -1, -1, -1, TY_VOID, 1);     // 73 print_i64
+    nat_add(1, TY_F64, -1, -1, -1, TY_VOID, 1);     // 74 print_f64
+    nat_add(0, -1, -1, -1, -1, TY_STRING, 1);       // 75 read_line
+    nat_add(1, TY_STRING, -1, -1, -1, TY_I64,  1);  // 76 file_read_bytes
+    nat_add(1, TY_STRING, -1, -1, -1, TY_STRING,1); // 77 file_read_text
+    nat_add(2, TY_STRING, TY_I64, -1, -1, TY_I64, 1); // 78 file_write_bytes
+    nat_add(1, TY_STRING, -1, -1, -1, TY_I64,  1);  // 79 file_exists
+    return 0;
+}
+
+// native_find(name) -> row index, or -1 for an unknown name. An if-chain
+// comparing name as string==string (ember keeps `string` handles distinct
+// from `i64`, so the names cannot live in the i64 signature array). The order
+// matches init_natives 1:1 (the trailing comment in each nat_add row).
+fn native_find(name: string) -> i64 {
+    // ARRAY
+    if (name == string_from_slice("array_new"))     { return 0; }
+    if (name == string_from_slice("array_length"))  { return 1; }
+    if (name == string_from_slice("array_resize"))  { return 2; }
+    if (name == string_from_slice("array_set_u8"))  { return 3; }
+    if (name == string_from_slice("array_get_u8"))  { return 4; }
+    if (name == string_from_slice("array_set_f32")) { return 5; }
+    if (name == string_from_slice("array_get_f32")) { return 6; }
+    if (name == string_from_slice("array_set_i64")) { return 7; }
+    if (name == string_from_slice("array_get_i64")) { return 8; }
+    if (name == string_from_slice("array_push_u8")) { return 9; }
+    if (name == string_from_slice("array_push_f32")){ return 10; }
+    if (name == string_from_slice("array_push_i64")){ return 11; }
+    if (name == string_from_slice("array_pop_u8"))  { return 12; }
+    if (name == string_from_slice("array_pop_f32")) { return 13; }
+    if (name == string_from_slice("array_pop_i64")) { return 14; }
+    if (name == string_from_slice("array_clear"))   { return 15; }
+    if (name == string_from_slice("array_remove"))  { return 16; }
+    // MATH (f32)
+    if (name == string_from_slice("sqrt"))    { return 17; }
+    if (name == string_from_slice("sin"))     { return 18; }
+    if (name == string_from_slice("cos"))     { return 19; }
+    if (name == string_from_slice("tan"))     { return 20; }
+    // MATH (f64)
+    if (name == string_from_slice("sqrt_f64")) { return 21; }
+    if (name == string_from_slice("sin_f64"))  { return 22; }
+    if (name == string_from_slice("cos_f64"))  { return 23; }
+    if (name == string_from_slice("tan_f64"))  { return 24; }
+    if (name == string_from_slice("floor_f64")){ return 25; }
+    if (name == string_from_slice("ceil_f64")) { return 26; }
+    if (name == string_from_slice("abs_f64"))  { return 27; }
+    if (name == string_from_slice("atan_f64")) { return 28; }
+    if (name == string_from_slice("exp_f64"))  { return 29; }
+    if (name == string_from_slice("log_f64"))  { return 30; }
+    if (name == string_from_slice("log2_f64")) { return 31; }
+    if (name == string_from_slice("log10_f64")){ return 32; }
+    if (name == string_from_slice("round_f64")){ return 33; }
+    if (name == string_from_slice("trunc_f64")){ return 34; }
+    if (name == string_from_slice("pow_f64"))  { return 35; }
+    if (name == string_from_slice("atan2_f64")){ return 36; }
+    if (name == string_from_slice("fmod_f64")) { return 37; }
+    if (name == string_from_slice("min_f64"))  { return 38; }
+    if (name == string_from_slice("max_f64"))  { return 39; }
+    if (name == string_from_slice("clamp_f64")){ return 40; }
+    if (name == string_from_slice("abs_i64"))  { return 41; }
+    if (name == string_from_slice("min_i64"))  { return 42; }
+    if (name == string_from_slice("max_i64"))  { return 43; }
+    if (name == string_from_slice("clamp_i64")){ return 44; }
+    if (name == string_from_slice("atan"))     { return 45; }
+    if (name == string_from_slice("atan2"))    { return 46; }
+    if (name == string_from_slice("exp"))      { return 47; }
+    if (name == string_from_slice("log"))      { return 48; }
+    if (name == string_from_slice("floor"))    { return 49; }
+    if (name == string_from_slice("ceil"))     { return 50; }
+    if (name == string_from_slice("abs"))      { return 51; }
+    if (name == string_from_slice("round"))    { return 52; }
+    // MAP
+    if (name == string_from_slice("map_new"))      { return 53; }
+    if (name == string_from_slice("map_set"))      { return 54; }
+    if (name == string_from_slice("map_get"))      { return 55; }
+    if (name == string_from_slice("map_contains")) { return 56; }
+    if (name == string_from_slice("map_length"))   { return 57; }
+    if (name == string_from_slice("map_remove"))   { return 58; }
+    if (name == string_from_slice("map_clear"))    { return 59; }
+    // STRING
+    if (name == string_from_slice("string_new"))       { return 60; }
+    if (name == string_from_slice("string_from_slice")){ return 61; }
+    if (name == string_from_slice("string_length"))    { return 62; }
+    if (name == string_from_slice("string_char_at"))   { return 63; }
+    if (name == string_from_slice("string_from_i64"))  { return 64; }
+    if (name == string_from_slice("string_from_f32"))  { return 65; }
+    if (name == string_from_slice("string_from_f64"))  { return 66; }
+    if (name == string_from_slice("string_from_bool")) { return 67; }
+    if (name == string_from_slice("string_identity"))  { return 68; }
+    if (name == string_from_slice("string_find"))      { return 69; }
+    if (name == string_from_slice("string_substr"))    { return 70; }
+    // IO (perm 1)
+    if (name == string_from_slice("print"))            { return 71; }
+    if (name == string_from_slice("println"))          { return 72; }
+    if (name == string_from_slice("print_i64"))        { return 73; }
+    if (name == string_from_slice("print_f64"))        { return 74; }
+    if (name == string_from_slice("read_line"))        { return 75; }
+    if (name == string_from_slice("file_read_bytes"))  { return 76; }
+    if (name == string_from_slice("file_read_text"))   { return 77; }
+    if (name == string_from_slice("file_write_bytes")) { return 78; }
+    if (name == string_from_slice("file_exists"))      { return 79; }
     return -1;
+}
+
+// native_param_count(name) -> arity, or -1 for an unknown name (so
+// check_callexpr falls through to the script-fn path).
+fn native_param_count(name: string) -> i64 {
+    let row: i64 = native_find(name);
+    if (row < 0) { return -1; }
+    return array_get_i64(g_natives, row * NAT_STRIDE + 0);
 }
 
 // the i-th param's type for a known native. Mirrors the host's registered
 // NativeSig params: string args are the opaque handle (TY_STRING), integer
-// args are i64 (TY_I64).
+// args are i64 (TY_I64), floats are TY_F32/TY_F64, bool is TY_BOOL, u8 is
+// TY_U8. Returns TY_VOID for an out-of-range index (defensive).
 fn native_param_type(name: string, i: i64) -> i64 {
-    if (name == string_from_slice("string_length"))  { return TY_STRING; }
-    if (name == string_from_slice("string_char_at")) {
-        if (i == 0) { return TY_STRING; }
-        return TY_I64;
-    }
-    if (name == string_from_slice("string_substr")) {
-        if (i == 0) { return TY_STRING; }
-        return TY_I64;
-    }
-    return TY_VOID;
+    let row: i64 = native_find(name);
+    if (row < 0) { return TY_VOID; }
+    if (i < 0 || i > 3) { return TY_VOID; }
+    let pt: i64 = array_get_i64(g_natives, row * NAT_STRIDE + 1 + i);
+    if (pt < 0) { return TY_VOID; }
+    return pt;
 }
 
 // the return type for a known native.
 fn native_ret_type(name: string) -> i64 {
-    if (name == string_from_slice("string_length"))  { return TY_I64; }
-    if (name == string_from_slice("string_char_at")) { return TY_I64; }
-    if (name == string_from_slice("string_substr"))  { return TY_STRING; }
-    return TY_VOID;
+    let row: i64 = native_find(name);
+    if (row < 0) { return TY_VOID; }
+    return array_get_i64(g_natives, row * NAT_STRIDE + 5);
+}
+
+// the permission bits for a known native (0=none, 1=PERM_FFI). The codegen
+// bakes this into the ABS64_NATIVE fingerprint so the loader's perm check +
+// fingerprint match pass (io natives are perm 1; all others perm 0).
+fn native_perm(name: string) -> i64 {
+    let row: i64 = native_find(name);
+    if (row < 0) { return 0; }
+    return array_get_i64(g_natives, row * NAT_STRIDE + 6);
 }
 
 // register a fn decl: resolve + record its signature. The body is checked

@@ -95,6 +95,9 @@ global R15 : i64 = 15;
 
 global XMM0 : i64 = 0;
 global XMM1 : i64 = 1;
+global XMM2 : i64 = 2;
+global XMM3 : i64 = 3;
+global XMM4 : i64 = 4;   // scratch for stack-passed float args (not used yet, reserved)
 
 // condition codes for jcc (low nibble of 0F 8x). Matches x64_emitter.hpp's Cond enum.
 global COND_E  : i64 = 0x4;   // equal (ZF=1)
@@ -693,6 +696,7 @@ fn cg_expr_type(e: i64) -> i64 {
 fn cg_type_code(t: i64) -> i64 {
     if (t < 0) { return 0; }   // void/missing -> 0
     if (ty_is_string(t) == 1) { return 6; }   // string handle -> opaque ptr
+    if (ty_is_slice(t) == 1)  { return 5; }   // slice {ptr,len} (string/slice<u8>)
     if (ty_is_void(t) == 1)  { return 0; }
     if (ty_is_i64(t) == 1)   { return 1; }
     if (ty_is_bool(t) == 1)  { return 4; }
@@ -2865,6 +2869,26 @@ fn cg_eval_offsetofexpr(e: i64) -> i64 {
 // order — the same stash-then-load pattern the C++ codegen uses.
 fn cg_eval_callexpr(e: i64) -> i64 {
     let name: string = nk_name(e);
+
+    // ---- string_from_slice(<StringLit>) special case ----
+    // The host registers string_from_slice with a u8-slice param (ABI code 5,
+    // passed as two words ptr+len). The self-hosted subset types a string
+    // literal as TY_STRING (a handle), and cg_eval_string_lit ALREADY
+    // materializes a literal by emitting the rodata slice + a real
+    // string_from_slice(ptr,len) call -> handle in rax. So a user-written
+    // `string_from_slice("lit")` is semantically identical to the bare literal
+    // `"lit"` (same handle): evaluate the literal directly. This avoids the
+    // generic path's 1-word handle ABI (which would mismatch the slice native)
+    // and produces the exact handle the host would. (A non-literal arg is an
+    // edge case the subset does not support; it falls through to the generic
+    // path, which is best-effort.)
+    if (name == string_from_slice("string_from_slice")) {
+        let mut a0: i64 = nk_a(e);
+        if (a0 >= 0 && nk_kind(a0) == (NK::StringLit as i64) && nk_next(a0) < 0) {
+            return cg_eval_string_lit(a0);
+        }
+    }
+
     let fn_row: i64 = find_fn(name);
     let mut is_native: i64 = 0;
     if (fn_row < 0) { is_native = 1; }
@@ -2900,47 +2924,109 @@ fn cg_eval_callexpr(e: i64) -> i64 {
     // sub rsp, call_frame
     cg_sub_reg_imm32(RSP, call_frame);
 
-    // eval each arg -> rax; store to [rsp + i*8]
+    // For a NATIVE call, decide each arg's register class (int reg vs xmm) +
+    // float width from the native's declared param type (the table mirrors the
+    // host's registered NativeSig, so the placement matches the real C++ ABI:
+    // float params arrive in xmm0..xmm3, int/handle params in rcx/rdx/r8/r9).
+    // A SCRIPT call keeps the private int-only ABI (the existing path).
+    let mut arg_is_float: i64 = array_new(8, 16);  // 1 if arg i is a float param
+    let mut arg_is_f64: i64   = array_new(8, 16);  // 1 if f64, 0 if f32
     let mut i: i64 = 0;
     while (i < argc) {
-        let arg_node: i64 = array_get_i64(args, i);
-        cg_eval(arg_node);
-        if (cg_err != 0) { return 0; }
-        cg_store_reg_mem(RSP, i * 8, RAX);
+        if (is_native == 1) {
+            let pt: i64 = native_param_type(name, i);
+            if (ty_is_float(pt) == 1) {
+                array_set_i64(arg_is_float, i, 1);
+                if (cg_float_is64_type(pt) == 1) { array_set_i64(arg_is_f64, i, 1); }
+            }
+        }
         i = i + 1;
     }
 
-    // load args into Win64 registers: rcx, rdx, r8, r9
-    if (argc >= 1) { cg_load_reg_mem(RCX, RSP, 0); }
-    if (argc >= 2) { cg_load_reg_mem(RDX, RSP, 8); }
-    if (argc >= 3) { cg_load_reg_mem(R8, RSP, 16); }
-    if (argc >= 4) { cg_load_reg_mem(R9, RSP, 24); }
+    // eval each arg -> rax (int/handle) or xmm0 (float); store to [rsp + i*8].
+    // For a float arg, cg_eval leaves the value in xmm0; store it with the
+    // param's width (movsd f64 / movss f32) so the native receives the right
+    // precision. For an int/handle arg, cg_eval leaves rax.
+    let mut i2: i64 = 0;
+    while (i2 < argc) {
+        let arg_node: i64 = array_get_i64(args, i2);
+        cg_eval(arg_node);
+        if (cg_err != 0) { return 0; }
+        if (array_get_i64(arg_is_float, i2) == 1) {
+            let is64: i64 = array_get_i64(arg_is_f64, i2);
+            cg_store_float_reg(RSP, i2 * 8, XMM0, is64);
+        } else {
+            cg_store_reg_mem(RSP, i2 * 8, RAX);
+        }
+        i2 = i2 + 1;
+    }
 
     if (is_native == 1) {
-        // NATIVE call: mov rax, <fn_ptr> via ABS64_NATIVE reloc + call rax.
-        // The fingerprint is computed from the call's arg types + return type
-        // (sema annotated the return type in slot c). Permission is 0 for the
-        // string natives (the host registers them with permission 0; the loader
-        // computes the fingerprint from the registered sig with perm 0).
+        // NATIVE call: place args 0..3 into Win64 registers (xmm0..xmm3 for
+        // float params, rcx/rdx/r8/r9 for int/handle params), then mov rax,
+        // <fn_ptr> via an ABS64_NATIVE reloc + call rax. The fingerprint is
+        // computed from the native's declared param/return types + permission
+        // (the table mirrors the host's registered NativeSig EXACTLY, so the
+        // baked addend == abi_fingerprint(registered_sig) and the loader's
+        // check passes). io natives are perm 1; array/math/map/string perm 0.
+        if (argc >= 1) {
+            if (array_get_i64(arg_is_float, 0) == 1) { cg_load_float_reg(XMM0, RSP, 0,  array_get_i64(arg_is_f64, 0)); }
+            else { cg_load_reg_mem(RCX, RSP, 0); }
+        }
+        if (argc >= 2) {
+            if (array_get_i64(arg_is_float, 1) == 1) { cg_load_float_reg(XMM1, RSP, 8,  array_get_i64(arg_is_f64, 1)); }
+            else { cg_load_reg_mem(RDX, RSP, 8); }
+        }
+        if (argc >= 3) {
+            if (array_get_i64(arg_is_float, 2) == 1) { cg_load_float_reg(XMM2, RSP, 16, array_get_i64(arg_is_f64, 2)); }
+            else { cg_load_reg_mem(R8, RSP, 16); }
+        }
+        if (argc >= 4) {
+            if (array_get_i64(arg_is_float, 3) == 1) { cg_load_float_reg(XMM3, RSP, 24, array_get_i64(arg_is_f64, 3)); }
+            else { cg_load_reg_mem(R9, RSP, 24); }
+        }
         let sym_idx: i64 = cg_sym_index(name);
-        // collect arg type nodes for the fingerprint
-        let arg_types: i64 = array_new(8, 4);
+        // build the fingerprint from the native's declared param types (not the
+        // call's arg types) so it matches the host's registered sig even when
+        // an arg adapts (e.g. an IntLit to an i64 param, f32->f64 widening).
+        let param_types: i64 = array_new(8, 4);
         let mut j: i64 = 0;
-        while (j < argc) {
-            array_set_i64(arg_types, j, cg_expr_type(array_get_i64(args, j)));
+        while (j < argc && j < 4) {
+            array_set_i64(param_types, j, native_param_type(name, j));
             j = j + 1;
         }
-        let ret_type: i64 = nk_c(e);   // sema-annotated return type
-        let fp: i64 = cg_abi_fingerprint(arg_types, argc, ret_type, 0);
+        let ret_type: i64 = native_ret_type(name);
+        let perm: i64 = native_perm(name);
+        let fp: i64 = cg_abi_fingerprint(param_types, argc, ret_type, perm);
         cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
         cg_call_reg(RAX);  // call rax (FF D0)
         // add rsp, call_frame (restore the stack)
         cg_add_reg_imm32(RSP, call_frame);
-        // result (i64 or handle) is in rax; normalize narrow int returns at
-        // the call boundary (mirrors src/codegen.cpp's CallExpr post-call normalize).
+        // result convention: a float return arrives in xmm0 (leave it there so
+        // callers reading a float CallExpr see xmm0); an int/handle/u8 return
+        // arrives in rax (normalize narrow ints — u8 etc. — at the boundary);
+        // a void return has no result (nothing to normalize). Annotate the
+        // call's type on slot c so downstream consumers know the return type.
+        set_c(e, ret_type);
+        if (ty_is_float(ret_type) == 1) {
+            // float result in xmm0; no rax normalization (mirrors the C++
+            // codegen, which leaves a float CallExpr result in xmm0).
+            return 0;
+        }
+        if (ty_is_void(ret_type) == 1) {
+            cg_mov_reg_imm64(RAX, 0);  // void call expr value is 0
+            return 0;
+        }
         cg_normalize_rax(ret_type);
         return 0;
     }
+
+    // SCRIPT call: load args 0..3 into the Win64 int registers (the private
+    // ember call ABI passes one 8-byte word per param in rcx/rdx/r8/r9).
+    if (argc >= 1) { cg_load_reg_mem(RCX, RSP, 0); }
+    if (argc >= 2) { cg_load_reg_mem(RDX, RSP, 8); }
+    if (argc >= 3) { cg_load_reg_mem(R8, RSP, 16); }
+    if (argc >= 4) { cg_load_reg_mem(R9, RSP, 24); }
 
     // SCRIPT call: a direct call rel32 to the callee's entry label.
     // cg_fn_labels maps the callee's name to a label bound at its prologue

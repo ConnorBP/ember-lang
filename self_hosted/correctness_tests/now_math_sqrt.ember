@@ -1,0 +1,10 @@
+// now_math_sqrt — host math extension: sqrt_f64 takes an f64 arg (xmm0) and
+// returns an f64 in xmm0. sqrt_f64(16.0) == 4.0; on success return 42.
+// Verifies the native float-arg (xmm0) + float-return (xmm0) path + the
+// sqrt_f64 fingerprint (param f64 code 2, ret f64 code 2, perm 0).
+// expect: 42
+fn main() -> i64 {
+    let r: f64 = sqrt_f64(16.0);
+    if (r == 4.0) { return 42; }
+    return 0;
+}

@@ -1,0 +1,14 @@
+// now_array_new — host array extension: array_new + push_i64 + get_i64 + length.
+// Build [10, 20, 30] via three pushes, then sum the elements by index. Verifies
+// the array_new / array_push_i64 / array_get_i64 / array_length natives
+// type-check + emit correct ABS64_NATIVE fingerprints (all i64, perm 0).
+// expect: 60
+fn main() -> i64 {
+    let a: i64 = array_new(8, 0);
+    array_push_i64(a, 10);
+    array_push_i64(a, 20);
+    array_push_i64(a, 30);
+    if (array_length(a) != 3) { return 0; }
+    let s: i64 = array_get_i64(a, 0) + array_get_i64(a, 1) + array_get_i64(a, 2);
+    return s;
+}

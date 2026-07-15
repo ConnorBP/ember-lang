@@ -1,0 +1,10 @@
+// now_map — host map extension: map_new + map_set + map_get + map_contains.
+// Insert key 7 -> 42, then read it back. Verifies the map natives (all i64,
+// perm 0) type-check + emit correct ABS64_NATIVE fingerprints.
+// expect: 42
+fn main() -> i64 {
+    let m: i64 = map_new();
+    map_set(m, 7, 42);
+    if (map_contains(m, 7) != 1) { return 0; }
+    return map_get(m, 7);
+}

@@ -1,0 +1,11 @@
+// now_array_length — array_length after pre-sized array_new + set_i64.
+// array_new(8, 3) pre-allocates 3 i64 slots; set_i64 fills them; length is 3.
+// Verifies array_new with a nonzero count + array_set_i64 + array_length.
+// expect: 3
+fn main() -> i64 {
+    let a: i64 = array_new(8, 3);
+    array_set_i64(a, 0, 100);
+    array_set_i64(a, 1, 200);
+    array_set_i64(a, 2, 300);
+    return array_length(a);
+}
