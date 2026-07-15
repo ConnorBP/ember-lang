@@ -152,6 +152,195 @@ int main() {
         ck(h.stats().freed_objects == 0, "[8b] clear: no freed after reset");
     }
 
+    // ====================================================================
+    // [9]-[13]: trace-callback + write-barrier foundational collector APIs.
+    // These exercise the per-GcHeap trace-callback registration mechanism
+    // (external root providers) + the write barrier. See gc.hpp for the API.
+    // ====================================================================
+
+    // [9] externally supplied roots: a trace callback reports an object as a
+    //     root; the object survives collect even though no explicit root slot
+    //     was registered. This is the core extension-owned-roots contract.
+    {
+        GcHeap h;
+        void* obj = h.alloc(8, refmap_none());
+        // user_data holds the pointer the callback will report.
+        void* reported = obj;
+        GcTraceToken tok = h.register_trace_callback(&reported,
+            [](void* ud, GcTraceVisitor& v) {
+                void* p = *static_cast<void**>(ud);
+                v.report(p);
+            });
+        ck(tok != 0, "[9a] register_trace_callback returns non-zero token");
+        h.collect();
+        ck(h.is_live(obj), "[9b] callback-reported object survives collect");
+        ck(h.stats().live_objects == 1, "[9c] live_objects==1 (callback root)");
+        // Unregister -> object no longer reported -> collected next cycle.
+        ck(h.unregister_trace_callback(tok), "[9d] unregister returns true");
+        h.collect();
+        ck(!h.is_live(obj), "[9e] object collected after callback removed");
+        ck(h.stats().freed_objects == 1, "[9f] freed_objects==1 after removal");
+        // unregister again -> false (already removed / invalid token).
+        ck(!h.unregister_trace_callback(tok), "[9g] re-unregister returns false");
+    }
+
+    // [10] callback-reported child pointers: a callback reports an object A
+    //      whose RefMap points to a child B. collect() traces from the
+    //      callback-reported A through the RefMap edge to B (the same mark
+    //      worklist used by explicit roots), so B survives too. An isolated
+    //      object C (not reported, not reachable) is collected.
+    {
+        GcHeap h;
+        void* A = h.alloc(16, refmap_words({0}));   // A[0] -> B
+        void* B = h.alloc(8, refmap_none());
+        void* C = h.alloc(8, refmap_none());         // isolated
+        std::memcpy(A, &B, 8);                       // A[0] = &B
+        void* reported = A;
+        h.register_trace_callback(&reported,
+            [](void* ud, GcTraceVisitor& v) {
+                v.report(*static_cast<void**>(ud));
+            });
+        h.collect();
+        ck(h.is_live(A), "[10a] callback-rooted A survives");
+        ck(h.is_live(B), "[10b] B survives via RefMap edge from callback-rooted A");
+        ck(!h.is_live(C), "[10c] isolated C collected");
+        ck(h.stats().live_objects == 2, "[10d] live_objects==2 (A + B)");
+    }
+
+    // [11] callback removal + clear() lifetime: removing a callback must not
+    //      leave dangling user data in the heap. After unregister, the heap
+    //      holds no reference to the caller's user_data. clear() drops every
+    //      registration without retaining caller pointers. We verify by (a)
+    //      letting the user_data storage go out of scope after unregister and
+    //      running another collect (no dangling access), and (b) clear()
+    //      dropping a still-registered callback without touching its data.
+    {
+        GcHeap h;
+        // (a) unregister then let user_data go out of scope before next collect.
+        GcTraceToken tok;
+        {
+            void* obj = h.alloc(8, refmap_none());
+            void* reported = obj;
+            tok = h.register_trace_callback(&reported,
+                [](void* ud, GcTraceVisitor& v) {
+                    v.report(*static_cast<void**>(ud));
+                });
+            h.collect();
+            ck(h.is_live(obj), "[11a] object survives while callback registered");
+            h.unregister_trace_callback(tok);
+            // `reported` goes out of scope here; the heap must not retain it.
+        }
+        // collect again: the heap must not dereference the now-gone user_data.
+        h.collect();
+        ck(h.stats().collections == 2, "[11b] second collect ran after user_data gone (no dangling)");
+        // (b) clear() drops a still-registered callback without touching user_data.
+        void* obj2 = h.alloc(8, refmap_none());
+        (void)obj2;
+        int touched = 0;
+        h.register_trace_callback(&touched,
+            [](void* ud, GcTraceVisitor& v) {
+                *static_cast<int*>(ud) += 1;  // mark that the callback ran
+                (void)v;
+            });
+        h.clear();  // drops the callback; the next collect must NOT call it.
+        int touched_before = touched;
+        h.collect();
+        ck(touched == touched_before, "[11c] clear() dropped callback: not invoked after clear");
+        ck(h.stats().live_objects == 0, "[11d] clear() freed all objects");
+        // After clear, the token from (a) is invalid (heap reset). unregister is false.
+        ck(!h.unregister_trace_callback(tok), "[11e] token invalid after clear()");
+    }
+
+    // [12] invalid / non-live reported pointers: a callback may report null,
+    //      a non-GC pointer (e.g. a stack address), and a pointer to an object
+    //      that was already freed. collect() must safely ignore all of these
+    //      and only keep genuinely-live reported objects. No crash, no false
+    //      mark of freed memory.
+    {
+        GcHeap h;
+        void* live = h.alloc(8, refmap_none());
+        // Root `live` so it survives the first collect, while `victim` (no
+        // root) is freed. We then drop that root and let the callback be the
+        // SOLE source keeping `live` alive in the second collect — proving the
+        // callback can rescue a live object while ignoring a freed pointer.
+        void* rlive = live;
+        h.add_root(&rlive);
+        void* victim = h.alloc(8, refmap_none());
+        h.collect();          // victim unrooted -> freed; live rooted -> survives
+        ck(!h.is_live(victim), "[12a] victim freed before callback reports it");
+        ck(h.is_live(live), "[12a2] live survived first collect (rooted)");
+        h.remove_root(&rlive);  // callback is now the only thing referencing live
+        int stack_local = 0;
+        void* stack_ptr = &stack_local;   // a non-GC pointer
+        // Bundle the candidates the callback will report.
+        struct Cand { void* live_p; void* freed_p; void* stack_p; };
+        Cand c{ live, victim, stack_ptr };
+        h.register_trace_callback(&c,
+            [](void* ud, GcTraceVisitor& v) {
+                Cand* p = static_cast<Cand*>(ud);
+                v.report(nullptr);        // null
+                v.report(p->freed_p);     // already freed
+                v.report(p->stack_p);     // non-GC pointer
+                v.report(p->live_p);      // the one genuinely-live candidate
+            });
+        h.collect();
+        ck(h.is_live(live), "[12b] live reported object survives");
+        ck(!h.is_live(victim), "[12c] freed reported pointer not resurrected");
+        ck(h.stats().live_objects == 1, "[12d] live_objects==1 (only the live candidate)");
+        ck(h.stats().freed_objects == 1, "[12e] freed_objects==1 (victim only)");
+    }
+
+    // [13] write-barrier invocation: write_barrier(owner, child) is observable
+    //      via a registered observer/hook and via stats().barrier_calls. It
+    //      must safely ignore null/non-live owner or child (no observer fire,
+    //      no counter bump for those). The current non-generational collector
+    //      does not need a remembered set, so the barrier is a no-op on actual
+    //      collection behavior — but the observability surface must work.
+    {
+        GcHeap h;
+        ck(h.stats().barrier_calls == 0, "[13a] barrier_calls starts at 0");
+        void* owner = h.alloc(16, refmap_words({0}));
+        void* child = h.alloc(8, refmap_none());
+        // Observer records the (owner, child) pairs it sees.
+        struct Obs { void* owner; void* child; int count; };
+        Obs rec{ nullptr, nullptr, 0 };
+        GcBarrierToken otok = h.register_barrier_observer(&rec,
+            [](void* ud, void* o, void* c) {
+                Obs* r = static_cast<Obs*>(ud);
+                r->owner = o; r->child = c; r->count++;
+            });
+        ck(otok != 0, "[13b] register_barrier_observer returns non-zero token");
+        // Valid barrier: both live -> observer fires, counter bumps.
+        h.write_barrier(owner, child);
+        ck(rec.count == 1, "[13c] observer fired for valid barrier");
+        ck(rec.owner == owner && rec.child == child, "[13d] observer saw (owner, child)");
+        ck(h.stats().barrier_calls == 1, "[13e] barrier_calls==1 after valid call");
+        // Null child -> safely ignored (no observer fire, no bump).
+        h.write_barrier(owner, nullptr);
+        ck(rec.count == 1, "[13f] null child: observer not fired");
+        ck(h.stats().barrier_calls == 1, "[13g] null child: barrier_calls unchanged");
+        // Null owner -> safely ignored.
+        h.write_barrier(nullptr, child);
+        ck(rec.count == 1, "[13h] null owner: observer not fired");
+        ck(h.stats().barrier_calls == 1, "[13i] null owner: barrier_calls unchanged");
+        // Non-live child (a stack pointer) -> safely ignored.
+        int sl = 0;
+        h.write_barrier(owner, &sl);
+        ck(rec.count == 1, "[13j] non-live child: observer not fired");
+        ck(h.stats().barrier_calls == 1, "[13k] non-live child: barrier_calls unchanged");
+        // Unregister observer -> subsequent barriers do not fire it.
+        ck(h.unregister_barrier_observer(otok), "[13l] unregister observer returns true");
+        h.write_barrier(owner, child);
+        ck(rec.count == 1, "[13m] observer not fired after unregister");
+        ck(h.stats().barrier_calls == 2, "[13n] barrier_calls still counts after observer removed");
+        // collect() is unaffected by the barrier (non-generational: no remembered set).
+        void* rootO = owner;
+        h.add_root(&rootO);
+        std::memcpy(owner, &child, 8);  // owner[0] = child (reachable edge)
+        h.collect();
+        ck(h.is_live(owner) && h.is_live(child), "[13o] barrier does not change reachability");
+    }
+
     std::printf("\ngc_test: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }

@@ -91,23 +91,118 @@ bool GcHeap::is_live(const void* p) const {
 
 const GcStats& GcHeap::stats() const { return m_stats; }
 
+// --- Trace-callback registration (external root providers) ---
+
+GcTraceToken GcHeap::register_trace_callback(void* user_data, GcTraceFn fn) {
+    if (!fn) return 0;  // 0 == invalid token
+    GcTraceToken tok = m_next_trace_token++;
+    m_trace_cbs.push_back(TraceCb{tok, user_data, fn});
+    return tok;
+}
+
+bool GcHeap::unregister_trace_callback(GcTraceToken token) {
+    if (token == 0) return false;
+    for (size_t i = 0; i < m_trace_cbs.size(); ++i) {
+        if (m_trace_cbs[i].token == token) {
+            // We do NOT touch user_data here: the caller owns it, so removing
+            // the registration must not dereference or retain it. Erasing the
+            // vector entry drops our only reference to it.
+            m_trace_cbs.erase(m_trace_cbs.begin() + i);
+            return true;
+        }
+    }
+    return false;  // invalid / already-removed token
+}
+
+// GcTraceVisitor::report: validate `candidate` and, if it is a live GC object
+// not yet marked, mark it + push onto the worklist. Safe for null / non-GC /
+// freed pointers (is_live() returns false for those, so they are ignored).
+void GcTraceVisitor::report(void* candidate) {
+    if (!candidate || !heap) return;
+    if (!heap->is_live(candidate)) return;  // null/non-GC/freed -> ignore
+    heap->mark_and_push(candidate, *worklist);
+}
+
+// mark_and_push: mark `obj` (a live GC object's user bytes) if not already
+// marked, then push it onto the worklist so its RefMap edges get traced.
+// Shared by the explicit-root loop and the trace-visitor so both feed the SAME
+// worklist (and thus the SAME trace phase) — externally-reported roots and
+// explicit roots are indistinguishable to the tracer.
+void GcHeap::mark_and_push(void* obj, std::vector<void*>& worklist) {
+    uint32_t hb;
+    std::memcpy(&hb, static_cast<char*>(obj) - 4, 4);
+    Header* hdr = reinterpret_cast<Header*>(static_cast<char*>(obj) - hb);
+    if (hdr->mark) return;
+    hdr->mark = 1;
+    worklist.push_back(obj);
+}
+
+// --- Write barrier + barrier observer hook ---
+
+GcBarrierToken GcHeap::register_barrier_observer(void* user_data, GcBarrierObserver obs) {
+    if (!obs) return 0;
+    GcBarrierToken tok = m_next_barrier_token++;
+    m_barrier_obs.push_back(BarrierObs{tok, user_data, obs});
+    return tok;
+}
+
+bool GcHeap::unregister_barrier_observer(GcBarrierToken token) {
+    if (token == 0) return false;
+    for (size_t i = 0; i < m_barrier_obs.size(); ++i) {
+        if (m_barrier_obs[i].token == token) {
+            // Same lifetime contract as trace callbacks: do NOT touch user_data.
+            m_barrier_obs.erase(m_barrier_obs.begin() + i);
+            return true;
+        }
+    }
+    return false;
+}
+
+void GcHeap::write_barrier(void* owner, void* child) {
+    // Safely ignore null / non-live values: a barrier is only meaningful when
+    // a live owner writes a live child (a real inter-object edge). For the
+    // current non-generational collector this is a behavioural no-op beyond
+    // the observability surface; the liveness filter keeps the counter + the
+    // observers from firing on noise (null writes, non-GC pointers, writes
+    // into dead/freed objects).
+    if (!owner || !child) return;
+    if (!is_live(owner) || !is_live(child)) return;
+    m_stats.barrier_calls++;
+    for (const BarrierObs& obs : m_barrier_obs) {
+        obs.fn(obs.user_data, owner, child);
+    }
+}
+
 const GcStats& GcHeap::collect() {
     m_stats.collections++;
 
-    // Mark phase: worklist starting from roots.
+    // Mark phase: worklist starting from explicit roots AND from every
+    // registered trace callback's reported candidates. Both feed the SAME
+    // worklist via mark_and_push, so externally-supplied roots are traced
+    // identically to explicit root slots.
     std::vector<void*> worklist;
+
+    // (1) Explicit root slots.
     for (void** root : m_roots) {
         if (!root) continue;
         void* obj = *root;
         if (!obj || !is_live(obj)) continue;
-        // Recover the header: header_bytes is stored as a uint32 at user - 4.
-        uint32_t hb;
-        std::memcpy(&hb, static_cast<char*>(obj) - 4, 4);
-        Header* hdr = reinterpret_cast<Header*>(static_cast<char*>(obj) - hb);
-        if (hdr->mark) continue;
-        hdr->mark = 1;
-        worklist.push_back(obj);
+        mark_and_push(obj, worklist);
     }
+
+    // (2) Trace-callback-reported roots. Each callback receives a visitor
+    // wired to this heap + worklist; it reports candidate pointers via
+    // visitor.report(), which validates (live?) + marks + pushes. Invalid /
+    // non-live / null candidates are silently filtered by the visitor.
+    if (!m_trace_cbs.empty()) {
+        GcTraceVisitor vis;
+        vis.heap = this;
+        vis.worklist = &worklist;
+        for (const TraceCb& cb : m_trace_cbs) {
+            cb.fn(cb.user_data, vis);
+        }
+    }
+
     // Trace: follow each object's pointer word offsets.
     while (!worklist.empty()) {
         void* obj = worklist.back();
@@ -121,12 +216,7 @@ const GcStats& GcHeap::collect() {
             void* child;
             std::memcpy(&child, static_cast<char*>(obj) + off, 8);
             if (!child || !is_live(child)) continue;
-            uint32_t chb;
-            std::memcpy(&chb, static_cast<char*>(child) - 4, 4);
-            Header* chdr = reinterpret_cast<Header*>(static_cast<char*>(child) - chb);
-            if (chdr->mark) continue;
-            chdr->mark = 1;
-            worklist.push_back(child);
+            mark_and_push(child, worklist);
         }
     }
 
@@ -165,7 +255,19 @@ void GcHeap::clear() {
     }
     m_live.clear();
     m_roots.clear();
+    // Drop all trace-callback and barrier-observer registrations WITHOUT
+    // touching any caller user_data: the heap held raw pointers into caller
+    // storage only for the lifetime of each registration; clearing the vectors
+    // drops those references. No dangling callback user data remains. Every
+    // previously-issued token is now invalid.
+    m_trace_cbs.clear();
+    m_barrier_obs.clear();
     m_stats = GcStats{};
+    // Leave the token counters as-is (they are monotonic per-heap). Tokens
+    // issued before clear() remain invalid because their entries are gone;
+    // new registrations continue from the next monotonic value. This keeps
+    // tokens globally unique across a heap's lifetime (a recycled token could
+    // otherwise refer to a stale registration a caller forgot to drop).
 }
 
 } // namespace ember::gc

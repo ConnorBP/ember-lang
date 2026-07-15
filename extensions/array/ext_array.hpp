@@ -46,4 +46,18 @@ bool get_bytes(int64_t handle, uint8_t** out_data, int64_t* out_len);
 // and freed on reset().
 int64_t alloc_bytes(const uint8_t* data, int64_t len);
 
+// === GC trace-callback integration (c1) ====================================
+// array<T> registers an idempotent trace callback against the current
+// thread-local GC runtime (via ext_gc) so an UNPINNED GC object stored in an
+// i64 element (elem_size==8) survives collection, then is reclaimed when the
+// entry is removed / cleared / the extension is reset. The callback visits
+// only aligned i64 elements of elem_size==8 slots; the heap visitor filters
+// ordinary integers + stale/non-live addresses. array_set_i64 / array_push_i64
+// also invoke the GC write barrier (the array is external-root storage, not a
+// live GC object, so the barrier filters the owner today; the call site is
+// forward-compatible for a future remembered set). No public-API change — the
+// integration is internal to ext_array.cpp; native signatures, opaque-handle
+// behavior, size limits, and reset() semantics are unchanged. When the GC
+// extension is absent/inactive the facade no-ops, so array works unchanged.
+
 } // namespace ember::ext_array

@@ -40,4 +40,15 @@ const std::string* slot(int64_t handle);
 // extension's host store and freed on reset().
 int64_t alloc(std::string s);
 
+// === GC trace-callback integration (c1) — LEAF =============================
+// string owns UTF-8 bytes (no GC-managed children), so string registers a LEAF
+// trace callback (reports nothing) against the current thread-local GC runtime
+// (via ext_gc). The registration is observable via gc_trace_callback_count()
+// (goes up by exactly 1, idempotent across string_new / string_from_*) and does
+// NOT create a false root (a string existing keeps no unrelated object alive).
+// reset() unregisters the callback. No public-API change — internal to
+// ext_string.cpp; native signatures, opaque-handle behavior, size limits, and
+// reset() semantics are unchanged. When the GC extension is absent/inactive
+// the facade no-ops, so string works unchanged.
+
 } // namespace ember::ext_string

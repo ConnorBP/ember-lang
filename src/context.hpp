@@ -52,6 +52,7 @@
 #include <csetjmp>
 #include <mutex>
 #include <string>
+#include "gc_roots.hpp"  // ember::gc::GcFrameRecord, GcGlobalRoots (precise GC root scanning)
 
 // Portable setjmp/longjmp for the host-managed trap-recovery checkpoint.
 // The JIT'd try/catch mechanism uses a CUSTOM register save/restore (not libc
@@ -126,6 +127,26 @@ struct context_t {
     int32_t _catch_pad = 0;       // explicit 4-byte pad so thrown_value is 8-aligned
     int64_t thrown_value = 0;
 
+    // ---- Precise GC root scanning (shadow stack + global roots) ----
+    // The head of the active-frame chain (the "shadow stack"). Each active
+    // JIT frame, on prologue, links a GcFrameRecord (living inside its own
+    // stack frame) onto this head; the epilogue unlinks it. The tracing
+    // collector (ext_gc) walks the chain from this head and reports each
+    // frame's mapped GC-pointer slots as roots. nullptr = no JIT frames
+    // active (collection finds no stack roots). JIT'd code reads/writes it via
+    // [r14 + context_offsets::gc_frame_head()]. reset_for_call() clears it
+    // after a trap longjmp (the abandoned frames' balanced epilogues never
+    // ran, so their records are stale; clearing the head prevents the next
+    // collection from walking a dead frame and dereferencing a freed env).
+    gc::GcFrameRecord* gc_frame_head = nullptr;
+    // The typed-global GC-root descriptor (globals base + the byte offsets of
+    // the block's GC-pointer words). Host-attached before running JIT code.
+    // The collector reads *(global_roots->base + off) for each off. nullptr
+    // = no global roots registered. JIT'd code does NOT read this (it is
+    // consumed only by the collector's trace callback), but it lives in the
+    // POD prefix so the offset is stable and a host can set it once.
+    gc::GcGlobalRoots* gc_global_roots = nullptr;
+
     // ---- checkpoint + host-side state (NOT read by JIT'd [ctx_reg+off]) ----
     jmp_buf checkpoint{};
     bool has_checkpoint = false;     // host sets true after setjmp, before raw B1 call
@@ -167,6 +188,16 @@ struct context_t {
         // to the host, not to a stale buffer from the previous call).
         catch_depth = 0;
         thrown_value = 0;
+        // Precise GC: a host-level trap recovery (longjmp to the host
+        // checkpoint) abandons the entire JIT call stack. The abandoned frames'
+        // balanced epilogues never executed, so their GcFrameRecords are still
+        // linked onto gc_frame_head — walking them would dereference freed env
+        // pointers and corrupt the collector. Clear the head so the next call
+        // starts with an empty shadow stack (the freed envs become collectable
+        // on the next collect, which is correct: nothing reachable reaches them
+        // after the trap). The global-root descriptor is retained (it is host-
+        // owned and independent of the call stack).
+        gc_frame_head = nullptr;
         // budget_remaining is NOT reset here — a host may set one budget for
         // a whole batch of calls; reset is the host's responsibility.
     }
@@ -185,6 +216,10 @@ struct context_offsets {
     static int32_t catch_bufs()      { return int32_t(offsetof(context_t, catch_bufs)); }
     static int32_t catch_saved_depths() { return int32_t(offsetof(context_t, catch_saved_call_depths)); }
     static int32_t catch_buf_stride()   { return 64; }  // 8 × int64_t per entry
+    // Precise GC root scanning: shadow-stack head + global-root descriptor.
+    // Both are POD-prefix pointers the JIT reads/writes via [r14 + off].
+    static int32_t gc_frame_head()    { return int32_t(offsetof(context_t, gc_frame_head)); }
+    static int32_t gc_global_roots()  { return int32_t(offsetof(context_t, gc_global_roots)); }
 };
 
 // The trap-stub function signature: a host-provided C function the JIT'd

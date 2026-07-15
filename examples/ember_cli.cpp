@@ -328,6 +328,7 @@ static void usage(FILE* out) {
 static uint32_t host_value_bytes(const ember::Type* t, const ember::StructLayoutTable* structs) {
     if (!t) return 8;
     if (t->is_slice) return 16;
+    if (t->is_lambda) return 16;   // {fn_slot, env_ptr} (#20) — same 16-byte ABI as a slice
     if (t->array_len > 0)
         return uint32_t(t->array_len) * host_value_bytes(t->elem.get(), structs);
     if (!t->struct_name.empty() && structs) {
@@ -613,6 +614,19 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
     gic.structs = &struct_layouts;
     eval_global_initializers(pr.program, gic);
 
+    // ---- precise GC: build the typed-global GC-root descriptor ----
+    // Lists the byte offsets of GC-pointer words in the globals block (the
+    // env_ptr half of every lambda-typed global, at offset+8). Attached to the
+    // context before the call so the collector's trace callback roots them.
+    ember::gc::GcGlobalRoots gc_global_roots;
+    gc_global_roots.base = uint64_t(gb.base);
+    for (const auto& g : pr.program.globals) {
+        if (g.ty && g.ty->is_lambda) {
+            auto oit = gb.offsets.find(g.name);
+            if (oit != gb.offsets.end()) gc_global_roots.offs.push_back(int32_t(oit->second + 8));
+        }
+    }
+
     // ---- dispatch table + codegen ctx (mirrors em_roundtrip_test) ----
     DispatchTable table(pr.program.funcs.size());
     CodeGenCtx ctx;
@@ -869,6 +883,11 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
             const auto& cf = fns[i];
             std::printf("fn %-20s slot=%-3d bytes=%-6zu relocs=%zu\n",
                         fn.name.c_str(), fn.slot, cf.bytes.size(), cf.abs_fixups.size());
+            if (fn.name == "main" || fn.name == "mk") {
+                std::printf("  %s bytes:", fn.name.c_str());
+                for (size_t b = 0; b < cf.bytes.size(); ++b) { if (b % 16 == 0) std::printf("\n  %04zx:", b); std::printf(" %02x", cf.bytes[b]); }
+                std::printf("\n"); std::fflush(stdout);
+            }
         }
     }
     // ---- locate the entry function ----
@@ -965,15 +984,22 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
     // The host's outer call participates in the same mutex protocol as
     // spawned workers. This prevents a worker from replacing ectx.checkpoint
     // while the main thread is executing and potentially trapping.
+    // Precise GC: attach the context (frame-chain + global-root trace callback)
+    // before the call so any collect (auto or explicit) sees the active frame
+    // chain + typed global roots. Detached on every normal/trap exit below.
+    if (opts.gc_env) ectx.gc_frame_head = nullptr;
+    ember::ext_gc::gc_attach_context(&ectx, gc_global_roots.empty() ? nullptr : &gc_global_roots);
     ectx.call_mutex.lock();
     if (EMBER_SETJMP(ectx.checkpoint)) {
         ectx.call_mutex.unlock();
+        ember::ext_gc::gc_detach_context(&ectx); ectx.reset_for_call();
         std::fprintf(stderr, "ember: RUNTIME TRAP: %s (%s)\n",
                      ectx.last_error.c_str(), ember::trap_reason_str(ectx.last_trap));
         exit_code = 70;
     } else {
         entry_ret = ember::ember_call_void(entry, &ectx);
         ectx.call_mutex.unlock();
+        ember::ext_gc::gc_detach_context(&ectx);
         if (!returns_void)
             exit_code = int(uint64_t(entry_ret) & 0x7fffffff);
     }

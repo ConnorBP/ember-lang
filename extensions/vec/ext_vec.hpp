@@ -30,4 +30,15 @@ void register_overloads(OpOverloadTable& t);
 // A host that does not care about run-to-run isolation may skip this.
 void reset();
 
+// === GC trace-callback integration (c1) — LEAF =============================
+// vec2/vec3/vec4 own only floats (no GC-managed children), so vec registers a
+// LEAF trace callback (reports nothing) against the current thread-local GC
+// runtime (via ext_gc). The registration is observable via
+// gc_trace_callback_count() (goes up by exactly 1, idempotent across vec2/3/4)
+// and does NOT create a false root (a vec existing keeps no unrelated object
+// alive). reset() unregisters the callback. No public-API change — internal to
+// ext_vec.cpp; native signatures, opaque-handle behavior, and reset() semantics
+// are unchanged. When the GC extension is absent/inactive the facade no-ops,
+// so vec works unchanged.
+
 } // namespace ember::ext_vec

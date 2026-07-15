@@ -8,6 +8,7 @@
 #include "ext_array.hpp"
 #include "ast.hpp"
 #include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
+#include "../gc/ext_gc.hpp"     // c1 GC trace-callback + write-barrier facade
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -37,6 +38,91 @@ static bool checked_bytes(int64_t elem_size, int64_t count, size_t* out) {
     if (n != 0 && es > uint64_t(MAX_CONTAINER_BYTES) / n) return false;
     *out = size_t(es * n);
     return *out <= MAX_CONTAINER_BYTES;
+}
+
+// ===========================================================================
+// c1 GC trace-callback integration.
+//
+// An array<i64> (elem_size == 8) can hold a GC object pointer in any of its
+// aligned 8-byte elements. For an UNPINNED GC object stored there to survive
+// gc_collect, the array store must report those element values as root
+// candidates to the collector. We register ONE idempotent trace callback per
+// thread (against that thread's thread-local GC runtime via the ext_gc facade)
+// that walks g_arrays under g_store_mutex and, for every slot whose
+// elem_size == 8, reports each aligned 8-byte element via visitor.report().
+// The heap visitor validates each candidate (live?) and rejects ordinary
+// integers, null, and stale / non-live addresses -- so a u8 / f32 array
+// (elem_size != 8) and a plain-integer i64 slot NEVER create a false root.
+//
+// The token is THREAD-LOCAL because the GC runtime is thread-local: each OS
+// thread registers its own callback on its own heap, and the callback walks the
+// (process-wide, mutex-protected) store. A pointer from thread B's heap stored
+// into an array is reported during thread A's collect, but the visitor rejects
+// it (not live on A's heap), so cross-thread pointers do not false-root.
+//
+// Lifecycle: the callback is registered lazily on the first GC-pointer-capable
+// mutation (set_i64 / push_i64) and only when the GC runtime is already
+// initialized on this thread (gc_runtime_initialized), so a thread that never
+// uses the GC stays in pure non-GC mode (no inert heap is materialized).
+// gc_reset() (ext_gc) clears the heap's registrations, invalidating outstanding
+// tokens; the next mutation detects this (the stale unregister is a no-op) and
+// re-registers fresh -- so the callback cannot outlive reset / runtime teardown
+// and is always reattached when needed. reset() (this extension) unregisters
+// the current thread's token + clears the store, so the callback does not
+// outlive the store either.
+//
+// Synchronization / deadlock: the trace callback acquires g_store_mutex during
+// collect() (the store must be stable while it is walked). Mutations acquire
+// g_store_mutex and call gc_write_barrier (which acquires NO mutex and never
+// calls collect), so there is no nested lock across the two and no path holds
+// g_store_mutex while triggering a collect -> no deadlock. collect is invoked
+// only from gc_collect / gc_alloc_env (never from within a store-mutex-held
+// mutation), and the callback's visitor.report() does mark_and_push (no mutex).
+static thread_local ember::gc::GcTraceToken g_trace_token = 0;
+
+// The trace callback: walk every array slot, report aligned i64 elements of
+// elem_size==8 arrays as root candidates. user_data is unused (the callback
+// walks the file-static store). ACQUIRES g_store_mutex so the process-wide
+// store is stable while it is walked: collect() is invoked from gc_collect /
+// gc_alloc_env on the owning thread OUTSIDE any store-mutex-held mutation (a
+// mutation holds g_store_mutex and calls gc_write_barrier, which acquires NO
+// mutex and never collects), so locking here cannot self-deadlock + cannot
+// nest with a mutation's lock. Without this lock a concurrent mutation on
+// another thread (g_arrays is process-wide) would race the callback's read.
+static void array_trace_cb(void* /*user_data*/, ember::gc::GcTraceVisitor& visitor) {
+    std::lock_guard<std::mutex> lock(g_store_mutex);
+    for (const ArraySlot& slot : g_arrays) {
+        if (slot.elem_size != 8) continue;  // only i64 elements can hold a ptr
+        const size_t n = slot.bytes.size() / 8;
+        for (size_t i = 0; i < n; ++i) {
+            int64_t v;
+            std::memcpy(&v, slot.bytes.data() + i * 8, 8);
+            visitor.report(reinterpret_cast<void*>(static_cast<uintptr_t>(v)));
+        }
+    }
+}
+
+// Ensure exactly one trace callback is registered on this thread's GC runtime,
+// re-registering if the previous token was invalidated by gc_reset(). Called
+// UNDER g_store_mutex by the pointer-capable mutations. No-op when the GC
+// runtime is not initialized on this thread (pure non-GC mode). Idempotent in
+// steady state: unregister of a still-valid token removes it, register mints a
+// fresh one, so the heap's callback list stays at exactly one array entry.
+static void ensure_gc_trace_cb() {
+    if (!ember::ext_gc::gc_runtime_initialized()) return;
+    if (g_trace_token != 0) {
+        ember::ext_gc::gc_unregister_trace_callback(g_trace_token);  // no-op if stale
+    }
+    g_trace_token = ember::ext_gc::gc_register_trace_callback(nullptr, &array_trace_cb);
+}
+
+// Unregister this thread's trace callback (teardown). Called UNDER g_store_mutex
+// by reset(). A no-op if never registered / already invalidated by gc_reset.
+static void drop_gc_trace_cb() {
+    if (g_trace_token != 0) {
+        ember::ext_gc::gc_unregister_trace_callback(g_trace_token);
+        g_trace_token = 0;
+    }
 }
 static int64_t arr_new(int64_t elem_size, int64_t count) noexcept {
     size_t bytes = 0;
@@ -71,7 +157,21 @@ extern "C" {
     static int64_t n_array_get_u8(int64_t h, int64_t i) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s = arr_slot(h); return (s && i>=0 && i<int64_t(s->bytes.size())) ? int64_t(s->bytes[size_t(i)]) : 0; }
     static void n_array_set_f32(int64_t h, int64_t i, float v) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s = arr_slot(h); if (s && i>=0 && s->elem_size==4 && size_t(i) < s->bytes.size()/s->elem_size) std::memcpy(&s->bytes[size_t(i)*4], &v, 4); }
     static float n_array_get_f32(int64_t h, int64_t i) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s = arr_slot(h); float v=0; if (s && i>=0 && s->elem_size==4 && size_t(i) < s->bytes.size()/s->elem_size) std::memcpy(&v, &s->bytes[size_t(i)*4], 4); return v; }
-    static void n_array_set_i64(int64_t h, int64_t i, int64_t v) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s = arr_slot(h); if (s && i>=0 && s->elem_size==8 && size_t(i) < s->bytes.size()/s->elem_size) std::memcpy(&s->bytes[size_t(i)*8], &v, 8); }
+    static void n_array_set_i64(int64_t h, int64_t i, int64_t v) {
+        std::lock_guard<std::mutex> lock(g_store_mutex);
+        auto* s = arr_slot(h);
+        if (s && i>=0 && s->elem_size==8 && size_t(i) < s->bytes.size()/s->elem_size) {
+            std::memcpy(&s->bytes[size_t(i)*8], &v, 8);
+            // c1: an i64 slot can hold a managed pointer. Register the trace
+            // callback (idempotent) so a future collect sees this slot, and
+            // invoke the write barrier (owner = the external-root slot, a non-
+            // GC owner so the barrier is a ceremonial no-op today; child = the
+            // stored value, a candidate GC pointer the visitor validates).
+            ensure_gc_trace_cb();
+            ember::ext_gc::gc_write_barrier(reinterpret_cast<void*>(s),
+                                            reinterpret_cast<void*>(static_cast<uintptr_t>(v)));
+        }
+    }
     static int64_t n_array_get_i64(int64_t h, int64_t i) { std::lock_guard<std::mutex> lock(g_store_mutex); auto* s = arr_slot(h); int64_t v=0; if (s && i>=0 && s->elem_size==8 && size_t(i) < s->bytes.size()/s->elem_size) std::memcpy(&v, &s->bytes[size_t(i)*8], 8); return v; }
     static void n_array_push_u8(int64_t h, int64_t v) {
         std::lock_guard<std::mutex> lock(g_store_mutex);
@@ -91,7 +191,12 @@ extern "C" {
         std::lock_guard<std::mutex> lock(g_store_mutex);
         auto* s = arr_slot(h);
         if (!s || s->elem_size != 8 || s->bytes.size() + 8 > MAX_CONTAINER_BYTES) return;
-        try { size_t off = s->bytes.size(); s->bytes.resize(off + 8); std::memcpy(&s->bytes[off], &v, 8); }
+        try { size_t off = s->bytes.size(); s->bytes.resize(off + 8); std::memcpy(&s->bytes[off], &v, 8);
+              // c1: same as set_i64 -- a pushed i64 may be a managed pointer.
+              ensure_gc_trace_cb();
+              ember::ext_gc::gc_write_barrier(reinterpret_cast<void*>(s),
+                                              reinterpret_cast<void*>(static_cast<uintptr_t>(v)));
+        }
         catch (const std::bad_alloc&) {} catch (const std::length_error&) {}
     }
     static int64_t n_array_pop_u8(int64_t h) {
@@ -204,6 +309,11 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
 void reset() {
     std::lock_guard<std::mutex> lock(g_store_mutex);
     g_arrays.clear();
+    // c1: drop this thread's trace callback so it does not outlive the store.
+    // After this, a collect on this thread reports no array roots (the store is
+    // empty + the callback is unregistered); any GC object that was rooted only
+    // via an array entry is reclaimed on the next collect.
+    drop_gc_trace_cb();
 }
 
 } // namespace ember::ext_array

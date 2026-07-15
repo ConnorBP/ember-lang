@@ -183,6 +183,16 @@ static bool thinfn_equal(const ThinFunction& a, const ThinFunction& b) {
         if (a.frame.params[i].off != b.frame.params[i].off) return false;
         if (a.frame.params[i].nwords != b.frame.params[i].nwords) return false;
     }
+    // Precise GC frame-plan fields (v3): the GC-pointer slot offsets + the
+    // 24-byte GcFrameRecord region offsets must round-trip so a deserialized
+    // blob's emit links a valid frame record + the collector walks the right
+    // slots. Without this, a v3 blob whose GC fields were silently zeroed would
+    // pass the structural compare (the fields were never checked) -> a latent
+    // metadata-invalidion-after-serialization gap.
+    if (a.frame.gc_ptr_frame_offs != b.frame.gc_ptr_frame_offs) return false;
+    if (a.frame.gc_rec_off != b.frame.gc_rec_off) return false;
+    if (a.frame.gc_rec_base_off != b.frame.gc_rec_base_off) return false;
+    if (a.frame.gc_rec_map_off != b.frame.gc_rec_map_off) return false;
     if (a.rodata != b.rodata) return false;
     return true;
 }
@@ -1459,9 +1469,10 @@ int main() {
         if (cf.exec) free_executable(cf.exec);
     }
 
-    // ─── Part 8: writer emits version 2 ───
-    // The current serializer must write IR_BLOB_VERSION = 2.
-    std::printf("Part 8: writer emits version 2\n");
+    // ─── Part 8: writer emits the current IR_BLOB_VERSION ───
+    // The current serializer must write IR_BLOB_VERSION (= 3 since the
+    // precise-GC frame-plan fields were added in v3).
+    std::printf("Part 8: writer emits current IR_BLOB_VERSION\n");
     {
         auto thf = build_hand_thinfn();
         std::vector<uint8_t> blob;
@@ -1470,7 +1481,7 @@ int main() {
         // Header: u32 magic (offset 0) + u16 version (offset 4)
         check(blob.size() >= 6, "P8: blob has header");
         uint16_t ver = uint16_t(blob[4]) | (uint16_t(blob[5]) << 8);
-        check(ver == 2, "P8: blob version == 2");
+        check(ver == IR_BLOB_VERSION, "P8: blob version == IR_BLOB_VERSION");
     }
 
     // ─── Part 9: valid legacy v1 blobs still decode with data_temp_off = 0 ───
@@ -1707,7 +1718,7 @@ int main() {
         // where the first instr's data_temp_off i32 starts.
         std::vector<uint8_t> v2;
         put_u32(v2, IR_BLOB_MAGIC);   // magic
-        put_u16(v2, IR_BLOB_VERSION); // version = 2
+        put_u16(v2, 2);               // version = 2 (a legacy v2 blob: no v3 GC fields)
         put_i32(v2, 3);               // slot
         put_u32(v2, 4);               // max_vreg
         put_u16(v2, 1);               // num_blocks
@@ -1809,26 +1820,68 @@ int main() {
 
     // ─── Part 12: unknown future versions fail ───
     //
-    // A blob with version 3 (or any version > IR_BLOB_VERSION) must be
-    // rejected by the deserializer.
+    // A blob with a version ABOVE the current IR_BLOB_VERSION (or any version
+    // the deserializer does not recognize) must be rejected.
     std::printf("Part 12: unknown future version rejected\n");
     {
         auto thf = build_hand_thinfn();
         std::vector<uint8_t> blob;
         std::string err;
         check(serialize_thin_function(thf, blob, &err), "P12: serialize");
-        // Patch the version to 3 (future unknown version).
+        // Patch the version to a future unknown version (one past current).
         // Version is at offset 4 (little-endian u16 after the u32 magic).
         check(blob.size() >= 6, "P12: blob has header");
-        blob[4] = 3; blob[5] = 0;  // version = 3
+        const uint16_t future = uint16_t(IR_BLOB_VERSION + 1);
+        blob[4] = uint8_t(future & 0xff); blob[5] = uint8_t((future >> 8) & 0xff);
         ThinFunction out;
         const uint8_t* cur = blob.data();
         const uint8_t* end = blob.data() + blob.size();
         std::string derr;
         check(!deserialize_thin_function(cur, end, "x", 0, out, &derr),
-              "P12: version 3 rejected");
+              "P12: future version rejected");
         check(derr.find("version") != std::string::npos,
               "P12: rejection mentions version");
+    }
+
+    // ─── Part 13: v3 precise-GC frame-plan fields round-trip ───
+    //
+    // The v3 blob carries the precise-GC frame-plan fields (gc_ptr_frame_offs
+    // + the 24-byte GcFrameRecord region offsets gc_rec_off / gc_rec_base_off /
+    // gc_rec_map_off). A deserialized v3 blob must reconstruct them EXACTLY so
+    // the emit links a valid frame record + the collector walks the right GC-
+    // pointer slots. This builds a ThinFunction with NON-default GC fields,
+    // serializes it, deserializes, and asserts the fields survived (the
+    // thinfn_equal compare now checks them, so a silent zeroing would fail).
+    std::printf("Part 13: v3 precise-GC frame-plan fields round-trip\n");
+    {
+        auto thf = build_hand_thinfn();
+        // Populate non-default GC frame-plan fields (use_gc_env=true shape).
+        thf.frame.gc_ptr_frame_offs = { -24, -40 };
+        thf.frame.gc_rec_off = -48;
+        thf.frame.gc_rec_base_off = -40;
+        thf.frame.gc_rec_map_off = -32;
+        std::vector<uint8_t> blob;
+        std::string err;
+        check(serialize_thin_function(thf, blob, &err), "P13: serialize with GC fields");
+        ThinFunction out;
+        const uint8_t* cur = blob.data();
+        const uint8_t* end = blob.data() + blob.size();
+        std::string derr;
+        // Deserialize with the SAME name/slot as the source so thinfn_equal's
+        // slot/name checks match (the deserializer takes name+slot from the
+        // caller, like Part 1 does). The GC fields are reconstructed from the
+        // blob body, independent of name/slot.
+        check(deserialize_thin_function(cur, end, thf.name, thf.slot, out, &derr),
+              "P13: deserialize v3 blob with GC fields");
+        check(thinfn_equal(thf, out),
+              "P13: GC frame-plan fields round-trip (gc_ptr_frame_offs + gc_rec_*)");
+        // Explicit field checks (belt + suspenders): even if thinfn_equal is
+        // later narrowed, these pin the exact values.
+        check(out.frame.gc_ptr_frame_offs == thf.frame.gc_ptr_frame_offs,
+              "P13: gc_ptr_frame_offs preserved");
+        check(out.frame.gc_rec_off == -48, "P13: gc_rec_off preserved");
+        check(out.frame.gc_rec_base_off == -40, "P13: gc_rec_base_off preserved");
+        check(out.frame.gc_rec_map_off == -32, "P13: gc_rec_map_off preserved");
     }
 
     std::printf("\n%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);

@@ -260,6 +260,20 @@ bool serialize_thin_function(const ThinFunction& thf, std::vector<uint8_t>& out,
     for (const auto& nm : thf.frame.native_fixup_names)
         if (!ser_name(out, nm, err, "native_fixup_name")) return false;
 
+    // v3: precise-GC frame-plan fields — the GC-pointer frame-slot offsets
+    // (gc_ptr_frame_offs) + the 24-byte GcFrameRecord region offsets. Stable
+    // frame-layout data; the deserializer reconstructs them and the JIT re-
+    // derives the runtime GcFrameMap at load time.
+    if (thf.frame.gc_ptr_frame_offs.size() > IR_MAX_GC_OFFS) {
+        if (err) *err = "thin_ir_ser: limit: gc_ptr_frame_offs count exceeds IR_MAX_GC_OFFS";
+        return false;
+    }
+    put_u32(out, static_cast<uint32_t>(thf.frame.gc_ptr_frame_offs.size()));
+    for (int32_t o : thf.frame.gc_ptr_frame_offs) put_i32(out, o);
+    put_i32(out, thf.frame.gc_rec_off);
+    put_i32(out, thf.frame.gc_rec_base_off);
+    put_i32(out, thf.frame.gc_rec_map_off);
+
     // Rodata
     put_u32(out, static_cast<uint32_t>(thf.rodata.size()));
     out.insert(out.end(), thf.rodata.begin(), thf.rodata.end());
@@ -353,10 +367,10 @@ bool deserialize_thin_function(const uint8_t*& cur, const uint8_t* end,
         if (err) *err = "thin_ir_ser: truncated header (version)";
         return false;
     }
-    // Accept v1 (legacy: no data_temp_off in the instruction-meta layout) and
-    // v2 (current: data_temp_off serialized at a fixed versioned location).
-    // Unknown future versions are rejected (fail-closed).
-    if (version != 1 && version != IR_BLOB_VERSION) {
+    // Accept v1 (legacy: no data_temp_off), v2 (data_temp_off; no precise-GC
+    // frame-plan fields), and v3 (current: precise-GC frame-plan fields after
+    // native_fixup_names). Unknown future versions are rejected (fail-closed).
+    if (version != 1 && version != 2 && version != IR_BLOB_VERSION) {
         if (err) *err = "thin_ir_ser: unsupported IR blob version " + std::to_string(version);
         return false;
     }
@@ -435,6 +449,29 @@ bool deserialize_thin_function(const uint8_t*& cur, const uint8_t* end,
         out.frame.native_fixup_names.push_back(std::move(nm));
     }
 
+    // v3: precise-GC frame-plan fields. v1/v2 blobs do NOT carry these — they
+    // default to empty/0 (the pre-v3 behavior: no precise GC root scanning).
+    if (version >= 3) {
+        uint32_t num_gc_offs = 0;
+        if (!read_u32(cur, end, num_gc_offs)) { if (err) *err = "thin_ir_ser: truncated num_gc_ptr_frame_offs"; return false; }
+        if (num_gc_offs > IR_MAX_GC_OFFS) { if (err) *err = "thin_ir_ser: limit: num_gc_ptr_frame_offs exceeds IR_MAX_GC_OFFS"; return false; }
+        out.frame.gc_ptr_frame_offs.clear();
+        out.frame.gc_ptr_frame_offs.reserve(num_gc_offs);
+        for (uint32_t i = 0; i < num_gc_offs; ++i) {
+            int32_t o;
+            if (!read_i32(cur, end, o)) { if (err) *err = "thin_ir_ser: truncated gc_ptr_frame_off"; return false; }
+            out.frame.gc_ptr_frame_offs.push_back(o);
+        }
+        if (!read_i32(cur, end, out.frame.gc_rec_off)) { if (err) *err = "thin_ir_ser: truncated gc_rec_off"; return false; }
+        if (!read_i32(cur, end, out.frame.gc_rec_base_off)) { if (err) *err = "thin_ir_ser: truncated gc_rec_base_off"; return false; }
+        if (!read_i32(cur, end, out.frame.gc_rec_map_off)) { if (err) *err = "thin_ir_ser: truncated gc_rec_map_off"; return false; }
+    } else {
+        out.frame.gc_ptr_frame_offs.clear();
+        out.frame.gc_rec_off = 0;
+        out.frame.gc_rec_base_off = 0;
+        out.frame.gc_rec_map_off = 0;
+    }
+
     // Rodata
     uint32_t rodata_len = 0;
     if (!read_u32(cur, end, rodata_len)) { if (err) *err = "thin_ir_ser: truncated rodata_len"; return false; }
@@ -481,7 +518,7 @@ bool deserialize_thin_function(const uint8_t*& cur, const uint8_t* end,
             // v2 adds meta.data_temp_off at this fixed versioned location
             // (the StringDecrypt decrypted-data buffer offset). v1 blobs do
             // NOT carry this field — it defaults to 0 (the pre-v2 behavior).
-            if (version >= IR_BLOB_VERSION) {
+            if (version >= 2) {
                 if (!read_i32(cur, end, in.meta.data_temp_off)) { if (err) *err = "thin_ir_ser: truncated meta.data_temp_off"; return false; }
             } else {
                 in.meta.data_temp_off = 0;  // v1: no data_temp_off field

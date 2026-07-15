@@ -7,6 +7,7 @@
 #include "ext_string.hpp"
 #include "ast.hpp"
 #include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
+#include "../gc/ext_gc.hpp"     // c1 GC trace-callback facade (leaf registration)
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -31,10 +32,63 @@ static std::vector<std::string> g_strings;
 static std::mutex g_store_mutex;
 // Match the other host containers: one string may own at most 1 GiB.
 static constexpr size_t MAX_STRING_BYTES = size_t(1) << 30;
+
+// ===========================================================================
+// c1 GC trace-callback integration (LEAF).
+//
+// A `string` holds chars (1-byte std::string bytes) -- it contains NO GC-
+// managed children. We therefore register a no-op LEAF trace callback (it
+// reports nothing) rather than scanning the character bytes as pointers: a
+// char sequence could otherwise look like a live heap address and create a
+// FALSE ROOT, keeping an unrelated object alive. Registering the leaf callback
+// marks the extension as a known GC-aware leaf so the no-child layout is
+// explicit + guarded against a future regression that might (incorrectly)
+// reinterpret the char bytes. The callback reports nothing, so it can never
+// root or false-root any object.
+//
+// The token is THREAD-LOCAL (the GC runtime is thread-local). Registered lazily
+// on the first string creation, only when the GC runtime is already initialized
+// on this thread (gc_runtime_initialized), so a thread that never uses the GC
+// stays in pure non-GC mode. gc_reset() invalidates tokens; the next creation
+// re-registers. reset() unregisters. No write barrier (no pointer stores). See
+// ext_array.cpp for the synchronization / deadlock rationale (identical).
+static thread_local ember::gc::GcTraceToken g_trace_token = 0;
+
+// The leaf trace callback: reports nothing (string holds chars, not GC ptrs).
+// No mutex is needed: the body is empty, so the callback never touches the
+// process-wide store (unlike array/map, whose callbacks walk g_arrays/g_maps
+// under g_store_mutex). Intentionally reports nothing so char bytes are never
+// reinterpreted as pointers (no false roots).
+static void string_leaf_trace_cb(void* /*user_data*/, ember::gc::GcTraceVisitor& /*visitor*/) {
+    // Leaf: no GC-managed children. Intentionally reports nothing so char
+    // bytes are never reinterpreted as pointers (no false roots).
+}
+
+// Ensure exactly one leaf trace callback is registered on this thread's GC
+// runtime, re-registering if the previous token was invalidated by gc_reset().
+// Called UNDER g_store_mutex by str_new. No-op when the GC runtime is not
+// initialized on this thread (pure non-GC mode).
+static void ensure_gc_leaf_cb() {
+    if (!ember::ext_gc::gc_runtime_initialized()) return;
+    if (g_trace_token != 0) {
+        ember::ext_gc::gc_unregister_trace_callback(g_trace_token);  // no-op if stale
+    }
+    g_trace_token = ember::ext_gc::gc_register_trace_callback(nullptr, &string_leaf_trace_cb);
+}
+
+// Unregister this thread's leaf trace callback (teardown). Called UNDER
+// g_store_mutex by reset().
+static void drop_gc_leaf_cb() {
+    if (g_trace_token != 0) {
+        ember::ext_gc::gc_unregister_trace_callback(g_trace_token);
+        g_trace_token = 0;
+    }
+}
 static int64_t str_new(std::string s) noexcept {
     if (s.size() > MAX_STRING_BYTES) return 0;
     try {
         g_strings.push_back(std::move(s));
+        ensure_gc_leaf_cb();  // c1: register leaf trace cb (idempotent) on this thread
         return int64_t(g_strings.size());
     } catch (const std::bad_alloc&) {
         return 0;
@@ -253,6 +307,8 @@ void register_overloads(OpOverloadTable& overloads) {
 void reset() {
     std::lock_guard<std::mutex> lock(g_store_mutex);
     g_strings.clear();
+    // c1: drop this thread's leaf trace callback so it does not outlive the store.
+    drop_gc_leaf_cb();
 }
 
 } // namespace ember::ext_string

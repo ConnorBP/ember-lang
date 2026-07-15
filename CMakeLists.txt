@@ -252,6 +252,21 @@ ember_add_extension(string   extensions/string/ext_string.cpp)
 ember_add_extension(array    extensions/array/ext_array.cpp)
 ember_add_extension(math     extensions/math/ext_math.cpp)
 ember_add_extension(map      extensions/map/ext_map.cpp)
+# c1 GC trace-callback integration: the array / map / vec / string host-store
+# extensions register idempotent trace callbacks + invoke the write-barrier
+# facade against the current thread-local GC runtime (ext_gc). They link
+# ember_ext_gc PRIVATE: the facade is an implementation detail (not exposed in
+# the extensions' public headers), and a STATIC library's PRIVATE dependency is
+# still placed on the link line of any consumer (to resolve the facade symbols
+# the extension's objects reference), so executables linking only
+# ember_ext_array (e.g. ext_bounds_test) get ember_ext_gc transitively without
+# a hard PUBLIC propagation. No cycle: ember_ext_gc -> ember_frontend -> ember,
+# and ember_ext_gc does NOT depend on array/map/vec/string, so the link
+# direction stays one-way (extension -> gc -> frontend -> core).
+target_link_libraries(ember_ext_array PRIVATE ember_ext_gc)
+target_link_libraries(ember_ext_map   PRIVATE ember_ext_gc)
+target_link_libraries(ember_ext_vec   PRIVATE ember_ext_gc)
+target_link_libraries(ember_ext_string PRIVATE ember_ext_gc)
 ember_add_extension(sync     extensions/sync/ext_sync.cpp)
 ember_add_extension(thread   extensions/thread/ext_thread.cpp)   # Tier 4: in-context threads (thread_spawn/join + call_mutex serialization)
 # coroutine extension is Windows-only (uses CreateFiber/SwitchToFiber). On
@@ -436,7 +451,7 @@ add_executable(gc_integration_test examples/gc_integration_test.cpp)
 target_link_libraries(gc_integration_test PRIVATE
     ember ember_frontend ember_import
     ember_ext_vec ember_ext_quat ember_ext_mat ember_ext_string
-    ember_ext_array ember_ext_math ember_ext_gc)
+    ember_ext_array ember_ext_map ember_ext_math ember_ext_gc)
 if(WIN32)
     target_link_libraries(gc_integration_test PRIVATE kernel32)
 endif()
@@ -453,7 +468,7 @@ add_executable(gc_full_test examples/gc_full_test.cpp)
 target_link_libraries(gc_full_test PRIVATE
     ember ember_frontend ember_import
     ember_ext_vec ember_ext_quat ember_ext_mat ember_ext_string
-    ember_ext_array ember_ext_math ember_ext_gc)
+    ember_ext_array ember_ext_map ember_ext_math ember_ext_gc)
 if(WIN32)
     target_link_libraries(gc_full_test PRIVATE kernel32)
 endif()

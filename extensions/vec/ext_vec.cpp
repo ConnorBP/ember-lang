@@ -7,6 +7,7 @@
 #include "ext_vec.hpp"
 #include "ast.hpp"       // ember public: Type, make_prim, make_slice, Prim
 #include "binding_builder.hpp"  // BindingBuilder: deduped I/H/add registration
+#include "../gc/ext_gc.hpp"     // c1 GC trace-callback facade (leaf registration)
 #include <mutex>
 #include <new>
 #include <stdexcept>
@@ -25,9 +26,64 @@ static std::vector<Vec3> g_vec3s;
 // ext_sync.cpp and g_mutex in ext_lifecycle.cpp. One mutex covers all three
 // stores; they are all cold allocation/creation paths.
 static std::mutex g_store_mutex;
+
+// ===========================================================================
+// c1 GC trace-callback integration (LEAF).
+//
+// A vec2/3/4 holds floats (POD {float x,y[,z[,w]]}) -- it contains NO GC-
+// managed children. We therefore register a no-op LEAF trace callback (it
+// reports nothing) rather than scanning the float bytes as pointers: a float's
+// bit pattern could otherwise look like a live heap address and create a FALSE
+// ROOT, keeping an unrelated object alive. Registering the leaf callback marks
+// the extension as a known GC-aware leaf so the no-child layout is explicit +
+// guarded against a future regression that might (incorrectly) reinterpret the
+// float bytes. The callback walks nothing + reports nothing, so it can never
+// root or false-root any object.
+//
+// The token is THREAD-LOCAL (the GC runtime is thread-local). The callback is
+// registered lazily on the first vec creation, and only when the GC runtime is
+// already initialized on this thread (gc_runtime_initialized), so a thread that
+// never uses the GC stays in pure non-GC mode. gc_reset() invalidates tokens;
+// the next creation re-registers. reset() unregisters. No write barrier is
+// emitted (no pointer stores). See ext_array.cpp for the synchronization /
+// deadlock rationale (identical: the callback acquires g_store_mutex during
+// collect + reports nothing; mutations never collect).
+static thread_local ember::gc::GcTraceToken g_trace_token = 0;
+
+// The leaf trace callback: reports nothing (vec holds floats, not GC pointers).
+// No mutex is needed: the body is empty, so the callback never touches the
+// process-wide store (unlike array/map, whose callbacks walk g_arrays/g_maps
+// under g_store_mutex). Intentionally reports nothing so float bytes are never
+// reinterpreted as pointers (no false roots).
+static void vec_leaf_trace_cb(void* /*user_data*/, ember::gc::GcTraceVisitor& /*visitor*/) {
+    // Leaf: no GC-managed children. Intentionally reports nothing so float
+    // bytes are never reinterpreted as pointers (no false roots).
+}
+
+// Ensure exactly one leaf trace callback is registered on this thread's GC
+// runtime, re-registering if the previous token was invalidated by gc_reset().
+// Called UNDER g_store_mutex by the v*_new creation paths. No-op when the GC
+// runtime is not initialized on this thread (pure non-GC mode).
+static void ensure_gc_leaf_cb() {
+    if (!ember::ext_gc::gc_runtime_initialized()) return;
+    if (g_trace_token != 0) {
+        ember::ext_gc::gc_unregister_trace_callback(g_trace_token);  // no-op if stale
+    }
+    g_trace_token = ember::ext_gc::gc_register_trace_callback(nullptr, &vec_leaf_trace_cb);
+}
+
+// Unregister this thread's leaf trace callback (teardown). Called UNDER
+// g_store_mutex by reset().
+static void drop_gc_leaf_cb() {
+    if (g_trace_token != 0) {
+        ember::ext_gc::gc_unregister_trace_callback(g_trace_token);
+        g_trace_token = 0;
+    }
+}
 static int64_t v3_new(float x, float y, float z) noexcept {
     try {
         g_vec3s.push_back({x,y,z});
+        ensure_gc_leaf_cb();  // c1: register leaf trace cb (idempotent) on this thread
         return int64_t(g_vec3s.size());
     } catch (const std::bad_alloc&) {
         return 0;
@@ -56,6 +112,7 @@ static std::vector<Vec2> g_vec2s;
 static int64_t v2_new(float x, float y) noexcept {
     try {
         g_vec2s.push_back({x,y});
+        ensure_gc_leaf_cb();  // c1: register leaf trace cb (idempotent) on this thread
         return int64_t(g_vec2s.size());
     } catch (const std::bad_alloc&) {
         return 0;
@@ -82,6 +139,7 @@ static std::vector<Vec4> g_vec4s;
 static int64_t v4_new(float x, float y, float z, float w) noexcept {
     try {
         g_vec4s.push_back({x,y,z,w});
+        ensure_gc_leaf_cb();  // c1: register leaf trace cb (idempotent) on this thread
         return int64_t(g_vec4s.size());
     } catch (const std::bad_alloc&) {
         return 0;
@@ -163,6 +221,8 @@ void register_overloads(OpOverloadTable& overloads) {
 void reset() {
     std::lock_guard<std::mutex> lock(g_store_mutex);
     g_vec2s.clear(); g_vec3s.clear(); g_vec4s.clear();
+    // c1: drop this thread's leaf trace callback so it does not outlive the store.
+    drop_gc_leaf_cb();
 }
 
 } // namespace ember::ext_vec

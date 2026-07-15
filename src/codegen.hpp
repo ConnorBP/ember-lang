@@ -318,6 +318,17 @@ struct CodeGenCtx {
     // hold). The host registers the __ember_gc_* natives + calls gc_init/
     // gc_reset around runs when this is enabled.
     bool use_gc_env = false;
+    // Precise GC root scanning (shadow stack): a pointer to the context_t's
+    // gc_frame_head field, used by the frame-record prologue/epilogue in
+    // BAKED-PTR mode (when use_context_reg is false). The host sets this to
+    // &ctx.gc_frame_head before compiling/calling. When use_context_reg is
+    // true, the JIT reads/writes gc_frame_head via [r14 + off] instead and
+    // this field is unused. When use_gc_env is true, at least ONE of
+    // use_context_reg / gc_frame_head_ptr must be set (the frame-record
+    // maintenance must be able to address the head). Null + !use_context_reg +
+    // use_gc_env = the frame record is still linked but the head lives only in
+    // a local (collection would not see stack roots) — hosts should set one.
+    void** gc_frame_head_ptr = nullptr;
 };
 
 // Compile one function. Returns the JIT'd bytes + (after finalize) entry.
