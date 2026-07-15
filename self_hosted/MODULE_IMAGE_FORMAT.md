@@ -1,4 +1,4 @@
-# Self-Hosted Module Image Format (EMBM v1)
+# Self-Hosted Module Image Format (EMBM v1 and v2)
 
 The self-hosted codegen emits a single `array<u8>` *module image*. A host
 loader native (`load_executable_module`) parses it, allocates stable code /
@@ -18,8 +18,16 @@ no `resolve_native`, no runtime-built pseudo-rodata).
 
 The image is one contiguous byte buffer:
 
+Version 1 remains accepted for backward compatibility:
+
 ```
-| header (80 bytes) | code | rodata | data | symbols | relocations |
+| v1 header (80 bytes) | code | rodata | data | symbols | relocations |
+```
+
+Version 2 adds a function table before relocations:
+
+```
+| v2 header (96 bytes) | code | rodata | data | symbols | fn-table | relocations |
 ```
 
 All offsets are **byte offsets from the start of the image**. All integers are
@@ -28,7 +36,9 @@ requirement (the loader copies each section to its own aligned region).
 
 ---
 
-## 2. Header (80 bytes, fixed)
+## 2. Headers
+
+### EMBM v1 header (80 bytes)
 
 | offset | size | field         | meaning                                                |
 |--------|------|---------------|--------------------------------------------------------|
@@ -44,17 +54,32 @@ requirement (the loader copies each section to its own aligned region).
 | 64     | 8    | syms_len      | u64 — length of symbol-name table                      |
 | 72     | 8    | reloc_count   | u64 — number of relocation records (follow symbols)    |
 
+### EMBM v2 header (96 bytes)
+
+Offsets 0 through 79 have the same meaning as v1, except `version` is `2` and
+relocations follow the function table. v2 appends:
+
+| offset | size | field         | meaning                                                |
+|--------|------|---------------|--------------------------------------------------------|
+| 80     | 8    | fntable_off   | u64 — byte offset of function-table section (0 if none) |
+| 88     | 8    | fntable_len   | u64 — byte length of function-table section            |
+
+`fntable_len` must be a multiple of 16. The loader accepts exactly versions 1
+and 2; later unknown versions are rejected.
+
 **Validation caps (reject image if exceeded):**
 - `code_len` <= 16 MiB
 - `rodata_len` <= 16 MiB
 - `data_len` <= 16 MiB
 - `syms_len` <= 1 MiB
+- `fntable_len` <= 16 MiB (v2)
 - `reloc_count` <= 65536
 - total image size <= 64 MiB
 - every `(off + len)` must be `<= total image size` and `off` values must be
-  non-overlapping and in section order (header < code < rodata < data < symbols
-  < relocations). A zero-length section may have `off = 0`.
-- `version` must be exactly `1`; unknown magic or version → reject.
+  non-overlapping and in section order. v1 order is header < code < rodata <
+  data < symbols < relocations; v2 order is header < code < rodata < data <
+  symbols < fn-table < relocations. A zero-length section may have `off = 0`.
+- `version` must be `1` or `2`; unknown magic or version → reject.
 
 ---
 
@@ -63,7 +88,7 @@ requirement (the loader copies each section to its own aligned region).
 Raw x64-64 machine bytes. The loader copies these to an **RX** page. Internal
 script-to-script `call rel32` fixups are already resolved by the self-hosted
 codegen's `cg_resolve_fixups` (relative within the code section), so the loader
-does **not** touch them. Only ABS64 relocations (§6) are patched by the loader.
+does **not** touch them. Only loader relocation records (§8) are patched.
 
 Entry point: `module_entry_ptr(handle, offset)` returns
 `code_base + offset` for invoking a specific function (e.g. `main`). The
@@ -102,23 +127,47 @@ reject. Example: `string_length\0string_concat\0print\0` defines symbols 0,1,2.
 
 ---
 
-## 7. Relocation records
+## 7. Function table (v2)
 
-`reloc_count` records immediately follow the symbol table. Each record is
+The v2 function table maps logical function slots to code offsets. Each entry
+is 16 bytes:
+
+| offset | size | field       | meaning                                      |
+|--------|------|-------------|----------------------------------------------|
+| 0      | 8    | slot        | u64 logical dispatch slot                    |
+| 8      | 8    | code_offset | u64 byte offset within the code section      |
+
+For every entry `(S, O)`, the loader stores `code_base + O` in dispatch slot
+`S`. The dispatch vector has `max_slot + 1` pointer entries, so slot 0 works
+without special treatment and omitted sparse slots are null. Duplicate slots,
+out-of-range code offsets, and slot values beyond the loader's allocation cap
+are rejected. An empty function table is valid and yields dispatch base 0 and
+count 0.
+
+The vector is stable for the lifetime of the module handle. Compiled indirect
+calls use `call [dispatch_base + slot*8]`. Lambdas and coroutine function
+handles therefore remain logical slot indices rather than raw code pointers.
+
+## 8. Relocation records
+
+`reloc_count` records immediately follow the symbol table in v1 or the
+function table in v2. Each record is
 **32 bytes**:
 
 | offset | size | field      | meaning                                                       |
 |--------|------|------------|---------------------------------------------------------------|
-| 0      | 8    | type       | u64: `1`=ABS64_RODATA, `2`=ABS64_DATA, `3`=ABS64_NATIVE        |
+| 0      | 8    | type       | u64: `1`=ABS64_RODATA, `2`=ABS64_DATA, `3`=ABS64_NATIVE, `4`=DISPATCH |
 | 8      | 8    | patch_off  | u64 — byte offset **within the code section** of the imm64 to patch |
-| 16     | 8    | sym_idx    | u64 — for NATIVE: index into symbol table; for RODATA/DATA: unused (0) |
-| 24     | 8    | addend     | u64 — for RODATA/DATA: byte addend into that section; for NATIVE: ABI fingerprint (§8) |
+| 16     | 8    | sym_idx    | u64 — for NATIVE: index into symbol table; otherwise unused (0) |
+| 24     | 8    | addend     | u64 — RODATA/DATA byte addend; NATIVE ABI fingerprint (§9); DISPATCH unused |
 
 **Semantics:**
 - `ABS64_RODATA`: write `rodata_base + addend` (u64 LE) at code offset `patch_off`.
 - `ABS64_DATA`: write `data_base + addend` (u64 LE) at code offset `patch_off`.
 - `ABS64_NATIVE`: look up symbol `sym_idx`; write the native's function pointer
   (u64 LE) at code offset `patch_off`, AFTER validating the ABI fingerprint.
+- `DISPATCH` (v2 only): write the stable dispatch-vector base address (u64 LE)
+  at code offset `patch_off`. For an empty function table this value is zero.
 
 **Validation:**
 - `patch_off + 8 <= code_len` (the patched 8 bytes must lie inside code).
@@ -140,7 +189,7 @@ This uses an indirect call through a relocated absolute address, avoiding the
 
 ---
 
-## 8. Native ABI fingerprint (u64)
+## 9. Native ABI fingerprint (u64)
 
 Packed into the `addend` field of an ABS64_NATIVE record so the loader can
 verify the call site matches the registered native's actual signature. Layout
@@ -168,27 +217,31 @@ reject. This catches a codegen that emits a call with the wrong arity/types.
 
 ---
 
-## 9. Loader lifecycle (host natives, PERM_FFI-gated)
+## 10. Loader lifecycle (host natives, PERM_FFI-gated)
 
 Added to `extensions/call_raw/ext_call_raw.cpp`:
 
 ```
 load_executable_module(image: array<u8>) -> i64   // opaque handle, 0 on failure
 module_entry_ptr(handle: i64, code_offset: i64) -> i64  // code_base+offset, 0 on failure
+module_dispatch_base(handle: i64) -> i64                 // stable void** base, 0 if absent/invalid
+module_dispatch_count(handle: i64) -> i64                // slot count, 0 if absent/invalid
 free_executable_module(handle: i64) -> void
 ```
 
 `load_executable_module`:
 1. Validate the entire image header + section bounds + caps BEFORE allocating.
-2. Allocate stable code (RX), rodata (R), data (RW) regions via existing
-   JIT/platform helpers (reuse, do not create a second allocator).
-3. Copy sections while writable; copy `data` section as the initial mutable
-   state (a per-load copy, so each module load gets fresh globals).
-4. Apply relocations (§7) with full validation; on ANY failure, free all
+2. Allocate stable code (initially RW), rodata (initially RW), and data (RW)
+   regions via existing JIT/platform helpers, and copy each section. The data
+   copy is fresh per load.
+3. For v2, while code remains writable, validate the function table and
+   allocate/fill the stable dispatch vector.
+4. Parse and validate symbols and relocation records before patching code.
+5. Apply relocations (§8) with full validation; on ANY failure, free all
    allocated regions and return 0 (no partial state).
-5. Protect code RX, rodata R, data RW.
-6. Return an opaque owning handle (store code/rodata/data bases + lengths).
-7. Reject: unknown magic/version, oversize sections, OOB/overlap relocations,
+6. Protect code RX, rodata R, data RW.
+7. Return an opaque owning handle (store code/rodata/data/dispatch ownership).
+8. Reject: unknown magic/version, oversize sections, OOB/overlap relocations,
    unknown native, ABI mismatch, missing permission, double-load of same
    image is allowed (fresh copy each time).
 
@@ -196,8 +249,15 @@ free_executable_module(handle: i64) -> void
 return `code_base + code_offset` (0/invalid otherwise). Entry pointers are
 invalidated when the handle is freed.
 
-`free_executable_module`: validate handle known; free all regions; remove
-handle; reject unknown handle (double-free).
+`module_dispatch_base` / `module_dispatch_count`: query the v2 dispatch vector;
+invalid, freed, v1, and empty-table handles return 0.
+
+`free_executable_module`: validate handle known; free all regions, including
+the dispatch vector; remove handle; reject unknown handle (double-free).
+
+The coroutine extension additionally registers the PERM_FFI native
+`set_coroutine_dispatch(base, count)`. The self-hosted run sequence is load
+module → query dispatch base/count → set coroutine dispatch → execute → free.
 
 `call_raw` (existing) is still used to *invoke* an entry pointer returned by
 `module_entry_ptr`. The old `make_executable`/`free_executable_ptr` remain for
@@ -205,7 +265,7 @@ back-compat but the self-hosted pipeline moves to the module API.
 
 ---
 
-## 10. Self-hosted codegen changes (Phase 1b)
+## 11. Self-hosted codegen notes
 
 `codegen.ember` gains parallel buffers:
 - `cg_code` (existing byte array — the code section)
@@ -217,9 +277,9 @@ back-compat but the self-hosted pipeline moves to the module API.
   returns existing index or appends + returns new index.
 - `cg_relocs` (new array<u8>, 32 bytes each) — relocation records; `cg_reloc(type, patch_off, sym_idx, addend)`.
 
-`codegen_emit_image() -> array<u8>`: builds the 80-byte header + concatenates
-code + rodata + data + symbols + relocations into one `array<u8>` and returns
-it (replacing the old "return code bytes" contract).
+`codegen_emit_image() -> array<u8>` builds the versioned header and concatenates
+the declared sections into one `array<u8>` (replacing the old "return code
+bytes" contract). A v2 emitter includes fn-table entries before relocations.
 
 `full_pipeline.ember` `compile_and_run`:
 - `let img = codegen_emit_image();`
@@ -241,7 +301,22 @@ aligned to 16, 32-byte shadow space) for args 5+, keeping Win64 ABI.
 
 ---
 
-## 11. Deferred (later in Phase 1 or beyond)
+## 12. Context-offset natives
+
+The loader extension also exposes permission-free, read-only layout constants
+for self-hosted try/catch machine-code emission. The values come directly from
+`context_offsets` in `src/context.hpp`; `r14` is already `context_t*` across
+`call_raw`:
+
+```
+context_off_catch_depth() -> i64
+context_off_thrown_value() -> i64
+context_off_catch_bufs() -> i64
+context_off_catch_saved_depths() -> i64
+context_catch_buf_stride() -> i64  // 64
+```
+
+## 13. Deferred (later in Phase 1 or beyond)
 
 - Cross-module linking / `link` decls / cross-module handles.
 - Non-constant global initialization (runtime init expressions).
@@ -252,12 +327,12 @@ aligned to 16, 32-byte shadow space) for args 5+, keeping Win64 ABI.
   frontend to reproduce native import behavior or consume a documented
   canonical preprocessed format in both bootstrap generations).
 
-The header is versioned so these can be added as v2 records / capabilities
-without changing v1 records.
+The versioned header permits later records/capabilities without changing v1 or
+v2 records.
 
 ---
 
-## 12. TDD coverage required
+## 14. TDD coverage required
 
 - real string contents (read bytes back, not just length)
 - two distinct same-length strings (distinct rodata addends)

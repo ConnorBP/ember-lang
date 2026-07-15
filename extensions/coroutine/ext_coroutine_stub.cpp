@@ -15,6 +15,7 @@ namespace ember::ext_coroutine {
 static int64_t n_coroutine_start(int64_t, int64_t) { return 0; }
 static int64_t n_coroutine_next(int64_t) { return 0; }
 static int64_t n_coroutine_done(int64_t) { return 1; }
+static void n_set_coroutine_dispatch(int64_t, int64_t) {}
 
 bool coroutine_init(ember::context_t*, void*, int64_t) { return false; }
 
@@ -27,6 +28,8 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
     b.add("coroutine_next",  type_i64(), {T},           (void*)&n_coroutine_next);
     b.add("coroutine_done",  type_bool(), {T},           (void*)&n_coroutine_done);
     b.add("__ember_coro_yield", type_i64(), {type_i64()}, (void*)&n_coroutine_start);
+    b.add("set_coroutine_dispatch", type_void(), {type_i64(), type_i64()},
+          (void*)&n_set_coroutine_dispatch, PERM_FFI);
     NativeTable t = b.build();
     for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }

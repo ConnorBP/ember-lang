@@ -1,7 +1,8 @@
-// ext_call_raw.cpp - ember extension: raw x64 execution natives + EMBM v1
+// ext_call_raw.cpp - ember extension: raw x64 execution natives + EMBM v1/v2
 // module image loader.
 //
-// Implements six PERM_FFI-gated natives. The first three bridge the
+// Implements raw execution, EMBM loader/query, and context-layout natives.
+// The first three bridge the
 // self-hosted ember codegen's output to actual execution:
 //
 //   make_executable(bytes: i64) -> i64
@@ -38,10 +39,11 @@
 #include "ext_call_raw.hpp"
 #include "ast.hpp"              // type_i64, type_void
 #include "binding_builder.hpp"  // BindingBuilder, PERM_FFI
+#include "context.hpp"          // context_offsets
 #include "ext_array.hpp"        // ext_array::get_bytes / alloc_bytes
 #include "jit_memory.hpp"       // alloc_executable_rw, seal_executable, free_executable
 #include "platform.hpp"         // platform::alloc_rw / protect_rx / free_page
-#include "module_abi_fingerprint.hpp"  // abi_fingerprint, type_code (EMBM v1 §8)
+#include "module_abi_fingerprint.hpp"  // abi_fingerprint, type_code (EMBM §9)
 #include "sema.hpp"             // NativeSig
 
 #include <algorithm>            // std::sort
@@ -113,15 +115,15 @@ static void n_free_executable_ptr(int64_t ptr) {
 }
 
 // =====================================================================
-// EMBM v1 module image loader (self_hosted/MODULE_IMAGE_FORMAT.md).
+// EMBM v1/v2 module image loader (self_hosted/MODULE_IMAGE_FORMAT.md).
 //
-// Three PERM_FFI-gated natives that replace the bare code-blob +
+// PERM_FFI-gated module natives that replace the bare code-blob +
 // make_executable model so the self-hosted compiler can emit real string
 // literals (rodata), mutable globals (data section), and native/extension
 // calls (relocated call sites) as one self-contained array<u8> image:
 //
 //   load_executable_module(image: array<u8>) -> i64
-//       Parse + validate an EMBM v1 image, allocate stable code(RX)/
+//       Parse + validate an EMBM v1/v2 image, allocate stable code(RX)/
 //       rodata(R)/data(RW) regions (reusing jit_memory/platform helpers — no
 //       second allocator), copy sections, apply ABS64 relocations (rodata /
 //       data / native with ABI-fingerprint validation), protect permissions,
@@ -165,12 +167,14 @@ static uint32_t g_loader_permissions = 0;
 // RX; W^X is preserved: rodata is never writable), data is RW (mutable
 // globals, a fresh per-load copy).
 struct LoadedModule {
-    void*  code_base   = nullptr;  // RX after seal_executable
-    size_t code_len    = 0;
-    void*  rodata_base = nullptr;  // R (via protect_rx: read-only, not writable)
-    size_t rodata_len  = 0;
-    void*  data_base   = nullptr;  // RW (mutable globals, fresh per load)
-    size_t data_len    = 0;
+    void*  code_base     = nullptr;  // RX after seal_executable
+    size_t code_len      = 0;
+    void*  rodata_base   = nullptr;  // R (via protect_rx: read-only, not writable)
+    size_t rodata_len    = 0;
+    void*  data_base     = nullptr;  // RW (mutable globals, fresh per load)
+    size_t data_len      = 0;
+    void*  dispatch_base = nullptr;  // stable RW void* vector (EMBM v2)
+    size_t dispatch_count = 0;
 };
 static std::vector<std::unique_ptr<LoadedModule>> g_modules;
 static std::mutex g_module_mutex;
@@ -198,13 +202,19 @@ static constexpr uint64_t CAP_SECTION = 16ull * 1024 * 1024;  // 16 MiB
 static constexpr uint64_t CAP_SYMS    =  1ull * 1024 * 1024;  //  1 MiB
 static constexpr uint64_t CAP_RELOCS  = 65536;
 static constexpr uint64_t CAP_TOTAL   = 64ull * 1024 * 1024;  // 64 MiB
-static constexpr uint64_t EMBM_HEADER = 80;
+static constexpr uint64_t EMBM_V1_HEADER = 80;
+static constexpr uint64_t EMBM_V2_HEADER = 96;
+static constexpr uint64_t FNTABLE_ENTRY_SIZE = 16;
 static constexpr uint64_t RELOC_SIZE  = 32;
+// Bound sparse slot numbers as well as fn-table bytes. Without this, one tiny
+// fn-table record could request an effectively unbounded dispatch allocation.
+static constexpr uint64_t MAX_DISPATCH_SLOTS = CAP_SECTION / sizeof(void*);
 
-// Relocation types (§7).
-static constexpr uint64_t RELOC_RODATA = 1;
-static constexpr uint64_t RELOC_DATA   = 2;
-static constexpr uint64_t RELOC_NATIVE = 3;
+// Relocation types (§8).
+static constexpr uint64_t RELOC_RODATA  = 1;
+static constexpr uint64_t RELOC_DATA    = 2;
+static constexpr uint64_t RELOC_NATIVE  = 3;
+static constexpr uint64_t RELOC_DISPATCH = 4;
 
 // A parsed relocation record (32 bytes in the image).
 struct ParsedReloc {
@@ -216,7 +226,7 @@ struct ParsedReloc {
 };
 
 // load_executable_module(image: array<u8>) -> i64
-// Full EMBM v1 parse + validate + allocate + copy + relocate + protect.
+// Full EMBM v1/v2 parse + validate + allocate + copy + relocate + protect.
 // Returns an opaque owning handle (1-based), or 0 on ANY failure (every
 // allocated region freed; no partial state).
 static int64_t n_load_executable_module(int64_t bytes_handle) {
@@ -230,14 +240,17 @@ static int64_t n_load_executable_module(int64_t bytes_handle) {
     uint64_t total = uint64_t(img_len);
 
     // ===== STEP 1: validate header + section bounds + caps BEFORE allocating
-    //         (§9 lifecycle: reject malformed images without any allocation). =====
-    if (total < EMBM_HEADER) return 0;                 // truncated (no header)
-    if (total > CAP_TOTAL)   return 0;                 // oversized image
+    //         (§10 lifecycle: reject malformed images without any allocation). =====
+    if (total < EMBM_V1_HEADER) return 0;              // truncated (no v1 header)
+    if (total > CAP_TOTAL)   return 0;                  // oversized image
 
-    // magic + version
+    // magic + version. v1 has an 80-byte header; v2 extends it to 96 bytes.
     if (!(img[0] == 0x45 && img[1] == 0x4D &&
           img[2] == 0x42 && img[3] == 0x4D)) return 0; // unknown magic
-    if (rd_u32(img + 4) != 1) return 0;                // unknown version
+    uint32_t version = rd_u32(img + 4);
+    if (version != 1 && version != 2) return 0;
+    uint64_t header_size = version == 2 ? EMBM_V2_HEADER : EMBM_V1_HEADER;
+    if (total < header_size) return 0;
 
     uint64_t code_off   = rd_u64(img + 8);
     uint64_t code_len   = rd_u64(img + 16);
@@ -248,18 +261,22 @@ static int64_t n_load_executable_module(int64_t bytes_handle) {
     uint64_t syms_off   = rd_u64(img + 56);
     uint64_t syms_len   = rd_u64(img + 64);
     uint64_t reloc_count = rd_u64(img + 72);
+    uint64_t fntable_off = version == 2 ? rd_u64(img + 80) : 0;
+    uint64_t fntable_len = version == 2 ? rd_u64(img + 88) : 0;
 
     // caps
-    if (code_len   > CAP_SECTION) return 0;
-    if (rodata_len > CAP_SECTION) return 0;
-    if (data_len   > CAP_SECTION) return 0;
-    if (syms_len   > CAP_SYMS)    return 0;
+    if (code_len    > CAP_SECTION) return 0;
+    if (rodata_len  > CAP_SECTION) return 0;
+    if (data_len    > CAP_SECTION) return 0;
+    if (syms_len    > CAP_SYMS)    return 0;
+    if (fntable_len > CAP_SECTION) return 0;
+    if (fntable_len % FNTABLE_ENTRY_SIZE != 0) return 0;
     if (reloc_count > CAP_RELOCS) return 0;
 
-    // section bounds + non-overlapping + in section order (header < code <
-    // rodata < data < symbols < relocations). A zero-length section may have
-    // off = 0 (absent); it does not advance the cursor.
-    uint64_t cursor = EMBM_HEADER;  // end of header
+    // Section bounds + non-overlapping order. v1 is header < code < rodata <
+    // data < symbols < relocations. v2 inserts fn-table before relocations.
+    // A zero-length section may have off = 0 (absent) and does not advance.
+    uint64_t cursor = header_size;  // end of the versioned header
     auto check_section = [&](uint64_t off, uint64_t len) -> bool {
         if (len == 0) return true;            // absent section: off ignored
         if (off < cursor) return false;       // out of order / overlap
@@ -272,14 +289,18 @@ static int64_t n_load_executable_module(int64_t bytes_handle) {
     if (!check_section(rodata_off, rodata_len)) return 0;
     if (!check_section(data_off,   data_len))   return 0;
     if (!check_section(syms_off,   syms_len))   return 0;
-    // relocations immediately follow the symbol table (or the last present
-    // section); cursor is now the end of the last present section.
+    if (version == 2 && !check_section(fntable_off, fntable_len)) return 0;
+    // Relocations immediately follow the last present section.
     uint64_t reloc_start = cursor;              // == syms_off+syms_len if syms present
     uint64_t reloc_bytes = reloc_count * RELOC_SIZE;
     if (reloc_count > 0) {
         if (reloc_start + reloc_bytes < reloc_start) return 0;  // overflow
         if (reloc_start + reloc_bytes > total)        return 0;  // runs past end
     }
+    // No trailing bytes: relocation placement is derived from the end of the
+    // final declared section, so requiring exact consumption removes any
+    // ambiguity about where records begin (especially for absent sections).
+    if (reloc_start + reloc_bytes != total) return 0;
 
     // ===== STEP 2: allocate stable regions + copy sections (writable) =====
     auto mod = std::make_unique<LoadedModule>();
@@ -320,7 +341,45 @@ static int64_t n_load_executable_module(int64_t bytes_handle) {
         free_executable(mod->code_base);
         ember::platform::free_page(mod->rodata_base, mod->rodata_len);
         ember::platform::free_page(mod->data_base, mod->data_len);
+        ember::platform::free_page(mod->dispatch_base,
+                                   mod->dispatch_count * sizeof(void*));
     };
+
+    // EMBM v2 fn-table: validate every record before allocating, then build a
+    // stable slot-indexed vector. Sparse slots are allowed and remain null.
+    if (version == 2 && fntable_len > 0) {
+        std::vector<std::pair<uint64_t, uint64_t>> entries;
+        uint64_t entry_count = fntable_len / FNTABLE_ENTRY_SIZE;
+        entries.reserve(size_t(entry_count));
+        uint64_t max_slot = 0;
+        for (uint64_t i = 0; i < entry_count; ++i) {
+            const uint8_t* e = img + fntable_off + i * FNTABLE_ENTRY_SIZE;
+            uint64_t slot = rd_u64(e);
+            uint64_t code_offset = rd_u64(e + 8);
+            if (slot >= MAX_DISPATCH_SLOTS || code_offset >= code_len) {
+                teardown(); return 0;
+            }
+            entries.emplace_back(slot, code_offset);
+            max_slot = std::max(max_slot, slot);
+        }
+        std::sort(entries.begin(), entries.end());
+        for (size_t i = 1; i < entries.size(); ++i) {
+            if (entries[i - 1].first == entries[i].first) {
+                teardown(); return 0;  // ambiguous duplicate slot
+            }
+        }
+
+        size_t count = size_t(max_slot + 1);
+        void** arr = (void**)ember::platform::alloc_rw(count * sizeof(void*));
+        if (!arr) { teardown(); return 0; }
+        std::memset(arr, 0, count * sizeof(void*));
+        auto* code = static_cast<uint8_t*>(mod->code_base);
+        for (const auto& [slot, code_offset] : entries) {
+            arr[size_t(slot)] = code + code_offset;
+        }
+        mod->dispatch_base = arr;
+        mod->dispatch_count = count;
+    }
 
     // ===== STEP 3: parse the symbol-name table (null-terminated strings) =====
     std::vector<std::string> symbols;
@@ -350,14 +409,14 @@ static int64_t n_load_executable_module(int64_t bytes_handle) {
         relocs.push_back(pr);
     }
 
-    // patch_off must be in-bounds for the 8-byte imm64 slot (§7).
+    // patch_off must be in-bounds for the 8-byte imm64 slot (§8).
     for (auto& pr : relocs) {
         if (pr.patch_off + 8 < pr.patch_off) { teardown(); return 0; }  // overflow
         if (pr.patch_off + 8 > code_len)     { teardown(); return 0; }  // OOB
     }
 
     // No two relocations may overlap: sort by patch_off, reject if a slot's
-    // 8 bytes run into the next slot (§7).
+    // 8 bytes run into the next slot (§8).
     std::sort(relocs.begin(), relocs.end(),
               [](const ParsedReloc& a, const ParsedReloc& b) {
                   return a.patch_off < b.patch_off;
@@ -393,7 +452,7 @@ static int64_t n_load_executable_module(int64_t bytes_handle) {
             auto it = natives->find(name);
             if (it == natives->end()) { teardown(); return 0; }   // unknown native
             const NativeSig& sig = it->second;
-            // ABI fingerprint (§8): reserved bits 38..63 must be zero, then the
+            // ABI fingerprint (§9): reserved bits 38..63 must be zero, then the
             // whole u64 must match the registered signature's fingerprint.
             if (pr.addend & ~((1ull << 38) - 1ull)) { teardown(); return 0; } // nonzero reserved
             uint64_t fp = abi_fingerprint(sig);
@@ -405,6 +464,11 @@ static int64_t n_load_executable_module(int64_t bytes_handle) {
             }
             if (!sig.fn_ptr) { teardown(); return 0; }            // no fn pointer
             pr.value = uint64_t(reinterpret_cast<uintptr_t>(sig.fn_ptr));
+        } else if (pr.type == RELOC_DISPATCH) {
+            if (version != 2 || pr.sym_idx != 0 || pr.addend != 0) {
+                teardown(); return 0;
+            }
+            pr.value = uint64_t(reinterpret_cast<uintptr_t>(mod->dispatch_base));
         } else {
             teardown(); return 0;  // unknown relocation type
         }
@@ -452,6 +516,20 @@ static int64_t n_module_entry_ptr(int64_t handle, int64_t code_offset) {
     return int64_t(reinterpret_cast<uintptr_t>(mod->code_base) + uintptr_t(code_offset));
 }
 
+static int64_t n_module_dispatch_base(int64_t handle) {
+    std::lock_guard<std::mutex> lock(g_module_mutex);
+    if (handle < 1 || handle > int64_t(g_modules.size())) return 0;
+    const auto& mod = g_modules[size_t(handle - 1)];
+    return mod ? int64_t(reinterpret_cast<uintptr_t>(mod->dispatch_base)) : 0;
+}
+
+static int64_t n_module_dispatch_count(int64_t handle) {
+    std::lock_guard<std::mutex> lock(g_module_mutex);
+    if (handle < 1 || handle > int64_t(g_modules.size())) return 0;
+    const auto& mod = g_modules[size_t(handle - 1)];
+    return mod ? int64_t(mod->dispatch_count) : 0;
+}
+
 // free_executable_module(handle: i64) -> void
 // Frees all regions owned by a loaded module handle and removes it. Rejects
 // an unknown / already-freed handle (double-free) as a no-op — it does NOT
@@ -469,14 +547,30 @@ static void n_free_executable_module(int64_t handle) {
     free_executable(mod->code_base);
     ember::platform::free_page(mod->rodata_base, mod->rodata_len);
     ember::platform::free_page(mod->data_base, mod->data_len);
+    ember::platform::free_page(mod->dispatch_base,
+                               mod->dispatch_count * sizeof(void*));
 }
 
-// Register the six natives, all PERM_FFI-gated (raw execution is a security
-// surface — a script that can mint + call executable pages can branch to
-// arbitrary host code). Mirrors ext_io/ext_array's BindingBuilder shape.
-// The three module-loader natives (load_executable_module / module_entry_ptr /
-// free_executable_module) are the EMBM v1 image loader
-// (self_hosted/MODULE_IMAGE_FORMAT.md §9).
+// Read-only context layout constants used by self-hosted try/catch codegen.
+static int64_t n_context_off_catch_depth() {
+    return context_offsets::catch_depth();
+}
+static int64_t n_context_off_thrown_value() {
+    return context_offsets::thrown_value();
+}
+static int64_t n_context_off_catch_bufs() {
+    return context_offsets::catch_bufs();
+}
+static int64_t n_context_off_catch_saved_depths() {
+    return context_offsets::catch_saved_depths();
+}
+static int64_t n_context_catch_buf_stride() {
+    return 64;
+}
+
+// Register the raw-execution and module-loader natives. Raw execution and
+// module ownership/query operations are PERM_FFI-gated; context-offset
+// constants are permission 0 because they expose read-only ABI layout only.
 void register_natives(std::unordered_map<std::string, NativeSig>& m) {
     BindingBuilder b;
     b.add("call_raw",            type_i64(), {type_i64(), type_i64()},
@@ -489,8 +583,22 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
           (void*)&n_load_executable_module,  PERM_FFI);
     b.add("module_entry_ptr",    type_i64(), {type_i64(), type_i64()},
           (void*)&n_module_entry_ptr,    PERM_FFI);
+    b.add("module_dispatch_base", type_i64(), {type_i64()},
+          (void*)&n_module_dispatch_base, PERM_FFI);
+    b.add("module_dispatch_count", type_i64(), {type_i64()},
+          (void*)&n_module_dispatch_count, PERM_FFI);
     b.add("free_executable_module", type_void(), {type_i64()},
           (void*)&n_free_executable_module, PERM_FFI);
+    b.add("context_off_catch_depth", type_i64(), {},
+          (void*)&n_context_off_catch_depth, 0);
+    b.add("context_off_thrown_value", type_i64(), {},
+          (void*)&n_context_off_thrown_value, 0);
+    b.add("context_off_catch_bufs", type_i64(), {},
+          (void*)&n_context_off_catch_bufs, 0);
+    b.add("context_off_catch_saved_depths", type_i64(), {},
+          (void*)&n_context_off_catch_saved_depths, 0);
+    b.add("context_catch_buf_stride", type_i64(), {},
+          (void*)&n_context_catch_buf_stride, 0);
     NativeTable t = b.build();
     for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }
@@ -513,6 +621,8 @@ void reset() {
         free_executable(mod->code_base);
         ember::platform::free_page(mod->rodata_base, mod->rodata_len);
         ember::platform::free_page(mod->data_base, mod->data_len);
+        ember::platform::free_page(mod->dispatch_base,
+                                   mod->dispatch_count * sizeof(void*));
     }
 }
 

@@ -71,15 +71,16 @@
 
 namespace ember::ext_call_raw {
 
-// Register the raw-execution + module-loader natives into m. All PERM_FFI-gated.
+// Register raw-execution + EMBM v1/v2 module-loader natives into m. Raw and
+// module operations are PERM_FFI-gated; read-only context-offset constants are
+// permission 0.
 // Mirrors ext_array/ext_string/ext_io's register_natives shape. The original
 // three (call_raw / make_executable / free_executable_ptr) bridge the
-// self-hosted codegen's output to execution; the three module-loader natives
-// (load_executable_module / module_entry_ptr / free_executable_module) are the
-// EMBM v1 image loader (self_hosted/MODULE_IMAGE_FORMAT.md).
+// self-hosted codegen's output to execution; the module-loader/query natives
+// implement the EMBM v1/v2 image loader (self_hosted/MODULE_IMAGE_FORMAT.md).
 void register_natives(std::unordered_map<std::string, NativeSig>& m);
 
-// Host wiring for the EMBM v1 module loader. The host calls this BEFORE
+// Host wiring for the EMBM v1/v2 module loader. The host calls this BEFORE
 // running JIT'd code that calls load_executable_module: `natives` is the
 // native table ABS64_NATIVE relocations resolve symbol names against, and
 // `permissions` is the calling module's granted permission mask (a relocated

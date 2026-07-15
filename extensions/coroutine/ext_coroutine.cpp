@@ -38,6 +38,7 @@ static std::recursive_mutex g_setup_mutex;
 static context_t*           g_ctx           = nullptr;
 static void*                g_dispatch_base = nullptr;
 static int64_t              g_slot_count    = 0;
+static bool                 g_dispatch_plain = false; // EMBM v2 void** vs atomic host table
 static void*                g_main_fiber    = nullptr;
 
 static thread_local Coroutine* g_current_coro = nullptr;
@@ -46,6 +47,9 @@ static void* resolve_entry(int64_t handle) {
     if (handle < 0) return nullptr;
     if (g_slot_count <= 0 || handle >= g_slot_count) return nullptr;
     if (!g_dispatch_base) return nullptr;
+    if (g_dispatch_plain) {
+        return static_cast<void**>(g_dispatch_base)[size_t(handle)];
+    }
     auto* slots = static_cast<std::atomic<void*>*>(g_dispatch_base);
     return slots[size_t(handle)].load(std::memory_order_acquire);
 }
@@ -150,6 +154,22 @@ static void n_coro_yield(int64_t value) {
     SwitchToFiber(caller);
 }
 
+// Wire an EMBM v2 module's stable dispatch vector into the legacy coroutine
+// resolver. The context/fiber setup remains owned by coroutine_init; the
+// self-hosted pipeline calls this after loading its module image.
+static void n_set_coroutine_dispatch(int64_t base, int64_t count) {
+    std::lock_guard<std::recursive_mutex> guard(g_setup_mutex);
+    if (base == 0 || count <= 0) {
+        g_dispatch_base = nullptr;
+        g_slot_count = 0;
+        g_dispatch_plain = false;
+        return;
+    }
+    g_dispatch_base = reinterpret_cast<void*>(uintptr_t(base));
+    g_slot_count = count;
+    g_dispatch_plain = true;
+}
+
 extern "C" {
 
 static int64_t n_coroutine_start(int64_t handle, int64_t arg) {
@@ -240,6 +260,8 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
     b.add("coroutine_next",  type_i64(), {T},           (void*)&n_coroutine_next);
     b.add("coroutine_done",  type_bool(), {T},           (void*)&n_coroutine_done);
     b.add("__ember_coro_yield", type_i64(), {type_i64()}, (void*)&n_coro_yield);
+    b.add("set_coroutine_dispatch", type_void(), {type_i64(), type_i64()},
+          (void*)&n_set_coroutine_dispatch, PERM_FFI);
     NativeTable t = b.build();
     for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }
@@ -250,6 +272,7 @@ bool coroutine_init(ember::context_t* ctx, void* dispatch_base, int64_t slot_cou
     g_ctx           = ctx;
     g_dispatch_base = dispatch_base;
     g_slot_count    = slot_count;
+    g_dispatch_plain = false;
     if (!IsThreadAFiber()) {
         g_main_fiber = ConvertThreadToFiberEx(nullptr, FIBER_FLAG_FLOAT_SWITCH);
     } else {
@@ -269,6 +292,9 @@ void coroutine_reset() {
     g_coros.clear();
     g_coros_free.clear();
     g_current_coro = nullptr;
+    g_dispatch_base = nullptr;
+    g_slot_count = 0;
+    g_dispatch_plain = false;
 }
 
 bool coroutine_init_keyed(ember::ModuleInstance& inst) {

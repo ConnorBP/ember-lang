@@ -1,7 +1,7 @@
-// module_loader_test - runtime coverage for the EMBM v1 module image loader
+// module_loader_test - runtime coverage for the EMBM v1/v2 module image loader
 // (extensions/call_raw/ext_call_raw.cpp: load_executable_module /
 // module_entry_ptr / free_executable_module; spec:
-// self_hosted/MODULE_IMAGE_FORMAT.md §2/§7/§8/§9).
+// self_hosted/MODULE_IMAGE_FORMAT.md §2/§7/§8/§9/§10/§12).
 //
 // This test hand-builds a minimal EMBM v1 image as a byte vector and exercises
 // the loader through the native function pointers directly (the same shape as
@@ -31,7 +31,8 @@
 // loader reads the image via ext_array::get_bytes / mint the image handle via
 // ext_array::alloc_bytes), same as the existing call_raw_test wiring.
 
-#include "../src/module_abi_fingerprint.hpp"   // abi_fingerprint (mirror the loader's §8)
+#include "../src/module_abi_fingerprint.hpp"   // abi_fingerprint (mirror the loader's §9)
+#include "../src/context.hpp"                  // context_offsets test oracle
 #include "../src/binding_builder.hpp"          // BindingBuilder, PERM_FFI
 #include "../src/sema.hpp"                     // NativeSig
 #include "../extensions/call_raw/ext_call_raw.hpp"
@@ -183,6 +184,40 @@ std::vector<uint8_t> build_image(const std::vector<uint8_t>& code,
     return img;
 }
 
+// Build EMBM v2: header + code/rodata/data/symbols/fn-table/relocations.
+std::vector<uint8_t> build_image_v2(
+        const std::vector<uint8_t>& code,
+        const std::vector<std::array<uint64_t,2>>& fntable,
+        const std::vector<std::array<uint64_t,4>>& relocs = {}) {
+    std::vector<uint8_t> img;
+    const uint64_t header = 96;
+    const uint64_t code_off = header;
+    const uint64_t rodata_off = code_off + code.size();
+    const uint64_t data_off = rodata_off;
+    const uint64_t syms_off = data_off;
+    const uint64_t fntable_off = syms_off;
+    const uint64_t fntable_len = fntable.size() * 16;
+
+    put_u32(img, 0x4D424D45u);
+    put_u32(img, 2);
+    put_u64(img, code_off); put_u64(img, code.size());
+    put_u64(img, rodata_off); put_u64(img, 0);
+    put_u64(img, data_off); put_u64(img, 0);
+    put_u64(img, syms_off); put_u64(img, 0);
+    put_u64(img, relocs.size());
+    put_u64(img, fntable_off); put_u64(img, fntable_len);
+    img.insert(img.end(), code.begin(), code.end());
+    for (const auto& e : fntable) {
+        put_u64(img, e[0]);
+        put_u64(img, e[1]);
+    }
+    for (const auto& r : relocs) {
+        put_u64(img, r[0]); put_u64(img, r[1]);
+        put_u64(img, r[2]); put_u64(img, r[3]);
+    }
+    return img;
+}
+
 } // namespace
 
 int main() {
@@ -191,8 +226,8 @@ int main() {
     auto passfail = [&](bool ok) { return ok ? "PASS" : "FAIL"; };
 
     // ---- register the natives the loader resolves against ----
-    // call_raw extension natives (call_raw / make_executable / free_executable_ptr
-    // + the three loader natives) + the test's add_one.
+    // call_raw extension natives (raw execution, module loader/queries, context
+    // offsets) + the test's add_one.
     std::unordered_map<std::string, NativeSig> natives;
     ext_call_raw::register_natives(natives);
     {
@@ -212,10 +247,14 @@ int main() {
     using EntryFn  = int64_t(*)(int64_t, int64_t);
     using FreeFn   = void(*)(int64_t);
     using CallRaw  = int64_t(*)(int64_t, int64_t);
+    using QueryFn  = int64_t(*)(int64_t);
+    using ConstFn  = int64_t(*)();
     auto load_fn  = reinterpret_cast<LoadFn>(natives["load_executable_module"].fn_ptr);
     auto entry_fn = reinterpret_cast<EntryFn>(natives["module_entry_ptr"].fn_ptr);
     auto free_fn  = reinterpret_cast<FreeFn>(natives["free_executable_module"].fn_ptr);
     auto callraw  = reinterpret_cast<CallRaw>(natives["call_raw"].fn_ptr);
+    auto dispatch_base_fn = reinterpret_cast<QueryFn>(natives["module_dispatch_base"].fn_ptr);
+    auto dispatch_count_fn = reinterpret_cast<QueryFn>(natives["module_dispatch_count"].fn_ptr);
 
     // ---- build the happy-path image ----
     uint64_t rp = 0, dp = 0, np = 0;
@@ -224,7 +263,7 @@ int main() {
     std::vector<uint8_t> data(8, 0);
     { int64_t g = 100; std::memcpy(data.data(), &g, 8); } // global init = 100
     std::string syms = std::string("add_one") + '\0';    // symbol 0 = "add_one"
-    uint64_t add_one_fp = abi_fingerprint(natives["add_one"]);  // mirror the loader's §8
+    uint64_t add_one_fp = abi_fingerprint(natives["add_one"]);  // mirror the loader's §9
     std::vector<std::array<uint64_t,4>> relocs = {
         {1, rp, 0, 0},           // ABS64_RODATA, addend 0
         {2, dp, 0, 0},           // ABS64_DATA,   addend 0
@@ -278,6 +317,81 @@ int main() {
             free_fn(12345);             // freeing an unknown handle is a no-op
             std::printf("[C] double-free / unknown-free no crash : PASS\n");
         }
+    }
+
+    // =====================================================================
+    // [V2] Function table, RELOC_DISPATCH, empty table, and invalid handles.
+    // Two tiny functions are laid out at offsets 8 and 9; bytes 0..7 are the
+    // DISPATCH imm64 relocation target.
+    // =====================================================================
+    {
+        std::vector<uint8_t> v2code(10, 0);
+        v2code[8] = 0xC3;  // slot 0 entry
+        v2code[9] = 0xC3;  // slot 1 entry
+        std::vector<std::array<uint64_t,2>> ft = {{1, 9}, {0, 8}}; // unsorted on purpose
+        std::vector<std::array<uint64_t,4>> dr = {{4, 0, 0, 0}};
+        auto v2 = build_image_v2(v2code, ft, dr);
+        int64_t ah = ext_array::alloc_bytes(v2.data(), int64_t(v2.size()));
+        int64_t h = ah ? load_fn(ah) : 0;
+        int64_t base = dispatch_base_fn(h);
+        int64_t count = dispatch_count_fn(h);
+        int64_t entry0 = entry_fn(h, 8);
+        int64_t entry1 = entry_fn(h, 9);
+        auto** slots = reinterpret_cast<void**>(uintptr_t(base));
+        bool ok = h != 0 && base != 0 && count == 2 && slots &&
+                  slots[0] == reinterpret_cast<void*>(uintptr_t(entry0)) &&
+                  slots[1] == reinterpret_cast<void*>(uintptr_t(entry1));
+        std::printf("[V2] two-slot dispatch table entries : %s\n", passfail(ok));
+        if (!ok) failures++;
+        if (h) {
+            // RELOC_DISPATCH wrote the same stable vector base to code[0..7].
+            uint64_t patched = 0;
+            std::memcpy(&patched, reinterpret_cast<void*>(uintptr_t(entry_fn(h, 0))), 8);
+            bool reloc_ok = patched == uint64_t(base);
+            std::printf("[V2] RELOC_DISPATCH patches base    : %s\n", passfail(reloc_ok));
+            if (!reloc_ok) failures++;
+            free_fn(h);
+        }
+        bool invalid_ok = dispatch_base_fn(h) == 0 && dispatch_count_fn(h) == 0 &&
+                          dispatch_base_fn(-1) == 0 && dispatch_count_fn(99999) == 0;
+        std::printf("[V2] freed/invalid dispatch queries  : %s\n", passfail(invalid_ok));
+        if (!invalid_ok) failures++;
+    }
+    {
+        std::vector<uint8_t> v2code = {0xC3};
+        auto empty = build_image_v2(v2code, {});
+        int64_t ah = ext_array::alloc_bytes(empty.data(), int64_t(empty.size()));
+        int64_t h = ah ? load_fn(ah) : 0;
+        bool ok = h != 0 && dispatch_base_fn(h) == 0 && dispatch_count_fn(h) == 0;
+        std::printf("[V2] empty fn-table accepted         : %s\n", passfail(ok));
+        if (!ok) failures++;
+        if (h) free_fn(h);
+    }
+    {
+        std::vector<uint8_t> v2code = {0xC3};
+        auto duplicate = build_image_v2(v2code, {{0, 0}, {0, 0}});
+        int64_t ah = ext_array::alloc_bytes(duplicate.data(), int64_t(duplicate.size()));
+        int64_t h = ah ? load_fn(ah) : 0;
+        bool ok = h == 0;
+        std::printf("[V2] duplicate fn slot rejected      : %s\n", passfail(ok));
+        if (!ok) { failures++; free_fn(h); }
+    }
+
+    // Context-offset natives are permission-free read-only constants and must
+    // exactly match the C++ layout authority in context.hpp.
+    {
+        auto get = [&](const char* name) {
+            return reinterpret_cast<ConstFn>(natives[name].fn_ptr)();
+        };
+        bool ok = get("context_off_catch_depth") == context_offsets::catch_depth() &&
+                  get("context_off_thrown_value") == context_offsets::thrown_value() &&
+                  get("context_off_catch_bufs") == context_offsets::catch_bufs() &&
+                  get("context_off_catch_saved_depths") == context_offsets::catch_saved_depths() &&
+                  get("context_catch_buf_stride") == 64 &&
+                  natives["context_off_catch_depth"].permission == 0 &&
+                  natives["context_catch_buf_stride"].permission == 0;
+        std::printf("[CTX] context offsets + stride 64    : %s\n", passfail(ok));
+        if (!ok) failures++;
     }
 
     // =====================================================================
@@ -345,7 +459,7 @@ int main() {
     // (8) unknown version
     {
         std::vector<uint8_t> bad = img;
-        bad[4] = 2;     // version 2
+        bad[4] = 3;     // only versions 1 and 2 are accepted
         expect_reject("unknown version", bad);
     }
     // (9) overlapping section offsets (rodata_off inside the code section)

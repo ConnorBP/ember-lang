@@ -386,12 +386,13 @@ add_executable(call_raw_test examples/call_raw_test.cpp)
 target_link_libraries(call_raw_test PRIVATE ember ember_frontend ember_ext_call_raw)
 add_test(NAME call_raw COMMAND call_raw_test)
 
-# module_loader_test: runtime coverage for the EMBM v1 module image loader
+# module_loader_test: runtime coverage for the EMBM v1/v2 module image loader
 # (extensions/call_raw/ext_call_raw.cpp: load_executable_module /
 # module_entry_ptr / free_executable_module; spec:
-# self_hosted/MODULE_IMAGE_FORMAT.md §2/§7/§8/§9). Hand-builds a minimal EMBM
-# v1 image (code + rodata + data + symbols + 3 ABS64 relocs), loads it, calls
-# the entry via call_raw, and asserts the return; plus the full rejection
+# self_hosted/MODULE_IMAGE_FORMAT.md §2/§7/§8/§9/§10/§12). Hand-builds EMBM
+# v1 image (code + rodata + data + symbols + 3 ABS64 relocs), plus a v2
+# function table/dispatch relocation image; loads and validates both, calls
+# the v1 entry via call_raw, and asserts the return; plus the full rejection
 # matrix (unknown native, ABI mismatch, OOB/overlap reloc, truncated/oversize,
 # bad magic/version, overlapping sections) and handle-lifetime (free then
 # invalidated entry, double-free, out-of-bounds entry). Links ember_ext_array
