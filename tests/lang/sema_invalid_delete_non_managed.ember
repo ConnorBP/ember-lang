@@ -1,0 +1,9 @@
+// sema_invalid: `delete` must reject a non-managed value. `delete` accepts
+// ONLY the managed-pointer type produced by `new T`; a plain i64 (or any
+// other non-managed value) is a sema error. This is the type-safety gate that
+// keeps `delete` from freeing an arbitrary integer / a foreign pointer.
+fn main() -> i64 {
+    let x: i64 = 42;
+    delete x;
+    return 0;
+}

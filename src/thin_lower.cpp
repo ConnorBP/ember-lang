@@ -139,6 +139,7 @@ struct ThinLowerer {
 
     static int32_t value_bytes(const Type* t, const StructLayoutTable* structs) {
         if (!t) return 8;
+        if (t->is_managed_ptr) return 8;
         if (t->is_slice || t->is_lambda) return 16;
         if (t->array_len > 0)
             return int32_t(t->array_len) * value_bytes(t->elem.get(), structs);
@@ -154,7 +155,7 @@ struct ThinLowerer {
         }
     }
     static int32_t local_width_bytes(const Type* t, const StructLayoutTable* structs) {
-        if (t && (t->is_slice || t->is_lambda || t->array_len > 0 ||
+        if (t && (t->is_managed_ptr || t->is_slice || t->is_lambda || t->array_len > 0 ||
                   (!t->struct_name.empty() && structs && structs->count(t->struct_name))))
             return value_bytes(t, structs);
         return 8;
@@ -202,6 +203,9 @@ struct ThinLowerer {
         // null (safely ignored), so recording every lambda slot's env_ptr word
         // is conservative + correct. Matches the tree-walker's alloc_local hook.
         if (ctx.use_gc_env && t && t->is_lambda) add_gc_ptr_slot(off + 8);
+        // v1.0 managed pointers: root the one-word GC pointer slot (mirrors
+        // the tree-walker's alloc_local hook).
+        if (ctx.use_gc_env && t && t->is_managed_ptr) add_gc_ptr_slot(off);
         return off;
     }
     // Record a frame slot (rbp-relative ABSOLUTE negative offset) holding a GC
@@ -354,6 +358,9 @@ struct ThinLowerer {
         if (auto* c = dynamic_cast<const CastExpr*>(&ex)) { prescan_expr(*c->operand); return; }
         if (auto* t = dynamic_cast<const TernaryExpr*>(&ex)) { prescan_expr(*t->cond); prescan_expr(*t->then_e); prescan_expr(*t->else_e); return; }
         if (auto* a = dynamic_cast<const AssignExpr*>(&ex)) { prescan_expr(*a->value); if (a->target) prescan_expr(*a->target); return; }
+        // v1.0 managed pointers: `new`/`delete` make native calls.
+        if (dynamic_cast<const NewExpr*>(&ex)) { makes_calls = true; return; }
+        if (auto* d = dynamic_cast<const DeleteExpr*>(&ex)) { makes_calls = true; if (d->operand) prescan_expr(*d->operand); return; }
     }
 
     void count_struct_temps_block(const Block& b, int32_t& total) {
@@ -421,6 +428,10 @@ struct ThinLowerer {
         if (auto* fx = dynamic_cast<const FieldExpr*>(&ex)) { count_struct_temps_expr(*fx->base, total); return; }
         if (auto* v = dynamic_cast<const ViewExpr*>(&ex)) { count_struct_temps_expr(*v->base, total); return; }
         if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) count_struct_temps_expr(*kv.second, total); return; }
+        // v1.0 managed pointers: `new T` allocs a rooted __newtmp$ 8-byte temp
+        // (when gc_active); `delete expr` recurses into its operand.
+        if (auto* n = dynamic_cast<const NewExpr*>(&ex)) { if (ctx.use_gc_env) total += 8; return; }
+        if (auto* d = dynamic_cast<const DeleteExpr*>(&ex)) { if (d->operand) count_struct_temps_expr(*d->operand, total); return; }
     }
 
     void count_arr_temps_block(const Block& b, int32_t& total) {
@@ -482,6 +493,7 @@ struct ThinLowerer {
         if (auto* fx = dynamic_cast<const FieldExpr*>(&ex)) { count_arr_temps_expr(*fx->base, total); return; }
         if (auto* v = dynamic_cast<const ViewExpr*>(&ex)) { count_arr_temps_expr(*v->base, total); return; }
         if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) count_arr_temps_expr(*kv.second, total); return; }
+        if (auto* d = dynamic_cast<const DeleteExpr*>(&ex)) { if (d->operand) count_arr_temps_expr(*d->operand, total); return; }
     }
 
     void count_str_temps_block(const Block& b, int32_t& total) {
@@ -556,6 +568,7 @@ struct ThinLowerer {
         if (auto* v = dynamic_cast<const ViewExpr*>(&ex)) { count_str_temps_expr(*v->base, total); return; }
         if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) count_str_temps_expr(*kv.second, total); return; }
         if (auto* al = dynamic_cast<const ArrayLit*>(&ex)) { for (auto& el : al->elements) count_str_temps_expr(*el, total); return; }
+        if (auto* d = dynamic_cast<const DeleteExpr*>(&ex)) { if (d->operand) count_str_temps_expr(*d->operand, total); return; }
     }
 
     // Count short-circuit (&&/||) result temps: one 8-byte bool frame slot per
@@ -619,6 +632,7 @@ struct ThinLowerer {
         if (auto* v = dynamic_cast<const ViewExpr*>(&ex)) { count_logical_temps_expr(*v->base, total); return; }
         if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) count_logical_temps_expr(*kv.second, total); return; }
         if (auto* al = dynamic_cast<const ArrayLit*>(&ex)) { for (auto& el : al->elements) count_logical_temps_expr(*el, total); return; }
+        if (auto* d = dynamic_cast<const DeleteExpr*>(&ex)) { if (d->operand) count_logical_temps_expr(*d->operand, total); return; }
     }
 
     void collect_defers(const Block& b) {
@@ -785,6 +799,11 @@ struct ThinLowerer {
             if (c->indirect_target) n = cost_add(n, expr_cost(*c->indirect_target));
             return n;
         }
+        // v1.0 managed pointers: `new T` is a native call site; `delete expr`
+        // is a native call site + the operand's cost.
+        if (dynamic_cast<const NewExpr*>(&ex))    return 3;
+        if (auto* d = dynamic_cast<const DeleteExpr*>(&ex))
+            return cost_add(3, d->operand ? expr_cost(*d->operand) : 0);
         return 1;
     }
     int64_t stmt_cost(const Stmt& s) {
@@ -2255,6 +2274,78 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
         ThinInstr& in = emit(ThinOp::ConstInt, v, 0, 0, loc);
         in.imm.i = int64_t(o->resolved); in.meta.type = &type_i64(); in.meta.width = 8;
         return { LoweredValue::Scalar, v, 0, &type_i64() };
+    }
+    // v1.0 managed pointers: `new T` -> CallNative(__ember_gc_alloc_object, size)
+    // -> i64 ptr. `delete expr` -> CallNative(__ember_gc_delete_object, ptr).
+    // Lowered through the existing CallNative ThinOp (the same path a native
+    // call uses), so optimized programs using new/delete stay on the IR
+    // backend (no tree-walker fallback). A rooted hidden temporary is reserved
+    // for each `new` (when gc_active) so a later alloc/collect cannot sweep the
+    // just-created pointer before its destination store — mirrors the
+    // tree-walker's __newtmp$ temp.
+    if (auto* n = dynamic_cast<const NewExpr*>(&ex)) {
+        const Type* ret_ty = ex.ty ? ex.ty : &type_i64();
+        // Look up the internal native binding.
+        const NativeSig* asig = nullptr;
+        if (ctx.natives) { auto it = ctx.natives->find("__ember_gc_alloc_object"); if (it != ctx.natives->end()) asig = &it->second; }
+        if (!asig || !asig->fn_ptr) {
+            non_serializable = true;
+            non_serializable_reason = "new T requires the gc extension to be registered (IR lowering)";
+            return { LoweredValue::Scalar, 0, 0, ret_ty };
+        }
+        // Reserve a rooted hidden temporary (when gc_active) for the alloc
+        // result, mirroring the tree-walker's __newtmp$ temp.
+        int32_t tmp_slot = 0;
+        if (ctx.use_gc_env) {
+            tmp_slot = alloc_local("__newtmp$" + std::to_string(temp_counter++), &type_i64());
+            add_gc_ptr_slot(tmp_slot);  // no-op when use_gc_env is false
+        }
+        // arg 0 = size (compile-time constant)
+        VReg size_v = new_vreg(&type_i64());
+        ThinInstr& si = emit(ThinOp::ConstInt, size_v, 0, 0, loc);
+        si.imm.i = int64_t(n->resolved_size); si.meta.type = &type_i64(); si.meta.width = 8;
+        VReg res = new_vreg(ret_ty);
+        ThinInstr in;
+        in.op = ThinOp::CallNative;
+        in.loc = loc;
+        in.dst = res;
+        in.args.push_back(size_v);
+        in.arg_frame_offs.push_back(-1);
+        in.arg_types.push_back(&type_i64());
+        in.meta.native_name = "__ember_gc_alloc_object";
+        in.native_fn = asig->fn_ptr;
+        in.ret_type = ret_ty;
+        in.meta.type = ret_ty; in.meta.width = value_bytes(ret_ty, ctx.structs);
+        if (ctx.use_gc_env) in.meta.frame_off = tmp_slot;  // pin result to rooted temp
+        emit_depth_check(loc);
+        cur_block().instrs.push_back(std::move(in));
+        return { LoweredValue::Scalar, res, 0, ret_ty };
+    }
+    if (auto* d = dynamic_cast<const DeleteExpr*>(&ex)) {
+        // `delete expr` -> CallNative(__ember_gc_delete_object, ptr). Void
+        // semantics (the result is ignored). Lower the operand first.
+        LoweredValue ptr = lower_expr(*d->operand);
+        const NativeSig* dsig = nullptr;
+        if (ctx.natives) { auto it = ctx.natives->find("__ember_gc_delete_object"); if (it != ctx.natives->end()) dsig = &it->second; }
+        if (!dsig || !dsig->fn_ptr) {
+            non_serializable = true;
+            non_serializable_reason = "delete requires the gc extension to be registered (IR lowering)";
+            return { LoweredValue::Scalar, 0, 0, &type_void() };
+        }
+        ThinInstr in;
+        in.op = ThinOp::CallNative;
+        in.loc = loc;
+        in.dst = 0;  // void result
+        in.args.push_back(ptr.vreg);
+        in.arg_frame_offs.push_back(-1);
+        in.arg_types.push_back(&type_i64());
+        in.meta.native_name = "__ember_gc_delete_object";
+        in.native_fn = dsig->fn_ptr;
+        in.ret_type = &type_i64();  // the native returns i64 (0/1), discarded
+        in.meta.type = &type_i64(); in.meta.width = 8;
+        emit_depth_check(loc);
+        cur_block().instrs.push_back(std::move(in));
+        return { LoweredValue::Scalar, 0, 0, &type_void() };
     }
     if (auto* al = dynamic_cast<const ArrayLit*>(&ex)) {
         // slice-typed array literal (the only kind reaching eval): backing temp + MakeSlice

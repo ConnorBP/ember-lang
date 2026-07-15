@@ -1,0 +1,17 @@
+// By-reference capture + new/delete (#20 full GC integration): a managed
+// pointer captured via `fn[&p]` survives collection until explicitly deleted.
+// Run with --gc-env for precise frame-root scanning (the run_lang_tests.sh
+// run_gc_cli runner passes --gc-env; ember_cli test parse-checks this file).
+fn main() -> i64 {
+    let p = new i64;
+    let before: i64 = gc_live();        // 1
+    let f = fn[&p]() -> i64 {
+        gc_collect();                   // must NOT sweep p (rooted via &p frame slot)
+        return gc_live();               // 1 (survived)
+    };
+    let survived: i64 = f();            // 1
+    delete p;                           // deterministic free NOW
+    let after: i64 = gc_live();         // 0
+    if (before == 1 && survived == 1 && after == 0) { return 7; }
+    return before * 100 + survived * 10 + after;
+}

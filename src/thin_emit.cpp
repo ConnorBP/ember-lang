@@ -39,6 +39,7 @@ inline int32_t round16(int32_t n) { return (n + 15) & ~15; }
 
 static int32_t value_bytes(const Type* t, const StructLayoutTable* structs) {
     if (!t) return 8;
+    if (t->is_managed_ptr) return 8;
     if (t->is_slice || t->is_lambda) return 16;
     if (t->array_len > 0)
         return int32_t(t->array_len) * value_bytes(t->elem.get(), structs);
@@ -55,6 +56,7 @@ static int32_t value_bytes(const Type* t, const StructLayoutTable* structs) {
 }
 
 static int32_t words_for_type(const Type* t, const StructLayoutTable* structs) {
+    if (t && t->is_managed_ptr) return 1;
     if (t && (t->is_slice || t->is_lambda)) return 2;
     if (t && !t->struct_name.empty() && structs) {
         auto it = structs->find(t->struct_name);

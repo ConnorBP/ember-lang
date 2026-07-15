@@ -37,9 +37,12 @@ extension trace-callback root providers + a stop-the-world write barrier
 (see Section 8). The GC manages lambda env lifetimes (an env that escapes
 its frame — returned / stored to a global / held in an `array`/`map` — is
 traced from the frame chain / global-root descriptor / extension callback
-and reaped when no root reaches it); it does NOT expose a script-visible
-`new Type{...}` pointer-type surface yet (`gc_new`/`gc_delete` raw-handle
-natives are the substrate). Every category above
+and reaped when no root reaches it). The v1.0 language-level `new T` /
+`delete expr` operators add a **managed-pointer** ownership category (see
+Section 8): a `new T` yields a one-word opaque GC pointer (not a raw
+pointer — no arithmetic/dereference), rooted via the frame map / global-root
+descriptor while its owning slot is live, reaped when the root is gone, and
+freed immediately by `delete`. Every category above
 has a lifetime that's either lexically scoped (1), externally owned
 (2), or engine-object-scoped (3/4) - no case requires tracing.
 
@@ -373,6 +376,36 @@ the way down.
 > suspended-frame rooting (#21); (4) per-context shared heaps. See
 > `extensions/gc/ext_gc.hpp` (the design + WHAT REMAINS) + `../ROADMAP.md`
 > Tier 3 (Tracing GC — ✓ core shipped + integration shipped).
+>
+> **Language-level `new`/`delete` managed pointers (v1.0).** The `new T`
+> operator allocates zero-initialized GC memory for a sized type `T` (a
+> scalar, a fixed array `T[N]`, or a registered by-value struct) and yields a
+> **managed pointer** — a one-word opaque GC pointer, NOT a raw pointer.
+> There is no pointer arithmetic, no dereference syntax, and no cast to/from
+> `i64`; the managed pointer is a distinct compiler-recognized type
+> (`Type::is_managed_ptr`) carrying its pointee. `delete expr` accepts ONLY a
+> managed pointer and invokes **deterministic destruction** (the object is
+> freed immediately via `__ember_gc_delete_object` -> `GcHeap::free_object`,
+> not just unpinned) — `gc_live()` drops by one with no `gc_collect()` needed.
+> Repeated `delete` of the same pointer is a safe no-op (the native returns 0
+> for an already-freed / null / non-live pointer). The operators lower to the
+> internal natives `__ember_gc_alloc_object(size)` / `__ember_gc_delete_object(ptr)`
+> (distinct from the legacy pinned `gc_new`/`gc_delete` surface). Both the
+> tree-walker (`src/codegen.cpp`) and the Thin IR backend (`src/thin_lower.cpp`/
+> `src/thin_emit.cpp`) lower them through the existing native-call paths
+> (CallNative ThinOp for the IR backend), so optimized programs using `new`/
+> `delete` stay on the IR backend. Managed-pointer locals, parameters, hidden
+> expression temporaries, return staging slots, and supported globals are
+> listed in the precise GC root maps (a managed-pointer slot is a one-word root
+> at offset+0); a rooted hidden temporary is reserved for each `new` so a
+> later argument/allocation cannot collect a just-created pointer before its
+> destination store. `new` and `delete` are forbidden in `@realtime` functions
+> (GC/heap allocation category). Sema rejects `new void` / `new T[]` (unsized
+> types) and `delete <non-managed-value>`. Run `new`/`delete` tests with
+> `--gc-env` so the precise frame-root scanning is active (the GC heap is
+> always initialized; `--gc-env` enables the frame-record + root-map emit so a
+> `new`'d object survives in-frame `gc_collect()` while its managed-pointer
+> local is live).
 
 Recorded here so the reasoning isn't lost: a tracing GC would be
 needed only if script code could create heap references with

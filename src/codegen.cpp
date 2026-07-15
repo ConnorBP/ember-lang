@@ -216,6 +216,7 @@ struct CG {
     // may fall back to the scalar default merely because it is nested.
     static int32_t value_bytes(const Type* t, const StructLayoutTable* structs) {
         if (!t) return 8;
+        if (t->is_managed_ptr) return 8;     // one-word opaque GC pointer
         if (t->is_slice) return 16;
         if (t->is_lambda) return 16;            // {fn_slot, env_ptr} (#20)
         if (t->array_len > 0)
@@ -235,7 +236,7 @@ struct CG {
     // Local scalar slots remain word-sized; aggregates use their exact,
     // recursively computed Ember extent.
     static int32_t local_width_bytes(const Type* t, const StructLayoutTable* structs) {
-        if (t && (t->is_slice || t->is_lambda || t->array_len > 0 ||
+        if (t && (t->is_managed_ptr || t->is_slice || t->is_lambda || t->array_len > 0 ||
                   (!t->struct_name.empty() && structs && structs->count(t->struct_name))))
             return value_bytes(t, structs);
         return 8;
@@ -248,6 +249,7 @@ struct CG {
     // check_struct_arg_shape - so codegen always has a source address to
     // copy the words from, never an arbitrary expression to evaluate).
     static int32_t words_for_type(const Type* t, const StructLayoutTable* structs) {
+        if (t && t->is_managed_ptr) return 1;  // one-word opaque GC pointer
         if (t && t->is_slice) return 2;
         if (t && t->is_lambda) return 2;        // {fn_slot, env_ptr} (#20)
         if (t && !t->struct_name.empty() && structs) {
@@ -920,6 +922,13 @@ struct CG {
         // env is on the GC heap (use_gc_env). A no-capture lambda's env_ptr is
         // null (safely ignored by the collector), so recording every lambda\n        // slot's env_ptr word is conservative + correct.
         if (gc_active() && t && t->is_lambda) add_gc_ptr_slot(off + 8);
+        // v1.0 managed pointers: a managed-pointer local/param is a one-word
+        // opaque GC pointer. Record the slot as a precise GC root so the
+        // collector marks the pointed-to object while the frame is live (the
+        // object survives in-frame collects + is reaped when the frame is
+        // torn down). A null managed pointer (zero-initialized, or after a
+        // delete) is safely ignored by the collector's liveness filter.
+        if (gc_active() && t && t->is_managed_ptr) add_gc_ptr_slot(off);
         return off;
     }
 
@@ -997,6 +1006,13 @@ struct CG {
         if (auto* c = dynamic_cast<const CastExpr*>(&ex)) { prescan_expr(*c->operand); return; }
         if (auto* t = dynamic_cast<const TernaryExpr*>(&ex)) { prescan_expr(*t->cond); prescan_expr(*t->then_e); prescan_expr(*t->else_e); return; }
         if (auto* a = dynamic_cast<const AssignExpr*>(&ex)) { prescan_expr(*a->value); if (a->target) prescan_expr(*a->target); return; }
+        // v1.0 managed pointers: `new T` and `delete expr` lower to native
+        // calls (__ember_gc_alloc_object / __ember_gc_delete_object), so they
+        // make calls (the frame needs the call-population). `new` has no
+        // sub-expr args (the size is a compile-time constant); `delete` recurses
+        // into its operand.
+        if (dynamic_cast<const NewExpr*>(&ex)) { makes_calls = true; return; }
+        if (auto* d = dynamic_cast<const DeleteExpr*>(&ex)) { makes_calls = true; if (d->operand) prescan_expr(*d->operand); return; }
     }
 
     // Pre-count the total frame bytes needed for compiler-hidden struct temp
@@ -1107,6 +1123,19 @@ struct CG {
                 total += ctx.use_gc_env ? 8 : int32_t((le->env_size + 7) & ~7);
             return;
         }
+        // v1.0 managed pointers: a `new T` allocs a rooted __newtmp$N 8-byte
+        // frame temp (only when gc_active / use_gc_env) to hold the just-
+        // created pointer until its destination store. Count it so the frame
+        // is sized to hold it. `delete expr` allocs no temp (its operand is
+        // evaluated inline into rax).
+        if (auto* n = dynamic_cast<const NewExpr*>(&ex)) {
+            if (ctx.use_gc_env) total += 8;
+            return;
+        }
+        if (auto* d = dynamic_cast<const DeleteExpr*>(&ex)) {
+            count_struct_temps_expr(*d->operand, total);
+            return;
+        }
         // a nested lambda's body is a separate fn (not in this fn's frame);
         // FnHandleExpr/EnumAccessExpr/IntLit/etc: no temps.
     }
@@ -1197,6 +1226,8 @@ struct CG {
         if (auto* fx = dynamic_cast<const FieldExpr*>(&ex)) { count_arr_temps_expr(*fx->base, total); return; }
         if (auto* v = dynamic_cast<const ViewExpr*>(&ex)) { count_arr_temps_expr(*v->base, total); return; }
         if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) count_arr_temps_expr(*kv.second, total); return; }
+        // v1.0 managed pointers: recurse into delete's operand; new has no sub-exprs.
+        if (auto* d = dynamic_cast<const DeleteExpr*>(&ex)) { if (d->operand) count_arr_temps_expr(*d->operand, total); return; }
     }
 
     // Chunk c3: pre-count the total frame bytes needed for string-literal inline
@@ -1277,6 +1308,8 @@ struct CG {
         if (auto* v = dynamic_cast<const ViewExpr*>(&ex)) { count_str_temps_expr(*v->base, total); return; }
         if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) count_str_temps_expr(*kv.second, total); return; }
         if (auto* al = dynamic_cast<const ArrayLit*>(&ex)) { for (auto& el : al->elements) count_str_temps_expr(*el, total); return; }
+        // v1.0 managed pointers: recurse into delete's operand; new has no sub-exprs.
+        if (auto* d = dynamic_cast<const DeleteExpr*>(&ex)) { if (d->operand) count_str_temps_expr(*d->operand, total); return; }
     }
 
     // Item E ("hot local pinning") candidate selection: a purely syntactic,
@@ -1758,6 +1791,11 @@ struct CG {
             return false;
         }
         if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) if (expr_clobbers_r10(*kv.second)) return true; return false; }
+        // v1.0 managed pointers: `new`/`delete` make native calls (which
+        // clobber r10 per the CallExpr rule above). `delete` also recurses
+        // into its operand.
+        if (dynamic_cast<const NewExpr*>(&ex)) return true;
+        if (auto* d = dynamic_cast<const DeleteExpr*>(&ex)) return true;
         // Ident (local scalar/global scalar), IntLit, BoolLit, FloatLit, StringLit,
         // FnHandleExpr, ViewExpr, ArrayLit: none clobber r10 in their eval.
         return false;
@@ -4289,6 +4327,75 @@ void CG::eval(const Expr& ex) {
     }
     if (auto* s = dynamic_cast<const SizeofExpr*>(&ex)) { e.mov_reg_imm64(Reg::rax, int64_t(s->resolved)); return; }
     if (auto* o = dynamic_cast<const OffsetofExpr*>(&ex)) { e.mov_reg_imm64(Reg::rax, int64_t(o->resolved)); return; }
+    // v1.0 managed pointers: `new T` -> call __ember_gc_alloc_object(size)
+    // -> rax = heap object ptr (zero-initialized). The result is a one-word
+    // managed pointer. GC safety: reserve a rooted hidden temporary FIRST,
+    // then allocate into it immediately, so a later argument/allocation's
+    // collect-before-alloc cannot sweep this just-created pointer before its
+    // destination store. The temp is rooted for the rest of the frame (the
+    // pointer will be copied to its destination local/arg slot, which is also
+    // rooted; the temp holds a stale copy after that, safely ignored by the
+    // collector's liveness filter once the object is freed or the real root
+    // takes over).
+    if (auto* n = dynamic_cast<const NewExpr*>(&ex)) {
+        const NativeSig* asig = native_named("__ember_gc_alloc_object");
+        if (!asig || !asig->fn_ptr) {
+            emit_trap(int(TrapReason::IllegalInstruction),
+                      "new requires the gc extension to be registered");
+            return;
+        }
+        // Reserve a rooted hidden temporary for the allocation result. This
+        // is the precise-GC safety net: the object returned by
+        // __ember_gc_alloc_object is UNPINNED, so if a collect ran before the
+        // pointer reached a rooted slot, the object would be swept. The temp
+        // is recorded as a root now (before the alloc), so the moment the
+        // pointer is stored into it the collector sees it as live.
+        int32_t tmp_off = 0;
+        if (gc_active()) {
+            std::string name = "__newtmp$" + std::to_string(temp_counter++);
+            tmp_off = alloc_local(name, &type_i64());
+            add_gc_ptr_slot(tmp_off);  // root for the rest of the frame
+            // Zero the temp so a pre-store collect sees null (not garbage).
+            e.mov_reg_imm64(Reg::rax, 0);
+            store_rax_to_rbp(*this, tmp_off);
+        }
+        // Call __ember_gc_alloc_object(size) -> rax = heap object ptr.
+        // Win64: arg 0 in rcx, 32 bytes shadow space (keeps rsp%16==0).
+        e.sub_reg_imm32(Reg::rsp, 32);
+        e.mov_reg_imm64(Reg::rcx, int64_t(n->resolved_size));  // arg 0 = byte size
+        emit_counted_named_native(asig->fn_ptr, "__ember_gc_alloc_object",
+                                  "new T gc alloc");
+        e.add_reg_imm32(Reg::rsp, 32);
+        // rax = the new object ptr. Spill to the rooted temp immediately so a
+        // later alloc/collect in this same expression cannot sweep it.
+        if (gc_active()) store_rax_to_rbp(*this, tmp_off);
+        // rax already holds the managed pointer (the result of `new T`).
+        return;
+    }
+    // v1.0 managed pointers: `delete expr` -> eval the operand (a managed
+    // pointer in rax) -> call __ember_gc_delete_object(ptr) -> deterministic
+    // immediate free. Void semantics (the result is ignored). The native
+    // safely no-ops on null / not-live / already-freed pointers (returns 0),
+    // so a repeated `delete p` is a safe no-op.
+    if (auto* d = dynamic_cast<const DeleteExpr*>(&ex)) {
+        const NativeSig* dsig = native_named("__ember_gc_delete_object");
+        if (!dsig || !dsig->fn_ptr) {
+            emit_trap(int(TrapReason::IllegalInstruction),
+                      "delete requires the gc extension to be registered");
+            return;
+        }
+        eval(*d->operand);  // rax = the managed pointer
+        // Win64: arg 0 in rcx, 32 bytes shadow space. Move rax -> rcx first
+        // (emit_counted_named_native clobbers eax but not rcx).
+        e.sub_reg_imm32(Reg::rsp, 32);
+        e.mov_reg_reg(Reg::rcx, Reg::rax);  // arg 0 = the managed pointer
+        emit_counted_named_native(dsig->fn_ptr, "__ember_gc_delete_object",
+                                  "delete gc free");
+        e.add_reg_imm32(Reg::rsp, 32);
+        // Void semantics: rax holds the native's success flag (0/1) but the
+        // expression's type is void, so callers discard it.
+        return;
+    }
     if (auto* al = dynamic_cast<const ArrayLit*>(&ex)) {
         // Array-literal rvalue (chunk c2). sema only lets a SLICE ArrayLit
         // reach eval() (a fixed-array ArrayLit is let-init-only and never
@@ -5335,6 +5442,11 @@ int64_t CG::expr_cost(const Expr& ex) {
         return cost_add(1, expr_cost(*fx->base));
     if (auto* v = dynamic_cast<const ViewExpr*>(&ex))
         return cost_add(1, expr_cost(*v->base));
+    // v1.0 managed pointers: `new T` is a native call site (alloc); `delete
+    // expr` is a native call site (free) + the operand's cost.
+    if (dynamic_cast<const NewExpr*>(&ex))    return 3;  // native call site + size load
+    if (auto* d = dynamic_cast<const DeleteExpr*>(&ex))
+        return cost_add(3, d->operand ? expr_cost(*d->operand) : 0);
     if (auto* sl = dynamic_cast<const StructLit*>(&ex)) {
         int64_t n = 1;
         for (auto& kv : sl->fields) n = cost_add(n, expr_cost(*kv.second));

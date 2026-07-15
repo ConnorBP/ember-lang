@@ -1,0 +1,10 @@
+// sema_invalid: `new T` must reject an unsized type. A slice type `i64[]` is
+// {ptr,len} — it has a fixed 16-byte descriptor size but no single scalar
+// payload size to zero-initialize as a heap object (the backing is a separate
+// allocation managed by the slice machinery). `new i64[]` is therefore a sema
+// error (unsupported unsized type for `new`); only sized scalar/array/
+// registered-struct types are allocatable.
+fn main() -> i64 {
+    let p = new i64[];
+    return 0;
+}

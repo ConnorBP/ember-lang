@@ -615,15 +615,22 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
     eval_global_initializers(pr.program, gic);
 
     // ---- precise GC: build the typed-global GC-root descriptor ----
-    // Lists the byte offsets of GC-pointer words in the globals block (the
-    // env_ptr half of every lambda-typed global, at offset+8). Attached to the
-    // context before the call so the collector's trace callback roots them.
+    // Lists the byte offsets of GC-pointer words in the globals block:
+    //   - the env_ptr half of every lambda-typed global (offset+8)
+    //   - the one-word GC pointer of every managed-pointer global (offset+0)
+    // v1.0 managed pointers: a `global g : managed T = new T;` holds a GC
+    // object pointer that must be rooted so the collector keeps the object
+    // alive while the global is live. Attached to the context before the call.
     ember::gc::GcGlobalRoots gc_global_roots;
     gc_global_roots.base = uint64_t(gb.base);
     for (const auto& g : pr.program.globals) {
         if (g.ty && g.ty->is_lambda) {
             auto oit = gb.offsets.find(g.name);
             if (oit != gb.offsets.end()) gc_global_roots.offs.push_back(int32_t(oit->second + 8));
+        }
+        if (g.ty && g.ty->is_managed_ptr) {
+            auto oit = gb.offsets.find(g.name);
+            if (oit != gb.offsets.end()) gc_global_roots.offs.push_back(int32_t(oit->second));
         }
     }
 

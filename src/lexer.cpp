@@ -20,6 +20,7 @@ static const std::unordered_map<std::string, Tk>& keywords() {
         {"yield",Tk::Kw_yield},
         {"true",Tk::Kw_true},{"false",Tk::Kw_false},
         {"sizeof",Tk::Kw_sizeof},{"offsetof",Tk::Kw_offsetof},
+        {"new",Tk::Kw_new},{"delete",Tk::Kw_delete},
         {"link",Tk::Kw_link},
         {"enum",Tk::Kw_enum},
         {"match",Tk::Kw_match},
@@ -66,6 +67,8 @@ const char* tok_spelling(Tk k) {
     case Tk::Kw_priv: return "priv";
     case Tk::Kw_static_assert: return "static_assert";
     case Tk::Kw_namespace: return "namespace";
+    case Tk::Kw_new: return "new";
+    case Tk::Kw_delete: return "delete";
     case Tk::Kw_try: return "try";
     case Tk::Kw_catch: return "catch";
     case Tk::Kw_throw: return "throw";

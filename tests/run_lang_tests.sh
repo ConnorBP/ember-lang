@@ -122,6 +122,28 @@ run_import_cli() {
     fi
 }
 
+# run_gc_cli: like run_import_cli but passes --gc-env so the tracing GC's
+# precise frame-root scanning is active (required for language-level `new`/
+# `delete` managed-pointer tests: a `new`'d object is rooted via the frame
+# map only when use_gc_env is set, so an in-frame gc_collect() reaps an
+# unrooted object without it). The GC heap is always initialized; --gc-env
+# enables the frame-record + root-map emit so managed pointers survive
+# while their frame is live.
+run_gc_cli() {
+    local f="$1" exp="$2"
+    local out rc
+    out=$(timeout "$RUN_TIMEOUT" "$CLI" run --gc-env "$f" 2>&1); rc=$?
+    if [ $rc -eq 124 ]; then
+        printf "FAIL  %s (TIMEOUT after %ss — possible runaway)\n" "$f" "$RUN_TIMEOUT"
+        fail=$((fail+1)); return
+    fi
+    if [ $rc -eq "$exp" ]; then
+        printf "PASS  %s (gc-env run, rc=%d == expected %d)\n" "$f" "$rc" "$exp"; pass=$((pass+1))
+    else
+        printf "FAIL  %s (gc-env run, rc=%d != expected %d)\n%s\n" "$f" "$rc" "$exp" "$out"; fail=$((fail+1))
+    fi
+}
+
 # Executable language regressions use main's exit code as their assertion.
 for spec in "runtime_audit_semantics.ember:77" "runtime_cast_regressions.ember:42" \
             "runtime_division_forms.ember:78" "runtime_integer_boundaries.ember:79" "runtime_language_features.ember:93" \
@@ -155,7 +177,8 @@ for spec in "runtime_audit_semantics.ember:77" "runtime_cast_regressions.ember:4
             "valid_try_return.ember:100" \
             "valid_catch_return.ember:200" \
             "valid_throw_in_catch.ember:55" \
-            "valid_nested_try_catch.ember:44"; do
+            "valid_nested_try_catch.ember:44" \
+            "sema_valid_new_delete.ember:42"; do
     f=${spec%%:*}; exp=${spec##*:}; out=$(timeout "$RUN_TIMEOUT" "$CLI" run "tests/lang/$f" 2>&1); rc=$?
     if [ $rc -eq 124 ]; then printf "FAIL  %s (TIMEOUT after %ss)\n" "$f" "$RUN_TIMEOUT"; fail=$((fail+1)); continue; fi
     if [ $rc -eq "$exp" ]; then printf "PASS  %s (explicit expected rc=%d)\n" "$f" "$rc"; pass=$((pass+1))
@@ -170,6 +193,12 @@ for f in tests/lang/runtime_trap_*.ember; do
         printf "FAIL  %s (expected recoverable rc=70, got %d)\n%s\n" "$f" "$rc" "$out"; fail=$((fail+1))
     fi
 done
+
+# --- language-level new/delete managed-pointer runtime tests (need --gc-env
+# for precise frame-root scanning so a `new`'d object survives in-frame
+# gc_collect() while its managed-pointer local is live) ---
+run_gc_cli tests/lang/valid_gc_by_ref_new_delete.ember 7
+run_gc_cli tests/lang/runtime_new_delete.ember 42
 
 for f in tests/lang/import_nested.ember tests/lang/import_diamond.ember \
          tests/lang/import_double.ember tests/lang/import_dotdot.ember \

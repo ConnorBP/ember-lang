@@ -1199,6 +1199,151 @@ static int run_part_g() {
     return g_fail;
 }
 
+// ---- PART H: deterministic new/delete substrate (gc_alloc_object / ----
+// ---- gc_delete_object) ----
+// The runtime substrate for the future language-level `new`/`delete` operators,
+// exposed as the internal native bindings __ember_gc_alloc_object /
+// __ember_gc_delete_object. These are HOST-side tests (call the ext_gc host
+// API directly) verifying the new surface is distinct from the legacy
+// gc_new/gc_delete (pin/unpin) compatibility surface:
+//   - gc_alloc_object allocates an UNPINNED object (same thread-local heap +
+//     collect-before-allocate threshold safety as gc_alloc_env).
+//   - gc_delete_object calls GcHeap::free_object for DETERMINISTIC immediate
+//     destruction (frees NOW, not just unpin -> collectable later).
+// This guards that the new immediate-free primitive works through the
+// extension layer + that the legacy gc_new/gc_delete pin/unpin behavior is
+// preserved (no regression).
+static int run_part_h() {
+    std::printf("=== PART H: deterministic new/delete substrate (gc_alloc_object / gc_delete_object) ===\n");
+    ext_gc::gc_init();
+
+    // [H1] gc_alloc_object returns a live UNPINNED object; gc_delete_object
+    //      frees it IMMEDIATELY (is_live false right away, no collect needed).
+    {
+        ext_gc::gc_reset();
+        int64_t p = ext_gc::gc_alloc_object(24);
+        check(p != 0, "H1a: gc_alloc_object returns non-zero ptr");
+        check(ext_gc::gc_is_live(p), "H1b: allocated object is live");
+        check(ext_gc::gc_live_count() == 1, "H1c: live_count==1 after alloc");
+        check(ext_gc::gc_delete_object(p) == 1, "H1d: gc_delete_object returns 1 (freed)");
+        check(!ext_gc::gc_is_live(p), "H1e: object not live after gc_delete_object");
+        check(ext_gc::gc_live_count() == 0, "H1f: live_count==0 after immediate free");
+        check(ext_gc::gc_freed_count() == 1, "H1g: freed_count==1 (immediate, no collect)");
+        // A subsequent collect must not double-free or change the count.
+        ext_gc::gc_collect();
+        check(ext_gc::gc_freed_count() == 1, "H1h: collect after delete does not re-free");
+        check(ext_gc::gc_live_count() == 0, "H1i: live_count still 0 after post-delete collect");
+    }
+
+    // [H2] gc_delete_object rejects null / non-live / already-freed pointers
+    //      (returns 0), without touching stats. Repeated delete is idempotent.
+    {
+        ext_gc::gc_reset();
+        check(ext_gc::gc_delete_object(0) == 0, "H2a: gc_delete_object(0) returns 0");
+        // A non-GC integer (not a live pointer) -> 0.
+        check(ext_gc::gc_delete_object(0x1234) == 0, "H2b: gc_delete_object(non-ptr) returns 0");
+        int64_t p = ext_gc::gc_alloc_object(16);
+        check(ext_gc::gc_delete_object(p) == 1, "H2c: first delete returns 1");
+        check(ext_gc::gc_delete_object(p) == 0, "H2d: second delete returns 0 (already freed)");
+        check(ext_gc::gc_delete_object(p) == 0, "H2e: third delete returns 0 (still freed)");
+        check(ext_gc::gc_freed_count() == 1, "H2f: freed_count==1 (no double-count)");
+        check(ext_gc::gc_live_count() == 0, "H2g: live_count==0");
+    }
+
+    // [H3] gc_delete_object is DETERMINISTIC destruction, NOT unpinning:
+    //      contrast with gc_delete (the legacy unpin native). gc_new allocs +
+    //      PINS; gc_delete UNPINS (the object is still on the heap until a
+    //      collect); gc_delete_object frees IMMEDIATELY (gone before any
+    //      collect). This guards the unpinning-vs-destruction distinction +
+    //      that the legacy surface still works (no regression).
+    {
+        ext_gc::gc_reset();
+        // Legacy surface: gc_new (pin) + gc_delete (unpin) -> still live until collect.
+        int64_t a = ext_gc::gc_alloc_env(16); ext_gc::gc_root_env(a); // simulate gc_new
+        check(ext_gc::gc_is_live(a), "H3a: legacy pinned object live");
+        ext_gc::gc_unroot_env(a);                 // simulate gc_delete (unpin)
+        check(ext_gc::gc_is_live(a), "H3b: unpinning does NOT free immediately (still live)");
+        check(ext_gc::gc_live_count() == 1, "H3c: live_count==1 after unpin (not freed yet)");
+        ext_gc::gc_collect();                     // NOW the collector reaps it
+        check(!ext_gc::gc_is_live(a), "H3d: unpinning -> collected on next collect");
+        // New surface: gc_delete_object frees IMMEDIATELY (no collect needed).
+        int64_t b = ext_gc::gc_alloc_object(16);
+        check(ext_gc::gc_is_live(b), "H3e: new object live before delete_object");
+        ext_gc::gc_delete_object(b);              // DETERMINISTIC destruction
+        check(!ext_gc::gc_is_live(b), "H3f: gc_delete_object frees IMMEDIATELY (gone, no collect)");
+        check(ext_gc::gc_live_count() == 0, "H3g: live_count==0 after immediate delete");
+    }
+
+    // [H4] stale root slot after gc_delete_object: pin an object (gc_root_env),
+    //      then gc_delete_object it. The pin slot still holds the freed pointer;
+    //      a subsequent collect must ignore the stale slot (is_live -> false),
+    //      not crash, not resurrect, not double-count the free.
+    {
+        ext_gc::gc_reset();
+        int64_t p = ext_gc::gc_alloc_object(16);
+        ext_gc::gc_root_env(p);                   // pin: a root slot now holds p
+        check(ext_gc::gc_delete_object(p) == 1, "H4a: gc_delete_object on a pinned obj returns 1");
+        check(!ext_gc::gc_is_live(p), "H4b: pinned obj freed immediately by gc_delete_object");
+        size_t freed_before = size_t(ext_gc::gc_freed_count());
+        ext_gc::gc_collect();                     // stale pin slot -> ignored
+        check(ext_gc::gc_freed_count() == int64_t(freed_before),
+              "H4c: stale pin slot not re-freed by collect");
+        check(!ext_gc::gc_is_live(p), "H4d: no resurrection via stale pin slot");
+        check(ext_gc::gc_live_count() == 0, "H4e: live_count==0 (stale pin ignored)");
+    }
+
+    // [H5] collect-before-allocate threshold safety: gc_alloc_object uses the
+    //      SAME threshold as gc_alloc_env. Allocating past the threshold
+    //      triggers a collect FIRST (so the new object is the newest + the next
+    //      collect is at the next alloc). Verify with a low threshold + many
+    //      unpinned allocs that the heap stays bounded (the auto-collect reaps
+    //      the unrooted objects).
+    {
+        ext_gc::gc_reset();
+        ext_gc::gc_set_threshold(64);
+        for (int i = 0; i < 500; ++i) {
+            (void)ext_gc::gc_alloc_object(16);   // unrooted -> collectable
+        }
+        check(ext_gc::gc_live_count() < 64 + 16,
+              "H5a: heap bounded (< ~80) after 500 unpinned allocs (auto-collect via threshold)");
+        ext_gc::gc_collect();
+        check(ext_gc::gc_live_count() == 0, "H5b: after final collect, live_count==0 (all reaped)");
+        check(ext_gc::gc_freed_count() >= 500, "H5c: freed_count>=500 (auto + explicit collect)");
+        ext_gc::gc_set_threshold(1024);           // restore default
+    }
+
+    // [H6] the new internal natives are registered (stable compiler contract):
+    //      __ember_gc_alloc_object + __ember_gc_delete_object resolve in a
+    //      registered native table. Guards that the compiler can lower the
+    //      future language `new`/`delete` to these names.
+    {
+        std::unordered_map<std::string, ember::NativeSig> natives;
+        ext_gc::register_natives(natives);
+        auto it_a = natives.find("__ember_gc_alloc_object");
+        auto it_d = natives.find("__ember_gc_delete_object");
+        check(it_a != natives.end(), "H6a: __ember_gc_alloc_object registered");
+        check(it_d != natives.end(), "H6b: __ember_gc_delete_object registered");
+        // The legacy surface is still registered (no regression).
+        check(natives.count("gc_new") && natives.count("gc_delete"),
+              "H6c: legacy gc_new/gc_delete still registered (compatibility preserved)");
+        // Call the registered fn_ptrs directly to confirm the binding works.
+        if (it_a != natives.end() && it_d != natives.end()) {
+            using F_alloc = int64_t(*)(int64_t);
+            using F_delete = int64_t(*)(int64_t);
+            auto f_alloc = reinterpret_cast<F_alloc>(it_a->second.fn_ptr);
+            auto f_delete = reinterpret_cast<F_delete>(it_d->second.fn_ptr);
+            int64_t p = f_alloc(16);
+            check(p != 0 && ext_gc::gc_is_live(p), "H6d: __ember_gc_alloc_object fn_ptr allocs a live obj");
+            check(f_delete(p) == 1, "H6e: __ember_gc_delete_object fn_ptr frees (returns 1)");
+            check(!ext_gc::gc_is_live(p), "H6f: object gone after native delete");
+        }
+        ext_gc::gc_reset();
+    }
+
+    ext_gc::gc_reset();
+    return g_fail;
+}
+
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     int a = run_part_a();
@@ -1208,6 +1353,7 @@ int main() {
     int e = run_part_e();
     int f = run_part_f();
     int g = run_part_g();
-    std::printf("\ngc_integration_test: %s\n", (a || b || c || d || e || f || g) ? "FAIL" : "PASS");
-    return (a || b || c || d || e || f || g) ? 1 : 0;
+    int h = run_part_h();
+    std::printf("\ngc_integration_test: %s\n", (a || b || c || d || e || f || g || h) ? "FAIL" : "PASS");
+    return (a || b || c || d || e || f || g || h) ? 1 : 0;
 }

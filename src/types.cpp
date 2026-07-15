@@ -7,7 +7,7 @@ bool Type::is_int() const {
     switch (prim) {
     case Prim::I8:case Prim::I16:case Prim::I32:case Prim::I64:
     case Prim::U8:case Prim::U16:case Prim::U32:case Prim::U64:
-        return struct_name.empty() && !is_slice && !is_lambda && array_len==0;
+        return struct_name.empty() && !is_slice && !is_lambda && !is_managed_ptr && array_len==0;
     default: return false;
     }
 }
@@ -19,13 +19,14 @@ bool Type::is_uint() const {
     }
 }
 bool Type::is_float() const {
-    return (prim==Prim::F32 || prim==Prim::F64) && struct_name.empty() && !is_slice && !is_lambda && array_len==0;
+    return (prim==Prim::F32 || prim==Prim::F64) && struct_name.empty() && !is_slice && !is_lambda && !is_managed_ptr && array_len==0;
 }
 bool Type::is_bool() const {
-    return prim==Prim::Bool && struct_name.empty() && !is_slice && !is_lambda && array_len==0;
+    return prim==Prim::Bool && struct_name.empty() && !is_slice && !is_lambda && !is_managed_ptr && array_len==0;
 }
 
 size_t Type::byte_size() const {
+    if (is_managed_ptr) return 8;           // one-word opaque GC pointer
     if (is_slice) return 16;             // {ptr,len}
     if (is_lambda) return 16;            // {fn_slot, env_ptr} (#20)
     if (array_len) return size_t(array_len) * (elem ? elem->byte_size() : 1);
@@ -40,6 +41,7 @@ size_t Type::byte_size() const {
     return 0;
 }
 uint32_t Type::align() const {
+    if (is_managed_ptr) return 8;
     if (is_slice) return 8;
     if (is_lambda) return 8;             // {fn_slot, env_ptr} (#20)
     if (array_len) return elem ? elem->align() : 1;
@@ -52,6 +54,13 @@ uint32_t Type::align() const {
     }
 }
 bool Type::same(const Type& o) const {
+    if (is_managed_ptr != o.is_managed_ptr) return false;
+    if (is_managed_ptr) {
+        // Two managed pointers are same iff both carry matching pointee types
+        // (stored in `elem`, reusing the existing shared_ptr field).
+        if (elem && o.elem) return elem->same(*o.elem);
+        return !elem && !o.elem;
+    }
     if (is_lambda != o.is_lambda) return false;
     if (is_lambda) {
         // A lambda type is same iff both carry matching recorded sigs. (A
@@ -100,6 +109,9 @@ bool Type::same(const Type& o) const {
 }
 std::string Type::to_string() const {
     if (is_void()) return "void";
+    if (is_managed_ptr) {
+        return std::string("managed ") + (elem ? elem->to_string() : std::string("?"));
+    }
     if (is_lambda) {
         std::string s = "fn(";
         for (size_t i = 0; i < recorded_params.size(); ++i) {
@@ -147,5 +159,10 @@ Type make_slice(std::shared_ptr<Type> e) { Type t; t.is_slice=true; t.elem=e; re
 Type make_array(std::shared_ptr<Type> e, uint32_t n){ Type t; t.array_len=n; t.elem=e; return t; }
 Type make_struct(std::string n){ Type t; t.struct_name=std::move(n); return t; }
 Type make_prim(Prim p){ Type t; t.prim=p; return t; }
+Type make_managed_ptr(std::shared_ptr<Type> pointee) {
+    Type t; t.prim = Prim::I64; t.is_managed_ptr = true;
+    t.elem = pointee;  // reuse the existing shared_ptr field (no struct growth)
+    return t;
+}
 
 } // namespace ember

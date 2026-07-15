@@ -1,0 +1,8 @@
+// sema_invalid: `new T` must reject `void` (an unsized type has no allocation
+// size). `new void` is a sema error — there is no byte size to allocate. This
+// is the unsupported-unsized-type check the `new` operator runs before asking
+// the GC for memory.
+fn main() -> i64 {
+    let p = new void;
+    return 0;
+}

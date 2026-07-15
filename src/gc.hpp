@@ -167,6 +167,30 @@ public:
     // True iff `p` points at the user bytes of a currently-live GC object.
     bool is_live(const void* p) const;
 
+    // Deterministic immediate free — the runtime substrate for the future
+    // language `delete` operator. Validates that `p` is an EXACT live GC user
+    // pointer (returns false for null / non-GC / interior / already-freed
+    // pointers). On success: removes `p` from the live set, frees its
+    // allocation IMMEDIATELY (bypassing the mark-sweep collector), decrements
+    // live_objects + live_bytes, and increments freed_objects.
+    //
+    // Does NOT touch root slots or RefMap edges that may still reference `p`
+    // — those stale values are SAFELY IGNORED by the existing liveness filter:
+    // the explicit-root loop calls is_live(*root) before marking; the trace
+    // visitor calls is_live(candidate); RefMap edge tracing calls
+    // is_live(child). A freed pointer fails is_live() in all three, so it is
+    // skipped (not dereferenced, not resurrected). Clearing every possible
+    // reference would require a full heap scan (the collector's job); leaving
+    // stale values for the filter to ignore is the O(1) deterministic-delete
+    // contract.
+    //
+    // This is DIFFERENT from unpinning (the extension's gc_unroot_env / the
+    // gc_delete native): unpinning only removes a root so the object becomes
+    // COLLECTABLE by a future collect(); free_object frees the object NOW,
+    // deterministically. The caller must not use `p` after a true return
+    // (use-after-free is the caller's contract, the same as free()).
+    bool free_object(void* p);
+
     // Free ALL objects + clear roots + clear all trace-callback and barrier-
     // observer registrations (without touching any caller user_data). Test
     // teardown / full reset. After this, every previously-issued token is

@@ -67,6 +67,24 @@ struct Type {
     // (sema sets is_lambda_call) that passes env_ptr as the hidden first arg.
     bool is_lambda = false;
 
+    // v1.0 managed pointers (language `new`/`delete` operators): a managed
+    // pointer is a one-word opaque GC pointer (Prim::I64, is_managed_ptr=true)
+    // carrying its pointee type in pointee_type. It is NOT a raw pointer —
+    // there is no arithmetic, no dereference syntax, no cast to/from i64.
+    // `new T` yields a managed pointer to T; `delete expr` accepts ONLY a
+    // managed pointer. The pointer is GC-traced: a frame slot / global holding
+    // a managed pointer is a precise GC root, so the object survives while the
+    // root is live and is reaped when the root is gone (or freed immediately
+    // by `delete`). byte_size()==8, align()==8 (one word). Type::same()
+    // requires both is_managed_ptr AND pointee_type->same() so a `new i64`
+    // pointer is distinct from a `new Pt` pointer (and from a plain i64).
+    bool is_managed_ptr = false;
+    // NOTE: the managed pointer's pointee type is stored in `elem` (reusing
+    // the existing shared_ptr<Type> field — a managed pointer has no
+    // is_slice/array_len, so `elem` is otherwise unused). This avoids growing
+    // the Type struct (which would push deeply-nested expression compilation
+    // past the stack limit before the recursion-depth guard can throw).
+
     bool is_int() const;            // any i*/u*
     bool is_uint() const;          // any u*
     bool is_float() const;          // f32/f64
@@ -90,6 +108,12 @@ Type make_slice(std::shared_ptr<Type> elem);
 Type make_array(std::shared_ptr<Type> elem, uint32_t n);
 Type make_struct(std::string name);
 Type make_prim(Prim p);
+// v1.0 managed pointer: a one-word opaque GC pointer to `pointee`. NOT a raw
+// pointer (no arithmetic/dereference); GC-traced. See Type::is_managed_ptr.
+// The pointee is stored in `elem` (reusing the existing shared_ptr field) to
+// avoid growing the Type struct (which would push deeply-nested expression
+// compilation past the stack limit before the recursion-depth guard throws).
+Type make_managed_ptr(std::shared_ptr<Type> pointee);
 
 // --- source location on every node ---
 struct Loc { uint32_t line; uint32_t col; };
@@ -281,6 +305,17 @@ struct ArrayLit : Expr { std::vector<ExprPtr> elements; };
 // at sema.cpp's SwitchStmt requires an IntLit by the time check_expr
 // returns, so the rewrite happens in sema, not as a codegen pre-pass).
 struct EnumAccessExpr : Expr { std::string enum_name; std::string variant; };
+// v1.0 managed-pointer operators (language `new`/`delete`). `new T` resolves
+// T at sema, computes its scalar/array/registered-struct byte size (with
+// overflow + unsupported-unsized-type checks), returns a compiler-recognized
+// managed pointer (Type::is_managed_ptr), and codegen lowers it to a call to
+// the internal native __ember_gc_alloc_object(size) (zero-initialized GC
+// memory). `delete expr` accepts ONLY a managed-pointer expression, invokes
+// deterministic destruction via __ember_gc_delete_object(ptr), and has void
+// semantics (it is an expression statement, not a value). No raw-pointer
+// arithmetic or dereference syntax is provided.
+struct NewExpr   : Expr { std::shared_ptr<Type> alloc_ty; uint64_t resolved_size = 0; };
+struct DeleteExpr: Expr { ExprPtr operand; };
 // LambdaExpr is defined below (after Param) — it carries declared params.
 
 // statements

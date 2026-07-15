@@ -19,6 +19,7 @@ enum class Tk : uint16_t {
     Kw_try, Kw_catch, Kw_throw,
     Kw_yield,
     Kw_true, Kw_false,
+    Kw_new, Kw_delete,
     Kw_sizeof, Kw_offsetof,
     Kw_link, Kw_enum, Kw_match, Kw_static_assert, Kw_namespace,
     // primitive types

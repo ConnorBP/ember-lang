@@ -91,6 +91,29 @@
 // pointer-type system (ember structs are value types today); these natives
 // are the heap-management substrate that follow-up would build on.
 //
+//   --- deterministic new/delete substrate (language `new`/`delete` natives) ---
+//   __ember_gc_alloc_object(i64 size)  -> i64 ptr   allocate an UNPINNED raw
+//                                                  GC heap object (the `new`
+//                                                  substrate; same thread-local
+//                                                  heap + collect-before-alloc
+//                                                  threshold safety as
+//                                                  __ember_gc_alloc_env)
+//   __ember_gc_delete_object(i64 ptr) -> i64 ok    DETERMINISTIC immediate free
+//                                                  via GcHeap::free_object (the
+//                                                  `delete` substrate; frees
+//                                                  NOW, not just unpin). 1 on
+//                                                  success, 0 if null / not
+//                                                  live / already freed.
+//
+// The __ember_gc_alloc_object / __ember_gc_delete_object natives are the
+// STABLE CONTRACT the compiler will lower the future language `new`/`delete`
+// operators to. They are distinct from the legacy gc_new/gc_delete: gc_new
+// allocs + PINS (the script-held handle is typed i64, so the frame map cannot
+// track it) and gc_delete UNPINS (marks collectable for a future collect);
+// __ember_gc_alloc_object allocs UNPINNED and __ember_gc_delete_object frees
+// IMMEDIATELY (deterministic destruction, not unpinning). The legacy surface
+// is preserved so current tests do not regress.
+//
 // codegen's lambda-env case (src/codegen.cpp) calls __ember_gc_alloc_env when
 // CodeGenCtx::use_gc_env is set, instead of stack-allocating the env. The
 // natives receive/return the env pointer as an i64 (Win64: a pointer is an
@@ -122,6 +145,19 @@
 //      Type{...}` syntax with typed field access needs a pointer type system
 //      (ember structs are value types today) — the natives are the heap-
 //      management substrate that follow-up would build on.
+//    * Deterministic new/delete substrate (DONE): GcHeap::free_object frees a
+//      single live object IMMEDIATELY (bypassing the collector) — the runtime
+//      primitive for the future language `delete` operator. Exposed as the
+//      internal natives __ember_gc_alloc_object (unpinned alloc, the `new`
+//      substrate) + __ember_gc_delete_object (immediate free, the `delete`
+//      substrate) — the stable contract the compiler will lower `new`/`delete`
+//      to. These are DISTINCT from the legacy gc_new/gc_delete: gc_delete only
+//      UNPINS (marks collectable for a future collect), while
+//      __ember_gc_delete_object frees NOW (deterministic destruction). The
+//      language frontend (`new`/`delete` syntax + typed pointer handling) is a
+//      follow-up; the runtime substrate + native contract ship here. See
+//      gc_test [14]-[19] (free_object direct) + gc_integration_test Part H
+//      (extension host API).
 //    * Precise root scanning (DONE): gc_alloc_env NO LONGER pins. Reachability
 //      is determined by the JIT'd active-frame chain (the shadow stack: each
 //      active frame links a GcFrameRecord onto context_t::gc_frame_head; the
@@ -235,6 +271,60 @@ int64_t gc_live_count();
 // Set the auto-collect threshold (live_objects at which an alloc triggers a
 // collect-then-alloc). 0 disables auto-collect. Default 1024.
 void gc_set_threshold(int64_t n);
+
+// ===========================================================================
+// Deterministic new/delete: unpinned object allocation + immediate destruction.
+//
+// These are the runtime substrate for the future language-level `new` and
+// `delete` operators, exposed as the internal native bindings
+// __ember_gc_alloc_object / __ember_gc_delete_object (the stable contract the
+// compiler will lower `new`/`delete` to). They are SEPARATE from the legacy
+// script-visible gc_new/gc_delete surface:
+//
+//   gc_new / gc_delete    — the COMPATIBILITY surface. gc_new allocs + PINS
+//                           (a script-held i64 handle is typed i64, so the
+//                           frame map cannot track it); gc_delete UNPINS
+//                           (marks the object collectable for a future
+//                           collect()). Preserved as-is so current tests do
+//                           not regress.
+//
+//   gc_alloc_object       — UNPINNED allocation (the `new` substrate). Uses
+//                           the same thread-local heap + collect-before-
+//                           allocate threshold safety as gc_alloc_env. The
+//                           object is NOT pinned; reachability is determined
+//                           by the frame chain / global roots / extension
+//                           callbacks / an explicit pin (gc_root_env).
+//
+//   gc_delete_object      — DETERMINISTIC immediate destruction (the `delete`
+//                           substrate). Calls GcHeap::free_object: validates
+//                           the pointer is an exact live GC object, removes +
+//                           frees it IMMEDIATELY, decrements live counts/bytes,
+//                           increments freed_objects. This is NOT unpinning —
+//                           the object is gone right now, not just collectable.
+//
+// The distinction matters: unpinning (gc_delete) is a HINT to the collector
+// ("you may reap this when nothing reaches it"); deterministic destruction
+// (gc_delete_object) is an IMMEDIATE free ("free this NOW"). The future
+// language `delete` operator uses __ember_gc_delete_object; a managed-only
+// mode would use gc_delete (unpin + let the collector decide).
+// ===========================================================================
+
+// Allocate `size` user bytes on the GcHeap as an UNPINNED raw object (the `new`
+// substrate). Same thread-local heap + collect-before-allocate threshold safety
+// as gc_alloc_env. NOT pinned (reachability via the frame chain / global roots
+// / extension callbacks / an explicit pin). Returns the object pointer as an
+// i64 (0 on failure / bad size).
+int64_t gc_alloc_object(int64_t size);
+
+// Immediately + deterministically free a GC object (the `delete` substrate).
+// Calls GcHeap::free_object: validates `ptr` is an exact live GC user pointer,
+// removes + frees the allocation immediately, decrements live counts/bytes,
+// increments freed_objects. Returns 1 on success, 0 if `ptr` is null / not a
+// live GC object / already freed. Stale root/edge values referencing the freed
+// object are safely ignored by the collector's liveness filter. DIFFERENT from
+// gc_delete (which only unpins, leaving the object collectable for a future
+// collect()).
+int64_t gc_delete_object(int64_t ptr);
 
 // True iff ptr points at a currently-live GC object (env) on this thread's
 // heap. Test helper.

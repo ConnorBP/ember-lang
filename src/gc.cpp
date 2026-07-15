@@ -89,6 +89,35 @@ bool GcHeap::is_live(const void* p) const {
     return m_live.count(const_cast<void*>(p)) > 0;
 }
 
+// Deterministic immediate free (the language `delete` substrate). See the
+// contract in gc.hpp. Frees a single live object NOW, bypassing the collector;
+// leaves stale root/edge values for the liveness filter to ignore.
+bool GcHeap::free_object(void* p) {
+    if (!p) return false;
+    auto it = m_live.find(p);
+    if (it == m_live.end()) return false;  // not an exact live GC user pointer
+    // Recover the header (same trailer-at-user-4 recovery as collect()) + free
+    // the allocation immediately.
+    uint32_t hb;
+    std::memcpy(&hb, static_cast<char*>(p) - 4, 4);
+    Header* hdr = reinterpret_cast<Header*>(static_cast<char*>(p) - hb);
+    m_stats.live_bytes -= hdr->size;
+    m_stats.live_objects--;
+    m_stats.freed_objects++;
+    m_live.erase(it);
+    std::free(hdr);
+    // DELIBERATELY do NOT clear root slots or RefMap edges that may still hold
+    // `p`. Those stale values are safely ignored by the existing liveness
+    // filter: the root loop checks is_live(*root) before marking; the trace
+    // visitor checks is_live(candidate); RefMap edge tracing checks
+    // is_live(child). A freed pointer fails is_live() in all three, so no
+    // dangling dereference + no false resurrection. Clearing every possible
+    // reference would require a full heap scan (the collector's job); leaving
+    // stale values for the filter to ignore is the O(1) deterministic-delete
+    // contract.
+    return true;
+}
+
 const GcStats& GcHeap::stats() const { return m_stats; }
 
 // --- Trace-callback registration (external root providers) ---

@@ -1,0 +1,19 @@
+// expect: 42
+// sema_valid + runtime: basic `new i64` / `delete p` round-trip. `new i64`
+// allocates zero-initialized GC memory and yields a managed pointer; `delete p`
+// deterministically frees it immediately (gc_live drops by 1 with NO collect).
+// The managed pointer is a one-word opaque GC pointer — not a raw pointer with
+// arithmetic/dereference (no such facility is added). We assert gc_live went
+// from 1 (the live new'd object) to 0 (after delete), then a collect reaps
+// nothing further. Returns 42 to signal success.
+fn main() -> i64 {
+    let p = new i64;
+    let before: i64 = gc_live();    // 1 (the live object)
+    delete p;
+    let after: i64 = gc_live();     // 0 (delete freed it immediately)
+    gc_collect();                   // reaps nothing (already freed)
+    let post: i64 = gc_live();      // 0
+    // Signal success: before==1, after==0, post==0
+    if (before == 1 && after == 0 && post == 0) { return 42; }
+    return before * 1000 + after * 100 + post;
+}

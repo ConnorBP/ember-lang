@@ -1298,9 +1298,16 @@ struct Checker {
             scan_expr_for_escapes(*cast->operand, out);
             return;
         }
+        // v1.0 managed pointers: `delete expr` recurses into its operand (no
+        // slice-escape shape, but keep the scan total); `new T` has no
+        // sub-expressions.
+        if (auto* d = dynamic_cast<const DeleteExpr*>(&e)) {
+            if (d->operand) scan_expr_for_escapes(*d->operand, out);
+            return;
+        }
         // IntLit/FloatLit/BoolLit/StringLit/Ident/SizeofExpr/OffsetofExpr/
-        // StructLit/ArrayLit/EnumAccessExpr/FnHandleExpr: no nested escape
-        // shapes to scan.
+        // StructLit/ArrayLit/EnumAccessExpr/FnHandleExpr/NewExpr: no nested
+        // escape shapes to scan.
     }
 
     // Compute per-fn borrowed_params / retained_params for every script fn, via
@@ -2567,6 +2574,85 @@ const Type* Checker::check_expr(Expr& e, const Type* expected, bool allow_struct
         }
         e.ty = intern(make_prim(Prim::U64)); return e.ty;
     }
+    if (auto* n = dynamic_cast<NewExpr*>(&e)) {
+        // `new T`: resolve T, compute its scalar/array/registered-struct byte
+        // size (with overflow + unsupported-unsized-type checks), return a
+        // compiler-recognized managed pointer (Type::is_managed_ptr). The
+        // object is zero-initialized GC memory; codegen lowers this to a call
+        // to the internal native __ember_gc_alloc_object(size).
+        const Type* at = n->alloc_ty.get();
+        if (!at) { err("'new' requires a type operand", n->loc.line, n->loc.col); e.ty = intern(type_void()); return e.ty; }
+        // Reject void (an unsized type has no allocation size).
+        if (at->is_void()) {
+            err("'new' cannot allocate void (an unsized type has no byte size)", n->loc.line, n->loc.col);
+            e.ty = intern(type_void()); return e.ty;
+        }
+        // Reject slices (T[]) — a slice is {ptr,len}, a descriptor with a
+        // separate backing allocation; there is no single sized payload to
+        // zero-initialize as one heap object. Only sized scalar/array/
+        // registered-struct types are allocatable. A fixed array T[N] IS
+        // allocatable (its byte size is N*elem_size).
+        if (at->is_slice) {
+            err("'new' cannot allocate a slice type '" + at->to_string() +
+                "' (slices are unsized for new; use a fixed array or a sized type)",
+                n->loc.line, n->loc.col);
+            e.ty = intern(type_void()); return e.ty;
+        }
+        // Reject a managed pointer (no pointer-to-pointer in v1) + a lambda/
+        // fn-handle (unsized handle, not a heap object).
+        if (at->is_managed_ptr) {
+            err("'new' cannot allocate a managed pointer (pointer-to-pointer is unsupported in v1)",
+                n->loc.line, n->loc.col);
+            e.ty = intern(type_void()); return e.ty;
+        }
+        if (at->is_lambda || at->is_fn_handle) {
+            err("'new' cannot allocate a function/lambda handle (unsized for new)",
+                n->loc.line, n->loc.col);
+            e.ty = intern(type_void()); return e.ty;
+        }
+        // Resolve the byte size using the SAME helper frame_byte_width uses
+        // (mirrors codegen's value_bytes). A named struct that is NOT in the
+        // StructLayoutTable (an opaque host handle like "string") is NOT a
+        // sized allocatable type for `new` (it is an i64 handle, not a
+        // by-value struct) -> reject.
+        int64_t size = -1;
+        if (at->array_len > 0) {
+            size = frame_byte_width(*at, structs);
+        } else if (!at->struct_name.empty()) {
+            if (structs && structs->count(at->struct_name)) {
+                size = int64_t(structs->at(at->struct_name).size);
+            } else {
+                err("'new' cannot allocate opaque handle type '" + at->to_string() +
+                    "' (not a registered by-value struct)", n->loc.line, n->loc.col);
+                e.ty = intern(type_void()); return e.ty;
+            }
+        } else {
+            size = int64_t(at->byte_size());
+        }
+        if (size <= 0 || size > MAX_FRAME_BYTES) {
+            err("'new' type '" + at->to_string() + "' has an invalid or oversized byte size (" +
+                std::to_string(size) + ") for allocation", n->loc.line, n->loc.col);
+            e.ty = intern(type_void()); return e.ty;
+        }
+        n->resolved_size = uint64_t(size);
+        // The result is a managed pointer to T (one-word opaque GC pointer).
+        e.ty = intern(make_managed_ptr(n->alloc_ty));
+        return e.ty;
+    }
+    if (auto* d = dynamic_cast<DeleteExpr*>(&e)) {
+        // `delete expr`: accept ONLY a managed-pointer expression (the type
+        // produced by `new T`). Invoke deterministic destruction via
+        // __ember_gc_delete_object(ptr). Void semantics (the expression is an
+        // expression statement, not a value). A non-managed value is a sema
+        // error (the type-safety gate that keeps `delete` from freeing an
+        // arbitrary integer / a foreign pointer).
+        const Type* ot = check_expr(*d->operand);
+        if (!ot || !ot->is_managed_ptr) {
+            err("'delete' requires a managed pointer (from 'new T'); got " +
+                (ot ? ot->to_string() : std::string("?")), d->loc.line, d->loc.col);
+        }
+        e.ty = intern(type_void()); return e.ty;
+    }
     if (auto* ix = dynamic_cast<IndexExpr*>(&e)) {
         // base[index]: base must be a fixed array T[N] or a slice T[]
         // (codegen Section index-expr - CG::eval's IndexExpr case).
@@ -3495,6 +3581,22 @@ void Checker::validate_realtime_expr(const Expr& e) {
     }
     if (auto* al = dynamic_cast<const ArrayLit*>(&e)) {
         for (const auto& element : al->elements) validate_realtime_expr(*element);
+        return;
+    }
+    // v1.0 managed pointers: `new` and `delete` are GC/heap operations,
+    // categorically forbidden in realtime functions (same category as
+    // gc_alloc/gc_collect — they allocate/free on the GC heap). `new T` has
+    // no sub-expressions; `delete expr` recurses into its operand.
+    if (auto* n = dynamic_cast<const NewExpr*>(&e)) {
+        err("@realtime violation: GC/heap allocation 'new' (forbidden in realtime functions)",
+            n->loc.line, n->loc.col);
+        return;
+    }
+    if (auto* d = dynamic_cast<const DeleteExpr*>(&e)) {
+        err("@realtime violation: GC/heap operation 'delete' (forbidden in realtime functions)",
+            d->loc.line, d->loc.col);
+        if (d->operand) validate_realtime_expr(*d->operand);
+        return;
     }
 }
 
@@ -3691,6 +3793,14 @@ void Checker::collect_captures_expr(const Expr& e, size_t lambda_scope_start,
         if (nlf) collect_captures_block(nlf->body, lambda_scope_start, out);
         return;
     }
+    // v1.0 managed pointers: `delete expr` recurses into its operand (a
+    // managed-pointer Ident in a lambda body is a capture); `new T` has no
+    // sub-expressions (T is a type, not an expr), so nothing to capture.
+    if (auto* d = dynamic_cast<const DeleteExpr*>(&e)) {
+        if (d->operand) collect_captures_expr(*d->operand, lambda_scope_start, out);
+        return;
+    }
+    // NewExpr: no Idents to capture (alloc_ty is a type, not an expression).
 }
 
 void Checker::collect_captures_stmt(const Stmt& s, size_t lambda_scope_start,

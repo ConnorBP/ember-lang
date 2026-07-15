@@ -591,7 +591,44 @@ struct P {
             a->value = std::move(one);
             return a;
         }
+        // v1.0 managed-pointer operators (language `new`/`delete`). Handled
+        // in dedicated helpers (parse_new / parse_delete) to keep parse_unary's
+        // stack frame small — parse_unary is on the critical recursive path for
+        // deeply nested expressions, and inlining the locals here would push
+        // pathological-but-valid inputs (e.g. sema_invalid_deep_nesting's
+        // ~10000-level `1 + 1 + ...`) past the stack limit before the
+        // MAX_EXPR_DEPTH guard can throw.
+        if (k==Tk::Kw_new)  return parse_new();
+        if (k==Tk::Kw_delete) return parse_delete();
         return parse_postfix();
+    }
+
+    // v1.0 managed-pointer `new T` (language operator). A prefix operator
+    // taking a TYPE (parsed via parse_type). Sema resolves T, computes its
+    // byte size, returns a compiler-recognized managed pointer. `new T` is a
+    // prefix expression at unary precedence.
+    ExprPtr parse_new() {
+        uint32_t l = peek().line, c = peek().col;
+        adv();  // 'new'
+        auto ty = parse_type();
+        auto n = std::make_unique<NewExpr>();
+        n->loc = {l, c};
+        n->alloc_ty = std::move(ty);
+        return n;
+    }
+    // v1.0 managed-pointer `delete expr` (language operator). A prefix
+    // operator taking an EXPRESSION (parsed via parse_unary, one level down).
+    // Sema checks the operand is a managed pointer. `delete` has void
+    // semantics. No raw-pointer dereference syntax is provided (a managed
+    // pointer is opaque).
+    ExprPtr parse_delete() {
+        uint32_t l = peek().line, c = peek().col;
+        adv();  // 'delete'
+        ExprPtr e = parse_unary();
+        auto d = std::make_unique<DeleteExpr>();
+        d->loc = {l, c};
+        d->operand = std::move(e);
+        return d;
     }
 
     ExprPtr parse_postfix() {

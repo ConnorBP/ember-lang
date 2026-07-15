@@ -166,6 +166,46 @@ int64_t gc_alloc_env(int64_t size) {
     return int64_t(reinterpret_cast<uintptr_t>(env));
 }
 
+// ---- deterministic new/delete: unpinned object allocation + immediate ----
+// ---- destruction (the language `new`/`delete` substrate).              ----
+// gc_alloc_object: UNPINNED allocation on the same thread-local heap as
+// gc_alloc_env, with the SAME collect-before-allocate threshold safety (the
+// check runs before the alloc, never after, closing the alloc-to-first-store
+// window). NOT pinned — reachability is determined by the frame chain / global
+// roots / extension callbacks / an explicit pin (gc_root_env). This is the
+// allocation native the future language `new` operator lowers to
+// (__ember_gc_alloc_object). Distinct from gc_new (which allocs + PINS for the
+// legacy script-visible surface) and from gc_alloc_env (the lambda-env path).
+int64_t gc_alloc_object(int64_t size) {
+    GcRuntime* r = rt();
+    if (!r || size <= 0) return 0;
+    // Collect-before-allocate (same safety as gc_alloc_env): if live >=
+    // threshold, collect FIRST so the new object is the newest + the next
+    // collect is at the next alloc, by which time the object is stored into a
+    // rooted slot. threshold == 0 disables auto-collect.
+    if (r->threshold > 0 && int64_t(r->heap.stats().live_objects) >= r->threshold) {
+        r->heap.collect();
+    }
+    void* obj = r->heap.alloc(size_t(size), gc::refmap_none());
+    if (!obj) return 0;
+    // NOT pinned: reachability is determined by the frame chain / global-root
+    // descriptor / extension callbacks / explicit pin (gc_root_env).
+    return int64_t(reinterpret_cast<uintptr_t>(obj));
+}
+
+// gc_delete_object: DETERMINISTIC immediate destruction (the `delete`
+// substrate). Calls GcHeap::free_object — validates the pointer is an exact
+// live GC object, removes + frees it NOW (not just unpin), decrements live
+// counts/bytes, increments freed_objects. This is DIFFERENT from gc_delete
+// (the compatibility native), which only UNPINS an object (marks it
+// collectable for a future collect). The future language `delete` operator
+// lowers to __ember_gc_delete_object -> gc_delete_object.
+int64_t gc_delete_object(int64_t ptr) {
+    GcRuntime* r = rt();
+    if (!r) return 0;
+    return r->heap.free_object(reinterpret_cast<void*>(ptr)) ? 1 : 0;
+}
+
 int64_t gc_collect() {
     GcRuntime* r = rt();
     if (!r) return 0;
@@ -361,7 +401,42 @@ static int64_t n_gc_new(int64_t size) {
 }
 
 static int64_t n_gc_delete(int64_t ptr) {
+    // UNPIN (not destroy): gc_delete is the COMPATIBILITY unpinning native. It
+    // removes the legacy pin so the object becomes COLLECTABLE by a future
+    // collect() — it does NOT free the object immediately. This is distinct
+    // from __ember_gc_delete_object (n_gc_delete_object below), which calls
+    // GcHeap::free_object for DETERMINISTIC immediate destruction (the language
+    // `delete` substrate). Preserved as-is so current gc_new/gc_delete tests do
+    // not regress.
     return gc_unroot_env(ptr) ? 1 : 0;  // unpin -> collectable; 1 if it was pinned
+}
+
+// ---- deterministic new/delete natives (the language `new`/`delete` ----
+// ---- substrate; stable contract for the compiler).                  ----
+// __ember_gc_alloc_object(i64 size) -> i64 ptr
+// Allocate an UNPINNED raw GC heap object of `size` user bytes (the `new`
+// substrate). Same thread-local heap + collect-before-allocate threshold
+// safety as __ember_gc_alloc_env. NOT pinned (reachability via the frame
+// chain / global roots / extension callbacks / an explicit pin). Returns the
+// object pointer as an i64 (0 on failure). The future language `new` operator
+// lowers to this native. Distinct from gc_new (alloc+pin) and
+// __ember_gc_alloc_env (lambda-env path).
+static int64_t n_gc_alloc_object(int64_t size) {
+    return gc_alloc_object(size);
+}
+
+// __ember_gc_delete_object(i64 ptr) -> i64 success
+// Immediately + deterministically free a GC object (the `delete` substrate).
+// Calls GcHeap::free_object: validates `ptr` is an exact live GC user pointer,
+// removes + frees it NOW, decrements live counts/bytes, increments
+// freed_objects. Returns 1 on success, 0 if `ptr` is null / not a live GC
+// object / already freed. DIFFERENT from gc_delete (which only unpins — see
+// n_gc_delete above). The future language `delete` operator lowers to this
+// native. Stale root/edge values referencing the freed object are safely
+// ignored by the collector's liveness filter (no dangling deref, no
+// resurrection).
+static int64_t n_gc_delete_object(int64_t ptr) {
+    return gc_delete_object(ptr);
 }
 
 // __ember_gc_write_barrier(i64 owner, i64 child) -> i64 (0)
@@ -402,6 +477,16 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
     b.add("gc_delete",  T, {T},  (void*)&n_gc_delete);
     b.add("gc_collect", T, {},   (void*)&n_gc_collect);
     b.add("gc_live",    T, {},   (void*)&n_gc_live);
+    // Deterministic new/delete substrate (the language `new`/`delete` internal
+    // natives): __ember_gc_alloc_object (unpinned alloc) + __ember_gc_delete_object
+    // (immediate free via GcHeap::free_object). Stable contract for the compiler.
+    // Separate from the legacy gc_new/gc_delete (pin/unpin) compatibility surface
+    // above: gc_new pins + gc_delete unpins (collectable later); these alloc
+    // unpinned + free NOW (deterministic destruction). The future language `new`
+    // operator lowers to __ember_gc_alloc_object; `delete` to
+    // __ember_gc_delete_object.
+    b.add("__ember_gc_alloc_object",  T, {T}, (void*)&n_gc_alloc_object);
+    b.add("__ember_gc_delete_object", T, {T}, (void*)&n_gc_delete_object);
     NativeTable t = b.build();
     for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }

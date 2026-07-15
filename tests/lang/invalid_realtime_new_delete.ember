@@ -1,0 +1,8 @@
+// @realtime must reject the language `new` and `delete` operators (they are
+// GC/heap allocation operations, same category as gc_alloc/gc_collect). Both
+// are forbidden in realtime functions.
+@realtime
+fn process() -> void {
+    let p = new i64;
+    delete p;
+}

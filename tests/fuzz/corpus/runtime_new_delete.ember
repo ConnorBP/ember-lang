@@ -1,0 +1,18 @@
+// Automatic reclamation after the owning function returns + collection while
+// a managed pointer local is live. Run with --gc-env for precise frame-root
+// scanning (the run_lang_tests.sh run_gc_cli runner passes --gc-env; ember_cli
+// test parse-checks this file).
+fn alloc_tmp() -> i64 {
+    let p = new i64;
+    gc_collect();           // p is live (frame slot root) -> NOT swept
+    let live: i64 = gc_live();   // 1
+    return live;            // p goes out of scope here (frame torn down after)
+}
+
+fn main() -> i64 {
+    let live_in_callee: i64 = alloc_tmp();   // 1 (survived the in-callee collect)
+    gc_collect();           // reaps the now-unreachable object (frame gone)
+    let post: i64 = gc_live();               // 0
+    if (live_in_callee == 1 && post == 0) { return 42; }
+    return live_in_callee * 100 + post;
+}
