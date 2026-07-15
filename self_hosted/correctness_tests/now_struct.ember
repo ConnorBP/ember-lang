@@ -1,4 +1,4 @@
-// Native-valid, self-hosted out-of-subset rejection expected: -301.
-// selfhost-reject: -301
+// Self-hosted positive: struct decl + literal + field access (was reject -301).
+// expect: 42
 struct Pair { x: i64; y: i64; }
 fn main() -> i64 { let p: Pair = Pair { x: 20, y: 22 }; return p.x + p.y; }

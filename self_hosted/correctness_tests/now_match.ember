@@ -1,3 +1,3 @@
-// Native-valid, self-hosted out-of-subset rejection expected: -304.
-// selfhost-reject: -304
+// Self-hosted positive: match with int patterns + wildcard (was reject -304).
+// expect: 42
 fn main() -> i64 { let x: i64 = 2; match (x) { 1 => { return 1; }, 2 => { return 42; }, _ => { return 0; } } return 0; }

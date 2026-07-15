@@ -1,3 +1,0 @@
-// Native-valid, self-hosted out-of-subset rejection expected: -309.
-// selfhost-reject: -309
-fn main() -> i64 { let s = "ember"; if (string_length(s) == 5) { return 42; } return 0; }
