@@ -1,0 +1,7 @@
+// Self-hosted positive: packed struct field access + sizeof (i64+i32+i8 = 13 bytes).
+// expect: 13
+struct Mixed { a: i64; b: i32; c: i8; }
+fn main() -> i64 {
+    let m: Mixed = Mixed { a: 1, b: 2, c: 3 };
+    return sizeof(Mixed) as i64;
+}

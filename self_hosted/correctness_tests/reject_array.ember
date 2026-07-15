@@ -1,3 +1,0 @@
-// Native-valid, self-hosted out-of-subset rejection expected: -310.
-// selfhost-reject: -310
-fn main() -> i64 { let a: i64[3] = [10, 20, 12]; return a[0] + a[1] + a[2]; }

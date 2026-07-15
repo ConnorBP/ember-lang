@@ -1,0 +1,8 @@
+// Self-hosted positive: struct field mutation via assignment.
+// expect: 99
+struct Cell { x: i64; }
+fn main() -> i64 {
+    let mut p: Cell = Cell { x: 0 };
+    p.x = 99;
+    return p.x;
+}

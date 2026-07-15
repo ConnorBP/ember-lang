@@ -1,0 +1,13 @@
+// Self-hosted positive: slice from a view, summed via bounds-checked index.
+// expect: 60
+fn main() -> i64 {
+    let a: i64[3] = [10, 20, 30];
+    let s: i64[] = a[..];
+    let mut sum: i64 = 0;
+    let mut i: i64 = 0;
+    while (i < 3) {
+        sum = sum + s[i];
+        i = i + 1;
+    }
+    return sum;
+}

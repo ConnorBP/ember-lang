@@ -1,0 +1,6 @@
+// Self-hosted positive: fixed i64 array literal + index reads.
+// expect: 60
+fn main() -> i64 {
+    let a: i64[3] = [10, 20, 30];
+    return a[0] + a[1] + a[2];
+}

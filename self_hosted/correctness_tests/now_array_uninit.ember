@@ -1,0 +1,15 @@
+// Self-hosted positive: uninit fixed array, const+var index store, loop, reads.
+// Mirrors tests/lang/valid_ir_array.ember (expect 80) for the self-hosted suite.
+// expect: 80
+fn main() -> i64 {
+    let mut a: i64[4];
+    a[0] = 10;
+    let mut index: i64 = 1;
+    a[index] = 20;
+    let mut i: i64 = 2;
+    while (i < 4) {
+        a[i] = i * 10;
+        i = i + 1;
+    }
+    return a[0] + a[index] + a[2] + a[3];
+}

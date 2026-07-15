@@ -1,0 +1,10 @@
+// Self-hosted positive: for-each over a slice (sum of elements).
+// expect: 10
+fn main() -> i64 {
+    let s: i64[] = [1, 2, 3, 4];
+    let mut sum: i64 = 0;
+    for (x in s) {
+        sum = sum + x;
+    }
+    return sum;
+}

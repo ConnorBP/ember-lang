@@ -1,0 +1,6 @@
+// Self-hosted positive: slice literal + index reads.
+// expect: 4
+fn main() -> i64 {
+    let s: i64[] = [1, 2, 3];
+    return s[0] + s[2];
+}

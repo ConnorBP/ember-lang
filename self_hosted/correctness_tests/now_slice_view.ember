@@ -1,0 +1,7 @@
+// Self-hosted positive: view of a fixed array -> slice, index read.
+// expect: 20
+fn main() -> i64 {
+    let a: i64[3] = [10, 20, 30];
+    let s: i64[] = a[..];
+    return s[1];
+}

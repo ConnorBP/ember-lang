@@ -1,0 +1,6 @@
+// Self-hosted positive: offsetof of packed struct fields (a@0, b@8, c@12 = 20).
+// expect: 20
+struct Triple { a: i64; b: i32; c: i8; }
+fn main() -> i64 {
+    return (offsetof(Triple, a) + offsetof(Triple, b) + offsetof(Triple, c)) as i64;
+}

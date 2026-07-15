@@ -421,19 +421,113 @@ fn cg_float_is64_type(t: i64) -> i64 { if (t >= 0 && nk_d(t) == (Prim::F64 as i6
 // the byte size of a primitive type (mirrors src/types.cpp byte_size +
 // src/codegen.cpp value_bytes for scalars). Used by sizeof + by width-aware
 // load/store helpers.
-fn cg_type_size(t: i64) -> i64 {
+// the byte size of a primitive SCALAR type (mirrors src/types.cpp byte_size +
+// src/codegen.cpp value_bytes for scalars). Aggregates use cg_value_bytes.
+fn cg_scalar_bytes(t: i64) -> i64 {
     if (t < 0) { return 8; }
     if (nk_kind(t) != (NK::Type as i64)) { return 8; }
     let p: i64 = nk_d(t);
-    if (nk_tok(t) >= 0) { return 8; }   // named/handle type (struct sizes are Phase 3)
+    if (nk_tok(t) >= 0) { return 8; }   // named/handle type (opaque -> 8)
     if (p == (Prim::Bool as i64) || p == (Prim::I8 as i64) || p == (Prim::U8 as i64)) { return 1; }
     if (p == (Prim::I16 as i64) || p == (Prim::U16 as i64)) { return 2; }
     if (p == (Prim::I32 as i64) || p == (Prim::U32 as i64) || p == (Prim::F32 as i64)) { return 4; }
     return 8;   // i64/u64/f64/ptr + fallback
 }
 
-// the alignment of a primitive type (same as size for primitives).
-fn cg_type_align(t: i64) -> i64 { return cg_type_size(t); }
+// Phase 3: the byte size of ANY type, mirroring src/codegen.cpp's value_bytes
+// EXACTLY (the packed memory model). Aggregates recurse:
+//   - slice T[]      -> 16 ({ptr,len})
+//   - fixed array T[N]-> N * value_bytes(elem)
+//   - struct          -> sum of field value_bytes (packed, declaration order)
+//   - scalar/handle   -> cg_scalar_bytes
+fn cg_value_bytes(t: i64) -> i64 {
+    if (t < 0) { return 8; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 8; }
+    if (nk_f(t) == 1) { return 16; }                       // slice {ptr,len}
+    if (nk_e(t) > 0) {                                     // fixed array T[N]
+        let elem: i64 = nk_a(t);
+        if (elem < 0) { return 8; }
+        return nk_e(t) * cg_value_bytes(elem);
+    }
+    if (nk_tok(t) >= 0) {                                  // named type
+        let nm: string = tok_name(nk_tok(t));
+        if (nm == string_from_slice("string")) { return 8; }   // opaque handle
+        let row: i64 = find_struct(nm);
+        if (row >= 0) { return cg_struct_value_bytes(row); }
+        return 8;
+    }
+    return cg_scalar_bytes(t);
+}
+
+// Phase 3: the local frame byte width, mirroring src/codegen.cpp's
+// local_width_bytes. Aggregates use their exact Ember extent; scalars use 8
+// (a scalar slot is always one 8-byte word in this codegen).
+fn cg_local_width_bytes(t: i64) -> i64 {
+    if (t < 0) { return 8; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 8; }
+    if (nk_f(t) == 1) { return 16; }                       // slice
+    if (nk_e(t) > 0) { return cg_value_bytes(t); }         // fixed array inline
+    if (nk_tok(t) >= 0) {
+        let nm: string = tok_name(nk_tok(t));
+        if (nm == string_from_slice("string")) { return 8; }
+        let row: i64 = find_struct(nm);
+        if (row >= 0) { return cg_value_bytes(t); }
+        return 8;
+    }
+    return 8;   // scalar slots are 8 bytes
+}
+
+// number of 8-byte stack slots an aggregate local occupies (ceil(extent/8),
+// min 1). Scalars are 1 slot. Mirrors src/codegen.cpp's words_for_type for
+// structs (ceil(size/8)) and the inline-fixed-array frame sizing.
+fn cg_local_slots(t: i64) -> i64 {
+    let w: i64 = cg_local_width_bytes(t);
+    let mut s: i64 = (w + 7) / 8;
+    if (s < 1) { s = 1; }
+    return s;
+}
+
+// Phase 3: struct layout (packed, declaration order, no padding). Mirrors
+// src/sema.cpp build_struct_layouts + src/codegen.cpp value_bytes(struct).
+// cg_struct_value_bytes(row) = sum of every field's value_bytes.
+// cg_struct_field_offset(row, idx) = sum of value_bytes of preceding fields.
+// cg_struct_local_slots(row) = ceil(value_bytes/8) stack slots (min 1).
+fn cg_struct_value_bytes(row: i64) -> i64 {
+    let mut total: i64 = 0;
+    let mut f: i64 = array_get_i64(g_structs, row * STRUCT_STRIDE + 1);
+    while (f >= 0) {
+        total = total + cg_value_bytes(resolve_type(nk_a(f)));
+        f = nk_next(f);
+    }
+    return total;
+}
+
+fn cg_struct_field_offset(row: i64, idx: i64) -> i64 {
+    let mut off: i64 = 0;
+    let mut f: i64 = array_get_i64(g_structs, row * STRUCT_STRIDE + 1);
+    let mut i: i64 = 0;
+    while (f >= 0) {
+        if (i == idx) { return off; }
+        off = off + cg_value_bytes(resolve_type(nk_a(f)));
+        i = i + 1;
+        f = nk_next(f);
+    }
+    return off;
+}
+
+fn cg_struct_local_slots(row: i64) -> i64 {
+    let w: i64 = cg_struct_value_bytes(row);
+    let mut s: i64 = (w + 7) / 8;
+    if (s < 1) { s = 1; }
+    return s;
+}
+
+// the byte size of a primitive type (kept for the sizeof/offsetof helpers;
+// delegates to the general cg_value_bytes so aggregates are sized correctly).
+fn cg_type_size(t: i64) -> i64 { return cg_value_bytes(t); }
+
+// the alignment of a type (same as size for this packed model).
+fn cg_type_align(t: i64) -> i64 { return cg_value_bytes(t); }
 
 // is this an UNSIGNED integer type (u8/u16/u32/u64)?
 fn cg_type_is_uint(t: i64) -> i64 {
@@ -516,6 +610,18 @@ fn cg_expr_type(e: i64) -> i64 {
         let bt: i64 = cg_expr_type(nk_a(e));
         let row: i64 = find_struct(ty_struct_name(bt));
         if (row >= 0) { return struct_field_type(row, nk_name(e)); }
+    }
+    if (k == (NK::IndexExpr as i64)) {
+        // result type = the base's element type (a fixed array / slice elem)
+        let bt: i64 = cg_expr_type(nk_a(e));
+        if (bt >= 0) { let et: i64 = nk_a(bt); if (et >= 0) { return resolve_type(et); } }
+        return -1;
+    }
+    if (k == (NK::ViewExpr as i64)) {
+        // result type = a slice of the base's element type (sema built this)
+        let bt: i64 = cg_expr_type(nk_a(e));
+        if (bt >= 0) { let et: i64 = nk_a(bt); if (et >= 0) { return resolve_type(et); } }
+        return -1;
     }
     if (k == (NK::BinExpr as i64)) {
         let op: i64 = nk_d(e);
@@ -682,6 +788,155 @@ fn cg_store_reg_mem(base: i64, disp: i64, src: i64) -> i64 {
     return 0;
 }
 
+// load rax's low `width` bytes from [base+disp] with sign/zero extension.
+// Mirrors src/x64_emitter.hpp load_elem_to_rax EXACTLY:
+//   1 byte: REX.W 0F B6/B7/B7/B7 + modrm(rax,base) + disp32 (zero/sign)
+//   2 bytes: REX.W 0F B7/BF + modrm + disp32
+//   4 bytes: movsxd rax,[mem] (signed) or mov r32 (unsigned, zero-extends)
+//   8 bytes: mov rax,[mem]
+// For base rsp/r12 (rm=4) emit a SIB byte (scale=0, index=none, base=base).
+fn cg_load_elem_to_rax(base: i64, disp: i64, width: i64, sign_extend: i64) -> i64 {
+    if (width >= 8) { cg_load_reg_mem(RAX, base, disp); return 0; }
+    if (width == 4) {
+        if (sign_extend != 0) {
+            cg_byte(cg_rex(1, 0, 0, cg_is_extended(base)));
+            cg_byte(0x63);   // movsxd rax, [mem]
+        } else {
+            if (cg_is_extended(base) != 0) { cg_byte(cg_rex(0, 0, 0, 1)); }
+            cg_byte(0x8B);   // mov r32 (zero-extends to rax)
+        }
+    } else if (width == 2) {
+        cg_byte(cg_rex(1, 0, 0, cg_is_extended(base)));
+        cg_byte(0x0F); cg_byte(sign_extend != 0 ? 0xBF : 0xB7);
+    } else {  // width == 1
+        cg_byte(cg_rex(1, 0, 0, cg_is_extended(base)));
+        cg_byte(0x0F); cg_byte(sign_extend != 0 ? 0xBE : 0xB6);
+    }
+    if ((base & 7) == 4) {
+        cg_byte(cg_modrm(2, RAX, 4));
+        cg_byte(0x24);
+    } else {
+        cg_byte(cg_modrm(2, RAX, base));
+    }
+    cg_imm32(disp);
+    return 0;
+}
+
+// store rax's low `width` bytes to [base+disp]. Mirrors src/x64_emitter.hpp
+// store_rax_elem EXACTLY: 1/2/4-byte partial stores (66 prefix for 2 bytes);
+// 8 bytes -> full mov [mem], rax.
+fn cg_store_rax_elem(base: i64, disp: i64, width: i64) -> i64 {
+    if (width >= 8) { cg_store_reg_mem(base, disp, RAX); return 0; }
+    if (width == 2) { cg_byte(0x66); }
+    if (width <= 4) {
+        if (cg_is_extended(base) != 0) { cg_byte(cg_rex(0, 0, 0, 1)); }
+        cg_byte(0x88 + (width == 1 ? 0 : 1));   // 88 (1 byte) / 89 (2 or 4 bytes)
+    }
+    if ((base & 7) == 4) {
+        cg_byte(cg_modrm(2, RAX, 4));
+        cg_byte(0x24);
+    } else {
+        cg_byte(cg_modrm(2, RAX, base));
+    }
+    cg_imm32(disp);
+    return 0;
+}
+
+// zero-fill `nbytes` bytes starting at [rbp + off] (an aggregate local with no
+// initializer), in 8/4/2/1-byte chunks. Mirrors src/codegen.cpp's LetStmt
+// no-init zero-fill loop. rax is clobbered (set to 0).
+fn cg_zero_fill(off: i64, nbytes: i64) -> i64 {
+    let mut remaining: i64 = nbytes;
+    let mut cur: i64 = off;
+    cg_mov_reg_imm64(RAX, 0);
+    while (remaining > 0) {
+        let chunk: i64 = cg_chunk_for(remaining);
+        cg_store_rax_elem(RBP, cur, chunk);
+        cur = cur + chunk;
+        remaining = remaining - chunk;
+    }
+    return 0;
+}
+
+// largest power-of-2 chunk <= n up to 8 (for copy/zero chunking).
+fn cg_chunk_for(n: i64) -> i64 {
+    if (n >= 8) { return 8; }
+    if (n >= 4) { return 4; }
+    if (n >= 2) { return 2; }
+    return 1;
+}
+
+// lea r64, [rbp + disp32] -> REX.W 8D /r mod=10. Used for fixed-array / view
+// base addresses (the local's frame slot address).
+fn cg_lea_r_rbp(dst: i64, disp: i64) -> i64 {
+    cg_byte(cg_rex(1, cg_is_extended(dst), 0, 0));
+    cg_byte(0x8D);
+    cg_byte(cg_modrm(2, dst, RBP));
+    cg_imm32(disp);
+    return 0;
+}
+fn cg_lea_rax_rbp(disp: i64) -> i64 { return cg_lea_r_rbp(RAX, disp); }
+fn cg_lea_r11_rbp(disp: i64) -> i64 { return cg_lea_r_rbp(R11, disp); }
+
+// SSE load/store from/to [base + disp32] with an ARBITRARY base register
+// (generalizes cg_sse_mem which is rbp-only). prefix=F2(sd)/F3(ss), op=10(load)
+// /11(store). REX (if any) is emitted BEFORE the 0F escape, in the right place.
+// Used for float array elements addressed through r11.
+fn cg_sse_mem_reg(prefix: i64, op: i64, x: i64, base: i64, disp: i64) -> i64 {
+    cg_byte(prefix);
+    if (cg_is_extended(x) != 0 || cg_is_extended(base) != 0) {
+        cg_byte(cg_rex(0, cg_is_extended(x), 0, cg_is_extended(base)));
+    }
+    cg_byte(0x0F); cg_byte(op);
+    if ((base & 7) == 4) {
+        cg_byte(cg_modrm(2, x, 4));
+        cg_byte(0x24);
+    } else {
+        cg_byte(cg_modrm(2, x, base));
+    }
+    cg_imm32(disp);
+    return 0;
+}
+
+fn cg_load_float_reg(x: i64, base: i64, disp: i64, is64: i64) -> i64 {
+    let mut pf: i64 = 0xF3;
+    if (is64 == 1) { pf = 0xF2; }
+    return cg_sse_mem_reg(pf, 0x10, x, base, disp);
+}
+fn cg_store_float_reg(base: i64, disp: i64, x: i64, is64: i64) -> i64 {
+    let mut pf: i64 = 0xF3;
+    if (is64 == 1) { pf = 0xF2; }
+    return cg_sse_mem_reg(pf, 0x11, x, base, disp);
+}
+// load an f32/f64 element from [r11 + 0] into xmm0 (for IndexExpr float path).
+fn cg_load_float_disp_r11(is64: i64) -> i64 { return cg_load_float_reg(XMM0, R11, 0, is64); }
+
+// Runtime bounds check: index in rax, len in r9 (a slice). Unsigned compare —
+// jb to an in-bounds label, else ud2 (trap). A negative index reinterpreted as
+// unsigned is enormous, so one unsigned compare catches both too-large and
+// negative. Mirrors src/codegen.cpp's emit_bounds_check_reg.
+fn cg_bounds_check_reg_rax_r9() -> i64 {
+    cg_mov_reg_reg(RCX, RAX);               // stash index in rcx
+    cg_cmp_reg_reg(RCX, R9);
+    let ok: i64 = cg_alloc_label();
+    cg_jcc(COND_B, ok);                     // idx < len (unsigned) -> ok
+    cg_byte(0x0F); cg_byte(0x0B);           // ud2 (raises #UD)
+    cg_bind(ok);
+    return 0;
+}
+
+// Runtime bounds check: index in rax, len = imm (a fixed array's N, non-const
+// index). cmp rax, imm32; jb to ok; else ud2.
+fn cg_bounds_check_imm_rax(len: i64) -> i64 {
+    cg_mov_reg_reg(RCX, RAX);               // stash index in rcx
+    cg_cmp_reg_imm32(RCX, len);
+    let ok: i64 = cg_alloc_label();
+    cg_jcc(COND_B, ok);
+    cg_byte(0x0F); cg_byte(0x0B);           // ud2
+    cg_bind(ok);
+    return 0;
+}
+
 // call r64 (indirect) -> FF /2 with mod=11
 fn cg_call_reg(r: i64) -> i64 {
     if (cg_is_extended(r) != 0) { cg_byte(cg_rex(0, 0, 0, 1)); }
@@ -834,11 +1089,17 @@ fn cg_pop_scope() -> i64 {
 }
 
 // Allocate a scalar or aggregate local. `slots` is the number of eight-byte
-// words reserved; aggregate fields occupy off, off-8, ... .
+// words reserved. Returns the rbp offset of the local's LOWEST address (the
+// base); aggregate fields/elements live at base + their byte offset (packed,
+// ascending), a scalar's value is at base + 0. The region spans
+// [base, base + slots*8). Mirrors the C++ codegen's rbp-relative frame slots
+// but keeps the base at the lowest address so packed layout addressing is a
+// simple base + offset.
 fn cg_alloc_local_t(name_tok: i64, type_node: i64, slots: i64) -> i64 {
-    let nslots: i64 = slots;
+    let mut nslots: i64 = slots;
+    if (nslots < 1) { nslots = 1; }
     cg_next_off = cg_next_off + nslots * 8;
-    let off: i64 = -(cg_next_off - (nslots - 1) * 8);
+    let off: i64 = -cg_next_off;   // lowest address of the reserved region
     if (array_length(cg_locals) < cg_local_len + 3) { array_resize(cg_locals, cg_local_len + 3); }
     array_set_i64(cg_locals, cg_local_len, name_tok);
     array_set_i64(cg_locals, cg_local_len + 1, off);
@@ -1175,7 +1436,16 @@ fn cg_count_locals_block(b: i64, total: i64) -> i64 {
 fn cg_count_locals_stmt(s: i64, total: i64) -> i64 {
     let k: i64 = nk_kind(s);
     if (k == (NK::LetStmt as i64)) {
-        total = total + 1;
+        // count the local's actual stack slots (aggregates occupy
+        // ceil(value_bytes/8); scalars occupy 1) so the frame is sized to
+        // hold every byte of every local. Mirrors cg_alloc_local_t's sizing.
+        let mut t: i64 = nk_a(s);
+        let init: i64 = nk_b(s);
+        if (t < 0 && init >= 0) { t = cg_expr_type(init); }
+        else if (t >= 0) { t = resolve_type(t); }
+        let mut slots: i64 = 1;
+        if (t >= 0) { slots = cg_local_slots(t); }
+        total = total + slots;
         return total;
     }
     if (k == (NK::IfStmt as i64)) {
@@ -1196,6 +1466,13 @@ fn cg_count_locals_stmt(s: i64, total: i64) -> i64 {
     if (k == (NK::ForStmt as i64)) {
         total = total + 1;
         total = cg_count_locals_block(nk_e(s), total);
+        return total;
+    }
+    if (k == (NK::ForEachStmt as i64)) {
+        // for-each uses 4 frame slots: ptr, len, idx, + the loop var (1 slot
+        // for a scalar element; aggregates are not yet supported in for-each).
+        total = total + 4;
+        total = cg_count_locals_block(nk_b(s), total);
         return total;
     }
     if (k == (NK::MatchStmt as i64)) {
@@ -1257,11 +1534,22 @@ fn cg_eval(e: i64) -> i64 {
         return 0;
     }
     if (k == (NK::FieldExpr as i64)) { return cg_eval_fieldexpr(e); }
+    if (k == (NK::IndexExpr as i64)) { return cg_eval_indexexpr(e); }
+    if (k == (NK::ViewExpr as i64)) { return cg_eval_viewexpr(e); }
+    if (k == (NK::ArrayLit as i64)) { return cg_eval_arraylit_rval(e); }
     if (k == (NK::Ident as i64)) {
         // look up the local; load from [rbp + offset]
         let off: i64 = cg_lookup_local(nk_tok(e));
         if (off != 0) {
             let t: i64 = cg_lookup_local_type(nk_tok(e));
+            if (t >= 0 && nk_kind(t) == (NK::Type as i64) && nk_f(t) == 1) {
+                // slice local: yield the 2-word slice ABI {rax=ptr, rdx=len}
+                // (mirrors src/codegen.cpp's slice Ident eval). Used by for-each
+                // + slice IndexExpr bases + slice args (future).
+                cg_load_reg_mem(RAX, RBP, off);
+                cg_load_reg_mem(RDX, RBP, off + 8);
+                return 0;
+            }
             if (ty_is_float(t) == 1) { cg_load_float(XMM0, off, cg_float_is64_type(t)); }
             else { cg_load_reg_mem(RAX, RBP, off); cg_normalize_rax(t); }
             return 0;
@@ -1317,21 +1605,145 @@ fn cg_enum_value(enum_name: string, variant_name: string) -> i64 {
     return 0;
 }
 
+// find a struct field's declaration index by name. Returns -1 if not found.
 fn cg_struct_field_index(type_node: i64, name: string) -> i64 {
     let row: i64 = find_struct(ty_struct_name(type_node)); if (row < 0) { return -1; }
     let mut f: i64 = array_get_i64(g_structs, row * STRUCT_STRIDE + 1); let mut i: i64 = 0;
     while (f >= 0) { if (nk_name(f) == name) { return i; } i = i + 1; f = nk_next(f); }
     return -1;
 }
+
+// the resolved Type node of a struct field by declaration index.
+fn cg_struct_field_type_at(row: i64, idx: i64) -> i64 {
+    let mut f: i64 = array_get_i64(g_structs, row * STRUCT_STRIDE + 1); let mut i: i64 = 0;
+    while (f >= 0) { if (i == idx) { return resolve_type(nk_a(f)); } i = i + 1; f = nk_next(f); }
+    return -1;
+}
+
+// load a value of type `t` from [base + disp] into rax (int) or xmm0 (float),
+// with the correct width + sign/zero extension. Mirrors src/codegen.cpp's
+// load_elem_to_rax + the FieldExpr load path. The field's width is
+// cg_value_bytes(t); a scalar narrower than 8 is loaded with load_elem_to_rax
+// (movsxd/movzx style) and normalized; an 8-byte scalar uses mov rax,[mem].
+fn cg_load_typed(RAX_reg: i64, base: i64, disp: i64, t: i64) -> i64 {
+    if (ty_is_float(t) == 1) { cg_load_float(XMM0, disp, cg_float_is64_type(t)); return 0; }
+    let w: i64 = cg_value_bytes(t);
+    if (w >= 8) { cg_load_reg_mem(RAX_reg, base, disp); return 0; }
+    // narrow integer load: movzx/movsx via the elem-load helper. For a signed
+    // narrow int, sign-extend; for unsigned, zero-extend (load_elem_to_rax's
+    // is_signed flag). Then normalize_rax canonicalizes the high bits.
+    let mut is_signed: i64 = 0;
+    if (cg_type_is_int(t) == 1 && cg_type_is_uint(t) == 0) { is_signed = 1; }
+    cg_load_elem_to_rax(base, disp, w, is_signed);
+    return 0;
+}
+
+// store rax (int) or xmm0 (float) to [base + disp] with the type's width.
+// Mirrors src/codegen.cpp's store_rax_elem / store_slot. Narrow ints write only
+// their low `w` bytes; the high bits of rax are already canonicalized by the
+// caller's normalize_rax so a partial store is correct.
+fn cg_store_typed(base: i64, disp: i64, t: i64) -> i64 {
+    if (ty_is_float(t) == 1) { cg_store_float(disp, XMM0, cg_float_is64_type(t)); return 0; }
+    let w: i64 = cg_value_bytes(t);
+    if (w >= 8) { cg_store_reg_mem(base, disp, RAX); return 0; }
+    cg_store_rax_elem(base, disp, w);
+    return 0;
+}
+
 fn cg_eval_fieldexpr(e: i64) -> i64 {
     let base: i64 = nk_a(e);
     if (nk_kind(base) != (NK::Ident as i64)) { cg_err = 1; cg_errmsg = string_from_slice("codegen: field base must be a local"); return 0; }
     let off: i64 = cg_lookup_local(nk_tok(base)); let t: i64 = cg_lookup_local_type(nk_tok(base));
+    let row: i64 = find_struct(ty_struct_name(t));
     let idx: i64 = cg_struct_field_index(t, nk_name(e));
-    if (idx < 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: unknown field"); return 0; }
-    let ft: i64 = cg_expr_type(e);
-    if (ty_is_float(ft) == 1) { cg_load_float(XMM0, off - idx * 8, cg_float_is64_type(ft)); }
-    else { cg_load_reg_mem(RAX, RBP, off - idx * 8); }
+    if (idx < 0 || row < 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: unknown field"); return 0; }
+    let foff: i64 = cg_struct_field_offset(row, idx);
+    let ft: i64 = cg_struct_field_type_at(row, idx);
+    cg_load_typed(RAX, RBP, off + foff, ft);
+    if (ty_is_float(ft) == 0) { cg_normalize_rax(ft); }
+    return 0;
+}
+
+// Phase 3: load base[index]. base is a bare local Ident of a fixed array T[N]
+// (inline, address = its frame slot) or a slice T[] (ptr+len in the slot).
+// Mirrors src/codegen.cpp's IndexExpr eval path. Computes the element address
+// base + index*elem_sz, applies a runtime bounds check (slice: always; fixed
+// array: only for a non-constant index, since sema already checked constant
+// indices), and loads the element with its width + sign extension.
+fn cg_eval_indexexpr(e: i64) -> i64 {
+    let base: i64 = nk_a(e);
+    if (nk_kind(base) != (NK::Ident as i64)) { cg_err = 1; cg_errmsg = string_from_slice("codegen: index base must be a local"); return 0; }
+    let boff: i64 = cg_lookup_local(nk_tok(base));
+    let bt: i64 = cg_lookup_local_type(nk_tok(base));
+    let mut is_sl: i64 = 0;
+    if (bt >= 0 && nk_kind(bt) == (NK::Type as i64)) { is_sl = nk_f(bt); }
+    let elem_ty: i64 = resolve_type(nk_a(bt));
+    if (cg_err != 0) { return 0; }
+    let elem_sz: i64 = cg_value_bytes(elem_ty);
+    let mut arr_len: i64 = 0;
+    if (bt >= 0) { arr_len = nk_e(bt); }
+    // base address -> r11 (survives index eval). For a fixed array, r11 = rbp +
+    // boff (lea). For a slice, load ptr from [rbp+boff] into r11 + len into r9.
+    if (is_sl == 1) {
+        cg_load_reg_mem(R11, RBP, boff);          // r11 = ptr
+        cg_load_reg_mem(R9, RBP, boff + 8);       // r9 = len
+    } else {
+        cg_lea_r11_rbp(boff);                      // r11 = &arr (rbp + boff)
+    }
+    // eval index -> rax
+    cg_eval(nk_b(e)); if (cg_err != 0) { return 0; }
+    // bounds check: slice always (len in r9); fixed array only if the index is
+    // not a compile-time constant (sema checked constants). Unsigned compare
+    // (jb) catches both too-large and negative indices in one shot.
+    if (is_sl == 1) {
+        cg_bounds_check_reg_rax_r9();
+    } else if (nk_kind(nk_b(e)) != (NK::IntLit as i64)) {
+        cg_bounds_check_imm_rax(arr_len);
+    }
+    // rax = index * elem_sz (imul when sz > 1)
+    if (elem_sz > 1) { cg_mov_reg_imm64(RCX, elem_sz); cg_imul_reg_reg(RAX, RCX); }
+    // r11 = element address = r11 + rax
+    cg_add_reg_reg(R11, RAX);
+    // load the element from [r11] with its width
+    let mut is_signed: i64 = 0;
+    if (cg_type_is_int(elem_ty) == 1 && cg_type_is_uint(elem_ty) == 0) { is_signed = 1; }
+    if (ty_is_float(elem_ty) == 1) {
+        cg_load_float_disp_r11(cg_float_is64_type(elem_ty));
+    } else if (elem_sz >= 8) {
+        cg_load_reg_mem(RAX, R11, 0);
+        cg_normalize_rax(elem_ty);
+    } else {
+        cg_load_elem_to_rax(R11, 0, elem_sz, is_signed);
+        cg_normalize_rax(elem_ty);
+    }
+    return 0;
+}
+
+// Phase 3: arr[..] -> slice {ptr=&arr, len=N}. base must be a bare local Ident
+// of a fixed array. Result is the slice ABI: rax = ptr (lea [rbp+boff]),
+// rdx = N. Mirrors src/codegen.cpp's ViewExpr eval path.
+fn cg_eval_viewexpr(e: i64) -> i64 {
+    let base: i64 = nk_a(e);
+    if (nk_kind(base) != (NK::Ident as i64)) { cg_err = 1; cg_errmsg = string_from_slice("codegen: view base must be a local"); return 0; }
+    let boff: i64 = cg_lookup_local(nk_tok(base));
+    let bt: i64 = cg_lookup_local_type(nk_tok(base));
+    let mut n: i64 = 0;
+    if (bt >= 0) { n = nk_e(bt); }
+    // rax = &arr (lea rax, [rbp+boff]); rdx = N
+    cg_lea_rax_rbp(boff);
+    cg_mov_reg_imm64(RDX, n);
+    return 0;
+}
+
+// A bare ArrayLit rvalue (not a let init). sema only lets a SLICE ArrayLit
+// reach eval() as an rvalue (a fixed-array ArrayLit is let-init-only). STEP 3
+// materializes a slice literal's backing into cg_data + yields {rax=ptr,rdx=len}.
+// A fixed-array ArrayLit reaching here is an internal error (sema rejects it).
+fn cg_eval_arraylit_rval(e: i64) -> i64 {
+    // Determine the baked type (sema stamps the declared type via check_let, but
+    // a bare rvalue ArrayLit only reaches here for a slice in an arg/return
+    // position the self-hosted subset does not yet support). Defensive trap.
+    cg_err = 1; cg_errmsg = string_from_slice("codegen: bare array literal rvalue not supported (use a let binding)");
     return 0;
 }
 
@@ -1900,7 +2312,13 @@ fn cg_eval_assignexpr(e: i64) -> i64 {
     let cop: i64 = nk_d(e);
     let postfix: i64 = nk_e(e);
 
-    // v1: only Ident targets
+    // Phase 3: FieldExpr / IndexExpr assignment targets (p.x = v, a[i] = v).
+    // Dispatch to dedicated handlers that compute the lvalue address + type,
+    // then perform the plain/compound/postfix store mirroring the Ident path.
+    if (nk_kind(target) == (NK::FieldExpr as i64)) { return cg_assign_field(target, value, cop, postfix); }
+    if (nk_kind(target) == (NK::IndexExpr as i64)) { return cg_assign_index(target, value, cop, postfix); }
+
+    // v1: only Ident targets (beyond the FieldExpr/IndexExpr cases above)
     if (nk_kind(target) != (NK::Ident as i64)) {
         if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: assignment target must be an identifier in v1"); }
         return 0;
@@ -2088,6 +2506,172 @@ fn cg_eval_assignexpr(e: i64) -> i64 {
 }
 
 // -----------------------------------------------------------------------------
+// Phase 3: FieldExpr / IndexExpr assignment targets. The lvalue address +
+// element type are resolved, then the plain/compound/postfix store mirrors the
+// Ident assignment path but with the field's/element's packed offset + width.
+// -----------------------------------------------------------------------------
+
+// resolve a FieldExpr lvalue to (base offset, field offset, field type).
+// base must be a bare local Ident of a struct type (v1 scope, mirroring the
+// C++ codegen). Returns the field's absolute rbp offset in `out_off` (via the
+// global scratch) and the field type via cg_struct_field_type_at.
+//
+// Computes: base_off = cg_lookup_local(base_tok); field_off = struct field
+// offset; addr = base_off + field_off; ft = field type.
+// On error sets cg_err. The field type is returned; the address is returned
+// via the second result channel (a global, since ember has no multi-return).
+global cg_lvalue_addr : i64 = 0;
+global cg_lvalue_type : i64 = 0;
+
+fn cg_resolve_field_lvalue(target: i64) -> i64 {
+    let base: i64 = nk_a(target);
+    if (nk_kind(base) != (NK::Ident as i64)) { cg_err = 1; cg_errmsg = string_from_slice("codegen: field-assign base must be a local"); return -1; }
+    let boff: i64 = cg_lookup_local(nk_tok(base));
+    let bt: i64 = cg_lookup_local_type(nk_tok(base));
+    let row: i64 = find_struct(ty_struct_name(bt));
+    let idx: i64 = cg_struct_field_index(bt, nk_name(target));
+    if (row < 0 || idx < 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: unknown field in assignment"); return -1; }
+    let foff: i64 = cg_struct_field_offset(row, idx);
+    let ft: i64 = cg_struct_field_type_at(row, idx);
+    cg_lvalue_addr = boff + foff;
+    cg_lvalue_type = ft;
+    return ft;
+}
+
+// p.x = value / p.x op= value / p.x++ / ++p.x. The field address + type are
+// compile-time-known (no index computation), so this mirrors the Ident path
+// with the field's offset + width substituted for the local slot.
+fn cg_assign_field(target: i64, value: i64, cop: i64, postfix: i64) -> i64 {
+    let ft: i64 = cg_resolve_field_lvalue(target);
+    if (cg_err != 0) { return 0; }
+    let addr: i64 = cg_lvalue_addr;
+    let is_float: i64 = ty_is_float(ft);
+
+    // plain '=' (cop < 0, not postfix)
+    if (cop < 0 && postfix != 1) {
+        cg_eval(value); if (cg_err != 0) { return 0; }
+        if (is_float == 1) { cg_store_float(addr, XMM0, cg_float_is64_type(ft)); }
+        else { cg_normalize_rax(ft); cg_store_typed(RBP, addr, ft); }
+        return 0;
+    }
+
+    // compound op= / prefix ++ / postfix ++ (integer + float paths)
+    if (is_float == 1) {
+        let is64: i64 = cg_float_is64_type(ft);
+        let prefix: i64 = if64_prefix(is64);
+        // load field (lhs) -> xmm0
+        cg_load_float(XMM0, addr, is64);
+        cg_sub_reg_imm32(RSP, 8);
+        if (is64 == 1) { cg_sse_mem(0xF2, 0x11, XMM0, 0); } else { cg_sse_mem(0xF3, 0x11, XMM0, 0); }
+        if (postfix == 1 || value < 0) { cg_mov_reg_imm64(RAX, 1); cg_i64_to_float(XMM0, RAX, is64); }
+        else { cg_eval(value); if (cg_err != 0) { return 0; } if (is64 == 1) { cg_movq_xmm_rax(XMM0); } else { cg_movd_xmm_eax(XMM0); } }
+        if (is64 == 1) { cg_sse_mem(0xF2, 0x10, XMM1, 0); } else { cg_sse_mem(0xF3, 0x10, XMM1, 0); }
+        cg_add_reg_imm32(RSP, 8);
+        if (cop == (BinOp::Add as i64)) { cg_float_op(0x58, is64); }
+        else if (cop == (BinOp::Mul as i64)) { cg_float_op(0x59, is64); }
+        else if (cop == (BinOp::Sub as i64)) { cg_sse_rr(prefix, 0x5C, XMM1, XMM0); cg_sse_rr(prefix, 0x10, XMM0, XMM1); }
+        else if (cop == (BinOp::Div as i64)) { cg_sse_rr(prefix, 0x5E, XMM1, XMM0); cg_sse_rr(prefix, 0x10, XMM0, XMM1); }
+        cg_store_float(addr, XMM0, is64);
+        if (postfix == 1) { cg_mov_reg_imm64(RAX, 1); cg_i64_to_float(XMM1, RAX, is64); if (cop == (BinOp::Add as i64)) { cg_sse_rr(prefix, 0x5C, XMM0, XMM1); } else { cg_sse_rr(prefix, 0x58, XMM0, XMM1); } }
+        return 0;
+    }
+
+    // integer compound / prefix / postfix
+    let is_unsigned: i64 = cg_type_is_uint(ft);
+    // load field -> rax (with width + sign extension)
+    cg_load_typed(RAX, RBP, addr, ft);
+    cg_normalize_rax(ft);
+    if (postfix == 1) { cg_push(RAX); }
+    cg_push(RAX);
+    if (postfix == 1 || value < 0) { cg_mov_reg_imm64(RAX, 1); }
+    else { cg_eval(value); if (cg_err != 0) { return 0; } }
+    cg_mov_reg_reg(RCX, RAX);
+    cg_pop(RAX);
+    if (cop == (BinOp::Add as i64)) { cg_add_reg_reg(RAX, RCX); }
+    else if (cop == (BinOp::Sub as i64)) { cg_sub_reg_reg(RAX, RCX); }
+    else if (cop == (BinOp::Mul as i64)) { cg_imul_reg_reg(RAX, RCX); }
+    else if (cop == (BinOp::And as i64)) { cg_and_reg_reg(RAX, RCX); }
+    else if (cop == (BinOp::Or as i64))  { cg_or_reg_reg(RAX, RCX); }
+    else if (cop == (BinOp::Xor as i64)) { cg_xor_reg_reg(RAX, RCX); }
+    else if (cop == (BinOp::Shl as i64)) { cg_shl_reg_cl(RAX); }
+    else if (cop == (BinOp::Shr as i64)) { if (is_unsigned == 1) { cg_shr_reg_cl(RAX); } else { cg_sar_reg_cl(RAX); } }
+    else if (cop == (BinOp::Div as i64)) { if (is_unsigned == 1) { cg_byte(0x48); cg_byte(0x31); cg_byte(0xD2); cg_byte(0x48); cg_byte(0xF7); cg_byte(0xF1); } else { cg_byte(0x48); cg_byte(0x99); cg_byte(0x48); cg_byte(0xF7); cg_byte(0xF9); } }
+    else if (cop == (BinOp::Mod as i64)) { if (is_unsigned == 1) { cg_byte(0x48); cg_byte(0x31); cg_byte(0xD2); cg_byte(0x48); cg_byte(0xF7); cg_byte(0xF1); } else { cg_byte(0x48); cg_byte(0x99); cg_byte(0x48); cg_byte(0xF7); cg_byte(0xF9); } cg_mov_reg_reg(RAX, RDX); }
+    cg_normalize_rax(ft);
+    cg_store_typed(RBP, addr, ft);
+    if (postfix == 1) { cg_pop(RAX); }
+    return 0;
+}
+
+// a[i] = value (IndexExpr target). STEP 2 fills this in for fixed arrays +
+// STEP 3 for slices. Until then sema rejects IndexExpr targets, so this is
+// unreachable; keep a defensive error.
+fn cg_assign_index(target: i64, value: i64, cop: i64, postfix: i64) -> i64 {
+    return cg_assign_index_impl(target, value, cop, postfix);
+}
+// a[i] = value / a[i] op= value / a[i]++ (IndexExpr target). Mirrors
+// src/codegen.cpp's AssignExpr IndexExpr-target store path. The value is
+// eval'd + stashed, the element address is computed (base + index*elem_sz,
+// with the same bounds check as the load path), then the value is stored with
+// the element width. v1: plain '=' only for index targets (the test set uses
+// plain assignment); compound/postfix on an index is a straightforward
+// extension but not yet exercised.
+fn cg_assign_index_impl(target: i64, value: i64, cop: i64, postfix: i64) -> i64 {
+    let base: i64 = nk_a(target);
+    if (nk_kind(base) != (NK::Ident as i64)) { cg_err = 1; cg_errmsg = string_from_slice("codegen: index-assign base must be a local"); return 0; }
+    let boff: i64 = cg_lookup_local(nk_tok(base));
+    let bt: i64 = cg_lookup_local_type(nk_tok(base));
+    let mut is_sl: i64 = 0;
+    if (bt >= 0 && nk_kind(bt) == (NK::Type as i64)) { is_sl = nk_f(bt); }
+    let elem_ty: i64 = resolve_type(nk_a(bt));
+    if (cg_err != 0) { return 0; }
+    let elem_sz: i64 = cg_value_bytes(elem_ty);
+    let mut arr_len: i64 = 0;
+    if (bt >= 0) { arr_len = nk_e(bt); }
+    // only plain '=' is supported for index targets in v1
+    if (cop >= 0 || postfix == 1) { cg_err = 1; cg_errmsg = string_from_slice("codegen: compound/postfix assignment to an index not yet supported"); return 0; }
+    // eval value -> rax (int) or xmm0 (float); stash it across address computation
+    let is_float: i64 = ty_is_float(elem_ty);
+    if (is_float == 1) {
+        cg_eval(value); if (cg_err != 0) { return 0; }
+        cg_sub_reg_imm32(RSP, 8);
+        let is64: i64 = cg_float_is64_type(elem_ty);
+        cg_store_float_reg(RSP, 0, XMM0, is64);
+    } else {
+        cg_eval(value); if (cg_err != 0) { return 0; }
+        cg_normalize_rax(elem_ty);
+        cg_push(RAX);
+    }
+    // base address -> r11 (survives index eval). slice: ptr+len; fixed: lea.
+    if (is_sl == 1) {
+        cg_load_reg_mem(R11, RBP, boff);
+        cg_load_reg_mem(R9, RBP, boff + 8);
+    } else {
+        cg_lea_r11_rbp(boff);
+    }
+    // eval index -> rax
+    cg_eval(nk_b(target)); if (cg_err != 0) { return 0; }
+    if (is_sl == 1) {
+        cg_bounds_check_reg_rax_r9();
+    } else if (nk_kind(nk_b(target)) != (NK::IntLit as i64)) {
+        cg_bounds_check_imm_rax(arr_len);
+    }
+    if (elem_sz > 1) { cg_mov_reg_imm64(RCX, elem_sz); cg_imul_reg_reg(RAX, RCX); }
+    cg_add_reg_reg(R11, RAX);   // r11 = element address
+    // store the stashed value to [r11] with the element width
+    if (is_float == 1) {
+        let is64: i64 = cg_float_is64_type(elem_ty);
+        cg_load_float_reg(XMM1, RSP, 0, is64);
+        cg_add_reg_imm32(RSP, 8);
+        cg_store_float_reg(R11, 0, XMM1, is64);
+    } else {
+        cg_pop(RAX);
+        cg_store_rax_elem(R11, 0, elem_sz);
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
 // Phase 2 Step 2: CastExpr (expr as Type). Mirrors src/codegen.cpp's CastExpr
 // lowering. The operand is eval'd into rax (int) or xmm0 (float), then
 // converted to the target type:
@@ -2189,15 +2773,16 @@ fn cg_eval_sizeofexpr(e: i64) -> i64 {
 }
 
 fn cg_eval_offsetofexpr(e: i64) -> i64 {
-    // Phase 2: offsetof of a struct field is Phase 3 (struct layout). For
-    // primitives there are no fields (sema rejects). Emit 0 as a placeholder;
-    // sema's check rejects non-struct offsetof before codegen runs.
+    // Phase 3: offsetof of a struct field = the field's packed offset. For
+    // primitives there are no fields (sema rejects). Mirror src/codegen.cpp:
+    // mov rax, <field_offset>.
     let t: i64 = resolve_type(nk_a(e));
     if (cg_err != 0) { return 0; }
-    // For a struct (Phase 3), compute the field offset from the layout. For
-    // now, structs are not supported in Phase 2, so this is unreachable for
-    // valid programs. Emit 0 defensively.
-    cg_mov_reg_imm64(RAX, 0);
+    let row: i64 = find_struct(ty_struct_name(t));
+    if (row < 0) { cg_mov_reg_imm64(RAX, 0); return 0; }
+    let idx: i64 = cg_struct_field_index(t, tok_name(nk_tok(e)));
+    if (idx < 0) { cg_mov_reg_imm64(RAX, 0); return 0; }
+    cg_mov_reg_imm64(RAX, cg_struct_field_offset(row, idx));
     return 0;
 }
 
@@ -2332,14 +2917,34 @@ fn cg_compile_stmt(s: i64) -> i64 {
         let name_tok: i64 = nk_tok(s);
         let init: i64 = nk_b(s);
         let mut t: i64 = nk_a(s); if (t < 0 && init >= 0) { t = cg_expr_type(init); } else if (t >= 0) { t = resolve_type(t); }
+        // size the local's stack slots from the type's packed extent (struct:
+        // ceil(value_bytes/8); fixed array: ceil(N*elem/8); slice: 2; scalar: 1).
         let mut slots: i64 = 1;
-        if (t >= 0 && string_length(ty_struct_name(t)) > 0) { let row: i64 = find_struct(ty_struct_name(t)); if (row >= 0) { slots = cg_struct_field_count(row); } }
+        if (t >= 0) { slots = cg_local_slots(t); }
         let off: i64 = cg_alloc_local_t(name_tok, t, slots);
         if (init >= 0 && nk_kind(init) == (NK::StructLit as i64)) { cg_store_struct_lit(init, t, off); return 0; }
+        if (init >= 0 && nk_kind(init) == (NK::ArrayLit as i64)) { return cg_store_arraylit_let(init, t, off); }
         if (init >= 0) {
-            cg_eval(init); if (cg_err != 0) { return 0; }
-            if (ty_is_float(t) == 1) { cg_store_float(off, XMM0, cg_float_is64_type(t)); }
-            else { cg_normalize_rax(t); cg_store_reg_mem(RBP, off, RAX); }
+            // slice-typed init (a ViewExpr, a slice Ident, etc.): cg_eval
+            // yields the 2-word slice ABI {rax=ptr, rdx=len}; store both words
+            // into the 16-byte local (ptr at off, len at off+8).
+            let mut is_sl_init: i64 = 0;
+            if (t >= 0 && nk_kind(t) == (NK::Type as i64)) { is_sl_init = nk_f(t); }
+            if (is_sl_init == 1) {
+                cg_eval(init); if (cg_err != 0) { return 0; }
+                cg_store_reg_mem(RBP, off, RAX);
+                cg_store_reg_mem(RBP, off + 8, RDX);
+            } else {
+                cg_eval(init); if (cg_err != 0) { return 0; }
+                if (ty_is_float(t) == 1) { cg_store_float(off, XMM0, cg_float_is64_type(t)); }
+                else { cg_normalize_rax(t); cg_store_reg_mem(RBP, off, RAX); }
+            }
+        } else {
+            // no initializer: zero-fill an aggregate's whole extent (a fixed
+            // array / struct local later populated via indexed / field assigns),
+            // mirroring src/codegen.cpp's LetStmt no-init path. Scalars leave
+            // their slot as whatever (the value is always written before read).
+            if (t >= 0 && cg_local_width_bytes(t) > 8) { cg_zero_fill(off, cg_local_width_bytes(t)); }
         }
         return 0;
     }
@@ -2384,6 +2989,7 @@ fn cg_compile_stmt(s: i64) -> i64 {
         return 0;
     }
     if (k == (NK::ForStmt as i64)) { return cg_compile_for(s); }
+    if (k == (NK::ForEachStmt as i64)) { return cg_compile_foreach(s); }
     if (k == (NK::MatchStmt as i64)) { return cg_compile_match(s); }
     // Phase 2 Step 6: static_assert produces NO codegen (sema resolved it:
     // true -> elided, false/non-const -> compile error that never reaches
@@ -2396,9 +3002,113 @@ fn cg_compile_stmt(s: i64) -> i64 {
 }
 
 fn cg_struct_field_count(row: i64) -> i64 { let mut n: i64 = 0; let mut f: i64 = array_get_i64(g_structs, row * STRUCT_STRIDE + 1); while (f >= 0) { n = n + 1; f = nk_next(f); } if (n < 1) { return 1; } return n; }
+
+// store a struct literal's fields at packed offsets [off + field_offset].
+// Mirrors src/codegen.cpp's LetStmt StructLit init path: eval each field
+// expression, store it at base + the field's packed offset with the field's
+// width. sema guarantees every field is present + types match.
 fn cg_store_struct_lit(lit: i64, t: i64, off: i64) -> i64 {
-    let row: i64 = find_struct(ty_struct_name(t)); let mut f: i64 = array_get_i64(g_structs, row * STRUCT_STRIDE + 1); let mut idx: i64 = 0;
-    while (f >= 0) { let mut init: i64 = nk_a(lit); while (init >= 0 && (nk_name(init) == nk_name(f)) == false) { init = nk_next(init); } if (init >= 0) { cg_eval(nk_a(init)); let ft: i64 = resolve_type(nk_a(f)); if (ty_is_float(ft) == 1) { cg_store_float(off - idx * 8, XMM0, cg_float_is64_type(ft)); } else { cg_store_reg_mem(RBP, off - idx * 8, RAX); } } idx = idx + 1; f = nk_next(f); }
+    let row: i64 = find_struct(ty_struct_name(t));
+    if (row < 0) { return 0; }
+    let mut f: i64 = array_get_i64(g_structs, row * STRUCT_STRIDE + 1);
+    let mut idx: i64 = 0;
+    while (f >= 0) {
+        // find the matching FieldInit by name (sema already verified it exists)
+        let mut init: i64 = nk_a(lit);
+        while (init >= 0 && (nk_name(init) == nk_name(f)) == false) { init = nk_next(init); }
+        if (init >= 0) {
+            let ft: i64 = resolve_type(nk_a(f));
+            let foff: i64 = cg_struct_field_offset(row, idx);
+            cg_eval(nk_a(init)); if (cg_err != 0) { return 0; }
+            if (ty_is_float(ft) == 1) {
+                cg_store_float(off + foff, XMM0, cg_float_is64_type(ft));
+            } else {
+                cg_normalize_rax(ft);
+                cg_store_typed(RBP, off + foff, ft);
+            }
+        }
+        idx = idx + 1;
+        f = nk_next(f);
+    }
+    return 0;
+}
+
+// (Phase 3 Step 2/3 placeholders — implemented below. Forward declarations
+// so the LetStmt dispatch compiles before the bodies are filled in.)
+fn cg_store_arraylit_let(lit: i64, t: i64, off: i64) -> i64 { return cg_store_arraylit_let_impl(lit, t, off); }
+// store an array literal as a let initializer at `off` (the local's base).
+// Mirrors src/codegen.cpp's LetStmt ArrayLit init path. Two shapes:
+//   (a) fixed array T[N]: elements go directly into the local's inline slot,
+//       each at base + i*elem_size via cg_store_typed (handles widths + floats).
+//   (b) slice T[]: the local is the 16-byte {ptr,len} pair; the elements go
+//       into a separate backing region in cg_data, then ptr=addend (ABS64_DATA)
+//       + len=count are stored into the slice slot. (STEP 3.)
+fn cg_store_arraylit_let_impl(lit: i64, t: i64, off: i64) -> i64 {
+    let mut is_sl: i64 = 0;
+    if (t >= 0 && nk_kind(t) == (NK::Type as i64)) { is_sl = nk_f(t); }
+    let mut elem_ty: i64 = -1;
+    if (t >= 0) { elem_ty = resolve_type(nk_a(t)); }
+    if (cg_err != 0) { return 0; }
+    let elem_sz: i64 = cg_value_bytes(elem_ty);
+    if (is_sl == 1) { return cg_store_slice_arraylit(lit, t, off, elem_ty, elem_sz); }
+    // fixed array T[N]: elements inline at base + i*elem_sz
+    let mut el: i64 = nk_a(lit);
+    let mut i: i64 = 0;
+    while (el >= 0) {
+        cg_eval(el); if (cg_err != 0) { return 0; }
+        if (ty_is_float(elem_ty) == 1) {
+            cg_store_float(off + i * elem_sz, XMM0, cg_float_is64_type(elem_ty));
+        } else {
+            cg_normalize_rax(elem_ty);
+            cg_store_typed(RBP, off + i * elem_sz, elem_ty);
+        }
+        i = i + 1;
+        el = nk_next(el);
+    }
+    return 0;
+}
+
+// (STEP 3 slice-array-literal backing.) Materialize the elements into a
+// fresh backing region in cg_data, then store the slice {ptr=addend, len=count}
+// into the 16-byte local at `off` (ptr at off, len at off+8). The ptr is
+// patched at load time via an ABS64_DATA reloc (the data section's base + the
+// backing addend). Mirrors src/codegen.cpp's slice-ArrayLit LetStmt path
+// (which uses a frame temp; the self-hosted compiler uses the data section as
+// the backing region since it has no frame-temp allocator and the literals
+// are immutable).
+fn cg_store_slice_arraylit(lit: i64, t: i64, off: i64, elem_ty: i64, elem_sz: i64) -> i64 {
+    // count elements
+    let mut count: i64 = 0;
+    let mut el: i64 = nk_a(lit);
+    while (el >= 0) { count = count + 1; el = nk_next(el); }
+    // allocate count*elem_sz bytes in cg_data + write each element's LE bytes
+    let back: i64 = cg_data_alloc(count * elem_sz);
+    el = nk_a(lit);
+    let mut i: i64 = 0;
+    while (el >= 0) {
+        // eval the element -> rax (int) or xmm0 (float), then write its LE
+        // bytes into cg_data at back + i*elem_sz. We must AVOID emitting
+        // runtime stores to cg_data (it's a host-owned byte array built at
+        // compile time); instead, fold the element to a compile-time constant
+        // + write the bytes directly. v1 slice literals only carry constant
+        // integer elements (sema-checked); a non-constant element is rejected.
+        let ev: i64 = cg_eval_const_i64(el);
+        if (cg_err != 0) { return 0; }
+        let mut b: i64 = 0;
+        while (b < elem_sz) {
+            array_set_u8(cg_data, back + i * elem_sz + b, (ev >> (b * 8)) & 0xFF);
+            b = b + 1;
+        }
+        i = i + 1;
+        el = nk_next(el);
+    }
+    // store ptr = <data_base + back> into [rbp+off] via an ABS64_DATA reloc.
+    // mov rax, <data_base+back>; mov [rbp+off], rax
+    cg_emit_abs64_reloc_reg(RAX, CG_RELOC_DATA, 0, back);
+    cg_store_reg_mem(RBP, off, RAX);
+    // store len = count into [rbp+off+8]
+    cg_mov_reg_imm64(RAX, count);
+    cg_store_reg_mem(RBP, off + 8, RAX);
     return 0;
 }
 
@@ -2545,6 +3255,120 @@ fn cg_compile_for(s: i64) -> i64 {
     return 0;
 }
 
+// compile a for-each statement: for (x in iter) { body } where iter is a slice
+// T[] (sema rejects a fixed array; use a[..] first). Mirrors src/codegen.cpp's
+// ForEachStmt slice path: eval iter -> {rax=ptr, rdx=len}; stash ptr, len, idx
+// into hidden frame slots; loop i=0..len, load elem [ptr + i*esz] into the
+// loop var, run the body, i++. break -> end, continue -> latch (the i++ step).
+fn cg_compile_foreach(s: i64) -> i64 {
+    let vtok: i64 = nk_tok(s);     // loop var name token
+    let iter: i64 = nk_a(s);       // iterable expr (a slice)
+    let body: i64 = nk_b(s);       // body block
+
+    // element type + stride from the iter's type (a slice)
+    let it: i64 = cg_expr_type(iter);
+    let mut elem_ty: i64 = -1;
+    if (it >= 0) { elem_ty = resolve_type(nk_a(it)); }
+    if (cg_err != 0) { return 0; }
+    let esz: i64 = cg_value_bytes(elem_ty);
+    let mut esz_use: i64 = esz;
+    if (esz_use <= 0) { esz_use = 8; }
+
+    // alloc hidden frame slots: ptr, len, idx (each 8 bytes) + the loop var.
+    // The loop var is 1 slot (v1 for-each element is a scalar; aggregate
+    // elements are a future enhancement, mirroring the C++ codegen note).
+    let ptr_off: i64 = cg_alloc_local_t(-1, TY_I64, 1);
+    let len_off: i64 = cg_alloc_local_t(-1, TY_I64, 1);
+    let idx_off: i64 = cg_alloc_local_t(-1, TY_I64, 1);
+    let var_off: i64 = cg_alloc_local_t(vtok, elem_ty, 1);
+
+    // eval the iterable -> {rax=ptr, rdx=len} (the slice ABI from cg_eval_viewexpr
+    // / a slice local load). Stash ptr + len into their slots.
+    cg_eval(iter); if (cg_err != 0) { return 0; }
+    cg_store_reg_mem(RBP, ptr_off, RAX);
+    cg_mov_reg_reg(RAX, RDX);          // rdx (len) -> rax for the store
+    cg_store_reg_mem(RBP, len_off, RAX);
+    cg_mov_reg_imm64(RAX, 0);
+    cg_store_reg_mem(RBP, idx_off, RAX);   // i = 0
+
+    let top: i64 = cg_alloc_label();
+    let latch: i64 = cg_alloc_label();
+    let end: i64 = cg_alloc_label();
+
+    cg_bind(top);
+    // if (idx >= len) goto end
+    cg_load_reg_mem(RAX, RBP, idx_off);
+    cg_load_reg_mem(RDX, RBP, len_off);
+    cg_cmp_reg_reg(RAX, RDX);
+    cg_jcc(COND_GE, end);              // idx >= len -> exit
+
+    // load element at [ptr + idx*esz] into the loop var slot.
+    cg_load_reg_mem(RAX, RBP, ptr_off);    // rax = ptr
+    cg_load_reg_mem(RCX, RBP, idx_off);    // rcx = idx
+    if (esz_use == 1 || esz_use == 2 || esz_use == 4 || esz_use == 8) {
+        let mut sc: i64 = 0;
+        if (esz_use == 2) { sc = 1; }
+        else if (esz_use == 4) { sc = 2; }
+        else if (esz_use == 8) { sc = 3; }
+        cg_lea_rax_rax_rcx_scale(sc);   // rax = ptr + idx*scale
+    } else {
+        cg_mov_reg_imm64(R11, esz_use);
+        cg_imul_reg_reg(RCX, R11);          // rcx = idx*esz
+        cg_add_reg_reg(RAX, RCX);           // rax = ptr + idx*esz
+    }
+    // load the element from [rax] with its width into the var slot.
+    let mut is_signed: i64 = 0;
+    if (cg_type_is_int(elem_ty) == 1 && cg_type_is_uint(elem_ty) == 0) { is_signed = 1; }
+    if (ty_is_float(elem_ty) == 1) {
+        cg_load_float_reg(XMM0, RAX, 0, cg_float_is64_type(elem_ty));
+        cg_store_float(var_off, XMM0, cg_float_is64_type(elem_ty));
+    } else if (esz_use >= 8) {
+        cg_load_reg_mem(RAX, RAX, 0);
+        cg_normalize_rax(elem_ty);
+        cg_store_reg_mem(RBP, var_off, RAX);
+    } else {
+        cg_load_elem_to_rax(RAX, 0, esz_use, is_signed);
+        cg_normalize_rax(elem_ty);
+        cg_store_reg_mem(RBP, var_off, RAX);
+    }
+
+    // set up break/continue targets + run the body.
+    let saved_depth: i64 = cg_loop_depth;
+    let saved_break: i64 = cg_loop_break;
+    let saved_cont: i64 = cg_loop_continue;
+    cg_loop_depth = 1;
+    cg_loop_break = end;
+    cg_loop_continue = latch;
+    cg_push_scope();
+    cg_compile_block(body);
+    cg_pop_scope();
+    cg_loop_depth = saved_depth;
+    cg_loop_break = saved_break;
+    cg_loop_continue = saved_cont;
+    if (cg_err != 0) { return 0; }
+
+    // latch: idx = idx + 1; jmp top
+    cg_bind(latch);
+    cg_load_reg_mem(RAX, RBP, idx_off);
+    cg_add_reg_imm32(RAX, 1);
+    cg_store_reg_mem(RBP, idx_off, RAX);
+    cg_jmp(top);
+    cg_bind(end);
+    return 0;
+}
+
+// lea rax, [rax + rcx*scale] (scale: 0->1, 1->2, 2->4, 3->8). Used by for-each
+// to compute the element address with a power-of-2 stride.
+fn cg_lea_rax_rax_rcx_scale(scale: i64) -> i64 {
+    // lea rax, [rax + rcz*2^scale] -> REX.W 8D /r SIB(scale, rcx, rax)
+    // mod=00 (no disp), reg=rax, rm=4 (SIB); SIB = scale<<6 | rcx<<3 | rax
+    cg_byte(cg_rex(1, 0, 0, 0));            // REX.W (rax/rcx are not extended)
+    cg_byte(0x8D);
+    cg_byte(cg_modrm(0, RAX, 4));           // mod=00, reg=rax, rm=4 (SIB)
+    cg_byte(((scale & 3) << 6) | (1 << 3) | (0 & 7));   // SIB: scale, index=rcx(1), base=rax(0)
+    return 0;
+}
+
 fn cg_compile_match(s: i64) -> i64 {
     cg_eval(nk_a(s)); cg_push(RAX);
     let end: i64 = cg_alloc_label(); let mut arm: i64 = nk_b(s);
@@ -2583,7 +3407,10 @@ fn cg_compile_func(fd: i64) -> i64 {
     // Count scalar locals, then add aggregate expansion words. The ordinary
     // count remains a conservative baseline for nested control-flow locals.
     let body: i64 = nk_c(fd);
-    let local_count: i64 = cg_count_locals_block(body, 0) + cg_count_extra_struct_slots(body);
+    // cg_count_locals_block now counts each let's actual stack slots
+    // (ceil(value_bytes/8) for aggregates, 1 for scalars), so the frame is
+    // sized to hold every byte of every local. No separate struct-extra pass.
+    let local_count: i64 = cg_count_locals_block(body, 0);
 
     // frame size = (params + locals) * 8, rounded up to 16
     // +8 for the return address alignment (push rbp makes it 16-aligned)

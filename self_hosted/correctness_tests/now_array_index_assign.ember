@@ -1,0 +1,7 @@
+// Self-hosted positive: fixed array index assignment (mutation).
+// expect: 99
+fn main() -> i64 {
+    let mut a: i64[3] = [10, 20, 30];
+    a[1] = 99;
+    return a[1];
+}

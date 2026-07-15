@@ -275,6 +275,24 @@ fn ty_array_len(t: i64) -> i64 { return nk_e(t); }
 // element type (the `a` slot) for array/slice types.
 fn ty_elem(t: i64) -> i64 { return nk_a(t); }
 
+// is this an aggregate type (slice, fixed array, or struct) that the
+// self-hosted call ABI cannot pass/return by value? Scalars (int/float/bool/
+// void/handle) are NOT aggregates. Used to reject aggregate fn params/returns
+// (-310) since the call ABI is one-word-per-operand.
+fn ty_is_aggregate(t: i64) -> i64 {
+    if (t < 0) { return 0; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 0; }
+    if (nk_f(t) == 1) { return 1; }          // slice
+    if (nk_e(t) > 0) { return 1; }           // fixed array
+    if (nk_tok(t) >= 0) {
+        let nm: string = tok_name(nk_tok(t));
+        if (nm == string_from_slice("string")) { return 0; }   // opaque handle
+        if (find_struct(nm) >= 0) { return 1; }                // struct
+        return 0;
+    }
+    return 0;
+}
+
 // is this type the integer type i64? (v1 subset: only i64 is a "plain integer")
 fn ty_is_i64(t: i64) -> i64 {
     if (t < 0) { return 0; }
@@ -341,6 +359,8 @@ fn ty_is_void(t: i64) -> i64 {
     if (nk_kind(t) != (NK::Type as i64)) { return 0; }
     if (nk_d(t) != (Prim::Void as i64)) { return 0; }
     if (nk_tok(t) >= 0) { return 0; }
+    if (nk_f(t) == 1) { return 0; }   // a slice is not void
+    if (nk_e(t) > 0) { return 0; }   // a fixed array is not void
     return 1;
 }
 
@@ -456,8 +476,32 @@ fn resolve_type(t: i64) -> i64 {
         return serr(string_from_slice("unknown type '") + nm + string_from_slice("'"),
                     node_line(t), node_col(t));
     }
-    if (nk_f(t) == 1) { return unsupported(-310, string_from_slice("slice type"), t); }
-    if (nk_e(t) > 0 || nk_a(t) >= 0) { return unsupported(-310, string_from_slice("array type"), t); }
+    if (nk_f(t) == 1) {
+        // slice T[]: resolve the element type recursively. A slice is a valid
+        // Phase 3 type (16 bytes {ptr,len}).
+        let elem: i64 = nk_a(t);
+        if (elem < 0) { return serr(string_from_slice("slice type missing element type"), node_line(t), node_col(t)); }
+        let re: i64 = resolve_type(elem);
+        if (s_err != 0) { return TY_VOID; }
+        set_a(t, re);
+        return t;
+    }
+    if (nk_e(t) > 0) {
+        // fixed array T[N]: resolve the element type recursively. A fixed
+        // array is a valid Phase 3 type (N*elem bytes, inline). Reject an
+        // absurdly large N (mirrors src/sema.cpp's MAX_ARRAY_LEN + the frame
+        // budget) so a malformed huge size can't build a frame that overflows.
+        let n: i64 = nk_e(t);
+        if (n > 2147483647) {
+            return serr(string_from_slice("array size exceeds the supported maximum"), node_line(t), node_col(t));
+        }
+        let elem: i64 = nk_a(t);
+        if (elem < 0) { return serr(string_from_slice("array type missing element type"), node_line(t), node_col(t)); }
+        let re: i64 = resolve_type(elem);
+        if (s_err != 0) { return TY_VOID; }
+        set_a(t, re);
+        return t;
+    }
     if (p == (Prim::I64 as i64)) { return TY_I64; }
     if (p == (Prim::Bool as i64)) { return TY_BOOL; }
     if (p == (Prim::Void as i64)) { return TY_VOID; }
@@ -652,6 +696,23 @@ fn register_fn(fd: i64) -> i64 {
         p = nk_next(p);
     }
     let rt: i64 = resolve_type(nk_b(fd));
+    if (s_err != 0) { return TY_VOID; }
+    // The self-hosted call ABI passes one 8-byte word per param/return and has
+    // no hidden-pointer / 2-word-slice path, so aggregate (slice / fixed-array
+    // / struct) params + returns are out-of-subset. Mirror the -310 contract
+    // (a slice/array type in a signature) so the sema_test rejection stays.
+    if (ty_is_aggregate(rt) == 1) {
+        return unsupported(-310, string_from_slice("aggregate return type"), fd);
+    }
+    let mut pp: i64 = nk_a(fd);
+    while (pp >= 0) {
+        let pt: i64 = resolve_type(nk_a(pp));
+        if (s_err != 0) { return TY_VOID; }
+        if (ty_is_aggregate(pt) == 1) {
+            return unsupported(-310, string_from_slice("aggregate parameter type"), pp);
+        }
+        pp = nk_next(pp);
+    }
     array_push_i64(g_fns, nm_tok);
     array_push_i64(g_fns, nk_b(fd));     // raw ret type node (resolved on read)
     array_push_i64(g_fns, nk_a(fd));     // first param
@@ -864,9 +925,8 @@ fn check_expr(e: i64) -> i64 {
     if (k == (NK::LambdaExpr as i64)) { return unsupported(-307, string_from_slice("lambda"), e); }
     if (k == (NK::StructLit as i64)) { return check_structlit(e); }
     if (k == (NK::FieldExpr as i64)) { return check_fieldexpr(e); }
-    if (k == (NK::IndexExpr as i64) || k == (NK::ViewExpr as i64)) {
-        return unsupported(-310, string_from_slice("array/slice expression"), e);
-    }
+    if (k == (NK::IndexExpr as i64)) { return check_indexexpr(e); }
+    if (k == (NK::ViewExpr as i64)) { return check_viewexpr(e); }
     if (k == (NK::EnumAccess as i64)) {
         let ename: string = tok_name(nk_a(e));
         let row: i64 = find_enum(ename);
@@ -930,26 +990,34 @@ fn check_expr(e: i64) -> i64 {
     if (k == (NK::SizeofExpr as i64)) {
         let t: i64 = resolve_type(nk_a(e));
         if (s_err != 0) { return TY_VOID; }
-        // Phase 2: only primitives (int/bool/float/void) are sized. Structs/
-        // arrays/slices are Phase 3.
-        if (nk_tok(t) >= 0) {
-            return unsupported(-313, string_from_slice("sizeof of struct type"), e);
-        }
-        if (nk_f(t) == 1 || nk_e(t) > 0 || nk_a(t) >= 0) {
-            return unsupported(-310, string_from_slice("sizeof of array/slice type"), e);
-        }
+        // Phase 3: any resolved type is sized via the packed memory model
+        // (primitives, structs, fixed arrays, slices all have a value_bytes).
         return TY_U64;
     }
-    // Phase 2 Step 5: OffsetofExpr. Result is a compile-time constant of type
-    // u64. For primitives there are no fields (reject); for structs (Phase 3)
-    // compute from the layout. For Phase 2, reject (no structs yet).
+    // Phase 3: OffsetofExpr. Result is a compile-time constant of type u64.
+    // The type must be a struct (declared) and the field must exist; the
+    // offset is the field's packed offset (computed by codegen). For
+    // primitives there are no fields (reject). Mirrors src/sema.cpp.
     if (k == (NK::OffsetofExpr as i64)) {
         let t: i64 = resolve_type(nk_a(e));
         if (s_err != 0) { return TY_VOID; }
         if (nk_tok(t) < 0) {
             return serr(string_from_slice("offsetof requires a struct type"), node_line(e), node_col(e));
         }
-        return unsupported(-313, string_from_slice("offsetof of struct type"), e);
+        let nm: string = tok_name(nk_tok(t));
+        if (nm == string_from_slice("string")) {
+            return serr(string_from_slice("offsetof requires a struct type"), node_line(e), node_col(e));
+        }
+        let row: i64 = find_struct(nm);
+        if (row < 0) {
+            return serr(string_from_slice("offsetof requires a struct type"), node_line(e), node_col(e));
+        }
+        let fname: string = tok_name(nk_tok(e));
+        if (struct_field_type(row, fname) < 0) {
+            return serr(string_from_slice("struct '") + nm + string_from_slice("' has no field '") + fname + string_from_slice("'"),
+                        node_line(e), node_col(e));
+        }
+        return TY_U64;
     }
     return unsupported(-313, string_from_slice("expression kind"), e);
 }
@@ -1185,7 +1253,11 @@ fn check_structlit(e: i64) -> i64 {
         if (init < 0) { return serr(string_from_slice("missing struct field '") + nk_name(field) + string_from_slice("'"), node_line(e), node_col(e)); }
         let want: i64 = resolve_type(nk_a(field));
         let got: i64 = check_expr(nk_a(init));
-        if (type_eq(want, got) == 0) { return serr(string_from_slice("struct field type mismatch"), node_line(init), node_col(init)); }
+        // literal adaptation: an IntLit (TY_I64) adapts to a narrower integer
+        // field if it fits (mirrors src/sema.cpp's check_value + adapt_int_lit).
+        if (lit_fits_int_type(nk_a(init), want) == 0 && types_compatible(want, got) == 0) {
+            return serr(string_from_slice("struct field type mismatch"), node_line(init), node_col(init));
+        }
         field = nk_next(field);
     }
     let t: i64 = alloc_node(NK::Type as i64);
@@ -1221,6 +1293,22 @@ fn check_fieldexpr(e: i64) -> i64 {
 
 // check an index base[idx]. base must be an array/slice; idx must be an
 // integer; the result is the element type. (v1: no bounds folding.)
+// try to evaluate an expression as a compile-time i64 constant (an IntLit
+// or a unary-negated IntLit). Returns 1 + sets `out_val` (via the global
+// s_constval) if it folds, 0 otherwise. Mirrors src/sema.cpp's try_eval_const_
+// i64 for the literal-only cases the self-hosted subset needs (IndexExpr
+// bounds folding + static_assert folding already use a separate path).
+global s_constval : i64 = 0;
+fn try_const_i64(e: i64) -> i64 {
+    if (e < 0) { return 0; }
+    if (nk_kind(e) == (NK::IntLit as i64)) { s_constval = nk_d(e); return 1; }
+    if (nk_kind(e) == (NK::UnaryExpr as i64) && nk_d(e) == (UnOp::Neg as i64)) {
+        let inner: i64 = nk_a(e);
+        if (nk_kind(inner) == (NK::IntLit as i64)) { s_constval = -nk_d(inner); return 1; }
+    }
+    return 0;
+}
+
 fn check_indexexpr(e: i64) -> i64 {
     let base: i64 = nk_a(e);
     let bt: i64 = check_expr(base);
@@ -1234,9 +1322,85 @@ fn check_indexexpr(e: i64) -> i64 {
         return serr(string_from_slice("indexing requires an array or slice type (got ") + ty_name(bt) + string_from_slice(")"),
                     node_line(e), node_col(e));
     }
+    // Compile-time bounds check for a FIXED array + constant index (mirrors
+    // src/sema.cpp): the length is known now, so a constant out-of-range index
+    // is a compile error. A slice's length is runtime-only, so it always
+    // defers to codegen's runtime check (no compile-time check here).
+    if (ty_is_slice(bt) == 0 && ty_array_len(bt) > 0) {
+        if (try_const_i64(nk_b(e)) == 1) {
+            let idx: i64 = s_constval;
+            let n: i64 = ty_array_len(bt);
+            if (idx < 0 || idx >= n) {
+                return serr(string_from_slice("array index ") + int_to_str(idx) + string_from_slice(" out of bounds for array of size ") + int_to_str(n),
+                            node_line(nk_b(e)), node_col(nk_b(e)));
+            }
+        }
+    }
     let elem: i64 = ty_elem(bt);
     if (elem < 0) { return TY_I64; }   // fallback
     return resolve_type(elem);
+}
+
+// check a view expr arr[..]. base must be a fixed array T[N]; the result is a
+// slice T[] of the same element type. Mirrors src/sema.cpp's ViewExpr check.
+fn check_viewexpr(e: i64) -> i64 {
+    let bt: i64 = check_expr(nk_a(e));
+    if (bt < 0) { return TY_VOID; }
+    if (ty_array_len(bt) <= 0) {
+        return serr(string_from_slice("'[..]' view requires a fixed-size array type (got ") + ty_name(bt) + string_from_slice(")"),
+                    node_line(e), node_col(e));
+    }
+    let elem: i64 = ty_elem(bt);
+    if (elem < 0) { return TY_VOID; }
+    let sl: i64 = alloc_node(NK::Type as i64);
+    set_f(sl, 1);          // is_slice
+    set_a(sl, resolve_type(elem));
+    return sl;
+}
+
+// check an array literal `[ e, e, ... ]` against a declared target type
+// `expected` (a fixed array T[N] or a slice T[]). v1 does NOT infer array
+// types from elements. For a fixed array, the element count must equal N; for
+// a slice, any non-empty count is allowed. Each element is checked against the
+// declared element type (with int-literal adaptation). Returns the declared
+// type (baked onto the literal so codegen knows the shape). Mirrors
+// src/sema.cpp's ArrayLit check.
+fn check_arraylit(e: i64, expected: i64) -> i64 {
+    let is_sl: i64 = ty_is_slice(expected);
+    let n: i64 = ty_array_len(expected);
+    if (is_sl == 0 && n <= 0) {
+        return serr(string_from_slice("array literal requires a fixed-array or slice target type"),
+                    node_line(e), node_col(e));
+    }
+    let elem_ty: i64 = resolve_type(ty_elem(expected));
+    if (s_err != 0) { return TY_VOID; }
+    // count elements
+    let mut count: i64 = 0;
+    let mut el: i64 = nk_a(e);
+    while (el >= 0) { count = count + 1; el = nk_next(el); }
+    if (count == 0) {
+        return serr(string_from_slice("empty array literal needs a declared type and at least one element (v1 does not infer array types)"),
+                    node_line(e), node_col(e));
+    }
+    if (is_sl == 0) {
+        // fixed array T[N]: requires EXACTLY N elements
+        if (count != n) {
+            return serr(string_from_slice("array literal for ") + ty_name(expected) + string_from_slice(" needs ") + int_to_str(n) + string_from_slice(" elements, got ") + int_to_str(count),
+                        node_line(e), node_col(e));
+        }
+    }
+    // check each element against the declared element type (with literal adaptation)
+    el = nk_a(e);
+    while (el >= 0) {
+        let got: i64 = check_expr(el);
+        if (s_err != 0) { return TY_VOID; }
+        if (lit_fits_int_type(el, elem_ty) == 0 && types_compatible(elem_ty, got) == 0) {
+            return serr(string_from_slice("array element type mismatch (expected ") + ty_name(elem_ty) + string_from_slice(", got ") + ty_name(got) + string_from_slice(")"),
+                        node_line(el), node_col(el));
+        }
+        el = nk_next(el);
+    }
+    return expected;
 }
 
 // check an assignment target = value (incl. compound += and postfix ++/--).
@@ -1383,7 +1547,7 @@ fn check_stmt(s: i64) -> i64 {
         return check_for(s);
     }
 
-    if (k == (NK::ForEachStmt as i64)) { unsupported(-311, string_from_slice("for-each"), s); return 0; }
+    if (k == (NK::ForEachStmt as i64)) { return check_foreach(s); }
     if (k == (NK::SwitchStmt as i64)) { unsupported(-305, string_from_slice("switch"), s); return 0; }
     if (k == (NK::MatchStmt as i64)) {
         let subject_ty: i64 = check_expr(nk_a(s));
@@ -1588,6 +1752,25 @@ fn check_let(s: i64) -> i64 {
         return 0;
     }
 
+    // Array literal init: requires a declared fixed-array or slice target type
+    // (v1 does not infer array types from elements, mirroring src/sema.cpp).
+    // check_arraylit validates the element count + each element's type against
+    // the declared element type and bakes the declared type onto the literal.
+    if (nk_kind(init) == (NK::ArrayLit as i64)) {
+        if (ty_node < 0) {
+            return serr(string_from_slice("array literal needs an explicit type annotation (v1 does not infer array types from elements)"),
+                        node_line(init), node_col(init));
+        }
+        if (ty_is_aggregate(decl_ty) == 0 || (ty_is_slice(decl_ty) == 0 && ty_array_len(decl_ty) <= 0)) {
+            return serr(string_from_slice("array literal requires a fixed-array or slice target type (got ") + ty_name(decl_ty) + string_from_slice(")"),
+                        node_line(init), node_col(init));
+        }
+        let alty: i64 = check_arraylit(init, decl_ty);
+        if (s_err != 0) { return 0; }
+        declare(nm_tok, alty);
+        return 0;
+    }
+
     let init_ty: i64 = check_expr(init);
     if (s_err != 0) { return 0; }
 
@@ -1668,6 +1851,34 @@ fn check_for(s: i64) -> i64 {
     check_block(nk_e(s));                          // body
     s_loop_depth = s_loop_depth - 1;
     pop_scope();
+    return 0;
+}
+
+// check a for-each statement: for (x in iter) { body }. The iterable must be a
+// SLICE T[] (the self-hosted subset has no array_new natives, so the array-
+// handle path is not supported). A fixed array T[N] is rejected (mirror
+// src/sema.cpp: convert it to a slice with [..] first). The loop variable gets
+// the slice's element type. Mirrors src/sema.cpp's ForEachStmt check.
+fn check_foreach(s: i64) -> i64 {
+    let iter: i64 = nk_a(s);
+    let it: i64 = check_expr(iter);
+    if (s_err != 0) { return 0; }
+    let mut elem_ty: i64 = -1;
+    if (ty_is_slice(it) == 1) {
+        elem_ty = resolve_type(ty_elem(it));
+        if (s_err != 0) { return 0; }
+        if (elem_ty < 0) { elem_ty = TY_I64; }
+    } else {
+        serr(string_from_slice("for-each iterable must be a slice (got ") + ty_name(it) + string_from_slice("); use a[..] to view a fixed array"),
+             node_line(iter), node_col(iter));
+        elem_ty = TY_I64;
+    }
+    s_loop_depth = s_loop_depth + 1;
+    push_scope();
+    declare(nk_tok(s), elem_ty);
+    check_block(nk_b(s));
+    pop_scope();
+    s_loop_depth = s_loop_depth - 1;
     return 0;
 }
 

@@ -1,0 +1,6 @@
+// Self-hosted positive: fixed i32 array literal + index reads (4-byte stride).
+// expect: 60
+fn main() -> i64 {
+    let a: i32[3] = [10, 20, 30];
+    return (a[0] + a[1] + a[2]) as i64;
+}

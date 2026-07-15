@@ -1,0 +1,14 @@
+// Self-hosted positive: for-each over a slice with break + continue.
+// Mirrors tests/lang/valid_for_each_break_continue.ember (expect 40).
+// expect: 40
+fn main() -> i64 {
+    let a: i64[5] = [10, 20, 30, 40, 50];
+    let s: i64[] = a[..];
+    let mut sum: i64 = 0;
+    for (x in s) {
+        if (x >= 40) { break; }
+        if (x == 20) { continue; }
+        sum = sum + x;
+    }
+    return sum;
+}

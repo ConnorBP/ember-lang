@@ -1,0 +1,7 @@
+// Self-hosted positive: struct literal with two i32 fields, field access, sum.
+// expect: 42
+struct Pair2 { x: i32; y: i32; }
+fn main() -> i64 {
+    let p: Pair2 = Pair2 { x: 20, y: 22 };
+    return (p.x + p.y) as i64;
+}
