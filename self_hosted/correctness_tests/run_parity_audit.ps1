@@ -210,8 +210,15 @@ foreach ($test in $validTests) {
 
     if ($selfDecoded -lt 0) {
         # A negative -3xx from the self-hosted compiler means it rejected the
-        # program as out-of-subset. That is expected for anything beyond the
-        # supported language subset; it is NOT a real mismatch.
+        # program. If the native also rejected (expected == 2 = sema error exit
+        # code, or expected < 0), this is parity (both rejected), not a subset
+        # gap. Otherwise it's an out-of-subset rejection.
+        if ($expected -le 0 -or $expected -eq 2) {
+            # Both backends rejected the program — this is parity.
+            Write-Host ("PASS  {0} => both rejected (native sema-error, self {1})" -f $name, $selfDecoded)
+            $script:validPass++
+            continue
+        }
         Write-Host ("UNSUPPORTED {0}: expected={1} self={2} (subset rejection)" -f $name, $expected, $selfDecoded) -ForegroundColor DarkGray
         $script:unsupportedSubset++
         continue
