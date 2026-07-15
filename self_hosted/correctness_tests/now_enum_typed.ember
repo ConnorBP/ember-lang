@@ -1,0 +1,5 @@
+// Self-hosted positive: typed enum (enum E : i32) with enum->backing-int widening via `as`.
+// A typed enum is a real type backed by i32; `e as i64` widens the backing int.
+// expect: 20
+enum E : i32 { A = 10, B = 20 }
+fn main() -> i64 { let e: E = E::B; return e as i64; }

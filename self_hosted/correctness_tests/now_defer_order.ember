@@ -1,0 +1,7 @@
+// Self-hosted positive: block-scope defers run LIFO at block exit.
+// setg(2) runs first, then setg(1) (last-declared defer runs last), so g=1.
+// Returning g after the block observes the LIFO result.
+// expect: 1
+global g: i64 = 0;
+fn setg(v: i64) -> i64 { g = v; return 0; }
+fn main() -> i64 { { defer setg(1); defer setg(2); } return g; }

@@ -97,6 +97,7 @@ global TY_U64 : i64 = 0;
 global g_fns     : i64 = 0;   // array, stride FN_STRIDE
 global g_structs : i64 = 0;   // array, stride STRUCT_STRIDE
 global g_enums   : i64 = 0;   // array, stride 2 [name_tok, first_variant]
+global g_enum_types : i64 = 0; // Phase 3b: typed-enum types, stride 2 [name_tok, type_node]
 global g_globals : i64 = 0;   // array, stride GLOBAL_STRIDE
 global g_scope   : i64 = 0;   // array, stride SCOPE_STRIDE (local vars)
 global g_marks   : i64 = 0;   // array, stride 1 (scope-push marks)
@@ -129,6 +130,7 @@ global s_cur_ret : i64 = 0;
 global s_mark_len  : i64 = 0;
 global s_scope_len : i64 = 0;
 global s_loop_depth: i64 = 0;
+global s_switch_depth: i64 = 0;   // Phase 3b: switch nesting (break valid inside a switch)
 
 // -----------------------------------------------------------------------------
 // init — allocate the symbol tables + canonical types. Called once at sema()
@@ -140,6 +142,7 @@ fn s_init() -> i64 {
     g_fns = array_new(8, 0);
     g_structs = array_new(8, 0);
     g_enums = array_new(8, 0);
+    g_enum_types = array_new(8, 0);
     g_globals = array_new(8, 0);
     g_scope = array_new(8, 0);
     g_marks = array_new(8, 0);
@@ -152,6 +155,7 @@ fn s_init() -> i64 {
     s_mark_len = 0;
     s_scope_len = 0;
     s_loop_depth = 0;
+    s_switch_depth = 0;
 
     // canonical primitive types: three Type nodes appended to g_nodes.
     TY_I64 = alloc_node(NK::Type as i64);
@@ -422,6 +426,16 @@ fn types_compatible(want: i64, got: i64) -> i64 {
             if (ty_int_width(got) < ty_int_width(want)) { return 1; }
         }
     }
+    // Phase 3b: typed-enum -> backing-int implicit widening. A typed-enum value
+    // (a Type with nk_tok = enum name + an integer backing prim) flows to a
+    // plain integer target when same-signedness + backing width <= target
+    // width. The reverse (int->enum) is NOT implicit. Mirrors src/sema.cpp's
+    // can_implicitly_convert enum branch.
+    if (ty_is_int(want) == 1 && is_typed_enum_type(got) == 1) {
+        if (ty_is_uint(want) == typed_enum_is_uint(got)) {
+            if (typed_enum_width(got) <= ty_int_width(want)) { return 1; }
+        }
+    }
     // f32 -> f64 widening
     if (ty_is_float(got) == 1 && ty_is_float(want) == 1) {
         if (nk_d(got) == (Prim::F32 as i64) && nk_d(want) == (Prim::F64 as i64)) { return 1; }
@@ -472,7 +486,16 @@ fn resolve_type(t: i64) -> i64 {
     if (nk_tok(t) >= 0) {
         let nm: string = tok_name(nk_tok(t));
         if (nm == string_from_slice("string")) { return TY_STRING; }
-        if (find_struct(nm) >= 0 || find_enum(nm) >= 0) { return t; }
+        if (find_struct(nm) >= 0) { return t; }
+        // Phase 3b: a typed enum name is a real type — return the canonical
+        // typed-enum Type (prim=backing, tok=name). An UNTYPED enum name in a
+        // type position is rejected (mirror src/sema.cpp's check_type_not_enum:
+        // `let x: Color = ...` for an untyped enum is a clean error).
+        if (is_typed_enum_name(nm) == 1) { return typed_enum_type(nm); }
+        if (find_enum(nm) >= 0) {
+            return serr(string_from_slice("enum '") + nm + string_from_slice("' is untyped; declare the binding with an integer type, or declare the enum as `enum ") + nm + string_from_slice(" : <int>`"),
+                        node_line(t), node_col(t));
+        }
         return serr(string_from_slice("unknown type '") + nm + string_from_slice("'"),
                     node_line(t), node_col(t));
     }
@@ -553,6 +576,99 @@ fn register_enum(ed: i64) -> i64 {
     }
     array_push_i64(g_enums, nk_tok(ed));
     array_push_i64(g_enums, nk_b(ed));
+    // Phase 3b: typed enum (`enum E : T`). A typed enum is a real type backed
+    // by the integer T: build a canonical Type node (prim=backing, tok=E-name)
+    // so `let e: E = E::B` type-checks (E==E) and `e as i64` widens the
+    // backing int. Mirrors src/sema.cpp's register_typed_enums + the interned
+    // typed_enum_types map. An untyped enum (no `: type`) gets NO entry here —
+    // its name is not a type, and using it in a type position is rejected
+    // (check_type_not_enum), matching the C++ untyped-enum rule.
+    let backing_node: i64 = nk_a(ed);
+    if (backing_node >= 0 && nk_kind(backing_node) == (NK::Type as i64)) {
+        let bt: i64 = resolve_type(backing_node);
+        if (s_err != 0) { return 0; }
+        // the backing must be an integer primitive (mirror the C++ guard).
+        if (ty_is_int(bt) == 0) {
+            return serr(string_from_slice("enum '") + nm + string_from_slice("' backing type must be an integer"),
+                        node_line(ed), node_col(ed));
+        }
+        // build the canonical typed-enum type: prim=backing, tok=enum-name.
+        let et: i64 = alloc_node(NK::Type as i64);
+        set_d(et, nk_d(bt));            // backing prim
+        set_tok(et, nk_tok(ed));        // enum name token
+        array_push_i64(g_enum_types, nk_tok(ed));
+        array_push_i64(g_enum_types, et);
+    }
+    return 0;
+}
+
+// Phase 3b: typed-enum helpers (mirror src/sema.cpp's is_typed_enum /
+// typed_enum_types). is_typed_enum(name) -> 1 if `enum E : T` declared.
+fn is_typed_enum_name(name: string) -> i64 {
+    let n: i64 = array_length(g_enum_types) / 2;
+    let mut i: i64 = 0;
+    while (i < n) {
+        if (tok_name(array_get_i64(g_enum_types, i * 2)) == name) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// the canonical typed-enum Type node for `name`, or -1 if it is untyped.
+fn typed_enum_type(name: string) -> i64 {
+    let n: i64 = array_length(g_enum_types) / 2;
+    let mut i: i64 = 0;
+    while (i < n) {
+        if (tok_name(array_get_i64(g_enum_types, i * 2)) == name) { return array_get_i64(g_enum_types, i * 2 + 1); }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// is a Type node a typed-enum type? (nk_tok names a typed enum). The typed-enum
+// type carries prim=backing + tok=enum-name, so it is distinguished from a
+// plain int (which has nk_tok < 0) and from a struct (which is in g_structs).
+fn is_typed_enum_type(t: i64) -> i64 {
+    if (t < 0) { return 0; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 0; }
+    if (nk_tok(t) < 0) { return 0; }
+    return is_typed_enum_name(tok_name(nk_tok(t)));
+}
+
+// is a typed-enum type's backing UNSIGNED? (u8/u16/u32/u64)
+fn typed_enum_is_uint(t: i64) -> i64 {
+    if (is_typed_enum_type(t) == 0) { return 0; }
+    let p: i64 = nk_d(t);
+    if (p == (Prim::U8 as i64) || p == (Prim::U16 as i64) || p == (Prim::U32 as i64) || p == (Prim::U64 as i64)) { return 1; }
+    return 0;
+}
+
+// the bit width of a typed-enum type's backing integer (8/16/32/64).
+fn typed_enum_width(t: i64) -> i64 {
+    if (is_typed_enum_type(t) == 0) { return 64; }
+    return ty_int_width(t);   // ty_int_width reads nk_d only; the backing prim is there
+}
+
+// resolve a variant's compile-time i64 value (explicit `= constexpr` or
+// auto-increment from 0 / prev+1). Mirrors src/sema.cpp's resolve_enums + the
+// self-hosted cg_enum_value, lifted to a shared sema helper so check_expr can
+// type-check a typed enum's variant value range + EnumAccess can report it.
+// Returns 1 + sets g_enum_val_out on success, 0 on failure (unknown variant).
+global g_enum_val_out: i64 = 0;
+fn enum_variant_value(row: i64, variant_name: string) -> i64 {
+    let mut value: i64 = 0;
+    let mut v: i64 = array_get_i64(g_enums, row * 2 + 1);
+    while (v >= 0) {
+        if (nk_a(v) >= 0) {
+            // explicit value: fold the const expr (IntLit / -IntLit, matching
+            // try_const_i64; the C++ also folds constexpr fn calls + BinExpr
+            // of literals, but the subset's variant values are plain literals).
+            if (try_const_i64(nk_a(v)) == 1) { value = s_constval; }
+        }
+        if (nk_name(v) == variant_name) { g_enum_val_out = value; return 1; }
+        value = value + 1;
+        v = nk_next(v);
+    }
     return 0;
 }
 
@@ -934,6 +1050,12 @@ fn check_expr(e: i64) -> i64 {
         if (enum_variant_exists(row, nk_name(e)) == 0) {
             return serr(string_from_slice("unknown enum variant '") + nk_name(e) + string_from_slice("'"), node_line(e), node_col(e));
         }
+        // Phase 3b: a typed enum's variant carries the typed-enum type
+        // (prim=backing, enum_name set) so `let e: E = E::B` type-checks and
+        // `e == E::B` compares two E values. An untyped enum's variant is a
+        // plain i64 constant (mirror src/sema.cpp's lower_enum_access_expr:
+        // typed -> IntLit with the typed-enum type; untyped -> plain i32/i64).
+        if (is_typed_enum_name(ename) == 1) { return typed_enum_type(ename); }
         return TY_I64;
     }
     // Phase 2 Step 2: CastExpr (expr as Type). Mirrors src/sema.cpp's cast matrix:
@@ -952,13 +1074,18 @@ fn check_expr(e: i64) -> i64 {
         let same: i64 = type_eq(from, to);
         let mut int_to_int: i64 = 0;
         if (ty_is_int(from) == 1 && ty_is_int(to) == 1) { int_to_int = 1; }
+        // Phase 3b: explicit typed-enum -> int cast (the explicit spelling of
+        // the implicit enum->backing-int widening). int->enum is NOT allowed
+        // (mirror src/sema.cpp's enum_to_int guard).
+        let mut enum_to_int: i64 = 0;
+        if (is_typed_enum_type(from) == 1 && ty_is_int(to) == 1) { enum_to_int = 1; }
         let mut float_to_float: i64 = 0;
         if (ty_is_float(from) == 1 && ty_is_float(to) == 1) { float_to_float = 1; }
         // signed int <-> float (unsigned is deliberately excluded, matching the C++ matrix)
         let mut int_float: i64 = 0;
         if (ty_is_int(from) == 1 && ty_is_uint(from) == 0 && ty_is_float(to) == 1) { int_float = 1; }
         if (ty_is_float(from) == 1 && ty_is_int(to) == 1 && ty_is_uint(to) == 0) { int_float = 1; }
-        if (same == 0 && int_to_int == 0 && float_to_float == 0 && int_float == 0) {
+        if (same == 0 && int_to_int == 0 && enum_to_int == 0 && float_to_float == 0 && int_float == 0) {
             return serr(string_from_slice("invalid cast from '") + ty_name(from) + string_from_slice("' to '") + ty_name(to) + string_from_slice("'"),
                         node_line(e), node_col(e));
         }
@@ -1532,14 +1659,18 @@ fn check_stmt(s: i64) -> i64 {
         return 0;
     }
     if (k == (NK::BreakStmt as i64)) {
-        if (s_loop_depth == 0) {
-            serr(string_from_slice("break outside a loop"), node_line(s), node_col(s));
+        // break is valid inside a loop OR a switch (mirrors src/sema.cpp:
+        // loop_depth>0 || switch_depth>0).
+        if (s_loop_depth == 0 && s_switch_depth == 0) {
+            serr(string_from_slice("break is only valid inside a loop or switch"), node_line(s), node_col(s));
         }
         return 0;
     }
     if (k == (NK::ContinueStmt as i64)) {
+        // continue is valid only inside a loop (a switch does NOT count,
+        // mirrors src/sema.cpp: loop_depth>0).
         if (s_loop_depth == 0) {
-            serr(string_from_slice("continue outside a loop"), node_line(s), node_col(s));
+            serr(string_from_slice("continue is only valid inside a loop"), node_line(s), node_col(s));
         }
         return 0;
     }
@@ -1548,7 +1679,30 @@ fn check_stmt(s: i64) -> i64 {
     }
 
     if (k == (NK::ForEachStmt as i64)) { return check_foreach(s); }
-    if (k == (NK::SwitchStmt as i64)) { unsupported(-305, string_from_slice("switch"), s); return 0; }
+    // Phase 3b: do-while. Body runs first, then cond is tested. Like while,
+    // the cond must be bool and break/continue are legal inside (loop depth
+    // is incremented around the body). Mirrors src/sema.cpp's DoWhileStmt.
+    if (k == (NK::DoWhileStmt as i64)) {
+        s_loop_depth = s_loop_depth + 1;
+        check_block(nk_a(s));
+        if (s_err != 0) { s_loop_depth = s_loop_depth - 1; return 0; }
+        s_loop_depth = s_loop_depth - 1;
+        let cond: i64 = nk_b(s);
+        let ct: i64 = check_expr(cond);
+        if (ty_is_bool(ct) == 0) {
+            serr(string_from_slice("do-while cond must be bool"), node_line(cond), node_col(cond));
+            return 0;
+        }
+        return 0;
+    }
+    // Phase 3b: switch. Subject must be int/bool; each non-default case value
+    // must be a constant matching the subject type; at most one default. Each
+    // nonempty case body must end with break/continue/return (no fallthrough).
+    // Mirrors src/sema.cpp's SwitchStmt. break/continue are legal inside a
+    // case (switch scopes the body like a loop for break purposes).
+    if (k == (NK::SwitchStmt as i64)) {
+        return check_switch(s);
+    }
     if (k == (NK::MatchStmt as i64)) {
         let subject_ty: i64 = check_expr(nk_a(s));
         let mut arm: i64 = nk_b(s);
@@ -1568,7 +1722,14 @@ fn check_stmt(s: i64) -> i64 {
         unsupported(-306, string_from_slice("try/catch or throw"), s); return 0;
     }
     if (k == (NK::YieldStmt as i64)) { unsupported(-308, string_from_slice("coroutine/yield"), s); return 0; }
-    if (k == (NK::DeferStmt as i64)) { unsupported(-312, string_from_slice("defer"), s); return 0; }
+    // Phase 3b: defer. The deferred expr is checked now (its result is
+    // discarded) but runs at scope exit in codegen. Cleanup runs while this
+    // lexical block's locals remain live, so ordinary scope lookup suffices.
+    // Mirrors src/sema.cpp's DeferStmt.
+    if (k == (NK::DeferStmt as i64)) {
+        if (nk_a(s) >= 0) { check_expr(nk_a(s)); }
+        return 0;
+    }
     // Phase 2 Step 6: static_assert(cond, msg). Evaluate cond at compile time.
     // If true, elide (no-op). If false, emit a sema error with the message. If
     // the cond is not a compile-time constant, emit a sema error. Mirrors
@@ -1880,6 +2041,115 @@ fn check_foreach(s: i64) -> i64 {
     pop_scope();
     s_loop_depth = s_loop_depth - 1;
     return 0;
+}
+
+// Phase 3b: check a switch statement. Subject must be int/bool. Each case is
+// either a default (at most one) or a constant value matching the subject
+// type. Each nonempty case body must end with break/continue/return (ember
+// does NOT support C-style fallthrough). break/continue are legal inside a
+// case body (switch increments loop depth for the duration of its cases).
+// Mirrors src/sema.cpp's SwitchStmt check.
+fn check_switch(s: i64) -> i64 {
+    let subj: i64 = nk_a(s);
+    let subj_ty: i64 = check_expr(subj);
+    if (s_err != 0) { return 0; }
+    if (ty_is_int(subj_ty) == 0 && ty_is_bool(subj_ty) == 0) {
+        serr(string_from_slice("switch subject must be an integer or bool (got ") + ty_name(subj_ty) + string_from_slice(")"),
+             node_line(subj), node_col(subj));
+        return 0;
+    }
+    let mut seen_default: i64 = 0;
+    // a switch body allows break (exit the switch) but NOT continue (a
+    // switch does not count as a loop for continue). Increment switch_depth
+    // only, mirroring src/sema.cpp's ++switch_depth around the cases.
+    s_switch_depth = s_switch_depth + 1;
+    let mut c: i64 = nk_b(s);
+    while (c >= 0) {
+        if (nk_d(c) == 1) {
+            if (seen_default == 1) {
+                serr(string_from_slice("switch has more than one 'default' case"), node_line(c), node_col(c));
+                s_switch_depth = s_switch_depth - 1;
+                return 0;
+            }
+            seen_default = 1;
+        } else {
+            // case value must be a compile-time constant literal. (The C++
+            // requires IntLit/BoolLit; enum variants are pre-lowered there.
+            // Here an EnumAccess folds to a constant at codegen, but for the
+            // type check we accept any int/bool constant expr that matches
+            // the subject type — IntLit/BoolLit/EnumAccess/unary-neg literal.)
+            let cval: i64 = nk_a(c);
+            let vt: i64 = check_expr(cval);
+            if (s_err != 0) { s_switch_depth = s_switch_depth - 1; return 0; }
+            if (type_eq(subj_ty, vt) == 0 && !(ty_is_int(subj_ty) == 1 && ty_is_int(vt) == 1)) {
+                serr(string_from_slice("case value type mismatch (switch on ") + ty_name(subj_ty) + string_from_slice(", case is ") + ty_name(vt) + string_from_slice(")"),
+                     node_line(cval), node_col(cval));
+                s_switch_depth = s_switch_depth - 1;
+                return 0;
+            }
+        }
+        // check the case body in its own scope. The parser stores a case body
+        // as a bare linked list of stmts (nk_b(c) = first stmt), NOT a
+        // BlockStmt, so iterate the list directly (mirrors src/sema.cpp's
+        // check_block over c.body.stmts).
+        push_scope();
+        let mut bs: i64 = nk_b(c);
+        while (bs >= 0) {
+            check_stmt(bs);
+            if (s_err != 0) { pop_scope(); s_switch_depth = s_switch_depth - 1; return 0; }
+            bs = nk_next(bs);
+        }
+        pop_scope();
+        if (s_err != 0) { s_switch_depth = s_switch_depth - 1; return 0; }
+        // enforce no-implicit-fallthrough: a nonempty case body must end with
+        // break/continue/return (mirrors src/sema.cpp's switch tail check).
+        if (case_stmtlist_needs_terminator(nk_b(c)) == 1) {
+            serr(string_from_slice("nonempty switch case must end with break, continue, or return; implicit fallthrough is not allowed"),
+                 node_line(c), node_col(c));
+            s_switch_depth = s_switch_depth - 1;
+            return 0;
+        }
+        c = nk_next(c);
+    }
+    s_switch_depth = s_switch_depth - 1;
+    return 0;
+}
+
+// Does a switch case body (a bare linked list of stmts, first = first_stmt)
+// need a terminator but lack one? Returns 1 iff the list is nonempty AND its
+// last statement is not a break/continue/return (the implicit-fallthrough
+// violation). Mirrors src/sema.cpp's
+// `!dynamic_cast<BreakStmt*>(last) && !ReturnStmt && !ContinueStmt` check.
+fn case_stmtlist_needs_terminator(first_stmt: i64) -> i64 {
+    if (first_stmt < 0) { return 0; }   // empty body -> no terminator required
+    let mut last: i64 = first_stmt;
+    let mut p: i64 = first_stmt;
+    while (p >= 0) { last = p; p = nk_next(p); }
+    let lk: i64 = nk_kind(last);
+    if (lk == (NK::BreakStmt as i64)) { return 0; }
+    if (lk == (NK::ContinueStmt as i64)) { return 0; }
+    if (lk == (NK::ReturnStmt as i64)) { return 0; }
+    return 1;
+}
+
+// Does a switch/match case body (a BlockStmt) need a terminator but lack one?
+// Returns 1 iff the body is nonempty AND its last statement is not a
+// break/continue/return (the implicit-fallthrough violation). A case body that
+// is a bare stmt list (no enclosing block) is treated the same: the last stmt
+// is the terminator candidate. Mirrors src/sema.cpp's
+// `!dynamic_cast<BreakStmt*>(last) && !ReturnStmt && !ContinueStmt` check.
+fn case_body_needs_terminator(body: i64) -> i64 {
+    if (body < 0) { return 0; }
+    // find the last stmt in the body's stmt list (nk_a = first stmt)
+    let mut last: i64 = nk_a(body);
+    if (last < 0) { return 0; }   // empty body -> no terminator required
+    let mut p: i64 = last;
+    while (p >= 0) { last = p; p = nk_next(p); }
+    let lk: i64 = nk_kind(last);
+    if (lk == (NK::BreakStmt as i64)) { return 0; }
+    if (lk == (NK::ContinueStmt as i64)) { return 0; }
+    if (lk == (NK::ReturnStmt as i64)) { return 0; }
+    return 1;
 }
 
 // -----------------------------------------------------------------------------

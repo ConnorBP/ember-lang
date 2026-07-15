@@ -1,0 +1,4 @@
+// Self-hosted positive: switch with case + default + break (was reject -305).
+// Each nonempty case ends with break (no C-style fallthrough in ember).
+// expect: 42
+fn main() -> i64 { let mut r: i64 = 0; switch (2) { case 1: r = 1; break; case 2: r = 42; break; default: r = 0; break; } return r; }

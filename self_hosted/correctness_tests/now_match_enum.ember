@@ -1,0 +1,5 @@
+// Self-hosted positive: match on untyped enum variants (patterns are EnumAccess).
+// The subject + patterns are i64 constants; the compare-chain matches State::On.
+// expect: 42
+enum State { Off, On }
+fn main() -> i64 { let s: i64 = State::On; match (s) { State::Off => { return 0; }, State::On => { return 42; }, _ => { return -1; } } return 0; }

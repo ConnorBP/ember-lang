@@ -1,0 +1,4 @@
+// Self-hosted positive: block-scope defer (converted from reject_defer.ember
+// once Phase 3b added defer support). The defer runs at block exit, mutating x.
+// expect: 42
+fn main() -> i64 { let mut x: i64 = 40; { defer x = x + 2; } return x; }

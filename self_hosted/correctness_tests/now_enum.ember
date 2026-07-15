@@ -1,0 +1,6 @@
+// Self-hosted positive: untyped enum variants resolve to i64 constants (was reject -302).
+// `let s: i64 = State::On` binds s to the variant's i64 value (1); comparing
+// s == State::On compares i64 values. Mirrors src/sema.cpp untyped enums.
+// expect: 42
+enum State { Off = 0, On = 1 }
+fn main() -> i64 { let s: i64 = State::On; if (s == State::On) { return 42; } return 0; }

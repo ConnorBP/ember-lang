@@ -570,7 +570,26 @@ fn cg_int_bits(t: i64) -> i64 {
 // Non-integer / 64-bit types are a no-op. Called after every arithmetic op
 // and at every load/store boundary so a narrower-typed value stays canonical.
 fn cg_normalize_rax(t: i64) -> i64 {
-    if (cg_type_is_int(t) == 0) { return 0; }
+    if (cg_type_is_int(t) == 0) {
+        // Phase 3b: a typed-enum value normalizes to its BACKING integer width
+        // (mirror src/codegen.cpp's normalize_rax, where a typed-enum Type
+        // has struct_name="" so is_int() is true and it normalizes to the
+        // backing prim). The self-hosted cg_type_is_int excludes named types,
+        // so handle typed enums explicitly here.
+        if (is_typed_enum_type(t) == 0) { return 0; }
+        let bits: i64 = typed_enum_width(t);
+        if (bits == 64) { return 0; }
+        let is_u: i64 = typed_enum_is_uint(t);
+        if (bits == 32) {
+            if (is_u == 1) { cg_byte(0x89); cg_byte(0xC0); }       // mov eax,eax
+            else { cg_byte(0x48); cg_byte(0x63); cg_byte(0xC0); }  // movsxd rax,eax
+            return 0;
+        }
+        cg_byte(0x48); cg_byte(0xC1); cg_byte(0xE0); cg_byte(64 - bits);
+        if (is_u == 1) { cg_byte(0x48); cg_byte(0xC1); cg_byte(0xE8); cg_byte(64 - bits); }
+        else { cg_byte(0x48); cg_byte(0xC1); cg_byte(0xF8); cg_byte(64 - bits); }
+        return 0;
+    }
     let bits: i64 = cg_int_bits(t);
     if (bits == 64) { return 0; }
     if (bits == 32) {
@@ -598,6 +617,13 @@ fn cg_expr_type(e: i64) -> i64 {
     if (k == (NK::StringLit as i64)) { return TY_STRING; }
     if (k == (NK::IntLit as i64)) { return TY_I64; }
     if (k == (NK::BoolLit as i64)) { return TY_BOOL; }
+    // Phase 3b: an EnumAccess's type is the enum's type — TY_I64 for an
+    // untyped enum variant, or the typed-enum type for `enum E : T`.
+    if (k == (NK::EnumAccess as i64)) {
+        let ename: string = tok_name(nk_a(e));
+        if (is_typed_enum_name(ename) == 1) { return typed_enum_type(ename); }
+        return TY_I64;
+    }
     if (k == (NK::Ident as i64)) {
         let lt: i64 = cg_lookup_local_type(nk_tok(e));
         if (lt >= 0) { return lt; }
@@ -1169,6 +1195,12 @@ fn cg_init() -> i64 {
     cg_relocs = array_new(1, 0);
     cg_globals = array_new(8, 0);
     cg_globals_len = 0;
+    // Phase 3b: defer cleanup stack (reset per function in cg_compile_func).
+    g_defers = array_new(8, 0);
+    g_defer_marks = array_new(8, 0);
+    g_defer_mark_len = 0;
+    cg_cur_ret = -1;
+    cg_loop_defer_mark = 0;
     cg_err = 0;
     cg_errmsg = string_from_slice("");
     return 0;
@@ -1478,6 +1510,15 @@ fn cg_count_locals_stmt(s: i64, total: i64) -> i64 {
     if (k == (NK::MatchStmt as i64)) {
         let mut a: i64 = nk_b(s); while (a >= 0) { total = cg_count_locals_block(nk_b(a), total); a = nk_next(a); } return total;
     }
+    // Phase 3b: do-while + switch + defer locals.
+    if (k == (NK::DoWhileStmt as i64)) {
+        total = cg_count_locals_block(nk_a(s), total);   // body
+        return total;
+    }
+    if (k == (NK::SwitchStmt as i64)) {
+        let mut c: i64 = nk_b(s); while (c >= 0) { total = cg_count_locals_block(nk_b(c), total); c = nk_next(c); } return total;
+    }
+    // DeferStmt holds an expr (no locals of its own); nothing to count.
     return total;
 }
 
@@ -1531,6 +1572,14 @@ fn cg_eval(e: i64) -> i64 {
     if (k == (NK::StringLit as i64)) { return cg_eval_string_lit(e); }
     if (k == (NK::EnumAccess as i64)) {
         cg_mov_reg_imm64(RAX, cg_enum_value(tok_name(nk_a(e)), nk_name(e)));
+        // Phase 3b: a typed-enum variant normalizes to the backing width (a
+        // typed enum is a real type; its value is the backing int). An
+        // untyped enum variant is a plain i64 constant (no normalize needed).
+        let ename: string = tok_name(nk_a(e));
+        if (is_typed_enum_name(ename) == 1) {
+            let et: i64 = typed_enum_type(ename);
+            if (et >= 0) { cg_normalize_rax(et); }
+        }
         return 0;
     }
     if (k == (NK::FieldExpr as i64)) { return cg_eval_fieldexpr(e); }
@@ -2696,6 +2745,16 @@ fn cg_eval_castexpr(e: i64) -> i64 {
         cg_normalize_rax(to);
         return 0;
     }
+    // Phase 3b: typed-enum -> int cast (the explicit spelling of enum->backing
+    // widening). The operand's backing value is already in rax; normalize to
+    // the target int width. Mirrors src/codegen.cpp's CastExpr, where a
+    // typed-enum `from` has is_int() && struct_name.empty() so it lands in the
+    // plain int->int normalize_rax(to) path.
+    if (is_typed_enum_type(from) == 1 && cg_type_is_int(to) == 1) {
+        cg_eval(operand); if (cg_err != 0) { return 0; }
+        cg_normalize_rax(to);
+        return 0;
+    }
     // float -> float: cvtss2sd (f32->f64) or cvtsd2ss (f64->f32)
     if (ty_is_float(from) == 1 && ty_is_float(to) == 1) {
         cg_eval(operand); if (cg_err != 0) { return 0; }
@@ -2953,7 +3012,7 @@ fn cg_compile_stmt(s: i64) -> i64 {
         return 0;
     }
     if (k == (NK::ReturnStmt as i64)) {
-        // eval the value -> rax; jmp epilogue
+        // eval the value -> rax (or xmm0 for float, {rax,rdx} for slice)
         let val: i64 = nk_a(s);
         if (val >= 0) {
             cg_eval(val);
@@ -2961,6 +3020,11 @@ fn cg_compile_stmt(s: i64) -> i64 {
         } else {
             cg_mov_reg_imm64(RAX, 0);  // void return -> rax = 0
         }
+        // Phase 3b: emit all pending defers (LIFO) before exiting, stashing
+        // the return value across them (a defer may clobber rax/xmm0/rdx).
+        // Mirrors src/codegen.cpp's ReturnStmt emit_cleanups_to(0) + stash.
+        cg_defer_emit_all_and_stash();
+        if (cg_err != 0) { return 0; }
         // jmp to the function's epilogue label
         cg_jmp(cg_epilogue_label);
         return 0;
@@ -2975,22 +3039,35 @@ fn cg_compile_stmt(s: i64) -> i64 {
         return cg_compile_block(s);
     }
     if (k == (NK::BreakStmt as i64)) {
-        // jmp to the current loop's break label
+        // Phase 3b: clean up defers from scopes opened inside the current
+        // loop/switch (down to the saved defer-mark depth), then jmp to the
+        // break target. Mirrors src/codegen.cpp's break emit_cleanups_to.
         if (cg_loop_depth > 0) {
+            cg_defer_emit_to(cg_loop_defer_mark);
+            if (cg_err != 0) { return 0; }
             cg_jmp(cg_loop_break);
         }
         return 0;
     }
     if (k == (NK::ContinueStmt as i64)) {
-        // jmp to the current loop's continue label
+        // jmp to the current loop's continue label (after cleaning up the
+        // scopes opened inside the loop, mirroring src/codegen.cpp's continue).
         if (cg_loop_depth > 0) {
+            cg_defer_emit_to(cg_loop_defer_mark);
+            if (cg_err != 0) { return 0; }
             cg_jmp(cg_loop_continue);
         }
         return 0;
     }
     if (k == (NK::ForStmt as i64)) { return cg_compile_for(s); }
     if (k == (NK::ForEachStmt as i64)) { return cg_compile_foreach(s); }
+    if (k == (NK::DoWhileStmt as i64)) { return cg_compile_dowhile(s); }
+    if (k == (NK::SwitchStmt as i64)) { return cg_compile_switch(s); }
     if (k == (NK::MatchStmt as i64)) { return cg_compile_match(s); }
+    // Phase 3b: defer. Do NOT emit the expr inline; record it on the defer
+    // stack for the current scope so it runs (LIFO) at scope exit. Mirrors
+    // src/codegen.cpp's DeferStmt (which sets a per-site activation flag).
+    if (k == (NK::DeferStmt as i64)) { return cg_compile_defer(s); }
     // Phase 2 Step 6: static_assert produces NO codegen (sema resolved it:
     // true -> elided, false/non-const -> compile error that never reaches
     // codegen). Skip it before any dispatch, mirroring src/codegen.cpp.
@@ -3120,16 +3197,171 @@ global cg_loop_depth   : i64 = 0;
 global cg_loop_break   : i64 = 0;
 global cg_loop_continue: i64 = 0;
 
+// Phase 3b: lexical defer cleanup. A defer stack (g_defers) holds deferred
+// expr node indices in declaration order; a parallel mark stack
+// (g_defer_marks) records the g_defers length at each block entry, so a
+// block exit can emit + truncate exactly its own defers. break/continue/return
+// emit pending defers from the inner scopes outward (LIFO) before jumping,
+// mirroring src/codegen.cpp's cleanup-scope emission. cg_loop_defer_mark
+// records the defer-mark depth at the current loop/switch entry so break /
+// continue clean up only the scopes opened inside that loop/switch.
+global g_defers        : i64 = 0;   // array of deferred expr node indices
+global g_defer_marks   : i64 = 0;   // array of mark depths (g_defers length)
+global g_defer_mark_len: i64 = 0;   // live mark-stack depth
+global cg_cur_ret      : i64 = 0;   // current fn's resolved return type (-1 none)
+// per-loop/switch saved defer-mark depth, so break/continue clean up only the
+// scopes opened inside the current loop/switch (mirrors src/codegen.cpp's
+// cleanup_scopes.size() captured in the LoopFrame).
+global cg_loop_defer_mark: i64 = 0;
+
+// push a defer-scope mark: record the current g_defers length as the cleanup
+// boundary for the block about to be compiled.
+fn cg_defer_push_mark() -> i64 {
+    if (array_length(g_defer_marks) < g_defer_mark_len + 1) {
+        array_resize(g_defer_marks, g_defer_mark_len + 1);
+    }
+    array_set_i64(g_defer_marks, g_defer_mark_len, array_length(g_defers));
+    g_defer_mark_len = g_defer_mark_len + 1;
+    return 0;
+}
+
+// pop a defer-scope mark (after the block's defers have been emitted + the
+// stack truncated to the mark).
+fn cg_defer_pop_mark() -> i64 {
+    if (g_defer_mark_len > 0) { g_defer_mark_len = g_defer_mark_len - 1; }
+    return 0;
+}
+
+// record a deferred expr (the DeferStmt's expr) on the current scope's defer
+// stack. Emits NO code inline; the expr is emitted at scope exit. Mirrors
+// src/codegen.cpp's DeferStmt (which sets a per-site activation flag instead;
+// this stack form is semantically equivalent for the subset).
+fn cg_compile_defer(s: i64) -> i64 {
+    let expr: i64 = nk_a(s);
+    if (expr >= 0) {
+        array_push_i64(g_defers, expr);
+    }
+    return 0;
+}
+
+// emit the deferred exprs in the range [lo, hi) in REVERSE order (LIFO). Each
+// defer's expr is evaluated for its side effect (result discarded). Mirrors
+// src/codegen.cpp's emit_cleanup_scope (rbegin -> rend).
+fn cg_emit_defer_range(lo: i64, hi: i64) -> i64 {
+    let mut i: i64 = hi - 1;
+    while (i >= lo) {
+        cg_eval(array_get_i64(g_defers, i));
+        if (cg_err != 0) { return 0; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+// emit + truncate the current scope's defers (from its mark to the end of the
+// defer stack), then pop the mark. Used at a block's normal fallthrough exit.
+fn cg_defer_emit_scope() -> i64 {
+    if (g_defer_mark_len == 0) { return 0; }
+    let mark: i64 = array_get_i64(g_defer_marks, g_defer_mark_len - 1);
+    let end: i64 = array_length(g_defers);
+    cg_emit_defer_range(mark, end);
+    // truncate the defer stack back to the mark (this scope's defers are spent)
+    array_resize(g_defers, mark);
+    g_defer_mark_len = g_defer_mark_len - 1;
+    return 0;
+}
+
+// emit all pending defers (the whole stack) in reverse — used at a function
+// return. Mirrors src/codegen.cpp's emit_cleanups_to(0). The return value(s)
+// are already in rax (and rdx for a two-word / xmm0 for a float return); they
+// are stashed across the defer exprs (a defer may clobber rax/xmm0/rdx) and
+// restored after, matching the C++ stash/restore around emit_cleanups_to(0).
+fn cg_defer_emit_all_and_stash() -> i64 {
+    if (array_length(g_defers) == 0) { return 0; }
+    // stash the return value across the defers. i64 return -> rax; a float
+    // return -> xmm0; a slice/two-word return -> {rax, rdx}. Reserve a
+    // 16-byte temp on the stack (keeps rsp 16-aligned for any calls the
+    // defers make), matching the C++ sub rsp,16 stash.
+    let ret_ty: i64 = cg_cur_ret;
+    let mut is_float: i64 = 0;
+    let mut is_two_word: i64 = 0;
+    if (ret_ty >= 0) {
+        if (ty_is_float(ret_ty) == 1) { is_float = 1; }
+        if (nk_kind(ret_ty) == (NK::Type as i64) && nk_f(ret_ty) == 1) { is_two_word = 1; }
+    }
+    cg_sub_reg_imm32(RSP, 16);
+    if (is_float == 1) {
+        cg_store_float(0, XMM0, cg_float_is64_type(ret_ty));
+    } else {
+        cg_store_reg_mem(RSP, 0, RAX);
+        if (is_two_word == 1) { cg_store_reg_mem(RSP, 8, RDX); }
+    }
+    // emit the whole defer stack in reverse (LIFO), leaving it intact (a
+    // return exits the function; the stack is discarded with the frame).
+    cg_emit_defer_range(0, array_length(g_defers));
+    if (cg_err != 0) { return 0; }
+    // restore the return value(s)
+    if (is_float == 1) {
+        cg_load_float(XMM0, 0, cg_float_is64_type(ret_ty));
+    } else {
+        cg_load_reg_mem(RAX, RSP, 0);
+        if (is_two_word == 1) { cg_load_reg_mem(RDX, RSP, 8); }
+    }
+    cg_add_reg_imm32(RSP, 16);
+    return 0;
+}
+
+// emit defers from the current inner scopes down to (but not including) the
+// scope at `retain_mark_len`, truncating the stack as each scope's defers run.
+// Used by break/continue to clean up the scopes opened inside a loop/switch
+// before jumping to the loop's break/continue target. Mirrors src/codegen.cpp's
+// emit_cleanups_to(retained_depth).
+fn cg_defer_emit_to(retain_mark_len: i64) -> i64 {
+    while (g_defer_mark_len > retain_mark_len) {
+        let mark: i64 = array_get_i64(g_defer_marks, g_defer_mark_len - 1);
+        let end: i64 = array_length(g_defers);
+        cg_emit_defer_range(mark, end);
+        if (cg_err != 0) { return 0; }
+        array_resize(g_defers, mark);
+        g_defer_mark_len = g_defer_mark_len - 1;
+    }
+    return 0;
+}
+
 // compile a block: push scope, compile each stmt, pop scope.
 fn cg_compile_block(b: i64) -> i64 {
     if (b < 0) { return 0; }
     cg_push_scope();
+    // Phase 3b: this lexical Block owns one defer cleanup scope. Push a mark
+    // so defers declared inside run (LIFO) at the block's normal fallthrough
+    // exit, mirroring src/codegen.cpp's exec_block cleanup-scope push/pop.
+    cg_defer_push_mark();
     let mut s: i64 = nk_a(b);
     while (s >= 0) {
         cg_compile_stmt(s);
-        if (cg_err != 0) { cg_pop_scope(); return 0; }
+        if (cg_err != 0) { cg_defer_pop_mark(); cg_pop_scope(); return 0; }
         s = nk_next(s);
     }
+    // normal fallthrough: emit this scope's defers (LIFO) + truncate the stack
+    // to the mark, BEFORE popping the local scope (the defer exprs may
+    // reference locals whose frame slots are still live at runtime).
+    cg_defer_emit_scope();
+    cg_pop_scope();
+    return 0;
+}
+
+// Phase 3b: compile a bare linked list of stmts (a switch case body, which
+// the parser stores as nk_b(case) = first stmt, NOT a BlockStmt). Same
+// scope + defer-cleanup handling as cg_compile_block.
+fn cg_compile_stmtlist(first_stmt: i64) -> i64 {
+    cg_push_scope();
+    cg_defer_push_mark();
+    let mut s: i64 = first_stmt;
+    while (s >= 0) {
+        cg_compile_stmt(s);
+        if (cg_err != 0) { cg_defer_pop_mark(); cg_pop_scope(); return 0; }
+        s = nk_next(s);
+    }
+    cg_defer_emit_scope();
     cg_pop_scope();
     return 0;
 }
@@ -3183,9 +3415,11 @@ fn cg_compile_while(s: i64) -> i64 {
     let saved_depth: i64 = cg_loop_depth;
     let saved_break: i64 = cg_loop_break;
     let saved_cont: i64 = cg_loop_continue;
+    let saved_dmark: i64 = cg_loop_defer_mark;
     cg_loop_depth = 1;
     cg_loop_break = end;
     cg_loop_continue = top;
+    cg_loop_defer_mark = g_defer_mark_len;   // break/continue clean up only inner scopes
 
     cg_compile_block(body);
 
@@ -3193,6 +3427,7 @@ fn cg_compile_while(s: i64) -> i64 {
     cg_loop_depth = saved_depth;
     cg_loop_break = saved_break;
     cg_loop_continue = saved_cont;
+    cg_loop_defer_mark = saved_dmark;
     if (cg_err != 0) { return 0; }
 
     cg_jmp(top);                   // back-edge
@@ -3232,15 +3467,18 @@ fn cg_compile_for(s: i64) -> i64 {
     let saved_depth: i64 = cg_loop_depth;
     let saved_break: i64 = cg_loop_break;
     let saved_cont: i64 = cg_loop_continue;
+    let saved_dmark: i64 = cg_loop_defer_mark;
     cg_loop_depth = 1;
     cg_loop_break = end;
     cg_loop_continue = cont;
+    cg_loop_defer_mark = g_defer_mark_len;   // break/continue clean up only inner scopes
 
     cg_compile_block(body);
 
     cg_loop_depth = saved_depth;
     cg_loop_break = saved_break;
     cg_loop_continue = saved_cont;
+    cg_loop_defer_mark = saved_dmark;
     if (cg_err != 0) { cg_pop_scope(); return 0; }
 
     cg_bind(cont);
@@ -3336,15 +3574,18 @@ fn cg_compile_foreach(s: i64) -> i64 {
     let saved_depth: i64 = cg_loop_depth;
     let saved_break: i64 = cg_loop_break;
     let saved_cont: i64 = cg_loop_continue;
+    let saved_dmark: i64 = cg_loop_defer_mark;
     cg_loop_depth = 1;
     cg_loop_break = end;
     cg_loop_continue = latch;
+    cg_loop_defer_mark = g_defer_mark_len;   // break/continue clean up only inner scopes
     cg_push_scope();
     cg_compile_block(body);
     cg_pop_scope();
     cg_loop_depth = saved_depth;
     cg_loop_break = saved_break;
     cg_loop_continue = saved_cont;
+    cg_loop_defer_mark = saved_dmark;
     if (cg_err != 0) { return 0; }
 
     // latch: idx = idx + 1; jmp top
@@ -3381,6 +3622,137 @@ fn cg_compile_match(s: i64) -> i64 {
     cg_bind(end); cg_pop(RCX); return 0;
 }
 
+// Phase 3b: compile a do-while loop. Body runs first, then the cond is
+// tested; if nonzero, jump back to the body. break -> end, continue -> cond
+// (the condition is the latch, mirroring src/codegen.cpp's DoWhileStmt which
+// sets the continue target to `cond`). Mirrors src/codegen.cpp exactly:
+//   body: <body>; cond: eval cond; cmp rax,0; je end; jmp body; end:
+fn cg_compile_dowhile(s: i64) -> i64 {
+    let body: i64 = nk_a(s);
+    let cond: i64 = nk_b(s);
+
+    let body_l: i64 = cg_alloc_label();
+    let cond_l: i64 = cg_alloc_label();
+    let end: i64 = cg_alloc_label();
+
+    cg_bind(body_l);
+    // set up break/continue targets (continue -> cond label, break -> end)
+    let saved_depth: i64 = cg_loop_depth;
+    let saved_break: i64 = cg_loop_break;
+    let saved_cont: i64 = cg_loop_continue;
+    let saved_dmark: i64 = cg_loop_defer_mark;
+    cg_loop_depth = 1;
+    cg_loop_break = end;
+    cg_loop_continue = cond_l;
+    cg_loop_defer_mark = g_defer_mark_len;   // break/continue clean up only inner scopes
+
+    cg_compile_block(body);
+
+    cg_loop_depth = saved_depth;
+    cg_loop_break = saved_break;
+    cg_loop_continue = saved_cont;
+    cg_loop_defer_mark = saved_dmark;
+    if (cg_err != 0) { return 0; }
+
+    cg_bind(cond_l);
+    cg_eval(cond);
+    if (cg_err != 0) { return 0; }
+    cg_cmp_reg_imm32(RAX, 0);
+    cg_jcc(COND_E, end);          // cond == 0 -> exit
+    cg_jmp(body_l);               // back-edge
+    cg_bind(end);
+    return 0;
+}
+
+// Phase 3b: compile a switch. Dispatch prologue: eval the subject into rax,
+// hold it in a temp stack slot, compare against each non-default case value,
+// je to that case's body label. After all compares, jmp to the default's label
+// (or past everything). Case bodies are emitted back-to-back; each nonempty
+// case ends with break/return/continue (sema enforces no fallthrough), so an
+// implicit break-to-end is NOT inserted — the explicit terminator jumps. break
+// inside a case jumps to `end` (switch scopes break like a loop). continue
+// inside a case continues the ENCLOSING loop (switch does not override
+// cg_loop_continue), mirroring src/codegen.cpp's switch loop-frame
+// {continue=Label{0}, break=end}. Mirrors src/codegen.cpp's SwitchStmt.
+fn cg_compile_switch(s: i64) -> i64 {
+    let subj: i64 = nk_a(s);
+
+    // eval subject -> rax; stash in a temp stack slot across the compare chain
+    // (case value evals are immediate loads and don't clobber the slot, but a
+    // temp slot is robust + matches the C++ r10-volatile approach in spirit).
+    cg_eval(subj);
+    if (cg_err != 0) { return 0; }
+    cg_push(RAX);
+
+    // pre-allocate a body label per case + an end label
+    let end: i64 = cg_alloc_label();
+    let mut case_labels: i64 = array_new(8, 0);
+    let mut c: i64 = nk_b(s);
+    let mut nc: i64 = 0;
+    while (c >= 0) {
+        let lab: i64 = cg_alloc_label();
+        array_push_i64(case_labels, lab);
+        nc = nc + 1;
+        c = nk_next(c);
+    }
+
+    // compare chain: for each non-default case, eval the value, cmp with the
+    // stashed subject, je to that case's label. Track the default index.
+    let mut default_idx: i64 = -1;
+    c = nk_b(s);
+    let mut ci: i64 = 0;
+    while (c >= 0) {
+        if (nk_d(c) == 1) {
+            default_idx = ci;
+        } else {
+            cg_eval(nk_a(c));
+            if (cg_err != 0) { return 0; }
+            cg_mov_reg_reg(RCX, RAX);          // RCX = case value
+            cg_load_reg_mem(RAX, RSP, 0);       // RAX = stashed subject
+            cg_cmp_reg_reg(RAX, RCX);
+            cg_jcc(COND_E, array_get_i64(case_labels, ci));
+        }
+        ci = ci + 1;
+        c = nk_next(c);
+    }
+    // no case matched: jump to default (if any) or past the switch
+    if (default_idx >= 0) {
+        cg_jmp(array_get_i64(case_labels, default_idx));
+    } else {
+        cg_jmp(end);
+    }
+
+    // emit case bodies. Each case gets its own scope (cg_compile_block pushes
+    // one). break inside a case jumps to `end`; continue keeps the enclosing
+    // loop's continue target (we only set cg_loop_break, not continue).
+    c = nk_b(s);
+    ci = 0;
+    let saved_depth: i64 = cg_loop_depth;
+    let saved_break: i64 = cg_loop_break;
+    let saved_dmark: i64 = cg_loop_defer_mark;
+    cg_loop_depth = 1;
+    cg_loop_break = end;
+    cg_loop_defer_mark = g_defer_mark_len;   // break cleans up only inner scopes
+    while (c >= 0) {
+        cg_bind(array_get_i64(case_labels, ci));
+        // The parser stores a case body as a bare linked list of stmts
+        // (nk_b(c) = first stmt), NOT a BlockStmt. Compile it as its own
+        // scope + defer cleanup scope, mirroring cg_compile_block.
+        cg_compile_stmtlist(nk_b(c));
+        if (cg_err != 0) { cg_loop_depth = saved_depth; cg_loop_break = saved_break; cg_loop_defer_mark = saved_dmark; return 0; }
+        ci = ci + 1;
+        c = nk_next(c);
+    }
+    cg_loop_depth = saved_depth;
+    cg_loop_break = saved_break;
+    cg_loop_defer_mark = saved_dmark;
+
+    cg_bind(end);
+    // pop the stashed subject (restore rsp; discard into RCX)
+    cg_pop(RCX);
+    return 0;
+}
+
 // =============================================================================
 // function compilation.
 // =============================================================================
@@ -3395,6 +3767,15 @@ fn cg_count_extra_struct_slots(b: i64) -> i64 {
 fn cg_compile_func(fd: i64) -> i64 {
     // init the local table for this function
     cg_locals_init();
+    // Phase 3b: reset the defer cleanup stack for this function (defers are
+    // function-scoped) + record the resolved return type so a return can
+    // stash the right value across deferred exprs.
+    array_resize(g_defers, 0);
+    array_resize(g_defer_marks, 0);
+    g_defer_mark_len = 0;
+    cg_loop_defer_mark = 0;
+    let ret_ty_node: i64 = nk_b(fd);
+    if (ret_ty_node >= 0) { cg_cur_ret = resolve_type(ret_ty_node); } else { cg_cur_ret = TY_VOID; }
 
     // count params
     let mut param_count: i64 = 0;

@@ -1,0 +1,10 @@
+// Self-hosted positive: defer inside a loop body runs each iteration at the
+// body's fallthrough (per-iteration cleanup), reading the loop var at run time.
+// expect: 6
+global g: i64 = 0;
+fn bump(v: i64) -> i64 { g = g + v; return 0; }
+fn main() -> i64 {
+    let mut i: i64 = 0;
+    while (i < 3) { defer bump(i); i = i + 1; }
+    return g;
+}

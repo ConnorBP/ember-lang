@@ -303,7 +303,12 @@ fn test_expanded_features() -> i64 {
 
 fn test_unsupported_features() -> i64 {
     let mut r: i64 = 0;
-    r = reject("fn f(x: i64) -> i64 { switch (x) { default: return 0; } }", -305, 31041); if (r != 0) { return r; }
+    // Phase 3b: switch, do-while, and defer are now SUPPORTED (sema accepts
+    // them). Verify acceptance here; the remaining rejects below are the
+    // still-unsupported subset.
+    r = sema("fn f(x: i64) -> i64 { switch (x) { default: return 0; } }"); if (r != 0) { return 31040; }
+    r = sema("fn f() -> i64 { let mut i: i64 = 0; do { i = i + 1; } while (i < 3); return i; }"); if (r != 0) { return 31042; }
+    r = sema("fn f() -> i64 { defer f(); return 0; }"); if (r != 0) { return 31043; }
     r = reject("fn f() -> i64 { try { return 1; } catch (e) { return 0; } }", -306, 31051); if (r != 0) { return r; }
     r = reject("fn f() -> i64 { let x = fn() -> i64 { return 1; }; return 0; }", -307, 31061); if (r != 0) { return r; }
     r = reject("fn f() -> i64 { yield 1; return 0; }", -308, 31071); if (r != 0) { return r; }

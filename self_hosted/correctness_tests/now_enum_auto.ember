@@ -1,0 +1,5 @@
+// Self-hosted positive: auto-incremented untyped enum variants (Red=0, Green=1, Blue=2).
+// A variant without an explicit `= value` is prev+1 (first defaults to 0).
+// expect: 1
+enum Color { Red, Green, Blue }
+fn main() -> i64 { return Color::Green; }

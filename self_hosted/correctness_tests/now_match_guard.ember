@@ -1,0 +1,4 @@
+// Self-hosted positive: match arm with a guard (`pattern if cond => body`).
+// The guard is a bool expression checked after the literal pattern matches.
+// expect: 42
+fn main() -> i64 { let x: i64 = 5; match (x) { 5 if x > 3 => { return 42; }, 5 => { return 1; }, _ => { return 0; } } return 0; }

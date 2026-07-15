@@ -1,3 +1,0 @@
-// Native-valid, self-hosted out-of-subset rejection expected: -312.
-// selfhost-reject: -312
-fn main() -> i64 { let mut x: i64 = 40; { defer x = x + 2; } return x; }

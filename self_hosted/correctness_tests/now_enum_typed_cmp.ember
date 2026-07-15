@@ -1,0 +1,5 @@
+// Self-hosted positive: typed enum value comparison (e == E::B).
+// Both operands carry the typed-enum type; == compares backing values.
+// expect: 42
+enum E : i32 { A = 10, B = 20 }
+fn main() -> i64 { let e: E = E::B; if (e == E::B) { return 42; } return 0; }
