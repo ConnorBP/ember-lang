@@ -1,0 +1,10 @@
+// Self-hosted positive: two distinct same-length string literals.
+// Each materializes its own rodata addend + a distinct host string handle;
+// string_length of each is 3. Verifies distinct rodata slots + real handles.
+// expect: 42
+fn main() -> i64 {
+    let a = "abc";
+    let b = "xyz";
+    if (string_length(a) == 3 && string_length(b) == 3) { return 42; }
+    return 0;
+}

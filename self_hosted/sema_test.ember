@@ -133,10 +133,17 @@ fn test_for_loop() -> i64 {
     return 0;
 }
 
-// Test 11 — globals are parsed by Stage 2 but are outside the preview emitter.
+// Test 11 — constant-initialized i64 globals are now supported (Phase 1 data
+// section); a global with a constant i64 initializer type-checks (sema returns
+// 0). A global with a NON-constant initializer (e.g. an arithmetic expression)
+// stays out-of-subset (-317) until runtime init is added.
 fn test_global() -> i64 {
     let r: i64 = sema("global C: i64 = 7; fn main() -> i64 { return C; }");
-    if (r != -317) { return 11001; }
+    if (r != 0) { return 11000 + r; }
+    // a global with a non-constant initializer is out-of-subset (Phase 1 needs
+    // a compile-time constant IntLit/neg-IntLit to bake into the data section)
+    let r2: i64 = sema("global D: i64 = 1 + 2; fn main() -> i64 { return 0; }");
+    if (r2 != -317) { return 11001; }
     g_pass = g_pass + 1;
     return 0;
 }

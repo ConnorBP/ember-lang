@@ -1,0 +1,9 @@
+// Self-hosted positive: string_substr returns a real substring handle, then
+// string_length + string_char_at read it back. "emberlang" -> substr(5,4) =
+// "lang" (length 4, char_at(0)='l'=108). 4 + 108 = 112.
+// expect: 112
+fn main() -> i64 {
+    let s = "emberlang";
+    let sub = string_substr(s, 5, 4);
+    return string_length(sub) + string_char_at(sub, 0);
+}

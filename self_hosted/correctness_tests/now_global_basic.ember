@@ -1,0 +1,7 @@
+// Self-hosted positive: constant-initialized global read (data section).
+// `answer` is an i64 global initialized to 42; main reads it and returns it.
+// Exercises an ABS64_DATA read relocation. (Converted from reject_global.ember
+// once Phase 1 added constant-initialized global support.)
+// expect: 42
+global answer: i64 = 42;
+fn main() -> i64 { return answer; }

@@ -1,0 +1,9 @@
+// Self-hosted positive: string_char_at reads a real byte from a host string.
+// "ember" -> handle; char_at(0)='e'=101, char_at(4)='r'=114. Sum = 215.
+// expect: 215
+fn main() -> i64 {
+    let s = "ember";
+    let c0 = string_char_at(s, 0);
+    let c4 = string_char_at(s, 4);
+    return c0 + c4;
+}

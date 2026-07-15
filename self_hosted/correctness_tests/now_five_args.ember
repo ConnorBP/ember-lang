@@ -1,0 +1,5 @@
+// Self-hosted positive: more than four call arguments (Win64 stack args).
+// 5 i64 args summed; arg5 is passed on the stack at [rsp+32] (after shadow).
+// expect: 15
+fn sum5(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 { return a + b + c + d + e; }
+fn main() -> i64 { return sum5(1, 2, 3, 4, 5); }

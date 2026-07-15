@@ -1,0 +1,8 @@
+// Self-hosted positive: seven call arguments (Win64 stack args 5-7).
+// 7 i64 args; args 5-7 are on the stack. Weighted sum to distinguish arg order.
+// 1*1 + 2*2 + 3*3 + 4*4 + 5*5 + 6*6 + 7*7 = 1+4+9+16+25+36+49 = 140.
+// expect: 140
+fn wsum7(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64) -> i64 {
+    return a*1 + b*2 + c*3 + d*4 + e*5 + f*6 + g*7;
+}
+fn main() -> i64 { return wsum7(1, 2, 3, 4, 5, 6, 7); }

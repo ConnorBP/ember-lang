@@ -116,6 +116,30 @@ global cg_next_label : i64 = 0; // next label id
 global cg_labels   : i64 = 0;   // bound labels: stride 2 [ label_id, code_offset ]
 global cg_fixups   : i64 = 0;   // pending rel32 fixups: stride 2 [ code_offset, label_id ]
 
+// -----------------------------------------------------------------------------
+// EMBM v1 module image buffers (self_hosted/MODULE_IMAGE_FORMAT.md).
+// Parallel to cg_code: rodata (read-only literals), data (mutable globals),
+// syms (null-terminated native symbol names), relocs (32-byte records). The
+// codegen accumulates these during emission; codegen_emit_image() stitches
+// them into one array<u8> with an 80-byte header for load_executable_module.
+// -----------------------------------------------------------------------------
+global cg_rodata : i64 = 0;   // array<u8> — read-only literal bytes
+global cg_data   : i64 = 0;   // array<u8> — mutable global initial bytes
+global cg_syms   : i64 = 0;   // array<u8> — null-terminated symbol names (bytes)
+global cg_relocs : i64 = 0;   // array<u8> — 32-byte relocation records (bytes)
+
+// codegen global table: stride 2 [ name_tok, data_addend ]. Populated by
+// cg_compile_globals() from the program's constant-initialized GlobalDecls;
+// a global's data addend is its byte offset within cg_data (§5). Reads/writes
+// go through a relocated ABS64_DATA pointer.
+global cg_globals : i64 = 0;
+global cg_globals_len : i64 = 0;
+
+// relocation type constants (MODULE_IMAGE_FORMAT.md §7).
+global CG_RELOC_RODATA : i64 = 1;   // ABS64_RODATA: addend = rodata byte offset
+global CG_RELOC_DATA   : i64 = 2;   // ABS64_DATA:   addend = data byte offset
+global CG_RELOC_NATIVE : i64 = 3;   // ABS64_NATIVE: sym_idx = symbol index, addend = fingerprint
+
 // frame layout for the current function
 global cg_locals     : i64 = 0;   // stride 3 [name_tok, rbp_offset, type_node]
 global cg_local_len  : i64 = 0;   // logical length of cg_locals (for scope pop)
@@ -397,7 +421,14 @@ fn cg_expr_type(e: i64) -> i64 {
     if (k == (NK::StringLit as i64)) { return TY_STRING; }
     if (k == (NK::IntLit as i64)) { return TY_I64; }
     if (k == (NK::BoolLit as i64)) { return TY_BOOL; }
-    if (k == (NK::Ident as i64)) { return cg_lookup_local_type(nk_tok(e)); }
+    if (k == (NK::Ident as i64)) {
+        let lt: i64 = cg_lookup_local_type(nk_tok(e));
+        if (lt >= 0) { return lt; }
+        // not a local: a global's type (sema registered it; Phase 1 globals are i64)
+        let g: i64 = cg_find_global(nk_name(e));
+        if (g >= 0) { return TY_I64; }
+        return -1;
+    }
     if (k == (NK::FieldExpr as i64)) {
         let bt: i64 = cg_expr_type(nk_a(e));
         let row: i64 = find_struct(ty_struct_name(bt));
@@ -408,7 +439,95 @@ fn cg_expr_type(e: i64) -> i64 {
         if (op >= (BinOp::Eq as i64)) { return TY_BOOL; }
         return cg_expr_type(nk_a(e));
     }
+    if (k == (NK::CallExpr as i64)) {
+        // sema annotates a call's resolved return type in slot c (free for
+        // CallExpr) for both script + native calls. Read it for downstream
+        // type inference (e.g. `let s = string_substr(...)`).
+        let rt: i64 = nk_c(e);
+        if (rt >= 0) { return rt; }
+        return -1;
+    }
     return -1;
+}
+
+// =============================================================================
+// ABI type code + fingerprint (mirrors src/module_abi_fingerprint.hpp EXACTLY).
+// The codegen computes a native call's fingerprint from the call's arg types +
+// return type (annotated by sema) so the EMBM v1 loader's fingerprint check
+// passes. Type -> 6-bit code table (module_abi_fingerprint.hpp):
+//   0=void 1=i64 2=f64 3=f32 4=bool 5=slice 6=ptr/opaque(handle)
+//   7=i32 8=u8 9=u16 10=u32 11=u64 12=i8 13=i16 14=aggregate
+// A `string` is an opaque i64 handle (host bind_handle("string")) -> code 6.
+// =============================================================================
+
+// map a sema Type node to its 6-bit ABI code. Mirrors ember::type_code().
+fn cg_type_code(t: i64) -> i64 {
+    if (t < 0) { return 0; }   // void/missing -> 0
+    if (ty_is_string(t) == 1) { return 6; }   // string handle -> opaque ptr
+    if (ty_is_void(t) == 1)  { return 0; }
+    if (ty_is_i64(t) == 1)   { return 1; }
+    if (ty_is_bool(t) == 1)  { return 4; }
+    if (ty_is_float(t) == 1) {
+        if (cg_float_is64_type(t) == 1) { return 2; }   // f64
+        return 3;                                        // f32
+    }
+    // other ints (i32/u8/...): read the prim directly
+    if (nk_kind(t) == (NK::Type as i64) && nk_tok(t) < 0) {
+        let p: i64 = nk_d(t);
+        if (p == (Prim::I32 as i64)) { return 7; }
+        if (p == (Prim::U8  as i64)) { return 8; }
+        if (p == (Prim::U16 as i64)) { return 9; }
+        if (p == (Prim::U32 as i64)) { return 10; }
+        if (p == (Prim::U64 as i64)) { return 11; }
+        if (p == (Prim::I8  as i64)) { return 12; }
+        if (p == (Prim::I16 as i64)) { return 13; }
+    }
+    return 14;  // aggregate / fallback (named struct, fixed array)
+}
+
+// compute the u64 ABI fingerprint from a call's arg types + return type +
+// permission. Layout (module_abi_fingerprint.hpp §8, LSB-first):
+//   bits 0..3   param_count (saturated to 15)
+//   bits 4..27  up to 4 param type codes, 6 bits each (param i at 4+6i)
+//   bits 28..33 return type code (6 bits)
+//   bits 34..37 permission (0=none, 1=FFI)
+//   bits 38..63 reserved (zero)
+// `arg_types` is an i64 array (elem 8) of sema Type node indices; `argc` is the
+// count; `ret_type` is the return Type node; `perm` is the permission bits.
+fn cg_abi_fingerprint(arg_types: i64, argc: i64, ret_type: i64, perm: i64) -> i64 {
+    let mut pc: i64 = argc;
+    if (pc > 15) { pc = 15; }
+    let mut fp: i64 = pc & 0xF;
+    let mut i: i64 = 0;
+    while (i < pc && i < 4) {
+        let tc: i64 = cg_type_code(array_get_i64(arg_types, i)) & 0x3F;
+        fp = fp | (tc << (4 + 6 * i));
+        i = i + 1;
+    }
+    let rc: i64 = cg_type_code(ret_type) & 0x3F;
+    fp = fp | (rc << 28);
+    fp = fp | ((perm & 0xF) << 34);
+    return fp;
+}
+
+// the ABI fingerprint for a known native, computed from EXPLICIT type codes
+// (used for internal codegen calls like string_from_slice where sema never
+// type-checks the call, + for operator-overload natives like string_add whose
+// registered params are plain I64, not the handle type sema would infer).
+// param_codes is an i64 array of 6-bit codes; perm is the permission.
+fn cg_abi_fingerprint_codes(param_codes: i64, argc: i64, ret_code: i64, perm: i64) -> i64 {
+    let mut pc: i64 = argc;
+    if (pc > 15) { pc = 15; }
+    let mut fp: i64 = pc & 0xF;
+    let mut i: i64 = 0;
+    while (i < pc && i < 4) {
+        let tc: i64 = array_get_i64(param_codes, i) & 0x3F;
+        fp = fp | (tc << (4 + 6 * i));
+        i = i + 1;
+    }
+    fp = fp | ((ret_code & 0x3F) << 28);
+    fp = fp | ((perm & 0xF) << 34);
+    return fp;
 }
 
 // Convert the decimal token text into mantissa and decimal scale, then emit
@@ -685,8 +804,259 @@ fn cg_init() -> i64 {
     cg_labels = array_new(8, 0);
     cg_fixups = array_new(8, 0);
     cg_fn_labels = array_new(8, 0);
+    // EMBM v1 image buffers (reset alongside cg_code so every codegen() starts clean).
+    cg_rodata = array_new(1, 0);
+    cg_data   = array_new(1, 0);
+    cg_syms   = array_new(1, 0);
+    cg_relocs = array_new(1, 0);
+    cg_globals = array_new(8, 0);
+    cg_globals_len = 0;
     cg_err = 0;
     cg_errmsg = string_from_slice("");
+    return 0;
+}
+
+// =============================================================================
+// EMBM v1 image-buffer helpers (self_hosted/MODULE_IMAGE_FORMAT.md).
+// =============================================================================
+
+// append a u64 little-endian (8 bytes) into a byte array (array<u8>).
+fn cg_push_u64_le(buf: i64, v: i64) -> i64 {
+    array_push_u8(buf, v & 0xFF);
+    array_push_u8(buf, (v >> 8) & 0xFF);
+    array_push_u8(buf, (v >> 16) & 0xFF);
+    array_push_u8(buf, (v >> 24) & 0xFF);
+    array_push_u8(buf, (v >> 32) & 0xFF);
+    array_push_u8(buf, (v >> 40) & 0xFF);
+    array_push_u8(buf, (v >> 48) & 0xFF);
+    array_push_u8(buf, (v >> 56) & 0xFF);
+    return 0;
+}
+
+// append a u32 little-endian (4 bytes) into a byte array (array<u8>).
+fn cg_push_u32_le(buf: i64, v: i64) -> i64 {
+    array_push_u8(buf, v & 0xFF);
+    array_push_u8(buf, (v >> 8) & 0xFF);
+    array_push_u8(buf, (v >> 16) & 0xFF);
+    array_push_u8(buf, (v >> 24) & 0xFF);
+    return 0;
+}
+
+// allocate `n` bytes in cg_rodata (the bytes are left zero; the caller writes
+// them via array_set_u8 after this returns the addend). Returns the byte
+// offset (addend) within rodata where the allocation begins. Used by string
+// literals: emit the literal's decoded bytes here, then reference them via an
+// ABS64_RODATA reloc whose addend is this offset.
+fn cg_rodata_alloc(n: i64) -> i64 {
+    let addend: i64 = array_length(cg_rodata);
+    let mut i: i64 = 0;
+    while (i < n) { array_push_u8(cg_rodata, 0); i = i + 1; }
+    return addend;
+}
+
+// allocate `n` bytes in cg_data (mutable globals). Returns the byte addend.
+// The caller writes the initial bytes via array_set_u8 after this returns.
+fn cg_data_alloc(n: i64) -> i64 {
+    let addend: i64 = array_length(cg_data);
+    let mut i: i64 = 0;
+    while (i < n) { array_push_u8(cg_data, 0); i = i + 1; }
+    return addend;
+}
+
+// find or append a null-terminated symbol name in cg_syms. Returns the 0-based
+// symbol index. Scans the accumulated names (each null-terminated) comparing
+// byte-for-byte; appends name + '\0' if new. Used by ABS64_NATIVE relocs to
+// reference a native by index into the image's symbol-name table (§6).
+fn cg_sym_index(name: string) -> i64 {
+    let nlen: i64 = string_length(name);
+    let syms_len: i64 = array_length(cg_syms);
+    let mut idx: i64 = 0;
+    let mut i: i64 = 0;
+    while (i < syms_len) {
+        // read one null-terminated name starting at i
+        let mut j: i64 = i;
+        let mut match_ok: i64 = 1;
+        let mut k: i64 = 0;
+        while (k < nlen) {
+            let b: i64 = array_get_u8(cg_syms, j) as i64;
+            if (b != string_char_at(name, k)) { match_ok = 0; }
+            j = j + 1;
+            k = k + 1;
+            if (j >= syms_len) { match_ok = 0; }
+        }
+        if (match_ok == 1) {
+            // the byte after the name must be the null terminator
+            if (j < syms_len && (array_get_u8(cg_syms, j) as i64) == 0) { return idx; }
+            match_ok = 0;
+        }
+        // advance past this null-terminated name to the next
+        while (i < syms_len && (array_get_u8(cg_syms, i) as i64) != 0) { i = i + 1; }
+        i = i + 1;  // skip the null
+        idx = idx + 1;
+    }
+    // not found: append name + '\0'
+    let mut k: i64 = 0;
+    while (k < nlen) { array_push_u8(cg_syms, string_char_at(name, k)); k = k + 1; }
+    array_push_u8(cg_syms, 0);
+    return idx;
+}
+
+// record a 32-byte relocation record [type u64][patch_off u64][sym_idx u64][addend u64]
+// (all little-endian). patch_off is a byte offset WITHIN the code section of
+// the imm64 to patch. For NATIVE, sym_idx is the symbol index + addend is the
+// ABI fingerprint; for RODATA/DATA, sym_idx is 0 + addend is the section addend.
+fn cg_reloc(reloc_type: i64, patch_off: i64, sym_idx: i64, addend: i64) -> i64 {
+    cg_push_u64_le(cg_relocs, reloc_type);
+    cg_push_u64_le(cg_relocs, patch_off);
+    cg_push_u64_le(cg_relocs, sym_idx);
+    cg_push_u64_le(cg_relocs, addend);
+    return 0;
+}
+
+// emit a `mov reg, <ABS64 imm64>` placeholder (REX.W B8+rd + 8 zero bytes) and
+// record a relocation against the imm64's code offset. Returns the code offset
+// of the imm64 (for validation). The loader patches the 8 zero bytes with the
+// resolved absolute address (rodata_base+addend, data_base+addend, or native fn_ptr).
+fn cg_emit_abs64_reloc_reg(reg: i64, reloc_type: i64, sym_idx: i64, addend: i64) -> i64 {
+    // mov r64, imm64 -> REX.W B8+rd io
+    cg_byte(cg_rex(1, 0, 0, cg_is_extended(reg)));
+    cg_byte(0xB8 + (reg & 7));
+    let patch_off: i64 = array_length(cg_code);
+    cg_imm64(0);  // placeholder; the loader writes the resolved address here
+    cg_reloc(reloc_type, patch_off, sym_idx, addend);
+    return patch_off;
+}
+
+// convenience: `mov rax, <ABS64>` + reloc (the common case for native calls,
+// where rax holds the call target before `call rax`).
+fn cg_emit_abs64_reloc(reloc_type: i64, sym_idx: i64, addend: i64) -> i64 {
+    return cg_emit_abs64_reloc_reg(RAX, reloc_type, sym_idx, addend);
+}
+
+// build the EMBM v1 module image: 80-byte header + code + rodata + data +
+// symbols + relocations, concatenated into one array<u8>. Returns the image
+// handle. Replaces the old "return cg_code" contract (§10).
+fn codegen_emit_image() -> i64 {
+    let code_len: i64   = array_length(cg_code);
+    let rodata_len: i64 = array_length(cg_rodata);
+    let data_len: i64   = array_length(cg_data);
+    let syms_len: i64   = array_length(cg_syms);
+    let reloc_count: i64 = array_length(cg_relocs) / 32;  // 32 bytes per record
+
+    let header_size: i64 = 80;
+    let code_off: i64   = header_size;
+    let rodata_off: i64 = code_off + code_len;
+    let data_off: i64   = rodata_off + rodata_len;
+    let syms_off: i64   = data_off + data_len;
+    let relocs_off: i64 = syms_off + syms_len;  // relocations follow symbols
+
+    let img: i64 = array_new(1, 0);
+
+    // ---- 80-byte header (§2) ----
+    // magic "EMBM" = 0x45 0x4D 0x42 0x4D
+    array_push_u8(img, 0x45); array_push_u8(img, 0x4D); array_push_u8(img, 0x42); array_push_u8(img, 0x4D);
+    cg_push_u32_le(img, 1);           // version = 1
+    cg_push_u64_le(img, code_off);     // code_off
+    cg_push_u64_le(img, code_len);     // code_len
+    // a zero-length section gets off = 0 (the loader accepts off=0 for empty sections)
+    if (rodata_len > 0) { cg_push_u64_le(img, rodata_off); } else { cg_push_u64_le(img, 0); }
+    cg_push_u64_le(img, rodata_len);   // rodata_len
+    if (data_len > 0) { cg_push_u64_le(img, data_off); } else { cg_push_u64_le(img, 0); }
+    cg_push_u64_le(img, data_len);     // data_len
+    if (syms_len > 0) { cg_push_u64_le(img, syms_off); } else { cg_push_u64_le(img, 0); }
+    cg_push_u64_le(img, syms_len);     // syms_len
+    cg_push_u64_le(img, reloc_count);  // reloc_count
+
+    // ---- concatenate the sections ----
+    let mut i: i64 = 0;
+    while (i < code_len) { array_push_u8(img, array_get_u8(cg_code, i) as i64); i = i + 1; }
+    i = 0;
+    while (i < rodata_len) { array_push_u8(img, array_get_u8(cg_rodata, i) as i64); i = i + 1; }
+    i = 0;
+    while (i < data_len) { array_push_u8(img, array_get_u8(cg_data, i) as i64); i = i + 1; }
+    i = 0;
+    while (i < syms_len) { array_push_u8(img, array_get_u8(cg_syms, i) as i64); i = i + 1; }
+    i = 0;
+    while (i < array_length(cg_relocs)) { array_push_u8(img, array_get_u8(cg_relocs, i) as i64); i = i + 1; }
+
+    return img;
+}
+
+// =============================================================================
+// mutable globals (EMBM v1 §5 data section). A constant-initialized i64
+// global gets an 8-byte slot in cg_data (the initial value written LE), + a
+// (name -> data addend) entry in cg_globals. Reads/writes go through a
+// relocated ABS64_DATA pointer: `mov reg, <data_base+addend>` then load/store
+// through that pointer.
+// =============================================================================
+
+// evaluate a constant i64 expression at compile time (mirrors sema's
+// expr_is_const_i64). IntLit -> its value; unary negation -> -operand.
+fn cg_eval_const_i64(e: i64) -> i64 {
+    if (e < 0) { return 0; }
+    let k: i64 = nk_kind(e);
+    if (k == (NK::IntLit as i64)) { return nk_d(e); }
+    if (k == (NK::UnaryExpr as i64)) {
+        if (nk_d(e) == (UnOp::Neg as i64)) { return 0 - cg_eval_const_i64(nk_a(e)); }
+    }
+    return 0;
+}
+
+// find a codegen global by name. Returns the row index, or -1 if not declared.
+fn cg_find_global(name: string) -> i64 {
+    let mut i: i64 = 0;
+    while (i < cg_globals_len) {
+        let tok: i64 = array_get_i64(cg_globals, i * 2);
+        if (tok_name(tok) == name) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// a global's data-section byte addend (its slot offset within cg_data).
+fn cg_global_addend(row: i64) -> i64 {
+    return array_get_i64(cg_globals, row * 2 + 1);
+}
+
+// walk the program's GlobalDecls + allocate a data slot for each
+// constant-initialized i64 global (mirroring sema's global_is_const_i64 gate).
+// Writes the constant's 8 LE bytes into cg_data + records (name -> addend).
+// Must run BEFORE compiling functions so global references resolve.
+fn cg_compile_globals(prog: i64) -> i64 {
+    let mut d: i64 = nk_a(prog);
+    while (d >= 0) {
+        if (nk_kind(d) == (NK::GlobalDecl as i64)) {
+            // only constant-initialized i64 globals are registered by sema;
+            // mirror that gate here so the codegen allocates exactly those.
+            let gty: i64 = resolve_type(nk_a(d));
+            let init: i64 = nk_b(d);
+            let mut is_const: i64 = 0;
+            if (gty >= 0 && ty_is_i64(gty) == 1 && init >= 0) {
+                if (nk_kind(init) == (NK::IntLit as i64)) { is_const = 1; }
+                if (nk_kind(init) == (NK::UnaryExpr as i64) && nk_d(init) == (UnOp::Neg as i64)) {
+                    if (nk_kind(nk_a(init)) == (NK::IntLit as i64)) { is_const = 1; }
+                }
+            }
+            if (is_const == 1) {
+                let addend: i64 = cg_data_alloc(8);
+                let val: i64 = cg_eval_const_i64(init);
+                // write the 8 LE bytes of the initial value into cg_data
+                let mut b: i64 = 0;
+                while (b < 8) {
+                    array_set_u8(cg_data, addend + b, (val >> (b * 8)) & 0xFF);
+                    b = b + 1;
+                }
+                // record (name_tok -> addend)
+                if (array_length(cg_globals) < cg_globals_len + 2) {
+                    array_resize(cg_globals, cg_globals_len + 2);
+                }
+                array_set_i64(cg_globals, cg_globals_len, nk_tok(d));
+                array_set_i64(cg_globals, cg_globals_len + 1, addend);
+                cg_globals_len = cg_globals_len + 2;
+            }
+        }
+        d = nk_next(d);
+    }
     return 0;
 }
 
@@ -793,13 +1163,24 @@ fn cg_eval(e: i64) -> i64 {
     if (k == (NK::Ident as i64)) {
         // look up the local; load from [rbp + offset]
         let off: i64 = cg_lookup_local(nk_tok(e));
-        if (off == 0) {
-            if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: unknown local '") + nk_name(e) + string_from_slice("'"); }
+        if (off != 0) {
+            let t: i64 = cg_lookup_local_type(nk_tok(e));
+            if (ty_is_float(t) == 1) { cg_load_float(XMM0, off, cg_float_is64_type(t)); }
+            else { cg_load_reg_mem(RAX, RBP, off); }
             return 0;
         }
-        let t: i64 = cg_lookup_local_type(nk_tok(e));
-        if (ty_is_float(t) == 1) { cg_load_float(XMM0, off, cg_float_is64_type(t)); }
-        else { cg_load_reg_mem(RAX, RBP, off); }
+        // not a local: try a mutable global. Read through a relocated ABS64_DATA
+        // pointer: mov rax, <data_base+addend>; mov rax, [rax]. (Phase 1 globals
+        // are i64 only, so no float path here.)
+        let g: i64 = cg_find_global(nk_name(e));
+        if (g >= 0) {
+            let addend: i64 = cg_global_addend(g);
+            cg_emit_abs64_reloc_reg(RAX, CG_RELOC_DATA, 0, addend);  // mov rax, <data ptr>
+            // mov rax, [rax]  -> 48 8B 00 (load the i64 through the pointer)
+            cg_byte(0x48); cg_byte(0x8B); cg_byte(0x00);
+            return 0;
+        }
+        if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: unknown local '") + nk_name(e) + string_from_slice("'"); }
         return 0;
     }
     if (k == (NK::BinExpr as i64)) {
@@ -845,34 +1226,60 @@ fn cg_eval_fieldexpr(e: i64) -> i64 {
     return 0;
 }
 
-// String literals are materialized by calling the host's string_from_slice
-// through helper addresses supplied by full_pipeline. Strings therefore use
-// exactly the same opaque handles as ordinary Ember code.
+// String literals are materialized as REAL host string handles. A plain
+// "ember" literal is compiled to:
+//   1. emit the decoded bytes to cg_rodata (cg_rodata_alloc) -> addend
+//   2. build a u8 slice {ptr, len}: mov rcx, <rodata_base+addend> via an
+//      ABS64_RODATA reloc (ptr in rcx) + mov rdx, len (len in rdx)
+//   3. call string_from_slice(rcx=p, rdx=len) via an ABS64_NATIVE reloc ->
+//      returns an opaque i64 HANDLE in rax
+// That handle IS the string value (host owns a mutable std::string). This
+// interoperates with the host string natives (string_length / string_char_at /
+// string_substr take handles, not slices). The fingerprint for string_from_slice
+// is param0=u8 slice (code 5), ret=string handle (code 6), permission 0.
+//
+// f-strings (nk_d == 1) keep the legacy length-based representation for now
+// (no required test exercises an f-string in the compiled program); the host
+// f-string model is deferred.
 fn cg_eval_string_lit(e: i64) -> i64 {
     let raw: string = nk_name(e);
     if (nk_d(e) != 1) {
-        let mut start: i64 = 1; let mut n: i64 = string_length(raw) - 2;
-        if (string_length(raw) >= 7 && string_char_at(raw, 0) == 114) { start = 4; n = string_length(raw) - 7; }
-        let mut h: i64 = 0; let mut i: i64 = 0;
-        while (i < n) { h = (h * 31 + string_char_at(raw, start + i)) & 0x7FFFFFFFFFFFFF; i = i + 1; }
-        cg_mov_reg_imm64(RAX, (h << 8) | (n & 0xFF));
+        // plain string literal: real rodata + string_from_slice -> handle in rax
+        let body: string = nk_string_body(e);   // decoded body (quotes stripped)
+        let n: i64 = string_length(body);
+        // 1. emit the body bytes to cg_rodata
+        let addend: i64 = cg_rodata_alloc(n);
+        let mut i: i64 = 0;
+        while (i < n) {
+            array_set_u8(cg_rodata, addend + i, string_char_at(body, i));
+            i = i + 1;
+        }
+        // 2. build the u8 slice {ptr in rcx, len in rdx}
+        //    mov rcx, <rodata_base + addend>  (ABS64_RODATA reloc patches the ptr)
+        cg_emit_abs64_reloc_reg(RCX, CG_RELOC_RODATA, 0, addend);
+        //    mov rdx, len
+        cg_mov_reg_imm64(RDX, n);
+        // 3. call string_from_slice(rcx, rdx) -> handle in rax. Allocate a
+        //    32-byte Win64 shadow frame (16-byte aligned: the caller's prologue
+        //    leaves rsp 16-aligned at the call site, so sub rsp,32 keeps it
+        //    aligned) so the native has scratch space.
+        cg_sub_reg_imm32(RSP, 32);
+        //    fingerprint: param0 = u8 slice (code 5), ret = string handle (code 6), perm 0
+        let sym_idx: i64 = cg_sym_index(string_from_slice("string_from_slice"));
+        let codes: i64 = array_new(8, 1);
+        array_set_i64(codes, 0, 5);  // u8 slice
+        let fp: i64 = cg_abi_fingerprint_codes(codes, 1, 6, 0);
+        cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
+        cg_call_reg(RAX);  // call rax (FF D0)
+        cg_add_reg_imm32(RSP, 32);
         return 0;
     }
-    // Runtime representation for the compact self-hosted string subset is its
-    // length. Concatenation and string_length are consequently allocation-free.
-    // Count literal bytes plus decimal width of simple {identifier}/{integer}
-    // interpolation segments. The parser preserves the raw f-string token.
-    let mut literal_len: i64 = 0; let mut i: i64 = 2; let end: i64 = string_length(raw) - 1;
-    let mut expr_start: i64 = -1; let mut first_expr: i64 = 1;
-    while (i < end) {
-        let ch: i64 = string_char_at(raw, i);
-        if (ch == 123) { expr_start = i + 1; i = i + 1; while (i < end && string_char_at(raw, i) != 125) { i = i + 1; } let name: string = string_substr(raw, expr_start, i - expr_start); cg_eval_fstring_width(name); if (first_expr == 1) { cg_mov_reg_reg(R10, RAX); first_expr = 0; } else { cg_add_reg_reg(R10, RAX); } }
-        else { literal_len = literal_len + 1; }
-        i = i + 1;
-    }
-    if (first_expr == 1) { cg_mov_reg_imm64(RAX, literal_len & 0xFF); }
-    else { cg_mov_reg_reg(RAX, R10); cg_add_reg_imm32(RAX, literal_len); }
-    return 0;
+    // f-string: build a REAL host string handle by concatenating literal
+    // segments (string_from_slice) + i64 interpolation segments (string_from_i64)
+    // with string_add. The result is a real handle interoperable with the host
+    // string natives (string_length etc.). The caller (cg_eval_string_lit) has
+    // NOT allocated a frame; cg_eval_fstring_real allocates its own.
+    return cg_eval_fstring_real(e);
 }
 
 fn cg_lookup_local_name(name: string) -> i64 {
@@ -893,6 +1300,202 @@ fn cg_eval_fstring_width(name: string) -> i64 {
     return 0;
 }
 fn cg_decimal_width_step(limit: i64) -> i64 { let skip: i64 = cg_alloc_label(); cg_cmp_reg_imm32(R11, limit); cg_jcc(COND_L, skip); cg_add_reg_imm32(RAX, 1); cg_bind(skip); return 0; }
+
+// -----------------------------------------------------------------------------
+// real f-string materialization. Builds a host string handle by concatenating
+// literal segments (string_from_slice) + i64 interpolation segments
+// (string_from_i64) with string_add. The result handle is in rax.
+//
+// Frame layout (allocated once, 16-byte aligned at every call):
+//   [rsp + 0..31]  shadow space (reused by every segment-build + string_add call)
+//   [rsp + 32]     acc  — the accumulator handle (the string built so far)
+//   [rsp + 40]     seg  — the current segment handle
+// frame = 48 (round16(32 + 8 + 8)).
+//
+// Segment building emits a native call (string_from_slice / string_from_i64)
+// whose shadow space is [rsp+0..31]; acc/seg live above it at [rsp+32/40] so
+// they are never clobbered. string_add(acc, seg) reads acc/seg from those slots
+// + writes its shadow to [rsp+0..31], returning the new acc in rax.
+// -----------------------------------------------------------------------------
+
+// build a literal-segment string handle from `n` bytes already written to
+// cg_rodata at `addend`. Emits the u8 slice {rcx=ptr, rdx=len} + a
+// string_from_slice native call. Assumes a 32-byte shadow frame is already
+// allocated at [rsp+0..31] by the caller. Result handle in rax.
+fn cg_build_literal_seg(addend: i64, n: i64) -> i64 {
+    // mov rcx, <rodata_base + addend>  (ABS64_RODATA reloc patches the ptr)
+    cg_emit_abs64_reloc_reg(RCX, CG_RELOC_RODATA, 0, addend);
+    // mov rdx, len
+    cg_mov_reg_imm64(RDX, n);
+    // call string_from_slice(rcx, rdx) -> handle in rax
+    let sym_idx: i64 = cg_sym_index(string_from_slice("string_from_slice"));
+    let codes: i64 = array_new(8, 1);
+    array_set_i64(codes, 0, 5);  // u8 slice
+    let fp: i64 = cg_abi_fingerprint_codes(codes, 1, 6, 0);
+    cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
+    cg_call_reg(RAX);
+    return 0;
+}
+
+// build an i64 interpolation segment: load the i64 local `name` -> rax, then
+// call string_from_i64(rcx=value) -> handle in rax. Assumes a 32-byte shadow
+// frame is already allocated at [rsp+0..31]. Returns 0 on success, 1 if the
+// name is not a local (the caller treats that as a literal-integer segment).
+fn cg_build_i64_seg(name: string) -> i64 {
+    let off: i64 = cg_lookup_local_name(name);
+    if (off == 0) { return 1; }  // not a local
+    // load the i64 value -> rax; move to rcx (arg1)
+    cg_load_reg_mem(RAX, RBP, off);
+    cg_mov_reg_reg(RCX, RAX);
+    // call string_from_i64(rcx) -> handle in rax
+    // fingerprint: param0 = i64 (code 1), ret = string handle (code 6), perm 0
+    let sym_idx: i64 = cg_sym_index(string_from_slice("string_from_i64"));
+    let codes: i64 = array_new(8, 1);
+    array_set_i64(codes, 0, 1);  // i64
+    let fp: i64 = cg_abi_fingerprint_codes(codes, 1, 6, 0);
+    cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
+    cg_call_reg(RAX);
+    return 0;
+}
+
+// emit string_add(acc, seg): rcx = acc (from [rsp+32]), rdx = seg (from [rsp+40]),
+// call string_add -> new acc in rax. Assumes shadow at [rsp+0..31].
+fn cg_emit_string_add() -> i64 {
+    cg_load_reg_mem(RCX, RSP, 32);  // acc = arg1
+    cg_load_reg_mem(RDX, RSP, 40);  // seg = arg2
+    // string_add(i64, i64) -> handle. fingerprint: params {1,1}, ret 6, perm 0.
+    let sym_idx: i64 = cg_sym_index(string_from_slice("string_add"));
+    let codes: i64 = array_new(8, 2);
+    array_set_i64(codes, 0, 1); array_set_i64(codes, 1, 1);
+    let fp: i64 = cg_abi_fingerprint_codes(codes, 2, 6, 0);
+    cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
+    cg_call_reg(RAX);
+    return 0;
+}
+
+// Build a real f-string handle from the StringLit node `e` (nk_d == 1).
+// Parses the raw f-string token content (between the outer quotes) into literal
+// + {identifier} interpolation segments, builds each as a handle, and
+// concatenates them with string_add. Result handle in rax.
+fn cg_eval_fstring_real(e: i64) -> i64 {
+    let raw: string = nk_name(e);  // raw token text, e.g. f"v={n}"
+    let rlen: i64 = string_length(raw);
+    // content lies between index 2 (after f") and rlen-1 (before the closing ")
+    let start_idx: i64 = 2;
+    let end_idx: i64 = rlen - 1;
+    if (end_idx <= start_idx) {
+        // empty f-string: build an empty handle via string_from_slice("")
+        let frame: i64 = 32;
+        cg_sub_reg_imm32(RSP, frame);
+        cg_build_literal_seg(cg_rodata_alloc(0), 0);
+        cg_add_reg_imm32(RSP, frame);
+        return 0;
+    }
+    // allocate the f-string frame: 32 shadow + 8 acc + 8 seg = 48
+    let frame: i64 = 48;
+    cg_sub_reg_imm32(RSP, frame);
+
+    let mut i: i64 = start_idx;
+    let mut have_acc: i64 = 0;  // has the first segment been built into acc?
+    // accumulate a literal run's bytes into cg_rodata, then build a segment
+    let mut lit_addend: i64 = 0;
+    let mut lit_len: i64 = 0;
+    let mut lit_started: i64 = 0;
+    while (i < end_idx) {
+        let ch: i64 = string_char_at(raw, i);
+        if (ch == 123) {  // '{'
+            if (i + 1 < end_idx && string_char_at(raw, i + 1) == 123) {
+                // '{{' -> literal '{'
+                if (lit_started == 0) { lit_addend = array_length(cg_rodata); lit_started = 1; }
+                array_push_u8(cg_rodata, 123); lit_len = lit_len + 1;
+                i = i + 2;
+                continue;
+            }
+            // flush any pending literal run into a segment first
+            if (lit_started == 1) {
+                cg_build_literal_seg(lit_addend, lit_len);
+                cg_store_reg_mem(RSP, 40, RAX);  // seg
+                if (have_acc == 0) {
+                    cg_store_reg_mem(RSP, 32, RAX); have_acc = 1;  // acc = first seg
+                } else {
+                    cg_emit_string_add(); cg_store_reg_mem(RSP, 32, RAX);  // acc = acc + seg
+                }
+                lit_started = 0; lit_len = 0;
+            }
+            // parse the interpolation {name}
+            let expr_start: i64 = i + 1;
+            i = i + 1;
+            while (i < end_idx && string_char_at(raw, i) != 125) { i = i + 1; }
+            let name: string = string_substr(raw, expr_start, i - expr_start);
+            // i now at '}' (or end); skip it
+            if (i < end_idx) { i = i + 1; }
+            // build the interpolation segment. Try i64 local first; if not a
+            // local, parse the name as a decimal integer + build it as i64.
+            let built: i64 = cg_build_i64_seg(name);
+            if (built != 0) {
+                // not a local: parse name as a decimal integer literal
+                let mut v: i64 = 0; let mut k: i64 = 0;
+                while (k < string_length(name)) {
+                    let dc: i64 = string_char_at(name, k);
+                    if (dc >= 48 && dc <= 57) { v = v * 10 + dc - 48; }
+                    k = k + 1;
+                }
+                cg_mov_reg_imm64(RAX, v);
+                cg_mov_reg_reg(RCX, RAX);
+                let sym_idx: i64 = cg_sym_index(string_from_slice("string_from_i64"));
+                let codes: i64 = array_new(8, 1);
+                array_set_i64(codes, 0, 1);
+                let fp: i64 = cg_abi_fingerprint_codes(codes, 1, 6, 0);
+                cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
+                cg_call_reg(RAX);
+            }
+            cg_store_reg_mem(RSP, 40, RAX);  // seg
+            if (have_acc == 0) {
+                cg_store_reg_mem(RSP, 32, RAX); have_acc = 1;
+            } else {
+                cg_emit_string_add(); cg_store_reg_mem(RSP, 32, RAX);
+            }
+            continue;
+        }
+        if (ch == 125) {  // '}'
+            if (i + 1 < end_idx && string_char_at(raw, i + 1) == 125) {
+                // '}}' -> literal '}'
+                if (lit_started == 0) { lit_addend = array_length(cg_rodata); lit_started = 1; }
+                array_push_u8(cg_rodata, 125); lit_len = lit_len + 1;
+                i = i + 2;
+                continue;
+            }
+            // unmatched '}' — emit as literal
+            if (lit_started == 0) { lit_addend = array_length(cg_rodata); lit_started = 1; }
+            array_push_u8(cg_rodata, 125); lit_len = lit_len + 1;
+            i = i + 1;
+            continue;
+        }
+        // ordinary literal char
+        if (lit_started == 0) { lit_addend = array_length(cg_rodata); lit_started = 1; }
+        array_push_u8(cg_rodata, ch); lit_len = lit_len + 1;
+        i = i + 1;
+    }
+    // flush any trailing literal run
+    if (lit_started == 1) {
+        cg_build_literal_seg(lit_addend, lit_len);
+        cg_store_reg_mem(RSP, 40, RAX);
+        if (have_acc == 0) {
+            cg_store_reg_mem(RSP, 32, RAX); have_acc = 1;
+        } else {
+            cg_emit_string_add(); cg_store_reg_mem(RSP, 32, RAX);
+        }
+    }
+    // if no segments at all (e.g. empty content), build an empty handle
+    if (have_acc == 0) {
+        cg_build_literal_seg(cg_rodata_alloc(0), 0);
+        cg_store_reg_mem(RSP, 32, RAX); have_acc = 1;
+    }
+    // result = acc
+    cg_load_reg_mem(RAX, RSP, 32);
+    cg_add_reg_imm32(RSP, frame);
+    return 0;
+}
 
 // evaluate a binary expression. lhs -> rax, push; rhs -> rax, mov rcx rax;
 // pop rax (lhs); apply op (result in rax).
@@ -1009,22 +1612,52 @@ fn cg_eval_float_binexpr(e: i64, t: i64) -> i64 {
 }
 fn if64_prefix(is64: i64) -> i64 { if (is64 == 1) { return 0xF2; } return 0xF3; }
 
+// evaluate a binary expression whose operands are strings (real host handles).
+// `string + string` concatenates via the string_add native (an operator
+// overload published into the host's native allowlist under name "string_add");
+// `==` / `!=` compare content via string_eq. Both take (i64 handle, i64 handle)
+// and are emitted as ABS64_NATIVE relocations. The registered overload sigs use
+// plain I64 params (code 1) + a handle/bool return, so the fingerprint is
+// computed from explicit codes (not the string arg type, which would code 6).
+// A proper Win64 call frame (32-byte shadow + 16-byte alignment) is allocated
+// so the native has scratch space.
 fn cg_eval_string_binexpr(e: i64) -> i64 {
     let op: i64 = nk_d(e);
-    cg_eval(nk_a(e)); cg_push(RAX); cg_eval(nk_b(e)); cg_mov_reg_reg(RCX, RAX); cg_pop(RAX);
+    // call_frame = round16(2*8 + 32) = 48 (2 arg temps + 32-byte shadow)
+    let call_frame: i64 = cg_round16(2 * 8 + 32);
+    cg_sub_reg_imm32(RSP, call_frame);
+    // eval lhs -> rax; store to [rsp+0]
+    cg_eval(nk_a(e)); if (cg_err != 0) { cg_add_reg_imm32(RSP, call_frame); return 0; }
+    cg_store_reg_mem(RSP, 0, RAX);
+    // eval rhs -> rax; store to [rsp+8]
+    cg_eval(nk_b(e)); if (cg_err != 0) { cg_add_reg_imm32(RSP, call_frame); return 0; }
+    cg_store_reg_mem(RSP, 8, RAX);
+    // load args: rcx = lhs (arg1), rdx = rhs (arg2)
+    cg_load_reg_mem(RCX, RSP, 0);
+    cg_load_reg_mem(RDX, RSP, 8);
     if (op == (BinOp::Add as i64)) {
-        // repr = (polynomial-hash << 8) | byte-length. Extend the lhs hash by
-        // rhs.length base-31 digits, then add rhs hash. This makes concat
-        // compare equal to the corresponding literal without allocations.
-        cg_mov_reg_reg(RDX, RCX); cg_mov_reg_imm64(R11, 0xFF); cg_and_reg_reg(RDX, R11);
-        cg_mov_reg_reg(R10, RAX); cg_shift_right_imm8(R10, 8);
-        cg_mov_reg_reg(R11, RCX); cg_shift_right_imm8(R11, 8);
-        cg_mov_reg_imm64(RCX, 0xFF); cg_and_reg_reg(RAX, RCX); cg_add_reg_reg(RAX, RDX); cg_push(RAX);
-        let top: i64 = cg_alloc_label(); let done: i64 = cg_alloc_label(); cg_bind(top); cg_cmp_reg_imm32(RDX, 0); cg_jcc(COND_E, done); cg_mov_reg_imm64(RCX, 31); cg_imul_reg_reg(R10, RCX); cg_sub_reg_imm32(RDX, 1); cg_jmp(top); cg_bind(done);
-        cg_add_reg_reg(R10, R11); cg_mov_reg_imm64(RCX, 0x7FFFFFFFFFFFFF); cg_and_reg_reg(R10, RCX);
-        cg_pop(RAX); cg_mov_reg_reg(RDX, R10); cg_shift_left_imm8(RDX, 8); cg_or_reg_reg(RAX, RDX); return 0;
+        // string_add(i64, i64) -> string handle. fingerprint: params {1,1}, ret 6, perm 0.
+        let sym_idx: i64 = cg_sym_index(string_from_slice("string_add"));
+        let codes: i64 = array_new(8, 2);
+        array_set_i64(codes, 0, 1); array_set_i64(codes, 1, 1);  // i64, i64
+        let fp: i64 = cg_abi_fingerprint_codes(codes, 2, 6, 0);
+        cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
+        cg_call_reg(RAX);  // call rax -> handle in rax
+        cg_add_reg_imm32(RSP, call_frame);
+        return 0;
     }
-    cg_cmp_reg_reg(RAX, RCX); let mut cc: i64 = COND_E; if (op == (BinOp::Neq as i64)) { cc = COND_NE; } cg_setcc_al(cc); cg_movzx_rax_al();
+    // == / != : string_eq(i64, i64) -> bool (0/1). fingerprint: params {1,1}, ret 4 (bool), perm 0.
+    let sym_idx: i64 = cg_sym_index(string_from_slice("string_eq"));
+    let codes: i64 = array_new(8, 2);
+    array_set_i64(codes, 0, 1); array_set_i64(codes, 1, 1);  // i64, i64
+    let fp: i64 = cg_abi_fingerprint_codes(codes, 2, 4, 0);
+    cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
+    cg_call_reg(RAX);  // call rax -> 0/1 in rax
+    cg_add_reg_imm32(RSP, call_frame);
+    if (op == (BinOp::Neq as i64)) {
+        // logical not of the bool result: rax = (rax == 0) ? 1 : 0
+        cg_cmp_reg_imm32(RAX, 0); cg_setcc_al(COND_E); cg_movzx_rax_al();
+    }
     return 0;
 }
 
@@ -1127,55 +1760,67 @@ fn cg_eval_assignexpr(e: i64) -> i64 {
     cg_eval(value);
     if (cg_err != 0) { return 0; }
 
-    // store rax to [rbp + off]
+    // store rax to the target. Try a local first ([rbp + off]); if not a
+    // local, store through a relocated ABS64_DATA pointer (mutable global).
     let off: i64 = cg_lookup_local(nk_tok(target));
-    if (off == 0) {
-        if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: assignment to unknown local '") + nk_name(target) + string_from_slice("'"); }
+    if (off != 0) {
+        cg_store_reg_mem(RBP, off, RAX);
         return 0;
     }
-    cg_store_reg_mem(RBP, off, RAX);
+    let g: i64 = cg_find_global(nk_name(target));
+    if (g >= 0) {
+        // mov rcx, <data_base + addend>  (ABS64_DATA reloc patches the ptr)
+        // mov [rcx], rax  -> 48 89 01 (store rax through the pointer)
+        // rax holds the value (the mov rcx imm64 does not clobber rax).
+        let addend: i64 = cg_global_addend(g);
+        cg_emit_abs64_reloc_reg(RCX, CG_RELOC_DATA, 0, addend);
+        cg_byte(0x48); cg_byte(0x89); cg_byte(0x01);  // mov [rcx], rax
+        return 0;
+    }
+    if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: assignment to unknown local '") + nk_name(target) + string_from_slice("'"); }
     return 0;
 }
 
 // evaluate a call expression.
-// v1: up to 4 i64 args in rcx/rdx/r8/r9 (Win64). The call target is a script
-// function; we emit a direct `call rel32` to the callee's entry label, which
-// cg_resolve_fixups patches to the callee's real prologue offset within the
-// same code buffer after all fns are compiled. Because every fn lives in one
-// contiguous executable page (make_executable copies the whole buffer), a
-// relative call between fns resolves correctly without any host patching.
+// Two call kinds:
+//   - SCRIPT call: find_fn(name) >= 0. Emit a direct `call rel32` to the
+//     callee's entry label (patched by cg_resolve_fixups to the callee's
+//     prologue offset within the same code section). The loader does NOT touch
+//     rel32 — it resolves within the RX code region.
+//   - NATIVE call: find_fn(name) < 0 (a host extension native). Eval args into
+//     rcx/rdx/r8/r9 (Win64), then emit `mov rax, 0` + an ABS64_NATIVE reloc
+//     (sym_idx = cg_sym_index(name), addend = the ABI fingerprint) + `call rax`.
+//     The loader resolves the symbol against the host's registered NativeSig
+//     table, validates the fingerprint, and patches the imm64 with the native's
+//     fn_ptr. The fingerprint is computed from the call's arg types + return
+//     type (annotated by sema) using the EXACT type-code table
+//     (module_abi_fingerprint.hpp), so it matches the host's registered sig.
+//
+// Win64: first 4 int args in rcx/rdx/r8/r9. Args are eval'd into stack temps
+// first (eval may clobber a placed register), then loaded into registers in
+// order — the same stash-then-load pattern the C++ codegen uses.
 fn cg_eval_callexpr(e: i64) -> i64 {
     let name: string = nk_name(e);
-    if (name == string_from_slice("string_length")) { cg_eval(nk_a(e)); cg_mov_reg_imm64(RCX, 0xFF); cg_and_reg_reg(RAX, RCX); return 0; }
     let fn_row: i64 = find_fn(name);
-    if (fn_row < 0) {
-        if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: call to unknown function '") + name + string_from_slice("'"); }
-        return 0;
-    }
+    let mut is_native: i64 = 0;
+    if (fn_row < 0) { is_native = 1; }
 
     // count args + collect them (walk the sibling chain via nk_next)
-    let mut args: i64 = array_new(8, 4);  // up to 4 arg node indices
+    let mut args: i64 = array_new(8, 16);  // arg node indices (allow >4 for step 4)
     let mut argc: i64 = 0;
     let mut a: i64 = nk_a(e);
     while (a >= 0) {
-        if (argc < 4) {
-            array_set_i64(args, argc, a);
-        }
+        if (argc < 16) { array_set_i64(args, argc, a); }
         argc = argc + 1;
         a = nk_next(a);
     }
-    if (argc > 4) {
-        if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: v1 supports at most 4 call args"); }
-        return 0;
-    }
+    // Win64: first 4 int args in rcx/rdx/r8/r9; args 5+ are passed on the stack
+    // at [rsp+32 + (i-4)*8] (after the 32-byte shadow space). The temp layout
+    // below stores arg i at [rsp + i*8], so args 5+ (i >= 4) already land at the
+    // correct stack-arg positions; args 0-3 are loaded into registers. No arity
+    // cap (Step 4 lifts the v1 4-arg limit).
 
     // Win64 calling convention: first 4 int args in rcx, rdx, r8, r9.
-    // We need to eval each arg + place it in the right register. The challenge
-    // is that evaluating arg[i] may clobber a previously-placed register. So:
-    // eval all args into stack temps first, then load them into registers in
-    // order. This is simpler + always correct (the C++ codegen does the same
-    // stash-then-load pattern).
-    //
     // Stack layout for the call (after sub rsp, call_frame):
     //   [rsp + 0]      = arg 0 (temp)
     //   [rsp + 8]      = arg 1 (temp)
@@ -1207,12 +1852,36 @@ fn cg_eval_callexpr(e: i64) -> i64 {
     if (argc >= 3) { cg_load_reg_mem(R8, RSP, 16); }
     if (argc >= 4) { cg_load_reg_mem(R9, RSP, 24); }
 
-    // call the target: a direct call rel32 to the callee's entry label.
+    if (is_native == 1) {
+        // NATIVE call: mov rax, <fn_ptr> via ABS64_NATIVE reloc + call rax.
+        // The fingerprint is computed from the call's arg types + return type
+        // (sema annotated the return type in slot c). Permission is 0 for the
+        // string natives (the host registers them with permission 0; the loader
+        // computes the fingerprint from the registered sig with perm 0).
+        let sym_idx: i64 = cg_sym_index(name);
+        // collect arg type nodes for the fingerprint
+        let arg_types: i64 = array_new(8, 4);
+        let mut j: i64 = 0;
+        while (j < argc) {
+            array_set_i64(arg_types, j, cg_expr_type(array_get_i64(args, j)));
+            j = j + 1;
+        }
+        let ret_type: i64 = nk_c(e);   // sema-annotated return type
+        let fp: i64 = cg_abi_fingerprint(arg_types, argc, ret_type, 0);
+        cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
+        cg_call_reg(RAX);  // call rax (FF D0)
+        // add rsp, call_frame (restore the stack)
+        cg_add_reg_imm32(RSP, call_frame);
+        // result (i64 or handle) is in rax
+        return 0;
+    }
+
+    // SCRIPT call: a direct call rel32 to the callee's entry label.
     // cg_fn_labels maps the callee's name to a label bound at its prologue
     // offset; the rel32 fixup is patched after all fns are compiled. This
-    // resolves to the callee's real entry within the same executable page, so
-    // multi-fn programs execute correctly under make_executable (which copies
-    // bytes verbatim and does not patch placeholders).
+    // resolves to the callee's real entry within the same code region, so
+    // multi-fn programs execute correctly (the loader copies the code section
+    // verbatim and does not patch rel32).
     let callee_label: i64 = cg_lookup_fn_label(name);
     if (callee_label < 0) {
         if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: no entry label for function '") + name + string_from_slice("'"); }
@@ -1515,9 +2184,17 @@ fn cg_compile_func(fd: i64) -> i64 {
         let pt: i64 = resolve_type(nk_a(p));
         let off: i64 = cg_alloc_local_t(nk_tok(p), pt, 1);
         if (pi < 4) {
+            // first 4 int args arrive in rcx/rdx/r8/r9; spill to the local slot
             let reg: i64 = array_get_i64(arg_regs, pi);
             if (ty_is_float(pt) == 1) { cg_store_float(off, pi, cg_float_is64_type(pt)); }
             else { cg_store_reg_mem(RBP, off, reg); }
+        } else {
+            // args 5+ were passed on the caller's stack at [rbp + 48 + (pi-4)*8]
+            // (32-byte shadow at [rbp+16..47] + return addr at [rbp+8] + saved
+            // rbp at [rbp+0]). Load from there into the local slot (via rax).
+            let src_off: i64 = 48 + (pi - 4) * 8;
+            cg_load_reg_mem(RAX, RBP, src_off);
+            cg_store_reg_mem(RBP, off, RAX);
         }
         pi = pi + 1;
         p = nk_next(p);
@@ -1592,6 +2269,12 @@ fn codegen(source: string) -> i64 {
         cg_errmsg = string_from_slice("codegen: no program node found");
         return 0;
     }
+
+    // Allocate the data-section slots for constant-initialized i64 globals
+    // BEFORE compiling functions, so global references in fn bodies resolve
+    // to their data addend. Each global gets 8 bytes in cg_data + a
+    // (name -> addend) entry in cg_globals (§5).
+    cg_compile_globals(prog);
 
     // Allocate an entry label for every function up front, so a call to a fn
     // declared later (forward reference) gets a fixup for a label that will be

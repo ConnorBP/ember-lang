@@ -1,0 +1,6 @@
+// Self-hosted positive: mutable global with a constant initializer (data section).
+// `g` is an i64 global initialized to 10; main reads it, adds 32, writes it
+// back, and returns it. Exercises ABS64_DATA read + write relocations.
+// expect: 42
+global g: i64 = 10;
+fn main() -> i64 { g = g + 32; return g; }

@@ -121,28 +121,36 @@ fn compile_and_run(source: string) -> i64 {
     // entry label per fn at its prologue offset; codegen_fn_entry_offset
     // returns it by name. For a single-fn program this is 0 (the only fn);
     // for a multi-fn program (helper fns declared before main) it is main's
-    // prologue offset, and we call page_ptr + offset to invoke main — not
-    // the first fn.
+    // prologue offset, and we call code_base + offset to invoke main.
     let main_off: i64 = codegen_fn_entry_offset(string_from_slice("main"));
     if (main_off < 0) { return -502; }
 
-    // ---- Execute the emitted x64 bytes via the host natives ----
-    // make_executable copies the array<u8> to a W^X executable page (RW ->
-    // memcpy -> seal RX) and returns the page base pointer (0 on failure).
-    let ptr: i64 = make_executable(bytes);
-    if (ptr == 0) { return -501; }
+    // ---- Build the EMBM v1 module image + load it via the host loader ----
+    // codegen_emit_image() stitches the 80-byte header + code + rodata + data
+    // + symbols + relocations into one array<u8> (replacing the bare code-blob
+    // contract). load_executable_module parses it, allocates stable RX/R/RW
+    // regions, applies the ABS64 relocations (rodata/data/native calls), and
+    // returns an opaque owning handle (0 on any validation failure). This
+    // replaces make_executable so the self-hosted compiler can emit real string
+    // literals (rodata), mutable globals (data), and native/extension calls.
+    let img: i64 = codegen_emit_image();
+    let h: i64 = load_executable_module(img);
+    if (h == 0) { return -501; }
 
-    // call_raw casts (ptr + main_off) to int64_t(*)(int64_t) and calls it.
-    // The compiled `main` takes no real args (the one i64 arg is ignored)
-    // and returns its result in rax, which call_raw reads back. Calls from
-    // main to other fns in the same program resolve via in-buffer call rel32
-    // (patched by cg_resolve_fixups to each callee's entry offset), so a
-    // multi-fn program runs end-to-end. This is the moment the self-hosted
-    // compiler's output actually RUNS.
-    let result: i64 = call_raw(ptr + main_off, 0);
+    // module_entry_ptr validates the handle + code_offset and returns
+    // code_base + main_off (the executable entry for `main`). 0 on failure.
+    let entry: i64 = module_entry_ptr(h, main_off);
+    if (entry == 0) { free_executable_module(h); return -502; }
 
-    // release the executable page (it was minted just for this call)
-    free_executable_ptr(ptr);
+    // call_raw casts the entry to int64_t(*)(int64_t) and calls it. The
+    // compiled `main` returns its result in rax, which call_raw reads back.
+    // Calls from main to other fns in the same program resolve via in-buffer
+    // call rel32 (patched by cg_resolve_fixups to each callee's entry offset);
+    // native/extension calls resolve via the loader's ABS64_NATIVE relocs.
+    let result: i64 = call_raw(entry, 0);
+
+    // release the loaded module (frees the code/rodata/data regions)
+    free_executable_module(h);
 
     return result;
 }
