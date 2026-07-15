@@ -41,6 +41,7 @@
 #include "ext_lifecycle.hpp"
 #include "ext_io.hpp"
 #include "ext_call_raw.hpp"     // self-hosting Stage 4 gap: call_raw(fn_ptr,arg)->i64
+#include "ext_coroutine.hpp"   // #21 coroutines (set_coroutine_dispatch native)
 
 #include <cstdio>
 #include <cstdint>
@@ -78,6 +79,7 @@ static void register_standard_bindings(
     ext_sync::register_natives(natives); ext_lifecycle::register_natives(natives);
     ext_io::register_natives(natives);
     ext_call_raw::register_natives(natives);
+    ext_coroutine::register_natives(natives);
     // Publish overload names into the allowlist (same as the CLI: the .em
     // loader resolves overloads by their sema-resolved fn_name).
     OpOverloadTable overloads;
