@@ -36,6 +36,29 @@ else()
     add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 endif()
 
+# ---- Binary hardening flags (compile-time security mitigations) ----
+# Feature-detected so we only enable what the compiler supports.
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-fstack-protector-strong" EMBER_HAS_STACK_PROTECTOR_STRONG)
+check_cxx_compiler_flag("-fstack-clash-protection" EMBER_HAS_STACK_CLASH_PROTECTION)
+check_cxx_compiler_flag("-fcf-protection" EMBER_HAS_CF_PROTECTION)
+if(EMBER_HAS_STACK_PROTECTOR_STRONG)
+    add_compile_options(-fstack-protector-strong)
+endif()
+if(EMBER_HAS_STACK_CLASH_PROTECTION)
+    add_compile_options(-fstack-clash-protection)
+endif()
+if(EMBER_HAS_CF_PROTECTION)
+    add_compile_options(-fcf-protection)
+endif()
+# _FORTIFY_SOURCE requires optimization, so gate on Release/RelWithDebInfo
+if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    check_cxx_compiler_flag("-D_FORTIFY_SOURCE=2" EMBER_HAS_FORTIFY_SOURCE)
+    if(EMBER_HAS_FORTIFY_SOURCE)
+        add_compile_options(-D_FORTIFY_SOURCE=2)
+    endif()
+endif()
+
 # ---- vendored Ed25519 (F2 .em content authentication, docs/spec/SPEC_AUDIT_2026-07-10.md F2) ----
 # orlp/ed25519 (public domain, see thirdparty/ed25519/license.txt) — the small,
 # portable Ed25519 implementation ember links for `.em` signature sign/verify.
