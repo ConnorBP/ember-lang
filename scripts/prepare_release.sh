@@ -112,10 +112,41 @@ else
     echo "  WARN: cannot bundle self-hosted compiler (ember_bundle.exe or emberc.ember not found)"
 fi
 
-# VST3 plugin (if built)
+# VST3 plugin (if built) — zip it for distribution
 if [ -d "buildt/VST3/Release/ember_gain.vst3" ]; then
-    echo "  Copying VST3 plugin (ember_gain.vst3)..."
+    echo "  Packaging VST3 plugin (ember_gain.vst3)..."
     cp -r buildt/VST3/Release/ember_gain.vst3 "$ARTIFACT_DIR/" 2>/dev/null || true
+    # Also create a zip for easy download
+    (cd "buildt/VST3/Release" && zip -r "$EMBER_DIR/$ARTIFACT_DIR/ember_gain.vst3.zip" ember_gain.vst3 2>/dev/null) || true
+fi
+
+# VSCode extension — package as .vsix (zip-compatible)
+if [ -d "editors/vscode" ]; then
+    echo "  Packaging VSCode extension..."
+    # Try vsce (VS Code Extension CLI) if available, otherwise create a .vsix zip manually
+    if command -v vsce &>/dev/null; then
+        (cd editors/vscode && vsce package --out "$EMBER_DIR/$ARTIFACT_DIR/ember.vsix" 2>/dev/null) \
+            && echo "  OK: ember.vsix packaged with vsce" \
+            || echo "  WARN: vsce packaging failed, falling back to zip"
+    fi
+    # Fallback: create .vsix as a zip of the extension directory
+    if [ ! -f "$ARTIFACT_DIR/ember.vsix" ]; then
+        (cd editors/vscode && zip -r "$EMBER_DIR/$ARTIFACT_DIR/ember.vsix" package.json language-configuration.json syntaxes README.md 2>/dev/null) \
+            && echo "  OK: ember.vsix packaged as zip" \
+            || echo "  WARN: could not package VSCode extension"
+    fi
+    # Also copy the source directory for reference
+    mkdir -p "$ARTIFACT_DIR/vscode_extension"
+    cp -r editors/vscode/* "$ARTIFACT_DIR/vscode_extension/" 2>/dev/null || true
+fi
+
+# AI skill — package for distribution
+if [ -d "ai-skills" ]; then
+    echo "  Packaging AI skill..."
+    mkdir -p "$ARTIFACT_DIR/ai-skills"
+    cp -r ai-skills/* "$ARTIFACT_DIR/ai-skills/" 2>/dev/null || true
+    # Also create a zip for easy download
+    (cd . && zip -r "$ARTIFACT_DIR/ember-ai-skill.zip" ai-skills 2>/dev/null) || true
 fi
 
 # Copy docs and examples
@@ -160,6 +191,15 @@ cat > "$NOTES_FILE" << EOF
 
 ### VST3 Plugin (if present)
 - \`ember_gain.vst3/\` — VST3 audio plugin wrapper (ember DSP, hot-reloadable)
+- \`ember_gain.vst3.zip\` — zipped VST3 plugin for easy download
+
+### VSCode Extension
+- \`ember.vsix\` — VSCode extension with syntax highlighting, bracket matching, and comment toggling for .ember files. Install with: \`code --install-extension ember.vsix\`
+- \`vscode_extension/\` — VSCode extension source directory
+
+### AI Skill
+- \`ember-ai-skill.zip\` — AI skill for the ember language (install to your AI coding assistant's skills directory)
+- \`ai-skills/\` — AI skill source directory (contains SKILL.md with full language reference)
 
 ### Other
 - \`docs/\` — documentation
@@ -210,12 +250,15 @@ if $PUBLISH; then
             --title "ember $VERSION" \
             --notes-file "$NOTES_FILE" \
             "$ARTIFACT_DIR"/*.exe \
+            "$ARTIFACT_DIR"/*.zip \
+            "$ARTIFACT_DIR"/*.vsix \
             "$ARTIFACT_DIR/checksums.sha256" \
             2>/dev/null || echo "  WARN: gh release create failed"
-        echo "  GitHub release created"
+        echo "  GitHub release created (with all artifacts)"
     else
         echo "  gh CLI not found — tag pushed, create release manually at:"
         echo "  https://github.com/ConnorBP/ember-lang/releases/new?tag=$VERSION"
+        echo "  Upload artifacts from: $ARTIFACT_DIR/"
     fi
 else
     echo "Review the artifacts and notes, then publish with:"
