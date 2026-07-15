@@ -80,7 +80,7 @@ enum NK {
     SwitchStmt   = 32,  // a=subject expr, b=first Case
     Case         = 33,  // a=value expr (or -1 for default), b=first body stmt, next=next Case, d=is_default
     MatchStmt    = 34,  // a=subject expr, b=first MatchArm
-    MatchArm     = 35,  // a=pattern expr (or -1 for wildcard), b=body BlockStmt, next=next MatchArm, d=is_wildcard
+    MatchArm     = 35,  // a=pattern expr (or -1 for wildcard/struct-pat), b=body BlockStmt, next=next MatchArm, d=is_wildcard, e=guard, f=has_struct_pat, tok=struct type-name, c=first struct-pattern FieldInit
     YieldStmt    = 36,  // a=value expr (or -1)
     ThrowStmt    = 37,  // a=value expr
     TryCatchStmt = 38,  // a=try BlockStmt, b=catch BlockStmt, tok=catch-name tok
@@ -104,7 +104,7 @@ enum NK {
     ArrayLit     = 65,  // a=first element (linked via next)
     ViewExpr     = 66,  // a=base
     FnHandleExpr = 67,  // a=operand (or -1 for cross-module), tok=fn-name tok, e=module-alias tok (or -1)
-    LambdaExpr   = 68,  // a=first Param, b=ret Type, c=body BlockStmt
+    LambdaExpr   = 68,  // a=first Param, b=ret Type, c=body BlockStmt, e=first by-ref capture Ident (d=1), next=next capture
     EnumAccess   = 69,  // tok=variant tok, a=enum-name tok (the base Ident's tok)
     SizeofExpr   = 70,  // a=Type
     OffsetofExpr = 71,  // a=Type, tok=field tok
@@ -705,8 +705,43 @@ fn parse_primary() -> i64 {
         return n;
     }
     if (k == (Tok::Kw_fn as i64)) {
-        // lambda: fn(params) -> ret { body }
+        // lambda: fn [capture-list]? (params) -> ret { body }
+        // The optional capture list `[&x, y]` mirrors src/parser.cpp:949-958:
+        // after `fn`, if a `[` is present, consume it + parse comma-separated
+        // capture idents (each optionally prefixed with `&` for by-ref). Only
+        // the by-ref captures are recorded (a linked list of Ident nodes off
+        // the LambdaExpr's `e` slot, each with d=1 marking by-ref); bare
+        // by-value names are accepted syntactically but not stored (sema's
+        // implicit capture walk finds them), matching the C++ parser. The list
+        // is unambiguous here: a `[` after `fn` can only be a capture list (an
+        // array literal `[` never follows `fn`), and `fn` types are parsed in
+        // parse_type, not here.
         p_adv();  // 'fn'
+        let mut first_cap: i64 = -1;
+        let mut prev_cap: i64 = -1;
+        if (at(Tok::LBracket as i64) == 1) {
+            p_adv();  // '['
+            if (at(Tok::RBracket as i64) == 0) {
+                let mut go_cap: i64 = 1;
+                while (go_cap == 1) {
+                    let by_ref: i64 = accept(Tok::Amp as i64);  // optional '&'
+                    let cap_tok: i64 = expect(Tok::Ident as i64, string_from_slice("capture name in lambda capture list"));
+                    if (p_err != 0) { return -1; }
+                    // record only by-ref captures (matches C++ ref_caps)
+                    if (by_ref == 1) {
+                        let cap: i64 = alloc_node(NK::Ident as i64);
+                        if (p_err != 0) { return -1; }
+                        set_tok(cap, cap_tok);
+                        set_d(cap, 1);  // by-ref flag
+                        if (first_cap < 0) { first_cap = cap; }
+                        else { set_next(prev_cap, cap); }
+                        prev_cap = cap;
+                    }
+                    if (accept(Tok::Comma as i64) == 0) { go_cap = 0; }
+                }
+            }
+            if (expect(Tok::RBracket as i64, string_from_slice("expected ']' to close lambda capture list")) < 0) { return -1; }
+        }
         if (expect(Tok::LParen as i64, string_from_slice("expected '(' after 'fn'")) < 0) { return -1; }
         let mut first_p: i64 = -1;
         let mut prev_p: i64 = -1;
@@ -738,6 +773,8 @@ fn parse_primary() -> i64 {
         if (first_p >= 0) { set_a(le, first_p); }
         set_b(le, ret);
         set_c(le, body);
+        // by-ref captures: linked list of Ident nodes (d=1) off slot e. -1 = none.
+        if (first_cap >= 0) { set_e(le, first_cap); }
         return le;
     }
 
@@ -1532,10 +1569,47 @@ fn parse_stmt() -> i64 {
         while (at(Tok::RBrace as i64) == 0 && at(Tok::Eof as i64) == 0) {
             let arm: i64 = alloc_node(NK::MatchArm as i64);
             if (p_err != 0) { return -1; }
-            // wildcard '_' or expr pattern
+            // wildcard '_' / struct-destructure pattern / expr pattern
             if (at(Tok::Ident as i64) == 1 && cur_text() == string_from_slice("_")) {
                 p_adv();
                 set_d(arm, 1);   // is_wildcard
+            } else if (at(Tok::Ident as i64) == 1 && peek_kind(1) == (Tok::LBrace as i64)) {
+                // Tier 1 struct-destructure pattern: TypeName{field, field: literal, ...}
+                // mirrors src/parser.cpp ~1144-1157. Each field is a name with
+                // an OPTIONAL `: value` (a literal to match); a bare name binds
+                // a local of the same name. Stored on the MatchArm as:
+                //   tok = struct type-name token, c = first FieldInit node,
+                //   f = 1 (has_struct_pat). Each FieldInit: tok = field-name
+                //   token, a = literal expr (-1 = capture-only), next = next field.
+                let type_tok: i64 = p_adv();  // the type name (an Ident)
+                if (expect(Tok::LBrace as i64, string_from_slice("expected '{' after struct pattern name")) < 0) { return -1; }
+                set_tok(arm, type_tok);
+                set_f(arm, 1);   // has_struct_pat
+                let mut first_fld: i64 = -1;
+                let mut prev_fld: i64 = -1;
+                if (at(Tok::RBrace as i64) == 0) {
+                    let mut go_fld: i64 = 1;
+                    while (go_fld == 1) {
+                        let fname_tok: i64 = expect(Tok::Ident as i64, string_from_slice("field name in struct pattern"));
+                        if (p_err != 0) { return -1; }
+                        let fld: i64 = alloc_node(NK::FieldInit as i64);
+                        if (p_err != 0) { return -1; }
+                        set_tok(fld, fname_tok);
+                        if (accept(Tok::Colon as i64) == 1) {
+                            let lit: i64 = parse_expr();
+                            if (p_err != 0) { return -1; }
+                            set_a(fld, lit);   // field: literal (match value)
+                        } else {
+                            set_a(fld, -1);    // capture-only (binds a local)
+                        }
+                        if (first_fld < 0) { first_fld = fld; }
+                        else { set_next(prev_fld, fld); }
+                        prev_fld = fld;
+                        if (accept(Tok::Comma as i64) == 0) { go_fld = 0; }
+                    }
+                }
+                if (first_fld >= 0) { set_c(arm, first_fld); }
+                if (expect(Tok::RBrace as i64, string_from_slice("expected '}' after struct pattern fields")) < 0) { return -1; }
             } else {
                 let pat: i64 = parse_expr();
                 if (p_err != 0) { return -1; }

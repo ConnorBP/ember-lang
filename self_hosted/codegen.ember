@@ -159,6 +159,32 @@ global cg_frame_size : i64 = 0;   // the current fn's frame size
 // with a real in-buffer relative call, so multi-fn programs execute.
 global cg_fn_labels : i64 = 0;   // array, stride 3 [ name_tok, label_id, ns_tok ]
 
+// Reusable scratch array for ABI-fingerprint computation (cg_abi_fingerprint_codes).
+// The `codes` locals previously allocated a fresh array_new(8,1|2) on EVERY
+// native-call emission (string_from_slice / string_from_i64 / string_add /
+// string_eq). The host array extension has no array_free, so each leaked a
+// slot; over a large module these accumulate in the trace-callback scan and
+// crash the host (bare RUNTIME TRAP / exit 70). This scratch is reused via
+// array_clear: set entry 0 (and 1), compute the fingerprint synchronously
+// (no recursive emission between set + read), done. Safe because the codes
+// are consumed by cg_abi_fingerprint_codes before any nested expression is
+// emitted.
+global cg_fp_codes : i64 = 0;   // scratch for cg_abi_fingerprint_codes (size 2)
+
+// Reusable scratch array for cg_abi_fingerprint (the type-node variant). The
+// `param_types` / `len_pt` / `get_pt` locals previously allocated a fresh
+// array_new(8,4) on every native-call / for-each emission. Like cg_fp_codes
+// these are consumed synchronously by cg_abi_fingerprint before any nested
+// expression is emitted, so a single reused slot is safe.
+global cg_fp_types : i64 = 0;   // scratch for cg_abi_fingerprint (size 4)
+
+// Reusable constant scratch holding the 4 Win64 argument registers
+// {RCX, RDX, R8, R9} for cg_compile_func's param-spill loop. Previously a
+// per-function array_new(8,4) leaked a slot on every function compiled; this
+// slot is a pure constant, set + read with no recursive emission between, so a
+// single reused slot is safe.
+global cg_arg_regs : i64 = 0;   // scratch for Win64 arg registers (size 4)
+
 // error state
 global cg_err     : i64 = 0;
 global cg_errmsg  : string = "";
@@ -777,6 +803,69 @@ fn cg_abi_fingerprint(arg_types: i64, argc: i64, ret_type: i64, perm: i64) -> i6
     return fp;
 }
 
+// Return the reusable ABI-fingerprint scratch array (cg_fp_codes), ensuring
+// it is allocated with capacity 2 (enough for the 1- or 2-entry codes used by
+// the internal string_* native emissions). Replaces a per-call array_new that
+// leaked a slot on every native-call emission. Callers overwrite index 0 (and
+// 1) then call cg_abi_fingerprint_codes with an explicit argc; stale entries
+// beyond argc are never read, so no clear is needed between uses.
+fn cg_fp_codes_get() -> i64 {
+    if (cg_fp_codes == 0) {
+        cg_fp_codes = array_new(8, 2);
+    } else if (array_length(cg_fp_codes) < 2) {
+        array_resize(cg_fp_codes, 2);
+    }
+    return cg_fp_codes;
+}
+
+// Return the reusable type-fingerprint scratch array (cg_fp_types), ensuring
+// it is allocated with capacity 4 (enough for the 4-entry param-type arrays
+// used by native-call + for-each fingerprinting). Callers overwrite entries
+// 0..argc-1 then call cg_abi_fingerprint with an explicit argc; stale entries
+// beyond argc are never read, so no clear is needed between uses.
+fn cg_fp_types_get() -> i64 {
+    if (cg_fp_types == 0) {
+        cg_fp_types = array_new(8, 4);
+    } else if (array_length(cg_fp_types) < 4) {
+        array_resize(cg_fp_types, 4);
+    }
+    return cg_fp_types;
+}
+
+// Return the reusable Win64-arg-register scratch array (cg_arg_regs),
+// ensuring it is allocated with capacity 4.
+fn cg_arg_regs_get() -> i64 {
+    if (cg_arg_regs == 0) {
+        cg_arg_regs = array_new(8, 4);
+    } else if (array_length(cg_arg_regs) < 4) {
+        array_resize(cg_arg_regs, 4);
+    }
+    return cg_arg_regs;
+}
+
+// On-demand native-arg register class for cg_eval_callexpr. Returns 1 if the
+// i-th param of native `name` is a float type (so the arg arrives in
+// xmm0..xmm3), else 0. Replaces the pre-computed `arg_is_float` array that
+// leaked a slot on every call expression (the array was read AFTER recursive
+// arg evaluation, so it could not be a simple global). native_param_type is a
+// pure table lookup (no codegen recursion), so recomputing on demand is safe.
+fn cg_arg_is_float(name: string, i: i64) -> i64 {
+    let pt: i64 = native_param_type(name, i);
+    if (ty_is_float(pt) == 1) { return 1; }
+    return 0;
+}
+
+// On-demand native-arg float width for cg_eval_callexpr. Returns 1 if the
+// i-th param of native `name` is an f64 (vs f32). Replaces the pre-computed
+// `arg_is_f64` array (same re-entrancy reasoning as cg_arg_is_float).
+fn cg_arg_is_f64(name: string, i: i64) -> i64 {
+    let pt: i64 = native_param_type(name, i);
+    if (ty_is_float(pt) == 1) {
+        if (cg_float_is64_type(pt) == 1) { return 1; }
+    }
+    return 0;
+}
+
 // the ABI fingerprint for a known native, computed from EXPLICIT type codes
 // (used for internal codegen calls like string_from_slice where sema never
 // type-checks the call, + for operator-overload natives like string_add whose
@@ -1125,9 +1214,16 @@ fn cg_resolve_fixups() -> i64 {
 
 // reset the local table for a new function
 fn cg_locals_init() -> i64 {
-    cg_locals = array_new(8, 0);
+    // Reuse cg_locals / cg_scope_marks across function compilations instead
+    // of allocating fresh arrays each time. This is a HOT PATH: cg_locals_init
+    // runs once PER FUNCTION, so compiling a module with N functions leaked
+    // 2*N arrays (no array_free in the host extension; slots are never
+    // reclaimed). array_clear() resets the logical length to 0 while keeping
+    // the backing buffer, so the slot is reused and the store stops growing.
+    // The first call (handle == 0) still allocates.
+    if (cg_locals != 0) { array_clear(cg_locals); } else { cg_locals = array_new(8, 0); }
     cg_local_len = 0;
-    cg_scope_marks = array_new(8, 0);
+    if (cg_scope_marks != 0) { array_clear(cg_scope_marks); } else { cg_scope_marks = array_new(8, 0); }
     cg_scope_mark_len = 0;
     cg_next_off = 0;
     return 0;
@@ -1248,21 +1344,30 @@ fn cg_lookup_fn_label_qualified(name: string, ns_name: string) -> i64 {
 // =============================================================================
 
 fn cg_init() -> i64 {
-    cg_code = array_new(1, 0);
+    // Reuse the emitter arrays across cg_init() calls instead of allocating
+    // fresh ones each time. The host array extension has no array_free (slots
+    // in the process-wide store are never reclaimed until reset()), so a
+    // fresh array_new on every codegen() leaks the previous buffer — and the
+    // leaked buffers accumulate in the trace-callback scan, eventually
+    // crashing the host at scale (a bare RUNTIME TRAP / exit 70).
+    // array_clear() resets the logical length to 0 while keeping the backing
+    // buffer, so the slot is reused and the store stops growing. The first
+    // call (handle == 0) still allocates.
+    if (cg_code != 0) { array_clear(cg_code); } else { cg_code = array_new(1, 0); }
     cg_next_label = 0;
-    cg_labels = array_new(8, 0);
-    cg_fixups = array_new(8, 0);
-    cg_fn_labels = array_new(8, 0);
+    if (cg_labels != 0) { array_clear(cg_labels); } else { cg_labels = array_new(8, 0); }
+    if (cg_fixups != 0) { array_clear(cg_fixups); } else { cg_fixups = array_new(8, 0); }
+    if (cg_fn_labels != 0) { array_clear(cg_fn_labels); } else { cg_fn_labels = array_new(8, 0); }
     // EMBM v1 image buffers (reset alongside cg_code so every codegen() starts clean).
-    cg_rodata = array_new(1, 0);
-    cg_data   = array_new(1, 0);
-    cg_syms   = array_new(1, 0);
-    cg_relocs = array_new(1, 0);
-    cg_globals = array_new(8, 0);
+    if (cg_rodata != 0) { array_clear(cg_rodata); } else { cg_rodata = array_new(1, 0); }
+    if (cg_data   != 0) { array_clear(cg_data);   } else { cg_data   = array_new(1, 0); }
+    if (cg_syms   != 0) { array_clear(cg_syms);   } else { cg_syms   = array_new(1, 0); }
+    if (cg_relocs != 0) { array_clear(cg_relocs); } else { cg_relocs = array_new(1, 0); }
+    if (cg_globals != 0) { array_clear(cg_globals); } else { cg_globals = array_new(8, 0); }
     cg_globals_len = 0;
     // Phase 3b: defer cleanup stack (reset per function in cg_compile_func).
-    g_defers = array_new(8, 0);
-    g_defer_marks = array_new(8, 0);
+    if (g_defers != 0) { array_clear(g_defers); } else { g_defers = array_new(8, 0); }
+    if (g_defer_marks != 0) { array_clear(g_defer_marks); } else { g_defer_marks = array_new(8, 0); }
     g_defer_mark_len = 0;
     cg_cur_ret = -1;
     cg_loop_defer_mark = 0;
@@ -1958,7 +2063,7 @@ fn cg_eval_string_lit(e: i64) -> i64 {
         cg_sub_reg_imm32(RSP, 32);
         //    fingerprint: param0 = u8 slice (code 5), ret = string handle (code 6), perm 0
         let sym_idx: i64 = cg_sym_index(string_from_slice("string_from_slice"));
-        let codes: i64 = array_new(8, 1);
+        let codes: i64 = cg_fp_codes_get();
         array_set_i64(codes, 0, 5);  // u8 slice
         let fp: i64 = cg_abi_fingerprint_codes(codes, 1, 6, 0);
         cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
@@ -2021,7 +2126,7 @@ fn cg_build_literal_seg(addend: i64, n: i64) -> i64 {
     cg_mov_reg_imm64(RDX, n);
     // call string_from_slice(rcx, rdx) -> handle in rax
     let sym_idx: i64 = cg_sym_index(string_from_slice("string_from_slice"));
-    let codes: i64 = array_new(8, 1);
+    let codes: i64 = cg_fp_codes_get();
     array_set_i64(codes, 0, 5);  // u8 slice
     let fp: i64 = cg_abi_fingerprint_codes(codes, 1, 6, 0);
     cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
@@ -2042,7 +2147,7 @@ fn cg_build_i64_seg(name: string) -> i64 {
     // call string_from_i64(rcx) -> handle in rax
     // fingerprint: param0 = i64 (code 1), ret = string handle (code 6), perm 0
     let sym_idx: i64 = cg_sym_index(string_from_slice("string_from_i64"));
-    let codes: i64 = array_new(8, 1);
+    let codes: i64 = cg_fp_codes_get();
     array_set_i64(codes, 0, 1);  // i64
     let fp: i64 = cg_abi_fingerprint_codes(codes, 1, 6, 0);
     cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
@@ -2057,7 +2162,7 @@ fn cg_emit_string_add() -> i64 {
     cg_load_reg_mem(RDX, RSP, 40);  // seg = arg2
     // string_add(i64, i64) -> handle. fingerprint: params {1,1}, ret 6, perm 0.
     let sym_idx: i64 = cg_sym_index(string_from_slice("string_add"));
-    let codes: i64 = array_new(8, 2);
+    let codes: i64 = cg_fp_codes_get();
     array_set_i64(codes, 0, 1); array_set_i64(codes, 1, 1);
     let fp: i64 = cg_abi_fingerprint_codes(codes, 2, 6, 0);
     cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
@@ -2135,7 +2240,7 @@ fn cg_eval_fstring_real(e: i64) -> i64 {
                 cg_mov_reg_imm64(RAX, v);
                 cg_mov_reg_reg(RCX, RAX);
                 let sym_idx: i64 = cg_sym_index(string_from_slice("string_from_i64"));
-                let codes: i64 = array_new(8, 1);
+                let codes: i64 = cg_fp_codes_get();
                 array_set_i64(codes, 0, 1);
                 let fp: i64 = cg_abi_fingerprint_codes(codes, 1, 6, 0);
                 cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
@@ -2353,7 +2458,7 @@ fn cg_eval_string_binexpr(e: i64) -> i64 {
     if (op == (BinOp::Add as i64)) {
         // string_add(i64, i64) -> string handle. fingerprint: params {1,1}, ret 6, perm 0.
         let sym_idx: i64 = cg_sym_index(string_from_slice("string_add"));
-        let codes: i64 = array_new(8, 2);
+        let codes: i64 = cg_fp_codes_get();
         array_set_i64(codes, 0, 1); array_set_i64(codes, 1, 1);  // i64, i64
         let fp: i64 = cg_abi_fingerprint_codes(codes, 2, 6, 0);
         cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
@@ -2363,7 +2468,7 @@ fn cg_eval_string_binexpr(e: i64) -> i64 {
     }
     // == / != : string_eq(i64, i64) -> bool (0/1). fingerprint: params {1,1}, ret 4 (bool), perm 0.
     let sym_idx: i64 = cg_sym_index(string_from_slice("string_eq"));
-    let codes: i64 = array_new(8, 2);
+    let codes: i64 = cg_fp_codes_get();
     array_set_i64(codes, 0, 1); array_set_i64(codes, 1, 1);  // i64, i64
     let fp: i64 = cg_abi_fingerprint_codes(codes, 2, 4, 0);
     cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
@@ -3044,14 +3149,20 @@ fn cg_eval_callexpr(e: i64) -> i64 {
     let mut is_native: i64 = 0;
     if (fn_row < 0) { is_native = 1; }
 
-    // count args + collect them (walk the sibling chain via nk_next)
-    let mut args: i64 = array_new(8, 16);  // arg node indices (allow >4 for step 4)
+    // count args (walk the sibling chain via nk_next). The arg node indices
+    // are NOT pre-collected into an array — the previous design allocated a
+    // fresh `args` array on every call expression and read it AFTER recursively
+    // evaluating each arg (cg_eval can recurse into cg_eval_callexpr for nested
+    // call args), which both leaked a slot per call (no array_free in the host
+    // extension) and made a reused global unsafe. Instead we count now and
+    // re-walk the chain during evaluation, so no scratch array is needed.
     let mut argc: i64 = 0;
-    let mut a: i64 = nk_a(e);
-    while (a >= 0) {
-        if (argc < 16) { array_set_i64(args, argc, a); }
-        argc = argc + 1;
-        a = nk_next(a);
+    {
+        let mut a: i64 = nk_a(e);
+        while (a >= 0) {
+            argc = argc + 1;
+            a = nk_next(a);
+        }
     }
     // Win64: first 4 int args in rcx/rdx/r8/r9; args 5+ are passed on the stack
     // at [rsp+32 + (i-4)*8] (after the 32-byte shadow space). The temp layout
@@ -3075,41 +3186,33 @@ fn cg_eval_callexpr(e: i64) -> i64 {
     // sub rsp, call_frame
     cg_sub_reg_imm32(RSP, call_frame);
 
-    // For a NATIVE call, decide each arg's register class (int reg vs xmm) +
-    // float width from the native's declared param type (the table mirrors the
-    // host's registered NativeSig, so the placement matches the real C++ ABI:
-    // float params arrive in xmm0..xmm3, int/handle params in rcx/rdx/r8/r9).
-    // A SCRIPT call keeps the private int-only ABI (the existing path).
-    let mut arg_is_float: i64 = array_new(8, 16);  // 1 if arg i is a float param
-    let mut arg_is_f64: i64   = array_new(8, 16);  // 1 if f64, 0 if f32
-    let mut i: i64 = 0;
-    while (i < argc) {
-        if (is_native == 1) {
-            let pt: i64 = native_param_type(name, i);
-            if (ty_is_float(pt) == 1) {
-                array_set_i64(arg_is_float, i, 1);
-                if (cg_float_is64_type(pt) == 1) { array_set_i64(arg_is_f64, i, 1); }
-            }
-        }
-        i = i + 1;
-    }
+    // For a NATIVE call, each arg's register class (int reg vs xmm) + float
+    // width is derived from the native's declared param type ON DEMAND via
+    // cg_arg_is_float / cg_arg_is_f64 (pure native_param_type lookups, no
+    // codegen recursion) instead of pre-computing into arrays that leaked a
+    // slot per call and were read after recursive arg evaluation.
 
     // eval each arg -> rax (int/handle) or xmm0 (float); store to [rsp + i*8].
     // For a float arg, cg_eval leaves the value in xmm0; store it with the
     // param's width (movsd f64 / movss f32) so the native receives the right
-    // precision. For an int/handle arg, cg_eval leaves rax.
-    let mut i2: i64 = 0;
-    while (i2 < argc) {
-        let arg_node: i64 = array_get_i64(args, i2);
-        cg_eval(arg_node);
-        if (cg_err != 0) { return 0; }
-        if (array_get_i64(arg_is_float, i2) == 1) {
-            let is64: i64 = array_get_i64(arg_is_f64, i2);
-            cg_store_float_reg(RSP, i2 * 8, XMM0, is64);
-        } else {
-            cg_store_reg_mem(RSP, i2 * 8, RAX);
+    // precision. For an int/handle arg, cg_eval leaves rax. Re-walk the arg
+    // sibling chain (no scratch array) so nested call args cannot clobber this
+    // call's iteration state.
+    {
+        let mut i2: i64 = 0;
+        let mut a: i64 = nk_a(e);
+        while (a >= 0) {
+            cg_eval(a);
+            if (cg_err != 0) { return 0; }
+            if (is_native == 1 && cg_arg_is_float(name, i2) == 1) {
+                let is64: i64 = cg_arg_is_f64(name, i2);
+                cg_store_float_reg(RSP, i2 * 8, XMM0, is64);
+            } else {
+                cg_store_reg_mem(RSP, i2 * 8, RAX);
+            }
+            i2 = i2 + 1;
+            a = nk_next(a);
         }
-        i2 = i2 + 1;
     }
 
     if (is_native == 1) {
@@ -3121,26 +3224,26 @@ fn cg_eval_callexpr(e: i64) -> i64 {
         // baked addend == abi_fingerprint(registered_sig) and the loader's
         // check passes). io natives are perm 1; array/math/map/string perm 0.
         if (argc >= 1) {
-            if (array_get_i64(arg_is_float, 0) == 1) { cg_load_float_reg(XMM0, RSP, 0,  array_get_i64(arg_is_f64, 0)); }
+            if (cg_arg_is_float(name, 0) == 1) { cg_load_float_reg(XMM0, RSP, 0,  cg_arg_is_f64(name, 0)); }
             else { cg_load_reg_mem(RCX, RSP, 0); }
         }
         if (argc >= 2) {
-            if (array_get_i64(arg_is_float, 1) == 1) { cg_load_float_reg(XMM1, RSP, 8,  array_get_i64(arg_is_f64, 1)); }
+            if (cg_arg_is_float(name, 1) == 1) { cg_load_float_reg(XMM1, RSP, 8,  cg_arg_is_f64(name, 1)); }
             else { cg_load_reg_mem(RDX, RSP, 8); }
         }
         if (argc >= 3) {
-            if (array_get_i64(arg_is_float, 2) == 1) { cg_load_float_reg(XMM2, RSP, 16, array_get_i64(arg_is_f64, 2)); }
+            if (cg_arg_is_float(name, 2) == 1) { cg_load_float_reg(XMM2, RSP, 16, cg_arg_is_f64(name, 2)); }
             else { cg_load_reg_mem(R8, RSP, 16); }
         }
         if (argc >= 4) {
-            if (array_get_i64(arg_is_float, 3) == 1) { cg_load_float_reg(XMM3, RSP, 24, array_get_i64(arg_is_f64, 3)); }
+            if (cg_arg_is_float(name, 3) == 1) { cg_load_float_reg(XMM3, RSP, 24, cg_arg_is_f64(name, 3)); }
             else { cg_load_reg_mem(R9, RSP, 24); }
         }
         let sym_idx: i64 = cg_sym_index(name);
         // build the fingerprint from the native's declared param types (not the
         // call's arg types) so it matches the host's registered sig even when
         // an arg adapts (e.g. an IntLit to an i64 param, f32->f64 widening).
-        let param_types: i64 = array_new(8, 4);
+        let param_types: i64 = cg_fp_types_get();
         let mut j: i64 = 0;
         while (j < argc && j < 4) {
             array_set_i64(param_types, j, native_param_type(name, j));
@@ -3801,7 +3904,7 @@ fn cg_compile_foreach_array(s: i64, vtok: i64, iter: i64, body: i64, elem_ty: i6
     cg_sub_reg_imm32(RSP, 32);
     cg_load_reg_mem(RCX, RBP, h_off);
     let len_sym: i64 = cg_sym_index(string_from_slice("array_length"));
-    let len_pt: i64 = array_new(8, 4);
+    let len_pt: i64 = cg_fp_types_get();
     array_set_i64(len_pt, 0, native_param_type(string_from_slice("array_length"), 0));
     let len_fp: i64 = cg_abi_fingerprint(len_pt, 1, native_ret_type(string_from_slice("array_length")), native_perm(string_from_slice("array_length")));
     cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, len_sym, len_fp);
@@ -3829,7 +3932,7 @@ fn cg_compile_foreach_array(s: i64, vtok: i64, iter: i64, body: i64, elem_ty: i6
     cg_load_reg_mem(RCX, RBP, h_off);
     cg_load_reg_mem(RDX, RBP, idx_off);
     let get_sym: i64 = cg_sym_index(get_name);
-    let get_pt: i64 = array_new(8, 4);
+    let get_pt: i64 = cg_fp_types_get();
     array_set_i64(get_pt, 0, native_param_type(get_name, 0));
     array_set_i64(get_pt, 1, native_param_type(get_name, 1));
     let get_fp: i64 = cg_abi_fingerprint(get_pt, 2, native_ret_type(get_name), native_perm(get_name));
@@ -4059,15 +4162,17 @@ fn cg_compile_switch(s: i64) -> i64 {
     if (cg_err != 0) { return 0; }
     cg_push(RAX);
 
-    // pre-allocate a body label per case + an end label
+    // pre-allocate a body label per case + an end label. The label is stashed
+    // on each Case node's `e` slot (unused by parse/sema) instead of a fresh
+    // `case_labels` array — the previous array leaked a slot per switch and
+    // was read after `cg_eval(case_value)` which can recurse, so a reused
+    // global was unsafe. Stashing on the node is re-entrancy-safe (each case
+    // owns its label) and allocation-free.
     let end: i64 = cg_alloc_label();
-    let mut case_labels: i64 = array_new(8, 0);
     let mut c: i64 = nk_b(s);
-    let mut nc: i64 = 0;
     while (c >= 0) {
         let lab: i64 = cg_alloc_label();
-        array_push_i64(case_labels, lab);
-        nc = nc + 1;
+        set_e(c, lab);
         c = nk_next(c);
     }
 
@@ -4085,14 +4190,21 @@ fn cg_compile_switch(s: i64) -> i64 {
             cg_mov_reg_reg(RCX, RAX);          // RCX = case value
             cg_load_reg_mem(RAX, RSP, 0);       // RAX = stashed subject
             cg_cmp_reg_reg(RAX, RCX);
-            cg_jcc(COND_E, array_get_i64(case_labels, ci));
+            cg_jcc(COND_E, nk_e(c));
         }
         ci = ci + 1;
         c = nk_next(c);
     }
     // no case matched: jump to default (if any) or past the switch
     if (default_idx >= 0) {
-        cg_jmp(array_get_i64(case_labels, default_idx));
+        // find the default case's stashed label
+        let mut dc: i64 = nk_b(s);
+        let mut di: i64 = 0;
+        while (dc >= 0) {
+            if (di == default_idx) { cg_jmp(nk_e(dc)); break; }
+            di = di + 1;
+            dc = nk_next(dc);
+        }
     } else {
         cg_jmp(end);
     }
@@ -4109,7 +4221,7 @@ fn cg_compile_switch(s: i64) -> i64 {
     cg_loop_break = end;
     cg_loop_defer_mark = g_defer_mark_len;   // break cleans up only inner scopes
     while (c >= 0) {
-        cg_bind(array_get_i64(case_labels, ci));
+        cg_bind(nk_e(c));
         // The parser stores a case body as a bare linked list of stmts
         // (nk_b(c) = first stmt), NOT a BlockStmt. Compile it as its own
         // scope + defer cleanup scope, mirroring cg_compile_block.
@@ -4182,9 +4294,12 @@ fn cg_compile_func(fd: i64, ns_tok: i64) -> i64 {
 
     // spill params to frame slots (Win64: rcx, rdx, r8, r9 for first 4 int args)
     // Each param gets an 8-byte slot at [rbp - offset], allocated in order.
-    // We use a temp array to hold the param node indices so we can alloc locals
-    // in order (alloc_local assigns offsets sequentially).
-    let mut arg_regs: i64 = array_new(8, 4);
+    // We use a reusable constant scratch array (cg_arg_regs) holding the 4
+    // Win64 argument registers so we can index by param position. Replaces a
+    // per-function array_new that leaked a slot on every cg_compile_func; the
+    // array is a pure constant + read-only here (no recursive emission between
+    // set + read), so a single reused slot is safe.
+    let mut arg_regs: i64 = cg_arg_regs_get();
     array_set_i64(arg_regs, 0, RCX);
     array_set_i64(arg_regs, 1, RDX);
     array_set_i64(arg_regs, 2, R8);

@@ -166,17 +166,26 @@ global s_switch_depth: i64 = 0;   // Phase 3b: switch nesting (break valid insid
 // -----------------------------------------------------------------------------
 fn s_init() -> i64 {
     s_toks = parse_tokens();
-    g_fns = array_new(8, 0);
-    g_structs = array_new(8, 0);
-    g_enums = array_new(8, 0);
-    g_enum_types = array_new(8, 0);
-    g_globals = array_new(8, 0);
-    g_scope = array_new(8, 0);
-    g_marks = array_new(8, 0);
-    g_ns_names = array_new(8, 0);
+    // Reuse the symbol-table arrays across s_init() calls instead of
+    // allocating fresh ones each time. The host array extension has no
+    // array_free (slots in the process-wide store are never reclaimed until
+    // reset()), so a fresh array_new on every sema() leaks the previous
+    // buffer — and the leaked buffers accumulate in the trace-callback scan,
+    // eventually crashing the host at scale (a bare RUNTIME TRAP / exit 70).
+    // array_clear() resets the logical length to 0 while keeping the backing
+    // buffer, so the slot is reused and the store stops growing. The first
+    // call (handle == 0) still allocates.
+    if (g_fns != 0) { array_clear(g_fns); } else { g_fns = array_new(8, 0); }
+    if (g_structs != 0) { array_clear(g_structs); } else { g_structs = array_new(8, 0); }
+    if (g_enums != 0) { array_clear(g_enums); } else { g_enums = array_new(8, 0); }
+    if (g_enum_types != 0) { array_clear(g_enum_types); } else { g_enum_types = array_new(8, 0); }
+    if (g_globals != 0) { array_clear(g_globals); } else { g_globals = array_new(8, 0); }
+    if (g_scope != 0) { array_clear(g_scope); } else { g_scope = array_new(8, 0); }
+    if (g_marks != 0) { array_clear(g_marks); } else { g_marks = array_new(8, 0); }
+    if (g_ns_names != 0) { array_clear(g_ns_names); } else { g_ns_names = array_new(8, 0); }
     s_cur_ns = -1;
-    ce_params = array_new(8, 0);
-    ce_param_marks = array_new(8, 0);
+    if (ce_params != 0) { array_clear(ce_params); } else { ce_params = array_new(8, 0); }
+    if (ce_param_marks != 0) { array_clear(ce_param_marks); } else { ce_param_marks = array_new(8, 0); }
     ce_params_len = 0;
     ce_param_mark_len = 0;
     ce_depth = 0;
@@ -928,7 +937,10 @@ fn nat_add(pc: i64, p0: i64, p1: i64, p2: i64, p3: i64, rt: i64, perm: i64) -> i
 // once from s_init after the canonical TY_* nodes exist. The row ORDER here is
 // the single source of truth for native_find's if-chain (1:1 by index).
 fn init_natives() -> i64 {
-    g_natives = array_new(8, 0);
+    // Reuse g_natives across init_natives() calls (it is called from s_init,
+    // which runs on every sema() entry). array_clear keeps the backing buffer
+    // so the slot stops leaking; the first call (g_natives == 0) allocates.
+    if (g_natives != 0) { array_clear(g_natives); } else { g_natives = array_new(8, 0); }
     // ---- ARRAY (extensions/array/ext_array.cpp) — all perm 0 ----
     nat_add(2, TY_I64, TY_I64, -1, -1, TY_I64,  0);  // 0 array_new
     nat_add(1, TY_I64, -1, -1, -1, TY_I64,  0);      // 1 array_length
