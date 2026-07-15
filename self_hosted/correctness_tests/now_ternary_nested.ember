@@ -1,0 +1,6 @@
+// Self-hosted positive: nested ternary operator.
+// expect: 30
+fn main() -> i64 {
+    let x: i64 = 7;
+    return x > 10 ? 100 : (x > 5 ? 30 : 200);
+}

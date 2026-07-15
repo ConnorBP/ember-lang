@@ -1,0 +1,7 @@
+// Self-hosted positive: i32 typed locals + arithmetic (was reject -315 before expansion).
+// expect: 3000
+fn main() -> i64 {
+    let x: i32 = 1000;
+    let y: i32 = 2000;
+    return x + y;
+}

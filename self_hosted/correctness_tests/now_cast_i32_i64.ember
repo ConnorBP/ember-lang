@@ -1,0 +1,7 @@
+// Self-hosted positive: i32 to i64 cast (was reject -313 before expansion).
+// expect: 3000
+fn main() -> i64 {
+    let x: i32 = 1000;
+    let y: i64 = x as i64;
+    return y + 2000;
+}

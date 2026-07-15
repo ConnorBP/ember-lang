@@ -79,6 +79,17 @@ global TY_VOID  : i64 = 0;
 global TY_F32   : i64 = 0;
 global TY_F64   : i64 = 0;
 global TY_STRING: i64 = 0;
+// Phase 2: canonical nodes for every integer width so resolve_type returns a
+// shared index for each (making type_eq a single-index compare in the common
+// case, matching how TY_I64/TY_BOOL/TY_VOID work). Mirrors src/sema.cpp's
+// intern(make_prim(...)) canonical primitive table.
+global TY_I8  : i64 = 0;
+global TY_I16 : i64 = 0;
+global TY_I32 : i64 = 0;
+global TY_U8  : i64 = 0;
+global TY_U16 : i64 = 0;
+global TY_U32 : i64 = 0;
+global TY_U64 : i64 = 0;
 
 // -----------------------------------------------------------------------------
 // symbol tables (flat i64 arrays).
@@ -156,6 +167,14 @@ fn s_init() -> i64 {
     set_d(TY_F32, Prim::F32 as i64);
     TY_F64 = alloc_node(NK::Type as i64);
     set_d(TY_F64, Prim::F64 as i64);
+    // Phase 2: canonical nodes for every integer width.
+    TY_I8  = alloc_node(NK::Type as i64); set_d(TY_I8,  Prim::I8  as i64);
+    TY_I16 = alloc_node(NK::Type as i64); set_d(TY_I16, Prim::I16 as i64);
+    TY_I32 = alloc_node(NK::Type as i64); set_d(TY_I32, Prim::I32 as i64);
+    TY_U8  = alloc_node(NK::Type as i64); set_d(TY_U8,  Prim::U8  as i64);
+    TY_U16 = alloc_node(NK::Type as i64); set_d(TY_U16, Prim::U16 as i64);
+    TY_U32 = alloc_node(NK::Type as i64); set_d(TY_U32, Prim::U32 as i64);
+    TY_U64 = alloc_node(NK::Type as i64); set_d(TY_U64, Prim::U64 as i64);
     // `string` is a builtin opaque handle. Prim 12 is private to the
     // self-hosted compiler and deliberately does not collide with v1 Prim.
     TY_STRING = alloc_node(NK::Type as i64);
@@ -282,6 +301,31 @@ fn ty_is_int(t: i64) -> i64 {
     return 0;
 }
 
+// is this type an UNSIGNED integer (u8/u16/u32/u64)?
+fn ty_is_uint(t: i64) -> i64 {
+    if (t < 0) { return 0; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 0; }
+    let p: i64 = nk_d(t);
+    if (nk_tok(t) >= 0) { return 0; }
+    if (nk_f(t) == 1) { return 0; }
+    // Prim U8..U64 = 6..9
+    if (p >= 6 && p <= 9) { return 1; }
+    return 0;
+}
+
+// the bit width of an integer type (8/16/32/64), mirroring src/sema.cpp's
+// int_width. Non-integer types return 0.
+fn ty_int_width(t: i64) -> i64 {
+    if (t < 0) { return 0; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 0; }
+    let p: i64 = nk_d(t);
+    if (p == (Prim::I8  as i64) || p == (Prim::U8  as i64)) { return 8; }
+    if (p == (Prim::I16 as i64) || p == (Prim::U16 as i64)) { return 16; }
+    if (p == (Prim::I32 as i64) || p == (Prim::U32 as i64)) { return 32; }
+    if (p == (Prim::I64 as i64) || p == (Prim::U64 as i64)) { return 64; }
+    return 0;
+}
+
 // is this type bool?
 fn ty_is_bool(t: i64) -> i64 {
     if (t < 0) { return 0; }
@@ -339,13 +383,30 @@ fn type_eq(t1: i64, t2: i64) -> i64 {
     return type_eq(e1, e2);
 }
 
-// types_compatible: true iff `want` and `got` are the same type. v1 subset has
-// NO implicit conversions (the C++ sema widens ints / adapts literals; v1
-// keeps it strict so the test is a clean same-type check). One ergonomic
-// exception: an IntLit (untyped literal) is checked at the let/init site, not
-// here, so a `let x: i64 = 1` works (1 is an IntLit that resolves to i64).
+// types_compatible: true iff `want` and `got` are compatible. Mirrors
+// src/sema.cpp's types_compatible + can_implicitly_convert:
+//   - same type (type_eq)
+//   - same-signedness integer widening (int_width(got) < int_width(want))
+//   - f32 -> f64 widening
+// A literal-adaptation path is NOT needed here because check_expr always
+// returns TY_I64 for an IntLit; the let/return/arg/call sites that compare a
+// declared int type against an IntLit's TY_I64 go through the widening rule
+// (i64 widens nothing, but the literal check is handled at the let site via
+// the int-literal-fits-int-type gate in check_let). For a typed int target
+// receiving an i64 IntLit, check_let/check_value use ty_int_fits_lit instead.
 fn types_compatible(want: i64, got: i64) -> i64 {
-    return type_eq(want, got);
+    if (type_eq(want, got) == 1) { return 1; }
+    // same-signedness integer widening: i8->i16->i32->i64, u8->u16->u32->u64
+    if (ty_is_int(want) == 1 && ty_is_int(got) == 1) {
+        if (ty_is_uint(want) == ty_is_uint(got)) {
+            if (ty_int_width(got) < ty_int_width(want)) { return 1; }
+        }
+    }
+    // f32 -> f64 widening
+    if (ty_is_float(got) == 1 && ty_is_float(want) == 1) {
+        if (nk_d(got) == (Prim::F32 as i64) && nk_d(want) == (Prim::F64 as i64)) { return 1; }
+    }
+    return 0;
 }
 
 // a human-readable type name for error messages ("i64", "bool", "void", or the
@@ -356,9 +417,15 @@ fn ty_name(t: i64) -> string {
     let p: i64 = nk_d(t);
     if (nk_tok(t) >= 0) { return tok_name(nk_tok(t)); }
     if (p == (Prim::I64 as i64)) { return string_from_slice("i64"); }
+    if (p == (Prim::I32 as i64)) { return string_from_slice("i32"); }
+    if (p == (Prim::I16 as i64)) { return string_from_slice("i16"); }
+    if (p == (Prim::I8  as i64)) { return string_from_slice("i8"); }
+    if (p == (Prim::U64 as i64)) { return string_from_slice("u64"); }
+    if (p == (Prim::U32 as i64)) { return string_from_slice("u32"); }
+    if (p == (Prim::U16 as i64)) { return string_from_slice("u16"); }
+    if (p == (Prim::U8  as i64)) { return string_from_slice("u8"); }
     if (p == (Prim::Bool as i64)) { return string_from_slice("bool"); }
     if (p == (Prim::Void as i64)) { return string_from_slice("void"); }
-    if (p == (Prim::I32 as i64)) { return string_from_slice("i32"); }
     if (p == (Prim::F32 as i64)) { return string_from_slice("f32"); }
     if (p == (Prim::F64 as i64)) { return string_from_slice("f64"); }
     if (p == 12) { return string_from_slice("string"); }
@@ -396,6 +463,16 @@ fn resolve_type(t: i64) -> i64 {
     if (p == (Prim::Void as i64)) { return TY_VOID; }
     if (p == (Prim::F32 as i64)) { return TY_F32; }
     if (p == (Prim::F64 as i64)) { return TY_F64; }
+    // Phase 2: all integer widths (i8/i16/i32/u8/u16/u32/u64) are now
+    // accepted, mirroring src/sema.cpp's full primitive resolution. Each
+    // resolves to its canonical Type node so type_eq is a single-index compare.
+    if (p == (Prim::I8  as i64)) { return TY_I8;  }
+    if (p == (Prim::I16 as i64)) { return TY_I16; }
+    if (p == (Prim::I32 as i64)) { return TY_I32; }
+    if (p == (Prim::U8  as i64)) { return TY_U8;  }
+    if (p == (Prim::U16 as i64)) { return TY_U16; }
+    if (p == (Prim::U32 as i64)) { return TY_U32; }
+    if (p == (Prim::U64 as i64)) { return TY_U64; }
     return unsupported(-315, string_from_slice("non-i64 integer or function-handle type"), t);
 }
 
@@ -799,6 +876,81 @@ fn check_expr(e: i64) -> i64 {
         }
         return TY_I64;
     }
+    // Phase 2 Step 2: CastExpr (expr as Type). Mirrors src/sema.cpp's cast matrix:
+    //   - same-type: no-op
+    //   - int->int (any width/signedness): allowed
+    //   - float->float (f32<->f64): allowed
+    //   - signed int <-> float: allowed
+    //   - unsigned int <-> float: NOT in the v1 matrix (deliberate)
+    //   - slice/aggregate/bool/fn-handle: same-type only
+    // The result type is the cast's target type.
+    if (k == (NK::CastExpr as i64)) {
+        let from: i64 = check_expr(nk_a(e));
+        if (s_err != 0) { return TY_VOID; }
+        let to: i64 = resolve_type(nk_b(e));
+        if (s_err != 0) { return TY_VOID; }
+        let same: i64 = type_eq(from, to);
+        let mut int_to_int: i64 = 0;
+        if (ty_is_int(from) == 1 && ty_is_int(to) == 1) { int_to_int = 1; }
+        let mut float_to_float: i64 = 0;
+        if (ty_is_float(from) == 1 && ty_is_float(to) == 1) { float_to_float = 1; }
+        // signed int <-> float (unsigned is deliberately excluded, matching the C++ matrix)
+        let mut int_float: i64 = 0;
+        if (ty_is_int(from) == 1 && ty_is_uint(from) == 0 && ty_is_float(to) == 1) { int_float = 1; }
+        if (ty_is_float(from) == 1 && ty_is_int(to) == 1 && ty_is_uint(to) == 0) { int_float = 1; }
+        if (same == 0 && int_to_int == 0 && float_to_float == 0 && int_float == 0) {
+            return serr(string_from_slice("invalid cast from '") + ty_name(from) + string_from_slice("' to '") + ty_name(to) + string_from_slice("'"),
+                        node_line(e), node_col(e));
+        }
+        return to;
+    }
+    // Phase 2 Step 4: TernaryExpr (cond ? then : else). Cond must be bool;
+    // then/else must have the same type; result = that type. Mirrors
+    // src/sema.cpp's TernaryExpr check.
+    if (k == (NK::TernaryExpr as i64)) {
+        let ct: i64 = check_expr(nk_a(e));
+        if (s_err != 0) { return TY_VOID; }
+        if (ty_is_bool(ct) == 0) {
+            return serr(string_from_slice("ternary condition must be bool"), node_line(e), node_col(e));
+        }
+        let tt: i64 = check_expr(nk_b(e));
+        if (s_err != 0) { return TY_VOID; }
+        let et: i64 = check_expr(nk_c(e));
+        if (s_err != 0) { return TY_VOID; }
+        if (type_eq(tt, et) == 0) {
+            return serr(string_from_slice("ternary branches must have same type (got ") + ty_name(tt) + string_from_slice(" and ") + ty_name(et) + string_from_slice(")"),
+                        node_line(e), node_col(e));
+        }
+        return tt;
+    }
+    // Phase 2 Step 5: SizeofExpr. Result is a compile-time constant of type
+    // u64. For primitives, the size is cg_type_size-compatible; for structs/
+    // arrays (Phase 3), reject for now. Mirrors src/sema.cpp's SizeofExpr check
+    // (which sets resolved = frame_byte_width(...)).
+    if (k == (NK::SizeofExpr as i64)) {
+        let t: i64 = resolve_type(nk_a(e));
+        if (s_err != 0) { return TY_VOID; }
+        // Phase 2: only primitives (int/bool/float/void) are sized. Structs/
+        // arrays/slices are Phase 3.
+        if (nk_tok(t) >= 0) {
+            return unsupported(-313, string_from_slice("sizeof of struct type"), e);
+        }
+        if (nk_f(t) == 1 || nk_e(t) > 0 || nk_a(t) >= 0) {
+            return unsupported(-310, string_from_slice("sizeof of array/slice type"), e);
+        }
+        return TY_U64;
+    }
+    // Phase 2 Step 5: OffsetofExpr. Result is a compile-time constant of type
+    // u64. For primitives there are no fields (reject); for structs (Phase 3)
+    // compute from the layout. For Phase 2, reject (no structs yet).
+    if (k == (NK::OffsetofExpr as i64)) {
+        let t: i64 = resolve_type(nk_a(e));
+        if (s_err != 0) { return TY_VOID; }
+        if (nk_tok(t) < 0) {
+            return serr(string_from_slice("offsetof requires a struct type"), node_line(e), node_col(e));
+        }
+        return unsupported(-313, string_from_slice("offsetof of struct type"), e);
+    }
     return unsupported(-313, string_from_slice("expression kind"), e);
 }
 
@@ -807,9 +959,20 @@ fn check_expr(e: i64) -> i64 {
 // operands and yields bool; logical requires bool operands and yields bool.
 fn check_binexpr(e: i64) -> i64 {
     let op: i64 = nk_d(e);
-    let lt: i64 = check_expr(nk_a(e));
-    let rt: i64 = check_expr(nk_b(e));
-    return check_binop_result(op, lt, rt, e);
+    let lhs: i64 = nk_a(e);
+    let rhs: i64 = nk_b(e);
+    let lt: i64 = check_expr(lhs);
+    let rt: i64 = check_expr(rhs);
+    // literal adaptation (mirrors src/sema.cpp's check_binexpr): if one operand
+    // is an IntLit (always TY_I64 from check_expr), adopt the other operand's
+    // integer type so `i32_var + 5` type-checks as i32 + i32 -> i32. The value
+    // still fits (sema would error on overflow at the let site); here we only
+    // need the TYPE to match for the same-type arithmetic rule.
+    let mut elt: i64 = lt;
+    let mut ert: i64 = rt;
+    if (nk_kind(lhs) == (NK::IntLit as i64) && ty_is_int(rt) == 1) { elt = rt; }
+    if (nk_kind(rhs) == (NK::IntLit as i64) && ty_is_int(lt) == 1) { ert = lt; }
+    return check_binop_result(op, elt, ert, e);
 }
 
 // Validate a binary op's operand types and return its result type (or TY_VOID
@@ -954,7 +1117,7 @@ fn check_callexpr(e: i64) -> i64 {
             let got: i64 = check_expr(ai);
             if (s_err != 0) { return TY_VOID; }
             let want: i64 = native_param_type(nm, i);
-            if (types_compatible(want, got) == 0) {
+            if (lit_fits_int_type(ai, want) == 0 && types_compatible(want, got) == 0) {
                 return serr(string_from_slice("arg ") + int_to_str(i + 1) + string_from_slice(" of '") + nm
                             + string_from_slice("': expected ") + ty_name(want) + string_from_slice(", got ")
                             + ty_name(got),
@@ -997,7 +1160,7 @@ fn check_callexpr(e: i64) -> i64 {
     while (ai >= 0) {
         let got: i64 = check_expr(ai);
         let want: i64 = fn_param_type(row, i);
-        if (types_compatible(want, got) == 0) {
+        if (lit_fits_int_type(ai, want) == 0 && types_compatible(want, got) == 0) {
             return serr(string_from_slice("arg ") + int_to_str(i + 1) + string_from_slice(" of '") + nm
                         + string_from_slice("': expected ") + ty_name(want) + string_from_slice(", got ")
                         + ty_name(got),
@@ -1131,7 +1294,7 @@ fn check_assignexpr(e: i64) -> i64 {
     // plain '=' : the value's type must be compatible with the target's.
     let rt: i64 = check_expr(value);
     if (s_err != 0) { return TY_VOID; }
-    if (types_compatible(lt, rt) == 0) {
+    if (lit_fits_int_type(value, lt) == 0 && types_compatible(lt, rt) == 0) {
         return serr(string_from_slice("assignment type mismatch (") + ty_name(lt) + string_from_slice(" = ")
                     + ty_name(rt) + string_from_slice(")"),
                     node_line(e), node_col(e));
@@ -1242,7 +1405,156 @@ fn check_stmt(s: i64) -> i64 {
     }
     if (k == (NK::YieldStmt as i64)) { unsupported(-308, string_from_slice("coroutine/yield"), s); return 0; }
     if (k == (NK::DeferStmt as i64)) { unsupported(-312, string_from_slice("defer"), s); return 0; }
+    // Phase 2 Step 6: static_assert(cond, msg). Evaluate cond at compile time.
+    // If true, elide (no-op). If false, emit a sema error with the message. If
+    // the cond is not a compile-time constant, emit a sema error. Mirrors
+    // src/sema.cpp's check_static_assert + try_eval_const_bool.
+    if (k == (NK::StaticAssertStmt as i64)) {
+        return check_static_assert(s);
+    }
     unsupported(-314, string_from_slice("statement kind"), s);
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// Phase 2 Step 6: compile-time constant evaluation for static_assert.
+// try_eval_const_i64 / try_eval_const_bool mirror src/sema.cpp's同名 fns:
+// fold IntLit, UnaryExpr (Neg/BitNot for int, Not for bool), and BinExpr
+// (arithmetic/bitwise for int, comparison/logical for bool) over constants.
+// Returns 1 + sets `out` on success, 0 on failure (non-constant expr).
+// -----------------------------------------------------------------------------
+
+// a two-outcome fold: returns 1 + sets out0 on success, 0 on failure.
+// (ember has no tuples/out-params, so the result is returned via globals.)
+global ce_int_out  : i64 = 0;
+global ce_bool_out : i64 = 0;
+
+fn try_eval_const_i64(e: i64) -> i64 {
+    if (e < 0) { return 0; }
+    let k: i64 = nk_kind(e);
+    if (k == (NK::IntLit as i64)) { ce_int_out = nk_d(e); return 1; }
+    if (k == (NK::UnaryExpr as i64)) {
+        if (try_eval_const_i64(nk_a(e)) == 0) { return 0; }
+        let v: i64 = ce_int_out;
+        if (nk_d(e) == (UnOp::Neg as i64)) { ce_int_out = 0 - v; return 1; }
+        if (nk_d(e) == (UnOp::BitNot as i64)) { ce_int_out = ~v; return 1; }
+        return 0;
+    }
+    if (k == (NK::BinExpr as i64)) {
+        if (try_eval_const_i64(nk_a(e)) == 0) { return 0; }
+        let l: i64 = ce_int_out;
+        if (try_eval_const_i64(nk_b(e)) == 0) { return 0; }
+        let r: i64 = ce_int_out;
+        let op: i64 = nk_d(e);
+        if (op == (BinOp::Add as i64)) { ce_int_out = l + r; return 1; }
+        if (op == (BinOp::Sub as i64)) { ce_int_out = l - r; return 1; }
+        if (op == (BinOp::Mul as i64)) { ce_int_out = l * r; return 1; }
+        if (op == (BinOp::And as i64)) { ce_int_out = l & r; return 1; }
+        if (op == (BinOp::Or  as i64)) { ce_int_out = l | r; return 1; }
+        if (op == (BinOp::Xor as i64)) { ce_int_out = l ^ r; return 1; }
+        if (op == (BinOp::Shl as i64)) { ce_int_out = l << (r & 63); return 1; }
+        if (op == (BinOp::Shr as i64)) { ce_int_out = l >> (r & 63); return 1; }
+        return 0;  // Div/Mod excluded (mirrors C++)
+    }
+    return 0;
+}
+
+fn try_eval_const_bool(e: i64) -> i64 {
+    if (e < 0) { return 0; }
+    let k: i64 = nk_kind(e);
+    if (k == (NK::BoolLit as i64)) { ce_bool_out = nk_d(e); return 1; }
+    if (k == (NK::UnaryExpr as i64)) {
+        if (nk_d(e) != (UnOp::Not as i64)) { return 0; }
+        if (try_eval_const_bool(nk_a(e)) == 0) { return 0; }
+        let v: i64 = ce_bool_out;
+        if (v != 0) { ce_bool_out = 0; } else { ce_bool_out = 1; }
+        return 1;
+    }
+    if (k == (NK::BinExpr as i64)) {
+        let op: i64 = nk_d(e);
+        // comparison: fold both sides as i64 constants
+        if (op == (BinOp::Eq as i64) || op == (BinOp::Neq as i64) ||
+            op == (BinOp::Lt as i64) || op == (BinOp::Le as i64) ||
+            op == (BinOp::Gt as i64) || op == (BinOp::Ge as i64)) {
+            if (try_eval_const_i64(nk_a(e)) == 0) { return 0; }
+            let l: i64 = ce_int_out;
+            if (try_eval_const_i64(nk_b(e)) == 0) { return 0; }
+            let r: i64 = ce_int_out;
+            if (op == (BinOp::Eq as i64))  { if (l == r) { ce_bool_out = 1; } else { ce_bool_out = 0; } return 1; }
+            if (op == (BinOp::Neq as i64)) { if (l != r) { ce_bool_out = 1; } else { ce_bool_out = 0; } return 1; }
+            if (op == (BinOp::Lt as i64))  { if (l <  r) { ce_bool_out = 1; } else { ce_bool_out = 0; } return 1; }
+            if (op == (BinOp::Le as i64))  { if (l <= r) { ce_bool_out = 1; } else { ce_bool_out = 0; } return 1; }
+            if (op == (BinOp::Gt as i64))  { if (l >  r) { ce_bool_out = 1; } else { ce_bool_out = 0; } return 1; }
+            if (op == (BinOp::Ge as i64))  { if (l >= r) { ce_bool_out = 1; } else { ce_bool_out = 0; } return 1; }
+            return 0;
+        }
+        // logical && / ||
+        if (op == (BinOp::LAnd as i64) || op == (BinOp::LOr as i64)) {
+            if (try_eval_const_bool(nk_a(e)) == 0) { return 0; }
+            let l: i64 = ce_bool_out;
+            if (try_eval_const_bool(nk_b(e)) == 0) { return 0; }
+            let r: i64 = ce_bool_out;
+            if (op == (BinOp::LAnd as i64)) {
+                if (l != 0 && r != 0) { ce_bool_out = 1; } else { ce_bool_out = 0; }
+            } else {
+                if (l != 0 || r != 0) { ce_bool_out = 1; } else { ce_bool_out = 0; }
+            }
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+// check a static_assert(cond, msg): evaluate cond at compile time. If false,
+// emit a sema error with the message. If true, no-op (codegen emits nothing).
+// If the cond is not a compile-time constant, emit a sema error. Mirrors
+// src/sema.cpp's check_static_assert. The message is the StringLit token's text.
+fn check_static_assert(s: i64) -> i64 {
+    let cond: i64 = nk_a(s);
+    let ct: i64 = check_expr(cond);
+    if (s_err != 0) { return 0; }
+    if (ty_is_bool(ct) == 0) {
+        serr(string_from_slice("static_assert condition must be bool"), node_line(s), node_col(s));
+        return 0;
+    }
+    if (try_eval_const_bool(cond) == 1) {
+        if (ce_bool_out == 0) {
+            // false: emit the message. The message token is a StringLit;
+            // its decoded body is the string content (quotes stripped).
+            let mut msg: string = string_from_slice("");
+            if (nk_tok(s) >= 0) { msg = tok_string_body(nk_tok(s)); }
+            serr(string_from_slice("static_assert failed: ") + msg, node_line(s), node_col(s));
+            s_errcode = -319;  // dedicated static_assert-failure code
+        }
+        // true -> elided: no-op
+    } else {
+        serr(string_from_slice("static_assert condition must be a compile-time constant"), node_line(s), node_col(s));
+    }
+    return 0;
+}
+
+// Does an IntLit expression's value fit in an integer `target` type? Mirrors
+// src/sema.cpp's adapt_int_lit: a default-i64 IntLit may adopt any integer
+// target whose range contains the literal value. Used at let/return/assign/
+// call sites where a typed int target receives an untyped integer literal
+// (the C++ sema adapts the literal in check_expr via the `expected` param;
+// the self-hosted check_expr has no expected param, so the adaptation gate
+// lives at the use site instead).
+fn lit_fits_int_type(e: i64, target: i64) -> i64 {
+    if (e < 0) { return 0; }
+    if (nk_kind(e) != (NK::IntLit as i64)) { return 0; }
+    if (ty_is_int(target) == 0) { return 0; }
+    let v: i64 = nk_d(e);
+    let p: i64 = nk_d(target);
+    if (p == (Prim::U8  as i64)) { if (v >= 0 && v <= 0xFF)         { return 1; } return 0; }
+    if (p == (Prim::U16 as i64)) { if (v >= 0 && v <= 0xFFFF)      { return 1; } return 0; }
+    if (p == (Prim::U32 as i64)) { if (v >= 0 && v <= 0xFFFFFFFF)  { return 1; } return 0; }
+    if (p == (Prim::U64 as i64)) { return 1; }   // any 64-bit bit pattern
+    if (p == (Prim::I8  as i64)) { if (v >= -128 && v <= 127)      { return 1; } return 0; }
+    if (p == (Prim::I16 as i64)) { if (v >= -32768 && v <= 32767)  { return 1; } return 0; }
+    if (p == (Prim::I32 as i64)) { if (v >= -2147483648 && v <= 2147483647) { return 1; } return 0; }
+    if (p == (Prim::I64 as i64)) { return 1; }
     return 0;
 }
 
@@ -1280,7 +1592,13 @@ fn check_let(s: i64) -> i64 {
     if (s_err != 0) { return 0; }
 
     if (ty_node >= 0) {
-        // typed let: init must match the declared type
+        // typed let: init must be compatible with the declared type. An IntLit
+        // (always TY_I64 from check_expr) adapts to any integer target whose
+        // range contains it (mirrors src/sema.cpp's adapt_int_lit).
+        if (lit_fits_int_type(init, decl_ty) == 1) {
+            declare(nm_tok, decl_ty);
+            return 0;
+        }
         if (types_compatible(decl_ty, init_ty) == 0) {
             serr(string_from_slice("let type mismatch (") + ty_name(decl_ty) + string_from_slice(" = ")
                  + ty_name(init_ty) + string_from_slice(")"),
@@ -1308,6 +1626,9 @@ fn check_return(s: i64) -> i64 {
         if (s_err != 0) { return 0; }
         if (s_cur_ret < 0) {
             serr(string_from_slice("return outside a function"), node_line(s), node_col(s));
+            return 0;
+        }
+        if (lit_fits_int_type(val, s_cur_ret) == 1) {
             return 0;
         }
         if (types_compatible(s_cur_ret, vt) == 0) {

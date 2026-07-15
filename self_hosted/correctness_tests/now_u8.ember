@@ -1,0 +1,6 @@
+// Self-hosted positive: u8 typed locals within u8 range (was reject -315 before expansion).
+// expect: 200
+fn main() -> i64 {
+    let b: u8 = 200;
+    return b as i64;
+}

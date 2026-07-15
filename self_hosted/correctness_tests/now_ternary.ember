@@ -1,0 +1,6 @@
+// Self-hosted positive: ternary operator (was reject -313 before expansion).
+// expect: 100
+fn main() -> i64 {
+    let x: i64 = 10;
+    return x > 5 ? 100 : 200;
+}

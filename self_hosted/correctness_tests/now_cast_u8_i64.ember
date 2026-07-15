@@ -1,0 +1,6 @@
+// Self-hosted positive: u8 to i64 cast (zero extend).
+// expect: 200
+fn main() -> i64 {
+    let b: u8 = 200;
+    return b as i64;
+}

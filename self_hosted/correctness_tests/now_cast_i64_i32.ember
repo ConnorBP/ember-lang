@@ -1,0 +1,7 @@
+// Self-hosted positive: i64 to i32 cast (truncation preserves value if it fits).
+// expect: 100000
+fn main() -> i64 {
+    let x: i64 = 100000;
+    let y: i32 = x as i32;
+    return y as i64;
+}

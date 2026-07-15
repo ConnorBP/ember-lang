@@ -1,0 +1,8 @@
+// Self-hosted positive: prefix ++ returns NEW value (was miscompiled before fix).
+// x becomes 6, y is new 6; x*100+y = 606
+// expect: 606
+fn main() -> i64 {
+    let mut x: i64 = 5;
+    let y: i64 = ++x;
+    return x * 100 + y;
+}

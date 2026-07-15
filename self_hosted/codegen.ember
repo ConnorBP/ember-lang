@@ -410,6 +410,89 @@ fn cg_i64_to_float(x: i64, r: i64, is64: i64) -> i64 { if (is64 == 1) { cg_byte(
 
 fn cg_float_is64_type(t: i64) -> i64 { if (t >= 0 && nk_d(t) == (Prim::F64 as i64)) { return 1; } return 0; }
 
+// -----------------------------------------------------------------------------
+// Phase 2: integer width support. Mirrors src/codegen.cpp's int_bits /
+// value_bytes / normalize_rax / is_uint. All scalar locals remain 8-byte slots
+// (local_width_bytes returns 8 for every scalar); the value is always stored
+// as a full 64-bit sign/zero-extended quantity, and normalize_rax re-extends
+// on load so a narrower-typed value reads back correctly.
+// -----------------------------------------------------------------------------
+
+// the byte size of a primitive type (mirrors src/types.cpp byte_size +
+// src/codegen.cpp value_bytes for scalars). Used by sizeof + by width-aware
+// load/store helpers.
+fn cg_type_size(t: i64) -> i64 {
+    if (t < 0) { return 8; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 8; }
+    let p: i64 = nk_d(t);
+    if (nk_tok(t) >= 0) { return 8; }   // named/handle type (struct sizes are Phase 3)
+    if (p == (Prim::Bool as i64) || p == (Prim::I8 as i64) || p == (Prim::U8 as i64)) { return 1; }
+    if (p == (Prim::I16 as i64) || p == (Prim::U16 as i64)) { return 2; }
+    if (p == (Prim::I32 as i64) || p == (Prim::U32 as i64) || p == (Prim::F32 as i64)) { return 4; }
+    return 8;   // i64/u64/f64/ptr + fallback
+}
+
+// the alignment of a primitive type (same as size for primitives).
+fn cg_type_align(t: i64) -> i64 { return cg_type_size(t); }
+
+// is this an UNSIGNED integer type (u8/u16/u32/u64)?
+fn cg_type_is_uint(t: i64) -> i64 {
+    if (t < 0) { return 0; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 0; }
+    let p: i64 = nk_d(t);
+    if (nk_tok(t) >= 0) { return 0; }
+    if (p == (Prim::U8 as i64) || p == (Prim::U16 as i64) || p == (Prim::U32 as i64) || p == (Prim::U64 as i64)) { return 1; }
+    return 0;
+}
+
+// is this a plain integer type (any width/signedness)?
+fn cg_type_is_int(t: i64) -> i64 {
+    if (t < 0) { return 0; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 0; }
+    let p: i64 = nk_d(t);
+    if (nk_tok(t) >= 0) { return 0; }
+    if (p >= (Prim::I8 as i64) && p <= (Prim::U64 as i64)) { return 1; }
+    return 0;
+}
+
+// the bit width of an integer type (8/16/32/64), mirroring src/sema.cpp's
+// int_bits. Non-integer types return 64 (no normalization needed).
+fn cg_int_bits(t: i64) -> i64 {
+    if (t < 0) { return 64; }
+    if (nk_kind(t) != (NK::Type as i64)) { return 64; }
+    let p: i64 = nk_d(t);
+    if (p == (Prim::I8  as i64) || p == (Prim::U8  as i64)) { return 8; }
+    if (p == (Prim::I16 as i64) || p == (Prim::U16 as i64)) { return 16; }
+    if (p == (Prim::I32 as i64) || p == (Prim::U32 as i64)) { return 32; }
+    return 64;
+}
+
+// Normalize rax to the integer type `t`: sign/zero-extend the low N bits into
+// the full 64-bit rax. Mirrors src/codegen.cpp's normalize_rax EXACTLY:
+//   - 64-bit: no-op
+//   - 32-bit unsigned: mov eax,eax (89 C0)        — zero-extends to rax
+//   - 32-bit signed:   movsxd rax,eax (48 63 C0)  — sign-extends
+//   - 8/16-bit: shl rax,64-bits; then sar (signed) or shr (unsigned) rax,64-bits
+// Non-integer / 64-bit types are a no-op. Called after every arithmetic op
+// and at every load/store boundary so a narrower-typed value stays canonical.
+fn cg_normalize_rax(t: i64) -> i64 {
+    if (cg_type_is_int(t) == 0) { return 0; }
+    let bits: i64 = cg_int_bits(t);
+    if (bits == 64) { return 0; }
+    if (bits == 32) {
+        if (cg_type_is_uint(t) == 1) { cg_byte(0x89); cg_byte(0xC0); }       // mov eax,eax
+        else { cg_byte(0x48); cg_byte(0x63); cg_byte(0xC0); }                // movsxd rax,eax
+        return 0;
+    }
+    // 8/16-bit: shl rax, (64-bits); then sar/shr rax, (64-bits).
+    // shl rax, imm8 -> REX.W C1 /4 ib
+    cg_byte(0x48); cg_byte(0xC1); cg_byte(0xE0); cg_byte(64 - bits);
+    // sar rax, imm8 (signed) -> REX.W C1 /7 ib ;  shr rax, imm8 (unsigned) -> REX.W C1 /5 ib
+    if (cg_type_is_uint(t) == 1) { cg_byte(0x48); cg_byte(0xC1); cg_byte(0xE8); cg_byte(64 - bits); }
+    else { cg_byte(0x48); cg_byte(0xC1); cg_byte(0xF8); cg_byte(64 - bits); }
+    return 0;
+}
+
 fn cg_expr_type(e: i64) -> i64 {
     if (e < 0) { return -1; }
     let k: i64 = nk_kind(e);
@@ -437,7 +520,12 @@ fn cg_expr_type(e: i64) -> i64 {
     if (k == (NK::BinExpr as i64)) {
         let op: i64 = nk_d(e);
         if (op >= (BinOp::Eq as i64)) { return TY_BOOL; }
-        return cg_expr_type(nk_a(e));
+        // literal adaptation: if lhs is an IntLit and rhs is a typed int, the
+        // result is rhs's type (mirrors sema's check_binexpr adaptation).
+        let lt2: i64 = cg_expr_type(nk_a(e));
+        let rt2: i64 = cg_expr_type(nk_b(e));
+        if (nk_kind(nk_a(e)) == (NK::IntLit as i64) && cg_type_is_int(rt2) == 1) { return rt2; }
+        return lt2;
     }
     if (k == (NK::CallExpr as i64)) {
         // sema annotates a call's resolved return type in slot c (free for
@@ -447,6 +535,15 @@ fn cg_expr_type(e: i64) -> i64 {
         if (rt >= 0) { return rt; }
         return -1;
     }
+    // Phase 2: CastExpr result type = the cast's target type (nk_b).
+    if (k == (NK::CastExpr as i64)) { return resolve_type(nk_b(e)); }
+    // Phase 2: TernaryExpr result type = the then-branch's type.
+    if (k == (NK::TernaryExpr as i64)) { return cg_expr_type(nk_b(e)); }
+    // Phase 2: sizeof/offsetof return u64 (mirrors src/sema.cpp which interns
+    // make_prim(Prim::U64)). The self-hosted codegen emits a compile-time
+    // constant, so the type is TY_U64.
+    if (k == (NK::SizeofExpr as i64)) { return TY_U64; }
+    if (k == (NK::OffsetofExpr as i64)) { return TY_U64; }
     return -1;
 }
 
@@ -1166,7 +1263,7 @@ fn cg_eval(e: i64) -> i64 {
         if (off != 0) {
             let t: i64 = cg_lookup_local_type(nk_tok(e));
             if (ty_is_float(t) == 1) { cg_load_float(XMM0, off, cg_float_is64_type(t)); }
-            else { cg_load_reg_mem(RAX, RBP, off); }
+            else { cg_load_reg_mem(RAX, RBP, off); cg_normalize_rax(t); }
             return 0;
         }
         // not a local: try a mutable global. Read through a relocated ABS64_DATA
@@ -1194,6 +1291,18 @@ fn cg_eval(e: i64) -> i64 {
     }
     if (k == (NK::AssignExpr as i64)) {
         return cg_eval_assignexpr(e);
+    }
+    if (k == (NK::CastExpr as i64)) {
+        return cg_eval_castexpr(e);
+    }
+    if (k == (NK::TernaryExpr as i64)) {
+        return cg_eval_ternaryexpr(e);
+    }
+    if (k == (NK::SizeofExpr as i64)) {
+        return cg_eval_sizeofexpr(e);
+    }
+    if (k == (NK::OffsetofExpr as i64)) {
+        return cg_eval_offsetofexpr(e);
     }
 
     // unsupported in v1
@@ -1529,6 +1638,15 @@ fn cg_eval_binexpr(e: i64) -> i64 {
     cg_pop(RAX);
 
     // apply the op (result in rax)
+    // literal adaptation: if lhs is an IntLit (always TY_I64) and rhs is a
+    // typed int, the result type is rhs's type (mirrors sema's check_binexpr
+    // adaptation + the C++ codegen's normalize_rax(b->lhs->ty) where the
+    // literal's ty was adapted to the other operand's type).
+    let mut lt: i64 = cg_expr_type(lhs);
+    if (nk_kind(lhs) == (NK::IntLit as i64) && cg_type_is_int(cg_expr_type(rhs)) == 1) {
+        lt = cg_expr_type(rhs);
+    }
+    let is_unsigned: i64 = cg_type_is_uint(lt);
     let mut is_cmp: i64 = 0;
     if (op == (BinOp::Eq as i64)) { is_cmp = 1; }
     if (op == (BinOp::Neq as i64)) { is_cmp = 1; }
@@ -1543,46 +1661,60 @@ fn cg_eval_binexpr(e: i64) -> i64 {
         let mut cc: i64 = 0;
         if (op == (BinOp::Eq as i64))  { cc = COND_E; }
         if (op == (BinOp::Neq as i64)) { cc = COND_NE; }
-        if (op == (BinOp::Lt as i64))  { cc = COND_L; }
-        if (op == (BinOp::Le as i64))  { cc = COND_LE; }
-        if (op == (BinOp::Gt as i64))  { cc = COND_G; }
-        if (op == (BinOp::Ge as i64))  { cc = COND_GE; }
+        if (op == (BinOp::Lt as i64))  { if (is_unsigned == 1) { cc = COND_B; } else { cc = COND_L; } }
+        if (op == (BinOp::Le as i64))  { if (is_unsigned == 1) { cc = COND_BE; } else { cc = COND_LE; } }
+        if (op == (BinOp::Gt as i64))  { if (is_unsigned == 1) { cc = COND_A; } else { cc = COND_G; } }
+        if (op == (BinOp::Ge as i64))  { if (is_unsigned == 1) { cc = COND_AE; } else { cc = COND_GE; } }
         cg_setcc_al(cc);
         cg_movzx_rax_al();
         return 0;
     }
 
-    if (op == (BinOp::Add as i64)) { cg_add_reg_reg(RAX, RCX); return 0; }
-    if (op == (BinOp::Sub as i64)) { cg_sub_reg_reg(RAX, RCX); return 0; }
-    if (op == (BinOp::Mul as i64)) { cg_imul_reg_reg(RAX, RCX); return 0; }
-    if (op == (BinOp::And as i64)) { cg_and_reg_reg(RAX, RCX); return 0; }
-    if (op == (BinOp::Or as i64))  { cg_or_reg_reg(RAX, RCX); return 0; }
-    if (op == (BinOp::Xor as i64)) { cg_xor_reg_reg(RAX, RCX); return 0; }
+    if (op == (BinOp::Add as i64)) { cg_add_reg_reg(RAX, RCX); cg_normalize_rax(lt); return 0; }
+    if (op == (BinOp::Sub as i64)) { cg_sub_reg_reg(RAX, RCX); cg_normalize_rax(lt); return 0; }
+    if (op == (BinOp::Mul as i64)) { cg_imul_reg_reg(RAX, RCX); cg_normalize_rax(lt); return 0; }
+    if (op == (BinOp::And as i64)) { cg_and_reg_reg(RAX, RCX); cg_normalize_rax(lt); return 0; }
+    if (op == (BinOp::Or as i64))  { cg_or_reg_reg(RAX, RCX); cg_normalize_rax(lt); return 0; }
+    if (op == (BinOp::Xor as i64)) { cg_xor_reg_reg(RAX, RCX); cg_normalize_rax(lt); return 0; }
     if (op == (BinOp::Shl as i64)) {
         // rcx already holds the shift count; shl rax, cl
         cg_shl_reg_cl(RAX);
+        cg_normalize_rax(lt);
         return 0;
     }
     if (op == (BinOp::Shr as i64)) {
-        // v1: i64 is signed -> arithmetic shift right (sar)
-        cg_sar_reg_cl(RAX);
+        // signed -> arithmetic shift right (sar); unsigned -> logical shift right (shr)
+        if (is_unsigned == 1) { cg_shr_reg_cl(RAX); }
+        else { cg_sar_reg_cl(RAX); }
+        cg_normalize_rax(lt);
         return 0;
     }
-    // Div/Mod are more complex (need cqo + idiv); emit a simple sequence.
-    // idiv rcx: rax = rax / rcx, rdx = rax % rcx
-    // cqo (sign-extend rax into rdx:rax) -> 48 99
-    // idiv rcx -> 48 F7 F9
+    // Div/Mod: signed uses cqo + idiv; unsigned uses xor rdx,rdx + div.
     if (op == (BinOp::Div as i64)) {
-        // cqo; idiv rcx (rax = rax / rcx)
-        cg_byte(0x48); cg_byte(0x99);
-        cg_byte(0x48); cg_byte(0xF7); cg_byte(0xF9);
+        if (is_unsigned == 1) {
+            // xor rdx, rdx; div rcx (rax = rax / rcx, unsigned)
+            cg_byte(0x48); cg_byte(0x31); cg_byte(0xD2);
+            cg_byte(0x48); cg_byte(0xF7); cg_byte(0xF1);
+        } else {
+            // cqo; idiv rcx (rax = rax / rcx, signed)
+            cg_byte(0x48); cg_byte(0x99);
+            cg_byte(0x48); cg_byte(0xF7); cg_byte(0xF9);
+        }
+        cg_normalize_rax(lt);
         return 0;
     }
     if (op == (BinOp::Mod as i64)) {
-        // cqo; idiv rcx; mov rax, rdx (rax = rax % rcx)
-        cg_byte(0x48); cg_byte(0x99);
-        cg_byte(0x48); cg_byte(0xF7); cg_byte(0xF9);
+        if (is_unsigned == 1) {
+            // xor rdx, rdx; div rcx; mov rax, rdx (rax = rax % rcx, unsigned)
+            cg_byte(0x48); cg_byte(0x31); cg_byte(0xD2);
+            cg_byte(0x48); cg_byte(0xF7); cg_byte(0xF1);
+        } else {
+            // cqo; idiv rcx; mov rax, rdx (rax = rax % rcx, signed)
+            cg_byte(0x48); cg_byte(0x99);
+            cg_byte(0x48); cg_byte(0xF7); cg_byte(0xF9);
+        }
         cg_mov_reg_reg(RAX, RDX);
+        cg_normalize_rax(lt);
         return 0;
     }
 
@@ -1743,12 +1875,30 @@ fn cg_eval_unaryexpr(e: i64) -> i64 {
     return 0;
 }
 
-// evaluate an assignment expression: target = value.
-// v1: target is an Ident (local variable). Eval value -> rax; store to [rbp+off].
-// The result of the assignment expression is the assigned value (in rax).
+// evaluate an assignment expression: target = value, target op= value, or
+// ++/-- target (prefix/postfix). Mirrors src/codegen.cpp's AssignExpr lowering.
+//
+// Node layout (parse.ember): a=target, b=value, d=compound op (or -1 for
+// plain '='), e=postfix flag (1 for postfix ++/--, where b is absent/-1).
+//
+//   plain '='      : eval value -> rax; normalize to target type; store.
+//                    expression result = the value (in rax).
+//   compound op=   : load target -> rax; push; eval value -> rax; rcx=rax;
+//                    pop rax (lhs); apply op; normalize to target type; store.
+//                    expression result = the new value (in rax).
+//   prefix ++/--   : same as compound with value=1 (parser sets b=IntLit(1),
+//                    e=-1). expression result = the new value.
+//   postfix ++/--  : load target -> rax; push (save old); eval/inc; apply op
+//                    with 1; normalize; store; then result = old value
+//                    (pop + adjust: for Add, old = new-1; for Sub, old = new+1).
+//
+// v1: only Ident targets (local or global). The compound/postfix op for
+// integers uses the same instruction sequence as cg_eval_binexpr.
 fn cg_eval_assignexpr(e: i64) -> i64 {
     let target: i64 = nk_a(e);
     let value: i64 = nk_b(e);
+    let cop: i64 = nk_d(e);
+    let postfix: i64 = nk_e(e);
 
     // v1: only Ident targets
     if (nk_kind(target) != (NK::Ident as i64)) {
@@ -1756,28 +1906,298 @@ fn cg_eval_assignexpr(e: i64) -> i64 {
         return 0;
     }
 
-    // eval value -> rax
-    cg_eval(value);
-    if (cg_err != 0) { return 0; }
-
-    // store rax to the target. Try a local first ([rbp + off]); if not a
-    // local, store through a relocated ABS64_DATA pointer (mutable global).
+    // resolve the target's offset + type (local or global)
     let off: i64 = cg_lookup_local(nk_tok(target));
-    if (off != 0) {
-        cg_store_reg_mem(RBP, off, RAX);
+    let tt: i64 = cg_lookup_local_type(nk_tok(target));
+    let mut is_global: i64 = 0;
+    let mut g_addend: i64 = 0;
+    if (off == 0) {
+        let g: i64 = cg_find_global(nk_name(target));
+        if (g >= 0) { is_global = 1; g_addend = cg_global_addend(g); }
+        else {
+            if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: assignment to unknown local '") + nk_name(target) + string_from_slice("'"); }
+            return 0;
+        }
+    }
+
+    // ---- helper: load the target's current value into rax ----
+    // (inlined below for each path)
+
+    // ---- helper: store rax to the target ----
+    // (inlined below)
+
+    // ---- plain '=' (cop < 0, not postfix) ----
+    if (cop < 0 && postfix != 1) {
+        cg_eval(value);
+        if (cg_err != 0) { return 0; }
+        cg_normalize_rax(tt);
+        if (is_global == 1) {
+            cg_emit_abs64_reloc_reg(RCX, CG_RELOC_DATA, 0, g_addend);
+            cg_byte(0x48); cg_byte(0x89); cg_byte(0x01);  // mov [rcx], rax
+        } else {
+            cg_store_reg_mem(RBP, off, RAX);
+        }
         return 0;
     }
-    let g: i64 = cg_find_global(nk_name(target));
-    if (g >= 0) {
-        // mov rcx, <data_base + addend>  (ABS64_DATA reloc patches the ptr)
-        // mov [rcx], rax  -> 48 89 01 (store rax through the pointer)
-        // rax holds the value (the mov rcx imm64 does not clobber rax).
-        let addend: i64 = cg_global_addend(g);
-        cg_emit_abs64_reloc_reg(RCX, CG_RELOC_DATA, 0, addend);
+
+    // ---- compound op= / prefix ++ / postfix ++ ----
+    // For postfix, the value is implicit 1 (b == -1); for prefix/compound, b is the value.
+    let is_float: i64 = ty_is_float(tt);
+
+    if (is_float == 1) {
+        // float compound: load target (lhs) -> xmm0; save on stack; eval value
+        // (rhs) -> xmm0; load lhs -> xmm1; apply op; store. For sub/div the
+        // operand order matters (lhs OP rhs), so swap: op xmm1, xmm0; mov xmm0, xmm1.
+        let is64: i64 = cg_float_is64_type(tt);
+        let prefix: i64 = if64_prefix(is64);
+        // load target (lhs) -> xmm0
+        if (is_global == 1) {
+            cg_emit_abs64_reloc_reg(RAX, CG_RELOC_DATA, 0, g_addend);
+            cg_byte(0x48); cg_byte(0x8B); cg_byte(0x00);  // mov rax, [rax]
+            if (is64 == 1) { cg_movq_xmm_rax(XMM0); } else { cg_movd_xmm_eax(XMM0); }
+        } else {
+            cg_load_float(XMM0, off, is64);
+        }
+        // save lhs (xmm0) on the stack
+        cg_sub_reg_imm32(RSP, 8);
+        if (is64 == 1) { cg_sse_mem(0xF2, 0x11, XMM0, 0); } else { cg_sse_mem(0xF3, 0x11, XMM0, 0); }
+        // eval value (rhs) -> xmm0 (or load 1 for ++/--)
+        if (postfix == 1 || value < 0) {
+            cg_mov_reg_imm64(RAX, 1);
+            cg_i64_to_float(XMM0, RAX, is64);
+        } else {
+            cg_eval(value); if (cg_err != 0) { return 0; }
+            if (is64 == 1) { cg_movq_xmm_rax(XMM0); } else { cg_movd_xmm_eax(XMM0); }
+        }
+        // xmm1 = lhs (reload from stack)
+        if (is64 == 1) { cg_sse_mem(0xF2, 0x10, XMM1, 0); } else { cg_sse_mem(0xF3, 0x10, XMM1, 0); }
+        cg_add_reg_imm32(RSP, 8);
+        // apply the float op. xmm0=rhs, xmm1=lhs. Result = lhs OP rhs.
+        //   add/mul: commutative -> op xmm0, xmm1 (xmm0 = xmm0 + xmm1)
+        //   sub/div: non-commutative -> op xmm1, xmm0 (xmm1 = xmm1 - xmm0); mov xmm0, xmm1
+        if (cop == (BinOp::Add as i64)) { cg_float_op(0x58, is64); }
+        else if (cop == (BinOp::Mul as i64)) { cg_float_op(0x59, is64); }
+        else if (cop == (BinOp::Sub as i64)) {
+            // subsd/ss xmm1, xmm0 (xmm1 = lhs - rhs); movsd/ss xmm0, xmm1
+            cg_sse_rr(prefix, 0x5C, XMM1, XMM0);
+            cg_sse_rr(prefix, 0x10, XMM0, XMM1);
+        }
+        else if (cop == (BinOp::Div as i64)) {
+            // divsd/ss xmm1, xmm0 (xmm1 = lhs / rhs); movsd/ss xmm0, xmm1
+            cg_sse_rr(prefix, 0x5E, XMM1, XMM0);
+            cg_sse_rr(prefix, 0x10, XMM0, XMM1);
+        }
+        // store xmm0 (the new value) to target
+        if (is_global == 1) {
+            // unreachable for float globals in Phase 1; defend anyway
+            cg_movq_rax_xmm(XMM0);
+            cg_emit_abs64_reloc_reg(RCX, CG_RELOC_DATA, 0, g_addend);
+            cg_byte(0x48); cg_byte(0x89); cg_byte(0x01);
+        } else {
+            cg_store_float(off, XMM0, is64);
+        }
+        // postfix float: result = old value. For ++/-- (Add/Sub with 1),
+        // old = new ∓ 1. This is an edge case not in the Phase 2 test set;
+        // mirror the C++ derive-from-new approach.
+        if (postfix == 1) {
+            // xmm0 = new value. old = new - 1 (for Add/++) or new + 1 (for Sub/--).
+            // Load 1.0 into xmm1, then sub/add.
+            cg_mov_reg_imm64(RAX, 1);
+            cg_i64_to_float(XMM1, RAX, is64);
+            if (cop == (BinOp::Add as i64)) { cg_sse_rr(prefix, 0x5C, XMM0, XMM1); }
+            else { cg_sse_rr(prefix, 0x58, XMM0, XMM1); }
+        }
+        // result in xmm0 (for float) — but the expression result convention is
+        // rax for int / xmm0 for float. The caller that use a float assignment
+        // result (let y = (x += 1.0);) read xmm0. Return 0 (no error).
+        return 0;
+    }
+
+    // integer compound / prefix / postfix
+    let is_unsigned: i64 = cg_type_is_uint(tt);
+
+    // load target -> rax
+    if (is_global == 1) {
+        cg_emit_abs64_reloc_reg(RAX, CG_RELOC_DATA, 0, g_addend);
+        cg_byte(0x48); cg_byte(0x8B); cg_byte(0x00);  // mov rax, [rax]
+        cg_normalize_rax(tt);
+    } else {
+        cg_load_reg_mem(RAX, RBP, off);
+        cg_normalize_rax(tt);
+    }
+
+    // For postfix: save the OLD value (push rax) before computing the new one.
+    // The C++ codegen pushes the updated value and derives old = new ± 1, but
+    // the simpler correct approach is to save old first, then compute new.
+    if (postfix == 1) {
+        cg_push(RAX);  // save old value
+    }
+
+    // save lhs (rax) across value eval
+    cg_push(RAX);
+    // eval value -> rax (or load 1 for postfix/prefix ++/--)
+    if (postfix == 1 || value < 0) {
+        cg_mov_reg_imm64(RAX, 1);
+    } else {
+        cg_eval(value); if (cg_err != 0) { return 0; }
+    }
+    // rcx = rhs
+    cg_mov_reg_reg(RCX, RAX);
+    // rax = lhs (pop)
+    cg_pop(RAX);
+
+    // apply the integer op (rax = rax OP rcx), mirroring cg_eval_binexpr
+    if (cop == (BinOp::Add as i64)) { cg_add_reg_reg(RAX, RCX); }
+    else if (cop == (BinOp::Sub as i64)) { cg_sub_reg_reg(RAX, RCX); }
+    else if (cop == (BinOp::Mul as i64)) { cg_imul_reg_reg(RAX, RCX); }
+    else if (cop == (BinOp::And as i64)) { cg_and_reg_reg(RAX, RCX); }
+    else if (cop == (BinOp::Or as i64))  { cg_or_reg_reg(RAX, RCX); }
+    else if (cop == (BinOp::Xor as i64)) { cg_xor_reg_reg(RAX, RCX); }
+    else if (cop == (BinOp::Shl as i64)) { cg_shl_reg_cl(RAX); }
+    else if (cop == (BinOp::Shr as i64)) {
+        if (is_unsigned == 1) { cg_shr_reg_cl(RAX); } else { cg_sar_reg_cl(RAX); }
+    }
+    else if (cop == (BinOp::Div as i64)) {
+        if (is_unsigned == 1) { cg_byte(0x48); cg_byte(0x31); cg_byte(0xD2); cg_byte(0x48); cg_byte(0xF7); cg_byte(0xF1); }
+        else { cg_byte(0x48); cg_byte(0x99); cg_byte(0x48); cg_byte(0xF7); cg_byte(0xF9); }
+    }
+    else if (cop == (BinOp::Mod as i64)) {
+        if (is_unsigned == 1) { cg_byte(0x48); cg_byte(0x31); cg_byte(0xD2); cg_byte(0x48); cg_byte(0xF7); cg_byte(0xF1); }
+        else { cg_byte(0x48); cg_byte(0x99); cg_byte(0x48); cg_byte(0xF7); cg_byte(0xF9); }
+        cg_mov_reg_reg(RAX, RDX);  // mod: result in rdx
+    }
+    // normalize the new value to the target type
+    cg_normalize_rax(tt);
+
+    // store the new value to the target
+    if (is_global == 1) {
+        // save rax (the new value) before emitting the data pointer (which uses rcx)
+        // mov rcx, <data ptr>; mov [rcx], rax
+        cg_emit_abs64_reloc_reg(RCX, CG_RELOC_DATA, 0, g_addend);
         cg_byte(0x48); cg_byte(0x89); cg_byte(0x01);  // mov [rcx], rax
+    } else {
+        cg_store_reg_mem(RBP, off, RAX);
+    }
+
+    // postfix: expression result = OLD value (saved on stack before the op)
+    if (postfix == 1) {
+        cg_pop(RAX);  // restore old value (the expression result)
+    }
+    // for compound/prefix: expression result = new value (already in rax)
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// Phase 2 Step 2: CastExpr (expr as Type). Mirrors src/codegen.cpp's CastExpr
+// lowering. The operand is eval'd into rax (int) or xmm0 (float), then
+// converted to the target type:
+//   - same type: no-op
+//   - int->int: normalize_rax(to) (sign/zero-extend or truncate via the
+//     shift-then-shift normalize)
+//   - f32->f64: cvtss2sd (F3 0F 5A C0)
+//   - f64->f32: cvtsd2ss (F2 0F 5A C0)
+//   - signed int -> float: normalize_rax(from) + cvtsi2ss/sd (F3/F2 48 0F 2A C0)
+//   - float -> signed int: cvttsi2ss/sd (F3/F2 48 0F 2C C0) + normalize_rax(to)
+// -----------------------------------------------------------------------------
+fn cg_eval_castexpr(e: i64) -> i64 {
+    let operand: i64 = nk_a(e);
+    let to: i64 = resolve_type(nk_b(e));
+    if (cg_err != 0) { return 0; }
+    let from: i64 = cg_expr_type(operand);
+    // same-type scalar: no-op (just eval the operand)
+    if (type_eq(from, to) == 1) { cg_eval(operand); return 0; }
+    // int -> int: eval operand, normalize to target width
+    if (cg_type_is_int(from) == 1 && cg_type_is_int(to) == 1) {
+        cg_eval(operand); if (cg_err != 0) { return 0; }
+        cg_normalize_rax(to);
         return 0;
     }
-    if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: assignment to unknown local '") + nk_name(target) + string_from_slice("'"); }
+    // float -> float: cvtss2sd (f32->f64) or cvtsd2ss (f64->f32)
+    if (ty_is_float(from) == 1 && ty_is_float(to) == 1) {
+        cg_eval(operand); if (cg_err != 0) { return 0; }
+        if (nk_d(from) == (Prim::F32 as i64) && nk_d(to) == (Prim::F64 as i64)) {
+            // cvtss2sd xmm0, xmm0 -> F3 0F 5A C0
+            cg_byte(0xF3); cg_byte(0x0F); cg_byte(0x5A); cg_byte(0xC0);
+        } else {
+            // cvtsd2ss xmm0, xmm0 -> F2 0F 5A C0
+            cg_byte(0xF2); cg_byte(0x0F); cg_byte(0x5A); cg_byte(0xC0);
+        }
+        return 0;
+    }
+    // signed int -> float: normalize the int, then cvtsi2ss/sd rax -> xmm0
+    if (cg_type_is_int(from) == 1 && ty_is_uint(from) == 0 && ty_is_float(to) == 1) {
+        cg_eval(operand); if (cg_err != 0) { return 0; }
+        cg_normalize_rax(from);
+        // cvtsi2sd xmm0, rax (f64) -> F2 48 0F 2A C0
+        // cvtsi2ss xmm0, rax (f32) -> F3 48 0F 2A C0
+        if (nk_d(to) == (Prim::F64 as i64)) { cg_byte(0xF2); } else { cg_byte(0xF3); }
+        cg_byte(0x48); cg_byte(0x0F); cg_byte(0x2A); cg_byte(0xC0);
+        return 0;
+    }
+    // float -> signed int: cvttsi2ss/sd xmm0 -> rax (truncate toward zero),
+    // then normalize to the target int width.
+    if (ty_is_float(from) == 1 && cg_type_is_int(to) == 1 && ty_is_uint(to) == 0) {
+        cg_eval(operand); if (cg_err != 0) { return 0; }
+        // cvttsi2si rax, xmm0 (f64->i64) -> F2 48 0F 2C C0
+        // cvttsi2si rax, xmm0 (f32->i64) -> F3 48 0F 2C C0
+        // (the 64-bit form is used for all int widths; normalize_rax narrows)
+        if (nk_d(from) == (Prim::F64 as i64)) { cg_byte(0xF2); } else { cg_byte(0xF3); }
+        cg_byte(0x48); cg_byte(0x0F); cg_byte(0x2C); cg_byte(0xC0);
+        cg_normalize_rax(to);
+        return 0;
+    }
+    // unreachable: sema's cast matrix rejects anything else
+    if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: invalid cast reached codegen"); }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// Phase 2 Step 4: TernaryExpr (cond ? then : else). Mirrors src/codegen.cpp:
+//   eval cond -> rax; cmp rax, 0; jz else; eval then -> rax; jmp end; else:
+//   eval else -> rax; end: Result in rax.
+// -----------------------------------------------------------------------------
+fn cg_eval_ternaryexpr(e: i64) -> i64 {
+    let cond: i64 = nk_a(e);
+    let then_e: i64 = nk_b(e);
+    let else_e: i64 = nk_c(e);
+    cg_eval(cond); if (cg_err != 0) { return 0; }
+    cg_cmp_reg_imm32(RAX, 0);
+    let else_l: i64 = cg_alloc_label();
+    let end_l: i64 = cg_alloc_label();
+    cg_jcc(COND_E, else_l);       // cond == 0 -> else
+    cg_eval(then_e); if (cg_err != 0) { return 0; }
+    cg_jmp(end_l);
+    cg_bind(else_l);
+    cg_eval(else_e); if (cg_err != 0) { return 0; }
+    cg_bind(end_l);
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// Phase 2 Step 5: SizeofExpr + OffsetofExpr. Both are COMPILE-TIME CONSTANTS
+// (sema resolved them). The codegen emits `mov rax, <constant>`. For
+// primitives, cg_type_size gives the size; offsetof of a primitive field is
+// rejected by sema (no fields). Struct sizeof/offsetof complete in Phase 3.
+// Mirrors src/codegen.cpp: mov_reg_imm64(Reg::rax, int64_t(s->resolved)).
+// -----------------------------------------------------------------------------
+fn cg_eval_sizeofexpr(e: i64) -> i64 {
+    let t: i64 = resolve_type(nk_a(e));
+    if (cg_err != 0) { return 0; }
+    let sz: i64 = cg_type_size(t);
+    cg_mov_reg_imm64(RAX, sz);
+    return 0;
+}
+
+fn cg_eval_offsetofexpr(e: i64) -> i64 {
+    // Phase 2: offsetof of a struct field is Phase 3 (struct layout). For
+    // primitives there are no fields (sema rejects). Emit 0 as a placeholder;
+    // sema's check rejects non-struct offsetof before codegen runs.
+    let t: i64 = resolve_type(nk_a(e));
+    if (cg_err != 0) { return 0; }
+    // For a struct (Phase 3), compute the field offset from the layout. For
+    // now, structs are not supported in Phase 2, so this is unreachable for
+    // valid programs. Emit 0 defensively.
+    cg_mov_reg_imm64(RAX, 0);
     return 0;
 }
 
@@ -1872,7 +2292,9 @@ fn cg_eval_callexpr(e: i64) -> i64 {
         cg_call_reg(RAX);  // call rax (FF D0)
         // add rsp, call_frame (restore the stack)
         cg_add_reg_imm32(RSP, call_frame);
-        // result (i64 or handle) is in rax
+        // result (i64 or handle) is in rax; normalize narrow int returns at
+        // the call boundary (mirrors src/codegen.cpp's CallExpr post-call normalize).
+        cg_normalize_rax(ret_type);
         return 0;
     }
 
@@ -1892,7 +2314,9 @@ fn cg_eval_callexpr(e: i64) -> i64 {
     // add rsp, call_frame (restore the stack)
     cg_add_reg_imm32(RSP, call_frame);
 
-    // result is in rax
+    // result is in rax; normalize narrow int returns at the call boundary.
+    let sret: i64 = nk_c(e);
+    cg_normalize_rax(sret);
     return 0;
 }
 
@@ -1915,7 +2339,7 @@ fn cg_compile_stmt(s: i64) -> i64 {
         if (init >= 0) {
             cg_eval(init); if (cg_err != 0) { return 0; }
             if (ty_is_float(t) == 1) { cg_store_float(off, XMM0, cg_float_is64_type(t)); }
-            else { cg_store_reg_mem(RBP, off, RAX); }
+            else { cg_normalize_rax(t); cg_store_reg_mem(RBP, off, RAX); }
         }
         return 0;
     }
@@ -1961,6 +2385,10 @@ fn cg_compile_stmt(s: i64) -> i64 {
     }
     if (k == (NK::ForStmt as i64)) { return cg_compile_for(s); }
     if (k == (NK::MatchStmt as i64)) { return cg_compile_match(s); }
+    // Phase 2 Step 6: static_assert produces NO codegen (sema resolved it:
+    // true -> elided, false/non-const -> compile error that never reaches
+    // codegen). Skip it before any dispatch, mirroring src/codegen.cpp.
+    if (k == (NK::StaticAssertStmt as i64)) { return 0; }
 
     // unsupported statement kind in v1
     if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: statement kind unsupported in v1"); }

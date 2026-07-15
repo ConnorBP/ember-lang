@@ -1,0 +1,8 @@
+// Self-hosted positive: postfix ++ returns OLD value (was miscompiled before fix).
+// x becomes 6, y is old 5; x*100+y = 605
+// expect: 605
+fn main() -> i64 {
+    let mut x: i64 = 5;
+    let y: i64 = x++;
+    return x * 100 + y;
+}

@@ -1,0 +1,6 @@
+// Self-hosted negative: static_assert with a false condition (sema error).
+// selfhost-reject: -319
+fn main() -> i64 {
+    static_assert(false, "boom");
+    return 42;
+}
