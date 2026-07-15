@@ -225,6 +225,58 @@ static void usage(FILE* out) {
     );
 }
 
+// Add a module-init function for host-owned string globals. A `.em` globals
+// block can persist plain scalar bytes, but a `string` value is a process-local
+// handle into ext_string's store; serializing the bundler process's handle makes
+// it invalid in the standalone stub process. Materialize each literal again at
+// runtime and store the fresh handle into the relocated globals block.
+static bool add_globals_init(ember::Program& program, std::string& err_out) {
+    using namespace ember;
+
+    FuncDecl init;
+    init.name = "__globals_init";
+    init.ret = std::make_shared<Type>(type_void());
+    init.loc = Loc{1, 1};
+
+    for (const auto& global : program.globals) {
+        const auto* literal = dynamic_cast<const StringLit*>(global.init.get());
+        // This runs before sema resolves named opaque handles from Prim::Void
+        // to Prim::I64, so identify `string` by its nominal name here.
+        const bool is_string = global.ty && global.ty->struct_name == "string";
+        if (!literal || !is_string) continue;
+        if (global.is_const || !global.ns.empty()) {
+            err_out = "ember_bundle: portable string-global initialization does not yet support "
+                      "const or namespaced global '" + global.name + "'";
+            return false;
+        }
+
+        auto target = std::make_unique<Ident>();
+        target->name = global.name;
+        target->loc = global.loc;
+        auto value = std::make_unique<StringLit>();
+        value->s = literal->s;
+        value->loc = literal->loc;
+        auto assign = std::make_unique<AssignExpr>();
+        assign->target = std::move(target);
+        assign->value = std::move(value);
+        assign->loc = global.loc;
+        auto statement = std::make_unique<ExprStmt>();
+        statement->expr = std::move(assign);
+        statement->loc = global.loc;
+        init.body.stmts.push_back(std::move(statement));
+    }
+
+    if (init.body.stmts.empty()) return true;
+    for (const auto& fn : program.funcs) {
+        if (fn.name == init.name && fn.ns.empty()) {
+            err_out = "ember_bundle: function name '__globals_init' is reserved for module initialization";
+            return false;
+        }
+    }
+    program.funcs.push_back(std::move(init));
+    return true;
+}
+
 // Compile a .ember file to an EmModule in memory. This is the emit-em pipeline
 // from ember_cli.cpp's run_ember_file, factored out so the bundler can produce
 // the .em without going through the CLI. Returns true + fills `mod` on success;
@@ -282,6 +334,7 @@ static bool compile_to_em_module(const fs::path& file,
         err_out = "ember_bundle: no functions in '" + file.u8string() + "'";
         return false;
     }
+    if (!add_globals_init(pr.program, err_out)) return false;
 
     // ---- slot assignment ----
     std::unordered_map<std::string, int> slots;
@@ -352,11 +405,10 @@ static bool compile_to_em_module(const fs::path& file,
     std::vector<uint8_t> gb_store(size_t(tgl.total_size), 0);
     gb.base = int64_t(gb_store.data());
     g_globals_for_codegen = nullptr;
-    auto string_alloc_thunk = [](const char* bytes, int64_t len) -> int64_t {
-        return ember::ext_string::alloc(std::string(bytes, size_t(len > 0 ? len : 0)));
-    };
     GlobalInitCtx gic{gb_store, gb.index, gb.types};
-    gic.string_alloc_fn = string_alloc_thunk;
+    // String handles are process-local and cannot be serialized. The synthetic
+    // __globals_init function above creates them in the loading process.
+    gic.string_alloc_fn = nullptr;
     gic.offsets = &gb.offsets;
     gic.sizes = &gb.sizes;
     gic.backing_offsets = &tgl.backing_offsets;

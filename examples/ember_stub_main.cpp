@@ -207,6 +207,10 @@ int main(int argc, char** argv) {
     std::unordered_map<std::string, ember::NativeSig> natives;
     register_standard_bindings(natives);
 
+    // The bundled program may itself invoke the self-hosted EMBM loader. Give
+    // that loader the same allowlisted bindings and permissions as this .em.
+    ember::ext_call_raw::set_loader_context(&natives, ember::PERM_FFI);
+
     // 4. Load the .em from memory.
     // The stub is a trusted host running its own bundled .em (appended at
     // build time, not loaded from an untrusted source), so it grants PERM_FFI
@@ -245,7 +249,20 @@ int main(int argc, char** argv) {
     bool is_void = selected_slot < mod.signatures_by_slot.size() &&
                    mod.signatures_by_slot[selected_slot].ret.is_void();
 
-    // 7. Call + exit code.
+    // 7. Initialize runtime services and process-local globals, then call.
+    // String global values are handles into ext_string's process-local store,
+    // so the bundler emits __globals_init to construct them in this process
+    // instead of persisting the bundler process's stale handles in `.em`.
+    ember::context_t ectx;
+    ectx.budget_remaining = 20000000000;
+    ectx.max_call_depth = 512;
+    ember::ext_coroutine::coroutine_init(&ectx, mod.dispatch.data(),
+                                         int64_t(mod.dispatch.size()));
+    if (void* globals_init = mod.entry_by_name("__globals_init"))
+        ember::call_i64_i64(globals_init);
+
     int64_t result = ember::call_i64_i64(entry);
+    ember::ext_coroutine::coroutine_reset();
+    ember::ext_call_raw::reset();
     return is_void ? 0 : int(result);
 }
