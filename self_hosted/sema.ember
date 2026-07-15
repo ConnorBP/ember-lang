@@ -782,10 +782,11 @@ fn enum_variant_value(row: i64, variant_name: string) -> i64 {
     let mut v: i64 = array_get_i64(g_enums, row * 2 + 1);
     while (v >= 0) {
         if (nk_a(v) >= 0) {
-            // explicit value: fold the const expr (IntLit / -IntLit, matching
-            // try_const_i64; the C++ also folds constexpr fn calls + BinExpr
-            // of literals, but the subset's variant values are plain literals).
-            if (try_const_i64(nk_a(v)) == 1) { value = s_constval; }
+            // explicit value: fold the const expr. try_eval_const_i64 handles
+            // IntLit / -IntLit / BinExpr of literals AND constexpr fn calls
+            // (e.g. `X = base()`), matching the C++ resolve_enums pre-pass.
+            if (try_eval_const_i64(nk_a(v)) == 1) { value = ce_int_out; }
+            else if (try_const_i64(nk_a(v)) == 1) { value = s_constval; }
         }
         if (nk_name(v) == variant_name) { g_enum_val_out = value; return 1; }
         value = value + 1;

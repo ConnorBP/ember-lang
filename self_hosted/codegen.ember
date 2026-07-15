@@ -2373,8 +2373,9 @@ fn cg_eval(e: i64) -> i64 {
 
 fn cg_enum_value(enum_name: string, variant_name: string) -> i64 {
     let row: i64 = find_enum(enum_name); if (row < 0) { return 0; }
-    let mut value: i64 = 0; let mut v: i64 = array_get_i64(g_enums, row * 2 + 1);
-    while (v >= 0) { if (nk_a(v) >= 0 && nk_kind(nk_a(v)) == (NK::IntLit as i64)) { value = nk_d(nk_a(v)); } if (nk_name(v) == variant_name) { return value; } value = value + 1; v = nk_next(v); }
+    // Delegate to sema's enum_variant_value, which folds constexpr fn calls
+    // (e.g. `X = base()`) via try_eval_const_i64, not just plain IntLits.
+    if (enum_variant_value(row, variant_name) == 1) { return g_enum_val_out; }
     return 0;
 }
 
