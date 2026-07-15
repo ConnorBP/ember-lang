@@ -58,7 +58,21 @@ fn main() -> i64 {
     // Register B's dispatch table for coroutines
     set_coroutine_dispatch(module_dispatch_base(h), module_dispatch_count(h));
 
-    // 4. Get B's `main` entry offset (emberc.ember's main, which reads a
+    // 4a. Call B's __globals_init BEFORE main (if present). The codegen emits
+    //     a synthetic __globals_init function when the program declares string
+    //     globals: it materializes each literal (rodata + string_from_slice ->
+    //     handle) + stores the handle into the global's data slot. Without this,
+    //     B's string globals (error messages, token names, etc.) are empty,
+    //     causing B's lex/parse to fail.
+    let init_off: i64 = codegen_globals_init_offset();
+    if (init_off >= 0) {
+        let init_entry: i64 = module_entry_ptr(h, init_off);
+        if (init_entry != 0) {
+            let init_res: i64 = call_raw(init_entry, 0);
+        }
+    }
+
+    // 4b. Get B's `main` entry offset (emberc.ember's main, which reads a
     //    file path from stdin, compiles + runs it, and returns the result).
     let main_off: i64 = codegen_fn_entry_offset(string_from_slice("main"));
     if (main_off < 0) { free_executable_module(h); return -502; }
