@@ -161,6 +161,7 @@ global cg_globals_init_label : i64 = -1;
 global CG_RELOC_RODATA : i64 = 1;   // ABS64_RODATA: addend = rodata byte offset
 global CG_RELOC_DATA   : i64 = 2;   // ABS64_DATA:   addend = data byte offset
 global CG_RELOC_NATIVE : i64 = 3;   // ABS64_NATIVE: sym_idx = symbol index, addend = fingerprint
+global CG_RELOC_DISPATCH : i64 = 4; // DISPATCH_BASE: module function vector
 
 // frame layout for the current function
 global cg_locals     : i64 = 0;   // stride 3 [name_tok, rbp_offset, type_node]
@@ -177,6 +178,11 @@ global cg_frame_size : i64 = 0;   // the current fn's frame size
 // `mov rax, 0; call rax` (which branched to address 0 under make_executable)
 // with a real in-buffer relative call, so multi-fn programs execute.
 global cg_fn_labels : i64 = 0;   // array, stride 3 [ name_tok, label_id, ns_tok ]
+global cg_current_lambda : i64 = -1;
+global cg_lambda_env_off : i64 = 0;
+global cg_cap_off : i64 = 0;
+global cg_cap_type : i64 = 0;
+global cg_cap_by_ref : i64 = 0;
 
 // Reusable scratch array for ABI-fingerprint computation (cg_abi_fingerprint_codes).
 // The `codes` locals previously allocated a fresh array_new(8,1|2) on EVERY
@@ -508,7 +514,7 @@ fn cg_scalar_bytes(t: i64) -> i64 {
 fn cg_value_bytes(t: i64) -> i64 {
     if (t < 0) { return 8; }
     if (nk_kind(t) != (NK::Type as i64)) { return 8; }
-    if (nk_f(t) == 1) { return 16; }                       // slice {ptr,len}
+    if (nk_f(t) == 1 || nk_f(t) == 2) { return 16; }       // slice/closure: two words
     if (nk_e(t) > 0) {                                     // fixed array T[N]
         let elem: i64 = nk_a(t);
         if (elem < 0) { return 8; }
@@ -530,7 +536,7 @@ fn cg_value_bytes(t: i64) -> i64 {
 fn cg_local_width_bytes(t: i64) -> i64 {
     if (t < 0) { return 8; }
     if (nk_kind(t) != (NK::Type as i64)) { return 8; }
-    if (nk_f(t) == 1) { return 16; }                       // slice
+    if (nk_f(t) == 1 || nk_f(t) == 2) { return 16; }       // slice/closure
     if (nk_e(t) > 0) { return cg_value_bytes(t); }         // fixed array inline
     if (nk_tok(t) >= 0) {
         let nm: string = tok_name(nk_tok(t));
@@ -633,7 +639,7 @@ fn cg_ty_is_struct(t: i64) -> i64 {
 fn cg_words_for_type(t: i64) -> i64 {
     if (t < 0) { return 1; }
     if (nk_kind(t) != (NK::Type as i64)) { return 1; }
-    if (nk_f(t) == 1) { return 2; }                       // slice {ptr,len}
+    if (nk_f(t) == 1 || nk_f(t) == 2) { return 2; }       // slice/closure {word,word}
     if (cg_ty_is_struct(t) == 1) {
         let w: i64 = cg_value_bytes(t);
         let mut s: i64 = (w + 7) / 8;
@@ -802,6 +808,8 @@ fn cg_expr_type(e: i64) -> i64 {
         return TY_F64;
     }
     if (k == (NK::StringLit as i64)) { return TY_STRING; }
+    if (k == (NK::LambdaExpr as i64)) { return nk_f(e); }
+    if (k == (NK::FnHandleExpr as i64)) { return TY_I64; }
     if (k == (NK::IntLit as i64)) { return TY_I64; }
     if (k == (NK::BoolLit as i64)) { return TY_BOOL; }
     // Phase 3b: an EnumAccess's type is the enum's type — TY_I64 for an
@@ -1168,6 +1176,12 @@ fn cg_lea_r_rbp(dst: i64, disp: i64) -> i64 {
 }
 fn cg_lea_rax_rbp(disp: i64) -> i64 { return cg_lea_r_rbp(RAX, disp); }
 fn cg_lea_r11_rbp(disp: i64) -> i64 { return cg_lea_r_rbp(R11, disp); }
+fn cg_lea_scaled8(dst: i64, base: i64, index: i64) -> i64 {
+    cg_byte(cg_rex(1, cg_is_extended(dst), cg_is_extended(index), cg_is_extended(base)));
+    cg_byte(0x8D); cg_byte(cg_modrm(0, dst, 4));
+    cg_byte((3 << 6) | ((index & 7) << 3) | (base & 7));
+    return 0;
+}
 
 // SSE load/store from/to [base + disp32] with an ARBITRARY base register
 // (generalizes cg_sse_mem which is rbp-only). prefix=F2(sd)/F3(ss), op=10(load)
@@ -1656,52 +1670,30 @@ fn cg_emit_abs64_reloc(reloc_type: i64, sym_idx: i64, addend: i64) -> i64 {
     return cg_emit_abs64_reloc_reg(RAX, reloc_type, sym_idx, addend);
 }
 
-// build the EMBM v1 module image: 80-byte header + code + rodata + data +
-// symbols + relocations, concatenated into one array<u8>. Returns the image
-// handle. Replaces the old "return cg_code" contract (§10).
+// Build EMBM v2: 96-byte header plus function dispatch table.
 fn codegen_emit_image() -> i64 {
-    let code_len: i64   = array_length(cg_code);
-    let rodata_len: i64 = array_length(cg_rodata);
-    let data_len: i64   = array_length(cg_data);
-    let syms_len: i64   = array_length(cg_syms);
-    let reloc_count: i64 = array_length(cg_relocs) / 32;  // 32 bytes per record
-
-    let header_size: i64 = 80;
-    let code_off: i64   = header_size;
-    let rodata_off: i64 = code_off + code_len;
-    let data_off: i64   = rodata_off + rodata_len;
-    let syms_off: i64   = data_off + data_len;
-    let relocs_off: i64 = syms_off + syms_len;  // relocations follow symbols
-
+    let code_len: i64 = array_length(cg_code); let rodata_len: i64 = array_length(cg_rodata);
+    let data_len: i64 = array_length(cg_data); let syms_len: i64 = array_length(cg_syms);
+    let reloc_count: i64 = array_length(cg_relocs) / 32;
+    let fn_count: i64 = array_length(cg_fn_labels) / 3; let fntable_len: i64 = fn_count * 16;
+    let header_size: i64 = 96; let code_off: i64 = header_size;
+    let rodata_off: i64 = code_off + code_len; let data_off: i64 = rodata_off + rodata_len;
+    let syms_off: i64 = data_off + data_len; let fntable_off: i64 = syms_off + syms_len;
     let img: i64 = array_new(1, 0);
-
-    // ---- 80-byte header (§2) ----
-    // magic "EMBM" = 0x45 0x4D 0x42 0x4D
     array_push_u8(img, 0x45); array_push_u8(img, 0x4D); array_push_u8(img, 0x42); array_push_u8(img, 0x4D);
-    cg_push_u32_le(img, 1);           // version = 1
-    cg_push_u64_le(img, code_off);     // code_off
-    cg_push_u64_le(img, code_len);     // code_len
-    // a zero-length section gets off = 0 (the loader accepts off=0 for empty sections)
-    if (rodata_len > 0) { cg_push_u64_le(img, rodata_off); } else { cg_push_u64_le(img, 0); }
-    cg_push_u64_le(img, rodata_len);   // rodata_len
-    if (data_len > 0) { cg_push_u64_le(img, data_off); } else { cg_push_u64_le(img, 0); }
-    cg_push_u64_le(img, data_len);     // data_len
-    if (syms_len > 0) { cg_push_u64_le(img, syms_off); } else { cg_push_u64_le(img, 0); }
-    cg_push_u64_le(img, syms_len);     // syms_len
-    cg_push_u64_le(img, reloc_count);  // reloc_count
-
-    // ---- concatenate the sections ----
+    cg_push_u32_le(img, 2); cg_push_u64_le(img, code_off); cg_push_u64_le(img, code_len);
+    if (rodata_len > 0) { cg_push_u64_le(img, rodata_off); } else { cg_push_u64_le(img, 0); } cg_push_u64_le(img, rodata_len);
+    if (data_len > 0) { cg_push_u64_le(img, data_off); } else { cg_push_u64_le(img, 0); } cg_push_u64_le(img, data_len);
+    if (syms_len > 0) { cg_push_u64_le(img, syms_off); } else { cg_push_u64_le(img, 0); } cg_push_u64_le(img, syms_len);
+    cg_push_u64_le(img, reloc_count);
+    if (fntable_len > 0) { cg_push_u64_le(img, fntable_off); } else { cg_push_u64_le(img, 0); } cg_push_u64_le(img, fntable_len);
     let mut i: i64 = 0;
     while (i < code_len) { array_push_u8(img, array_get_u8(cg_code, i) as i64); i = i + 1; }
-    i = 0;
-    while (i < rodata_len) { array_push_u8(img, array_get_u8(cg_rodata, i) as i64); i = i + 1; }
-    i = 0;
-    while (i < data_len) { array_push_u8(img, array_get_u8(cg_data, i) as i64); i = i + 1; }
-    i = 0;
-    while (i < syms_len) { array_push_u8(img, array_get_u8(cg_syms, i) as i64); i = i + 1; }
-    i = 0;
-    while (i < array_length(cg_relocs)) { array_push_u8(img, array_get_u8(cg_relocs, i) as i64); i = i + 1; }
-
+    i = 0; while (i < rodata_len) { array_push_u8(img, array_get_u8(cg_rodata, i) as i64); i = i + 1; }
+    i = 0; while (i < data_len) { array_push_u8(img, array_get_u8(cg_data, i) as i64); i = i + 1; }
+    i = 0; while (i < syms_len) { array_push_u8(img, array_get_u8(cg_syms, i) as i64); i = i + 1; }
+    i = 0; while (i < fn_count) { cg_push_u64_le(img, i); cg_push_u64_le(img, cg_label_offset(array_get_i64(cg_fn_labels, i * 3 + 1))); i = i + 1; }
+    i = 0; while (i < array_length(cg_relocs)) { array_push_u8(img, array_get_u8(cg_relocs, i) as i64); i = i + 1; }
     return img;
 }
 
@@ -2177,6 +2169,11 @@ fn cg_count_locals_stmt(s: i64, total: i64) -> i64 {
         total = cg_count_locals_block(nk_b(s), total);   // catch body
         return total;
     }
+    // Each captured lambda creation keeps one heap-env pointer spill in its
+    // surrounding frame while captures are copied.
+    if (k == (NK::ExprStmt as i64) || k == (NK::ReturnStmt as i64)) {
+        if (nk_a(s) >= 0 && nk_kind(nk_a(s)) == (NK::LambdaExpr as i64)) { total = total + 1; }
+    }
     // DeferStmt holds an expr (no locals of its own); nothing to count.
     return total;
 }
@@ -2211,6 +2208,49 @@ fn cg_emit_epilogue() -> i64 {
 // (v1: everything is i64 or bool, both held in rax as a 64-bit value.)
 // =============================================================================
 
+fn cg_find_capture(le: i64, name: string) -> i64 {
+    let n: i64 = array_length(g_lambda_caps) / LAMBDA_CAP_STRIDE; let mut i: i64 = 0;
+    while (i < n) {
+        if (array_get_i64(g_lambda_caps, i * LAMBDA_CAP_STRIDE) == le &&
+            tok_name(array_get_i64(g_lambda_caps, i * LAMBDA_CAP_STRIDE + 1)) == name) {
+            cg_cap_type = array_get_i64(g_lambda_caps, i * LAMBDA_CAP_STRIDE + 2);
+            cg_cap_off = array_get_i64(g_lambda_caps, i * LAMBDA_CAP_STRIDE + 3);
+            cg_cap_by_ref = array_get_i64(g_lambda_caps, i * LAMBDA_CAP_STRIDE + 4); return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn cg_eval_lambda(e: i64) -> i64 {
+    let cap_count: i64 = lambda_capture_count(e); let env_size: i64 = cap_count * 8;
+    if (env_size == 0) { cg_mov_reg_imm64(RAX, nk_d(e)); cg_mov_reg_imm64(RDX, 0); return 0; }
+    // Heap allocate the environment, retaining its pointer in a stack spill.
+    let frame: i64 = 48; cg_sub_reg_imm32(RSP, frame); cg_mov_reg_imm64(RCX, env_size);
+    let sym: i64 = cg_sym_index(string_from_slice("__ember_gc_alloc_env"));
+    let pts: i64 = cg_fp_types_get(); array_set_i64(pts, 0, TY_I64);
+    cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym, cg_abi_fingerprint(pts, 1, TY_I64, 0)); cg_call_reg(RAX);
+    cg_store_reg_mem(RSP, 0, RAX);
+    let n: i64 = array_length(g_lambda_caps) / LAMBDA_CAP_STRIDE; let mut i: i64 = 0;
+    while (i < n) {
+        if (array_get_i64(g_lambda_caps, i * LAMBDA_CAP_STRIDE) == e) {
+            let nt: i64 = array_get_i64(g_lambda_caps, i * LAMBDA_CAP_STRIDE + 1);
+            let coff: i64 = array_get_i64(g_lambda_caps, i * LAMBDA_CAP_STRIDE + 3);
+            let byref: i64 = array_get_i64(g_lambda_caps, i * LAMBDA_CAP_STRIDE + 4);
+            let loff: i64 = cg_lookup_local(nt);
+            if (loff != 0) {
+                if (byref == 1) { cg_lea_rax_rbp(loff); } else { cg_load_reg_mem(RAX, RBP, loff); }
+            } else if (cg_current_lambda >= 0 && cg_find_capture(cg_current_lambda, tok_name(nt)) == 1) {
+                cg_load_reg_mem(RAX, RBP, cg_lambda_env_off); cg_load_reg_mem(RAX, RAX, cg_cap_off);
+                if (cg_cap_by_ref == 1 && byref == 0) { cg_load_reg_mem(RAX, RAX, 0); }
+            } else { cg_mov_reg_imm64(RAX, 0); }
+            cg_load_reg_mem(RCX, RSP, 0); cg_store_reg_mem(RCX, coff, RAX);
+        }
+        i = i + 1;
+    }
+    cg_load_reg_mem(RDX, RSP, 0); cg_add_reg_imm32(RSP, frame); cg_mov_reg_imm64(RAX, nk_d(e)); return 0;
+}
+
 fn cg_eval(e: i64) -> i64 {
     if (e < 0) {
         if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: missing expression"); }
@@ -2229,6 +2269,8 @@ fn cg_eval(e: i64) -> i64 {
     }
     if (k == (NK::FloatLit as i64)) { return cg_eval_float_lit(e); }
     if (k == (NK::StringLit as i64)) { return cg_eval_string_lit(e); }
+    if (k == (NK::LambdaExpr as i64)) { return cg_eval_lambda(e); }
+    if (k == (NK::FnHandleExpr as i64)) { cg_mov_reg_imm64(RAX, nk_d(e)); return 0; }
     if (k == (NK::EnumAccess as i64)) {
         let ename: string = tok_name(nk_a(e));
         // Tier 1 namespaces: Foo::val where Foo is a namespace (not an enum) is
@@ -2261,12 +2303,17 @@ fn cg_eval(e: i64) -> i64 {
     if (k == (NK::ViewExpr as i64)) { return cg_eval_viewexpr(e); }
     if (k == (NK::ArrayLit as i64)) { return cg_eval_arraylit_rval(e); }
     if (k == (NK::Ident as i64)) {
+        if (cg_current_lambda >= 0 && cg_find_capture(cg_current_lambda, nk_name(e)) == 1) {
+            cg_load_reg_mem(RAX, RBP, cg_lambda_env_off); cg_load_reg_mem(RAX, RAX, cg_cap_off);
+            if (cg_cap_by_ref == 1) { cg_load_reg_mem(RAX, RAX, 0); }
+            cg_normalize_rax(cg_cap_type); return 0;
+        }
         // look up the local; load from [rbp + offset]
         let off: i64 = cg_lookup_local(nk_tok(e));
         if (off != 0) {
             let t: i64 = cg_lookup_local_type(nk_tok(e));
-            if (t >= 0 && nk_kind(t) == (NK::Type as i64) && nk_f(t) == 1) {
-                // slice local: yield the 2-word slice ABI {rax=ptr, rdx=len}
+            if (t >= 0 && nk_kind(t) == (NK::Type as i64) && (nk_f(t) == 1 || nk_f(t) == 2)) {
+                // slice/closure local: yield the 2-word ABI {rax=word0, rdx=word1}
                 // (mirrors src/codegen.cpp's slice Ident eval). Used by for-each
                 // + slice IndexExpr bases + slice args (future).
                 cg_load_reg_mem(RAX, RBP, off);
@@ -3569,8 +3616,25 @@ fn cg_eval_offsetofexpr(e: i64) -> i64 {
 // Win64: first 4 int args in rcx/rdx/r8/r9. Args are eval'd into stack temps
 // first (eval may clobber a placed register), then loaded into registers in
 // order — the same stash-then-load pattern the C++ codegen uses.
+fn cg_eval_indirect_lambda_call(e: i64) -> i64 {
+    let mut argc: i64 = 0; let mut a: i64 = nk_a(e); while (a >= 0) { argc = argc + 1; a = nk_next(a); }
+    let frame: i64 = cg_round16((argc + 2) * 8 + 32); cg_sub_reg_imm32(RSP, frame);
+    cg_eval(nk_e(e)); if (cg_err != 0) { return 0; }
+    cg_store_reg_mem(RSP, 0, RAX); cg_store_reg_mem(RSP, 8, RDX);
+    a = nk_a(e); let mut i: i64 = 0;
+    while (a >= 0) { cg_eval(a); if (cg_err != 0) { return 0; } cg_store_reg_mem(RSP, 16 + i * 8, RAX); i = i + 1; a = nk_next(a); }
+    cg_load_reg_mem(RAX, RSP, 0); cg_load_reg_mem(RCX, RSP, 8);
+    if (argc >= 1) { cg_load_reg_mem(RDX, RSP, 16); }
+    if (argc >= 2) { cg_load_reg_mem(R8, RSP, 24); }
+    if (argc >= 3) { cg_load_reg_mem(R9, RSP, 32); }
+    cg_emit_abs64_reloc_reg(R11, CG_RELOC_DISPATCH, 0, 0);
+    cg_lea_scaled8(R11, R11, RAX); cg_load_reg_mem(R11, R11, 0); cg_call_reg(R11);
+    cg_add_reg_imm32(RSP, frame); return 0;
+}
+
 fn cg_eval_callexpr(e: i64) -> i64 {
     let name: string = nk_name(e);
+    if (nk_d(e) == 2) { return cg_eval_indirect_lambda_call(e); }
 
     // ---- string_from_slice(<StringLit>) special case ----
     // The host registers string_from_slice with a u8-slice param (ABI code 5,
@@ -3701,7 +3765,14 @@ fn cg_eval_callexpr(e: i64) -> i64 {
         }
         let ret_type: i64 = native_ret_type(name);
         let perm: i64 = native_perm(name);
-        let fp: i64 = cg_abi_fingerprint(param_types, argc, ret_type, perm);
+        let mut fp: i64 = cg_abi_fingerprint(param_types, argc, ret_type, perm);
+        // The host marks coroutine_start's first i64-shaped parameter as a
+        // function handle (ABI code 6), even though source-level checking uses
+        // i64 slots. Match that registered fingerprint exactly.
+        if (name == string_from_slice("coroutine_start")) {
+            let codes: i64 = cg_fp_codes_get(); array_set_i64(codes, 0, 6); array_set_i64(codes, 1, 1);
+            fp = cg_abi_fingerprint_codes(codes, 2, 1, 0);
+        }
         cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
         cg_call_reg(RAX);  // call rax (FF D0)
         cg_add_reg_imm32(RSP, call_frame);
@@ -3747,8 +3818,8 @@ fn cg_eval_callexpr(e: i64) -> i64 {
                 cg_stash_struct_arg(a, pt, off);
                 if (cg_err != 0) { return 0; }
                 next_slot = next_slot + cg_words_for_type(pt);
-            } else if (nk_f(pt) == 1) {
-                // slice arg: {rax=ptr, rdx=len} (2 words)
+            } else if (nk_f(pt) == 1 || nk_f(pt) == 2) {
+                // slice/closure arg: {rax=word0, rdx=word1} (2 words)
                 cg_eval(a); if (cg_err != 0) { return 0; }
                 cg_store_reg_mem(RSP, off, RAX);
                 cg_store_reg_mem(RSP, off + 8, RDX);
@@ -3921,8 +3992,8 @@ fn cg_eval_struct_returning_call(e: i64) -> i64 {
             cg_stash_struct_arg(a, pt, off);
             if (cg_err != 0) { return 0; }
             next_slot = next_slot + cg_words_for_type(pt);
-        } else if (nk_f(pt) == 1) {
-            // slice arg: cg_eval yields {rax=ptr, rdx=len}
+        } else if (nk_f(pt) == 1 || nk_f(pt) == 2) {
+            // slice/closure arg: cg_eval yields two words in rax/rdx
             cg_eval(a); if (cg_err != 0) { return 0; }
             cg_store_reg_mem(RSP, off, RAX);
             cg_store_reg_mem(RSP, off + 8, RDX);
@@ -4020,7 +4091,7 @@ fn cg_compile_stmt(s: i64) -> i64 {
             // into the 16-byte local (ptr at off, len at off+8).
             let mut is_sl_init: i64 = 0;
             if (t >= 0 && nk_kind(t) == (NK::Type as i64)) { is_sl_init = nk_f(t); }
-            if (is_sl_init == 1) {
+            if (is_sl_init == 1 || is_sl_init == 2) {
                 cg_eval(init); if (cg_err != 0) { return 0; }
                 cg_store_reg_mem(RBP, off, RAX);
                 cg_store_reg_mem(RBP, off + 8, RDX);
@@ -4158,6 +4229,14 @@ fn cg_compile_stmt(s: i64) -> i64 {
 
     if (k == (NK::TryCatchStmt as i64)) { return cg_compile_trycatch(s); }
     if (k == (NK::ThrowStmt as i64)) { return cg_compile_throw(s); }
+    if (k == (NK::YieldStmt as i64)) {
+        if (nk_a(s) >= 0) { cg_eval(nk_a(s)); } else { cg_mov_reg_imm64(RAX, 0); }
+        let frame: i64 = 32; cg_sub_reg_imm32(RSP, frame); cg_mov_reg_reg(RCX, RAX);
+        let sym: i64 = cg_sym_index(string_from_slice("__ember_coro_yield"));
+        let pts: i64 = cg_fp_types_get(); array_set_i64(pts, 0, TY_I64);
+        cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym, cg_abi_fingerprint(pts, 1, TY_I64, 0)); cg_call_reg(RAX);
+        cg_add_reg_imm32(RSP, frame); return 0;
+    }
     // unsupported statement kind in v1
     if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: statement kind unsupported in v1"); }
     return 0;
@@ -5176,6 +5255,7 @@ fn cg_count_extra_struct_slots(b: i64) -> i64 {
 // compile a single function: prologue, param spill, body, epilogue, fixups.
 fn cg_compile_func(fd: i64, ns_tok: i64) -> i64 {
     cg_cur_ns = ns_tok;
+    let is_lambda_fn: i64 = (nk_kind(fd) == (NK::LambdaExpr as i64)) ? 1 : 0;
     // init the local table for this function
     cg_locals_init();
     // Phase 3b: reset the defer cleanup stack for this function (defers are
@@ -5193,6 +5273,9 @@ fn cg_compile_func(fd: i64, ns_tok: i64) -> i64 {
     let ret_is_struct: i64 = cg_ty_is_struct(cg_cur_ret);
     cg_struct_ret_dest_ready = 0;
     cg_struct_ret_ptr_off = 0;
+    cg_current_lambda = -1;
+    cg_lambda_env_off = 0;
+    if (is_lambda_fn == 1) { cg_current_lambda = fd; }
 
     // count params (and accumulate each param's word count for the spill map)
     let mut param_count: i64 = 0;
@@ -5205,6 +5288,7 @@ fn cg_compile_func(fd: i64, ns_tok: i64) -> i64 {
     // over params). Used for the stack-arg source offset of words >= 4.
     let mut total_words: i64 = 0;
     if (ret_is_struct == 1) { total_words = 1; }
+    if (is_lambda_fn == 1) { total_words = total_words + 1; }
     {
         let mut pp: i64 = nk_a(fd);
         while (pp >= 0) {
@@ -5223,7 +5307,7 @@ fn cg_compile_func(fd: i64, ns_tok: i64) -> i64 {
     // Phase 4: add compiler-hidden struct temp slots (struct-literal returns +
     // struct-by-value StructLit/CallExpr args) + the hidden return-pointer slot.
     let struct_temp_slots: i64 = cg_count_struct_temps_block(body, 0, ret_is_struct);
-    let hidden_ptr_slots: i64 = (ret_is_struct == 1) ? 1 : 0;
+    let hidden_ptr_slots: i64 = ((ret_is_struct == 1) ? 1 : 0) + is_lambda_fn;
 
     // frame size = (params + locals + struct temps + hidden ptr) * 8, rounded
     // to 16, +8 for the return-address alignment (push rbp makes it 16-aligned).
@@ -5247,6 +5331,13 @@ fn cg_compile_func(fd: i64, ns_tok: i64) -> i64 {
         // word 0 arrives in rcx (the first Win64 int arg reg)
         cg_store_reg_mem(RBP, rptr_off, RCX);
         param_word = 1;
+    }
+    if (is_lambda_fn == 1) {
+        let env_off: i64 = cg_alloc_local_t(-1, TY_I64, 1);
+        cg_lambda_env_off = env_off;
+        if (param_word == 0) { cg_store_reg_mem(RBP, env_off, RCX); }
+        else { cg_store_reg_mem(RBP, env_off, RDX); }
+        param_word = param_word + 1;
     }
 
     // spill params to frame slots. Each param occupies cg_words_for_type(pt)
@@ -5299,8 +5390,8 @@ fn cg_compile_func(fd: i64, ns_tok: i64) -> i64 {
                 byte_pos = byte_pos + word_bytes;
                 w = w + 1;
             }
-        } else if (nk_f(pt) == 1) {
-            // slice param: 2 consecutive integer words -> the local's 16-byte
+        } else if (nk_f(pt) == 1 || nk_f(pt) == 2) {
+            // slice/closure param: 2 consecutive integer words -> the local's 16-byte
             // {ptr,len} slot (word 0 -> off, word 1 -> off+8).
             let off: i64 = cg_alloc_local_t(nk_tok(p), pt, 2);
             cg_spill_word(param_word, off, arg_regs, total_words);
@@ -5446,6 +5537,15 @@ fn codegen(source: string) -> i64 {
         }
         d = nk_next(d);
     }
+    // Synthetic lambdas follow user functions in creation order. This makes
+    // sema's baked slot (user-fn count + lambda index) match this table.
+    let mut lalloc: i64 = 0;
+    while (lalloc < array_length(g_lambdas)) {
+        let le: i64 = array_get_i64(g_lambdas, lalloc);
+        let lab: i64 = cg_alloc_label();
+        array_push_i64(cg_fn_labels, -1); array_push_i64(cg_fn_labels, lab); array_push_i64(cg_fn_labels, -1);
+        lalloc = lalloc + 1;
+    }
 
     // compile each function declaration in the program, binding its entry
     // label at its prologue offset (the current code position) first so any
@@ -5476,6 +5576,17 @@ fn codegen(source: string) -> i64 {
             if (cg_err != 0) { return 0; }
         }
         d = nk_next(d);
+    }
+
+    // Compile synthetic lambda bodies after ordinary functions. Their labels
+    // were allocated after user functions, so their indices are dispatch slots.
+    let mut li: i64 = 0;
+    while (li < array_length(g_lambdas)) {
+        let le: i64 = array_get_i64(g_lambdas, li);
+        let slot: i64 = (array_length(cg_fn_labels) / 3) - array_length(g_lambdas) + li;
+        let llab: i64 = array_get_i64(cg_fn_labels, slot * 3 + 1);
+        cg_bind(llab); cg_compile_func(le, -1); if (cg_err != 0) { return 0; }
+        li = li + 1;
     }
 
     // resolve ALL label fixups now that every fn's entry label (and every

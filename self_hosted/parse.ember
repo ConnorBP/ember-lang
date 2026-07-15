@@ -390,6 +390,7 @@ fn parse_type() -> i64 {
         n = alloc_node(NK::Type as i64);
         if (p_err != 0) { return -1; }
         set_d(n, Prim::I64 as i64);
+        set_f(n, 2);  // function/closure type marker (distinct from f=1 slice)
         // optional '(' params ')' '->' ret signature
         if (at(Tok::LParen as i64) == 1) {
             p_adv();

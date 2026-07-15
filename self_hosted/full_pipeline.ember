@@ -136,6 +136,9 @@ fn compile_and_run(source: string) -> i64 {
     let img: i64 = codegen_emit_image();
     let h: i64 = load_executable_module(img);
     if (h == 0) { return -501; }
+    // Coroutines resolve the slot passed to coroutine_start through this
+    // module's v2 dispatch vector. Register it before any module code runs.
+    set_coroutine_dispatch(module_dispatch_base(h), module_dispatch_count(h));
 
     // module_entry_ptr validates the handle + code_offset and returns
     // code_base + main_off (the executable entry for `main`). 0 on failure.

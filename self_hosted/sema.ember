@@ -108,6 +108,11 @@ global g_marks   : i64 = 0;   // array, stride 1 (scope-push marks)
 // Tier 1 namespaces: the set of declared namespace name tokens (for Foo::bar
 // resolution). A flat array of tokens (no stride). Built during registration.
 global g_ns_names : i64 = 0;
+// Lambda metadata. g_lambdas is the creation-order list of LambdaExpr nodes.
+// g_lambda_caps rows are [lambda_node,name_tok,type,env_offset,by_ref].
+global g_lambdas : i64 = 0;
+global g_lambda_caps : i64 = 0;
+global LAMBDA_CAP_STRIDE : i64 = 5;
 // the namespace of the fn currently being checked (-1 = top-level). Used so a
 // bare call inside a namespace fn resolves to the sibling Ns::fn first
 // (mirrors src/sema.cpp's current_ns).
@@ -195,6 +200,8 @@ fn s_init() -> i64 {
     if (g_scope != 0) { array_clear(g_scope); } else { g_scope = array_new(8, 0); }
     if (g_marks != 0) { array_clear(g_marks); } else { g_marks = array_new(8, 0); }
     if (g_ns_names != 0) { array_clear(g_ns_names); } else { g_ns_names = array_new(8, 0); }
+    if (g_lambdas != 0) { array_clear(g_lambdas); } else { g_lambdas = array_new(8, 0); }
+    if (g_lambda_caps != 0) { array_clear(g_lambda_caps); } else { g_lambda_caps = array_new(8, 0); }
     s_cur_ns = -1;
     if (ce_params != 0) { array_clear(ce_params); } else { ce_params = array_new(8, 0); }
     if (ce_param_marks != 0) { array_clear(ce_param_marks); } else { ce_param_marks = array_new(8, 0); }
@@ -332,7 +339,8 @@ fn ty_struct_tok(t: i64) -> i64 { return nk_tok(t); }
 fn ty_struct_name(t: i64) -> string { return tok_name(nk_tok(t)); }
 
 // is_slice flag (the `f` slot).
-fn ty_is_slice(t: i64) -> i64 { return nk_f(t); }
+fn ty_is_slice(t: i64) -> i64 { if (nk_f(t) == 1) { return 1; } return 0; }
+fn ty_is_fn(t: i64) -> i64 { if (t >= 0 && nk_kind(t) == (NK::Type as i64) && nk_f(t) == 2) { return 1; } return 0; }
 
 // array_len (the `e` slot).
 fn ty_array_len(t: i64) -> i64 { return nk_e(t); }
@@ -491,6 +499,18 @@ fn type_eq(t1: i64, t2: i64) -> i64 {
     if ((tok_name(nk_tok(t1)) == tok_name(nk_tok(t2))) == false) { return 0; }
     if (nk_f(t1) != nk_f(t2)) { return 0; }
     if (nk_e(t1) != nk_e(t2)) { return 0; }
+    if (nk_f(t1) == 2) {
+        if (type_eq(resolve_type(nk_b(t1)), resolve_type(nk_b(t2))) == 0) { return 0; }
+        let mut p1: i64 = nk_a(t1); let mut p2: i64 = nk_a(t2);
+        while (p1 >= 0 && p2 >= 0) {
+            let mut a1: i64 = p1; if (nk_kind(p1) == (NK::Param as i64)) { a1 = nk_a(p1); }
+            let mut a2: i64 = p2; if (nk_kind(p2) == (NK::Param as i64)) { a2 = nk_a(p2); }
+            if (type_eq(resolve_type(a1), resolve_type(a2)) == 0) { return 0; }
+            p1 = nk_next(p1); p2 = nk_next(p2);
+        }
+        if (p1 >= 0 || p2 >= 0) { return 0; }
+        return 1;
+    }
     // element type for array/slice — recurse
     let e1: i64 = nk_a(t1);
     let e2: i64 = nk_a(t2);
@@ -590,6 +610,16 @@ fn resolve_type(t: i64) -> i64 {
         }
         return serr(string_from_slice("unknown type '") + nm + string_from_slice("'"),
                     node_line(t), node_col(t));
+    }
+    if (nk_f(t) == 2) {
+        let mut fp: i64 = nk_a(t);
+        while (fp >= 0) {
+            let mut fpt: i64 = fp; if (nk_kind(fp) == (NK::Param as i64)) { fpt = nk_a(fp); }
+            resolve_type(fpt); if (s_err != 0) { return TY_VOID; }
+            fp = nk_next(fp);
+        }
+        if (nk_b(t) >= 0) { resolve_type(nk_b(t)); if (s_err != 0) { return TY_VOID; } }
+        return t;
     }
     if (nk_f(t) == 1) {
         // slice T[]: resolve the element type recursively. A slice is a valid
@@ -1067,6 +1097,15 @@ fn init_natives() -> i64 {
     nat_add(0, -1, -1, -1, -1, TY_I64, 0);  // 82 context_off_catch_bufs
     nat_add(0, -1, -1, -1, -1, TY_I64, 0);  // 83 context_off_catch_saved_depths
     nat_add(0, -1, -1, -1, -1, TY_I64, 0);  // 84 context_catch_buf_stride
+    // ---- COROUTINE / DISPATCH / LAMBDA ENV ----
+    nat_add(2, TY_I64, TY_I64, -1, -1, TY_I64, 0);  // 85 coroutine_start
+    nat_add(1, TY_I64, -1, -1, -1, TY_I64, 0);      // 86 coroutine_next
+    nat_add(1, TY_I64, -1, -1, -1, TY_BOOL, 0);     // 87 coroutine_done
+    nat_add(1, TY_I64, -1, -1, -1, TY_I64, 0);      // 88 __ember_coro_yield
+    nat_add(1, TY_I64, -1, -1, -1, TY_I64, 0);      // 89 __ember_gc_alloc_env
+    nat_add(1, TY_I64, -1, -1, -1, TY_I64, 1);      // 90 module_dispatch_base
+    nat_add(1, TY_I64, -1, -1, -1, TY_I64, 1);      // 91 module_dispatch_count
+    nat_add(2, TY_I64, TY_I64, -1, -1, TY_VOID, 1); // 92 set_coroutine_dispatch
     return 0;
 }
 
@@ -1167,6 +1206,14 @@ fn native_find(name: string) -> i64 {
     if (name == string_from_slice("context_off_catch_bufs"))         { return 82; }
     if (name == string_from_slice("context_off_catch_saved_depths")) { return 83; }
     if (name == string_from_slice("context_catch_buf_stride"))       { return 84; }
+    if (name == string_from_slice("coroutine_start"))                 { return 85; }
+    if (name == string_from_slice("coroutine_next"))                  { return 86; }
+    if (name == string_from_slice("coroutine_done"))                  { return 87; }
+    if (name == string_from_slice("__ember_coro_yield"))              { return 88; }
+    if (name == string_from_slice("__ember_gc_alloc_env"))            { return 89; }
+    if (name == string_from_slice("module_dispatch_base"))            { return 90; }
+    if (name == string_from_slice("module_dispatch_count"))           { return 91; }
+    if (name == string_from_slice("set_coroutine_dispatch"))          { return 92; }
     return -1;
 }
 
@@ -1498,6 +1545,104 @@ fn lookup_var(name: string) -> i64 {
 }
 
 // -----------------------------------------------------------------------------
+// Lambda capture discovery + checking. Captures are scalar locals from the
+// enclosing live scope; globals/functions are not captured. Metadata remains
+// in flat side tables so the parser's stride-9 AST layout stays unchanged.
+// -----------------------------------------------------------------------------
+fn lambda_has_capture(le: i64, name: string) -> i64 {
+    let n: i64 = array_length(g_lambda_caps) / LAMBDA_CAP_STRIDE;
+    let mut i: i64 = 0;
+    while (i < n) {
+        if (array_get_i64(g_lambda_caps, i * LAMBDA_CAP_STRIDE) == le &&
+            tok_name(array_get_i64(g_lambda_caps, i * LAMBDA_CAP_STRIDE + 1)) == name) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn lambda_is_ref_capture(le: i64, name: string) -> i64 {
+    let mut c: i64 = nk_e(le);
+    while (c >= 0) { if (nk_name(c) == name) { return 1; } c = nk_next(c); }
+    return 0;
+}
+fn lambda_add_capture(le: i64, id: i64) -> i64 {
+    let name: string = nk_name(id);
+    if (lambda_has_capture(le, name) == 1) { return 0; }
+    let t: i64 = lookup_local(name);
+    if (t < 0) { return 0; }
+    if (ty_is_aggregate(t) == 1 || ty_is_fn(t) == 1) {
+        serr(string_from_slice("lambda capture '") + name + string_from_slice("' must be scalar"), node_line(id), node_col(id));
+        return 0;
+    }
+    let off: i64 = lambda_capture_count(le) * 8;
+    array_push_i64(g_lambda_caps, le); array_push_i64(g_lambda_caps, nk_tok(id));
+    array_push_i64(g_lambda_caps, t); array_push_i64(g_lambda_caps, off);
+    array_push_i64(g_lambda_caps, lambda_is_ref_capture(le, name));
+    return 0;
+}
+fn lambda_capture_count(le: i64) -> i64 {
+    let n: i64 = array_length(g_lambda_caps) / LAMBDA_CAP_STRIDE;
+    let mut i: i64 = 0; let mut count: i64 = 0;
+    while (i < n) { if (array_get_i64(g_lambda_caps, i * LAMBDA_CAP_STRIDE) == le) { count = count + 1; } i = i + 1; }
+    return count;
+}
+fn lambda_collect_expr(le: i64, e: i64) -> i64 {
+    if (e < 0) { return 0; }
+    let k: i64 = nk_kind(e);
+    if (k == (NK::Ident as i64)) { return lambda_add_capture(le, e); }
+    if (k == (NK::BinExpr as i64) || k == (NK::AssignExpr as i64) || k == (NK::IndexExpr as i64)) {
+        lambda_collect_expr(le, nk_a(e)); lambda_collect_expr(le, nk_b(e)); return 0;
+    }
+    if (k == (NK::UnaryExpr as i64) || k == (NK::CastExpr as i64) || k == (NK::FieldExpr as i64) || k == (NK::ViewExpr as i64)) {
+        return lambda_collect_expr(le, nk_a(e));
+    }
+    if (k == (NK::TernaryExpr as i64)) {
+        lambda_collect_expr(le, nk_a(e)); lambda_collect_expr(le, nk_b(e)); lambda_collect_expr(le, nk_c(e)); return 0;
+    }
+    if (k == (NK::CallExpr as i64)) {
+        if (nk_e(e) >= 0 && string_length(nk_name(e)) == 0) { lambda_collect_expr(le, nk_e(e)); }
+        let mut a: i64 = nk_a(e); while (a >= 0) { lambda_collect_expr(le, a); a = nk_next(a); } return 0;
+    }
+    if (k == (NK::LambdaExpr as i64)) { return lambda_collect_block(le, nk_c(e)); }
+    return 0;
+}
+fn lambda_collect_stmt(le: i64, s: i64) -> i64 {
+    let k: i64 = nk_kind(s);
+    if (k == (NK::LetStmt as i64)) { lambda_collect_expr(le, nk_b(s)); return 0; }
+    if (k == (NK::ExprStmt as i64) || k == (NK::ReturnStmt as i64) || k == (NK::YieldStmt as i64) || k == (NK::ThrowStmt as i64) || k == (NK::DeferStmt as i64)) { return lambda_collect_expr(le, nk_a(s)); }
+    if (k == (NK::IfStmt as i64)) { lambda_collect_expr(le, nk_a(s)); lambda_collect_block(le, nk_b(s)); lambda_collect_block(le, nk_c(s)); return 0; }
+    if (k == (NK::WhileStmt as i64)) { lambda_collect_expr(le, nk_a(s)); lambda_collect_block(le, nk_b(s)); return 0; }
+    if (k == (NK::BlockStmt as i64)) { return lambda_collect_block(le, s); }
+    return 0;
+}
+fn lambda_collect_block(le: i64, b: i64) -> i64 {
+    if (b < 0) { return 0; }
+    let mut s: i64 = nk_a(b); while (s >= 0) { lambda_collect_stmt(le, s); s = nk_next(s); }
+    return 0;
+}
+fn check_lambda_expr(le: i64) -> i64 {
+    let idx: i64 = array_length(g_lambdas);
+    array_push_i64(g_lambdas, le);
+    lambda_collect_block(le, nk_c(le));
+    if (s_err != 0) { return TY_VOID; }
+    let slot: i64 = array_length(g_fns) / FN_STRIDE + idx;
+    set_d(le, slot);
+    let ft: i64 = alloc_node(NK::Type as i64); set_d(ft, Prim::I64 as i64); set_f(ft, 2);
+    if (nk_a(le) >= 0) { set_a(ft, nk_a(le)); } set_b(ft, resolve_type(nk_b(le))); set_f(le, ft);
+    push_scope();
+    let n: i64 = array_length(g_lambda_caps) / LAMBDA_CAP_STRIDE; let mut i: i64 = 0;
+    while (i < n) {
+        if (array_get_i64(g_lambda_caps, i * LAMBDA_CAP_STRIDE) == le) {
+            declare(array_get_i64(g_lambda_caps, i * LAMBDA_CAP_STRIDE + 1), array_get_i64(g_lambda_caps, i * LAMBDA_CAP_STRIDE + 2));
+        }
+        i = i + 1;
+    }
+    let mut p: i64 = nk_a(le); while (p >= 0) { let pt: i64 = resolve_type(nk_a(p)); declare(nk_tok(p), pt); p = nk_next(p); }
+    let saved_ret: i64 = s_cur_ret; s_cur_ret = resolve_type(nk_b(le)); check_block(nk_c(le)); s_cur_ret = saved_ret;
+    pop_scope();
+    return ft;
+}
+
+// -----------------------------------------------------------------------------
 // expression type-check. check_expr(e) -> the expression's resolved type (a
 // Type node index), or TY_VOID on error (with s_err set). Mirrors the C++
 // Checker::check_expr's dispatch on node kind.
@@ -1555,7 +1700,13 @@ fn check_expr(e: i64) -> i64 {
     }
     if (k == (NK::StringLit as i64)) { return TY_STRING; }
     if (k == (NK::ArrayLit as i64)) { return unsupported(-310, string_from_slice("array literal"), e); }
-    if (k == (NK::LambdaExpr as i64)) { return unsupported(-307, string_from_slice("lambda"), e); }
+    if (k == (NK::LambdaExpr as i64)) { return check_lambda_expr(e); }
+    if (k == (NK::FnHandleExpr as i64)) {
+        let row: i64 = find_fn(nk_name(e));
+        if (row < 0) { return serr(string_from_slice("unknown function '") + nk_name(e) + string_from_slice("'"), node_line(e), node_col(e)); }
+        set_d(e, row);  // top-level function registration order is dispatch-slot order
+        return TY_I64;
+    }
     if (k == (NK::StructLit as i64)) { return check_structlit(e); }
     if (k == (NK::FieldExpr as i64)) { return check_fieldexpr(e); }
     if (k == (NK::IndexExpr as i64)) { return check_indexexpr(e); }
@@ -1837,6 +1988,33 @@ fn check_unaryexpr(e: i64) -> i64 {
 // handles direct named calls only (no fn-handle / indirect / cross-module).
 fn check_callexpr(e: i64) -> i64 {
     let nm: string = nk_name(e);
+
+    // Indirect closure call. `f(args)` initially looks like a named call; if
+    // `f` is a closure local, synthesize its Ident target into slot e.
+    let mut indirect: i64 = nk_e(e);
+    if (indirect < 0) {
+        let local_ft: i64 = lookup_local(nm);
+        if (local_ft >= 0 && ty_is_fn(local_ft) == 1) {
+            indirect = alloc_node(NK::Ident as i64); set_tok(indirect, nk_tok(e)); set_e(e, indirect);
+        }
+    }
+    if (indirect >= 0 && (string_length(nm) == 0 || ty_is_fn(lookup_local(nm)) == 1)) {
+        let ft: i64 = check_expr(indirect);
+        if (s_err != 0) { return TY_VOID; }
+        if (ty_is_fn(ft) == 0) { return serr(string_from_slice("indirect call target is not callable"), node_line(e), node_col(e)); }
+        let mut a: i64 = nk_a(e); let mut p: i64 = nk_a(ft); let mut i: i64 = 0;
+        while (a >= 0 && p >= 0) {
+            let mut want_node: i64 = p; if (nk_kind(p) == (NK::Param as i64)) { want_node = nk_a(p); }
+            let want: i64 = resolve_type(want_node); let got: i64 = check_expr(a);
+            if (s_err != 0) { return TY_VOID; }
+            if (lit_fits_int_type(a, want) == 0 && types_compatible(want, got) == 0) {
+                return serr(string_from_slice("indirect-call argument type mismatch"), node_line(a), node_col(a));
+            }
+            a = nk_next(a); p = nk_next(p); i = i + 1;
+        }
+        if (a >= 0 || p >= 0) { return serr(string_from_slice("indirect-call argument count mismatch"), node_line(e), node_col(e)); }
+        let rt: i64 = resolve_type(nk_b(ft)); set_c(e, rt); set_d(e, 2); return rt;
+    }
 
     // ---- NATIVE calls (host extensions) ----
     // The self-hosted codegen emits these as ABS64_NATIVE relocations resolved
@@ -2436,7 +2614,15 @@ fn check_stmt(s: i64) -> i64 {
         pop_scope();
         return 0;
     }
-    if (k == (NK::YieldStmt as i64)) { unsupported(-308, string_from_slice("coroutine/yield"), s); return 0; }
+    if (k == (NK::YieldStmt as i64)) {
+        let val: i64 = nk_a(s);
+        if (val >= 0) {
+            let yt: i64 = check_expr(val);
+            if (s_err != 0) { return 0; }
+            if (ty_is_i64(yt) == 0) { serr(string_from_slice("yield value must be i64"), node_line(s), node_col(s)); }
+        }
+        return 0;
+    }
     // Phase 3b: defer. The deferred expr is checked now (its result is
     // discarded) but runs at scope exit in codegen. Cleanup runs while this
     // lexical block's locals remain live, so ordinary scope lookup suffices.
