@@ -147,6 +147,33 @@ static int64_t n_file_read_bytes(int64_t path_h) {
     return ext_array::alloc_bytes(buf.data(), static_cast<int64_t>(got));
 }
 
+// file_read_text(path: string) -> string -- read the entire file as a text
+// string handle (UTF-8 bytes preserved verbatim, including non-ASCII). The
+// self-hosted preview uses this to feed .ember source to the compiler without
+// the ASCII-only byte-to-string conversion that rejected smart quotes,
+// em-dashes, and other non-ASCII characters (-603). Returns a string handle
+// on success (empty string for a 0-byte file), or 0 on failure (bad path
+// handle, fopen error, read error).
+static int64_t n_file_read_text(int64_t path_h) {
+    const std::string* path = ext_string::slot(path_h);
+    if (!path) return 0;
+    FILE* fp = std::fopen(path->c_str(), "rb");
+    if (!fp) return 0;
+    if (std::fseek(fp, 0, SEEK_END) != 0) { std::fclose(fp); return 0; }
+    long sz = std::ftell(fp);
+    if (sz < 0) { std::fclose(fp); return 0; }
+    if (std::fseek(fp, 0, SEEK_SET) != 0) { std::fclose(fp); return 0; }
+    std::string content;
+    content.resize(static_cast<size_t>(sz));
+    size_t got = 0;
+    if (sz > 0) {
+        got = std::fread(&content[0], 1, static_cast<size_t>(sz), fp);
+        content.resize(got);
+    }
+    std::fclose(fp);
+    return ext_string::alloc(std::move(content));
+}
+
 // file_write_bytes(path: string, data: i64) -> i64 -- write the array<u8>'s
 // bytes to path (truncate + create). Returns 1 on success, 0 on failure (bad
 // path/data handle, fopen error, short write).
@@ -226,6 +253,7 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
 
     // --- file ---
     b.add("file_read_bytes",  type_i64(), {Str},             (void*)&n_file_read_bytes,  PERM_FFI);
+    b.add("file_read_text",   Str,        {Str},                (void*)&n_file_read_text,   PERM_FFI);
     b.add("file_write_bytes", type_i64(), {Str, type_i64()}, (void*)&n_file_write_bytes, PERM_FFI);
     b.add("file_exists",      type_i64(), {Str},             (void*)&n_file_exists,      PERM_FFI);
 

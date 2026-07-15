@@ -50,10 +50,20 @@ fn bytes_to_source(bytes: i64) -> string {
 
 fn compile_file_and_run(path: string) -> i64 {
     if (string_length(path) == 0) { return -601; }
-    let bytes: i64 = file_read_bytes(path);
-    if (bytes == 0) { return -602; }
-    let source: string = bytes_to_source(bytes);
-    if (array_length(bytes) > 0 && string_length(source) == 0) { return -603; }
+    // Read the file as text (UTF-8 preserved verbatim, including non-ASCII)
+    // via the host file_read_text native. This replaces the ASCII-only
+    // byte-to-string conversion that rejected smart quotes, em-dashes, and
+    // other non-ASCII characters (-603), so the self-hosted compiler can
+    // now read its own source and the full tests/lang corpus.
+    let source: string = file_read_text(path);
+    if (string_length(source) == 0) {
+        // 0-length result: either a genuine empty file (valid, compiles to
+        // no tokens -> -102) or a read failure (return -602). file_read_text
+        // returns 0 (a null handle) on read failure, which string_length
+        // treats as 0; a real empty file returns an empty-string handle.
+        // Distinguish by re-checking the path exists.
+        if (file_exists(path) == 0) { return -602; }
+    }
     return compile_and_run(source);
 }
 
