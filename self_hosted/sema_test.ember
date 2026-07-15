@@ -286,17 +286,20 @@ fn reject(src: string, want: i64, code: i64) -> i64 {
     return 0;
 }
 
+fn test_expanded_features() -> i64 {
+    let mut r: i64 = sema("fn f() -> f64 { return 1.5 + 2.0; }"); if (r != 0) { return 30901; }
+    r = sema("fn f() -> i64 { let s: string = f\"value={42}\"; if (string_length(s) == 8) { return 1; } return 0; }"); if (r != 0) { return 101; }
+    r = sema("struct S { x: i64; } fn f() -> i64 { let s: S = S { x: 7 }; return s.x; }"); if (r != 0) { return 102; }
+    r = sema("enum E { A, B } fn f() -> i64 { let e: i64 = E::B; match (e) { E::B => { return 1; }, _ => { return 0; } } return 0; }"); if (r != 0) { return 103; }
+    return 0;
+}
+
 fn test_unsupported_features() -> i64 {
     let mut r: i64 = 0;
-    r = reject("struct S { x: i64; }", -301, 31001); if (r != 0) { return r; }
-    r = reject("enum E { A, B }", -302, 31011); if (r != 0) { return r; }
-    r = reject("fn f() -> f64 { return 1.5; }", -303, 31021); if (r != 0) { return r; }
-    r = reject("fn f(x: i64) -> i64 { match (x) { _ => { return 0; } } }", -304, 31031); if (r != 0) { return r; }
     r = reject("fn f(x: i64) -> i64 { switch (x) { default: return 0; } }", -305, 31041); if (r != 0) { return r; }
     r = reject("fn f() -> i64 { try { return 1; } catch (e) { return 0; } }", -306, 31051); if (r != 0) { return r; }
     r = reject("fn f() -> i64 { let x = fn() -> i64 { return 1; }; return 0; }", -307, 31061); if (r != 0) { return r; }
     r = reject("fn f() -> i64 { yield 1; return 0; }", -308, 31071); if (r != 0) { return r; }
-    r = reject("fn f() -> i64 { let s = \"nope\"; return 0; }", -309, 31081); if (r != 0) { return r; }
     r = reject("fn f() -> i64 { let a = [1, 2]; return 0; }", -310, 31091); if (r != 0) { return r; }
     r = reject("fn f(a: i64[]) -> i64 { return 0; }", -310, 31101); if (r != 0) { return r; }
     r = reject("@realtime fn f() -> i64 { return 0; }", -318, 31111); if (r != 0) { return r; }
@@ -338,6 +341,7 @@ fn main() -> i64 {
     r = test_neg_logical_int();     if (r != 0) { return r; }
     r = test_neg_block_local_escape(); if (r != 0) { return r; }
     r = test_neg_loop_control();    if (r != 0) { return r; }
+    r = test_expanded_features();   if (r != 0) { return r; }
     r = test_unsupported_features(); if (r != 0) { return r; }
 
     // every check passed
