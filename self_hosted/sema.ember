@@ -1061,6 +1061,12 @@ fn init_natives() -> i64 {
     nat_add(1, TY_STRING, -1, -1, -1, TY_STRING,1); // 77 file_read_text
     nat_add(2, TY_STRING, TY_I64, -1, -1, TY_I64, 1); // 78 file_write_bytes
     nat_add(1, TY_STRING, -1, -1, -1, TY_I64,  1);  // 79 file_exists
+    // ---- CONTEXT OFFSETS (extensions/call_raw/ext_call_raw.cpp) — perm 0 ----
+    nat_add(0, -1, -1, -1, -1, TY_I64, 0);  // 80 context_off_catch_depth
+    nat_add(0, -1, -1, -1, -1, TY_I64, 0);  // 81 context_off_thrown_value
+    nat_add(0, -1, -1, -1, -1, TY_I64, 0);  // 82 context_off_catch_bufs
+    nat_add(0, -1, -1, -1, -1, TY_I64, 0);  // 83 context_off_catch_saved_depths
+    nat_add(0, -1, -1, -1, -1, TY_I64, 0);  // 84 context_catch_buf_stride
     return 0;
 }
 
@@ -1155,6 +1161,12 @@ fn native_find(name: string) -> i64 {
     if (name == string_from_slice("file_read_text"))   { return 77; }
     if (name == string_from_slice("file_write_bytes")) { return 78; }
     if (name == string_from_slice("file_exists"))      { return 79; }
+    // CONTEXT OFFSETS
+    if (name == string_from_slice("context_off_catch_depth"))        { return 80; }
+    if (name == string_from_slice("context_off_thrown_value"))       { return 81; }
+    if (name == string_from_slice("context_off_catch_bufs"))         { return 82; }
+    if (name == string_from_slice("context_off_catch_saved_depths")) { return 83; }
+    if (name == string_from_slice("context_catch_buf_stride"))       { return 84; }
     return -1;
 }
 
@@ -2408,8 +2420,21 @@ fn check_stmt(s: i64) -> i64 {
         }
         return 0;
     }
-    if (k == (NK::TryCatchStmt as i64) || k == (NK::ThrowStmt as i64)) {
-        unsupported(-306, string_from_slice("try/catch or throw"), s); return 0;
+    if (k == (NK::ThrowStmt as i64)) {
+        let val: i64 = nk_a(s);
+        if (val >= 0) { check_expr(val); }
+        return 0;
+    }
+    if (k == (NK::TryCatchStmt as i64)) {
+        push_scope();
+        let cnametok: i64 = nk_tok(s);
+        if (cnametok >= 0) { declare(cnametok, TY_I64); }
+        if (s_err != 0) { pop_scope(); return 0; }
+        check_block(nk_a(s));
+        if (s_err != 0) { pop_scope(); return 0; }
+        check_block(nk_b(s));
+        pop_scope();
+        return 0;
     }
     if (k == (NK::YieldStmt as i64)) { unsupported(-308, string_from_slice("coroutine/yield"), s); return 0; }
     // Phase 3b: defer. The deferred expr is checked now (its result is

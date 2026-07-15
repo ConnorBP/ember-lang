@@ -1236,6 +1236,26 @@ fn cg_call_reg(r: i64) -> i64 {
     return 0;
 }
 
+// lea dst, [rip + rel32] — rip-relative address of a label (for catch-entry rip).
+// REX.W 8D /r mod=00 rm=5 (rip) + rel32 (fixup, backpatched by cg_resolve_fixups).
+fn cg_lea_reg_rip(dst: i64, label_id: i64) -> i64 {
+    cg_byte(cg_rex(1, cg_is_extended(dst), 0, 0));
+    cg_byte(0x8D);
+    cg_byte(cg_modrm(0, dst, 5));  // mod=00, rm=5 = RIP-relative
+    cg_add_fixup(label_id);
+    cg_imm32(0);  // placeholder rel32, backpatched by cg_resolve_fixups
+    return 0;
+}
+
+// jmp r64 — indirect jump to register (FF /4). Used by throw's longjmp to
+// jump to the catch-entry rip loaded from catch_bufs.
+fn cg_jmp_reg(r: i64) -> i64 {
+    if (cg_is_extended(r) != 0) { cg_byte(cg_rex(0, 0, 0, 1)); }
+    cg_byte(0xFF);
+    cg_byte(cg_modrm(3, 4, r));  // /4 = jmp
+    return 0;
+}
+
 // call rel32 (direct, in-buffer) -> E8 rel32. The rel32 is a placeholder
 // recorded as a fixup for `label_id`; cg_resolve_fixups patches it after all
 // labels (including other fns' entry labels) are bound. Used for script-to-
@@ -2061,6 +2081,11 @@ fn cg_count_struct_temps_stmt(s: i64, total: i64, ret_is_struct: i64) -> i64 {
     if (k == (NK::MatchStmt as i64)) {
         let mut a: i64 = nk_b(s); while (a >= 0) { total = cg_count_struct_temps_block(nk_b(a), total, ret_is_struct); a = nk_next(a); } return total;
     }
+    if (k == (NK::TryCatchStmt as i64)) {
+        total = cg_count_struct_temps_block(nk_a(s), total, ret_is_struct);  // try body
+        total = cg_count_struct_temps_block(nk_b(s), total, ret_is_struct);  // catch body
+        return total;
+    }
     return total;
 }
 
@@ -2145,6 +2170,12 @@ fn cg_count_locals_stmt(s: i64, total: i64) -> i64 {
     }
     if (k == (NK::SwitchStmt as i64)) {
         let mut c: i64 = nk_b(s); while (c >= 0) { total = cg_count_locals_block(nk_b(c), total); c = nk_next(c); } return total;
+    }
+    if (k == (NK::TryCatchStmt as i64)) {
+        total = total + 1;  // catch variable
+        total = cg_count_locals_block(nk_a(s), total);   // try body
+        total = cg_count_locals_block(nk_b(s), total);   // catch body
+        return total;
     }
     // DeferStmt holds an expr (no locals of its own); nothing to count.
     return total;
@@ -4125,6 +4156,8 @@ fn cg_compile_stmt(s: i64) -> i64 {
     // codegen). Skip it before any dispatch, mirroring src/codegen.cpp.
     if (k == (NK::StaticAssertStmt as i64)) { return 0; }
 
+    if (k == (NK::TryCatchStmt as i64)) { return cg_compile_trycatch(s); }
+    if (k == (NK::ThrowStmt as i64)) { return cg_compile_throw(s); }
     // unsupported statement kind in v1
     if (cg_err == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: statement kind unsupported in v1"); }
     return 0;
@@ -4394,6 +4427,141 @@ fn cg_defer_emit_to(retain_mark_len: i64) -> i64 {
         array_resize(g_defers, mark);
         g_defer_mark_len = g_defer_mark_len - 1;
     }
+    return 0;
+}
+
+// compile a try/catch/throw statement. Uses raw JIT bytes on context_t::catch_bufs
+// via r14 (the context pointer, callee-saved + preserved across call_raw).
+// Mirrors src/codegen.cpp / thin_emit.cpp's TryCatch + Throw emission.
+//
+// catch_bufs[depth] layout (64 bytes): [0]rbx [8]rbp [16]r12 [24]r13 [32]r14
+// [40]r15 [48]rsp [56]catch-entry-rip. catch_saved_call_depths[depth] snapshots
+// call_depth at try-entry so a cross-frame throw restores the catching frame's
+// depth. catch_depth is the 0-based index (incremented AFTER saving).
+fn cg_compile_trycatch(s: i64) -> i64 {
+    let try_b: i64 = nk_a(s);     // try body (BlockStmt)
+    let catch_b: i64 = nk_b(s);   // catch body (BlockStmt)
+    let cnametok: i64 = nk_tok(s); // catch variable name token
+
+    // context offsets (compile-time constants from host natives)
+    let cd_off: i64 = context_off_catch_depth();
+    let cb_off: i64 = context_off_catch_bufs();
+    let csd_off: i64 = context_off_catch_saved_depths();
+
+    cg_push_scope();
+    let catch_off: i64 = cg_alloc_local_t(cnametok, TY_I64, 1);
+
+    let catch_label: i64 = cg_alloc_label();
+    let end_label: i64 = cg_alloc_label();
+
+    // ===== SETJMP: save state into catch_bufs[catch_depth] =====
+    // 1. load catch_depth (32-bit, zero-extended) -> rax
+    cg_load_elem_to_rax(R14, cd_off, 4, 0);
+    // save catch_depth in r10 (for snapshot + increment later)
+    cg_mov_reg_reg(R10, RAX);
+    // 2. compute catch_bufs[catch_depth] address -> r9
+    //    r9 = r14 + cb_off + catch_depth * 64
+    cg_shift_left_imm8(RAX, 6);   // rax = catch_depth * 64
+    cg_mov_reg_reg(R9, R14);
+    cg_add_reg_imm32(R9, cb_off);
+    cg_add_reg_reg(R9, RAX);      // r9 = &catch_bufs[catch_depth]
+    // 3. save 6 callee-saved regs + rsp
+    cg_store_reg_mem(R9, 0, RBX);
+    cg_store_reg_mem(R9, 8, RBP);
+    cg_store_reg_mem(R9, 16, R12);
+    cg_store_reg_mem(R9, 24, R13);
+    cg_store_reg_mem(R9, 32, R14);
+    cg_store_reg_mem(R9, 40, R15);
+    cg_store_reg_mem(R9, 48, RSP);
+    // 4. save catch-entry rip (PC-relative lea to catch_label)
+    cg_lea_reg_rip(RAX, catch_label);
+    cg_store_reg_mem(R9, 56, RAX);
+    // 5. save call_depth snapshot into catch_saved_call_depths[catch_depth]
+    //    r10 still has catch_depth; r11 = catch_depth * 4
+    cg_mov_reg_reg(R11, R10);
+    cg_shift_left_imm8(R11, 2);   // r11 = catch_depth * 4
+    cg_mov_reg_reg(R8, R14);
+    cg_add_reg_imm32(R8, csd_off);
+    cg_add_reg_reg(R8, R11);      // r8 = &saved_depths[catch_depth]
+    // call_depth is at offset 8 in context_t (catch_depth at offset 20, diff=12)
+    let call_depth_off: i64 = cd_off - 12;
+    cg_load_elem_to_rax(R14, call_depth_off, 4, 0);
+    cg_store_rax_elem(R8, 0, 4);
+    // 6. catch_depth++
+    cg_add_reg_imm32(R10, 1);
+    cg_mov_reg_reg(RAX, R10);
+    cg_store_rax_elem(R14, cd_off, 4);
+
+    // ===== TRY BODY =====
+    cg_compile_block(try_b);
+    if (cg_err != 0) { cg_pop_scope(); return 0; }
+
+    // ===== CATCH CLEANUP: on normal try completion, catch_depth-- =====
+    cg_load_elem_to_rax(R14, cd_off, 4, 0);
+    cg_sub_reg_imm32(RAX, 1);
+    cg_store_rax_elem(R14, cd_off, 4);
+
+    // jump past the catch block
+    cg_jmp(end_label);
+
+    // ===== CATCH BLOCK =====
+    cg_bind(catch_label);
+    // load thrown_value -> rax, store to catch variable frame slot
+    let tv_off: i64 = context_off_thrown_value();
+    cg_load_reg_mem(RAX, R14, tv_off);
+    cg_store_reg_mem(RBP, catch_off, RAX);
+    // compile catch body
+    cg_compile_block(catch_b);
+    if (cg_err != 0) { cg_pop_scope(); return 0; }
+
+    cg_bind(end_label);
+    cg_pop_scope();
+    return 0;
+}
+
+// compile a throw statement: store the thrown value into context_t::thrown_value,
+// then longjmp to the most recent catch handler by restoring callee-saved regs
+// + rsp from catch_bufs[catch_depth-1] and jumping to the saved catch-entry rip.
+fn cg_compile_throw(s: i64) -> i64 {
+    // 1. evaluate throw expression -> rax (the thrown value)
+    cg_eval(nk_a(s));
+    if (cg_err != 0) { return 0; }
+    // 2. store thrown value into context_t::thrown_value
+    let tv_off: i64 = context_off_thrown_value();
+    cg_store_reg_mem(R14, tv_off, RAX);
+    // 3. load catch_depth (32-bit) -> rax
+    let cd_off: i64 = context_off_catch_depth();
+    cg_load_elem_to_rax(R14, cd_off, 4, 0);
+    // 4. if catch_depth == 0 -> unhandled throw (trap via ud2)
+    cg_cmp_reg_imm32(RAX, 0);
+    let no_handler: i64 = cg_alloc_label();
+    cg_jcc(COND_E, no_handler);
+    // 5. catch_depth-- : rax = catch_depth - 1
+    cg_sub_reg_imm32(RAX, 1);
+    cg_mov_reg_reg(R10, RAX);   // r10 = catch_depth - 1 (saved for buf ptr)
+    // store decremented catch_depth (32-bit)
+    cg_store_rax_elem(R14, cd_off, 4);
+    // 6. compute catch_bufs[catch_depth-1] address -> r9
+    let cb_off: i64 = context_off_catch_bufs();
+    cg_shift_left_imm8(RAX, 6);  // rax = (catch_depth-1) * 64
+    cg_mov_reg_reg(R9, R14);
+    cg_add_reg_imm32(R9, cb_off);
+    cg_add_reg_reg(R9, RAX);     // r9 = &catch_bufs[catch_depth-1]
+    // 7. load catch-entry rip from [r9+56] -> rax (BEFORE restoring regs)
+    cg_load_reg_mem(RAX, R9, 56);
+    // 8. restore 6 callee-saved regs + rsp from catch_bufs
+    cg_load_reg_mem(RBX, R9, 0);
+    cg_load_reg_mem(RBP, R9, 8);
+    cg_load_reg_mem(R12, R9, 16);
+    cg_load_reg_mem(R13, R9, 24);
+    cg_load_reg_mem(R14, R9, 32);
+    cg_load_reg_mem(R15, R9, 40);
+    cg_load_reg_mem(RSP, R9, 48);  // restore rsp last
+    // 9. jmp to catch-entry rip
+    cg_jmp_reg(RAX);
+    // 10. no handler: ud2 (unhandled throw trap)
+    cg_bind(no_handler);
+    cg_byte(0x0F); cg_byte(0x0B);  // ud2
     return 0;
 }
 
