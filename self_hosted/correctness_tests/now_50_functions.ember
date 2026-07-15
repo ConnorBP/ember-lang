@@ -1,0 +1,57 @@
+// Scalability: 50 simple functions + main summing five of them.
+// Uses g-prefixed names because f32/i64/etc are reserved type keywords
+// and a fn literally named f32 hits a parse error (keyword collision),
+// which is the real root cause of the apparent ~33-function cliff —
+// NOT a capacity or overflow bug in the parser.
+// expect: 20
+fn g0(x: i64) -> i64 { return x + 0; }
+fn g1(x: i64) -> i64 { return x + 1; }
+fn g2(x: i64) -> i64 { return x + 2; }
+fn g3(x: i64) -> i64 { return x + 3; }
+fn g4(x: i64) -> i64 { return x + 4; }
+fn g5(x: i64) -> i64 { return x + 5; }
+fn g6(x: i64) -> i64 { return x + 6; }
+fn g7(x: i64) -> i64 { return x + 7; }
+fn g8(x: i64) -> i64 { return x + 8; }
+fn g9(x: i64) -> i64 { return x + 9; }
+fn g10(x: i64) -> i64 { return x + 10; }
+fn g11(x: i64) -> i64 { return x + 11; }
+fn g12(x: i64) -> i64 { return x + 12; }
+fn g13(x: i64) -> i64 { return x + 13; }
+fn g14(x: i64) -> i64 { return x + 14; }
+fn g15(x: i64) -> i64 { return x + 15; }
+fn g16(x: i64) -> i64 { return x + 16; }
+fn g17(x: i64) -> i64 { return x + 17; }
+fn g18(x: i64) -> i64 { return x + 18; }
+fn g19(x: i64) -> i64 { return x + 19; }
+fn g20(x: i64) -> i64 { return x + 20; }
+fn g21(x: i64) -> i64 { return x + 21; }
+fn g22(x: i64) -> i64 { return x + 22; }
+fn g23(x: i64) -> i64 { return x + 23; }
+fn g24(x: i64) -> i64 { return x + 24; }
+fn g25(x: i64) -> i64 { return x + 25; }
+fn g26(x: i64) -> i64 { return x + 26; }
+fn g27(x: i64) -> i64 { return x + 27; }
+fn g28(x: i64) -> i64 { return x + 28; }
+fn g29(x: i64) -> i64 { return x + 29; }
+fn g30(x: i64) -> i64 { return x + 30; }
+fn g31(x: i64) -> i64 { return x + 31; }
+fn g32(x: i64) -> i64 { return x + 32; }
+fn g33(x: i64) -> i64 { return x + 33; }
+fn g34(x: i64) -> i64 { return x + 34; }
+fn g35(x: i64) -> i64 { return x + 35; }
+fn g36(x: i64) -> i64 { return x + 36; }
+fn g37(x: i64) -> i64 { return x + 37; }
+fn g38(x: i64) -> i64 { return x + 38; }
+fn g39(x: i64) -> i64 { return x + 39; }
+fn g40(x: i64) -> i64 { return x + 40; }
+fn g41(x: i64) -> i64 { return x + 41; }
+fn g42(x: i64) -> i64 { return x + 42; }
+fn g43(x: i64) -> i64 { return x + 43; }
+fn g44(x: i64) -> i64 { return x + 44; }
+fn g45(x: i64) -> i64 { return x + 45; }
+fn g46(x: i64) -> i64 { return x + 46; }
+fn g47(x: i64) -> i64 { return x + 47; }
+fn g48(x: i64) -> i64 { return x + 48; }
+fn g49(x: i64) -> i64 { return x + 49; }
+fn main() -> i64 { return g0(0) + g1(1) + g2(2) + g3(3) + g4(4); }

@@ -1987,7 +1987,20 @@ fn parse(source: string) -> i64 {
     }
     g_tcount = tok_count(g_toks);
     g_ti = 0;
-    g_nodes = array_new(8, 0);
+    // Reuse the node pool across parse() calls instead of allocating a fresh
+    // array each time. The host array extension has no array_free (slots in
+    // the process-wide store are never reclaimed until reset()), so a fresh
+    // array_new on every parse() leaks the previous buffer — and the leaked
+    // buffers accumulate in the trace-callback scan, eventually crashing the
+    // host at scale (repeated parses of a large module trap with a bare
+    // RUNTIME TRAP). array_clear() resets the logical length to 0 while
+    // keeping the backing buffer, so the slot is reused and the store stops
+    // growing. The first call (g_nodes == 0) still allocates.
+    if (g_nodes != 0) {
+        array_clear(g_nodes);
+    } else {
+        g_nodes = array_new(8, 0);
+    }
     p_err = 0;
     p_errline = 0;
     p_errcol = 0;

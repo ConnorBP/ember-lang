@@ -194,6 +194,62 @@ global g_err  : i64    = 0;    // 1 once a lex error is flagged
 global g_errline : i64 = 0;    // error position (1-based)
 global g_errcol  : i64 = 0;
 
+// --- keyword string cache (allocated ONCE at module load). ---
+// The host string store has no string_free -- every string_from_slice(...) is
+// a permanent slot until reset(). keyword_kind previously called
+// string_from_slice("fn")/"if"/... on every identifier probe (~up to 11 per
+// token), leaking a host string slot each call. Across the pipeline's repeated
+// lex passes that accumulation crashed the host at scale. Caching the keyword
+// texts as module globals allocates each exactly once.
+global KW_fn   : string = "fn";
+global KW_if   : string = "if";
+global KW_do   : string = "do";
+global KW_as   : string = "as";
+global KW_in   : string = "in";
+global KW_i8   : string = "i8";
+global KW_u8   : string = "u8";
+global KW_let  : string = "let";
+global KW_mut  : string = "mut";
+global KW_for  : string = "for";
+global KW_try  : string = "try";
+global KW_i16  : string = "i16";
+global KW_i32  : string = "i32";
+global KW_i64  : string = "i64";
+global KW_u16  : string = "u16";
+global KW_u32  : string = "u32";
+global KW_u64  : string = "u64";
+global KW_f32  : string = "f32";
+global KW_f64  : string = "f64";
+global KW_else  : string = "else";
+global KW_case  : string = "case";
+global KW_void  : string = "void";
+global KW_enum  : string = "enum";
+global KW_link  : string = "link";
+global KW_bool  : string = "bool";
+global KW_auto  : string = "auto";
+global KW_priv  : string = "priv";
+global KW_true  : string = "true";
+global KW_while : string = "while";
+global KW_break : string = "break";
+global KW_catch : string = "catch";
+global KW_const : string = "const";
+global KW_defer : string = "defer";
+global KW_match : string = "match";
+global KW_yield : string = "yield";
+global KW_throw : string = "throw";
+global KW_false : string = "false";
+global KW_return : string = "return";
+global KW_struct : string = "struct";
+global KW_switch : string = "switch";
+global KW_global : string = "global";
+global KW_sizeof : string = "sizeof";
+global KW_default : string = "default";
+global KW_continue : string = "continue";
+global KW_offsetof : string = "offsetof";
+global KW_namespace : string = "namespace";
+global KW_constexpr : string = "constexpr";
+global KW_static_assert : string = "static_assert";
+
 // -----------------------------------------------------------------------------
 // char classifiers (mirror the demo's is_digit/is_alpha; ASCII code ranges).
 // -----------------------------------------------------------------------------
@@ -283,88 +339,103 @@ fn lex_error(line: i64, col: i64) -> i64 {
 // text `kw`. Builds a string from the source span and compares to a string
 // built from the keyword literal.
 fn id_eq(start: i64, len: i64, kw: string) -> i64 {
-    let id: string = string_substr(g_src, start, len);
-    if (id == kw) { return 1; }
-    return 0;
+    // Compare the source span [start, start+len) against `kw` character by
+    // character. The previous form built a fresh substring with
+    // string_substr(g_src, start, len) on EVERY keyword probe (and keyword_kind
+    // calls id_eq up to ~11x per identifier), which leaked a host string slot
+    // each call -- the host string store has no string_free, so every string
+    // allocation is permanent until reset(). At scale (lex re-run across the
+    // pipeline stages) the leaked strings accumulated and crashed the host.
+    // Comparing via string_char_at allocates nothing.
+    let klen: i64 = string_length(kw);
+    if (klen != len) { return 0; }
+    let mut i: i64 = 0;
+    while (i < len) {
+        if (string_char_at(g_src, start + i) != string_char_at(kw, i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
 }
 
 fn keyword_kind(start: i64, len: i64) -> i64 {
     // fast reject by length: only check keywords of this length. `import` is
     // NOT a keyword here (the C++ lexer's keyword map omits it — the import
     // resolver handles `import` lines pre-lex), so `import` lexes as Ident.
+    // Keyword texts are cached module globals (KW_*) allocated once; id_eq
+    // compares char-by-char so no substring is allocated per probe.
     if (len == 2) {
-        if (id_eq(start, len, string_from_slice("fn")) == 1) { return Tok::Kw_fn as i64; }
-        if (id_eq(start, len, string_from_slice("if")) == 1) { return Tok::Kw_if as i64; }
-        if (id_eq(start, len, string_from_slice("do")) == 1) { return Tok::Kw_do as i64; }
-        if (id_eq(start, len, string_from_slice("as")) == 1) { return Tok::Kw_as as i64; }
-        if (id_eq(start, len, string_from_slice("in")) == 1) { return Tok::Kw_in as i64; }
-        if (id_eq(start, len, string_from_slice("i8")) == 1) { return Tok::Kw_i8 as i64; }
-        if (id_eq(start, len, string_from_slice("u8")) == 1) { return Tok::Kw_u8 as i64; }
+        if (id_eq(start, len, KW_fn) == 1) { return Tok::Kw_fn as i64; }
+        if (id_eq(start, len, KW_if) == 1) { return Tok::Kw_if as i64; }
+        if (id_eq(start, len, KW_do) == 1) { return Tok::Kw_do as i64; }
+        if (id_eq(start, len, KW_as) == 1) { return Tok::Kw_as as i64; }
+        if (id_eq(start, len, KW_in) == 1) { return Tok::Kw_in as i64; }
+        if (id_eq(start, len, KW_i8) == 1) { return Tok::Kw_i8 as i64; }
+        if (id_eq(start, len, KW_u8) == 1) { return Tok::Kw_u8 as i64; }
         return Tok::Ident as i64;
     }
     if (len == 3) {
-        if (id_eq(start, len, string_from_slice("let")) == 1) { return Tok::Kw_let as i64; }
-        if (id_eq(start, len, string_from_slice("mut")) == 1) { return Tok::Kw_mut as i64; }
-        if (id_eq(start, len, string_from_slice("for")) == 1) { return Tok::Kw_for as i64; }
-        if (id_eq(start, len, string_from_slice("try")) == 1) { return Tok::Kw_try as i64; }
-        if (id_eq(start, len, string_from_slice("i16")) == 1) { return Tok::Kw_i16 as i64; }
-        if (id_eq(start, len, string_from_slice("i32")) == 1) { return Tok::Kw_i32 as i64; }
-        if (id_eq(start, len, string_from_slice("i64")) == 1) { return Tok::Kw_i64 as i64; }
-        if (id_eq(start, len, string_from_slice("u16")) == 1) { return Tok::Kw_u16 as i64; }
-        if (id_eq(start, len, string_from_slice("u32")) == 1) { return Tok::Kw_u32 as i64; }
-        if (id_eq(start, len, string_from_slice("u64")) == 1) { return Tok::Kw_u64 as i64; }
-        if (id_eq(start, len, string_from_slice("f32")) == 1) { return Tok::Kw_f32 as i64; }
-        if (id_eq(start, len, string_from_slice("f64")) == 1) { return Tok::Kw_f64 as i64; }
+        if (id_eq(start, len, KW_let) == 1) { return Tok::Kw_let as i64; }
+        if (id_eq(start, len, KW_mut) == 1) { return Tok::Kw_mut as i64; }
+        if (id_eq(start, len, KW_for) == 1) { return Tok::Kw_for as i64; }
+        if (id_eq(start, len, KW_try) == 1) { return Tok::Kw_try as i64; }
+        if (id_eq(start, len, KW_i16) == 1) { return Tok::Kw_i16 as i64; }
+        if (id_eq(start, len, KW_i32) == 1) { return Tok::Kw_i32 as i64; }
+        if (id_eq(start, len, KW_i64) == 1) { return Tok::Kw_i64 as i64; }
+        if (id_eq(start, len, KW_u16) == 1) { return Tok::Kw_u16 as i64; }
+        if (id_eq(start, len, KW_u32) == 1) { return Tok::Kw_u32 as i64; }
+        if (id_eq(start, len, KW_u64) == 1) { return Tok::Kw_u64 as i64; }
+        if (id_eq(start, len, KW_f32) == 1) { return Tok::Kw_f32 as i64; }
+        if (id_eq(start, len, KW_f64) == 1) { return Tok::Kw_f64 as i64; }
         return Tok::Ident as i64;
     }
     if (len == 4) {
-        if (id_eq(start, len, string_from_slice("else")) == 1) { return Tok::Kw_else as i64; }
-        if (id_eq(start, len, string_from_slice("case")) == 1) { return Tok::Kw_case as i64; }
-        if (id_eq(start, len, string_from_slice("void")) == 1) { return Tok::Kw_void as i64; }
-        if (id_eq(start, len, string_from_slice("enum")) == 1) { return Tok::Kw_enum as i64; }
-        if (id_eq(start, len, string_from_slice("link")) == 1) { return Tok::Kw_link as i64; }
-        if (id_eq(start, len, string_from_slice("bool")) == 1) { return Tok::Kw_bool as i64; }
-        if (id_eq(start, len, string_from_slice("auto")) == 1) { return Tok::Kw_auto as i64; }
-        if (id_eq(start, len, string_from_slice("priv")) == 1) { return Tok::Kw_priv as i64; }
-        if (id_eq(start, len, string_from_slice("true")) == 1) { return Tok::BoolLit as i64; }
+        if (id_eq(start, len, KW_else) == 1) { return Tok::Kw_else as i64; }
+        if (id_eq(start, len, KW_case) == 1) { return Tok::Kw_case as i64; }
+        if (id_eq(start, len, KW_void) == 1) { return Tok::Kw_void as i64; }
+        if (id_eq(start, len, KW_enum) == 1) { return Tok::Kw_enum as i64; }
+        if (id_eq(start, len, KW_link) == 1) { return Tok::Kw_link as i64; }
+        if (id_eq(start, len, KW_bool) == 1) { return Tok::Kw_bool as i64; }
+        if (id_eq(start, len, KW_auto) == 1) { return Tok::Kw_auto as i64; }
+        if (id_eq(start, len, KW_priv) == 1) { return Tok::Kw_priv as i64; }
+        if (id_eq(start, len, KW_true) == 1) { return Tok::BoolLit as i64; }
         return Tok::Ident as i64;
     }
     if (len == 5) {
-        if (id_eq(start, len, string_from_slice("while")) == 1) { return Tok::Kw_while as i64; }
-        if (id_eq(start, len, string_from_slice("break")) == 1) { return Tok::Kw_break as i64; }
-        if (id_eq(start, len, string_from_slice("catch")) == 1) { return Tok::Kw_catch as i64; }
-        if (id_eq(start, len, string_from_slice("const")) == 1) { return Tok::Kw_const as i64; }
-        if (id_eq(start, len, string_from_slice("defer")) == 1) { return Tok::Kw_defer as i64; }
-        if (id_eq(start, len, string_from_slice("match")) == 1) { return Tok::Kw_match as i64; }
-        if (id_eq(start, len, string_from_slice("yield")) == 1) { return Tok::Kw_yield as i64; }
-        if (id_eq(start, len, string_from_slice("throw")) == 1) { return Tok::Kw_throw as i64; }
-        if (id_eq(start, len, string_from_slice("false")) == 1) { return Tok::BoolLit as i64; }
+        if (id_eq(start, len, KW_while) == 1) { return Tok::Kw_while as i64; }
+        if (id_eq(start, len, KW_break) == 1) { return Tok::Kw_break as i64; }
+        if (id_eq(start, len, KW_catch) == 1) { return Tok::Kw_catch as i64; }
+        if (id_eq(start, len, KW_const) == 1) { return Tok::Kw_const as i64; }
+        if (id_eq(start, len, KW_defer) == 1) { return Tok::Kw_defer as i64; }
+        if (id_eq(start, len, KW_match) == 1) { return Tok::Kw_match as i64; }
+        if (id_eq(start, len, KW_yield) == 1) { return Tok::Kw_yield as i64; }
+        if (id_eq(start, len, KW_throw) == 1) { return Tok::Kw_throw as i64; }
+        if (id_eq(start, len, KW_false) == 1) { return Tok::BoolLit as i64; }
         return Tok::Ident as i64;
     }
     if (len == 6) {
-        if (id_eq(start, len, string_from_slice("return")) == 1) { return Tok::Kw_return as i64; }
-        if (id_eq(start, len, string_from_slice("struct")) == 1) { return Tok::Kw_struct as i64; }
-        if (id_eq(start, len, string_from_slice("switch")) == 1) { return Tok::Kw_switch as i64; }
-        if (id_eq(start, len, string_from_slice("global")) == 1) { return Tok::Kw_global as i64; }
-        if (id_eq(start, len, string_from_slice("sizeof")) == 1) { return Tok::Kw_sizeof as i64; }
+        if (id_eq(start, len, KW_return) == 1) { return Tok::Kw_return as i64; }
+        if (id_eq(start, len, KW_struct) == 1) { return Tok::Kw_struct as i64; }
+        if (id_eq(start, len, KW_switch) == 1) { return Tok::Kw_switch as i64; }
+        if (id_eq(start, len, KW_global) == 1) { return Tok::Kw_global as i64; }
+        if (id_eq(start, len, KW_sizeof) == 1) { return Tok::Kw_sizeof as i64; }
         return Tok::Ident as i64;
     }
     if (len == 7) {
-        if (id_eq(start, len, string_from_slice("default")) == 1) { return Tok::Kw_default as i64; }
+        if (id_eq(start, len, KW_default) == 1) { return Tok::Kw_default as i64; }
         return Tok::Ident as i64;
     }
     if (len == 8) {
-        if (id_eq(start, len, string_from_slice("continue")) == 1) { return Tok::Kw_continue as i64; }
-        if (id_eq(start, len, string_from_slice("offsetof")) == 1) { return Tok::Kw_offsetof as i64; }
+        if (id_eq(start, len, KW_continue) == 1) { return Tok::Kw_continue as i64; }
+        if (id_eq(start, len, KW_offsetof) == 1) { return Tok::Kw_offsetof as i64; }
         return Tok::Ident as i64;
     }
     if (len == 9) {
-        if (id_eq(start, len, string_from_slice("namespace")) == 1) { return Tok::Kw_namespace as i64; }
-        if (id_eq(start, len, string_from_slice("constexpr")) == 1) { return Tok::Kw_constexpr as i64; }
+        if (id_eq(start, len, KW_namespace) == 1) { return Tok::Kw_namespace as i64; }
+        if (id_eq(start, len, KW_constexpr) == 1) { return Tok::Kw_constexpr as i64; }
         return Tok::Ident as i64;
     }
     if (len == 13) {
-        if (id_eq(start, len, string_from_slice("static_assert")) == 1) { return Tok::Kw_static_assert as i64; }
+        if (id_eq(start, len, KW_static_assert) == 1) { return Tok::Kw_static_assert as i64; }
         return Tok::Ident as i64;
     }
     return Tok::Ident as i64;
@@ -688,7 +759,18 @@ fn lex(source: string) -> i64 {
     g_err = 0;
     g_errline = 0;
     g_errcol = 0;
-    g_arr = array_new(8, 0);   // growable i64 store, elem_size 8
+    // Reuse the token store across lex() calls instead of allocating a fresh
+    // array each time. The host array extension has no array_free, so a fresh
+    // array_new on every lex() leaks the previous buffer (the slot is never
+    // reclaimed); the leaked buffers accumulate in the GC trace-callback scan
+    // and eventually crash the host at scale. array_clear() resets the logical
+    // length to 0 while keeping the backing buffer, so the slot is reused and
+    // the store stops growing. The first call (g_arr == 0) still allocates.
+    if (g_arr != 0) {
+        array_clear(g_arr);
+    } else {
+        g_arr = array_new(8, 0);   // growable i64 store, elem_size 8
+    }
 
     let mut go: i64 = 1;
     while (go == 1) {
