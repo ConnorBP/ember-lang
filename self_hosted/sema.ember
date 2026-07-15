@@ -1107,6 +1107,13 @@ fn init_natives() -> i64 {
     nat_add(1, TY_I64, -1, -1, -1, TY_I64, 1);      // 90 module_dispatch_base
     nat_add(1, TY_I64, -1, -1, -1, TY_I64, 1);      // 91 module_dispatch_count
     nat_add(2, TY_I64, TY_I64, -1, -1, TY_VOID, 1); // 92 set_coroutine_dispatch
+    // ---- CALL_RAW (extensions/call_raw/ext_call_raw.cpp) — all perm 1 (PERM_FFI) ----
+    nat_add(2, TY_I64, TY_I64, -1, -1, TY_I64,  1); // 93 call_raw
+    nat_add(1, TY_I64, -1, -1, -1, TY_I64,  1);     // 94 make_executable
+    nat_add(1, TY_I64, -1, -1, -1, TY_VOID, 1);     // 95 free_executable_ptr
+    nat_add(1, TY_I64, -1, -1, -1, TY_I64,  1);     // 96 load_executable_module
+    nat_add(2, TY_I64, TY_I64, -1, -1, TY_I64,  1); // 97 module_entry_ptr
+    nat_add(1, TY_I64, -1, -1, -1, TY_VOID, 1);     // 98 free_executable_module
     return 0;
 }
 
@@ -1215,6 +1222,13 @@ fn native_find(name: string) -> i64 {
     if (name == string_from_slice("module_dispatch_base"))            { return 90; }
     if (name == string_from_slice("module_dispatch_count"))           { return 91; }
     if (name == string_from_slice("set_coroutine_dispatch"))          { return 92; }
+    // CALL_RAW
+    if (name == string_from_slice("call_raw"))                       { return 93; }
+    if (name == string_from_slice("make_executable"))                { return 94; }
+    if (name == string_from_slice("free_executable_ptr"))            { return 95; }
+    if (name == string_from_slice("load_executable_module"))         { return 96; }
+    if (name == string_from_slice("module_entry_ptr"))               { return 97; }
+    if (name == string_from_slice("free_executable_module"))         { return 98; }
     return -1;
 }
 

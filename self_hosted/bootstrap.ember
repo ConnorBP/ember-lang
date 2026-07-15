@@ -1,0 +1,75 @@
+// self_hosted/bootstrap.ember — the two-generation bootstrap.
+//
+// This script proves the self-hosted compiler can compile ITSELF:
+//   1. The host (C++ ember_cli) compiles THIS script (which imports the full
+//      self-hosted pipeline) → compiler A (running in the host's JIT).
+//   2. Compiler A reads the pre-inlined self-hosted compiler source
+//      (bootstrap_compiler_source.ember — all 6 stage files concatenated
+//      with imports stripped) and compiles it through the self-hosted
+//      pipeline → EMBM module B (compiler B, the second generation).
+//   3. Compiler A loads module B and calls B's `main` entry via call_raw.
+//      B's `main` (from emberc.ember) reads a .ember file path from stdin,
+//      compiles + runs it, and returns the result.
+//   4. The result should match what A and the native compiler produce.
+//
+// Usage:
+//   echo tests/lang/valid_try_catch.ember | \
+//     ./build/ember_cli.exe run self_hosted/bootstrap.ember --fn main --ffi
+//
+// Returns the test program's return value (compiled by B, the second-
+// generation self-hosted compiler). For valid_try_catch.ember, returns 42.
+
+import "full_pipeline.ember";
+
+fn main() -> i64 {
+    // 1. Read the pre-inlined self-hosted compiler source
+    let path: string = string_from_slice("self_hosted/bootstrap_compiler_source.ember");
+    let source: string = file_read_text(path);
+    if (string_length(source) == 0) {
+        if (file_exists(path) == 0) { return -602; }
+        return -603;
+    }
+
+    // 2. Compile the source through the self-hosted pipeline (A compiles the
+    //    full self-hosted compiler → EMBM image for B)
+    let toks: i64 = lex(source);
+    if (lex_failed() != 0) { return -101; }
+    let ntok: i64 = tok_count(toks);
+    if (ntok < 2) { return -102; }
+
+    let prog: i64 = parse(source);
+    if (parse_failed() != 0) { return -201; }
+    if (prog < 0) { return -202; }
+
+    let sr: i64 = sema(source);
+    if (sr < 0) { return sr; }
+    if (sr != 0) { return -301 - sr; }
+
+    let bytes: i64 = codegen(source);
+    if (codegen_failed() != 0) { return -401; }
+    let nbytes: i64 = codegen_byte_count();
+    if (nbytes <= 0) { return -402; }
+
+    // 3. Build the EMBM image + load module B
+    let img: i64 = codegen_emit_image();
+    let h: i64 = load_executable_module(img);
+    if (h == 0) { return -501; }
+
+    // Register B's dispatch table for coroutines
+    set_coroutine_dispatch(module_dispatch_base(h), module_dispatch_count(h));
+
+    // 4. Get B's `main` entry offset (emberc.ember's main, which reads a
+    //    file path from stdin, compiles + runs it, and returns the result).
+    let main_off: i64 = codegen_fn_entry_offset(string_from_slice("main"));
+    if (main_off < 0) { free_executable_module(h); return -502; }
+    let b_entry: i64 = module_entry_ptr(h, main_off);
+    if (b_entry == 0) { free_executable_module(h); return -503; }
+
+    // 5. Call B's main. B reads a .ember file path from stdin (piped by the
+    //    caller), compiles + runs it, and returns the result.
+    //    call_raw passes 0 as the arg (B's main ignores it — it reads stdin).
+    let result: i64 = call_raw(b_entry, 0);
+
+    free_executable_module(h);
+    return result;
+}

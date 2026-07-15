@@ -434,13 +434,13 @@ static int64_t n_load_executable_module(int64_t bytes_handle) {
     for (auto& pr : relocs) {
         if (pr.type == RELOC_RODATA) {
             if (rodata_len == 0) { teardown(); return 0; }       // no rodata to ref
-            if (pr.addend >= rodata_len) { teardown(); return 0; } // addend OOB
+            if (pr.addend > rodata_len) { teardown(); return 0; }  // addend OOB (addend == rodata_len is valid: a 0-length string at the end)
             uintptr_t base = reinterpret_cast<uintptr_t>(mod->rodata_base);
             if (pr.addend > UINT64_MAX - base) { teardown(); return 0; } // wrap
             pr.value = uint64_t(base + pr.addend);
         } else if (pr.type == RELOC_DATA) {
             if (data_len == 0) { teardown(); return 0; }         // no data to ref
-            if (pr.addend >= data_len) { teardown(); return 0; } // addend OOB
+            if (pr.addend > data_len) { teardown(); return 0; }   // addend OOB (addend == data_len is valid: 0-length data at the end)
             uintptr_t base = reinterpret_cast<uintptr_t>(mod->data_base);
             if (pr.addend > UINT64_MAX - base) { teardown(); return 0; } // wrap
             pr.value = uint64_t(base + pr.addend);
