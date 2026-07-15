@@ -138,6 +138,25 @@ global cg_relocs : i64 = 0;   // array<u8> — 32-byte relocation records (bytes
 global cg_globals : i64 = 0;
 global cg_globals_len : i64 = 0;
 
+// string-globals table for the module-init function. Stride 3
+// [ name_tok, data_addend, init_node ]. Populated by cg_compile_globals() for
+// each `string`-typed global with a StringLit initializer; the data slot is
+// zero-filled (the handle is materialized at runtime). cg_emit_globals_init()
+// walks this table + emits, for each entry, the same literal materialization
+// as cg_eval_string_lit (rodata + u8 slice + string_from_slice -> handle in
+// rax) followed by a store of rax into the global's [data_base + addend] slot.
+// The init function runs BEFORE main (full_pipeline's compile_and_run calls it
+// via codegen_globals_init_offset()). i64 globals keep their compile-time
+// constant in the data section (no runtime init needed).
+global cg_str_globals : i64 = 0;
+global cg_str_globals_len : i64 = 0;
+
+// the entry label id of the synthetic __globals_init function (-1 when none
+// was emitted, i.e. the program declares no string globals). Bound at the
+// init function's prologue offset; codegen_globals_init_offset() returns that
+// offset so the pipeline can call it before main.
+global cg_globals_init_label : i64 = -1;
+
 // relocation type constants (MODULE_IMAGE_FORMAT.md §7).
 global CG_RELOC_RODATA : i64 = 1;   // ABS64_RODATA: addend = rodata byte offset
 global CG_RELOC_DATA   : i64 = 2;   // ABS64_DATA:   addend = data byte offset
@@ -1365,6 +1384,11 @@ fn cg_init() -> i64 {
     if (cg_relocs != 0) { array_clear(cg_relocs); } else { cg_relocs = array_new(1, 0); }
     if (cg_globals != 0) { array_clear(cg_globals); } else { cg_globals = array_new(8, 0); }
     cg_globals_len = 0;
+    // string-globals table + init label (reset so each codegen() starts clean;
+    // cg_globals_init_label = -1 means "no __globals_init emitted this compile").
+    if (cg_str_globals != 0) { array_clear(cg_str_globals); } else { cg_str_globals = array_new(8, 0); }
+    cg_str_globals_len = 0;
+    cg_globals_init_label = -1;
     // Phase 3b: defer cleanup stack (reset per function in cg_compile_func).
     if (g_defers != 0) { array_clear(g_defers); } else { g_defers = array_new(8, 0); }
     if (g_defer_marks != 0) { array_clear(g_defer_marks); } else { g_defer_marks = array_new(8, 0); }
@@ -1628,9 +1652,27 @@ fn cg_compile_globals(prog: i64) -> i64 {
     return 0;
 }
 
-// allocate a data slot for one constant-initialized i64 global + record
-// (name_tok, addend, ns_tok) in cg_globals. Mirrors sema's global_is_const_i64
-// gate so the codegen allocates exactly the globals sema registered.
+// is a GlobalDecl a string global with a StringLit initializer? Mirrors
+// sema's global_is_const_string gate so the codegen allocates exactly the
+// string globals sema registered. (A plain "..." literal, not an f-string.)
+fn cg_global_is_string(d: i64) -> i64 {
+    let gty: i64 = resolve_type(nk_a(d));
+    if (gty < 0) { return 0; }
+    if (ty_is_string(gty) == 0) { return 0; }
+    let init: i64 = nk_b(d);
+    if (init < 0) { return 0; }
+    if (nk_kind(init) != (NK::StringLit as i64)) { return 0; }
+    if (nk_d(init) != 0) { return 0; }   // plain string, not an f-string
+    return 1;
+}
+
+// allocate a data slot for one supported global (constant-initialized i64 OR
+// string with a StringLit initializer) + record (name_tok, addend, ns_tok) in
+// cg_globals. Mirrors sema's global_is_supported gate so the codegen allocates
+// exactly the globals sema registered. An i64 global's 8 LE init bytes are
+// written into cg_data now; a string global's slot is zero-filled (the handle
+// is materialized at runtime by __globals_init) + recorded in cg_str_globals
+// so the init function can emit its literal materialization + store.
 fn cg_compile_one_global(d: i64, ns_tok: i64) -> i64 {
     let gty: i64 = resolve_type(nk_a(d));
     let init: i64 = nk_b(d);
@@ -1641,6 +1683,7 @@ fn cg_compile_one_global(d: i64, ns_tok: i64) -> i64 {
             if (nk_kind(nk_a(init)) == (NK::IntLit as i64)) { is_const = 1; }
         }
     }
+    let is_str: i64 = cg_global_is_string(d);
     if (is_const == 1) {
         let addend: i64 = cg_data_alloc(8);
         let val: i64 = cg_eval_const_i64(init);
@@ -1658,8 +1701,112 @@ fn cg_compile_one_global(d: i64, ns_tok: i64) -> i64 {
         array_set_i64(cg_globals, cg_globals_len + 1, addend);
         array_set_i64(cg_globals, cg_globals_len + 2, ns_tok);
         cg_globals_len = cg_globals_len + 3;
+    } else if (is_str == 1) {
+        // a string global: 8-byte zero-filled slot (the handle is filled at
+        // runtime by __globals_init). Record it in cg_globals (for read/write
+        // resolution) AND in cg_str_globals (for the init function).
+        let addend: i64 = cg_data_alloc(8);   // zero-filled (cg_data_alloc pushes 0s)
+        if (array_length(cg_globals) < cg_globals_len + 3) {
+            array_resize(cg_globals, cg_globals_len + 3);
+        }
+        array_set_i64(cg_globals, cg_globals_len, nk_tok(d));
+        array_set_i64(cg_globals, cg_globals_len + 1, addend);
+        array_set_i64(cg_globals, cg_globals_len + 2, ns_tok);
+        cg_globals_len = cg_globals_len + 3;
+        // record (name_tok, addend, init_node) at stride 3 for __globals_init
+        if (array_length(cg_str_globals) < cg_str_globals_len + 3) {
+            array_resize(cg_str_globals, cg_str_globals_len + 3);
+        }
+        array_set_i64(cg_str_globals, cg_str_globals_len, nk_tok(d));
+        array_set_i64(cg_str_globals, cg_str_globals_len + 1, addend);
+        array_set_i64(cg_str_globals, cg_str_globals_len + 2, init);
+        cg_str_globals_len = cg_str_globals_len + 3;
     }
     return 0;
+}
+
+// =============================================================================
+// module-init function (__globals_init). For each string global, materialize
+// its StringLit initializer at runtime (decode bytes to cg_rodata + build a
+// u8 slice {rcx=ptr, rdx=len} + call string_from_slice -> handle in rax) and
+// store the handle into the global's [data_base + addend] slot (mov rcx, <data
+// ptr>; mov [rcx], rax). i64 globals keep their compile-time constant in the
+// data section, so they need no runtime init. The pipeline calls this function
+// BEFORE main (full_pipeline's compile_and_run via codegen_globals_init_offset).
+//
+// Emitted as a normal function in the code section with a minimal prologue
+// (push rbp; mov rbp, rsp — no frame sub: there are no locals, and the
+// per-call 32-byte shadow space is managed inline by the materialization, the
+// same way cg_eval_string_lit manages it). rbp is preserved across the native
+// calls (string_from_slice is Win64-ABI callee-saved with respect to rbp), so
+// the epilogue (mov rsp, rbp; pop rbp; ret) restores the caller's frame.
+// =============================================================================
+
+// emit the __globals_init function (one per string global). Binds its entry
+// label at the prologue offset + records the label in cg_globals_init_label so
+// codegen_globals_init_offset() can resolve it. A no-op function (prologue +
+// epilogue only) when there are no string globals is NOT emitted — instead the
+// label stays -1 and the pipeline skips the call (cleaner than a dead fn).
+fn cg_emit_globals_init() -> i64 {
+    if (cg_str_globals_len == 0) {
+        cg_globals_init_label = -1;
+        return 0;
+    }
+    let lab: i64 = cg_alloc_label();
+    cg_globals_init_label = lab;
+    cg_bind(lab);   // entry = current code offset
+    // prologue: push rbp; mov rbp, rsp  (no frame sub — see file header).
+    // Emitted directly (not via cg_emit_prologue) to avoid a dead `sub rsp,0`.
+    cg_push(RBP);                    // 0x55
+    cg_mov_reg_reg(RBP, RSP);        // 48 89 E5
+    // for each string global: materialize the literal -> rax, then store rax
+    // into [data_base + addend]. The materialization mirrors cg_eval_string_
+    // lit's plain-string path (rodata + slice + string_from_slice) and manages
+    // its own 32-byte shadow space (sub/add rsp around the call); rbp is held
+    // fixed so the store's data-pointer load is independent of rsp motion.
+    let mut i: i64 = 0;
+    while (i < cg_str_globals_len) {
+        let addend: i64 = array_get_i64(cg_str_globals, i + 1);
+        let init_node: i64 = array_get_i64(cg_str_globals, i + 2);
+        // 1. emit the body bytes to cg_rodata
+        let body: string = nk_string_body(init_node);
+        let n: i64 = string_length(body);
+        let ro_addend: i64 = cg_rodata_alloc(n);
+        let mut j: i64 = 0;
+        while (j < n) {
+            array_set_u8(cg_rodata, ro_addend + j, string_char_at(body, j));
+            j = j + 1;
+        }
+        // 2. build the u8 slice {rcx=ptr, rdx=len}
+        cg_emit_abs64_reloc_reg(RCX, CG_RELOC_RODATA, 0, ro_addend);
+        cg_mov_reg_imm64(RDX, n);
+        // 3. call string_from_slice(rcx, rdx) -> handle in rax (32-byte shadow)
+        cg_sub_reg_imm32(RSP, 32);
+        let sym_idx: i64 = cg_sym_index(string_from_slice("string_from_slice"));
+        let codes: i64 = cg_fp_codes_get();
+        array_set_i64(codes, 0, 5);  // u8 slice
+        let fp: i64 = cg_abi_fingerprint_codes(codes, 1, 6, 0);
+        cg_emit_abs64_reloc_reg(RAX, CG_RELOC_NATIVE, sym_idx, fp);
+        cg_call_reg(RAX);
+        cg_add_reg_imm32(RSP, 32);
+        // 4. store the handle into the global's data slot:
+        //    mov rcx, <data_base + addend>; mov [rcx], rax
+        cg_emit_abs64_reloc_reg(RCX, CG_RELOC_DATA, 0, addend);
+        cg_byte(0x48); cg_byte(0x89); cg_byte(0x01);  // mov [rcx], rax
+        i = i + 3;
+    }
+    // epilogue: mov rsp, rbp; pop rbp; ret
+    cg_emit_epilogue();
+    return 0;
+}
+
+// the code offset of the __globals_init function's entry (prologue) within the
+// buffer, or -1 if no string globals were declared (no init function emitted).
+// Used by the end-to-end pipeline to call the init function BEFORE main so
+// string globals are live when main reads them.
+fn codegen_globals_init_offset() -> i64 {
+    if (cg_globals_init_label < 0) { return -1; }
+    return cg_label_offset(cg_globals_init_label);
 }
 
 // =============================================================================
@@ -4398,10 +4545,20 @@ fn codegen(source: string) -> i64 {
     }
 
     // Allocate the data-section slots for constant-initialized i64 globals
+    // AND string globals (zero-filled slots, handles materialized at runtime)
     // BEFORE compiling functions, so global references in fn bodies resolve
     // to their data addend. Each global gets 8 bytes in cg_data + a
-    // (name -> addend) entry in cg_globals (§5).
+    // (name -> addend) entry in cg_globals (§5). String globals are also
+    // recorded in cg_str_globals for the init function below.
     cg_compile_globals(prog);
+
+    // Emit the synthetic __globals_init function (materializes each string
+    // global's literal + stores the handle into its data slot) BEFORE the user
+    // functions so it lands at offset 0 when present (the pipeline's prologue
+    // check still sees 0x55 = push rbp at byte 0). No-op (no fn emitted, label
+    // stays -1) when the program declares no string globals. Must run before
+    // cg_resolve_fixups so its entry label is bound.
+    cg_emit_globals_init();
 
     // Allocate an entry label for every function up front, so a call to a fn
     // declared later (forward reference) gets a fixup for a label that will be

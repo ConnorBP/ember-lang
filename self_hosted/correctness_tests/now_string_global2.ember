@@ -1,0 +1,13 @@
+// Two distinct string globals — both materialized by the module-init function
+// before main. Verifies the init sequence handles multiple globals correctly
+// (each gets its own rodata + string_from_slice + store).
+// expect: 42
+global GREETING : string = "hello";
+global FAREWELL : string = "goodbye";
+
+fn main() -> i64 {
+    // both handles must be live and distinct: GREETING len 5, FAREWELL len 7
+    if (string_length(GREETING) != 5) { return 1; }
+    if (string_length(FAREWELL) != 7) { return 2; }
+    return 42;
+}

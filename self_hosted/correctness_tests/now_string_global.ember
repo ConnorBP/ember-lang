@@ -1,0 +1,11 @@
+// String global (constant string initializer). The sema accepts a
+// `string`-typed global with a StringLit initializer; the codegen materializes
+// the literal at runtime via a module-init function (string_from_slice) and
+// stores the handle into the global's data slot before main runs.
+// expect: 42
+global GREETING : string = "hello";
+
+fn main() -> i64 {
+    if (string_length(GREETING) == 5) { return 42; }
+    return 0;
+}

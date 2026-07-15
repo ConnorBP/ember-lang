@@ -1296,6 +1296,36 @@ fn global_is_const_i64(gd: i64) -> i64 {
     return expr_is_const_i64(init);
 }
 
+// is a GlobalDecl a Phase-1-supported string global? It must have a declared
+// `string` type + a constant StringLit initializer (a plain "..." literal,
+// not an f-string). The initializer is NOT a compile-time value — it is a
+// string literal the codegen materializes at runtime (decode bytes to rodata
+// + build a u8 slice + call string_from_slice -> handle) and stores into the
+// global's data slot in a module-init function that runs before main (§11).
+// check_global_init still type-checks the initializer (StringLit -> TY_STRING)
+// against the declared type, so the gate only decides registration.
+fn global_is_const_string(gd: i64) -> i64 {
+    let gty: i64 = resolve_type(nk_a(gd));
+    if (s_err != 0) { return 0; }
+    if (ty_is_string(gty) == 0) { return 0; }   // only string globals here
+    let init: i64 = nk_b(gd);
+    if (init < 0) { return 0; }                  // must have an initializer
+    if (nk_kind(init) != (NK::StringLit as i64)) { return 0; }
+    if (nk_d(init) != 0) { return 0; }           // plain string, not an f-string
+    return 1;
+}
+
+// is a GlobalDecl supported by the Phase-1 subset? A constant-initialized i64
+// global (compile-time constant, written to the data section at emit time) OR
+// a string global with a StringLit initializer (materialized at runtime by the
+// module-init function). Non-constant / non-i64 / non-string globals stay
+// out-of-subset (-317).
+fn global_is_supported(gd: i64) -> i64 {
+    if (global_is_const_i64(gd) == 1) { return 1; }
+    if (global_is_const_string(gd) == 1) { return 1; }
+    return 0;
+}
+
 // is an expression a compile-time constant i64? An IntLit, or a unary negation
 // of an IntLit. (The codegen mirrors this to compute the data-section bytes.)
 fn expr_is_const_i64(e: i64) -> i64 {
@@ -3101,7 +3131,7 @@ fn check_program(prog: i64) -> i64 {
                 } else if (mk == (NK::FnDecl as i64)) {
                     register_fn(m, ns_tok);
                 } else if (mk == (NK::GlobalDecl as i64)) {
-                    if (global_is_const_i64(m) == 1) {
+                    if (global_is_supported(m) == 1) {
                         register_global(m, ns_tok);
                     } else {
                         unsupported(-317, string_from_slice("global declaration"), m);
@@ -3119,10 +3149,13 @@ fn check_program(prog: i64) -> i64 {
         } else if (k == (NK::FnDecl as i64)) {
             register_fn(d, -1);
         } else if (k == (NK::GlobalDecl as i64)) {
-            // Phase 1 supports constant-initialized globals (i64 with a
-            // compile-time constant initializer). Register those; a global
-            // without a constant initializer stays out-of-subset (-317).
-            if (global_is_const_i64(d) == 1) {
+            // Phase 1 supports constant-initialized globals: an i64 global
+            // with a compile-time constant initializer (written to the data
+            // section at emit time) OR a string global with a StringLit
+            // initializer (materialized at runtime by the module-init
+            // function). Register those; any other global stays
+            // out-of-subset (-317).
+            if (global_is_supported(d) == 1) {
                 register_global(d, -1);
             } else {
                 unsupported(-317, string_from_slice("global declaration"), d);

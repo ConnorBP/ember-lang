@@ -142,6 +142,24 @@ fn compile_and_run(source: string) -> i64 {
     let entry: i64 = module_entry_ptr(h, main_off);
     if (entry == 0) { free_executable_module(h); return -502; }
 
+    // ---- Run the module-init function BEFORE main (if present) ----
+    // The codegen emits a synthetic __globals_init function when the program
+    // declares string globals: it materializes each literal (rodata +
+    // string_from_slice -> handle) + stores the handle into the global's data
+    // slot, so the globals are live when main reads them. codegen_globals_
+    // init_offset returns its entry offset, or -1 when none was emitted (no
+    // string globals -> nothing to init). The init result is discarded.
+    let init_off: i64 = codegen_globals_init_offset();
+    if (init_off >= 0) {
+        let init_entry: i64 = module_entry_ptr(h, init_off);
+        if (init_entry != 0) {
+            let init_res: i64 = call_raw(init_entry, 0);
+            // an init failure is non-fatal (string natives returning 0 just
+            // leaves the global empty); continue to main regardless.
+            if (init_res < 0) { }   // discard
+        }
+    }
+
     // call_raw casts the entry to int64_t(*)(int64_t) and calls it. The
     // compiled `main` returns its result in rax, which call_raw reads back.
     // Calls from main to other fns in the same program resolve via in-buffer
