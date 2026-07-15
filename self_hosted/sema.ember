@@ -1361,16 +1361,11 @@ fn global_is_supported(gd: i64) -> i64 {
     return 0;
 }
 
-// is an expression a compile-time constant i64? An IntLit, or a unary negation
-// of an IntLit. (The codegen mirrors this to compute the data-section bytes.)
+// Is an expression a compile-time i64? Use the bounded constexpr evaluator,
+// not just the old literal/-literal gate. This admits constexpr calls nested
+// in arithmetic global initializers while retaining the interpreter's limits.
 fn expr_is_const_i64(e: i64) -> i64 {
-    if (e < 0) { return 0; }
-    let k: i64 = nk_kind(e);
-    if (k == (NK::IntLit as i64)) { return 1; }
-    if (k == (NK::UnaryExpr as i64)) {
-        if (nk_d(e) == (UnOp::Neg as i64)) { return expr_is_const_i64(nk_a(e)); }
-    }
-    return 0;
+    return try_eval_const_i64(e);
 }
 
 // -----------------------------------------------------------------------------
@@ -1985,6 +1980,15 @@ fn check_callexpr(e: i64) -> i64 {
                     node_line(e), node_col(e));
     }
     set_c(e, srt);  // annotate return type for the codegen
+    // Lower an all-constant constexpr call in every expression context.
+    // CallExpr's d/f slots are otherwise unused: d=1 marks the fold and f
+    // carries the resulting i64 for codegen.
+    if (ty_is_i64(srt) == 1 && fn_is_constexpr(row) == 1) {
+        if (ce_fold_constexpr_call(e, 0) == 1) {
+            set_d(e, 1);
+            set_f(e, ce_int_out);
+        }
+    }
     return srt;
 }
 
@@ -2357,19 +2361,48 @@ fn check_stmt(s: i64) -> i64 {
         let subject_ty: i64 = check_expr(nk_a(s));
         let mut arm: i64 = nk_b(s);
         while (arm >= 0) {
-            if (nk_d(arm) == 0) {
+            // Struct-pattern captures are visible to both the guard and body.
+            push_scope();
+            if (nk_f(arm) == 1) {
+                let pat_name: string = tok_name(nk_tok(arm));
+                let row: i64 = find_struct(pat_name);
+                if (row < 0 || ty_is_struct(subject_ty) == 0 || (ty_struct_name(subject_ty) == pat_name) == false) {
+                    serr(string_from_slice("match struct pattern type mismatch"), node_line(arm), node_col(arm));
+                    pop_scope(); return 0;
+                }
+                let mut fld: i64 = nk_c(arm);
+                while (fld >= 0) {
+                    let ft: i64 = struct_field_type(row, nk_name(fld));
+                    if (ft < 0) {
+                        serr(string_from_slice("struct '") + pat_name + string_from_slice("' has no field '") + nk_name(fld) + string_from_slice("'"), node_line(fld), node_col(fld));
+                        pop_scope(); return 0;
+                    }
+                    if (nk_a(fld) < 0) {
+                        declare(nk_tok(fld), ft);
+                    } else {
+                        let pt: i64 = check_expr(nk_a(fld));
+                        if (lit_fits_int_type(nk_a(fld), ft) == 0 && types_compatible(ft, pt) == 0) {
+                            serr(string_from_slice("match struct field pattern type mismatch"), node_line(fld), node_col(fld));
+                            pop_scope(); return 0;
+                        }
+                    }
+                    if (s_err != 0) { pop_scope(); return 0; }
+                    fld = nk_next(fld);
+                }
+            } else if (nk_d(arm) == 0) {
                 let pt: i64 = check_expr(nk_a(arm));
                 // same type OR both integer (a typed enum IS an integer, so an
                 // enum subject + int pattern, or an int subject + enum pattern,
                 // is accepted — mirrors src/sema.cpp's match pattern rule).
                 if (type_eq(subject_ty, pt) == 0) {
                     if (ty_is_int_or_typed_enum(subject_ty) == 0 || ty_is_int_or_typed_enum(pt) == 0) {
-                        serr(string_from_slice("match pattern type mismatch"), node_line(arm), node_col(arm)); return 0;
+                        serr(string_from_slice("match pattern type mismatch"), node_line(arm), node_col(arm)); pop_scope(); return 0;
                     }
                 }
             }
-            if (nk_e(arm) >= 0 && ty_is_bool(check_expr(nk_e(arm))) == 0) { serr(string_from_slice("match guard must be bool"), node_line(arm), node_col(arm)); return 0; }
+            if (nk_e(arm) >= 0 && ty_is_bool(check_expr(nk_e(arm))) == 0) { serr(string_from_slice("match guard must be bool"), node_line(arm), node_col(arm)); pop_scope(); return 0; }
             check_block(nk_b(arm));
+            pop_scope();
             if (s_err != 0) { return 0; }
             arm = nk_next(arm);
         }

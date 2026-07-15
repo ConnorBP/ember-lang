@@ -1697,11 +1697,8 @@ fn codegen_emit_image() -> i64 {
 // expr_is_const_i64). IntLit -> its value; unary negation -> -operand.
 fn cg_eval_const_i64(e: i64) -> i64 {
     if (e < 0) { return 0; }
-    let k: i64 = nk_kind(e);
-    if (k == (NK::IntLit as i64)) { return nk_d(e); }
-    if (k == (NK::UnaryExpr as i64)) {
-        if (nk_d(e) == (UnOp::Neg as i64)) { return 0 - cg_eval_const_i64(nk_a(e)); }
-    }
+    // Sema's bounded interpreter is the single constexpr implementation.
+    if (try_eval_const_i64(e) == 1) { return ce_int_out; }
     return 0;
 }
 
@@ -1797,10 +1794,7 @@ fn cg_compile_one_global(d: i64, ns_tok: i64) -> i64 {
     let init: i64 = nk_b(d);
     let mut is_const: i64 = 0;
     if (gty >= 0 && ty_is_i64(gty) == 1 && init >= 0) {
-        if (nk_kind(init) == (NK::IntLit as i64)) { is_const = 1; }
-        if (nk_kind(init) == (NK::UnaryExpr as i64) && nk_d(init) == (UnOp::Neg as i64)) {
-            if (nk_kind(nk_a(init)) == (NK::IntLit as i64)) { is_const = 1; }
-        }
+        is_const = expr_is_const_i64(init);
     }
     let is_str: i64 = cg_global_is_string(d);
     if (is_const == 1) {
@@ -2133,7 +2127,16 @@ fn cg_count_locals_stmt(s: i64, total: i64) -> i64 {
         return total;
     }
     if (k == (NK::MatchStmt as i64)) {
-        let mut a: i64 = nk_b(s); while (a >= 0) { total = cg_count_locals_block(nk_b(a), total); a = nk_next(a); } return total;
+        let mut a: i64 = nk_b(s);
+        while (a >= 0) {
+            if (nk_f(a) == 1) {
+                let mut fld: i64 = nk_c(a);
+                while (fld >= 0) { if (nk_a(fld) < 0) { total = total + 1; } fld = nk_next(fld); }
+            }
+            total = cg_count_locals_block(nk_b(a), total);
+            a = nk_next(a);
+        }
+        return total;
     }
     // Phase 3b: do-while + switch + defer locals.
     if (k == (NK::DoWhileStmt as i64)) {
@@ -2264,6 +2267,9 @@ fn cg_eval(e: i64) -> i64 {
         return cg_eval_unaryexpr(e);
     }
     if (k == (NK::CallExpr as i64)) {
+        // Sema annotated an all-constant constexpr call in the unused d/f
+        // slots. Emit the folded immediate instead of a runtime call.
+        if (nk_d(e) == 1) { cg_mov_reg_imm64(RAX, nk_f(e)); return 0; }
         return cg_eval_callexpr(e);
     }
     if (k == (NK::AssignExpr as i64)) {
@@ -4791,15 +4797,62 @@ fn cg_lea_rax_rax_rcx_scale(scale: i64) -> i64 {
 }
 
 fn cg_compile_match(s: i64) -> i64 {
-    cg_eval(nk_a(s)); cg_push(RAX);
+    let subject: i64 = nk_a(s);
+    // Recompute from the live codegen local table. Sema runs again at codegen
+    // entry, so storing canonical type-node indices on the AST would leave
+    // stale indices after the second s_init appends a fresh canonical set.
+    let subject_ty: i64 = cg_expr_type(subject);
+    let is_struct: i64 = ty_is_struct(subject_ty);
+    let mut subject_off: i64 = 0;
+    if (is_struct == 1) {
+        // Aggregate subjects need an address; supported struct values are
+        // frame locals/params and therefore have a stable rbp offset.
+        if (nk_kind(subject) != (NK::Ident as i64)) {
+            cg_err = 1; cg_errmsg = string_from_slice("codegen: struct match subject must be a local"); return 0;
+        }
+        subject_off = cg_lookup_local(nk_tok(subject));
+        if (subject_off == 0) { cg_err = 1; cg_errmsg = string_from_slice("codegen: unknown struct match subject"); return 0; }
+    } else {
+        cg_eval(subject); cg_push(RAX);
+    }
+
     let end: i64 = cg_alloc_label(); let mut arm: i64 = nk_b(s);
     while (arm >= 0) {
         let next: i64 = cg_alloc_label();
-        if (nk_d(arm) == 0) { cg_eval(nk_a(arm)); cg_mov_reg_reg(RCX, RAX); cg_load_reg_mem(RAX, RSP, 0); cg_cmp_reg_reg(RAX, RCX); cg_jcc(COND_NE, next); }
+        cg_push_scope();
+        if (nk_f(arm) == 1) {
+            let row: i64 = find_struct(tok_name(nk_tok(arm)));
+            let mut fld: i64 = nk_c(arm);
+            while (fld >= 0) {
+                let idx: i64 = cg_struct_field_index(subject_ty, nk_name(fld));
+                let ft: i64 = cg_struct_field_type_at(row, idx);
+                let foff: i64 = cg_struct_field_offset(row, idx);
+                cg_load_typed(RAX, RBP, subject_off + foff, ft);
+                if (nk_a(fld) < 0) {
+                    let cap_off: i64 = cg_alloc_local_t(nk_tok(fld), ft, 1);
+                    if (ty_is_float(ft) == 1) { cg_store_float(cap_off, XMM0, cg_float_is64_type(ft)); }
+                    else { cg_store_typed(RBP, cap_off, ft); }
+                } else {
+                    // Constant sub-pattern: compare the extracted field value.
+                    cg_push(RAX);
+                    cg_eval(nk_a(fld));
+                    cg_mov_reg_reg(RCX, RAX);
+                    cg_pop(RAX);
+                    cg_cmp_reg_reg(RAX, RCX);
+                    cg_jcc(COND_NE, next);
+                }
+                fld = nk_next(fld);
+            }
+        } else if (nk_d(arm) == 0) {
+            cg_eval(nk_a(arm)); cg_mov_reg_reg(RCX, RAX); cg_load_reg_mem(RAX, RSP, 0); cg_cmp_reg_reg(RAX, RCX); cg_jcc(COND_NE, next);
+        }
         if (nk_e(arm) >= 0) { cg_eval(nk_e(arm)); cg_cmp_reg_imm32(RAX, 0); cg_jcc(COND_E, next); }
-        cg_compile_block(nk_b(arm)); cg_jmp(end); cg_bind(next); arm = nk_next(arm);
+        cg_compile_block(nk_b(arm)); cg_jmp(end);
+        cg_bind(next);
+        cg_pop_scope();
+        arm = nk_next(arm);
     }
-    cg_bind(end); cg_pop(RCX); return 0;
+    cg_bind(end); if (is_struct == 0) { cg_pop(RCX); } return 0;
 }
 
 // Phase 3b: compile a do-while loop. Body runs first, then the cond is
