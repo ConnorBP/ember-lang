@@ -1567,6 +1567,21 @@ add_executable(opt_pass_coverage_test examples/opt_pass_coverage_test.cpp)
 target_link_libraries(opt_pass_coverage_test PRIVATE ember ember_frontend ember_ext_opt)
 add_test(NAME opt_pass_coverage COMMAND opt_pass_coverage_test)
 
+# Exhaustive registry factory/template coverage: strict registration errors,
+# fresh configured factories, every opt/obf/custom pass factory, duplicate
+# package registration, and one pipeline containing all production passes.
+add_executable(pass_registry_coverage_test
+    examples/pass_registry_coverage_test.cpp
+    examples/custom_pass/minimal_pass.cpp
+    examples/custom_pass/nop_injection_pass.cpp
+    examples/custom_pass/block_merge_pass.cpp)
+target_include_directories(pass_registry_coverage_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples/custom_pass)
+target_link_libraries(pass_registry_coverage_test PRIVATE
+    ember ember_frontend ember_ext_opt ember_ext_obf)
+add_test(NAME pass_registry_coverage COMMAND pass_registry_coverage_test)
+set_tests_properties(pass_registry_coverage PROPERTIES TIMEOUT 30)
+
 # regalloc_test - Stage 3: the linear-scan register allocation value-preservation
 # + register-assignment gate. Compiles register-heavy workloads (recursion,
 # loops, register pressure) WITH and WITHOUT run_regalloc, asserts identical
@@ -1657,6 +1672,17 @@ target_link_libraries(keyed_dispatch_hot_reload PRIVATE
 if(WIN32)
     target_link_libraries(keyed_dispatch_hot_reload PRIVATE kernel32)
 endif()
+
+# Exhaustive public-API, malformed-metadata, lifecycle, generation, and
+# concurrent-publication coverage for keyed_hot_reload.cpp.
+add_executable(keyed_hot_reload_coverage_test examples/keyed_hot_reload_coverage_test.cpp)
+target_link_libraries(keyed_hot_reload_coverage_test PRIVATE
+    ember ember_frontend ember_import)
+if(WIN32)
+    target_link_libraries(keyed_hot_reload_coverage_test PRIVATE kernel32)
+endif()
+add_test(NAME keyed_hot_reload_coverage COMMAND keyed_hot_reload_coverage_test)
+set_tests_properties(keyed_hot_reload_coverage PROPERTIES TIMEOUT 60)
 
 set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
     v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
