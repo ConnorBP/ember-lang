@@ -1248,6 +1248,19 @@ if(WIN32)
 endif()
 add_test(NAME codegen_opt COMMAND codegen_opt_test)
 
+# Comprehensive integration coverage for src/codegen.cpp's legacy tree walker:
+# uncommon scalar/aggregate ABI paths, closures, coroutine yield, exceptions,
+# switch/match/defer/for-each lowering, casts, and defensive failures.
+add_executable(codegen_coverage_test examples/codegen_coverage_test.cpp)
+target_link_libraries(codegen_coverage_test PRIVATE
+    ember ember_frontend ember_import
+    ember_ext_array ember_ext_string ember_ext_coroutine ember_ext_gc)
+if(WIN32)
+    target_link_libraries(codegen_coverage_test PRIVATE kernel32)
+endif()
+add_test(NAME codegen_coverage COMMAND codegen_coverage_test)
+set_tests_properties(codegen_coverage PROPERTIES TIMEOUT 60)
+
 # thin_ir_test - Stage A c5 (IL-.em): the IR-backend CORRECTNESS GATE. Models
 # the Stage 1 gate (codegen_opt_test): a compile(src, ir_on, ...) helper that
 # runs the full pipeline with CodeGenCtx::enable_ir_backend set, captures
