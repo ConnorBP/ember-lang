@@ -63,12 +63,20 @@ self-hosting, and has not received a new release version yet.
   modules, and keyed-dispatch v6 artifacts. See
   [`docs/BUNDLING_AND_EM_MODULES.md`](docs/BUNDLING_AND_EM_MODULES.md).
 - A standalone executable bundler (`ember bundle` and `ember_bundle`).
-- Fifteen standard native extensions plus optimization and obfuscation pass
-  packages. See [`extensions/README.md`](extensions/README.md).
+- **20 extension libraries:** 18 native/addon extensions plus the optimization
+  and obfuscation pass packages. The native set now includes Win32/D3D11
+  graphics, Dear ImGui UI bindings, and audio visualization/LLM export. See
+  [`extensions/README.md`](extensions/README.md).
 - Concurrent script entry with per-call contexts and a shared, cooperatively
   collected GC heap.
-- VST3 wrapper, 13 example plugin scripts, realtime validation/stress tests,
-  hot reload, and an editor-side node-graph model with JSON persistence and
+- A Windows graphics extension for Win32 window management, runtime HLSL
+  compilation, D3D11 full-screen shader drawing, clear, and present. The
+  animated [`examples/mandelbrot_shader.ember`](examples/mandelbrot_shader.ember)
+  demo renders without a vertex buffer by using `SV_VertexID`.
+- VST3 wrapper with a raw-HWND Dear ImGui editor, script-defined `on_ui()`
+  frames, custom neon knobs, waveform/spectrum/meters, LLM-friendly audio-state
+  export, 14 example plugin scripts, realtime validation/stress tests, hot
+  reload, and an editor-side node-graph model with JSON persistence and
   deterministic Ember source generation.
 - A fully self-hosted compiler and one-/two-generation bootstrap proofs.
 
@@ -148,7 +156,8 @@ Windows. Use host calls or printed output when the complete 64-bit value matters
 - Ninja
 - MinGW-w64 GCC (the tested configuration is g++ 15.2.0)
 - Bash discoverable by CMake, because `lang_suite` uses a Bash test driver
-- Git submodules initialized, including the optional VST3 SDK tree
+- Git submodules initialized, including the optional VST3 SDK and the
+  `ember-imgui` fork
 
 MSVC x64 is intentionally rejected by CMake because the supported raw-call
 thunk and generated ABI are the MinGW/Win64 path.
@@ -166,9 +175,13 @@ A fully configured current tree contains **94 tests**. Optional dependency or
 platform conditions can change the configured count; use `ctest --test-dir
 buildt -N` to inspect the local inventory.
 
-The build vendors Ed25519 source under `thirdparty/ed25519`. The VST3 target is
-built when `thirdparty/vst3sdk` is present and `EMBER_BUILD_VST3=ON` (the
-default).
+The build vendors Ed25519 source under `thirdparty/ed25519`. Its Git submodules
+also include the VST3 SDK and [`ember-imgui`](https://github.com/ConnorBP/ember-imgui),
+a custom Dear ImGui v1.91.9b fork shared with the fvc/prism projects. The fork
+provides Win32/D3D11 backends, `SimpleKnob`, `FovAngleKnob`, the `retro_neon`
+theme (neon palette, `ToggleSwitch`, and CRT overlays), and the
+`GNeoButtonBg` custom button-rendering hook. The VST3 target is built when
+`thirdparty/vst3sdk` is present and `EMBER_BUILD_VST3=ON` (the default).
 
 ## CLI
 
@@ -261,15 +274,30 @@ configuration.
 
 The wrapper provides realtime-safe processing validation, sample-accurate
 parameter automation, MIDI, f32/f64 processing, state/preset persistence,
-latency/tail reporting, background hot reload, and crossfades. Thirteen example
-DSP scripts live in `examples/vst3_wrapper/`.
+latency/tail reporting, background hot reload, and crossfades. It now also
+implements `IPlugView` directly with a Win32 child `HWND`, D3D11, and the ImGui
+Win32/DX11 backends; it does not depend on VSTGUI. A timer-driven render loop
+calls an optional Ember `fn on_ui() -> void` every frame. UI scripts can use
+knobs, sliders, checkboxes, combo boxes, buttons, layout helpers, and a clipped
+line/rectangle/text canvas.
+
+The visualization extension transfers a bounded mono output snapshot from the
+audio thread through atomics, with no audio-thread lock or FFT. The UI/control
+thread derives waveform data, a radix-2 FFT spectrum, RMS, and peak. The same
+state is available as LLM-friendly text through `llm_export_state`,
+`llm_export_spectrum`, `llm_export_waveform`, and
+`llm_export_param_summary`. The 14 scripts in `examples/vst3_wrapper/` include
+[`demo_ui_vst.ember`](examples/vst3_wrapper/demo_ui_vst.ember), which combines
+four custom knobs, spectrum and waveform canvases, RMS/peak meters, and the
+retro-neon theme.
 
 The editor-side node-graph code in `src/node_graph.*` and `src/node_codegen.*`
 validates acyclic audio graphs, persists them as JSON, and generates
-self-contained Ember VST3 source. It is a model/code-generation layer rather
-than a VSTGUI editor embedded in the plugin.
+self-contained Ember VST3 source. It remains a model/code-generation layer;
+the shipped in-plugin editor is the script-driven ImGui view, not VSTGUI.
 
-See [`docs/VST3_PLUGIN_GUIDE.md`](docs/VST3_PLUGIN_GUIDE.md) and
+See [`docs/VST3_PLUGIN_GUIDE.md`](docs/VST3_PLUGIN_GUIDE.md),
+[`docs/spec/GRAPHICS_AND_UI.md`](docs/spec/GRAPHICS_AND_UI.md), and
 [`examples/vst3_wrapper/stress_tests/README.md`](examples/vst3_wrapper/stress_tests/README.md).
 
 ## Embedding and runtime model
@@ -311,6 +339,7 @@ Read these first:
 - [`docs/spec/TYPE_SYSTEM.md`](docs/spec/TYPE_SYSTEM.md)
 - [`docs/spec/COMPILER_PIPELINE.md`](docs/spec/COMPILER_PIPELINE.md)
 - [`docs/spec/CODEGEN_SPEC.md`](docs/spec/CODEGEN_SPEC.md)
+- [`docs/spec/GRAPHICS_AND_UI.md`](docs/spec/GRAPHICS_AND_UI.md)
 - [`docs/spec/PASS_SYSTEM_DESIGN.md`](docs/spec/PASS_SYSTEM_DESIGN.md)
 - [`docs/ROADMAP.md`](docs/ROADMAP.md)
 - [`docs/RESEARCH_NOTES.md`](docs/RESEARCH_NOTES.md)

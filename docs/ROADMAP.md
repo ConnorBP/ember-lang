@@ -80,18 +80,55 @@ thread-local to the call. The shared collector coordinates participants at
 safepoints. Legacy `call_mutex` storage remains for source compatibility but is
 not the mechanism for the concurrent-entry path.
 
-### VST3 wrapper and node graph
+### VST3 wrapper, ImGui UI, and node graph
 
-**Status: wrapper shipped; node-graph model/code generation shipped.** The tree
-contains 13 Ember plugin scripts and a VST3 wrapper with f32/f64 processing,
-parameter automation, MIDI, presets/state, latency/tail reporting, background
-hot reload, state migration, and crossfades. The Phase 9 editor-side graph code
-validates and persists acyclic graphs and generates deterministic Ember VST3
-source.
+**Status: complete for the shipped wrapper/UI scope.** The tree contains 14
+Ember plugin scripts and a VST3 wrapper with f32/f64 processing, parameter
+automation, MIDI, presets/state, latency/tail reporting, background hot reload,
+state migration, and crossfades. The Phase 9 editor-side graph code validates
+and persists acyclic graphs and generates deterministic Ember VST3 source.
 
-The graph layer is not yet a VSTGUI visual editor embedded in the plugin. That
-remains a relevant product/UI project, as do sidechain buses and note
-expression support.
+The plugin now ships a visual editor without VSTGUI. `EmberVst3Editor`
+implements `IPlugView` directly, owns a child Win32 `HWND` plus D3D11 swap
+chain, drives Dear ImGui's Win32/DX11 backends from a timer, handles host
+resize requests, and calls an optional script `on_ui()` callback each frame.
+The `ui` extension exposes knobs, sliders, checkbox/combo/button controls,
+layout helpers, and a clipped canvas. `demo_ui_vst.ember` demonstrates four
+knobs, custom spectrum/waveform canvases, meters, and the retro-neon theme.
+
+Audio visualization transfers a bounded mono snapshot through atomics; the
+audio thread takes no locks and performs no FFT or formatting. The UI thread
+provides waveform, radix-2 FFT spectrum, RMS, and peak. LLM-friendly export
+functions serialize parameters, spectrum, waveform, RMS, peak, zero-crossing
+rate, and source identity for external model workflows.
+
+Sidechain buses and broader DAW/pluginval coverage remain future work. Basic
+note-expression events already exist in the extension ABI and wrapper event
+translation; richer note-expression parameter/controller behavior remains a
+possible expansion.
+
+### Win32/D3D11 graphics extension
+
+**Status: complete.** `extensions/graphics/` provides `PERM_FFI`-gated Win32
+window lifecycle, resize/event handling, D3D11 device/swap-chain ownership,
+runtime HLSL `vs_main`/`ps_main` compilation, constant-buffer upload,
+full-screen `SV_VertexID` triangle rendering, clear/present, and error text.
+Opaque generation handles prevent stale window/program reuse, and window
+destruction releases dependent shader resources. Non-Windows builds register
+the same API through a fail-closed unsupported stub.
+
+`examples/mandelbrot_shader.ember` is the completed reference demo: it compiles
+HLSL at runtime and animates a full-screen Mandelbrot zoom with an eight-float
+constant block.
+
+### Audio visualization and LLM export
+
+**Status: complete.** `extensions/visualize/` publishes up to 2048 recent output
+samples through atomics and performs Hann-windowed radix-2 FFT analysis only on
+the UI/control thread. Script natives expose spectrum, waveform, RMS, and peak,
+plus compact state/spectrum/waveform/parameter text exports designed for model
+input. The exports are observational and do not invoke an AI service or change
+parameters.
 
 ### Test and coverage expansion
 
@@ -268,13 +305,26 @@ mismatches, and measured wins rather than pass-count growth.
 ThinIR is the intended reusable middle layer, but the current tree walker,
 bootstrap emitter, and EMBM images are Win64 x86-64 specific.
 
-### 5. VST3/UI expansion
+### 5. VST3 host and workflow expansion
 
-- [ ] Build a visual VSTGUI editor over the shipped node-graph model.
+The original VST3/UI expansion item is **done**: the shipped plugin has a
+resizable raw-HWND ImGui/D3D11 editor, script `on_ui()` callback, custom widgets,
+canvas visualizations, and realtime-safe sample transfer. A VSTGUI editor is no
+longer planned because the direct `IPlugView` implementation supplies the
+visual plugin UI without that dependency.
+
+Remaining optional expansions:
+
+- [ ] Connect the node-graph model to an interactive ImGui graph editing view;
+  the current in-plugin UI is script-driven and the graph remains a separate
+  JSON/code-generation model.
 - [ ] Add sidechain buses.
-- [ ] Add note expression support.
-- [ ] Expand DAW/pluginval validation beyond the existing validator and stress
-  gates.
+- [ ] Expand note-expression behavior beyond the current event translation.
+- [ ] Expand DAW/pluginval validation beyond the existing validator, stress,
+  editor-smoke, and soak gates.
+- [ ] Add explicit host-to-script parameter writeback helpers so custom script
+  controls can participate in host automation/undo with the same contract as
+  the editor's default controls.
 
 ### 6. Language/API cleanup
 
@@ -337,4 +387,8 @@ bootstrap emitter, and EMBM images are Win64 x86-64 specific.
 - integrated precise GC roots, by-reference captures, and managed allocation
 - concurrent shared-context execution
 - VST3 node-graph model/source generation
+- Win32/D3D11 graphics extension and Mandelbrot shader demo
+- custom `ember-imgui` v1.91.9b fork with neon widgets/theme and Win32/DX11 backends
+- direct-`IPlugView` ImGui VST3 editor with script `on_ui()` rendering
+- realtime-safe audio visualization and LLM-friendly state export
 - test inventory expanded to 94 passing CTest tests

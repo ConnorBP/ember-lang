@@ -21,6 +21,20 @@ Each entry:
 
 ---
 
+## 2026-07-16 (manual documentation update — graphics and VST3 UI)
+- **Tree state:** documentation task started from clean tracked Ember files; pre-existing modified content inside `thirdparty/vst3sdk` was left untouched.
+- **Build:** not run (Markdown-only task; implementation commits already include the feature/editor smoke work).
+- **Findings:**
+  - [DOCUMENTED] `extensions/graphics/`: Win32 window lifecycle, D3D11 ownership, runtime HLSL compilation, constant upload, full-screen `SV_VertexID` drawing, clear/present/error APIs, non-Windows stub, and `examples/mandelbrot_shader.ember`.
+  - [DOCUMENTED] `thirdparty/imgui/`: the ConnorBP `ember-imgui` Dear ImGui v1.91.9b fork shared with fvc/prism, including `SimpleKnob`, `FovAngleKnob`, retro-neon palette/theme, `ToggleSwitch`, CRT overlays, `GNeoButtonBg`, and Win32/DX11 backends.
+  - [DOCUMENTED] VST3 `IPlugView`: raw child `HWND`, D3D11/ImGui backend ownership, timer-driven frames, resize handling, per-frame script `on_ui()`, default UI fallback, and atomic/lock-free audio-thread visualization publication.
+  - [DOCUMENTED] `extensions/ui/`: every window/control/layout/canvas native and `PERM_FFI`/inactive-context behavior.
+  - [DOCUMENTED] `extensions/visualize/`: waveform, Hann-windowed radix-2 FFT spectrum, RMS/peak, and all four LLM-friendly export functions, including output formats and control-thread requirements.
+  - [DOCUMENTED] `examples/vst3_wrapper/demo_ui_vst.ember`: gain/cutoff/resonance/mix knobs, spectrum/waveform canvases, meters, LLM export, and retro-neon presentation.
+  - [UPDATED] extension inventory from 17 to 20 libraries (18 native/addon plus 2 pass extensions), VST3 example count from 13 to 14, roadmap completion status, API overview, top-level README, and third-party inventory.
+  - [ADDED] `docs/spec/GRAPHICS_AND_UI.md` as the architecture/API specification.
+- **Commit:** recorded by the task's final report.
+
 ## 2026-07-11 00:45 (initial — created by the human, not the cron)
 - **Tree state:** clean
 - **Build:** PASS (32/32 tests)
