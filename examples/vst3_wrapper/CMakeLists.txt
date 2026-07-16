@@ -10,6 +10,8 @@ set(public_sdk_SOURCE_DIR "${EMBER_VST3_SDK_ROOT}/public.sdk")
 set(EMBER_VST3_PROCESSOR_SOURCES
     vst3_ember_processor.h
     vst3_ember_processor.cpp
+    vst3_ember_editor.h
+    vst3_ember_editor.cpp
     ${public_sdk_SOURCE_DIR}/source/vst/vstsinglecomponenteffect.h
     ${public_sdk_SOURCE_DIR}/source/vst/vstsinglecomponenteffect.cpp
 )
@@ -48,7 +50,13 @@ target_include_directories(ember_vst3_processor PUBLIC
     ${public_sdk_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/extensions/audio
-    ${CMAKE_SOURCE_DIR}/extensions/math)
+    ${CMAKE_SOURCE_DIR}/extensions/array
+    ${CMAKE_SOURCE_DIR}/extensions/string
+    ${CMAKE_SOURCE_DIR}/extensions/math
+    ${CMAKE_SOURCE_DIR}/extensions/ui
+    ${CMAKE_SOURCE_DIR}/extensions/visualize
+    ${CMAKE_SOURCE_DIR}/thirdparty/imgui
+    ${CMAKE_SOURCE_DIR}/thirdparty/imgui/widgets)
 target_include_directories(ember_gain PRIVATE
     ${EMBER_VST3_SDK_ROOT}
     ${public_sdk_SOURCE_DIR}
@@ -60,7 +68,13 @@ target_link_libraries(ember_vst3_processor PUBLIC
     ember
     ember_frontend
     ember_ext_audio
-    ember_ext_math)
+    ember_ext_array
+    ember_ext_string
+    ember_ext_math
+    ember_ext_ui
+    ember_ext_visualize
+    ember_imgui
+    d3d11 dxgi d3dcompiler user32 gdi32)
 target_link_libraries(ember_gain PRIVATE ember_vst3_processor)
 
 # SDK 3.8's validator uses wmain on Windows. MinGW needs -municode to select

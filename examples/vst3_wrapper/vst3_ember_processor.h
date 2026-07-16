@@ -4,6 +4,7 @@
 // IComponent, IAudioProcessor and IEditController plumbing; this class owns
 // one Ember JIT module per plug-in instance.
 #include "public.sdk/source/vst/vstsinglecomponenteffect.h"
+#include "pluginterfaces/gui/iplugview.h"
 
 #include "ext_audio.hpp"
 #include "parser.hpp"
@@ -48,6 +49,16 @@ public:
     Steinberg::tresult PLUGIN_API process(Steinberg::Vst::ProcessData& data) override;
     Steinberg::tresult PLUGIN_API setState(Steinberg::IBStream* state) override;
     Steinberg::tresult PLUGIN_API getState(Steinberg::IBStream* state) override;
+    Steinberg::IPlugView* PLUGIN_API createView(Steinberg::FIDString name) override;
+
+    std::size_t parameterCount() const noexcept { return plugin_parameter_count_; }
+    float parameterValue(std::size_t index) const noexcept;
+    float parameterMinimum(std::size_t index) const noexcept;
+    float parameterMaximum(std::size_t index) const noexcept;
+    const char* parameterName(std::size_t index) const noexcept;
+    void setParameterFromEditor(std::size_t index, float value);
+    bool renderScriptUi();
+    void drawDefaultVisualizations();
 
 private:
     bool loadEmberScript();

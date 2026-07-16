@@ -319,6 +319,25 @@ int64_t alloc_bytes(const uint8_t* data, int64_t len) {
     }
 }
 
+int64_t alloc_f32(const float* data, int64_t count) {
+    std::lock_guard<std::mutex> lock(g_store_mutex);
+    if (count < 0 || (!data && count > 0)) return 0;
+    size_t bytes = 0;
+    if (!checked_bytes(int64_t(sizeof(float)), count, &bytes)) return 0;
+    try {
+        ArraySlot slot;
+        slot.elem_size = int64_t(sizeof(float));
+        slot.bytes.resize(bytes);
+        if (bytes) std::memcpy(slot.bytes.data(), data, bytes);
+        g_arrays.push_back(std::move(slot));
+        return int64_t(g_arrays.size());
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::length_error&) {
+        return 0;
+    }
+}
+
 // Registered surface is byte-identical to the old I/H/add lambda form
 // (ext_registration_test asserts array_new -> i64 2 params; array_length
 //  -> i64 1 param; array_get_u8 -> u8; array_push_u8 -> void 2 params).

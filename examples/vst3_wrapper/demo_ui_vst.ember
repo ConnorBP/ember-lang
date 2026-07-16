@@ -1,0 +1,69 @@
+// Ember ImGui/D3D11 VST3 demo. Select with EMBER_VST3_SCRIPT.
+global gain: f32 = 1.0;
+global cutoff: f32 = 1000.0;
+global resonance: f32 = 0.7;
+global mix: f32 = 1.0;
+global filter_l: f32 = 0.0;
+global filter_r: f32 = 0.0;
+
+@realtime
+fn process_f32(ctx: i64, frames: i64) -> void {
+    let sr: f32 = audio_get_sample_rate(ctx) as f32;
+    let alpha: f32 = cutoff / (cutoff + sr);
+    let mut i: i64 = 0;
+    while (i < frames) {
+        let left: f32 = audio_load_sample(ctx, 0, i);
+        let right: f32 = audio_load_sample(ctx, 1, i);
+        filter_l = filter_l + alpha * (left - filter_l);
+        filter_r = filter_r + alpha * (right - filter_r);
+        audio_store_sample(ctx, 0, i, (left * (1.0 - mix) + filter_l * mix) * gain);
+        audio_store_sample(ctx, 1, i, (right * (1.0 - mix) + filter_r * mix) * gain);
+        i = i + 1;
+    }
+}
+
+fn on_ui() -> void {
+    if (ui_begin(string_from_slice("EMBER // NEON FILTER"))) {
+        gain = ui_knob(string_from_slice("Gain"), gain, 0.0, 2.0);
+        ui_same_line();
+        cutoff = ui_knob(string_from_slice("Cutoff"), cutoff, 20.0, 20000.0);
+        ui_same_line();
+        resonance = ui_knob(string_from_slice("Resonance"), resonance, 0.1, 20.0);
+        ui_same_line();
+        mix = ui_knob(string_from_slice("Mix"), mix, 0.0, 1.0);
+        ui_separator();
+
+        ui_text_colored(0.29, 0.965, 0.149, string_from_slice("LIVE SPECTRUM"));
+        let bins: i64 = viz_get_spectrum(64);
+        ui_canvas_begin(600.0, 160.0);
+        let mut b: i64 = 0;
+        while (b < 64) {
+            let magnitude: f32 = array_get_f32(bins, b);
+            let height: f32 = magnitude * 700.0;
+            ui_canvas_rect((b as f32) * 9.2, 155.0 - height, 7.0, height,
+                           0.29, 0.965, 0.149, 0.8, true);
+            b = b + 1;
+        }
+        ui_canvas_end();
+
+        ui_text_colored(0.29, 0.965, 0.149, string_from_slice("WAVEFORM"));
+        let wave: i64 = viz_get_waveform(128);
+        ui_canvas_begin(600.0, 100.0);
+        let mut w: i64 = 1;
+        while (w < 128) {
+            let y0: f32 = 50.0 - array_get_f32(wave, w - 1) * 45.0;
+            let y1: f32 = 50.0 - array_get_f32(wave, w) * 45.0;
+            ui_canvas_line(((w - 1) as f32) * 4.7, y0, (w as f32) * 4.7, y1,
+                           0.29, 0.965, 0.149, 1.0, 1.5);
+            w = w + 1;
+        }
+        ui_canvas_end();
+        ui_text(string_from_f32(viz_get_rms()));
+        ui_same_line();
+        ui_text(string_from_f32(viz_get_peak()));
+        if (ui_button(string_from_slice("Export state for LLM"))) {
+            ui_text(llm_export_state());
+        }
+    }
+    ui_end();
+}

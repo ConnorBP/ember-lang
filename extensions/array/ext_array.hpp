@@ -54,6 +54,10 @@ bool copy_f32(int64_t handle, float* out_data, int64_t max_count,
 // and freed on reset().
 int64_t alloc_bytes(const uint8_t* data, int64_t len);
 
+// Allocate a typed array<f32> handle. Unlike alloc_bytes, this records an
+// element size of four so array_get_f32 and for-each type checks accept it.
+int64_t alloc_f32(const float* data, int64_t count);
+
 // === GC trace-callback integration (c1) ====================================
 // array<T> registers an idempotent trace callback against the current
 // thread-local GC runtime (via ext_gc) so an UNPINNED GC object stored in an

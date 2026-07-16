@@ -75,6 +75,8 @@
 #include "ext_coroutine.hpp"     // #21 coroutines with yield (Windows fibers)
 #include "ext_call_raw.hpp"     // self-hosting Stage 4 gap: call_raw(fn_ptr,arg)->i64
 #include "ext_audio.hpp"        // realtime-safe raw f32/f64/i32 audio buffer access
+#include "ext_visualize.hpp"    // audio analysis and compact LLM exports
+#include "ext_ui.hpp"           // ImGui bindings (no-op without an editor frame)
 #include "ext_graphics.hpp"     // Win32 + D3D11 full-screen shader rendering
 #include "ext_gc.hpp"          // tracing GC runtime: lambda env heap management (#20)
 #include "../src/ember_pass.hpp"       // Stage C: EmberPassManager
@@ -236,6 +238,8 @@ static void register_standard_bindings(
     ember::ext_coroutine::register_natives(natives);
     ember::ext_call_raw::register_natives(natives);
     ember::ext_audio::register_natives(natives);
+    ember::ext_visualize::register_natives(natives);
+    ember::ext_ui::register_natives(natives);
     ember::ext_graphics::register_natives(natives);
     ember::ext_thread::register_natives(natives);
     ember::ext_gc::register_natives(natives);   // __ember_gc_alloc_env/collect/live (lambda env heap)

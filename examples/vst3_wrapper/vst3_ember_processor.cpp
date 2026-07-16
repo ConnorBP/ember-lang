@@ -1,4 +1,5 @@
 #include "vst3_ember_processor.h"
+#include "vst3_ember_editor.h"
 
 #include "base/source/fstreamer.h"
 #include "pluginterfaces/base/ibstream.h"
@@ -15,7 +16,12 @@
 #include "binding_builder.hpp"
 #include "globals.hpp"
 #include "ext_audio.hpp"
+#include "ext_array.hpp"
+#include "ext_string.hpp"
 #include "ext_math.hpp"
+#include "ext_ui.hpp"
+#include "ext_visualize.hpp"
+#include "imgui.h"
 #include "jit_memory.hpp"
 #include "lexer.hpp"
 #include "parser.hpp"
@@ -47,6 +53,7 @@ using ProcessFn = void (*)(int64_t, int64_t);
 using SaveStateFn = int64_t (*)();
 using LoadStateFn = void (*)(int64_t, int64_t);
 using ReportSamplesFn = int64_t (*)();
+using UiFn = void (*)();
 
 // save_state() returns a pointer to this two-word descriptor. The bytes remain
 // script-owned and only need to stay valid until the wrapper copies them.
@@ -215,6 +222,11 @@ public:
             error = "load_state must have signature fn load_state(ptr: i64, len: i64) -> void";
             return false;
         }
+        if (const auto* uiFn = findFunction("on_ui");
+            uiFn && !hasSignature(*uiFn, {}, ember::type_void())) {
+            error = "on_ui must have signature fn on_ui() -> void";
+            return false;
+        }
         for (const char* callback : {"get_latency", "get_tail"}) {
             if (const auto* fn = findFunction(callback);
                 fn && !hasSignature(*fn, {}, ember::type_i64())) {
@@ -225,7 +237,11 @@ public:
         }
 
         ember::ext_audio::register_natives(natives);
+        ember::ext_array::register_natives(natives);
+        ember::ext_string::register_natives(natives);
         ember::ext_math::register_natives(natives);
+        ember::ext_ui::register_natives(natives);
+        ember::ext_visualize::register_natives(natives);
         layouts = ember::build_struct_layouts(program);
         program.string_xor_key = 0;
         auto checked = ember::sema(program, natives, slots, ember::PERM_FFI, nullptr, &layouts);
@@ -290,6 +306,8 @@ public:
         if (process64 != slots.end())
             process_f64 = reinterpret_cast<ProcessFn>(dispatch->get(process64->second));
 
+        const auto ui = slots.find("on_ui");
+        if (ui != slots.end()) on_ui = reinterpret_cast<UiFn>(dispatch->get(ui->second));
         const auto save = slots.find("save_state");
         if (save != slots.end())
             save_state = reinterpret_cast<SaveStateFn>(dispatch->get(save->second));
@@ -309,6 +327,10 @@ public:
                      int64_t frames) noexcept {
         return guardedCall(process_context, reinterpret_cast<void*>(function), 2,
                            audioContext, frames, nullptr);
+    }
+
+    bool callUi() noexcept {
+        return guardedCall(ui_context, reinterpret_cast<void*>(on_ui), 0, 0, 0, nullptr);
     }
 
     bool callSaveState(int64_t& result) noexcept {
@@ -378,12 +400,14 @@ public:
     ember::context_t process_context;
     ember::context_t state_context;
     ember::context_t report_context;
+    ember::context_t ui_context;
     ProcessFn process_f32 {nullptr};
     ProcessFn process_f64 {nullptr};
     SaveStateFn save_state {nullptr};
     LoadStateFn load_state {nullptr};
     ReportSamplesFn get_latency {nullptr};
     ReportSamplesFn get_tail {nullptr};
+    UiFn on_ui {nullptr};
 };
 
 EmberProcessor::EmberProcessor()
@@ -461,6 +485,14 @@ tresult PLUGIN_API EmberProcessor::initialize(FUnknown* context) {
         return kResultFalse;
     }
     refreshLatencyAndTail();
+    {
+        const char* names[3] = {parameterName(0), parameterName(1), parameterName(2)};
+        const std::size_t hashValue = std::hash<std::string>{}(watched_source_);
+        char hash[24]; std::snprintf(hash, sizeof(hash), "%zx", hashValue);
+        ember::ext_visualize::set_parameter_metadata(
+            parameter_values_.data(), parameter_minimums_.data(), parameter_maximums_.data(),
+            names, plugin_parameter_count_, hash);
+    }
     startHotReload();
     return kResultOk;
 }
@@ -951,6 +983,15 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
             data.outputEvents->addEvent(event);
         }
     }
+    // Publish a bounded copy only after DSP and crossfade complete. The audio
+    // thread performs no allocation; FFT/export work remains on the UI thread.
+    if (sample64)
+        ember::ext_visualize::publish_f64(data.outputs[0].channelBuffers64,
+                                          data.outputs[0].numChannels, data.numSamples);
+    else
+        ember::ext_visualize::publish_f32(data.outputs[0].channelBuffers32,
+                                          data.outputs[0].numChannels, data.numSamples);
+
     // Conservatively clear silence when Ember ran: an instrument may generate
     // signal from events even when there is no input or the input is silent.
     const uint64 channelMask = data.outputs[0].numChannels >= 64
@@ -960,6 +1001,51 @@ tresult PLUGIN_API EmberProcessor::process(ProcessData& data) {
         (data.inputs[0].silenceFlags & channelMask) == channelMask;
     data.outputs[0].silenceFlags = (silentInput || blockRemainsSilent) ? channelMask : 0u;
     return kResultOk;
+}
+
+Steinberg::IPlugView* PLUGIN_API EmberProcessor::createView(FIDString name) {
+    if (!name || std::strcmp(name, ViewType::kEditor) != 0) return nullptr;
+    return new EmberVst3Editor(*this);
+}
+
+float EmberProcessor::parameterValue(std::size_t index) const noexcept {
+    return index < plugin_parameter_count_ ? parameter_values_[index] : 0.0f;
+}
+float EmberProcessor::parameterMinimum(std::size_t index) const noexcept {
+    return index < plugin_parameter_count_ ? parameter_minimums_[index] : 0.0f;
+}
+float EmberProcessor::parameterMaximum(std::size_t index) const noexcept {
+    return index < plugin_parameter_count_ ? parameter_maximums_[index] : 1.0f;
+}
+const char* EmberProcessor::parameterName(std::size_t index) const noexcept {
+    static const char* gain[] = {"Gain", "Parameter 1", "Parameter 2"};
+    const ScriptProfile profile = scriptProfile(script_path_);
+    if (profile == ScriptProfile::Delay) { static const char* n[]={"Delay Time","Feedback","Mix"}; return n[index<3?index:0]; }
+    if (profile == ScriptProfile::Filter) { static const char* n[]={"Cutoff","Resonance","Mix"}; return n[index<3?index:0]; }
+    if (profile == ScriptProfile::Oscillator) { static const char* n[]={"Waveform","Volume","Mix"}; return n[index<3?index:0]; }
+    return gain[index<3?index:0];
+}
+void EmberProcessor::setParameterFromEditor(std::size_t index, float value) {
+    if (index >= plugin_parameter_count_) return;
+    value = std::clamp(value, parameter_minimums_[index], parameter_maximums_[index]);
+    parameter_values_[index] = value;
+    const float span = parameter_maximums_[index] - parameter_minimums_[index];
+    const ParamValue normalized = span > 0.0f ? (value - parameter_minimums_[index]) / span : 0.0;
+    beginEdit(static_cast<ParamID>(index)); setParamNormalized(static_cast<ParamID>(index), normalized);
+    performEdit(static_cast<ParamID>(index), normalized); endEdit(static_cast<ParamID>(index));
+}
+bool EmberProcessor::renderScriptUi() {
+    auto current = std::atomic_load_explicit(&current_, std::memory_order_acquire);
+    return current && current->on_ui && current->callUi();
+}
+void EmberProcessor::drawDefaultVisualizations() {
+    std::array<float,64> spectrum{}; std::array<float,128> waveform{};
+    ember::ext_visualize::copy_spectrum(spectrum.data(),spectrum.size());
+    ember::ext_visualize::copy_waveform(waveform.data(),waveform.size());
+    ImGui::Separator(); ImGui::Text("SPECTRUM"); ImGui::PlotHistogram("##spectrum",spectrum.data(),int(spectrum.size()),0,nullptr,0.0f,0.5f,ImVec2(-1,130));
+    ImGui::Text("WAVEFORM"); ImGui::PlotLines("##wave",waveform.data(),int(waveform.size()),0,nullptr,-1.0f,1.0f,ImVec2(-1,100));
+    ImGui::ProgressBar(std::min(ember::ext_visualize::rms_value(),1.0f),ImVec2(-1,0),"RMS");
+    ImGui::ProgressBar(std::min(ember::ext_visualize::peak_value(),1.0f),ImVec2(-1,0),"PEAK");
 }
 
 tresult PLUGIN_API EmberProcessor::setState(IBStream* state) {

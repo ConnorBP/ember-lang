@@ -318,6 +318,29 @@ target_link_libraries(ember_ext_call_raw PUBLIC ember_ext_array)
 # ext_audio: allocation-free raw access to host-owned f32/f64/i32 DSP buffers.
 # The six bindings are PERM_FFI-gated because scripts supply raw pointers.
 ember_add_extension(audio extensions/audio/ext_audio.cpp)
+ember_add_extension(visualize extensions/visualize/ext_visualize.cpp)
+target_link_libraries(ember_ext_visualize PUBLIC ember_ext_array ember_ext_string)
+
+# Dear ImGui core + Win32/D3D11 backend. The UI extension is available to the
+# CLI/stub for validation; calls no-op unless a VST editor owns an active frame.
+if(WIN32)
+    set(EMBER_IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/imgui)
+    add_library(ember_imgui STATIC
+        ${EMBER_IMGUI_DIR}/imgui.cpp
+        ${EMBER_IMGUI_DIR}/imgui_draw.cpp
+        ${EMBER_IMGUI_DIR}/imgui_widgets.cpp
+        ${EMBER_IMGUI_DIR}/imgui_tables.cpp
+        ${EMBER_IMGUI_DIR}/imgui_impl_dx11.cpp
+        ${EMBER_IMGUI_DIR}/imgui_impl_win32.cpp
+        ${EMBER_IMGUI_DIR}/widgets/AngleKnob.cpp)
+    target_include_directories(ember_imgui PUBLIC ${EMBER_IMGUI_DIR} ${EMBER_IMGUI_DIR}/widgets)
+    target_link_libraries(ember_imgui PUBLIC d3d11 dxgi d3dcompiler user32 gdi32 dwmapi)
+    target_compile_features(ember_imgui PUBLIC cxx_std_17)
+    ember_add_extension(ui extensions/ui/ext_ui.cpp)
+    target_link_libraries(ember_ext_ui PUBLIC ember_imgui ember_ext_string)
+else()
+    add_library(ember_ext_ui INTERFACE)
+endif()
 
 # Graphics extension: one owner for Win32 windows, D3D11 devices/swap chains,
 # shaders, render targets, and constant buffers. Non-Windows builds publish the
@@ -830,7 +853,7 @@ target_link_libraries(ember_cli PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_opt ember_ext_obf ember_ext_map
-    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_audio ember_ext_graphics ember_ext_thread ember_ext_gc)
+    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_audio ember_ext_visualize ember_ext_ui ember_ext_graphics ember_ext_thread ember_ext_gc)
 
 # Self-hosted compiler stages. Each ember test returns 0 on success and a
 # stage-specific nonzero code on failure. Use absolute source paths so ctest
@@ -857,7 +880,8 @@ target_link_libraries(ember_stub_main PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_map
-    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_graphics ember_ext_gc)
+    ember_ext_io ember_ext_coroutine ember_ext_call_raw
+    ember_ext_visualize ember_ext_ui ember_ext_graphics ember_ext_gc)
 
 # Shared bundler implementation. Both `ember bundle` and ember_bundle.exe call
 # this one implementation, so compile/validation/footer policy cannot drift.
