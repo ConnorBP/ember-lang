@@ -5333,4 +5333,6 @@ chunk does not touch `src/thin_lower.*`, `src/thin_emit.*`, or `extensions/opt/e
   tagged; changing it would violate this task's Markdown-only constraint and is
   deferred to the next release/versioning change. Historical audit/planning
   documents can intentionally retain dated counts and pre-completion states.
-- **Commit:** pending at entry creation; the task report records the resulting hash.
+- **Commit:** documentation content landed in `42d4b63` during concurrent
+  documentation publication; the task report also records the log-finalization
+  follow-up commit.
