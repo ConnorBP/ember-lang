@@ -168,6 +168,44 @@ void processChecked(Fixture& fixture, Block& block, int frames,
 
 void runHotReloadStress();
 
+void runEditorSmoke() {
+#ifdef _WIN32
+    Fixture fixture;
+    HWND parent = CreateWindowExW(0, L"STATIC", L"Ember editor smoke",
+                                  WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                                  760, 560, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    check(parent != nullptr, "editor parent window");
+    IPlugView* view = fixture.processor.createView(ViewType::kEditor);
+    check(view != nullptr, "create editor view");
+    check(view->isPlatformTypeSupported(kPlatformTypeHWND) == kResultTrue,
+          "editor HWND support");
+    check(view->attached(parent, kPlatformTypeHWND) == kResultOk,
+          "attach editor view");
+    ViewRect size;
+    check(view->getSize(&size) == kResultOk && size.getWidth() >= 480,
+          "editor initial size");
+    size.right = size.left + 800;
+    size.bottom = size.top + 600;
+    check(view->onSize(&size) == kResultOk, "resize editor view");
+
+    Block block(1024);
+    for (int i = 0; i < 1024; ++i) {
+        const float sample = std::sin(float(i) * 0.05f) * 0.25f;
+        block.in[0][static_cast<std::size_t>(i)] = sample;
+        block.in[1][static_cast<std::size_t>(i)] = sample;
+    }
+    ProcessData data = block.data(1024);
+    check(fixture.processor.process(data) == kResultOk, "editor visualization process");
+    UpdateWindow(parent);
+    check(view->removed() == kResultOk, "remove editor view");
+    view->release();
+    DestroyWindow(parent);
+    std::puts("[vst3 editor] HWND/D3D11/ImGui/script UI smoke passed");
+#else
+    std::puts("[vst3 editor] skipped on non-Windows");
+#endif
+}
+
 void runStress() {
     constexpr std::array<double, 5> rates {{32000.0, 44100.0, 48000.0, 96000.0, 192000.0}};
     constexpr std::array<int, 12> blocks {{1, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 0}};
@@ -439,6 +477,7 @@ void operator delete[](void* ptr, std::size_t, std::align_val_t) noexcept { _ali
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "stress";
     if (mode == "stress") runStress();
+    else if (mode == "editor") runEditorSmoke();
     else if (mode == "realtime") runRealtimeContract();
     else if (mode == "fuzz") runFuzz();
     else if (mode == "soak") {
