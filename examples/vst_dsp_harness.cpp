@@ -1,6 +1,6 @@
-// Headless DSP validation for the future VST3 wrapper. No VST SDK is used:
-// this host compiles Ember DSP, passes host-owned buffers through ext_audio,
-// and differentially checks the JIT against straightforward C++ references.
+// Headless DSP validation for Ember's VST3-style audio ABI. No VST SDK is
+// used: this host compiles Ember DSP, passes host-owned buffers through
+// ext_audio, and differentially checks the JIT against C++ references.
 #include "lexer.hpp"
 #include "parser.hpp"
 #include "sema.hpp"

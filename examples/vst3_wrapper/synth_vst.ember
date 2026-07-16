@@ -6,6 +6,8 @@ global envelope_level: f64 = 0.0;
 global envelope_stage: i64 = 0; // 0 idle, 1 attack, 2 decay, 3 sustain, 4 release
 global active_note: i64 = -1;
 
+// Event accessors are not yet in the @realtime native allowlist, so this
+// event-driven callback intentionally omits that annotation.
 fn process_f32(ctx: i64, frames: i64) -> void {
     let sample_rate: f64 = audio_get_sample_rate(ctx) as f64;
     let event_count: i64 = audio_get_event_count(ctx);

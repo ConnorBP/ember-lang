@@ -1,56 +1,43 @@
-// filter_vst.ember — VST3 biquad lowpass filter
-// Parameters: 0=Cutoff (Hz, 20-20000), 1=Resonance (0.0-1.0)
-// Implements a biquad lowpass filter using cookbook formulas
-// State: filter coefficients + state variables (z1, z2) per channel
+// filter_vst.ember — persistent stereo one-pole low-pass filter.
+// Parameter 0: cutoff in Hz (20..20000). Parameter 1: resonance (0..1), used
+// here as a conservative output emphasis. The previous output is stored in
+// globals, so state continues correctly across process blocks.
+
+global filter_state_left: f32 = 0.0;
+global filter_state_right: f32 = 0.0;
 
 @realtime
 fn process_f32(ctx: i64, frames: i64) -> void {
-    let cutoff: f32 = audio_get_parameter(ctx, 0);
-    let resonance: f32 = audio_get_parameter(ctx, 1);
-    let channels: i64 = audio_get_num_input_channels(ctx);
+    let mut cutoff: f32 = audio_get_parameter(ctx, 0);
+    let mut resonance: f32 = audio_get_parameter(ctx, 1);
     let sample_rate: f32 = audio_get_sample_rate(ctx) as f32;
+    if (cutoff < 20.0) { cutoff = 20.0; }
+    if (cutoff > 20000.0) { cutoff = 20000.0; }
+    if (resonance < 0.0) { resonance = 0.0; }
+    if (resonance > 1.0) { resonance = 1.0; }
 
-    // Biquad lowpass coefficients (cookbook formulas)
-    let w0: f32 = 2.0 * 3.14159265358979 * cutoff / sample_rate;
-    let cos_w0: f32 = cos_f32(w0);
-    let sin_w0: f32 = sin_f32(w0);
-    let alpha: f32 = sin_w0 / (2.0 * resonance + 0.5);
+    // Stable exponential smoothing coefficient for a one-pole low pass.
+    let alpha: f32 = 1.0 - exp((0.0f - 6.283185307179586f) * cutoff / sample_rate);
+    let emphasis: f32 = 1.0 + resonance * 0.25;
+    let inputs: i64 = audio_get_num_input_channels(ctx);
+    let outputs: i64 = audio_get_num_output_channels(ctx);
 
-    let b0: f32 = (1.0 - cos_w0) / 2.0;
-    let b1: f32 = 1.0 - cos_w0;
-    let b2: f32 = (1.0 - cos_w0) / 2.0;
-    let a0: f32 = 1.0 + alpha;
-    let a1: f32 = -2.0 * cos_w0;
-    let a2: f32 = 1.0 - alpha;
+    let mut i: i64 = 0;
+    while (i < frames) {
+        let mut left: f32 = 0.0;
+        let mut right: f32 = 0.0;
+        if (inputs > 0) { left = audio_load_sample(ctx, 0, i); }
+        if (inputs > 1) { right = audio_load_sample(ctx, 1, i); }
 
-    // Normalize by a0
-    let nb0: f32 = b0 / a0;
-    let nb1: f32 = b1 / a0;
-    let nb2: f32 = b2 / a0;
-    let na1: f32 = a1 / a0;
-    let na2: f32 = a2 / a0;
-
-    // Process each channel (state would be preserved per-channel in full version)
-    let mut ch: i64 = 0;
-    while (ch < channels) {
-        let mut z1: f32 = 0.0;
-        let mut z2: f32 = 0.0;
-        let mut i: i64 = 0;
-        while (i < frames) {
-            let input: f32 = audio_load_sample(ctx, ch, i);
-            // Direct form I biquad
-            let output: f32 = nb0 * input + nb1 * z1 + nb2 * z2 - na1 * z1 - na2 * z2;
-            z2 = z1;
-            z1 = output;
-            audio_store_sample(ctx, ch, i, output);
-            i = i + 1;
-        }
-        ch = ch + 1;
+        filter_state_left = filter_state_left + alpha * (left - filter_state_left);
+        filter_state_right = filter_state_right + alpha * (right - filter_state_right);
+        if (outputs > 0) { audio_store_sample(ctx, 0, i, filter_state_left * emphasis); }
+        if (outputs > 1) { audio_store_sample(ctx, 1, i, filter_state_right * emphasis); }
+        i = i + 1;
     }
 }
 
 fn get_latency() -> i64 { return 0; }
 fn get_tail() -> i64 { return 0; }
-
 fn save_state() -> i64 { return 0; }
-fn load_state(state: i64) -> void { return; }
+fn load_state(state_ptr: i64, state_len: i64) -> void { return; }

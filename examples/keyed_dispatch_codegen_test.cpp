@@ -62,9 +62,9 @@
 // Links ember (keyed_dispatch.* — Red 1, context.hpp, engine.* — Red 5 thunks,
 // dispatch_table.hpp) + ember_frontend (module_layout.* — Red 3/4,
 // codegen.* — the keyed CodeGenCtx, thin_lower.*, thin_emit.*,
-// dispatch_abi.* — ABI classifier). NOT a CTest entry: the configured suite
-// count stays 73 (§14.1); the target building cleanly + the executable passing
-// IS the gate.
+// dispatch_abi.* — ABI classifier). This remains a direct-run integration
+// gate rather than a CTest entry; building and executing the target is the
+// complete check.
 
 #include "../src/engine.hpp"
 #include "../src/context.hpp"
@@ -972,6 +972,9 @@ static std::unique_ptr<PairedCompile> compile_paired_identity(const std::string&
 }
 
 int main() {
+    // Keep diagnostics visible if a generated-code probe faults before normal
+    // process exit; this target is also run directly during example audits.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("== keyed_dispatch_codegen_test (Red 6) ==\n");
 
     // A deterministic route word seed for the correct key.
@@ -1271,15 +1274,9 @@ int main() {
                 if (!g.crashed) {
                     ck(g.value == 139, (std::string("legacy ") + be + ": multiword/stack lambda args — (s[0]=104)+5+10+20 == 139").c_str());
                     ck(g.call_depth == 0, (std::string("legacy ") + be + ": multiword/stack lambda args — call_depth balanced (0)").c_str());
-                    // Re-run without the guard to read r15 (the guard's
-                    // longjmp recovery would skip this read on a crash; the
-                    // non-guarded tree path never crashes so this is safe).
-                    context_t ctx2; ctx2.budget_remaining = 1'000'000'000LL; ctx2.max_call_depth = 64;
-                    uint64_t saved_r15_2 = ember_read_r15();
-                    ember_set_r15(0);
-                    (void)ember_call_i64(m->main_entry, &ctx2, 0);
-                    ck(ember_read_r15() == 0, (std::string("legacy ") + be + ": multiword/stack lambda args — r15 untouched (legacy)").c_str());
-                    ember_set_r15(saved_r15_2);  // restore caller r15 (callee-saved)
+                    // A separate identity-layout section below checks r15 on
+                    // both backends. Do not invoke this six-word ABI stress
+                    // case a redundant second time solely for that assertion.
                 } else if (ir) {
                     unsigned long fc = static_cast<unsigned long>(g.code);
                     char buf[160]; std::snprintf(buf, sizeof(buf),

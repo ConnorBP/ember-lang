@@ -170,7 +170,7 @@ int main(int argc, char** argv) {
     ck(g_entities[2].x == 2.0f + 50.0f, "entity[2] moved by +50 too (script iterated all entities)");
 
     // ---- @event("player_input"): fires once, doubles g_speed + log(200) ----
-    // (g_speed is a script global; the event fn mutates it. After: speed=20.)
+    // g_speed is host-owned; the handler updates it through get/set natives.
     auto handlers = get_event_handlers(m->prog, "player_input");
     ck(handlers.size() == 1, "@event(\"player_input\") discovered (1 handler)");
     g_last_log_code = 0;

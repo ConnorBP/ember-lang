@@ -1,0 +1,24 @@
+// coroutine_pipeline.ember — lazy producer/consumer pipeline.
+// The producer yields three jobs. The consumer repeatedly calls
+// coroutine_next until coroutine_done, transforms each value, and accumulates
+// 2*10 + 2*20 + 2*30 + final return 0 = 120.
+// Coroutines use Windows fibers; non-Windows builds fail closed by design.
+// Run: build/ember_cli.exe run examples/scripts/coroutine_pipeline.ember --ffi
+// expect: 120
+
+fn produce_jobs(unused: i64) -> i64 {
+    yield 10;
+    yield 20;
+    yield 30;
+    return 0;
+}
+
+fn main() -> i64 {
+    let producer: i64 = coroutine_start(&produce_jobs, 0);
+    let mut total: i64 = 0;
+    while (!coroutine_done(producer)) {
+        let job: i64 = coroutine_next(producer);
+        total += job * 2;
+    }
+    return total;
+}

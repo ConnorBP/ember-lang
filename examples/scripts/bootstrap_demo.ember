@@ -1,0 +1,20 @@
+// bootstrap_demo.ember — runnable signpost for the two-generation bootstrap.
+//
+// The actual bootstrap must compile and load a complete compiler image, so its
+// implementation lives in self_hosted/bootstrap.ember rather than being copied
+// into a tiny example. Run this command from the repository root:
+//
+//   echo tests/lang/valid_try_catch.ember | build/ember_cli.exe run \
+//       self_hosted/bootstrap.ember --fn main --ffi
+//
+// Native Ember compiles compiler A; A compiles compiler B from the inlined
+// self-hosted source; B compiles/runs the piped test and returns 42. This script
+// prints the command and exits successfully so example discovery is useful.
+// Run: build/ember_cli.exe run examples/scripts/bootstrap_demo.ember --ffi
+// expect: 0
+
+fn main() -> i64 {
+    println("Two-generation bootstrap:");
+    println("echo tests/lang/valid_try_catch.ember | build/ember_cli.exe run self_hosted/bootstrap.ember --fn main --ffi");
+    return 0;
+}

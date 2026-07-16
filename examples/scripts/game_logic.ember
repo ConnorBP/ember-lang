@@ -3,17 +3,15 @@
 // this with @entry / @on_tick / @event, the script drives host-owned entity
 // state through registered natives.
 //
-// NOTE: ember does not evaluate global *initializers* at load (a known gap —
-// the globals block is zero-initialized; a host or @entry seeds them). And a
-// separate codegen bug in float-global WRITES was found by this integration
-// (see docs/v0.6_INTEGRATION_NOTES.md); to keep the integration focused on the
-// embeddability seams (lifecycle, natives, hot reload), speed is held in the
-// HOST (get_speed/set_speed) rather than a script f32 global. The float-global-
-// write bug is tracked separately.
+// This file is intentionally host-dependent: game_host registers the entity,
+// timing, speed, and log natives before compiling it. Running the script with
+// the standalone CLI therefore produces expected "unknown function" errors.
+// Speed remains host-owned to demonstrate a realistic ownership boundary;
+// Ember also supports initialized globals and float-global writes directly.
 
 @entry
 fn main() -> i64 {
-    // setup: report loaded. return > 0 = stay loaded (docs/LIFECYCLE.md §1).
+    // Setup: report loaded. Returning > 0 keeps the module loaded.
     log(100);
     return 1;
 }

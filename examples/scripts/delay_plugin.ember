@@ -1,5 +1,9 @@
-// Headless reference delay. The process entry has the full explicit state ABI
-// planned for VST3. process_host is only the four-register C++ harness adapter.
+// Headless reference delay for examples/vst_dsp_harness.cpp.
+//
+// The harness registers delay_buffer() and delay_size() as host natives backed
+// by a preallocated f32 delay line. process() shows the explicit six-argument
+// DSP/state ABI; process_host() keeps the C++ call boundary to four integer
+// registers. This is a host-embedded script, not a standalone CLI program.
 @realtime
 fn process(in_ptr: i64, out_ptr: i64, frames: i64, delay_buf: i64, delay_samples: i64, write_pos: i64) -> i64 {
     let mut i: i64 = 0;

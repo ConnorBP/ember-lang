@@ -24,8 +24,8 @@ target_link_libraries(my_ember_host PRIVATE ember_custom_pass_examples)
 Or build the root test that compiles all three examples and checks registration:
 
 ```bash
-cmake --build buildt --target pass_registry_coverage_test
-ctest --test-dir buildt -R '^pass_registry_coverage$' --output-on-failure
+cmake --build build --target pass_registry_coverage_test
+ctest --test-dir build -R '^pass_registry_coverage$' --output-on-failure
 ```
 
 ## Register and run

@@ -3,10 +3,9 @@
 //
 // RED-GREEN TDD driver for the polymorphic code engine
 // (plan_POLYMORPHIC_CODE_ENGINE.md §9.3 Red 6/7/8/9). Built as a standalone
-// executable wired into CMakeLists.txt WITHOUT add_test, so the unfiltered
-// CTest baseline is unchanged (the add_test source-line count is 69; the
-// filtered CI ctest total stays 67). Run explicitly: ./buildt/polymorphic_pass_test
-// (never added to CTest — it is an integration gate, not a unit test).
+// executable wired into CMakeLists.txt without add_test. Run explicitly:
+//   ./build/polymorphic_pass_test
+// It is a long-form integration gate rather than a regular CTest case.
 //
 // Coverage (per the Red 6 spec), for each of the six migrated transforms
 // subst, mba_expand, const_encode, opaque_pred, deadcode, block_split:
@@ -76,7 +75,7 @@
 // str_encrypt overlap private-region/scrub rule (SE-E4/SE-J), the checked
 // IR/obf backend routing script-level recoverable traps (try/catch/throw)
 // through the IR backend (PUB-TC, not the TreeWalker fallback), and the
-// deserialized string-bearing module executing main == 200 (DESER). No
+// deserialized string-bearing module executing main == 197 (DESER). No
 // assertion is weakened to achieve GREEN.
 //
 // Options validation:
@@ -1935,10 +1934,10 @@ int main(int argc, char** argv) {
         //   chain(3) = 1+2+3 = 6
         //   trace contributes 0 to the value (side-effect only); the gate reads
         //   g_red9_trace separately for the ORDER assertion.
-        //   marker_a() = 13, marker_b() = 13, marker_c() = 20  -> 46
+        //   marker_a() = 12, marker_b() = 12, marker_c() = 19  -> 43
         //   gctr read = 5, gctr += 1 -> gctr becomes 6 (the gate reads it back)
-        //   subtotal = 30 + 6 + 100 + 6 + 46 + 5 = 193
-        //   main returns subtotal + 7 = 200  (a recognizable sentinel < 256)
+        //   subtotal = 30 + 6 + 100 + 6 + 43 + 5 = 190
+        //   main returns subtotal + 7 = 197  (a recognizable sentinel < 256)
         // divzero() is NOT called by main; the gate calls it separately with a
         // host trap stub and asserts the TrapReason.
         const char* kRed9Src =
@@ -1964,7 +1963,7 @@ int main(int argc, char** argv) {
             "  let mk: i64 = marker_a() + marker_b() + marker_c();\n"
             "  let g: i64 = gctr; gctr = g + 1;\n"
             "  return w1 + w2 + w4 + w8 + sl + pk + ch + mk + g + 7; }\n";
-        const int64_t kRed9Expect = 200;
+        const int64_t kRed9Expect = 197;
 
         // ─── (PIPE) full pipeline through compile_func_checked, source + reverse order ───
         // The full Red 9 recipe: an optimization prefix followed by ALL seven
@@ -2202,18 +2201,18 @@ int main(int argc, char** argv) {
             if (!m->gbs.empty()) { int64_t v = 5; std::memcpy(&m->gbs[0], &v, 8); }
             auto [ok_rev_on, v_rev_on] = compile_publish(m, 42, 500000, true, true);
             ck(ok_rev_on, "PIPE: reverse-order build succeeds (regalloc on)");
-            ck(ok_rev_on && v_rev_on == kRed9Expect, "PIPE: reverse-order main() == 200 (order-independent, regalloc on)");
+            ck(ok_rev_on && v_rev_on == kRed9Expect, "PIPE: reverse-order main() == 197 (order-independent, regalloc on)");
 
             // source order, regalloc OFF — value preservation without regalloc
             if (!m->gbs.empty()) { int64_t v = 5; std::memcpy(&m->gbs[0], &v, 8); }
             auto [ok_src_off, v_src_off] = compile_publish(m, 42, 500000, false, false);
             ck(ok_src_off, "PIPE: source-order build succeeds (regalloc off)");
-            ck(ok_src_off && v_src_off == kRed9Expect, "PIPE: source-order main() == 200 (regalloc off)");
+            ck(ok_src_off && v_src_off == kRed9Expect, "PIPE: source-order main() == 197 (regalloc off)");
 
             // reverse order, regalloc OFF
             if (!m->gbs.empty()) { int64_t v = 5; std::memcpy(&m->gbs[0], &v, 8); }
             auto [ok_rev_off, v_rev_off] = compile_publish(m, 42, 500000, false, true);
-            ck(ok_rev_off && v_rev_off == kRed9Expect, "PIPE: reverse-order main() == 200 (regalloc off)");
+            ck(ok_rev_off && v_rev_off == kRed9Expect, "PIPE: reverse-order main() == 197 (regalloc off)");
         }
 
         // ─── (LIFE) recoverable runtime trap preserved through the obf pipeline ───
@@ -2344,8 +2343,8 @@ int main(int argc, char** argv) {
                 auto [ok, v] = compile_publish(lm, seed, 500000, true, false);
                 return ok ? v : INT64_MIN;
             };
-            ck(run_seed_value(0) == kRed9Expect, "SEED: seed 0 preserves the observable (main == 200)");
-            ck(run_seed_value(UINT64_MAX) == kRed9Expect, "SEED: seed UINT64_MAX preserves the observable (main == 200)");
+            ck(run_seed_value(0) == kRed9Expect, "SEED: seed 0 preserves the observable (main == 197)");
+            ck(run_seed_value(UINT64_MAX) == kRed9Expect, "SEED: seed UINT64_MAX preserves the observable (main == 197)");
         }
 
         // ─── (LEGACY) execute all seven legacy names through configured factories ───
@@ -2578,7 +2577,7 @@ int main(int argc, char** argv) {
         // deserialize -> validate -> re-serialize (assert byte-identical round-
         // trip fidelity) -> emit + EXECUTE with regalloc off AND on, comparing the
         // ACTUAL returned value (never raw CompiledFn bytes). The IR round-trips
-        // byte-identically AND the deserialized module executes main == 200
+        // byte-identically AND the deserialized module executes main == 197
         // (emit_x64 rebinds a deserialized CallNative's dropped native_fn by
         // name from the host table — the Stage B rebind the design always
         // intended, now implemented in emit_x64). Placed last so every other
@@ -2626,7 +2625,7 @@ int main(int argc, char** argv) {
             // (never comparing raw CompiledFn bytes). emit_x64 rebinds a
             // deserialized CallNative's dropped native_fn by name from the host
             // table (the Stage B rebind), so the deserialized string-bearing
-            // module executes main == 200 with regalloc off AND on.
+            // module executes main == 197 with regalloc off AND on.
             auto deser_exec = [&](bool regalloc) -> int64_t {
                 DispatchTable dt(m->prog.funcs.size());
                 std::vector<CompiledFn> keep;
@@ -2654,11 +2653,11 @@ int main(int argc, char** argv) {
             };
             // DESER execution: emit + execute the deserialized multi-function
             // module (main calls the string-bearing marker) with regalloc off
-            // AND on, asserting the returned value == 200. emit_x64 rebinds a
+            // AND on, asserting the returned value == 197. emit_x64 rebinds a
             // deserialized CallNative's dropped native_fn by name from the host
             // table, so the deserialized string site executes correctly.
-            ck(deser_exec(false) == kRed9Expect, "DESER: deserialized ThinFunctions execute main == 200 (regalloc off)");
-            ck(deser_exec(true) == kRed9Expect, "DESER: deserialized ThinFunctions execute main == 200 (regalloc on)");
+            ck(deser_exec(false) == kRed9Expect, "DESER: deserialized ThinFunctions execute main == 197 (regalloc off)");
+            ck(deser_exec(true) == kRed9Expect, "DESER: deserialized ThinFunctions execute main == 197 (regalloc on)");
         }
     }
 

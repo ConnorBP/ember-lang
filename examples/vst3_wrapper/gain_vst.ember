@@ -1,3 +1,8 @@
+// gain_vst.ember — the wrapper's default gain effect.
+// Parameter 0 is linear gain (0.0-2.0). The f32 callback applies automation
+// at exact sample offsets; process_f64 demonstrates optional 64-bit audio.
+// This stateless plugin needs no save_state/load_state callbacks.
+
 @realtime
 fn process_f32(ctx: i64, frames: i64) -> void {
     let mut gain: f32 = audio_get_parameter(ctx, 0);

@@ -1,0 +1,35 @@
+// retry_pattern.ember — bounded retry with loops and try/catch/throw.
+// flaky_operation throws an i64 error code until the third attempt. retry()
+// catches expected transient failures, records the last error, and never loops
+// forever. Unexpected errors are rethrown to the caller.
+// Run: build/ember_cli.exe run examples/scripts/retry_pattern.ember --ffi
+// expect: 42
+
+global attempts: i64 = 0;
+
+fn flaky_operation() -> i64 {
+    attempts += 1;
+    if (attempts < 3) { throw 503; }
+    return 42;
+}
+
+fn retry(max_attempts: i64) -> i64 {
+    let mut used: i64 = 0;
+    let mut last_error: i64 = 0;
+    while (used < max_attempts) {
+        try {
+            return flaky_operation();
+        } catch (error) {
+            if (error != 503) { throw error; }
+            last_error = error;
+            used += 1;
+        }
+    }
+    // A real application might log last_error or translate it to a domain code.
+    if (last_error == 503) { return -1; }
+    return 0;
+}
+
+fn main() -> i64 {
+    return retry(4);
+}

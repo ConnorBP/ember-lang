@@ -1,0 +1,27 @@
+// stack_queue.ember — stack and queue patterns over array<i64> handles.
+// array_push_i64 grows storage; array_get accesses existing slots. Logical
+// top/head/tail indices control LIFO and FIFO behavior independently of the
+// backing array's capacity.
+// Run: build/ember_cli.exe run examples/scripts/stack_queue.ember --ffi
+// expect: 42
+
+fn main() -> i64 {
+    let stack: i64 = array_new(8, 0);
+    let mut top: i64 = 0;
+    array_push_i64(stack, 10); top += 1;
+    array_push_i64(stack, 20); top += 1;
+
+    let queue: i64 = array_new(8, 0);
+    let mut head: i64 = 0;
+    let mut tail: i64 = 0;
+    array_push_i64(queue, 22); tail += 1;
+    array_push_i64(queue, 99); tail += 1;
+
+    // Pop from the stack's tail (LIFO) and consume the queue's head (FIFO).
+    top -= 1;
+    let stack_value: i64 = array_get_i64(stack, top);
+    let queue_value: i64 = array_get_i64(queue, head);
+    head += 1;
+    if (head >= tail) { return 0; }
+    return stack_value + queue_value;
+}

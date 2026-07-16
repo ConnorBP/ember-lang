@@ -1,3 +1,7 @@
-// lambdas are now supported in the self-hosted compiler.
+// Self-hosted positive: infer a lambda's function-handle type and call it.
+// The by-value argument is passed through the lambda ABI; 41 + 1 = 42.
 // expect: 42
-fn main() -> i64 { let f = fn(x: i64) -> i64 { return x + 1; }; return f(41); }
+fn main() -> i64 {
+    let increment = fn(value: i64) -> i64 { return value + 1; };
+    return increment(41);
+}

@@ -1,4 +1,7 @@
 // Headless typed-context gain processor with sample-accurate automation.
+// examples/vst_dsp_harness.cpp supplies AudioContext and invokes process().
+// This host callback has no main(), so validate it through vst_dsp_harness
+// rather than running it as a standalone CLI script.
 @realtime
 fn process(ctx: i64, frames: i64) -> void {
     let mut gain: f32 = audio_get_parameter(ctx, 0);

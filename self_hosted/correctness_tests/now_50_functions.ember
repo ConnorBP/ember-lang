@@ -1,7 +1,7 @@
 // Scalability: 50 simple functions + main summing five of them.
 // Uses g-prefixed names because f32/i64/etc are reserved type keywords
 // and a fn literally named f32 hits a parse error (keyword collision),
-// which is the real root cause of the apparent ~33-function cliff —
+// which is the real root cause of the apparent ~33-function cliff -
 // NOT a capacity or overflow bug in the parser.
 // expect: 20
 fn g0(x: i64) -> i64 { return x + 0; }

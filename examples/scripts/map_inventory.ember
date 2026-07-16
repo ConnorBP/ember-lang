@@ -1,0 +1,28 @@
+// map_inventory.ember — inventory counts with the map extension.
+// Map keys and values are i64 in the current opaque-handle API, so practical
+// callers commonly use stable numeric item IDs. This example covers insert,
+// update, membership, removal, length, and clear.
+// Run: build/ember_cli.exe run examples/scripts/map_inventory.ember --ffi
+// expect: 42
+
+fn add_item(inventory: i64, item_id: i64, amount: i64) -> void {
+    let old: i64 = map_get(inventory, item_id);
+    map_set(inventory, item_id, old + amount);
+}
+
+fn main() -> i64 {
+    let inventory: i64 = map_new();
+    add_item(inventory, 1001, 10); // health potions
+    add_item(inventory, 1001, 2);
+    add_item(inventory, 2005, 30); // arrows
+
+    if (map_contains(inventory, 1001) != 1) { return 0; }
+    if (map_length(inventory) != 2) { return 0; }
+    let total: i64 = map_get(inventory, 1001) + map_get(inventory, 2005);
+
+    map_remove(inventory, 1001);
+    if (map_contains(inventory, 1001) != 0) { return 0; }
+    map_clear(inventory);
+    if (map_length(inventory) != 0) { return 0; }
+    return total;
+}

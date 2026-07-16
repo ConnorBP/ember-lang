@@ -7,7 +7,7 @@
 // stdout/stderr redirected to a temp file, mirroring ember_cli_pipe_live_test.
 //
 // Built as a standalone executable WITHOUT add_test so the filtered CTest
-// total is unchanged (run explicitly: ./buildt/polymorphic_cli_test
+// total is unchanged (run explicitly: ./build/polymorphic_cli_test
 // <ember_cli> <source_dir>). Does NOT link ember — it only invokes the CLI as
 // a subprocess.
 //

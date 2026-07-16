@@ -1,0 +1,40 @@
+// entity_system.ember — small data-oriented game entity update.
+// A fixed array stores struct entities. The loop updates positions in place,
+// while match selects the health rule for each entity kind. Final health is
+// 29 + 13 + 0 = 42, used as the executable's expected result.
+// Run: build/ember_cli.exe run examples/scripts/entity_system.ember --ffi
+// expect: 42
+
+enum EntityKind : i64 { Player, Enemy, Pickup }
+
+struct Entity {
+    id: i64;
+    kind: EntityKind;
+    x: i64;
+    velocity: i64;
+    health: i64;
+}
+
+fn main() -> i64 {
+    let mut entities: Entity[3] = [
+        Entity { id: 1, kind: EntityKind::Player, x: 0, velocity: 3, health: 30 },
+        Entity { id: 2, kind: EntityKind::Enemy, x: 10, velocity: -2, health: 20 },
+        Entity { id: 3, kind: EntityKind::Pickup, x: 5, velocity: 0, health: 1 }
+    ];
+
+    let mut total_health: i64 = 0;
+    let mut i: i64 = 0;
+    while (i < 3) {
+        entities[i].x += entities[i].velocity;
+        let mut new_health: i64 = entities[i].health;
+        match (entities[i].kind) {
+            EntityKind::Player => { new_health -= 1; },
+            EntityKind::Enemy => { new_health -= 7; },
+            EntityKind::Pickup => { new_health = 0; }
+        }
+        entities[i].health = new_health;
+        total_health += new_health;
+        i += 1;
+    }
+    return total_health;
+}

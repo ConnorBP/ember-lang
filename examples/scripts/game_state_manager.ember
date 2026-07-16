@@ -1,0 +1,48 @@
+// game_state_manager.ember — practical game-flow state machine.
+// Demonstrates a state struct, typed enum, match arms, and a fixed-size array
+// of level records. The scenario advances Boot -> Menu -> Playing -> Paused
+// -> Playing and returns the active level score (42).
+// Run: build/ember_cli.exe run examples/scripts/game_state_manager.ember --ffi
+// expect: 42
+
+enum GameMode : i64 { Boot, Menu, Playing, Paused, GameOver }
+
+struct LevelState {
+    score: i64;
+    lives: i64;
+    completed: bool;
+}
+
+struct GameState {
+    mode: GameMode;
+    active_level: i64;
+    ticks: i64;
+}
+
+fn next_mode(mode: GameMode, event: i64) -> GameMode {
+    match (mode) {
+        GameMode::Boot => { return GameMode::Menu; },
+        GameMode::Menu if event == 1 => { return GameMode::Playing; },
+        GameMode::Playing if event == 2 => { return GameMode::Paused; },
+        GameMode::Paused if event == 2 => { return GameMode::Playing; },
+        GameMode::Playing if event == 9 => { return GameMode::GameOver; },
+        _ => { return mode; }
+    }
+    return mode;
+}
+
+fn main() -> i64 {
+    let levels: LevelState[2] = [
+        LevelState { score: 42, lives: 3, completed: false },
+        LevelState { score: 100, lives: 3, completed: false }
+    ];
+    let mut game: GameState = GameState { mode: GameMode::Boot, active_level: 0, ticks: 0 };
+
+    game.mode = next_mode(game.mode, 0); game.ticks += 1; // boot completes
+    game.mode = next_mode(game.mode, 1); game.ticks += 1; // Start
+    game.mode = next_mode(game.mode, 2); game.ticks += 1; // pause
+    game.mode = next_mode(game.mode, 2); game.ticks += 1; // resume
+
+    if (game.mode != GameMode::Playing || game.ticks != 4) { return 0; }
+    return levels[game.active_level].score;
+}

@@ -1127,4 +1127,4 @@ fn process_f32(ctx: i64, frames: i64) -> void {
 fn get_latency() -> i64 { return 0; }
 fn get_tail() -> i64 { return 8192; }
 fn save_state() -> i64 { return 0; }
-fn load_state(state: i64) -> void { return; }
+fn load_state(state_ptr: i64, state_len: i64) -> void { return; }

@@ -1,0 +1,23 @@
+// text_formatter.ember — user-facing status text with f-strings and fmt.
+// It combines ordinary string concatenation, scalar interpolation, and the
+// printf-style fmt helpers. Assertions use lengths/contents so this remains a
+// deterministic runnable example instead of relying only on console output.
+// Run: build/ember_cli.exe run examples/scripts/text_formatter.ember --ffi
+// expect: 0
+
+fn make_status(player: string, score: i64, ready: bool) -> string {
+    let prefix: string = "player=" + player;
+    return f"{prefix}, score={score}, ready={ready}";
+}
+
+fn main() -> i64 {
+    let status: string = make_status("Ada", 42, true);
+    let compact: string = fmt2("score=%d (0x%x)", 42, 42);
+
+    if (string_length(status) != 32) { return 1; }
+    if (string_find(status, "score=42") < 0) { return 2; }
+    if (string_length(compact) != 15) { return 3; }
+    println(status);
+    println(compact);
+    return 0;
+}

@@ -1,68 +1,63 @@
-// oscillator_vst.ember — VST3 oscillator instrument
-// MIDI input: NoteOn/NoteOff events
-// Parameters: 0=Waveform (0=sine, 1=square, 2=saw), 1=Volume (0.0-1.0)
-// Generates waveforms at note frequencies
-// State: current phase, active note frequency
+// oscillator_vst.ember — sample-accurate monophonic VST3 instrument.
+// Parameter 0: waveform (0 sine, 1 square, 2 saw). Parameter 1: volume
+// (0.0-1.0). Note events are consumed at their sample offsets, while global
+// phase/note state persists across audio blocks.
 
-@realtime
+global osc_phase: f32 = 0.0;
+global osc_frequency: f32 = 0.0;
+global osc_active_note: i64 = -1;
+
+// Event accessors are allocation-free, but are not currently marked in the
+// sema realtime-safe allowlist; unlike effect examples, this event-driven
+// callback therefore omits @realtime while preserving an allocation-free body.
 fn process_f32(ctx: i64, frames: i64) -> void {
     let waveform: i64 = audio_get_parameter(ctx, 0) as i64;
-    let volume: f32 = audio_get_parameter(ctx, 1);
+    let mut volume: f32 = audio_get_parameter(ctx, 1);
+    if (volume < 0.0) { volume = 0.0; }
+    if (volume > 1.0) { volume = 1.0; }
+
     let sample_rate: f32 = audio_get_sample_rate(ctx) as f32;
     let event_count: i64 = audio_get_event_count(ctx);
     let channels: i64 = audio_get_num_output_channels(ctx);
+    let mut event_index: i64 = 0;
+    let mut frame: i64 = 0;
 
-    // Track active note (simple monophonic synth)
-    let mut active_freq: f32 = 0.0;
-    let mut phase: f32 = 0.0;
-
-    // Process MIDI events
-    let mut ev: i64 = 0;
-    while (ev < event_count) {
-        let ev_type: i64 = audio_get_event_type(ctx, ev);
-        let ev_offset: i64 = audio_get_event_offset(ctx, ev);
-        if (ev_type == 0) {
-            // NoteOn: compute frequency from note number
-            let note: i64 = audio_get_event_note(ctx, ev);
-            // freq = 440 * 2^((note - 69) / 12)
-            active_freq = 440.0 * pow_f32(2.0, (note - 69) as f32 / 12.0);
-        } else if (ev_type == 1) {
-            // NoteOff
-            active_freq = 0.0;
-        }
-        ev = ev + 1;
-    }
-
-    // Generate audio
-    let phase_inc: f32 = active_freq / sample_rate;
-    let mut i: i64 = 0;
-    while (i < frames) {
-        let mut sample: f32 = 0.0;
-        if (active_freq > 0.0) {
-            if (waveform == 0) {
-                // Sine
-                sample = sin_f32(phase * 2.0 * 3.14159265358979) * volume;
-            } else if (waveform == 1) {
-                // Square
-                if (phase < 0.5) { sample = volume; } else { sample = -volume; }
-            } else {
-                // Saw
-                sample = (phase * 2.0 - 1.0) * volume;
+    while (frame < frames) {
+        // Apply every event scheduled at or before this exact output frame.
+        while (event_index < event_count && audio_get_event_offset(ctx, event_index) <= frame) {
+            let event_type: i64 = audio_get_event_type(ctx, event_index);
+            let note: i64 = audio_get_event_note(ctx, event_index);
+            if (event_type == 0 && audio_get_event_velocity(ctx, event_index) > 0) {
+                osc_active_note = note;
+                osc_frequency = (440.0 * pow_f64(2.0, (note - 69) as f64 / 12.0)) as f32;
+            } else if (event_type == 1 && note == osc_active_note) {
+                osc_active_note = -1;
+                osc_frequency = 0.0;
             }
-            phase = phase + phase_inc;
-            if (phase >= 1.0) { phase = phase - 1.0; }
+            event_index = event_index + 1;
         }
-        let mut ch: i64 = 0;
-        while (ch < channels) {
-            audio_store_sample(ctx, ch, i, sample);
-            ch = ch + 1;
+
+        let mut sample: f32 = 0.0;
+        if (osc_active_note >= 0) {
+            match (waveform) {
+                0 => { sample = sin(osc_phase * 6.283185307179586f) * volume; },
+                1 => { sample = (osc_phase < 0.5 ? volume : 0.0f - volume); },
+                _ => { sample = (osc_phase * 2.0 - 1.0) * volume; }
+            }
+            osc_phase = osc_phase + osc_frequency / sample_rate;
+            while (osc_phase >= 1.0) { osc_phase = osc_phase - 1.0; }
         }
-        i = i + 1;
+
+        let mut channel: i64 = 0;
+        while (channel < channels) {
+            audio_store_sample(ctx, channel, frame, sample);
+            channel = channel + 1;
+        }
+        frame = frame + 1;
     }
 }
 
 fn get_latency() -> i64 { return 0; }
 fn get_tail() -> i64 { return 0; }
-
 fn save_state() -> i64 { return 0; }
-fn load_state(state: i64) -> void { return; }
+fn load_state(state_ptr: i64, state_len: i64) -> void { return; }

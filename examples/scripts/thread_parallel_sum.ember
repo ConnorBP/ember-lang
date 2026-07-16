@@ -1,0 +1,26 @@
+// thread_parallel_sum.ember — two-way parallel computation.
+// thread_spawn receives a function handle and one i64 argument. Each worker
+// owns a per-call context while sharing immutable JIT code; thread_join waits
+// and returns that worker's i64 result. The two ranges sum 1..9 = 45.
+// Run: build/ember_cli.exe run examples/scripts/thread_parallel_sum.ember --ffi
+// expect: 45
+
+// Pack inclusive [first,last] into one positive i64 (16 bits per endpoint).
+fn sum_packed_range(packed: i64) -> i64 {
+    let first: i64 = packed >> 16;
+    let last: i64 = packed & 0xFFFF;
+    let mut sum: i64 = 0;
+    let mut value: i64 = first;
+    while (value <= last) {
+        sum += value;
+        value += 1;
+    }
+    return sum;
+}
+
+fn main() -> i64 {
+    let left: i64 = thread_spawn(&sum_packed_range, (1 << 16) | 4);
+    let right: i64 = thread_spawn(&sum_packed_range, (5 << 16) | 9);
+    // Joining in either order is valid; both workers were already launched.
+    return thread_join(left) + thread_join(right);
+}

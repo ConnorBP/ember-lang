@@ -1,0 +1,20 @@
+// sync_queue.ember — bounded MPMC queue lifecycle.
+// All sync queues are non-blocking: push returns 0 when full and try_pop uses
+// the empty sentinel after the queue drains. This single-script demonstration
+// verifies FIFO behavior; C++ hosts can use the matching *_host accessors from
+// another thread without calling into the Ember context.
+// Run: build/ember_cli.exe run examples/scripts/sync_queue.ember --ffi
+// expect: 42
+
+fn main() -> i64 {
+    let queue: mpmc = mpmc_new(2);
+    if (mpmc_push(queue, 20) != 1) { return 0; }
+    if (mpmc_push(queue, 22) != 1) { return 0; }
+    if (mpmc_push(queue, 99) != 0) { return 0; } // bounded queue is full
+
+    let first: i64 = mpmc_try_pop(queue);
+    let second: i64 = mpmc_try_pop(queue);
+    if (mpmc_size(queue) != 0) { return 0; }
+    mpmc_free(queue);
+    return first + second;
+}

@@ -13,28 +13,28 @@ submodule is available. The root CMake file registers four CTest modes.
 Configure and build from the repository root:
 
 ```bash
-cmake -S . -B buildt -G Ninja \
+cmake -S . -B build -G Ninja \
   -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe \
   -DEMBER_BUILD_VST3=ON
-cmake --build buildt -j 8
+cmake --build build -j 8
 ```
 
 Run through CTest:
 
 ```bash
-ctest --test-dir buildt -R '^vst3_(stress|realtime_contract|fuzz)$' --output-on-failure
-ctest --test-dir buildt -R '^vst3_soak$' --output-on-failure
+ctest --test-dir build -R '^vst3_(stress|realtime_contract|fuzz)$' --output-on-failure
+ctest --test-dir build -R '^vst3_soak$' --output-on-failure
 ```
 
 Or invoke one mode directly (the executable location is generator-dependent):
 
 ```bash
-buildt/examples/vst3_wrapper/stress_tests/vst3_stress_tests.exe fuzz
-buildt/examples/vst3_wrapper/stress_tests/vst3_stress_tests.exe soak --seconds 60
+build/examples/vst3_wrapper/stress_tests/vst3_stress_tests.exe fuzz
+build/examples/vst3_wrapper/stress_tests/vst3_stress_tests.exe soak --seconds 60
 ```
 
 `vst3_soak` is labelled `soak`; a short normal gate can exclude it with
-`ctest --test-dir buildt -LE soak -E bench`.
+`ctest --test-dir build -LE soak -E bench`.
 
 ## Steinberg validator checkpoint
 
@@ -45,8 +45,8 @@ silence, state transitions, bus consistency, and the validator's sample-rate
 matrix.
 
 ```bash
-cmake --build buildt --target validator -j 8
-buildt/bin/validator.exe buildt/VST3/Release/ember_gain.vst3
+cmake --build build --target validator -j 8
+build/bin/validator.exe build/VST3/Release/ember_gain.vst3
 ```
 
 MinGW needs `-municode` for the SDK validator's `wmain`; the wrapper CMake adds

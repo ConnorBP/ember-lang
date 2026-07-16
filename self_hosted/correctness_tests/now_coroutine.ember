@@ -1,4 +1,9 @@
-// coroutines are now supported in the self-hosted compiler.
+// Self-hosted positive: execute a coroutine that yields 42, then returns 0.
+// coroutine_next starts/resumes producer; the first call observes its yield.
+// Coroutines use Windows fibers in the current runtime.
 // expect: 42
-fn producer() -> i64 { yield 42; return 0; }
-fn main() -> i64 { return 42; }
+fn producer(unused: i64) -> i64 { yield 42; return 0; }
+fn main() -> i64 {
+    let coroutine: i64 = coroutine_start(&producer, 0);
+    return coroutine_next(coroutine);
+}

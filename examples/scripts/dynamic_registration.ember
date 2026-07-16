@@ -1,6 +1,6 @@
-// dynamic_registration.ember — v1.0 dynamic routine registration demo
-// (docs/planning/plan_FUNCTION_REFS.md §6). This is the pattern docs/LIFECYCLE.md §2 flagged as
-// "needs function references, ROADMAP Tier 2" — now shipped.
+// dynamic_registration.ember — dynamic routine registration demo.
+//
+// Function handles and dynamic lifecycle registration are fully supported.
 //
 // A script chooses AT RUNTIME what the host should call per frame, instead
 // of only the static @on_tick annotation. @entry registers a routine via
@@ -8,8 +8,11 @@
 // calls fn(data) each frame via the dispatch table — the SAME call mechanism
 // as @on_tick, just discovered by the script at runtime).
 //
-// Run:  ember run dynamic_registration.ember --tick --tick-count 5 --tick-interval 50
-// (the host ticks the dynamically-registered routine 5 times, then stops).
+// Run from the repository root:
+//   build/ember_cli.exe run examples/scripts/dynamic_registration.ember \
+//       --tick --tick-count 5 --tick-interval 50
+// The initial main() result is 1, then the host ticks the registered routine
+// five times. A plain `run` also correctly exits with main's result, 1.
 
 global g_ticks: i64 = 0;
 

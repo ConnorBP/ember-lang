@@ -1,3 +1,10 @@
-// try/catch is now supported in the self-hosted compiler.
+// Self-hosted positive: throw an i64 and recover it in the nearest catch.
+// The catch binding receives the thrown value, so the observable result is 42.
 // expect: 42
-fn main() -> i64 { try { throw 42; } catch (e) { return e; } }
+fn main() -> i64 {
+    try {
+        throw 42;
+    } catch (error) {
+        return error;
+    }
+}
