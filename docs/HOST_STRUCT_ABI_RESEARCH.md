@@ -21,12 +21,27 @@ The probes and raw disassembly are saved under `docs/abi_evidence/`
 `probe_pod16.asm`, `probe_abi_attr.asm`, `rustabi.asm`, `rustabi2.asm`,
 `probe_cpp.cpp`, `sizes.exe`).
 
-**Frame for this workspace.** The `prism` host stores `vec3`/`vec4`/`quat`/`mat4`
-as host-side types and hands them to ember scripts through natives; ember's
-struct ABI is MSVC-compatible on Windows. A mismatch between how the host
-lays out / passes a `Mat4` and how the JIT-compiled ember ABI expects it is
-exactly the class of bug this document exists to prevent. The dual-use / ABI
-research framing is the same one the rest of `docs/` uses.
+**Frame for this workspace.** Ember now has two intentionally distinct struct
+layout classes:
+
+- script-declared structs are tightly packed in declaration order with
+  alignment 1;
+- host C++ structs registered with `register_struct` use natural C/C++ field
+  alignment, padding, trailing padding, and retain their computed alignment.
+
+`bind_struct("T")` exposes a registered host layout as a first-class by-value
+script type. Native aggregate arguments up to 128 bytes are supported: <=8
+bytes use one GP word and >8 bytes use the Win64 hidden-pointer by-value path;
+larger registered native arguments are rejected by sema. Aggregate returns use
+the hidden-return path. `examples/host_struct_test.cpp`,
+`examples/binding_abi_test.cpp`, `src/binding_builder.hpp`, and
+`docs/spec/BINDING_API.md` are the implementation truth.
+
+The vec/quat/mat extensions themselves use nominal **opaque i64 handles**, not
+by-value C++ aggregates. Do not use their public names as evidence that a
+`Mat4` C++ object crosses that extension boundary by value. The layout/ABI
+research below is still directly applicable to `register_struct` and any
+future Rust/C host boundary.
 
 ---
 
@@ -71,12 +86,11 @@ research framing is the same one the rest of `docs/` uses.
    emits a warning. Do not FFI a C++ type with virtual functions / base
    classes / non-trivial ctor by value. Pass it opaquely. `[emp]` (see §2.3)
 
-8. **There is a real MSVC-vs-LLVM/GCC divergence on 16-byte POD returns.**
-   MSVC's documented ABI permits a qualifying ≤16-byte POD to be returned in
-   `RAX`(+`RDX`). Both LLVM (rustc/MSVC target) and GCC/mingw, as observed
-   here, return **all** >8-byte structs (including 16-byte all-int POD) by
-   hidden pointer. Treat "return a >8-byte struct by value" as a
-   cross-toolchain hazard; prefer an explicit out-pointer. `[emp]` (see §3.3)
+8. **There is no special 16-byte POD return exception in the standard Win64
+   ABI.** Microsoft lists return-in-RAX aggregate sizes in **bits**: 8, 16, 32,
+   or 64 bits (1, 2, 4, or 8 bytes). A 16-byte POD therefore uses the hidden
+   return pointer, matching the observed MinGW and rustc/LLVM output. The old
+   draft misread “16 bits” as “16 bytes”; §3.3 records the correction.
 
 ---
 
@@ -409,7 +423,6 @@ Decode:
 | scalar `float`/`double`/`__m128*` | XMM0 |
 | user-defined ≤ 8 bytes AND C++03-POD | RAX (packed) |
 | user-defined > 8 bytes, OR non-POD | hidden pointer: caller allocates, passes ptr in **RCX** (arg 1), args shift right, callee returns ptr in RAX |
-| (MSVC-only, see §3.3) 16-byte POD | may use RAX(+RDX) |
 
 Empirical (gcc/mingw and rustc/LLVM-MSVC): `ret_FF` (8B pure float) returns in
 **RAX** as `0x400000003f800000` (the two floats packed), **not** XMM0. All
@@ -435,44 +448,24 @@ Note `func3`: with the hidden return pointer occupying **position 1 (RCX)**,
 `a` moves to **RDX**, `b` to **XMM2**, `c` to **R9**, and `d` (position 5)
 **spills to the stack**. This is the positional rule (§3.4) in action.
 
-### 3.3 The 16-byte POD return divergence (read this before you FFI)
+### 3.3 Correction: the supposed 16-byte POD divergence
 
-The MS doc says a ≤16-byte *C++03-POD* user type **may** be returned in
-registers (`RAX`, plus `RDX` for the second 8 bytes). This is an **MSVC
-optimization**. Empirically, **neither toolchain available in this workspace
-emits it**:
+An earlier reading of the Microsoft documentation confused its aggregate-size
+list's **bits** with bytes. The documented RAX-eligible lengths are 8, 16, 32,
+or 64 **bits**: at most 8 bytes. It does not authorize a 16-byte user-defined
+return in `RAX+RDX`.
 
-```
-ret_pod16i()  -> Pod16i {i32,i32,i32,i32}  (16B, all-int POD)
-  rustc/LLVM-MSVC:  mov rax,rcx; movaps xmm0,[rip]; movups [rcx],xmm0; ret   // hidden ptr
-  gcc/mingw:        mov rax,rcx; mov [rcx],1; [rcx+4]=2; [rcx+8]=3; [rcx+0xc]=4 // hidden ptr
-ret_pod16ptr() -> Pod16ptr {void*,void*}   (16B, 2 pointers)
-  both:             mov rax,rcx; ...; movups [rcx],xmm0                   // hidden ptr
-ret_Vec4()     -> Vec4 {f32×4}              (16B)
-  both:             mov rax,rcx; movups [rcx],xmm0                        // hidden ptr
-ret_DD()       -> DD {f64,f64}              (16B pure double)
-  both:             mov rax,rcx; movups [rcx],xmm0                        // hidden ptr
-```
+The empirical probes are therefore confirmation, not a compiler divergence:
+`Pod16i`, two-pointer `Pod16ptr`, `Vec4`, and `{f64,f64}` all return through the
+hidden RCX pointer under MinGW and rustc/LLVM's Windows target. The corrected
+portable Win64 rule is simply:
 
-So the **observed, uniform rule across GCC/mingw and rustc/LLVM-MSVC** is:
-**>8 bytes → hidden pointer, no exceptions.** MSVC itself *can* return a
-qualifying 16-byte POD in `RAX`+`RDX`; LLVM's MSVC target and GCC's mingw
-target, in the versions tested here, do not for the cases above.
+- qualifying 1/2/4/8-byte POD aggregates return packed in RAX;
+- larger or non-qualifying aggregates use caller-provided storage, with its
+  pointer in RCX and returned in RAX.
 
-**Practical consequence:** a function that returns a >8-byte struct by value
-can be a **cross-toolchain ABI mismatch** if one side is MSVC and the other is
-LLVM/GCC. This workspace's host is MSVC-ABI; the JIT emits its own code. The
-safe, portable rule:
-
-> **For any struct > 8 bytes, do not return it by value across the FFI/JIT
-> boundary.** Have the caller pass an explicit out-pointer (`T* out` /
-> `*mut T`) and have the callee write through it. This is identical to what
-> the ABI does anyway (hidden pointer), but it makes the contract explicit
-> and toolchain-independent.
-
-For ≤8-byte POD, return-by-value in RAX is uniform and safe across all three
-toolchains (verified: `ret_II`, `ret_FF`, `ret_pod8i` all use RAX in C, C++,
-and Rust).
+An explicit out-pointer can still make a public cross-language API clearer, but
+it is not needed to work around a special 16-byte MSVC return convention.
 
 ### 3.4 Argument registers are positional (the rule everyone gets wrong)
 
@@ -593,8 +586,8 @@ size  = 12    align = 4
 x@0  y@4  z@8   (no internal padding; 12 is already a multiple of 4)
 no trailing padding (12 % 4 == 0)
 ```
-Passed/returned by **hidden pointer** on Win64 (12 > 8). On System V, one SSE
-eightbyte + one partial → XMM0 + RAX (≤16B, in registers).
+Passed/returned by **hidden pointer** on Win64 (12 > 8). On System V, its two
+SSE-class eightbytes are carried in XMM registers (≤16B, in registers).
 
 ### 4.2 `Vec4 { float x, y, z, w; }`
 
@@ -729,7 +722,7 @@ System V AMD64 ABI (refspecs.linuxbase.org/elf/x86_64-abi-0.99.pdf):
 | Arg XMM regs | XMM0–XMM3 (4) | XMM0–XMM7 (8) |
 | Reg assignment | **positional** (pos→GP/XMM pair) | per-eightbyte class, in order |
 | Hidden return ptr | RCX (arg 1, shifts rest) | RDI (arg 1) |
-| 16B POD return | MSVC: RAX(+RDX); LLVM/GCC: hidden ptr `[emp]` | RAX+RDX or XMM0+XMM1 per class |
+| 16B POD return | hidden pointer (RCX) | RAX+RDX or XMM0+XMM1 per class |
 | Stack at call | 16B aligned, **+32B shadow space** | 16B aligned, no shadow space |
 | 5th+ arg | stack, right-to-left | stack, right-to-left |
 | C++ non-trivial type | by hidden ptr (not in RAX) | invisible reference |
@@ -744,23 +737,30 @@ families). Option (a) is what this workspace does.
 
 ---
 
-## 6. Recommendations for the host↔ember struct ABI
+## 6. Recommendations for the host↔Ember struct ABI
 
+0. **Choose the correct Ember representation first.** Use `bind_handle` for an
+   opaque host object whose script value is an i64 handle. Use
+   `register_struct` + `bind_struct` only for a true standard-layout by-value
+   aggregate. Do not expect a script-declared packed struct to match a
+   naturally aligned C/C++ struct merely because fields have the same names.
 1. **Every FFI struct is `#[repr(C)]`** on the Rust side and a plain
    standard-layout struct on the C/C++ side. No `repr(Rust)` types in the ABI
    graph; no non-standard-layout C++ types in the ABI graph.
 2. **`repr(C)` must be applied recursively** to every nested struct that is
    part of the ABI. Inner `repr(Rust)` types keep Rust layout (§1.3).
-3. **Pass structs > 8 bytes by explicit out-pointer** (`*const T` in /
-   `*mut T` out), not by value, across host↔JIT. This matches what Win64
-   does anyway and is immune to the MSVC-vs-LLVM 16B-return divergence (§3.3).
-   Structs ≤ 8 bytes may be passed/returned by value (one integer register /
-   RAX) safely.
+3. **Understand Ember's shipped aggregate path.** Ember can marshal registered
+   native aggregate arguments up to 128 bytes: <=8 bytes in one GP word and
+   >8 bytes through the Win64 hidden-pointer path; aggregate returns use a
+   hidden return pointer. This is tested with the supported MinGW host. For a
+   Rust or mixed-language public ABI, an explicit pointer/out-pointer can
+   still make ownership and storage explicit; §3.3 corrects the former
+   16-byte-divergence claim.
 4. **`Mat4` (and any 16-byte-SIMD type) must be `alignas(16)` /
    `#[repr(C, align(16))]`** if the host or JIT issues aligned 128-bit
    loads/stores (`movaps`) or uploads to shaders expecting 16-byte alignment.
    Default `Mat4` is `align 4` (§4.3).
-5. **The JIT must emit Win64 call frames**: positional `(RCX,RDX,R8,R9)` +
+5. **The JIT emits Win64 call frames**: positional `(RCX,RDX,R8,R9)` +
    `(XMM0–XMM3)` register allocation (§3.4), 32-byte shadow space, 16-byte
    stack alignment at `call`, hidden return pointer in RCX for >8B returns,
    5th+ args on the stack right-to-left.

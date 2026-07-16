@@ -5,9 +5,31 @@ copyable examples live in [`examples/custom_pass/`](../examples/custom_pass/).
 The framework headers are `src/ember_pass.hpp`, `ember_pass_registry.hpp`,
 `ember_pass_pipeline.hpp`, `src/extension_registry.hpp` (the shared
 `ExtensionError` / `ExtensionStatus` / `ExtensionResult<T>` contracts used by
-the pass registry and, later, by other extension registries), and
+the pass registry and other extension registries), and
 `src/seed_derivation.hpp` (the shared, versioned seed-derivation service — see
 [Deterministic seeds](#deterministic-seeds)).
+
+## Current built-in inventory (25 passes)
+
+The stock host registers 18 optimization names from `ember_ext_opt` and 7
+required obfuscation names from `ember_ext_obf`:
+
+| Family | Registered pipeline names |
+|---|---|
+| Optimization (18) | `constprop`, `dce`, `simplifycfg`, `cse`, `gvn`, `licm`, `lsr`, `forward`, `copyprop`, `instcombine`, `dse`, `bounds-elim`, `sccp`, `unroll`, `spill_elim`, `peephole`, `branch_folding`, `tailcall` |
+| Obfuscation (7) | `subst`, `mba_expand`, `const_encode`, `opaque_pred`, `deadcode`, `str_encrypt`, `block_split` |
+
+`gvn` performs conservative dominance-based global value numbering;
+`tailcall` marks the narrow direct same-module scalar/register-only tail-call
+shape for tail emission. Consult `extensions/opt/ext_opt.hpp` for every pass's
+exact eligibility restrictions. The seven obfuscation passes are configured
+through immutable `PolymorphicPassOptions` when a profile/seed is selected.
+
+The CLI also expands ordinary named recipes with `--profile light|balanced|heavy`
+(`--pass-profile` is an alias) and accepts `--pass-seed U64`. An explicit
+`--passes` specification replaces a profile's recipe while retaining its
+configured polymorphic options/seed. Profiles are recipes, not hidden pass
+manager modes.
 
 ## Pass shape and lifecycle
 
@@ -650,8 +672,9 @@ contents are unchanged.
 ### Deterministic listing
 
 `reg.names()` returns the registered pass names sorted lexicographically, so
-`--list-passes` output and any host-driven enumeration are deterministic and
-independent of `unordered_map` iteration order.
+host-driven enumeration is deterministic and independent of `unordered_map`
+iteration order. The current stock CLI does not expose a `--list-passes`
+option; embedders can print `reg.names()` themselves.
 
 ### Pipeline grammar and transactional guarantees
 
@@ -726,8 +749,18 @@ ctx.enable_ir_backend = true;
 A CLI host wired this way accepts:
 
 ```bash
-ember run program.ember --passes constprop,my-pass,dce
+./buildt/ember_cli.exe run program.ember --passes constprop,my-pass,dce
 ```
+
+The stock CLI additionally supports ordinary built-in profiles:
+
+```bash
+./buildt/ember_cli.exe run program.ember --profile balanced --pass-seed 42
+```
+
+A named profile requires the IR backend for every function and rejects a
+TreeWalker fallback. Bare `--passes` preserves the compatibility behavior that
+allows an unsupported function to fall back.
 
 The stock `ember_cli` registers only `ext_opt` and `ext_obf`; it reports
 `unknown pass` for custom names until its registry setup calls the custom

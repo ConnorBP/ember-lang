@@ -1,169 +1,190 @@
-# Writing VST Plugins in ember
+# Writing VST3 plugins in Ember
 
-This guide covers how to write VST3 audio plugins using ember as the DSP scripting language.
+The wrapper builds one combined VST3 component/controller named
+`ember_gain.vst3`. DSP lives in an Ember script. The default script is
+`examples/vst3_wrapper/gain_vst.ember`; set `EMBER_VST3_SCRIPT` before loading
+the plugin to select another script.
 
-## Quick Start
-
-### Build the VST3 wrapper
+## Build
 
 ```bash
-cd ember
-mkdir buildt && cd buildt
-cmake -G Ninja -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe ..
-cmake --build . -j 8
+cmake -S . -B buildt -G Ninja \
+  -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe \
+  -DEMBER_BUILD_VST3=ON
+cmake --build buildt -j 8
 ```
 
-The VST3 plugin is built at `buildt/VST3/Release/ember_gain.vst3/`.
+With the default single-config Release build, the bundle is normally:
 
-### Load in a DAW
+```text
+buildt/VST3/Release/ember_gain.vst3/
+```
 
-Copy the `.vst3` bundle to your DAW's VST3 plugin directory:
-- **Windows**: `C:/Program Files/Common Files/VST3/`
-- The DAW will scan and find "ember_gain" in its plugin browser
+Install it under `C:/Program Files/Common Files/VST3/` or point a development
+host at the build directory. The SDK submodule is pinned to VST3 3.8.0.
 
-### Write your own plugin
-
-Create a `.ember` file with a `@realtime` `process_f32` function:
+## Minimal DSP script
 
 ```ember
 @realtime
 fn process_f32(ctx: i64, frames: i64) -> void {
-    let channels: i64 = audio_get_num_input_channels(ctx);
-    let mut i: i64 = 0;
-    while (i < frames) {
-        let mut ch: i64 = 0;
-        while (ch < channels) {
-            let s: f32 = audio_load_sample(ctx, ch, i);
-            audio_store_sample(ctx, ch, i, s * 0.5);  // gain = 0.5
-            ch = ch + 1;
+    let channels = audio_get_num_output_channels(ctx);
+    let mut frame: i64 = 0;
+    while (frame < frames) {
+        let mut channel: i64 = 0;
+        while (channel < channels) {
+            let sample = audio_load_sample(ctx, channel, frame);
+            audio_store_sample(ctx, channel, frame, sample * 0.5f);
+            channel += 1;
         }
-        i = i + 1;
+        frame += 1;
     }
 }
+
+fn get_latency() -> i64 { return 0; }
+fn get_tail() -> i64 { return 0; }
 ```
 
-## The ember VST API
+The required f32 callback is
+`fn process_f32(ctx: i64, frames: i64) -> void`; legacy name `process` is also
+accepted. `process_f64` with the same signature is optional. The wrapper only
+advertises 64-bit sample processing when that callback exists.
 
-### AudioContext
+## Callback contract
 
-The `ctx: i64` parameter is a pointer to an AudioContext struct containing all audio data. Access it via natives:
+| Callback | Required | Contract |
+|---|---:|---|
+| `process_f32(ctx: i64, frames: i64) -> void` | yes (or legacy `process`) | f32 block processing |
+| `process_f64(ctx: i64, frames: i64) -> void` | no | f64 block processing |
+| `get_latency() -> i64` | no | latency samples; missing/negative becomes 0 |
+| `get_tail() -> i64` | no | tail samples; missing/negative becomes 0 |
+| `save_state() -> i64` | no | pointer to a wrapper-compatible `ScriptStateBuffer { data, size }` descriptor whose bytes remain valid through migration/write |
+| `load_state(ptr: i64, len: i64) -> void` | no | consume state bytes; **two arguments**, not one opaque handle |
 
-| Native | Returns | Description |
-|--------|---------|-------------|
-| `audio_get_sample_rate(ctx)` | `i64` | Sample rate (e.g., 48000) |
-| `audio_get_block_size(ctx)` | `i64` | Max block size |
-| `audio_get_num_input_channels(ctx)` | `i64` | Input channel count |
-| `audio_get_num_output_channels(ctx)` | `i64` | Output channel count |
-| `audio_load_sample(ctx, ch, i)` | `f32` | Load input sample (channel ch, index i) |
-| `audio_store_sample(ctx, ch, i, val)` | `void` | Store output sample |
-| `audio_load_sample_f64(ctx, ch, i)` | `f64` | Load f64 input sample |
-| `audio_store_sample_f64(ctx, ch, i, val)` | `void` | Store f64 output sample |
-| `audio_get_parameter(ctx, id)` | `f32` | Get current parameter value |
-| `audio_is_playing(ctx)` | `i64` | Transport playing (1/0) |
-| `audio_get_bpm(ctx)` | `f64` | Tempo (BPM) |
-| `audio_get_ppq(ctx)` | `f64` | Musical position (PPQ) |
+All signatures are checked before compilation. State payloads are capped at 16
+MiB. The simple examples often return 0 from `save_state`; stateful plugins must
+honor the descriptor lifetime contract in `vst3_ember_processor.cpp`.
 
-### Parameter Automation
+## AudioContext natives
 
-Sample-accurate parameter changes are available via:
+The wrapper registers only `ember_ext_audio` and `ember_ext_math`. Audio calls
+are `PERM_FFI`-gated, and the wrapper sema run grants that permission.
 
-| Native | Returns | Description |
-|--------|---------|-------------|
-| `audio_get_param_change_count(ctx)` | `i64` | Number of parameter changes in this block |
-| `audio_get_param_change_id(ctx, i)` | `i64` | Parameter ID for change i |
-| `audio_get_param_change_offset(ctx, i)` | `i64` | Sample offset for change i |
-| `audio_get_param_change_value(ctx, i)` | `f32` | New value for change i |
+### Block and sample access
 
-### MIDI Events
+| Native | Return | Meaning |
+|---|---|---|
+| `audio_get_sample_rate(ctx)` | `i64` | current sample rate |
+| `audio_get_block_size(ctx)` | `i64` | frames in the current process call |
+| `audio_get_num_input_channels(ctx)` | `i64` | 0 or 2 in the current wrapper |
+| `audio_get_num_output_channels(ctx)` | `i64` | 2 |
+| `audio_load_sample(ctx,ch,frame)` | `f32` | bounds-checked f32 input; 0 when no input |
+| `audio_store_sample(ctx,ch,frame,value)` | `void` | bounds-checked f32 output |
+| `audio_load_sample_f64(...)` / `audio_store_sample_f64(...)` | `f64` / `void` | f64 equivalents |
 
-| Native | Returns | Description |
-|--------|---------|-------------|
-| `audio_get_event_count(ctx)` | `i64` | Number of MIDI events in this block |
-| `audio_get_event_type(ctx, i)` | `i64` | Event type (0=NoteOn, 1=NoteOff) |
-| `audio_get_event_channel(ctx, i)` | `i64` | MIDI channel |
-| `audio_get_event_note(ctx, i)` | `i64` | Note number (0-127) |
-| `audio_get_event_velocity(ctx, i)` | `i64` | Velocity (0-127) |
-| `audio_get_event_offset(ctx, i)` | `i64` | Sample offset |
-| `audio_add_event(ctx, type, ch, note, vel, offset)` | `void` | Output a MIDI event |
+Legacy raw helpers `load_f32`/`store_f32`, `load_f64`/`store_f64`, and
+`load_i32`/`store_i32` also exist, but the typed `AudioContext` accessors are
+the preferred VST surface.
 
-### Latency, Tail, State
+### Parameters and transport
 
-```ember
-fn get_latency() -> i64 { return 0; }  // report latency in samples
-fn get_tail() -> i64 { return 0; }     // report tail length in samples
-fn save_state() -> i64 { ... }         // save DSP state, return handle
-fn load_state(state: i64) -> void { ... }  // restore DSP state
-```
+- `audio_get_parameter(ctx, id) -> f32`
+- `audio_get_param_change_count(ctx) -> i64`
+- `audio_get_param_change_id/offset/value(ctx, index)`
+- `audio_is_playing(ctx) -> i64`
+- `audio_get_bpm(ctx) -> f64`
+- `audio_get_ppq(ctx) -> f64`
 
-### @realtime Annotation
+The wrapper has at most three parameter IDs. Parameter metadata is selected by
+the script filename profile (gain, delay, filter, or oscillator/synth); other
+example scripts use the generic gain profile unless the host/wrapper is
+extended.
 
-The `@realtime` annotation tells the ember compiler to validate that your function is real-time safe. The following are **forbidden** in `@realtime` functions:
+### Events
 
-- GC allocation (`gc_alloc`, `new`, `delete`)
-- I/O operations (`print`, `file_*`, `path_*`)
-- Thread operations (`thread_create`, `mutex_*`)
-- Exceptions (`try`/`catch`/`throw`)
-- FFI (`call_raw`, `make_executable`)
+- `audio_get_event_count(ctx)`
+- `audio_get_event_type/channel/note/velocity/offset(ctx, index)`
+- `audio_add_event(ctx, type, channel, note, velocity, offset)`
 
-## Example Plugins
+Event kinds are note-on, note-off, note-expression, and controller in the
+extension ABI. Input/output event storage is bounded and allocation-free in
+`process()`.
 
-| Plugin | File | Description |
-|--------|------|-------------|
-| Gain | `gain_vst.ember` | Simple gain effect with parameter automation |
-| Delay | `delay_vst.ember` | Delay with feedback and mix controls |
-| Filter | `filter_vst.ember` | Biquad lowpass filter with cutoff/resonance |
-| Oscillator | `oscillator_vst.ember` | MIDI instrument with sine/square/saw waveforms |
-| Synth | `synth_vst.ember` | Simple synthesizer with ADSR envelope |
+## Realtime validation
 
-## Hot Reload
+Annotate the process callback with `@realtime`. Sema rejects operations that
+cannot be proven safe on the audio thread, including:
 
-The VST3 wrapper supports **hot reload** — edit your `.ember` DSP script while the plugin runs in the DAW:
+- GC/allocation (`new`, `delete`, `gc_*`);
+- I/O (`print*`, `file_*`, `path_*`, `read_line`);
+- thread/channel/mutex operations;
+- raw execution/FFI escape hatches;
+- try/catch/throw;
+- indirect, cross-module, or unapproved script/native calls;
+- by-reference lambda capture.
 
-1. The wrapper watches the `.ember` file for changes
-2. On change, it recompiles the script on a background thread
-3. The new module is swapped atomically at the next block boundary
-4. Old JIT pages are reclaimed safely (no audio glitches)
-5. DSP state is preserved via `save_state`/`load_state`
+Audio accessors and the audited math surface are allowed. The stress suite also
+checks that warmed `process()` performs zero C++ allocations and no collection.
 
-**Failure retention**: if the new script fails to compile, the last known-good processor continues running.
+## Hot reload
 
-## Testing
+A watcher polls the selected script, compiles changed source on a background
+thread, and publishes a complete immutable module at a block boundary. A
+failed edit retains the last known-good module. The audio thread takes owning
+`shared_ptr` snapshots, so retired modules remain alive through an in-flight
+block/crossfade. `EMBER_VST3_CROSSFADE_SAMPLES` controls the f32 transition
+(default 64; invalid values fall back to the default).
 
-### Headless DSP Harness
+If both old and new scripts implement the state callbacks, reload migrates
+state through `save_state` and `load_state(ptr,len)`. Latency and tail reports
+are refreshed after publication.
+
+## Example scripts (13)
+
+`gain`, `delay`, `filter`, `oscillator`, `synth`, `distortion`, `panner`,
+`tremolo`, `compressor`, `chorus`, `bitcrusher`, `limiter`, and `reverb` live in
+`examples/vst3_wrapper/`.
+
+They are **script examples for one wrapper binary**, not 13 separately built
+VST3 libraries. Only `gain_vst.ember` and `synth_vst.ember` are attached as
+bundle resources by current CMake; development selection normally uses
+`EMBER_VST3_SCRIPT` and a filesystem path.
+
+## Node graph model and code generation
+
+Phase 9 adds an editor-side graph substrate:
+
+- `src/node_graph.hpp/.cpp`: graph/node/port model, validation, strict JSON
+  save/load;
+- `src/node_codegen.hpp/.cpp`: deterministic graph-to-Ember VST source;
+- built-in nodes: oscillator, filter, gain, mixer, delay;
+- numeric parameters receive stable VST parameter IDs;
+- directed cycles and invalid ports/names/types are rejected.
+
+This is a **node-graph editor backend/model**, not a shipped VSTGUI visual
+editor. An external editor can load/save JSON and call
+`graph_to_ember_vst(...)`; the generated source uses the existing wrapper.
+Run `buildt/node_graph_test.exe` directly to validate graph round-trips and
+generated sema-valid source. The target is intentionally not registered with
+CTest.
+
+## Tests and validator
 
 ```bash
-# Run the DSP test harness (compares ember output against C++ references)
-ctest -R vst_dsp
+ctest --test-dir buildt -R '^vst_dsp_harness$' --output-on-failure
+ctest --test-dir buildt -R '^vst3_(stress|realtime_contract|fuzz)$' --output-on-failure
+ctest --test-dir buildt -R '^vst3_soak$' --output-on-failure
+./buildt/node_graph_test.exe
 ```
 
-### Stress Tests
+The 2026-07-12 Release bundle passed the SDK 3.8.0 validator: 47 tests passed,
+0 failed. See the stress-suite README for exact commands.
 
-```bash
-# Run VST3 stress tests
-ctest -R vst3_stress
-ctest -R vst3_realtime_contract
-ctest -R vst3_fuzz
-ctest -R vst3_soak
-```
+## Current limitations
 
-### Block Partition Invariance
-
-The DSP harness verifies that processing N samples as one block gives the same result as processing them as multiple sub-blocks (e.g., 1024 as 1×1024 vs 4×256 vs 16×64).
-
-## Limitations
-
-The current VST3 wrapper supports:
-- ✅ f32 and f64 processing
-- ✅ Stereo/mono/multi-channel
-- ✅ Sample-accurate parameter automation
-- ✅ MIDI input/output
-- ✅ Latency/tail reporting
-- ✅ State/preset serialization
-- ✅ Hot reload with state migration
-- ✅ Silence flags
-
-Not yet supported:
-- ❌ VSTGUI editor (no custom UI — use the DAW's generic parameter view)
-- ❌ Multiple plugins per library (one plugin per .vst3)
-- ❌ Sidechain buses (planned)
-- ❌ Note expression (planned)
+- Windows-first, stereo output, with zero or one stereo input bus;
+- no sidechain bus;
+- no custom VSTGUI view (DAW generic parameter UI only);
+- one plugin class/bundle, script-selected DSP;
+- no f64 hot-reload crossfade (f32 path crossfades; f64 swaps at boundary);
+- node graph is a model/JSON/codegen API, not a complete visual UI.

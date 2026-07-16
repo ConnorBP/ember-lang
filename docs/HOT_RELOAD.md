@@ -1,215 +1,220 @@
-# ember - hot reload and executable-page reclamation
+# Ember hot reload
 
-ember ships atomic single-function replacement plus a host-visible epoch
-reclamation domain. Added/removed functions and whole-module transactions
-remain deferred.
+Ember supports two reload families:
 
-## 0. Migration from the pre-v1.0 single-threaded reload API (breaking bump)
+1. **Identity dispatch:** atomic replacement of one existing function with a
+   stable slot.
+2. **Keyed dispatch:** replacement of one logical function at its derived
+   physical route, plus coherent whole-generation replacement.
 
-The reload source API changed in v1.0. The old helper took seven arguments
-and **returned a caller-owned `old_entry` pointer** that the host was expected
-to free after no caller could still be executing the old page. That model is
-gone: the new `reload_function` (Section 3) takes a `HotReloadDomain&` as its
-fourth argument and `ReloadResult` no longer carries `old_entry`. The domain,
-not the caller, owns the replaced executable page from the moment
-`publish` succeeds, and frees it only after a guarded quiescent point.
+Both use `HotReloadDomain` and `ExecutionGuard` to keep replaced executable
+pages alive until pre-publication callers have left.
 
-A hidden temporary domain inside the helper would be unsafe: it would
-conflate the domain's lifetime with the call and could not survive a caller
-that holds a guard across the reload. The domain must be a long-lived object
-the host stores beside the table.
+## 1. The guard rule
 
-A host using the old signature no longer compiles. The migration recipe:
-
-1. **Hold a persistent `HotReloadDomain` beside the `DispatchTable`** for the
-   table's entire lifetime. Do not create a fresh domain per reload; a domain
-   destroyed immediately after `publish` cannot track retirement or guarantee
-   quiescence.
-2. **Guard before every outer slot load/call.** Every host-to-script
-   invocation through the reloadable table must construct a `domain.guard()`
-   *before* loading the slot and keep it across the call return:
-   ```cpp
-   auto guard = domain.guard();
-   void* entry = table.get(slot);
-   return reinterpret_cast<Fn>(entry)(args...);
-   ```
-   One outer guard covers all nested script-to-script and recursive calls.
-3. **Stop freeing/reading `old_entry` — it no longer exists.** `ReloadResult`
-   reports `publication_epoch`, `retirement_epoch`, and `old_page_retired`,
-   but carries no owning pointer to the replaced page. The domain owns it.
-4. **Disown the old `CompiledFn`.** Remove/clear the replaced `CompiledFn` from
-   your own bookkeeping (set `exec = nullptr`, `entry = nullptr` or erase it
-   from the vector) so your destructor does not double-free it. The domain
-   frees the executable page after reclamation; your destructor frees only the
-   pages that are still *current*.
-5. **Periodically call `domain.reclaim()` or `domain.quiesce()`** to actually
-   free retired pages. `reclaim()` is nonblocking and frees currently-eligible
-   pages; `quiesce()` blocks until pages retired through the entry-observed
-   epoch are eligible, then frees them. An uncomplicated single-threaded host
-   can call `quiesce()` after each reload.
-6. **At shutdown: drain all guards, then `domain.quiesce()`, then free current
-   pages / table / domain.** The domain must outlive all of its guards. Its
-   destructor performs a final `quiesce()`, but explicit draining first makes
-   the shutdown ordering unambiguous. After quiesce, free the pages still
-   published in the table (the domain does not own current pages), then let
-   the domain and table destruct.
-
-No deprecated single-threaded compatibility abstraction ships: a temporary
-hidden domain is unsafe per the audit, and the domain-based API is the
-supported path for both single-threaded and concurrent hosts.
-
-## 1. Dispatch table layout and slot stability
+Every outer host-to-script invocation through reloadable state must enroll in
+the associated domain **before** resolving/loading the entry and retain the
+guard until JIT code returns:
 
 ```cpp
-struct DispatchTable {
-    std::vector<std::atomic<void*>> slots;
-};
-```
-
-- One table normally belongs to one module. A function receives its stable slot
-  during initial registration; reload never renumbers slots.
-- Generated script-to-script calls read the slot for every call. Existing stack
-  frames continue in their already-selected code version.
-- `DispatchTable::set` is a `std::memory_order_release` store and `get` is a
-  `std::memory_order_acquire` load. Finalized RX code and its bytes therefore
-  happen-before a caller that acquires the published entry.
-- `DispatchTable::set` rejects a null function with `std::invalid_argument`. A
-  null entry would be dereferenced by the generated `call [base + slot*8]` and
-  fault with `0xC0000005` outside Ember's trap model; rejecting it at
-  publication time makes a null entry a recoverable host error (catchable via
-  try/catch) rather than a process fault. `HotReloadDomain::publish` already
-  rejects null before reaching `set`; this guards direct host writes.
-- A host may cache a function name or stable slot index. An unguarded cached raw
-  entry pointer is unsupported because reclamation can invalidate it.
-
-## 2. Added/removed functions (deferred)
-
-`reload_function` replaces exactly one function already present in the module.
-Adding functions, growing a live table, and replacing removed functions with a
-trap stub require a future whole-module reload transaction.
-
-## 3. Single-function publication protocol
-
-The public helper takes the module state and its reclamation domain:
-
-```cpp
-ReloadResult reload_function(source, program, table, domain, codegen_ctx,
-                             natives, overloads, struct_layouts);
-```
-
-1. Lex and parse exactly one complete function declaration.
-2. Find its existing stable slot and verify the canonical call ABI: arity,
-   ordered parameter types/word shapes, and return type/word shape must match.
-3. Temporarily install the replacement AST for whole-module sema, compile it,
-   allocate a fresh page, and seal it RX. Any lex, parse, signature, sema,
-   codegen/finalize, or publication-preparation failure restores the old AST.
-   The table and domain epoch remain unchanged.
-4. `HotReloadDomain::publish` records the replaced page for retirement, release-
-   stores the new entry into the slot, and advances the domain's monotonic epoch
-   exactly once. Recording retirement is prepared before publication, so an
-   allocation failure cannot publish an untracked replacement. **Executable-page
-   ownership is uniquely bound to one `(domain, table, slot)`:** before retiring
-   the replaced page, `publish` scans the other slots of the same table, and if
-   any still holds the old page it is **not** retired (the page stays current via
-   that other slot and is retired only when its last publishing slot is
-   replaced). This prevents a duplicate current-page alias from being reclaimed
-   while still published. A host that publishes the same allocation to more than
-   one slot through direct `DispatchTable::set` writes must observe the same
-   contract: the domain's reclamation is sound only while each executable page is
-   current in at most one slot of the table it was published through.
-5. `ReloadResult` reports `publication_epoch`, `retirement_epoch`, and
-   `old_page_retired`, and carries the current `new_fn`. It intentionally does
-   **not** return an owning old-page pointer: the old executable allocation has
-   transferred to the domain and must not be freed by the caller. A host that
-   keeps `CompiledFn` bookkeeping must clear/remove the replaced record; the
-   domain is its sole executable-page owner after successful publication.
-
-The current `CompiledFn` remains host-owned while it is published. On its next
-successful replacement, its executable page transfers to the domain. The host
-continues to own current pages when tearing down a module, after first ensuring
-there are no calls and destroying/quiescing its domain.
-
-## 4. Execution guards and in-flight calls
-
-Every **outer host-to-script invocation** that can use a reloadable dispatch
-table must be guarded from before loading the entry until after JIT code
-returns:
-
-```cpp
-auto guard = module.reload_domain.guard();
-void* entry = module.table.get(slot); // acquire load while guarded
+auto guard = domain.guard();
+void* entry = table.get(slot);
 return reinterpret_cast<Fn>(entry)(args...);
 ```
 
-The same rule applies to raw B1 context thunks: create the guard before loading
-an entry and retain it across `ember_call_*`. `context_t` does not contain epoch
-state; contexts and reclamation domains have independent lifetimes and there is
-no global participant registry.
+One outer guard covers nested script calls and recursion. Do not:
 
-One outer guard covers all nested script-to-script calls and recursion because
-it remains active for the entire call tree. A native that returns to the same
-outer script invocation is also covered. A separate host re-entry after the
-outer invocation has returned needs its own guard.
+- load an entry before creating the guard;
+- retain a raw entry after the guard ends;
+- cache a physical keyed slot across keyed generations;
+- destroy the domain while a guard exists.
 
-A frame already executing an old version at publication continues normally.
-Fresh calls through the slot can observe the new version. In particular,
-recursive calls made after publication may enter the new version while older
-recursive frames finish in the old version. This per-call identity is deliberate.
+Context state and reload-domain state are separate. A `context_t` does not
+implicitly enroll in an epoch.
 
-Do not load an entry before entering the guard, retain it after leaving the
-guard, or invoke a raw cached pointer later. Such pointers are unsupported and
-may refer to a reclaimed page.
+## 2. Publication and reclamation
 
-## 5. Epoch reclamation API
+`HotReloadDomain` serializes guard enrollment and publication with one mutex.
+A successful publication:
 
-`HotReloadDomain` is a small host-owned domain; normally it is stored beside the
-dispatch table. It uses a mutex/condition variable, has no background thread,
-and performs no process-global registration.
+1. validates/prepares retirement before changing visible state;
+2. release-publishes the new entry or generation record;
+3. advances the monotonic epoch once;
+4. records replaced owned executable pages with their retirement epoch.
 
-- `domain.guard()` returns a move-only RAII `ExecutionGuard`. Guard entry
-  records the current epoch under the same mutex that serializes publication.
-- A successful publication changes epoch `E-1 -> E` and retires the replaced
-  page at `E`.
-- A retired page at `E` is eligible when no active guard has an entry epoch less
-  than `E`. Publication sets the epoch and release-stores the slot while holding
-  the domain mutex; a guard enrolled at `E` or later is therefore serialized
-  after that store and does not pin the old page.
-- `domain.reclaim()` is nonblocking. It frees every currently eligible retired
-  page and returns the number freed.
-- `domain.quiesce()` snapshots the current epoch, waits until pages retired
-  through that epoch are eligible, frees them, and returns the number freed.
-  Publications after its snapshot are not part of that wait.
-- `epoch()`, `retired_page_count()`, and `reclaimed_page_count()` provide host-
-  visible status/test instrumentation.
-- Domain destruction performs a final `quiesce()`. The domain must outlive all
-  of its guards. Destruction does not own or free entries still current in the
-  table.
+A guard records the epoch at entry. A retired page from publication epoch `E`
+is reclaimable when no active guard has an entry epoch below `E`.
 
-The domain mutex provides the crucial enrollment/publication ordering; the
-release/acquire dispatch slot publishes executable data. Guard exit notifies
-blocking quiescers. Page freeing occurs while domain state is locked, after the
-eligibility predicate proves no pre-publication outer call remains.
+APIs:
 
-For an uncomplicated single-threaded host, publication occurs outside a script
-call and `quiesce()` immediately afterward reclaims the replaced page without
-waiting. Concurrent hosts can use `reclaim()` opportunistically or call
-`quiesce()` at an explicit lifecycle boundary.
+- `guard()` — create a move-only `ExecutionGuard`;
+- `reclaim()` — nonblocking; free currently eligible retired pages;
+- `quiesce()` — wait for pages retired through the observed epoch and free them;
+- `epoch()`, `retired_page_count()`, `reclaimed_page_count()` — instrumentation.
 
-## 6. Whole-module reload (deferred)
+The domain owns **replaced** executable pages after successful publication. It
+does not own entries still current. The host must disown a replaced
+`CompiledFn::exec` handle to avoid double-free and must release current pages at
+module teardown after guards drain.
 
-No whole-module reload API ships. Transactional batch replacement, added slot
-assignment, removed-function trap stubs, global-layout migration, and atomic
-multi-function version sets remain deferred. Single-function reload does not
-change globals or declarations beyond the replacement function body.
+## 3. Identity-dispatch single-function reload
 
-## 7. Host integration checklist
+The public helper is:
 
-1. Keep one `HotReloadDomain` beside each reloadable table (or deliberately use
-   one domain for several tables and guard all outer calls through it).
-2. Enter a guard before every host slot load and keep it through script return.
-3. Publish only through `reload_function`/the domain; never write a reloadable
-   slot and free its prior entry manually.
-4. After success, remove the replaced page from caller-owned `CompiledFn`
-   bookkeeping; consume `new_fn` as the new current page.
-5. Use `reclaim()` or `quiesce()` to perform actual frees. At shutdown, stop new
-   calls, drain guards, quiesce the domain, then free current pages/table state.
+```cpp
+ReloadResult reload_function(
+    const std::string& replacement_source,
+    Program& program,
+    DispatchTable& table,
+    HotReloadDomain& domain,
+    const CodeGenCtx& codegen,
+    const NativeTable& natives,
+    const OpOverloadTable* overloads,
+    const StructLayoutTable* structs);
+```
+
+The replacement source must contain exactly one complete function declaration.
+Reload requires:
+
+- the function already exists;
+- the stable slot is assigned;
+- arity is unchanged;
+- every parameter type and ABI word shape is unchanged;
+- return type and ABI word shape are unchanged.
+
+The helper temporarily installs the replacement AST so whole-program sema can
+resolve calls, compiles/finalizes a new page privately, and publishes only after
+all steps succeed. Lex, parse, signature, sema, codegen, allocation, or
+publication-preparation failure restores the old AST and leaves the table and
+epoch unchanged.
+
+`ReloadResult` returns:
+
+- success/error;
+- publication and retirement epochs;
+- whether an old page was retired;
+- the new current `CompiledFn`.
+
+It does not return an owning old-page pointer.
+
+### Slot alias rule
+
+Ordinary domain publication scans the table before retiring the replaced page.
+If another table slot still publishes the same page, that page remains current
+and is not retired yet. Hosts that mutate dispatch storage directly must still
+respect unique page ownership; prefer the domain publication APIs.
+
+## 4. Keyed single-function reload
+
+`reload_keyed_function` takes a stable logical slot plus a transient build
+provider. Before publication it verifies that the replacement preserves the
+existing logical route's:
+
+- canonical ABI fingerprint;
+- visibility;
+- calling mode;
+- dispatch-domain label and topology membership.
+
+It derives the physical route with the module's existing strategy/version and
+publishes that physical entry. It never treats the logical slot as a physical
+index.
+
+The provider route word is transient. Ember stores no expected key, key digest,
+verifier, or machine fingerprint. A different provider may select a different
+bounded destination within the compatible domain; metadata validation and
+ownership safety still hold.
+
+Only an actually replaced, owned JIT page transfers to the reclamation domain.
+Static padding trap targets and non-owned entries are never retired as
+executable allocations.
+
+## 5. Keyed whole-generation replacement
+
+`replace_keyed_generation` can publish a complete new keyed module topology
+under an existing stable module ID. The request supplies:
+
+- stable module name and optional expected dense ID;
+- a new `ModuleLayoutPlan`;
+- backing `RecordBuilderStorage`;
+- a destination `ModuleDispatchRecord`;
+- a callback providing real entries;
+- the `ModuleRegistry` and `HotReloadDomain`.
+
+The implementation builds and validates the new immutable record privately,
+preflights registry/publication/retirement state, and performs one coherent
+release publication. Readers acquire either the old generation or the new
+generation, never a partially mutated record.
+
+On success:
+
+- the stable module ID is unchanged;
+- old real executable pages transfer to the domain;
+- old record metadata/backing remains the caller's responsibility until old
+  guards drain;
+- the caller must disown retired old `CompiledFn` allocations.
+
+On failure, no generation record, legacy registry field, epoch, or ownership
+state is partially changed.
+
+`keyed_reload_preserves_topology` can be used to decide whether a replacement
+is eligible for single-function keyed reload or requires generation
+replacement.
+
+## 6. Dispatch visibility and memory ordering
+
+Ordinary `DispatchTable::set` is a release store and `get` is an acquire load.
+Keyed generation records are also release-published/acquire-read through the
+registry. Finalized code bytes and immutable metadata therefore happen-before a
+reader that observes the new pointer.
+
+A frame already executing an old body continues in that body. Calls made after
+publication can observe the replacement. Recursive calls may enter the new body
+while older recursive frames finish in the old body; this per-call version
+identity is intentional.
+
+## 7. What remains unsupported
+
+The ordinary identity-dispatch path does not expose a general whole-module
+transaction. It cannot atomically:
+
+- add stable slots for new functions;
+- publish unavailable stubs for removed functions;
+- migrate globals layouts;
+- re-resolve imports as one generation.
+
+Keyed whole-generation replacement does exist, but it is tied to the immutable
+keyed module-record model and does not silently provide these semantics for an
+ordinary `DispatchTable`/`Program` pair.
+
+Loaded `.em` files do not contain source by default. A host needs retained
+source/`Program`/codegen state to compile a source replacement; there is no
+“reload this `.em` from itself” API.
+
+## 8. Shutdown checklist
+
+1. Stop accepting new outer calls and reload requests.
+2. Join script worker/tick threads.
+3. Ensure all execution guards have left.
+4. Call `domain.quiesce()`.
+5. Release pages still current in identity tables or keyed records.
+6. Release module registry, globals, dispatch/record backing, contexts, and
+   extension/GC state in dependency order.
+7. Destroy the domain last relative to its guards.
+
+The domain destructor performs a final quiesce, but explicit shutdown ordering
+is clearer and avoids relying on destruction side effects.
+
+## 9. Migration from the legacy reload API
+
+The pre-v1 API returned a caller-owned `old_entry` and had no persistent domain.
+That API is gone. Migrate by:
+
+- keeping one long-lived `HotReloadDomain` beside reloadable dispatch state;
+- guarding every outer resolution/call;
+- removing all manual old-page frees after successful publication;
+- clearing replaced `CompiledFn` ownership in host bookkeeping;
+- periodically reclaiming/quiescing;
+- draining guards before module destruction.
+
+A temporary domain created inside one reload call is unsafe because guards and
+retired ownership must outlive the call.

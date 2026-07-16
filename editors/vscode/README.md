@@ -11,7 +11,7 @@ built-in grammar engine.
 
 ## Features
 
-- Full keyword coverage matching `src/lexer.cpp`:
+- Keyword/type coverage for the original grammar set:
   - Declarations: `fn`, `struct`, `global`, `enum`, `let`, `mut`, `const`,
     `constexpr`, `defer`, `priv`, `link`
   - Control flow: `if`, `else`, `while`, `do`, `for`, `switch`, `case`,
@@ -19,6 +19,10 @@ built-in grammar engine.
   - Cast / meta: `as`, `auto`, `sizeof`, `offsetof`
   - Primitives: `bool`, `i8`–`i64`, `u8`–`u64`, `f32`, `f64`, `void`
   - Literals: `true`, `false`
+- **Current 0.1.0 grammar gap:** the compiler also has `namespace`,
+  `static_assert`, `try`, `catch`, `throw`, `yield`, `new`, and `delete`, but
+  the TextMate grammar does not yet assign those words keyword scopes. They
+  still parse/compile normally; this declarative extension only affects color.
 - Operators: `=>` (fat arrow), `->` (arrow), `::`, `..`, full
   comparison / arithmetic / bitwise / shift / compound-assignment set,
   `++`, `--`, `?`
@@ -29,9 +33,9 @@ built-in grammar engine.
     embedded ember expressions (incl. nested plain strings and `{{`/`}}`
     escaping)
   - Raw triple-quoted `r"""..."""` (literal, no escapes)
-- Numbers: hex `0x..`, decimal, float (`1.0`, `1e5`, `1.0f`), and tolerant
-  integer width suffixes (`42_u8` etc.) so suffix-typed literals still
-  highlight as numbers even though the v1 lexer rejects them
+- Numbers: hex `0x..`, decimal, and float (`1.0`, `1e5`, `1.0f`). The
+  grammar tolerantly highlights integer width suffixes (`42_u8` etc.), but
+  the compiler intentionally rejects them; use an explicit `as` cast
 - Annotations: `@entry`, `@on_tick`, `@obf("mba")`, …
 - `struct`/`enum` names → type scope, `fn name` → function scope,
   `Name::Variant` → enum-variant scope
@@ -69,7 +73,8 @@ editors/vscode/
 
 ## Keeping it in sync
 
-The grammar is generated to track `src/lexer.cpp` and `src/lexer.hpp`. When
+The grammar tracks `src/lexer.cpp` and `src/lexer.hpp` manually. When
 a new keyword / operator / literal form is added to the lexer, add it to the
 corresponding repository entry here. The token inventory lives in
-`enum class Tk` in `src/lexer.hpp`.
+`enum class Tk` in `src/lexer.hpp`. The eight keywords listed in the gap above
+are the current known synchronization backlog.

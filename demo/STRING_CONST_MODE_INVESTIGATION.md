@@ -1,5 +1,15 @@
 # String Const-Mode Classification — Feasibility & Subsumption Study
 
+> **Historical investigation — conclusion implemented through slice safety.**
+> This is a pre-fix snapshot, not a description of current sema verdicts.
+> Encrypted literals used as slices still decode into per-use frame storage;
+> literals converted to the extension `string` become owned copies. Sema now
+> treats a slice-typed `StringLit` as stack-backed and rejects its escape
+> through return/global/retaining-call paths, including borrowed/retained
+> script-function propagation. Therefore the proposed separate const-mode
+> classifier remains unnecessary. See `src/sema.cpp::is_local_array_view`,
+> the Stage 2 borrow/retain pre-pass, and the `sema_invalid_stringlit_*` tests.
+
 **Read-only investigation.** No `src/`, `extensions/`, or `examples/` files were
 modified. The only artifacts created are this doc and the probe under
 `tmp_edit/constmode/` (gitignored). The gate (`ctest` 22/22, lang 245/0/0) was

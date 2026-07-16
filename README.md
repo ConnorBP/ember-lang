@@ -1,74 +1,105 @@
 # ember
 
-![calcifer in a prism](./img/calcifer_prism.png)
+![Calcifer in a prism](./img/calcifer_prism.png)
 
-**A native-JIT embedded scripting language.** Ember compiles scripts to x86-64
-machine code at runtime — no interpreter dispatch loop, no bytecode VM. A hot
-loop runs as real native instructions, not a switch-on-opcode interpreter, so
-it posts **6-7x faster than AngelScript's bytecode interpreter** on compute-
-heavy workloads (`fib`, `tight_loop`, `nested_calls`) and **within 1.04x of
-g++-O2** on integer division (the one path where ember's tree-walker codegen
-is already near-optimal). Around that core it ships a real sandbox (per-frame
-byte budget, stack-depth guard, recoverable traps — a fault unwinds to your
-host, it doesn't kill the process), **hot-reload** of live modules with stable
-dispatch slots, **`.em` module bundling** (signed, native-code bundles with a
-relocation contract, plus a v5 IR-on-disk variant that is re-emitted to x64 at
-load time), a **VST3 audio plugin wrapper** (write VST plugins fully in ember
-with hot-reload DSP), and a Rust-like syntax built for game-engine /
-modding embedding.
+**A native-JIT embedded scripting language for Windows x86-64.** Ember parses,
+type-checks, and compiles source directly to native machine code. There is no
+bytecode interpreter or opcode-dispatch loop. The runtime includes a sandboxed
+call boundary, hot reload, compiled modules, a tracing garbage collector,
+concurrent execution, a standalone executable bundler, and a self-hosted Ember
+compiler.
 
-The **default codegen path is a baseline JIT** — correctness-first, tree-
-walking, stack-spilling — which is 5-8x slower than `g++ -O2` on most paths
-(loop_overhead 5.1x, call_overhead 5.1x, dce_dead_store 7.2x). Closing that gap
-is the purpose of the **IR backend + optimization passes + register allocator**,
-which ship behind the `--passes` flag (default-off, so the default path is the
-unchanged baseline tree-walker). With `--passes`, the optimization passes
-provide targeted speedups: **constprop 1.34x**, **int_div 1.31x** (closing to
-within 1.30x of g++-O2). The linear-scan register allocator promotes hot
-loop-carried frame slots to callee-saved registers, reducing memory traffic in
-tight loops.
+**Release status:** **v1.3.0** is the latest tagged release. The
+`self-hosting-completion` branch contains post-v1.3.0 work, including completed
+self-hosting, and has not received a new release version yet.
 
-**23 IR passes shipped** (16 optimization + 7 obfuscation):
-- Optimization: constprop, dce, cse, licm, forward, copyprop, instcombine, dse,
-  simplifycfg, bounds-elim, sccp, lsr, unroll, spill_elim, peephole, branch_folding
-- Obfuscation: subst (MBA), mba_expand, const_encode, opaque_pred, deadcode,
-  str_encrypt, block_split
+**Current verification:**
 
-Full SSA construction (phi nodes, SSA renaming) remains the future upgrade;
-the shipped regalloc is the linear-scan-over-thin-IR subset (assigns scalar
-int/bool VRegs to Win64 callee-saved registers, spills to frame slots under
-pressure, promotes hot loop-carried frame slots to registers). Current
-version: **v1.2**.
+- **94 CTest tests are configured and the reported current run is 94/94** in
+  the supported MinGW configuration.
+- **The reported self-hosted parity run is 188/188**: 0 unsupported, 0
+  mismatches, and 0 hangs.
+- Reported statement/line coverage is approximately **85%+** in the current
+  coverage campaign. Coverage varies with the configured optional targets.
+- `self_hosted/lex.ember` compiles itself and returns **12** in the reported
+  one-stage bootstrap proof.
+- In the two-generation proof, compiler A compiles the complete approximately
+  12.7k-line self-hosted compiler into compiler B; B then compiles and runs the
+  parity programs correctly.
 
-## What it looks like
+## Highlights
 
-A modular damage calculator that exercises type inference, enums, structs,
-for-each over slices, pattern matching, operator overloads, and native calls —
-with comments marking where ember's unique properties show:
+### Language
+
+- Primitive types: `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`,
+  `f32`, `f64`, `bool`, `void`, and the extension-backed `string` type.
+- Value aggregates: packed structs, fixed arrays, slices, aggregate globals,
+  struct arguments and returns, destructuring, `sizeof`, and `offsetof`.
+- Declarations: mutable and inferred locals, constants, globals, typed and
+  untyped enums, namespaces, default parameters, `constexpr fn`, and
+  `static_assert`.
+- Control flow: `if`/`else`, `while`, C-style `for`, for-each, `do`/`while`,
+  `switch`, `match` with guards and struct patterns, `break`, `continue`, and
+  `defer`.
+- Expressions: explicit casts, ternary expressions, compound assignments,
+  prefix/postfix `++` and `--`, f-strings, function handles, and overloads.
+- Exceptions: `try`, `catch`, and `throw` with per-context catch stacks.
+- Lambdas: no-capture, by-value capture, and GC-backed by-reference capture.
+- Coroutines: `yield` plus `coroutine_start`, `coroutine_next`, and
+  `coroutine_done`.
+- Managed allocation: tracing mark-sweep GC, precise frame/global/extension
+  roots, and language-level `new`/`delete` managed pointers.
+
+### Runtime and tooling
+
+- Baseline tree-walking x86-64 JIT plus a ThinIR backend and linear-scan
+  register allocator.
+- **25 built-in IR passes**: 18 optimization passes and 7 obfuscation passes.
+- Stable dispatch tables, atomic single-function reload, epoch/quiescence page
+  reclamation, keyed-dispatch reload, and whole keyed-generation replacement.
+- Textual source imports and separately compiled `.em` modules with live
+  cross-module calls.
+- Raw-x86 `.em` compatibility formats, validated IR-on-disk formats, signed
+  modules, and keyed-dispatch v6 artifacts. See
+  [`docs/BUNDLING_AND_EM_MODULES.md`](docs/BUNDLING_AND_EM_MODULES.md).
+- A standalone executable bundler (`ember bundle` and `ember_bundle`).
+- Fifteen standard native extensions plus optimization and obfuscation pass
+  packages. See [`extensions/README.md`](extensions/README.md).
+- Concurrent script entry with per-call contexts and a shared, cooperatively
+  collected GC heap.
+- VST3 wrapper, 13 example plugin scripts, realtime validation/stress tests,
+  hot reload, and an editor-side node-graph model with JSON persistence and
+  deterministic Ember source generation.
+- A fully self-hosted compiler and one-/two-generation bootstrap proofs.
+
+The built-in pass names are:
+
+- **Optimization (18):** `constprop`, `dce`, `simplifycfg`, `cse`, `gvn`,
+  `licm`, `lsr`, `forward`, `copyprop`, `instcombine`, `dse`, `bounds-elim`,
+  `sccp`, `unroll`, `spill_elim`, `peephole`, `branch_folding`, `tailcall`.
+- **Obfuscation (7):** `subst`, `mba_expand`, `const_encode`, `opaque_pred`,
+  `deadcode`, `str_encrypt`, `block_split`.
+
+Full SSA construction with phi nodes remains a possible optimization upgrade;
+the shipped allocator operates on ThinIR with conservative live intervals and
+loop-carried frame-slot promotion.
+
+## Example
+
+The following example is compiled by the current CLI. It demonstrates enums,
+structs, slices, for-each, pattern matching, string overloads, and native calls.
 
 ```rs
-// Enums are C-style named constants. The untyped form (`enum E { ... }`)
-// has i32 variants auto-incrementing from 0; an explicit `= N` sets the next
-// base. The typed form `enum E : T` (e.g. `enum Color : i32`) makes the enum
-// name a real type backed by T — see the Language spec below. This example
-// uses the untyped form; `E::A` rewrites to an i64 literal at sema time.
 enum Damage { Physical, Fire = 10, Ice, Lightning }
 
-// Structs are value types with Ember's tight-packed layout (no C++ alignment).
-// Passed by value: ≤8 bytes → one register; >8 bytes → hidden pointer (Win64 ABI).
 struct Enemy {
     hp: i64;
-    weakness: i64;   // holds a Damage enum value (untyped i32 → i64)
-    name: string;     // opaque host handle — string is an extension type
+    weakness: i64;
+    name: string;
 }
 
-// Type inference: `let x = expr` infers x's type from the initializer.
-// No need to write `let x: i64 = 0` — ember infers it.
-fn compute_damage(base: i64, type: i64) -> i64 {
-    // match: pattern matching with no-fallthrough arms (unlike switch).
-    // Each arm is a separate branch — no `break` needed.
-    // `_` is the wildcard/default arm.
-    match (type) {
+fn compute_damage(base: i64, kind: i64) -> i64 {
+    match (kind) {
         Damage::Physical => { return base; },
         Damage::Fire     => { return base * 2; },
         _                => { return base; },
@@ -76,347 +107,217 @@ fn compute_damage(base: i64, type: i64) -> i64 {
     return 0;
 }
 
-// Operator overloads: `string + string` concatenates (registered by the
-// string extension via BindingBuilder::add_overload). The `+` here is
-// a real native call, not syntax sugar.
 fn label(e: Enemy) -> string {
     return e.name + string_from_i64(e.hp);
 }
 
 fn main() -> i64 {
-    // Array literal — a fixed-size i64[3] allocated on the frame.
     let hps: i64[3] = [100, 200, 50];
+    let values: i64[] = hps[..];
+    let mut total = 0;
 
-    // View: `arr[..]` creates a slice {ptr, len} pointing at the array's
-    // backing storage. No copy — the slice is a two-word {pointer, length}.
-    let slice: i64[] = hps[..];
-
-    // for-each: iterates a slice, binding each element to `hp`.
-    // Desugars to a while loop with index + bounds check.
-    // The element type is inferred from the slice's element type.
-    let mut total: i64 = 0;
-    for (hp in slice) {
-        // `as` is the explicit cast operator. Implicit narrowing is rejected
-        // by sema (i64 → i32 requires `as i32`; `let y: i8 = x_i64` is an error).
-        let d: i64 = compute_damage(hp as i64, Damage::Fire);
-        total = total + d;
+    for (hp in values) {
+        total += compute_damage(hp, Damage::Fire);
     }
 
-    // String construction via the string extension's native functions.
-    let goblin: Enemy = Enemy { hp: 150, weakness: Damage::Fire, name: string_from_i64(0) };
-    let tagged: string = label(goblin);  // operator overload: string + string
-    let len: i64 = string_length(tagged); // opaque handle → i64
-
-    // The i64 return becomes the process exit code. The source `run`/`pipe`
-    // paths mask the i64 with `& 0x7fffffff` (clearing bit 31) first, then the
-    // OS truncates to 8 bits (>255 wraps); `--load-em` uses `int(result)` (no
-    // 31-bit mask). Either way the observable exit code is the low byte.
-    return total + len;
+    let goblin: Enemy = Enemy {
+        hp: 150,
+        weakness: Damage::Fire,
+        name: string_from_i64(0)
+    };
+    let tagged = label(goblin);
+    return total + string_length(tagged);
 }
 ```
 
-**What this example shows:**
-- **Type inference** (`let total = 0`, `let d = compute_damage(...)`) — no redundant type annotations
-- **Enums** — untyped (`enum E { ... }`, i32 variants) + typed (`enum E : T`); auto-increment + explicit values (`Damage::Fire = 10`, `Damage::Ice = 11`); variant values may be a `constexpr fn` call
-- **Structs** as value types with field access (`e.hp`, `e.name`)
-- **for-each** over a slice (`for (hp in slice)`) — no manual index loop
-- **match** with no-fallthrough arms + wildcard (`_ => default`)
-- **Operator overloads** (`string + string` → concatenation via a registered native)
-- **Explicit casts** (`hp as i64`) — no implicit narrowing
-- **Opaque host handles** (`string` — an i64 backed by a host-side `std::string`)
-- **Slice views** (`arr[..]` — zero-copy {ptr, len} pair)
-- **Native calls** (`string_from_i64`, `string_length`, `sqrt` — registered via `BindingBuilder`)
-
-All of this compiles to native x86-64 machine code at runtime — no interpreter, no bytecode.
-
-## Getting started
-
-C++17, no external deps beyond `Windows.h`. Builds clean on **MinGW g++ 15.2.0 +
-Ninja** (the supported path). MSVC x64 is unsupported — CMake fails loudly
-because no working MSVC B1 thunk exists.
+Save it as `damage.ember`, then run:
 
 ```bash
-cd ember
-mkdir buildt && cd buildt
-cmake -G Ninja -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe ..
-cmake --build .          # or: ninja
-ctest                    # 70 tests (67 excluding benchmarks + soak)
+./buildt/ember_cli.exe run damage.ember --fn main
 ```
 
-Run and bench a script (`ember` = `buildt/ember_cli.exe`):
+`run` returns the low byte of the script result as the process exit status on
+Windows. Use host calls or printed output when the complete 64-bit value matters.
+
+## Build
+
+### Requirements
+
+- Windows x64
+- CMake 3.16 or newer
+- Ninja
+- MinGW-w64 GCC (the tested configuration is g++ 15.2.0)
+- Bash discoverable by CMake, because `lang_suite` uses a Bash test driver
+- Git submodules initialized, including the optional VST3 SDK tree
+
+MSVC x64 is intentionally rejected by CMake because the supported raw-call
+thunk and generated ABI are the MinGW/Win64 path.
 
 ```bash
-ember run hello.ember              # compiles + calls main(); exit code = low byte of (i64 & 0x7fffffff)
-ember bench hello.ember            # microbenchmark: warmup + N timed iters, prints min/median/mean/p99/stddev
-ember test tests/lang              # native test runner: classify + compile/run every .ember in a directory
-```
-
-CLI reference:
-
-```
-ember run <file.ember> [--fn NAME] [--dump] [--emit-em OUT.em] [--passes P1,P2,...] [--tick [--tick-count N] [--tick-interval MS]]
-ember emit-em <file.ember> <out.em>      # precompile without running
-ember bench <file.ember> [--fn NAME] [--iters N] [--warmup N]
-ember test [dir]                        # run every .ember file in <dir> (default tests/lang/)
-ember run --load-em <file.em> [--fn NAME]
-ember bundle <file.ember> <output.exe> [--stub <stub.exe>] [--fn NAME] [--permissions none|ffi] [--output-permissions stub|preserve]   # bundle into standalone exe
-ember pipe <config>                     # dataflow pipeline runner (Family C): load N .em modules, wire a stage graph, stream i64s through it
-ember live <file.ember> [--tick ...]    # live-coding/reload runner: recompile on file change, show tick output evolve
-```
-
-- `run` compiles and calls the entry function (default `main`). An `i64`
-  return becomes the process exit code: the source `run` (and `pipe`) paths
-  first mask the result with `& 0x7fffffff` (clearing bit 31), then the OS
-  truncates to the low 8 bits (>255 wraps — OS truncation, not a C++ `%`);
-  `void` exits 0. The `--load-em` path instead uses `int(result)` (no 31-bit
-  mask) before the same OS 8-bit truncation, so the two paths agree on the
-  low byte but differ on whether bit 31 is cleared first.
-- `--fn` overrides the entry. `--dump` prints each compiled fn's slot, byte
-  size, and reloc count. `--emit-em` precompiles to a `.em` bundle.
-- `--ffi` / `--allow-io` grant FFI permission: enable the I/O natives
-  (`print`, `println`, `print_i64`, `print_f64`, file/path natives). Without
-  it, an I/O native call is a compile-time sema error. `--allow-io` is an alias.
-- `--gc-env` allocates lambda closure environments on the tracing-GC heap
-  instead of stack-frame temporaries (off by default); needed for a by-value
-  lambda that escapes its defining scope without a use-after-scope.
-- `--tick` runs `@on_tick` fns + any `register_routine`-registered routines on a
-  tick thread (its own `context_t`, isolated from the main thread) at
-  `--tick-interval` ms (default 16); `--tick-count N` auto-stops after N ticks.
-- `ember_check <file>` (parse-only) and `sema_check <file>` (parse+sema) are the
-  one-shot "does this parse/sema-check?" tools the lang regression suite drives.
-
-`import "path";` is textual inclusion before lexing (cycle-detected, deduped),
-so multi-file scripts work. The CLI `run --load-em <file.em>` action loads a
-pre-compiled `.em` bundle (see the CLI reference above); the host
-`load_em_file`/`link_em_file` API and the `link "mod.em" as m;` source
-directive are the embedding-side equivalents. A v1 `.em` carries embedded
-process-local pointers, so it is ABI/process-trusted, not a portable
-interchange format.
-
-## Use cases & quick start
-
-ember is built for **embedding** — you use it as a scripting layer inside a
-host application (game engine, audio plugin, tool, pipeline). Pick your use
-case and follow the quick start:
-
-### 1. Game engine scripting (hot reload, game logic)
-
-Write game logic in ember, hot-reload it while the game runs:
-
-```bash
-# Write a script with @on_tick
-ember live examples/scripts/game_logic.ember --tick --tick-interval 16
-
-# Edit the .ember file → ember recompiles on save, no restart needed
-```
-
-- **Hot reload:** `docs/HOT_RELOAD.md` — dispatch slots, epoch/quiescence reclamation
-- **Lifecycle:** `docs/LIFECYCLE.md` — `@entry`, `@on_tick`, `@event(...)` annotations
-- **Example:** `examples/scripts/game_logic.ember` — modular damage calculator
-- **Host embedding:** `examples/game_host.cpp` — how to embed ember in a C++ host
-
-### 2. VST3 audio plugins (DSP, hot reload, real-time)
-
-Write VST3 plugins **fully in ember** — the C++ wrapper handles the VST3 API,
-you write the DSP:
-
-```bash
-# Build the VST3 wrapper plugin
+git submodule update --init --recursive
+cmake -S . -B buildt -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe
 cmake --build buildt -j 8
-# Output: buildt/VST3/Release/ember_gain.vst3/
-
-# Write your DSP in ember (see examples/vst3_wrapper/gain_vst.ember)
-# @realtime annotation validates real-time safety at compile time
+ctest --test-dir buildt --output-on-failure
 ```
 
-- **Plan:** `docs/planning/plan_VST3_EMBER_WRAPPER.md` — full architecture
-- **Example plugin:** `examples/vst3_wrapper/gain_vst.ember` — stereo gain
-- **DSP harness:** `examples/vst_dsp_harness.cpp` — headless DSP testing
-- **Audio natives:** `extensions/audio/` — `load_f32`/`store_f32`/`audio_*`
-- **@realtime checker:** rejects GC/alloc/IO/threads/exceptions in RT functions
+A fully configured current tree contains **94 tests**. Optional dependency or
+platform conditions can change the configured count; use `ctest --test-dir
+buildt -N` to inspect the local inventory.
 
-### 3. Dataflow pipelines (stream processing)
+The build vendors Ed25519 source under `thirdparty/ed25519`. The VST3 target is
+built when `thirdparty/vst3sdk` is present and `EMBER_BUILD_VST3=ON` (the
+default).
 
-Chain ember modules into a pipeline that processes a stream of values:
+## CLI
+
+In the commands below, `ember` means `buildt/ember_cli.exe`.
+
+```text
+ember run <file.ember> [--fn NAME] [--dump] [--emit-em OUT.em]
+          [--tick [--tick-count N] [--tick-interval MS]]
+          [--passes SPEC] [--profile light|balanced|heavy]
+          [--pass-seed U64] [--gc-env] [--ffi]
+ember emit-em <file.ember> <out.em>
+ember run --load-em <file.em> [--fn NAME]
+ember bench <file.ember> [--fn NAME] [--iters N] [--warmup N]
+ember test [dir]
+ember pipe <config.pipe>
+ember live <file.ember> [--tick-count N] [--tick-interval MS] [--poll-ms MS]
+ember bundle <file.ember> <output.exe> [--stub PATH] [--fn NAME]
+             [--permissions none|ffi]
+             [--output-permissions stub|preserve]
+```
+
+Important options:
+
+- `--ffi` grants `PERM_FFI`, including the standard I/O and module-loader
+  natives. `--allow-io` is an alias.
+- `--gc-env` enables GC-backed lambda environments and precise GC roots; use it
+  for escaping by-reference captures and managed `new`/`delete` workloads.
+- `--passes` selects an explicit comma-separated pipeline.
+- `--profile` (alias `--pass-profile`) selects `light`, `balanced`, or the
+  explicitly experimental `heavy` recipe. `--pass-seed` fixes its root seed.
+- `--dump` prints compiled function slots, sizes, and relocation counts.
+- `emit-em` and `--emit-em` currently write the standard unsigned `.em`
+  artifact used by the CLI and bundler. Loading raw-x86 compatibility artifacts
+  is an explicit trusted/development policy in the embedding API.
+
+`import "path.ember";` performs cycle-detected, deduplicated textual inclusion
+before lexing. `link "module.em" as m;` keeps a separately compiled module and
+allows calls such as `m::process(value)` through the module registry.
+
+## Self-hosting and bootstrap
+
+Self-hosting is complete on this branch. The compiler stages are written in
+Ember:
+
+- `self_hosted/lex.ember`
+- `self_hosted/parse.ember`
+- `self_hosted/sema.ember`
+- `self_hosted/codegen.ember`
+- `self_hosted/full_pipeline.ember`
+- `self_hosted/emberc.ember`
+
+The generated `ember_selfhost_preview.exe` bundles the self-hosted compiler.
+It reads a source path from standard input, compiles that source, and executes
+its `main` function.
+
+```console
+echo self_hosted\preview_smoke_input.ember | buildt\ember_selfhost_preview.exe
+```
+
+Bootstrap proofs:
+
+- The one-stage harness compiles `self_hosted/lex.ember` with the self-hosted
+  pipeline and checks the expected result, 12. `lex.ember` is a compiler-stage
+  library and intentionally has no directly runnable `main`, so invoking it as
+  a normal CLI entry is not the bootstrap command.
+- The two-generation driver can be run directly. Compiler A emits B; B reads
+  the piped test path, compiles it, and returns the test result:
 
 ```bash
-# Run a 3-stage pipeline: A::process -> B::reduce -> C::square
-ember pipe tests/features/pipe_3stage.pipe
+echo tests/lang/valid_try_catch.ember | \
+  ./buildt/ember_cli.exe run self_hosted/bootstrap.ember --fn main --ffi
+
+# Full differential parity audit.
+powershell -ExecutionPolicy Bypass \
+  -File self_hosted/correctness_tests/run_parity_audit.ps1 \
+  -EmberCli buildt/ember_cli.exe
 ```
 
-- **Pipeline config:** `.pipe` text format — `module <alias> <path>`, `stage <alias>::<fn>`, `input <start> <count>`
-- **Examples:** `tests/features/pipe_2stage.pipe`, `pipe_3stage.pipe`
-- **Modules:** `docs/MODULES.md` — `.em` bundling + cross-module linking
+The parity result is **188/188**, with no unsupported cases, mismatches, or
+hangs. The module image produced by the self-hosted compiler is **EMBM v2**,
+which adds a function table and stable dispatch vector to EMBM v1. EMBM is a
+separate in-memory bootstrap image format from the public `EMBL`/`.em` file
+format. See [`self_hosted/MODULE_IMAGE_FORMAT.md`](self_hosted/MODULE_IMAGE_FORMAT.md).
 
-### 4. Live coding (iterate on tick-based scripts)
+## VST3 wrapper
 
-Run a script with `@on_tick` functions, recompile on file change:
+Build the default VST3 target with the normal build command. The package is
+normally emitted under `buildt/VST3/Release/ember_gain.vst3` in a Release
+configuration.
 
-```bash
-ember live examples/scripts/control.ember --tick --tick-count 10 --tick-interval 100
-# Edit control.ember → ember recompiles, prints "reloaded (epoch N)"
-```
+The wrapper provides realtime-safe processing validation, sample-accurate
+parameter automation, MIDI, f32/f64 processing, state/preset persistence,
+latency/tail reporting, background hot reload, and crossfades. Thirteen example
+DSP scripts live in `examples/vst3_wrapper/`.
 
-- **Hot reload mechanics:** `src/hot_reload.hpp` — `HotReloadDomain`, `ExecutionGuard`
-- **Example:** `tests/features/live_tick.ember`
+The editor-side node-graph code in `src/node_graph.*` and `src/node_codegen.*`
+validates acyclic audio graphs, persists them as JSON, and generates
+self-contained Ember VST3 source. It is a model/code-generation layer rather
+than a VSTGUI editor embedded in the plugin.
 
-### 5. Standalone exe bundling (distribute without ember installed)
+See [`docs/VST3_PLUGIN_GUIDE.md`](docs/VST3_PLUGIN_GUIDE.md) and
+[`examples/vst3_wrapper/stress_tests/README.md`](examples/vst3_wrapper/stress_tests/README.md).
 
-Bundle a `.ember` script + the ember runtime into a single `.exe`:
+## Embedding and runtime model
 
-```bash
-# Bundle a script into a standalone executable
-ember bundle my_script.ember my_app.exe
-# Or use the dedicated bundler:
-ember_bundle my_script.ember my_app.exe
+- `engine_t`-style state owns registered native signatures and overloads.
+- A compiled module owns stable dispatch slots and a globals block.
+- Each invocation uses a `context_t` for budget, depth, trap, catch, thread, and
+  GC state.
+- Native functions are registered with `BindingBuilder` and `NativeSig`.
+- `PERM_FFI` is checked at source compilation and at module load.
+- JIT pages are written RW and sealed RX before publication.
+- Recoverable traps use the host checkpoint instead of terminating the process
+  when the host follows the documented call contract.
 
-# Run it anywhere — no ember install needed
-./my_app.exe
-```
+Read these first:
 
-- **Bundling:** `docs/BUNDLING_AND_EM_MODULES.md` — the `.em` format, relocations
-- **Stub:** `examples/ember_stub_main.cpp` — the runtime stub
-- **Bundler:** `examples/ember_bundle.cpp` — the bundler tool
-- **Release packaging:** `scripts/package_release.sh`
+- [`docs/spec/BINDING_API.md`](docs/spec/BINDING_API.md)
+- [`docs/spec/SAFETY_AND_SANDBOX.md`](docs/spec/SAFETY_AND_SANDBOX.md)
+- [`docs/spec/MEMORY_AND_GC.md`](docs/spec/MEMORY_AND_GC.md)
+- [`docs/LIFECYCLE.md`](docs/LIFECYCLE.md)
+- [`docs/HOT_RELOAD.md`](docs/HOT_RELOAD.md)
 
-### 6. Self-hosted compiler (ember written in ember)
+## Documentation index
 
-The ember compiler (lexer, parser, sema, codegen) is being ported to ember itself:
+### User and runtime documentation
 
-```bash
-# Run the self-hosted end-to-end pipeline
-ember run self_hosted/full_pipeline.ember --fn run_demo --ffi
-# Compiles + executes `fn main() -> i64 { return 1 + 2 * 3; }` → 7
-```
+- [`docs/guide/00-index.md`](docs/guide/00-index.md) — language guide index
+- [`docs/MODULES.md`](docs/MODULES.md) — source imports, live modules, dispatch,
+  EMBL `.em`, and EMBM bootstrap images
+- [`docs/BUNDLING_AND_EM_MODULES.md`](docs/BUNDLING_AND_EM_MODULES.md) — `.em`
+  versions, loader policy, and executable bundling
+- [`docs/HOT_RELOAD.md`](docs/HOT_RELOAD.md) — identity and keyed reload
+- [`docs/LIFECYCLE.md`](docs/LIFECYCLE.md) — annotations and dynamic routines
+- [`docs/PASS_AUTHORING.md`](docs/PASS_AUTHORING.md) — custom IR passes
+- [`docs/VST3_PLUGIN_GUIDE.md`](docs/VST3_PLUGIN_GUIDE.md) — VST3 wrapper
 
-- **Stages:** `self_hosted/lex.ember`, `parse.ember`, `sema.ember`, `codegen.ember`
-- **Compiler entry:** `self_hosted/emberc.ember` — the self-hosted compiler
-- **Tests:** `self_hosted/*_test.ember` (wired into ctest)
-- **Status:** subset of ember supported (i64/bool/void, let, if/while/for, arithmetic, calls)
+### Specifications and project history
 
-### 7. Custom optimization & obfuscation passes
-
-Write your own IR passes — optimization or obfuscation:
-
-```bash
-# Run built-in passes
-ember run my_script.ember --passes constprop,forward,copyprop,instcombine,dce,licm,dse,simplifycfg,bounds-elim,sccp
-# Obfuscation passes
-ember run my_script.ember --passes opaque_pred,deadcode,mba_expand,const_encode,str_encrypt,block_split
-```
-
-**23 passes shipped (16 optimization + 7 obfuscation):**
-- Optimization: ConstProp, DCE, CSE, LICM, Forward, CopyProp, InstCombine, DSE, SimplifyCFG, bounds-elim, SCCP, LSR, Unroll, SpillElim, Peephole, BranchFolding
-- Obfuscation: SubstitutionPass (MBA), mba_expand, const_encode, opaque_pred, deadcode, str_encrypt, block_split
-
-String encryption (`str_encrypt`) and block splitting (`block_split`) are
-shipped obfuscation passes: string encryption transforms `ConstStringRef` IR
-ops into `StringDecrypt` (XOR-decrypt at runtime), matching ember's built-in
-`string_xor_key` feature but as a composable pass; block splitting
-deterministically splits long basic blocks. Both are value-preserving (pinned
-by `tests/lang/valid_obf_str_encrypt.ember` and `valid_obf_block_split.ember`,
-run with `--passes str_encrypt` / `--passes block_split`).
-
-- **Pass system:** `docs/spec/PASS_SYSTEM_DESIGN.md` — architecture, registration, lifecycle
-- **Pass authoring guide:** `docs/PASS_AUTHORING.md` — how to write a custom pass
-- **Custom pass examples:** `examples/custom_pass/` — minimal_pass, nop_injection, block_merge + README
-- **Optimization research:** `docs/planning/plan_OPTIMIZATION_PASSES.md`
-- **Obfuscation research:** `docs/planning/plan_OBFUSCATION_PASSES.md`
-
-## Docs
-
-**Spec** (`docs/spec/`)
-- `TYPE_SYSTEM.md` — primitives, struct layout, slices, the no-raw-pointer rule, conversion matrix
-- `COMPILER_PIPELINE.md` — lexer/BNF/AST, sema passes, the shipped tree-walking lowering, deferred SSA-lite
-- `CODEGEN_SPEC.md` — the x86-64 backend: calling convention, encodings, regalloc, traps
-- `SAFETY_AND_SANDBOX.md` — threat model, budgets, depth guard, bounds checks, `PERM_FFI`, trap surface, thread-safety
-- `BINDING_API.md` — the shipped `BindingBuilder`/`NativeSig` API, Win64 slot mapping, slice convention
-- `MEMORY_AND_GC.md` — ownership taxonomy, slice-escape check, globals, the v2-GC deferral rationale
-- `BENCHMARK_SYSTEM_DESIGN.md` — the bench harness design, the g++ -O2 axis, methodology
-- `PASS_SYSTEM_DESIGN.md` — the composable pass architecture: extension-style discovery + LLVM-style pass interface, the shipped opt/obf passes
-- `CODEGEN_OPTIMIZATION_DESIGN.md` — the codegen optimization design: per-path waste mapping, staged SSA-lite IR plan, pass interface
-
-**Usage**
-- `docs/BUNDLING_AND_EM_MODULES.md` — the `.em` binary bundling format: `EMBL` container, relocations, writer/loader
-- `docs/MODULES.md` — the module model: `.em` → dispatch table + globals, slot stability across reloads
-- `docs/HOT_RELOAD.md` — dispatch table, slot stability, reload protocol, epoch/quiescence reclamation
-- `docs/LIFECYCLE.md` — `@entry` / `@on_tick` / `@event(...)` annotation discovery + `register_routine`
-
-**Planning**
-- `docs/ROADMAP.md` — every v2+ deferral with a re-entry trigger + dependency, tiered by build order; hard non-goals
-- `docs/planning/DESIGN.md` — the index doc: top-level plan, architecture diagram, milestone list
-- `docs/planning/GAP_ANALYSIS.md` — the completeness audit: original-request requirements → where satisfied
-
-## Language spec
-
-**Type system.** Primitives `i8/i16/i32/i64`, `u8/u16/u32/u64`, `f32/f64`,
-`bool`, `string` (owned, via the string extension), and `slice[T]` (a bounded
-view — the no-raw-pointer rule). User types: `struct` (value type, field layout
-queryable via `sizeof`/`offsetof`) and `enum` — **untyped** (`enum E { ... }`,
-i32 variants, `E::A` rewrites to an `i64` literal at sema) **or typed**
-(`enum E : T`, e.g. `enum Color : i32`, makes the enum name a real type backed
-by `T`; enum→int implicit widening is allowed, int→enum is rejected). First-class `fn` handles (`&fn` / `handle(args)`)
-backed by the dispatch table.
-
-**Syntax (Rust-like).**
-- Bindings: `let x: i64 = 0;`, `let mut x = 0;`, `const N: u64 = sizeof(i64);`
-- Functions: `fn name(p: i64) -> i64 { ... }`; default+trailing-optional params;
-  `constexpr fn name(...) -> i64 { ... }` — a fn that **can** be const-evaluated
-  at sema time when called with all-constant args (the call is rewritten to an
-  `IntLit`; bounded interpreter, i64 integer fns only, falls back to a runtime
-  call for non-constant args or float/bool/struct fns)
-- Compile-time assertions: `static_assert(cond, "msg");` — folds `cond` at
-  sema (cond may be a literal expr or a `constexpr fn` call); a false result is
-  a compile error with `msg`, a true result is elided (no runtime code)
-- Control: `if`/`else`, `while`, `for (init; cond; step)`, `for (x in slice)`
-  (and `for (x in array_handle)` via the `iterable()` hook),
-  `do { } while(cond);`, `switch`/`case`/`default`/`break`,
-  `match (expr) { pat => body, _ => default }`, `continue`, `return`
-- `defer` — cleanup runs at **lexical-block exit** (LIFO), including on
-  `break`/`continue`/`return` edges
-- Operators: `+ - * / %`, comparisons, `&& ||`, `as` casts, `++/--`, `+=` etc.
-- F-string lowering through the string extension
-
-**Safety model.** W^X JIT memory; a per-frame byte budget (instructions), a
-stack-depth guard, and bounds checks. Every fault — budget exhaustion, stack
-overflow, div-by-zero, `INT64_MIN/-1`, OOB — funnels through **one non-local
-unwind** to the host: a trap is recoverable, never process death. `PERM_FFI`
-gates native calls. v1.0 adds call-target-provenance (the REDSHELL #6 guard) and
-context thread-safety (per-thread `context_t`, one compiled body serves N
-contexts). Documented gaps are listed in `SAFETY_AND_SANDBOX.md`.
-
-**Modules / `.em`.** `link "mod.em" as m;` resolves a compiled bundle to a
-dispatch table + globals block; `m::fn()` cross-module calls go through the real
-grammar. `.em` bundles are signed, carry relocations (`DispatchTableBase` /
-`GlobalsBase`), and keep slot stability across hot reloads. A v1 `.em` is
-ABI/process-trusted (process-local pointers), not a portable format —
-cross-process portability is a versioned-relocation v2+ item.
-
-**Binding API.** Register natives with `BindingBuilder` + `NativeSig`; the
-host maps script types to Win64 slots and ships a slice convention. The fifteen
-`NativeSig` addon extensions (`vec`/`quat`/`mat`/`string`/`array`/`math`/`map`/
-`sync`/`thread`/`coroutine`/`lifecycle`/`io`/`call_raw`/`audio`/`gc`) register their
-`NativeSig` + `OpOverloadTable` entries the same way. (The standalone `ember` CLI
-links and registers all fifteen — see `extensions/README.md`.) Two pass extensions
-(`opt`, `obf`) are a separate category — they register IR→IR transforms via
-`register_passes` (not `register_natives`); see
-`docs/spec/PASS_SYSTEM_DESIGN.md` and `docs/PASS_AUTHORING.md`. The fluent `TypeBuilder`/`StructBuilder`
-surface stays trigger-gated on a host needing script-visible C++ struct types.
+- [`docs/spec/TYPE_SYSTEM.md`](docs/spec/TYPE_SYSTEM.md)
+- [`docs/spec/COMPILER_PIPELINE.md`](docs/spec/COMPILER_PIPELINE.md)
+- [`docs/spec/CODEGEN_SPEC.md`](docs/spec/CODEGEN_SPEC.md)
+- [`docs/spec/PASS_SYSTEM_DESIGN.md`](docs/spec/PASS_SYSTEM_DESIGN.md)
+- [`docs/ROADMAP.md`](docs/ROADMAP.md)
+- [`docs/RESEARCH_NOTES.md`](docs/RESEARCH_NOTES.md)
 
 ## License
 
-ember is **dual-licensed**:
-
-- **AGPL-3.0** for open-source and community use — if you use ember in a
-  project that you distribute or make available as a network service, you must
-  open-source your integration under AGPL-3.0. See `LICENSE`.
-
-- **Commercial license** for proprietary/commercial use — if you want to use
-  ember without the AGPL copyleft obligation (e.g., in a proprietary product or
-  commercial service), you need a commercial license. See `COMMERCIAL_LICENSE.md`
-  or contact connor.postma@gmail.com.
-
-This dual-license model ensures ember stays free for open-source development
-while allowing sustainable commercial integration. External contributions
-require a CLA (Contributor License Agreement) to preserve the ability to offer
-commercial licenses.
+Ember is offered under AGPL-3.0 and under separately negotiated commercial
+terms. `LICENSE` is the authoritative AGPL text. The commercial overview is in
+[`COMMERCIAL_LICENSE.md`](COMMERCIAL_LICENSE.md). Nothing in this README is
+legal advice.

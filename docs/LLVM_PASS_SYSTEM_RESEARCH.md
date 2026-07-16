@@ -1,5 +1,20 @@
 # LLVM Pass System Research — For Ember's Composable Pass Architecture
 
+> **Research snapshot and design provenance.** The LLVM 18.1.8 material below
+> remains useful background, but Ember's implementation has moved beyond the
+> original minimal design. Current Ember uses concept/model type erasure,
+> strict factory registration, transactional comma-only pipeline parsing,
+> checked execution with rollback/growth limits, deterministic seed derivation,
+> ordinary named profiles, and 25 registered passes (18 optimization + 7
+> obfuscation). `EmberAnalysisManager` is still a stub; transforms compute
+> predecessor/dominator/use information locally. For the authoritative current
+> contract use [`PASS_AUTHORING.md`](PASS_AUTHORING.md),
+> `src/ember_pass*.{hpp,cpp}`, and `extensions/{opt,obf}`.
+>
+> One deliberate difference from the recommendation in §9: Ember currently
+> rejects parenthesized/nested pipeline syntax. Its grammar is an empty string
+> or comma-separated names; this keeps construction strict and transactional.
+
 > **Purpose:** Research how LLVM organizes its optimization pass system modularly, in order to design a composable pass architecture for ember — a C-style JIT scripting language whose passes operate on a thin IR (`ThinFunction`).
 >
 > **Primary source:** LLVM 18.1.8 source tree at `E:\DEVELOPER\LLVM_18_1_8`.

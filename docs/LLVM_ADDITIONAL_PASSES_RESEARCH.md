@@ -1,5 +1,30 @@
 # LLVM Additional Passes Research — For Ember's Thin IR
 
+> **Historical research snapshot; implementation status has changed.** This
+> document was written when Ember had four optimization passes and evaluates
+> eight candidates. The current registry has 18 optimization passes plus 7
+> obfuscation passes. The researched forwarding, copy propagation,
+> instcombine, DSE, CFG simplification/branch cleanup, LSR, and IR peephole
+> work has shipped; so have SCCP, bounds-check elimination, unrolling, spill
+> elimination, GVN, and tail-call marking. `EmberAnalysisManager` remains a
+> stub: even GVN/LICM construct the facts they need locally. Treat the old line
+> numbers, performance predictions, “what Ember lacks,” and implementation
+> order as provenance, not current status. See `extensions/opt/ext_opt.hpp`,
+> [`PASS_AUTHORING.md`](PASS_AUTHORING.md), and the pass coverage tests.
+
+## Current disposition of the researched candidates
+
+| Research item | Current status |
+|---|---|
+| Store-to-load forwarding | shipped as `forward` |
+| Instruction combining | shipped as `instcombine` |
+| Constant-through-memory | remains part of `constprop`; no separate MemCpyOpt clone |
+| Dead-store elimination | shipped as `dse` |
+| Branch/unreachable CFG cleanup | `simplifycfg` plus `branch_folding` |
+| Copy propagation | shipped as `copyprop` |
+| Strength reduction | shipped as canonical-loop `lsr` |
+| IR peephole | shipped as `peephole` |
+
 > **Purpose:** Research which *additional* LLVM optimization passes could be adapted for ember's thin IR (`ThinFunction`), assess each for applicability to naive three-address TAC (NOT SSA), implementability as an IR→IR transform over `ThinFunction`, and expected impact on a compile-time-sensitive JIT. This is the companion to `docs/LLVM_PASS_SYSTEM_RESEARCH.md` (which studied the pass *system* architecture) — this doc studies the *passes themselves*.
 >
 > **Primary source:** LLVM 18.1.8 source tree at `E:\DEVELOPER\LLVM_18_1_8`.

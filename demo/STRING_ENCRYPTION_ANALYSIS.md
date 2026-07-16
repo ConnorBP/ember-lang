@@ -1,5 +1,14 @@
 # String Encryption — Transient-Raw-Value Analysis
 
+> **Historical investigation — implementation superseded.** The original
+> `__str_decrypt` host contract described below no longer exists. Both the
+> tree-walker and ThinIR backends decrypt encrypted literal bytes inline into
+> compiler-owned frame temporaries (`alloc_str_temp`); no heap-returning decrypt
+> native is registered. Owned `string` conversion copies those bytes, and the
+> later slice-escape safety work prevents a temporary slice from escaping its
+> frame. The `str_encrypt` ThinIR pass is an additional composable transform,
+> not the old host native. Retain the analysis below for rationale only.
+
 **Read-only investigation.** No `src/`, `extensions/`, or `examples/` files were
 modified. The only artifacts created are this doc and the probe under
 `tmp_edit/enc/` (gitignored). The gate (`ctest`, 20 tests) was confirmed green

@@ -1,5 +1,16 @@
 # Slice-of-Stack-Local Escape Safety — Investigation & Fix Design
 
+> **Historical investigation — fixes shipped.** This document captures the
+> pre-fix snapshot at commit `e98dc87`; its line numbers, verdict matrix, and
+> recommended changes are not current implementation claims. Stage 1 now
+> recognizes encrypted `StringLit` frame temporaries and global-rooted field/
+> index stores. Stage 2 adds per-function borrowed/retained parameter analysis,
+> rejects retaining native/script call paths, and propagates borrowed return
+> provenance. Current code is in `src/sema.cpp` (`is_local_array_view`,
+> `compute_borrow_retain`, and the C1/C2/C3/C5 guards); regression coverage is
+> in `tests/lang/sema_{invalid,valid}_*slice*` and
+> `sema_invalid_stringlit_*`. This file remains relevant as design rationale.
+
 **Read-only investigation.** No `src/`, `extensions/`, or `examples/` files
 were modified. The only artifacts created are this doc and the probes under
 `tmp_edit/slice_escape/` (gitignored). The gate (`ctest` 22/22, lang 245/0/0)

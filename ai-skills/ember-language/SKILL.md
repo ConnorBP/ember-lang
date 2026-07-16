@@ -1,430 +1,280 @@
 ---
 name: ember-language
-description: Write and debug ember scripts (.ember files) for the ember JIT scripting language. Ember is a C-style language that compiles to native x86-64 (not bytecode) via a tree-walking codegen or an optimizing three-address IR backend with 23 passes. Use when writing .ember scripts, porting AngelScript/ENMA code to ember, debugging ember compile/runtime errors, writing VST3 audio plugins in ember, or authoring custom IR passes.
+description: Write, debug, build, and embed Ember scripts on the self-hosting-completion branch. Use for .ember syntax, CLI commands, native extensions, ThinIR passes, VST3 DSP scripts and node graphs, standalone bundles, or self-hosting work.
 ---
 
-# Ember Language — JIT-compiled C-style scripting (v1.2+)
+# Ember language reference (self-hosting-completion)
 
-Ember compiles `.ember` source directly to native x86-64 machine code at runtime
-— no interpreter dispatch loop, no bytecode VM. A hot loop runs as real native
-instructions. Runs **6-7x faster than AngelScript** on compute-heavy workloads
-and **within 1.04x of g++-O2** on integer division. Designed for game engine,
-modding, audio plugin, and pipeline embedding.
+The latest tag is v1.3.0; this branch is post-v1.3.0 and unreleased. Ember is
+a Windows x86-64 native JIT scripting language. The supported build is
+MinGW g++ 15.2 + Ninja; MSVC x64 is not supported. The default backend walks the
+AST and emits x64. `--passes` or a named profile uses ThinIR, checked pass
+execution, register allocation, and x64 emission.
 
-## Two codegen backends
+## Build and executable names
 
-- **Tree-walker (default):** correctness-first, stack-spilling. The baseline JIT.
-  Always available; default-off for `--passes`.
-- **ThinIR backend (`--passes`):** three-address IR with linear-scan register
-  allocation + 23 optimization/obfuscation passes. Promotes hot loop-carried
-  frame slots to callee-saved registers.
-
-## Type system — DO NOT use C++ types
-
-Ember has its own type names. C++ types are a compile error.
-
-| Ember type | C++ equivalent | Notes |
-|---|---|---|
-| `i8` `i16` `i32` `i64` | `int8_t` ... `int64_t` | Signed integers |
-| `u8` `u16` `u32` `u64` | `uint8_t` ... `uint64_t` | Unsigned integers |
-| `f32` `f64` | `float` / `double` | IEEE-754 |
-| `bool` | `bool` | `true` / `false` |
-| `void` | `void` | Return type only |
-| `string` | — | Owned string via the string extension (opaque host handle) |
-| `slice[T]` | — | Bounded view {ptr, len} — the no-raw-pointer rule |
-
-**Common mistakes:**
-- ❌ `int x = 5;` → ✅ `let x : i32 = 5;`
-- ❌ `float y = 1.5f;` → ✅ `let y : f32 = 1.5f;`
-- ❌ `uint64_t addr;` → ✅ `let addr : u64;`
-- ✅ `auto x = 5;` (ember HAS auto — infers i64)
-- ✅ `let s = "hi";` (string literals are `slice<u8>`; `string` is an owned extension type)
-
-## Syntax basics
-
-### Variable declaration
-```
-let x : i64 = 42;          // explicit type
-let mut y = 3.14f;         // mut + type inference (infers f32)
-auto z = 5;                // infers i64
-const Z : i64 = 100;       // immutable
+```bash
+cmake -S . -B buildt -G Ninja \
+  -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe
+cmake --build buildt -j 8
+ctest --test-dir buildt -E bench -LE soak --output-on-failure
 ```
 
-### Functions
-```
-fn add(a: i64, b: i64) -> i64 {
-    return a + b;
-}
+The binary is `buildt/ember_cli.exe`; documentation often calls it `ember`.
 
-fn void_fn() {             // void return (no -> prefix needed)
-    print_i64(42);
-}
+## Core syntax
 
-constexpr fn fib(n: i64) -> i64 {   // constexpr fn — const-evaluated at sema
-    if (n < 2) { return n; }        // time when called with all-constant args
-    return fib(n - 1) + fib(n - 2); // (i64 integer fns only; falls back to
-}                                  //  runtime call for non-constant args)
-```
-
-### Control flow
-```
-if (x > 0) { ... }
-else if (x == 0) { ... }
-else { ... }
-
-while (i < 10) { i += 1; }
-
-for (let i : i32 = 0; i < 10; i += 1) { ... }
-
-for (hp in slice) { total += hp; }    // for-each over a slice or array handle
-
-do { i += 1; } while (i < 10);
-
-switch (x) {
-    case 1: { ... break; }
-    default: { ... break; }
-}
-
-// match: pattern matching with no-fallthrough arms (no break needed)
-match (type) {
-    Damage::Fire     => { return base * 2; },
-    Damage::Physical => { return base; },
-    _                => { return base; },   // _ = wildcard/default
-}
-```
-
-### Enums (untyped + typed)
-```
-enum Damage { Physical, Fire = 10, Ice, Lightning }  // untyped: i32 variants
-//   Damage::Fire rewrites to i64 literal 10 at sema time
-//   Damage::Ice auto-increments to 11
-
-enum Color : i32 { Red, Green, Blue }  // typed: Color is a real type backed by i32
-//   enum→int implicit widening allowed; int→enum is rejected
-```
-
-### Structs (POD value types, tight-packed layout)
-```
+```ember
 struct Pair { a: i64; b: i64; }
-fn sum(p: Pair) -> i64 { return p.a + p.b; }
-let x : Pair = Pair { a: 10, b: 20 };
+enum Kind { A, B = 10, C }
+enum Color: i32 { Red, Green, Blue }
 
-// struct destructure:
-let Pair { a, b } = x;    // binds a = 10, b = 20
-```
+constexpr fn twice(x: i64) -> i64 { return x * 2; }
+static_assert(twice(3) == 6, "constexpr works");
 
-### Namespaces
-```
-namespace cs2 {
-    fn process(addr: u64) -> u64 { ... }
+fn sum(p: Pair, xs: i64[]) -> i64 {
+    let mut out: i64 = p.a + p.b;
+    for (x in xs) { out += x; }
+    defer cleanup();              // defer takes an expression statement, not a block
+    return out;
 }
-// call: cs2::process(0x1234)
-```
 
-### Defer (lexical-block-exit cleanup, LIFO)
-```
-fn example() -> i64 {
-    let buf = array_new(1, 256);
-    defer { array_free(buf); }    // runs at block exit (incl. return/break)
-    // ... use buf ...
-    return 0;                      // defer runs here
-}
-```
-
-### Try / catch / throw (exceptions)
-```
-fn risky() -> i64 {
+fn control(x: i64) -> i64 {
     try {
-        if (bad) { throw 42; }
-        return 1;
+        match (x) {
+            0 => { return 1; },
+            _ if x > 0 => { return 2; },
+            _ => { throw 9; },
+        }
+        return 0;                 // trailing return may still be needed after switch/match
     } catch (e: i64) {
-        return e;                  // e = thrown value
+        return e;
     }
 }
 ```
 
-### Coroutines / yield
+### Types
+
+- primitives: `bool`, signed/unsigned `i8`-`i64` / `u8`-`u64`, `f32`, `f64`,
+  `void`;
+- fixed array: `T[N]`; slice: `T[]` (not `slice[T]`);
+- packed value structs and typed/untyped enums;
+- extension-backed nominal handles such as `string`, `vec3`, `atomic`, and
+  `coroutine`;
+- function types: bare `fn` or recorded `fn(i64, f32) -> bool`;
+- managed pointer type produced by `new T` and accepted by `delete`.
+
+Integer literals default to `i64`; decimal floating literals default to `f64`;
+`1.0f` is f32. Integer width suffixes are rejected—write `42 as u8`. There are
+no implicit mixed-type promotions: cast explicitly with `as`.
+
+Locals are immutable unless `mut` is present:
+
+```ember
+let x: i64 = 1;
+let mut y = 2;
+auto z = 3;
+const K: i64 = 4;
+global counter: i64 = 0;
 ```
-fn generator() -> i64 {
-    yield 1;
-    yield 2;
-    yield 3;
-    return 0;    // done
+
+Aggregate globals, array literals, direct struct-literal returns, and aggregate
+call arguments are implemented:
+
+```ember
+global origin: Pair = Pair { a: 0, b: 0 };
+global table: i64[3] = [1, 2, 3];
+fn make() -> Pair { return Pair { a: 4, b: 5 }; }
+```
+
+### Strings and slices
+
+A literal initially has a bounded `u8[]` representation. In a `string` context
+sema requests an owned extension string. Encryption is host-selected (the CLI
+uses a nonzero XOR key); both backends decrypt inline into compiler frame
+storage. Do not return/store a literal-backed slice—the slice-escape checker
+rejects stack-backed escapes. `string_from_slice` copies.
+
+```ember
+let bytes: u8[] = "hello";
+let owned: string = "hello";
+let message: string = f"value={42}";
+let raw: u8[] = r"""C:\literal\path""";
+```
+
+### Functions, lambdas, and coroutines
+
+```ember
+fn add(a: i64, b: i64 = 1) -> i64 { return a + b; }
+let h: fn(i64, i64) -> i64 = &add;
+let result = h(2, 3);
+
+let base = 10;
+let by_value = fn(x: i64) -> i64 { return base + x; };
+let mut n = 1;
+let by_ref = fn[&n](x: i64) -> i64 { n += x; return n; };
+
+fn generator(n: i64) -> i64 {
+    yield n;
+    yield n + 1;
+    return 0;
 }
-// driven by the coroutine extension (Windows fibers)
+let c = coroutine_start(&generator, 10); // Windows fiber implementation
+let first = coroutine_next(c);
 ```
 
-### Lambdas (with capture)
-```
-fn make_adder(n: i64) -> i64 {
-    let add = fn(x: i64) -> i64 { return x + n; };  // captures n by value
-    return add(10);
-}
-// by-ref capture via the GC-backed lambda env (use_gc_env flag)
-```
+Function-handle stack arguments are supported. Use recorded function types
+when signatures matter. GC-backed escaping/by-reference closure environments
+are enabled by the appropriate host/CLI GC setup (`--gc-env` where required).
 
-### Static assertions
-```
-static_assert(sizeof(i64) == 8, "i64 must be 8 bytes");
-static_assert(MY_CONST == 42, "config mismatch");
-// cond is folded at sema time (may be a constexpr fn call)
-// false = compile error with msg; true = elided (no runtime code)
+### Allocation and safety
+
+```ember
+let p = new i64;
+delete p;
 ```
 
-### Type conversions (explicit `as`, never implicit)
-```
-let i : i64 = 42;
-let f : f32 = i as f32;     // explicit cast
-let n : i32 = i as i32;     // narrowing (truncates)
-let u : u64 = i as u64;     // signed→unsigned (explicit)
+`new` produces a managed pointer and zero-initialized storage; `delete` frees a
+live managed object immediately. The runtime also has tracing collection,
+precise frame/global/extension roots, bounds checks, call-depth checks, an
+instruction budget, and recoverable host checkpoints. FFI-gated calls require
+`--ffi` in the CLI.
 
-// ❌ implicit conversion is an ERROR:
-// let f : f32 = i;          // compile error — must use `as`
-```
+## Imports and modules
 
-### Operators
-```
-+  -  *  /  %          // arithmetic (same-type operands required)
-&  |  ^  ~  <<  >>     // bitwise (integers only)
-== != < <= > >=        // comparison (same-type required, produces bool)
-&& || !                // logical (bool operands only, short-circuit)
-+= -= *= /= %=         // compound assign
-++ --                  // prefix and postfix (integers only)
-?  :                   // ternary (both arms must be same type)
+```ember
+import "lib/math.ember";    // textual, relative, idempotent, cycle-safe
+link "plugin.em" as p;      // compiled module
+let x = p::run(4);
 ```
 
-**No implicit promotion** — `i32 + i64` is a compile error. Both operands
-must be the same type. Use `as` to convert one.
+Keep `import` on its own line; the current resolver does not accept a trailing
+`//` comment. `.em` emission rejects functions that still require process-local
+representations. A rejection is module-wide, not only entry-reachable.
 
-### Literals
-```
-42            // i64 (default integer type)
-42u           // u64 (suffix)
-0xFF          // hex (i64)
-3.14f         // f32 (f suffix forces float)
-3.14          // f64 (default float type)
-"hello"       // slice<u8> (string literal)
-true false    // bool
-```
+## CLI
 
-### Globals
-```
-global g_count : i64 = 0;
-global g_factor : f32 = 1.5f;
-const MAX : i32 = 100;
-```
-
-### Annotations
-```
-@entry
-fn main() -> i64 { return 1; }
-
-@on_tick
-fn render() { ... }
-
-@obf("mba")       // MBA arithmetic obfuscation
-@obf_keyed        // CPUID-keyed entry gate
-fn sensitive() { ... }
-
-@realtime         // real-time safety validation (rejects GC/alloc/IO/threads)
-fn dsp_process() { ... }   // for VST3 audio plugins
-```
-
-### Imports (textual include, not a C preprocessor)
-```
-import "lib/cs2.ember";
-import "../features/bomb_timer.ember";
-```
-- Idempotent (a file imported twice inlines once)
-- Cycle-safe
-- Resolves relative to the importing file's directory
-
-### Cross-module linking
-```
-link "mod.em" as m;        // load a pre-compiled .em bundle
-let v : i64 = m::do_thing(42);   // cross-module call through dispatch table
-```
-
-### Method-call sugar
-```
-let buf : i64 = array_new(1, 64);
-buf.array_set_u8(0, 0xFF);     // desugars to array_set_u8(buf, 0, 0xFF)
-let n : i64 = buf.array_length();
-```
-`obj.method(args)` → `method(obj, args)` — receiver becomes arg[0].
-
-### Slices + fixed arrays
-```
-let s = "hello";              // slice<u8> (rodata, immutable)
-let arr : i64[8] = 0;         // fixed array (8 i64's, zero-init)
-let view : i64[] = arr[..];   // whole-array view as slice {ptr, len}
-```
-
-### Operator overloads (for registered handle types)
-vec3 is an opaque `i64` handle with registered overloads:
-```
-let a : vec3 = vec3_new(1.0f, 2.0f, 3.0f);
-let c : vec3 = a + b;           // auto-dispatches to vec3_add(a, b)
-let eq : bool = (a == a);
-```
-
-## String encryption (default-on)
-All string literals are XOR-encrypted in the compiled rodata. Raw strings
-never appear in the executable memory. The codegen emits a decrypt call at
-each use site. No script-side action needed. The `str_encrypt` pass can also
-apply this as a composable IR transform.
-
-## Safety model + failsafes
-
-Ember ships a real sandbox with recoverable traps:
-- **Per-frame instruction budget** (default 100M) — budget exhaustion → trap
-- **Stack-depth guard** (call-depth limit, default 512) — stack overflow → trap
-- **Bounds checks** — slice/array OOB → trap
-- **Recoverable traps** — every fault funnels through ONE non-local unwind to
-  the host. A trap is recoverable, never process death.
-- **`PERM_FFI`** gates native calls (FFI must be explicitly enabled)
-- **RSS memory cap** (2 GiB default) — unbounded allocation → instant-fail
-  (abort) to prevent host freeze
-- **Compiler recursion depth guards** — deep ASTs → clean compile error
-  (not a C++ stack overflow crash)
-- **Wall-clock deadlines** on all harnesses (test runner 120s, bench 60s, VST3
-  process 5s) — runaway loops are killed before they freeze the host
-
-## Optimization + obfuscation passes (23 total)
-
-Use `--passes P1,P2,...` to enable the ThinIR backend + passes:
-
-```
-ember run my_script.ember --passes constprop,forward,copyprop,instcombine,dce,licm,dse,simplifycfg,bounds-elim,sccp,unroll,spill_elim,peephole,lsr
-```
-
-**16 optimization passes:** constprop, dce, cse, licm, forward, copyprop,
-instcombine, dse, simplifycfg, bounds-elim, sccp, unroll, spill_elim,
-peephole, branch_folding, lsr
-
-**7 obfuscation passes:** subst (MBA), opaque_pred, deadcode, mba_expand,
-const_encode, str_encrypt, block_split
-
-Write your own passes — see `examples/custom_pass/` and `docs/PASS_AUTHORING.md`.
-
-## CLI reference
-
-```
-ember run <file.ember> [--fn NAME] [--dump] [--emit-em OUT.em] [--passes P1,P2,...] [--tick ...]
+```text
+ember run <file.ember> [--fn NAME] [--dump] [--emit-em OUT.em]
+          [--tick --tick-count N --tick-interval MS]
+          [--passes SPEC] [--profile light|balanced|heavy]
+          [--pass-seed U64] [--ffi] [--gc-env]
+ember emit-em <file.ember> <out.em>
+ember run --load-em <file.em> [--fn NAME]
 ember bench <file.ember> [--fn NAME] [--iters N] [--warmup N]
-ember test [dir]                        # run every .ember file in <dir>
-ember run --load-em <file.em> [--fn NAME]   # run a pre-compiled .em bundle
-ember bundle <file.ember> <output.exe> [--fn NAME]   # bundle into standalone exe
-ember pipe <config.pipe>                # dataflow pipeline: load N .em modules, stream i64s
-ember live <file.ember> [--tick ...]    # live-coding: recompile on file change
+ember test [directory]
+ember bundle <input.ember> <output.exe> [--stub PATH] [--fn NAME]
+             [--permissions none|ffi] [--output-permissions stub|preserve]
+ember pipe <config>
+ember live <file.ember> [--tick ...] [--poll-ms MS]
 ```
 
-- `run` compiles and calls the entry function (default `main`). An `i64` return
-  becomes the process exit code (8-bit, so >255 wraps — OS truncation).
-- `--tick` runs `@on_tick` fns on a tick thread at `--tick-interval` ms.
-- `--passes` enables the ThinIR backend + optimization/obfuscation passes.
-- `ember_check <file>` (parse-only) and `sema_check <file>` (parse+sema) are
-  one-shot check tools.
+`--profile` has alias `--pass-profile`. An explicit `--passes` recipe replaces
+the selected profile recipe but retains the profile's configured seed/options.
+`heavy` is explicitly experimental. Ordinary run/tick budgets differ by host
+path; do not describe one numeric value as a universal language default.
 
-## VST3 audio plugins
+## Extensions (17 libraries)
 
-Write VST3 plugins **fully in ember** — the C++ wrapper handles the VST3 API,
-you write the DSP. `@realtime` annotation validates real-time safety at compile
-time (rejects GC/alloc/IO/threads/exceptions in RT functions).
+Fifteen native/addon extensions:
 
-```bash
-# Build the VST3 wrapper plugin
-cmake --build buildt -j 8
-# Output: buildt/VST3/Release/ember_gain.vst3/
-
-# 13 example plugins: gain, delay, filter, oscillator, synth,
-# distortion, panner, tremolo, compressor, chorus, bitcrusher, limiter, reverb
-```
-
-Audio natives: `load_f32`/`store_f32`/`load_f64`/`store_f64`/`load_i32`/`store_i32`
-+ `audio_get_sample_rate`/`audio_get_parameter`/`audio_get_event_*`/etc.
-
-## Available extensions (15 addon + 2 pass)
-
-| Extension | Provides |
+| Extension | Surface |
 |---|---|
-| `vec` | vec3/vec4 types + operator overloads |
-| `quat` | quaternion type + operations |
-| `mat` | matrix types + operations |
-| `string` | owned `string` type, concat, format, from_i64, length, etc. |
-| `array` | host-backed arrays (opaque i64 handle) |
-| `math` | sqrt, sin, cos, tan, atan, atan2, exp, log, min, max, clamp, etc. |
-| `map` | hash map (opaque i64 handle) |
-| `sync` | MPSC/MPMC queues, swap buffers |
-| `thread` | in-context threads, thread_join |
-| `coroutine` | coroutines via Windows fibers, yield/resume |
-| `lifecycle` | @entry/@on_tick/@event annotation discovery, register_routine |
-| `io` | console + file + path I/O |
-| `call_raw` | raw native function calls |
-| `gc` | tracing mark-sweep GC (for lambda env, by-ref capture, new/delete) |
-| `audio` | VST3 audio buffer natives + AudioContext |
-| `opt` | 16 optimization passes (registered via register_passes) |
-| `obf` | 7 obfuscation passes (registered via register_passes) |
+| `vec`, `quat`, `mat` | nominal math handles, accessors, operators |
+| `string` | owned strings, conversion/find/substr/format, concat/equality |
+| `array` | host-backed u8/f32/i64 arrays |
+| `math` | broad f32/f64 elementary math and min/max/clamp |
+| `map` | i64/i64 host map |
+| `sync` | atomics, swap buffers, SPSC/MPSC/MPMC |
+| `thread` | concurrent in-context spawn/join |
+| `coroutine` | Windows fibers and yield; non-Windows stub only |
+| `lifecycle` | dynamic routine registration |
+| `io` | console/file/path; `PERM_FFI` |
+| `call_raw` | raw x64 page API plus EMBM v1/v2 loader; dangerous operations `PERM_FFI` |
+| `gc` | tracing GC, closure environments, new/delete substrate |
+| `audio` | typed audio context, samples, parameters/events; `PERM_FFI` |
 
-## Common syntax mistakes to avoid
+Two pass extensions: `opt` and `obf`. Hosts expose capabilities explicitly by
+linking and calling registration/init APIs; linking alone is not discovery.
 
-1. **C-style type names** — use `i32` not `int`, `f32` not `float`, `u64` not `uint64_t`
-2. **C-style declaration** — use `let x : i32 = 5;` not `int x = 5;`
-3. **Implicit promotion** — `i32 + f32` is a compile error; cast explicitly with `as`
-4. **`int` as bool** — `if (x)` is an error when `x` is `i32`; write `if (x != 0)`
-5. **Mixed-type arithmetic** — `i32 + i64` is an error; both must be same type
-6. **Signed index on array/slice** — `arr[i]` requires `i` to be unsigned; use `as u64`
-7. **`cast<T>(x)`** — this is AngelScript syntax; ember uses `x as T`
-8. **`#include`** — ember uses `import "path";` (not a C preprocessor)
-9. **`nullptr`/`NULL`** — use `0` (handles are `i64`; `0` = null/invalid)
-10. **`NULL` checks on handles** — use `if (handle == 0)` not `if (handle == null)`
-11. **`string` keyword** — `string` IS now a type (owned, via the string extension);
-    string literals are `slice<u8>`, use `string_from_i64` etc. to get a `string`
+## Built-in ThinIR passes (25)
 
-## Running scripts
-```
-# CLI runner (compiles + JITs + executes):
-ember_cli run scripts/entry/main.ember
+Optimization (18):
 
-# With a specific entry function:
-ember_cli run script.ember --fn my_function
-
-# With optimization passes:
-ember_cli run script.ember --passes constprop,forward,copyprop,instcombine,dce,licm,dse
-
-# Dump JIT'd bytes for debugging:
-ember_cli run script.ember --dump
-
-# Microbenchmark:
-ember_cli bench script.ember --iters 10000
-
-# Native test runner:
-ember_cli test tests/lang
-
-# Bundle into standalone exe:
-ember_cli bundle my_script.ember my_app.exe
+```text
+constprop,dce,simplifycfg,cse,gvn,licm,lsr,forward,copyprop,
+instcombine,dse,bounds-elim,sccp,unroll,spill_elim,peephole,
+branch_folding,tailcall
 ```
 
-## Build
+Obfuscation (7):
 
-C++17, MinGW g++ 15.2.0 + Ninja, Windows-first. MSVC x64 unsupported.
+```text
+subst,mba_expand,const_encode,opaque_pred,deadcode,str_encrypt,block_split
+```
+
+Example:
 
 ```bash
-cd ember
-mkdir buildt && cd buildt
-cmake -G Ninja -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe ..
-cmake --build . -j 8
-ctest -E bench -LE soak --timeout 60    # 64 tests
+buildt/ember_cli.exe run script.ember \
+  --passes simplifycfg,constprop,gvn,licm,dce,tailcall
+buildt/ember_cli.exe run script.ember --profile balanced --pass-seed 42
 ```
 
-## Self-hosted compiler
+Custom passes operate on `ThinFunction`, register through `EmberPassRegistry`,
+return `all()` only when unchanged, use `ThinIRMutation` for transactional
+growth, classify effects with `classify_thin_effects`, and should run through
+checked validation. See `examples/custom_pass/` and `docs/PASS_AUTHORING.md`.
 
-The ember compiler (lexer, parser, sema, codegen) is being ported to ember itself.
-Entry point: `self_hosted/emberc.ember`. Currently supports a subset of ember
-(i64/bool/void, let, if/while/for, arithmetic, calls). Out-of-subset constructs
-are rejected by the self-hosted sema.
+## VST3 DSP and node graphs
 
-## License
+Required callback:
 
-Dual-licensed: **AGPL-3.0** (open source) or **commercial license** (proprietary
-use). See `COMMERCIAL_LICENSE.md`.
+```ember
+@realtime
+fn process_f32(ctx: i64, frames: i64) -> void { ... }
+```
+
+`process` is accepted as a legacy f32 name; `process_f64` is optional. Optional
+callbacks are `get_latency() -> i64`, `get_tail() -> i64`,
+`save_state() -> i64`, and **`load_state(ptr: i64, len: i64) -> void`**.
+`save_state` returns a pointer to the wrapper's two-word state descriptor
+contract, not an arbitrary opaque handle.
+
+The wrapper is one stereo VST3 binary (`ember_gain.vst3`) whose script is
+selected with `EMBER_VST3_SCRIPT`; it is not 13 separately built libraries.
+There are 13 example scripts, but only gain, delay, filter, and oscillator/synth
+filenames select specialized host parameter metadata; other scripts currently
+receive the generic gain profile unless the wrapper is extended. The component
+accepts stereo output and zero or one stereo input; it does not support
+sidechains or a VSTGUI custom view.
+
+The editor-side node graph is a C++ model/code generator, not a finished GUI:
+`src/node_graph.*` provides strict JSON and validation;
+`src/node_codegen.*` generates VST-ready Ember for oscillator, filter, gain,
+mixer, and delay nodes. Cycles are rejected. Run `node_graph_test` explicitly
+(the target is intentionally not registered with CTest).
+
+## Self-hosting status
+
+Self-hosting is complete on this branch. The Ember lexer/parser/sema/codegen
+under `self_hosted/` cover the current parity corpus; the tracked result is
+188/188 supported and matching. A two-generation bootstrap is present: compiler
+A builds compiler B, and B compiles/runs the parity programs. Do not repeat the
+older claim that the self-hosted compiler only supports i64/bool/void.
+
+## Common mistakes
+
+1. Use `i32`/`f32`/`u64`, not C++ `int`/`float`/`uint64_t`.
+2. Use `let x: i32 = 5;`, not `int x = 5;`.
+3. Use `T[]` for slices, not `slice[T]`.
+4. Add `mut` before reassigning a local.
+5. Cast mixed/narrow values explicitly with `as`.
+6. Nominal handles such as `vec3` or `atomic` are not forgeable/comparable as
+   plain i64; do not assume every extension handle has the array extension's
+   legacy plain-i64 type.
+7. `defer` takes an expression statement, not a brace block.
+8. `load_state` in the VST wrapper takes pointer and length.
+9. `@realtime` rejects allocation, I/O, threads, exceptions, unknown natives,
+   indirect calls, and other operations it cannot prove realtime-safe.
+10. Run commands from the repository root so relative imports/scripts resolve.

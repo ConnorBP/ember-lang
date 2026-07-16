@@ -1,434 +1,214 @@
-# ember - modules / live `import` (Tier 6 design sketch)
+# Ember modules and module formats
 
-**Status: design sketch, now substantially shipped.** This doc began as a
-future-work design sketch for `ROADMAP.md` Tier 6 ("Modules / `import`"). The
-core of that design — the per-process `ModuleRegistry` (`src/module_registry.{hpp,cpp}`),
-the cross-module call IR (the `CallCrossModule` `ThinOp` + AST
-`cross_module_id`/`cross_module_slot` + `codegen.cpp`'s `emit_cross_module_call`),
-the `link "file.em" as alias;` grammar (`src/parser.cpp`), and the linker
-(`src/module_linker.hpp` + `em_loader.cpp`'s `link_em_file`) — **shipped**
-(`BUNDLING_AND_EM_MODULES.md` Part 3 item 3). So the module registry, the
-cross-module call, and the `link` directive are NOT future work; they are the
-implemented live-module surface, and this doc is the design reference for that
-surface. What remains genuinely future is the re-entry-trigger-gated work this
-doc frames as not-yet-needed: whole-module reload, late `relink_imports`, and
-the removed-function trap stub (see §6 + `HOT_RELOAD.md`). The deferral is a
-tracked decision with the load-bearing design points written down, not a
-forgotten gap - the same reason every other `ROADMAP.md` entry has a re-entry
-trigger and a dependency rather than a one-line "later."
+Ember has three related but distinct composition/serialization mechanisms:
 
-The split this doc rests on is already decided in
-`BUNDLING_AND_EM_MODULES.md` Section 1.1: `include` (parse-time bundle, one
-output module) ships now; `import` (live, runtime multi-module
-linking) is Tier 6 and lives here. Read Section 1.5 of that doc first - it
-records the trigger, the registry shape, and the slot-stability
-argument in compressed form; this doc expands them into a design.
+1. **Textual source import** merges `.ember` files before lexing.
+2. **Live `.em` linking** keeps separately compiled `EMBL` modules and routes
+   calls through a module registry.
+3. **Self-hosted EMBM images** are in-memory executable images emitted by the
+   Ember-written compiler during bootstrap.
 
----
+Do not use `.em`, EMBL, and EMBM interchangeably. EMBL and EMBM have different
+magics, layouts, loaders, and version histories.
 
-## 1. Purpose & re-entry trigger
+## 1. Textual source import
 
-**Why `import` exists:** to let one ember module call into another
-module that was compiled separately and loaded at runtime  - 
-specifically, a mod loading another mod's pre-compiled `.em`
-(`BUNDLING_AND_EM_MODULES.md` Part 2) and invoking its functions.
-Each module keeps its own dispatch table, globals block, and slot
-assignment; the cross-module call goes through a per-process
-registry that resolves "which module" at call time.
-
-**Re-entry trigger (from `ROADMAP.md` Tier 6):** "a real runtime
-mod-loading use case (one mod loads another's pre-compiled `.em` at
-runtime)." This is not "a script got too big for one file" - that is
-source-level file splitting, which `include` covers
-(`BUNDLING_AND_EM_MODULES.md` Section 1.1) by merging files into one module
-at parse time with zero new runtime machinery. The two needs look
-similar from the script author's chair and are completely different
-subsystems from the runtime's chair: `include` produces one module;
-`import` produces N modules that link at load time.
-
-**Why `include` does not cover this.** `include` is a parse-time
-merge into a single `Program` that flows through the existing
-pipeline as if it were one file (`BUNDLING_AND_EM_MODULES.md` Section 1.2)  - 
-one dispatch table, one globals block, one slot assignment, no new IR
-shape, no new runtime state. By the time it runs there *is* no
-separately compiled module - everything has been fused. A mod that
-wants to call into another mod's already-shipped `.em` needs the
-target to remain a separate module with its own stable identity,
-looked up at load time. That is `import`, and `include` is
-structurally incapable of it without ceasing to be `include`.
-
-The original Tier 6 trigger ("a real runtime mod-loading use case") had not
-fired when this section was written, but the **v0.5 live-module trigger since
-fired** and the `link` grammar + `ModuleRegistry` + cross-module call path
-**shipped** (see §6 below + `BUNDLING_AND_EM_MODULES.md` Part 3 item 3). The
-core live-module surface is therefore NOT "spec'd, not built" — it is the
-implemented surface this doc is the design reference for. What remains
-genuinely future is the re-entry-trigger-gated work in §6 (whole-module
-reload, late `relink_imports`, the removed-function trap stub).
-
----
-
-## 2. Module registry
-
-A per-process map from `module_id` to the current `DispatchTable*`
-of that module. Both flavors of module register here: JIT-compiled
-modules (`ember_compile`, `planning/DESIGN.md` Section 8) and `.em`-loaded modules
-(`ember_load_em`, `BUNDLING_AND_EM_MODULES.md` Section 2.5). They share the
-same `module_t` shape by construction (Section 2.6 of the bundling doc: "the
-runtime cannot tell a loaded module from a JIT'd one"), so the
-registry does not branch on provenance.
-
-```cpp
-struct ModuleRegistry {
-    // Stable id assigned once at registration; baked into cross-module
-    // call sites (Section 3). Never reused (Section 8 non-goal: no entry removal).
-    uint32_t register_module(const std::string& name,
-                             DispatchTable* table,
-                             void* globals_block);
-
-    // O(1), used by the cross-module call sequence (Section 3). Returns the
-    // *current* DispatchTable*  -  may have been swapped on reload (Section 4).
-    DispatchTable* resolve(uint32_t module_id) const;
-
-    // Used by the linker stage (Section 5), not the hot call path.
-    uint32_t find_by_name(const std::string& name) const;
-
-  private:
-    struct Entry {
-        std::string    name;             // for linker name resolution (Section 5)
-        DispatchTable* table;            // current; swapped on reload
-        void*          globals_block;    // current; swapped on reload
-    };
-    std::vector<Entry>             entries_;   // module_id = index
-    std::unordered_map<std::string,
-                       uint32_t>   by_name_;
-};
+```rs
+import "math/stats.ember";
 ```
 
-- **`module_id` is a small dense integer**, not a pointer or string.
-  It is baked into call sites as a literal (`Section 3`), so it must be
-  cheap to embed and stable for the caller's lifetime. Assigned once,
-  never reused.
-- **`table` is a pointer, not a copy.** The registry holds the
-  *current* `DispatchTable*`; on reload, the entry's pointer is
-  swapped to the new table (Section 4). Call sites never cache the table
-  pointer - they cache `module_id` and re-resolve on every call. This
-  is the one indirection that buys cross-module reload transparency.
-- **Both `table` and `globals_block` are in the entry** because a
-  cross-module call may also touch the callee's globals
-  (`spec/MEMORY_AND_GC.md` Section 4 - globals are per-module). The cross-module
-  globals access path mirrors the call path: `registry[module_id]
-  .globals_block` → offset. Carrying both in one entry avoids a
-  second lookup; the shape has to carry both.
+`src/import.cpp` resolves imports before lexing:
 
----
+- paths are relative to the importing file;
+- canonical paths are deduplicated;
+- recursive import cycles terminate through the same seen-path set;
+- imported source is merged into one `Program`;
+- the result has one globals block, one dispatch space, and ordinary
+  intra-module calls.
 
-## 3. Cross-module call IR
+An import is therefore source composition, not runtime linking. It creates no
+module registry entry and no cross-module dispatch operation.
 
-A new IR op `CallScriptExternal` (or an augmentation of `CallScript`
-with an optional `module_id` field - code-organization detail, not a
-design decision; this doc writes them as separate ops for clarity).
-It carries `(module_id, slot_index)` instead of intra-module
-`(slot_index)` alone.
+## 2. Live compiled-module linking
 
-**Cross-module form (one extra indirection):**
+```rs
+link "filters.em" as filters;
 
-```asm
-mov  r11, [registry_base + module_id*8]   ; registry_base = absolute imm64
-                                          ; baked at compile time
-                                          ; (AbsFixup kind 2  -  below)
-                                          ; load the Entry's DispatchTable*
-mov  r11, [r11 + slot_index*8]            ; load slots[slot_index]  -  the
-                                          ; function's current entry
-call r11                                  ; same final step as intra-module
+fn process(x: i64) -> i64 {
+    return filters::lowpass(x);
+}
 ```
 
-**Intra-module form (`spec/CODEGEN_SPEC.md` Section 7, for contrast):**
+The `link` declaration keeps the target as a separate module. Its functions
+and globals retain their own storage. The importer records the target module ID
+and logical slot, and generated code resolves the call through
+`ModuleRegistry`.
 
-```asm
-mov  r11, [dispatch_table_base + slot*8] ; this module's own table base,
-                                         ; baked as imm64; no registry hop
-call r11                                 ; (spec Section 7 folds the load into the
-                                         ; call's addressing mode; the
-                                         ; indirection count is the same  - 
-                                         ; one absolute load, one indirect
-                                         ; call)
-```
+The host may also pre-register a module and link it by the configured name.
+File-based linking uses `link_em_file` from `src/module_linker.hpp`.
 
-The cross-module form is **one extra `mov`**: the registry hop. The
-intra-module caller knows its own dispatch table at compile time and
-skips the lookup; the cross-module caller knows only the *foreign
-module's identity* (`module_id`), not its current table address, so
-it pays one indirection to turn identity into table. That is the
-entire runtime cost of true dynamic linking in this design - one load
-per cross-module call, on top of the intra-module baseline. Call it
-the price of the registry's reason for existing.
+### Export visibility
 
-**Relocation kind.** `registry_base` is a new absolute-imm64 the
-codegen bakes into cross-module call sites. It fits the `AbsFixup`/
-reloc-table mechanism introduced for the `.em` loader
-(`BUNDLING_AND_EM_MODULES.md` Section 2.4) as a **new kind 2,
-"ModuleRegistryBase"**:
+- A bare `fn` or `pub fn` is exported.
+- A `priv fn` remains callable inside its module but is omitted from the export
+  directory.
+- Cross-module sema checks the target's canonical signature for v2+ EMBL
+  modules.
+- Historical EMBL v1 has no canonical signature metadata and remains
+  ABI-trusted compatibility input.
 
-```cpp
-struct AbsFixup {
-    uint32_t code_offset = 0;
-    enum Kind : uint8_t {
-        DispatchTableBase   = 0,   // existing  -  bundling doc Section 2.4
-        GlobalsBase         = 1,   // existing  -  bundling doc Section 2.4
-        ModuleRegistryBase  = 2,   // NEW: per-process registry base addr
-    } kind;
-};
-```
+## 3. Module registry and dispatch
 
-The `module_id` itself is a compile-time literal baked into the
-`[registry_base + module_id*8]` displacement (constant at the call
-site post-link - Section 5), so it needs no reloc of its own; only
-`registry_base` is position-dependent and gets patched when a `.em`
-containing a cross-module call site loads into a fresh process whose
-registry lives at a different address.
+`ModuleRegistry` assigns a stable dense `module_id`. A module publishes:
 
----
+- its dispatch storage;
+- its logical slot count;
+- its cross-module call allowlist/provenance data;
+- for keyed modules, an immutable `ModuleDispatchRecord`.
 
-## 4. Slot stability across modules
+An ordinary cross-module call uses a logical `(module_id, slot)` pair. The
+registry supplies the target dispatch state at call time, so callers do not
+cache a raw code pointer. Logical IDs and slots are not recycled while callers
+can still refer to them.
 
-`HOT_RELOAD.md` Section 1 establishes slot stability within a single
-module: "slot indices never change for the lifetime of the
-`module_t`," which makes intra-module reload safe - callers bake
-`slot*8` into their compiled code, so a slot's *content* (function
-address) can be swapped without touching any caller's bytes.
-Cross-module calls lift this invariant one indirection up.
+### Identity dispatch
 
-- **Within each module, slots are still stable for that module's
-  own lifetime.** A foreign module's slot indices do not change
-  while it is loaded; a reload repoints slot *contents*, never
-  renumbers slots (`HOT_RELOAD.md` Section 3).
-- **A foreign caller caches `(module_id, slot_index)`** - identity
-  of the target module, and a slot inside it. It does *not* cache the
-  target's `DispatchTable*` and does *not* cache a function pointer;
-  both go stale on reload.
-- **At call time, `module_id` resolves to the *current*
-  `DispatchTable*`** via the registry (`Section 2 resolve()`), which may
-  have been swapped if the foreign module was reloaded since the
-  caller was compiled. The caller then indexes `slots[slot_index]`
-  on that current table.
-- **A reload of the foreign module is transparent to the caller.**
-  The caller's bytes (`mov r11, [registry_base + module_id*8]`) are
-  unchanged - the registry entry's `table` pointer changed, the
-  caller's code did not. The caller picks up new function addresses
-  on its next call with no recompilation of itself.
+Identity modules map logical slot `N` to dispatch entry `N`. Ordinary
+single-function reload release-stores a new entry into that stable slot.
 
-This is the same property intra-module reload already has
-(`HOT_RELOAD.md` Section 3: "the swap only affects *future* `call [slot]`
-instructions, which read the slot fresh each time"), lifted one
-indirection up: the registry slot plays for modules the role the
-dispatch slot plays for functions. The cost is the one extra `mov`
-from Section 3; the benefit is that cross-module reload needs no
-cross-module caller recompilation - exactly the goal that motivated
-the dispatch table in the first place (`spec/CODEGEN_SPEC.md` Section 7: "hot-
-reloading any function ... never requires touching the caller's code
-bytes at all").
+### Keyed dispatch
 
-One asymmetry, inherited from `HOT_RELOAD.md` Section 4: a cross-module
-call already past the registry load and into the foreign function's
-body completes in the *old* version of that function, exactly as an
-intra-module in-flight call does. Reload affects *future* calls, not
-frames already inside the callee. No new machinery; the property
-composes.
+A keyed module groups compatible callables into dispatch domains and maps each
+logical route to a physical slot through the versioned keyed permutation. The
+immutable dispatch record carries:
 
----
+- dispatch mode and strategy version;
+- logical and physical counts;
+- ABI/visibility/calling-mode/domain descriptors;
+- logical routes;
+- physical real and padding entries;
+- allowlist data.
 
-## 5. Linker stage
+Runtime resolution receives a transient route word from the host/provider. The
+module does not store or compare an expected environmental key, key digest, or
+machine fingerprint. Invalid metadata and padding routes fail closed.
 
-`import "foo"` is resolved at **load time**, not parse time (the
-defining difference from `include`, `BUNDLING_AND_EM_MODULES.md`
-Section 1.1). The flow:
+## 4. Public `.em` files: EMBL
 
-1. **Compile records unresolved externals.** A `modname::fn`
-   reference (Section 6) where `modname` is an imported (not-included) module
-   becomes an unresolved-symbol record: `(target_module_name, fn_name,
-   expected signature, call site location)`. The call site is emitted
-   with a **trap stub** as its operands initially (same pattern as
-   `HOT_RELOAD.md` Section 2 / `spec/CODEGEN_SPEC.md` Section 7 edge case: "slot points
-   at a shared trap stub rather than a null/garbage pointer"), so the
-   module is *runnable* before linking but any cross-module call
-   traps.
-2. **Linker walks the unresolved list.** For each record:
-   - Look up `target_module_name` via `find_by_name` (Section 2). If not
-     registered → unmet import; the linker leaves the trap stub in
-     place and reports it (the module runs, calls to the missing
-     module trap - see "unresolved at call time" below). Whether an
-     unmet import is a hard error or a deferred trap is a host policy
-     decision; this design makes it a deferred trap, matching
-     `spec/CODEGEN_SPEC.md` Section 7's "slots are never literally null during
-     normal operation" stance (a missing module is the cross-module
-     analog of a not-yet-compiled function).
-   - If registered → retrieve the target's `DispatchTable*` and its
-     name→slot directory (`HOT_RELOAD.md` Section 7: the directory
-     `ember_call` uses for host→script lookup; the linker reuses it
-     for cross-module name lookup - same data, no duplicate).
-   - Look up `fn_name` in the target's directory. Absent → unmet
-     import, trap stub stays.
-   - **Signature handling:** JIT-module and v2 `.em` exports carry canonical
-     `Type` signatures and sema verifies arity, ordered parameter types, and
-     return type. Historical v1 `.em` exports remain `unknown_sig`; those
-     imports are ABI-trusted and skip signature verification.
-   - On success → **bake `(target_module_id, target_slot_index)`
-     into the call site**, rewriting the `module_id` and `slot_index`
-     displacements in the Section 3 sequence from trap-stub placeholders to
-     the resolved values. The `registry_base` reloc
-     (`AbsFixup::ModuleRegistryBase`) is untouched - it was already
-     correct; only the two displacements change.
-3. **Unresolved at call time.** The current source linker marks unresolved
-   calls for the existing runtime trap lowering; hosts should treat unresolved
-   links as load/compile failures rather than rely on a removed-function or
-   uncompiled-function slot stub (those stubs are not shipped APIs).
-4. **Late re-linking is deferred.** No `relink_imports(module_t*)` API ships.
-   A host resolves/registers dependencies before compiling the importer or
-   recompiles after the dependency becomes available.
+Public precompiled `.em` files start with the little-endian magic `EMBL`
+(`0x454D424C`). The fixed header is 40 bytes. Versions are additive or
+explicitly branched by the loader; unknown versions are rejected.
 
----
+| EMBL version | Main contract |
+|---|---|
+| v1 | historical raw x86 and basic relocations; unknown export signatures |
+| v2 | canonical signatures, symbolic native bindings, rodata relocations, build/ABI identity |
+| v3 | v2 body model plus export-directory `pub`/`priv` visibility |
+| v4 | v3 plus a 104-byte Ed25519 signature block |
+| v5 | per-function ThinIR or raw-x86 fallback records |
+| v6 | v5 body model plus versioned keyed-dispatch metadata and capabilities |
 
-## 6. Shipped link grammar
+The complete binary layouts and loader policies are documented in
+[`BUNDLING_AND_EM_MODULES.md`](BUNDLING_AND_EM_MODULES.md).
 
-The v0.5 live-module trigger fired and the parser accepts:
+### Loader policy
 
-```
-link_stmt     := 'link' STRING_LIT 'as' IDENT ';'
-call_external := IDENT '::' IDENT '(' arg_list? ')'     // modname::fn
-```
+The loader separates authenticity policy from executable-content policy:
 
-- `link "file.em" as alias;` loads/registers a file relative to the source
-  file. `link "registered-name" as alias;` is the host-driven form for a
-  module already in the registry. The alias is required by the grammar.
-- `modname::fn(args)` - a call into `fn` of the imported module. The
-  `::` is the cross-module selector; an unqualified `fn(args)` is the
-  existing intra-module call (`spec/CODEGEN_SPEC.md` Section 7). The `::` makes
-  the distinction visible at the call site, which matters for reading
-  code and makes the IR op choice (`CallScript` vs
-  `CallScriptExternal`, Section 3) a trivial parse-time decision rather than
-  a name-resolution guess.
-- **`pub`/`priv` visibility (F1, implemented 2026-07-10).** A bundled/linked
-  module's exported surface is now a SUBSET of its functions, not "every
-  function." A `pub fn` or a bare `fn` is EXPORTED (callable cross-module via
-  `mod::fn()`); a `priv fn` is a module-private helper — still callable within
-  its own module (intra-module visibility is unchanged) but NOT published to
-  the `.em` name directory / the JIT export table, so other modules cannot
-  resolve it. A cross-module `mod::priv_fn()` call is a sema ERROR ("targets a
-  function that is not exported by module 'mod'"), distinct from a not-yet-
-  registered module (which stays a deferred trap). Backward-compat decision: a
-  bare `fn` stays exported by default (preserves existing cross-module tests/
-  demos); `priv fn` opts out. The `.em` format is v3 (v1/v2 still load). ~~No
-  `pub`/`export`. Visibility remains deferred; every function in a registered
-  module is callable cross-module, matching C `#include`'s "everything
-  included is visible" stance (~~`BUNDLING_AND_EM_MODULES.md` Section 1.3~~
-  Section 4 + this section)~~. See `spec/SPEC_AUDIT_2026-07-10.md` F1 +
-  `pub_priv_test` (ctest). In-module name scoping (namespaces, `ROADMAP.md`
-  Tier 6) remains a separate language concern; the exported surface of a
-  bundled module is the bundling concern F1 corrects.
+- `EmVerifyPolicy` supplies trusted Ed25519 public keys for signed v4 input.
+- `EmLoadPolicy::module_permissions` controls permission-gated native binding.
+- `EmLoadPolicy::allow_raw_x86` controls compatibility loading of raw machine
+  code.
+- `EmV6HostCaps` declares supported v6 dispatch strategy, mode, re-emission,
+  and ABI-domain capabilities.
 
----
+The secure default refuses historical raw-x86 EMBL input and mixed/raw v5
+functions. All-IR v5 is deserialized, validated, rebound to allowed natives,
+and re-emitted before executable allocation. v6 additionally requires an
+explicit compatible host capability set.
 
-## 7. Why this does not ship with `include`
+The CLI and bundler deliberately opt into trusted/development raw-x86 loading
+for the artifacts they create. Embedders loading untrusted modules should use
+the secure default or an explicit signed policy, not copy the CLI's convenience
+policy blindly.
 
-The two features share a keyword family and a user mental model ("pull
-in code from elsewhere") and almost nothing else.
+## 5. Self-hosted module images: EMBM v1 and v2
 
-| | textual `import` | live `link` |
-|---|---|---|
-| Stage | parse time, before sema | load time, after each unit compiles |
-| Output | one module | N modules |
-| New runtime state | none  -  merged `Program` flows through existing pipeline (`BUNDLING_AND_EM_MODULES.md` Section 1.2) | module registry (`Section 2`), cross-module call IR (`Section 3`), linker stage (`Section 5`) |
-| New IR op | none  -  ordinary `CallScript` through the shared table | `CallScriptExternal` carrying `(module_id, slot_index)` |
-| New encoder reloc | none | `AbsFixup::ModuleRegistryBase` (`Section 3`) |
-| Signature verification | none — same module, sema checked it | JIT exports + v2 `.em`: canonical `Type` signatures, sema/loader verify (arity, ordered params, return); v1 `.em`: no metadata, ABI-trusted `unknown_sig` (`Section 5`) |
-| Status | shipped source merge | shipped v0.5 (JIT sigs) + v2 `.em` (canonical sigs + build/ABI identity); v1 `.em` remains ABI-trusted `unknown_sig` |
+The Ember-written compiler emits an **in-memory** module image with magic
+`EMBM`, loaded by the `call_raw` extension's `load_executable_module` native.
+This is not the public `.em`/EMBL loader.
 
-Textual `import` is a parse-time merge with no new runtime machinery. Live
-`link` is the shipped registry/kind-2-relocation path. v2 `.em` exports carry
-canonical `Type` signatures plus build/ABI identity and are verified at link
-(see `Section 5`); the metadata gap is now closed for v2. Only v1 `.em` exports
-remain `unknown_sig` (ABI-trusted, no canonical signatures) — the v1
-compatibility contract, not a live gap.
+### EMBM v1
 
----
+Contains:
 
-## 8. Dependencies & non-goals
+- an 80-byte header;
+- code, rodata, mutable data, symbol-name, and relocation sections;
+- ABS64 rodata/data/native relocations;
+- native ABI fingerprints and permission checks.
 
-**Hard dependency:**
+### EMBM v2
 
-- **The `.em` loader (`BUNDLING_AND_EM_MODULES.md` Part 2).** The Section 1
-  trigger is literally "one mod loads another mod's pre-compiled
-  `.em` at runtime." `load_em_file`/`link_em_file` produce and register the
-  `LoadedModule`; callers must retain it while the registry points at its
-  dispatch storage.
+Extends the header to 96 bytes and inserts a function table. The table maps
+logical function slots to code offsets. The loader creates a stable dispatch
+vector and supports the `DISPATCH` relocation, enabling self-hosted function
+handles, lambdas, and coroutines to use logical slots.
 
-**Companion, not a hard dep:**
+The full format, limits, and loader lifecycle are documented in
+[`../self_hosted/MODULE_IMAGE_FORMAT.md`](../self_hosted/MODULE_IMAGE_FORMAT.md).
 
-- **Namespaces (`ROADMAP.md` Tier 6).** Roadmap lists namespaces as a
-  separate Tier 6 entry ("name scoping within a module; trigger:
-  module size makes flat scope crowded; dep: modules, or usable
-  standalone"). Namespaces and modules are siblings, not
-  parent/child: this doc's registry and call mechanism work without
-  namespaces (every function in a registered module is callable
-  cross-module, Section 6), and namespaces can ship without cross-module
-  calls (scoping *within* one module needs no registry). They compose
-  when both exist; neither blocks the other. The Section 6 sketch's "no
-  `pub`/`export`" note is the seam where namespaces plug in later,
-  not a prerequisite.
+## 6. Slot and lifetime rules
 
-**Hard non-goals (things this design deliberately does not do):**
+- A caller caches logical identity, never an unguarded raw executable pointer.
+- Dispatch and globals backing storage must not move after addresses are baked
+  or published.
+- A loaded module must outlive registry entries and callers that reference it.
+- Raw `LoadedModule::dispatch` indexes physical storage for v6 keyed modules;
+  use `resolve_entry_by_name`/the keyed resolver rather than assuming logical
+  slot equals vector index.
+- Current executable pages are owned by their module/host. Replaced pages
+  transfer to the associated `HotReloadDomain` and are reclaimed only after
+  pre-publication guards drain.
 
-- **No cross-process modules.** The registry is per-process (`Section 2`).
-  A mod in process A cannot call a mod in process B through this
-  mechanism; that is an IPC problem, not a linking problem, and ember
-  is an in-process embedded scripting language (`planning/DESIGN.md` goals:
-  "for embedding in game engines"). Out of scope forever, not just
-  for v1 of this feature.
-- **No dynamic unloading / module-registry-entry removal.**
-  `HOT_RELOAD.md` Section 5's guarded epoch retirement covers replaced *code
-  pages* only; it does not remove a `module_t` from the registry once
-  registered. A `module_id` baked
-  into a call site (`Section 3`) must remain valid for the caller's lifetime
-  - unregistering a module would orphan every cross-module call site
-  that cached its id, turning them into registry reads of a stale
-  index. The Section 2 design assigns ids once and never reuses them
-  precisely to avoid this; entry *removal* is the symmetric operation
-  and is not provided. If a host needs to "drop" a module, the
-  supported path is to leave its registry entry in place and repoint
-  retain the entry and arrange its own unavailable-target policy; the proposed
-  removed-function trap stub is deferred with whole-module reload
-  (`HOT_RELOAD.md` Section 2). This is the "slot indices are never
-  recycled in v1" stance lifted one level up: module ids are never
-  recycled either.
-- **Version negotiation.** v2 `.em` carries build/ABI identity (`EM_BUILD_ID`
-  / `EM_TARGET_ABI_HASH`, `em_file.hpp`) and canonical `Type` signature records;
-  the loader rejects identity mismatch before page publication and sema verifies
-  the signatures. v1 `.em` exports are `unknown_sig` and ABI-trusted (no metadata,
-  no identity check) — the v1 compatibility contract, retained for backward
-  compat. Portable, verified `.em` linking is therefore a shipped v2 guarantee,
-  not a future redesign. **v5 IR `.em` (Stage B, IL-`.em`)** is a separate,
-  additive format version that carries the thin three-address IR on disk
-  instead of raw x86 (the per-function `is_ir` byte + the `ir_blob` record);
-  the loader deserializes + validates + re-emits the IR to x64 via `emit_x64`
-  BEFORE `alloc_executable_rw` (the re-emit-at-load security model). v5 is
-  unsigned for Stage B and shares the v3/v4 header + globals block + name
-  directory; a v5 module may mix IR and raw-x86 functions per-function (mixed
-  mode). The full v5 format + security model is documented in
-  `BUNDLING_AND_EM_MODULES.md` §2.5.2 (see `src/em_file.hpp` `EM_VERSION_V5` +
-  `src/thin_ir_ser.{hpp,cpp}` for the codec). v5 does not change the
-  cross-module call mechanism this doc specifies — it changes only what a
-  per-function record carries on disk, not the registry/linker/slot model.
+## 7. Reload behavior
 
----
+### Ordinary identity modules
 
-This doc is a design sketch, not a spec amendment. It adds no
-grammar, no IR op, no encoder change, no source file. The Section 1 trigger
-("a real runtime mod-loading use case") is still the gate, and
-`ROADMAP.md`'s re-evaluation cadence ("after the v0.5 benchmark
-milestone") still governs when the trigger is even *checked* against
-reality. Writing this doc is documentation, not a commitment to build
- -  recorded so the next person who hits the trigger does not start
-from a blank page. That is the entire purpose of a deferred-design
-doc; it is the same purpose `ROADMAP.md` serves at the higher level of
-"which features at all."
+`reload_function` replaces exactly one existing function. It requires the same
+name, slot, arity, parameter types/word shapes, and return type/word shape.
+Added/removed functions and global-layout changes are rejected because the
+ordinary whole-module transaction is not yet exposed.
+
+### Keyed modules
+
+`reload_keyed_function` preserves logical identity and verifies the replacement
+against the existing ABI fingerprint, visibility, calling mode, and dispatch
+domain. It publishes the derived physical slot, not the raw logical index.
+
+`replace_keyed_generation` can publish a complete new keyed topology under the
+same stable module ID. The new immutable record is built and validated
+privately, then coherently release-published. Old executable pages remain alive
+under epoch guards.
+
+See [`HOT_RELOAD.md`](HOT_RELOAD.md).
+
+## 8. Host integration checklist
+
+1. Resolve textual imports before lexing when compiling source.
+2. Construct and retain one `ModuleRegistry` for mutually linked modules.
+3. Register dependencies before compiling/linking callers when possible.
+4. Supply the real native signature table and explicit permissions to EMBL or
+   EMBM loaders.
+5. Choose the EMBL verification/raw-code policy deliberately.
+6. For v6, advertise only capabilities actually implemented by the host.
+7. Keep loaded-module storage and keyed record backing alive for all callers.
+8. Guard reloadable outer calls and quiesce reclamation domains before teardown.
+
+## 9. Remaining work
+
+- Ordinary identity-dispatch whole-module transactions
+- Added/removed-function publication policy for ordinary modules
+- Global-layout migration hooks
+- Late re-linking without recompilation
+- Platform-neutral module backends beyond the current Win64 x86-64 execution
+  formats

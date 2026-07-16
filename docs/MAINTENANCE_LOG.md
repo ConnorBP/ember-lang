@@ -5296,3 +5296,41 @@ chunk does not touch `src/thin_lower.*`, `src/thin_emit.*`, or `extensions/opt/e
   struct-by-value ABI gap (F-struct) explicitly retained as pending.
 - `docs/MAINTENANCE_LOG.md` — this entry (plus the prior DIRTY-READ-ONLY appends committed
   together as the sanctioned reconciliation).
+
+---
+
+## 2026-07-15 22:16 EDT — top-level documentation correctness pass
+
+- **Branch / starting HEAD:** `self-hosting-completion` / `e5f3777`.
+- **Tree state:** substantial concurrent Markdown edits and a pre-existing modified
+  `thirdparty/vst3sdk` submodule were present. This task touched only its ten
+  assigned top-level Markdown files and staged only those paths. No source, build,
+  `buildt/`, `tmp_edit/`, or third-party file was modified.
+- **Scope:** audited `README.md`, `ROADMAP.md`, this log,
+  `MAINTENANCE_CONSTRAINTS.md`, `RESEARCH_NOTES.md`, `COMMERCIAL_LICENSE.md`,
+  `LIFECYCLE.md`, `HOT_RELOAD.md`, `MODULES.md`, and
+  `BUNDLING_AND_EM_MODULES.md` against CMake, CLI, module writer/loader, reload,
+  GC/concurrency, VST3/node-graph, and self-hosted/bootstrap implementation.
+- **Fixed:** v1.2/v1.0-era version text; 23-pass and 73-test counts; stale
+  self-hosted-subset/preview language; stale GC/by-ref/new-delete and serialized
+  threading claims; VST3 Phase-D TODO wording; identity-only reload descriptions;
+  pre-v6 `.em` descriptions; EMBL/EMBM conflation; obsolete build/CLI commands;
+  ambiguous commercial-license promises; and broken/stale top-level cross-references.
+- **Documented current state:** latest release v1.3.0 versus unreleased branch
+  state; 94/94 CTest; 188/188 parity with zero unsupported/mismatch/hang;
+  approximately 85%+ coverage; complete one-/two-generation bootstrap; 25
+  built-in passes; EMBM v2; EMBL v1-v6; keyed function/generation reload; GC,
+  concurrent execution, standalone bundling, 13 VST3 examples, and node-graph
+  source generation.
+- **Verification:** a fresh temporary MinGW/Ninja configure reported `Total
+  Tests: 94`; the README example compiled and ran under the current CLI (exit
+  192, the documented low byte of its successful result); every
+  relative Markdown link in the rewritten current docs was checked;
+  `git diff --check` passed for the assigned files. The full CTest/parity gates
+  were not rerun because this was documentation-only and the user's supplied
+  current state was corroborated by source/configuration/history.
+- **Remaining:** CMake still declares project version 1.0.0 although v1.3.0 is
+  tagged; changing it would violate this task's Markdown-only constraint and is
+  deferred to the next release/versioning change. Historical audit/planning
+  documents can intentionally retain dated counts and pre-completion states.
+- **Commit:** pending at entry creation; the task report records the resulting hash.

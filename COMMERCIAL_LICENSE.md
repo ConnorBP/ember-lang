@@ -1,44 +1,65 @@
-# ember — Commercial License
+# Ember commercial licensing overview
 
-ember is dual-licensed under **AGPL-3.0** (for open-source/community use) and
-a **commercial license** (for proprietary/commercial integration).
+Ember source is available under the **GNU Affero General Public License,
+version 3** (`LICENSE`). The copyright holder may also offer separate commercial
+terms for uses that do not want to comply with AGPL-3.0.
 
-## Open-source use (AGPL-3.0)
+This file is an informational overview and is **not itself a commercial license
+grant, quote, warranty, or legal advice**. Commercial rights exist only in a
+separate agreement signed by the relevant parties.
 
-If you are using ember in an open-source project, a personal project, or a
-project that is itself AGPL-licensed, you may use ember freely under the terms
-of the AGPL-3.0 license (see `LICENSE`).
+## AGPL-3.0 option
 
-The AGPL-3.0 requires that if you distribute or make available a service that
-uses ember, you must make your modifications and the source code of your
-integration available under AGPL-3.0.
+You may use, modify, and redistribute Ember under AGPL-3.0. Your obligations
+depend on the facts of your distribution, modification, linking/integration,
+and network-service use. Read the complete `LICENSE` text and obtain legal
+advice for your situation.
 
-## Commercial use
+Do not rely on a short project summary as a substitute for the license. In
+particular, the phrase “personal” or “open-source” does not by itself determine
+whether a use complies; the actual AGPL terms do.
 
-If you want to use ember in a proprietary product, a commercial service, or any
-project that you do not want to open-source under AGPL-3.0, you need a
-**commercial license**.
+## Commercial option
 
-A commercial license:
-- Removes the AGPL-3.0 copyleft obligation (you are not required to open-source
-  your integration)
-- Includes a runtime exception (scripts compiled by ember and .em modules
-  loaded by ember are not "covered works" — your users' scripts are theirs)
-- May include priority support, custom extensions, and integration assistance
-- Is available for individual developers, startups, and enterprise
+A separately negotiated commercial agreement can permit proprietary
+integration without relying on the AGPL option. Terms may cover, as agreed:
 
-## Pricing
+- products and network services;
+- internal or redistributed builds;
+- Ember runtime/JIT embedding;
+- generated executables and `.em`/EMBL modules;
+- support, integration work, updates, and custom extensions;
+- organization, product, seat, revenue, or deployment scope;
+- warranty, indemnity, maintenance, and termination provisions.
 
-Pricing is negotiable based on use case. Contact:
+There is **no blanket runtime exception granted by this file**. Treatment of
+user scripts, generated native code, standalone bundles, and module artifacts
+must be stated in the signed commercial agreement if that distinction matters
+to the licensee.
+
+## Pricing and contact
+
+Pricing and terms depend on the use case. Contact:
 
 **Connor Postma**  
 connor.postma@gmail.com  
 https://github.com/ConnorBP/ember-lang
 
-## Contributor License Agreement (CLA)
+Include a short description of the product/service, expected distribution or
+hosting model, organization size, and desired support level.
 
-External contributions require a Contributor License Agreement (CLA) that grants
-the project maintainer the right to relicense the contribution. This preserves
-the ability to offer commercial licenses while accepting community contributions.
+## Contributions
 
-A CLA template will be provided upon first contribution.
+A contribution does not automatically grant the maintainer relicensing rights
+beyond the contributor's submitted license terms. The project may require a
+Contributor License Agreement before accepting an external contribution when
+commercial relicensing rights are needed. Request the current CLA before
+submitting substantial work; an absent future template is not an executed CLA.
+
+## Third-party components
+
+A commercial Ember agreement cannot replace licenses for third-party
+components. Distributors remain responsible for the notices and terms of
+vendored or optional dependencies, including the VST3 SDK and Ed25519 sources.
+Review `thirdparty/` and release-package notices for the exact dependency set in
+your build.

@@ -1,138 +1,171 @@
-# Research Notes - prior art survey
+# Research notes and prior-art decisions
 
-Sources examined before design:
+This document records the research that shaped Ember. It is not a current
+feature-gap list; current status lives in `README.md` and `ROADMAP.md`.
 
-## Sibling x64 PE bin2bin obfuscator (surveyed prior art)
-- A sibling workspace project ships an x64 PE bin2bin obfuscator, with its own
-  `ext/binwrite` lib on top of Zydis (decode+encode).
-- `binwrite::assembler_instruction_t` wraps one `ZydisEncoderRequest` + calls
-  `ZydisEncoderEncodeInstruction` per instruction. No concept of labels, no
-  relocation fixups, no executable-memory allocator. It's built for patching
-  bytes inside an already-laid-out PE image, not for emitting fresh code at
-  runtime.
-- Verdict: **not directly reusable as a JIT backend.** Zydis itself (decoder)
-  is useful for a disassembling debug/verify tool later, but for the actual
-  JIT we need our own encoder with labels/patches/exec-mem, scoped to the
-  small instruction subset we actually emit. Zero new dependency either way.
+## 1. Native JIT rather than an interpreter
 
-## Prior native-JIT scripting language (surveyed)
+AngelScript's normal execution model is a bytecode VM. Its optional JIT hook
+does not remove the complexity of a bytecode baseline and generic call
+trampolines. Ember instead chose one execution model: native code.
 
-Two sources: the closed-source SDK headers (`.lib` only - no
-implementation) and the public language docs. The docs reveal this
-language is **far larger than `sdk.h` alone suggested** - it's a full
-systems-level language, not a small scripting dialect. Surveyed surface:
+Consequences:
 
-**From the embedding-API headers (this is the part we mirror):**
-- `engine_t` / `module_t` / `context_t` split (engine=registry, module=compiled
-  unit, context=execution/call state) - same shape as AngelScript.
-- `register_native(engine, name, fn_ptr, ret_type, params[], count, permission)`
-  - flat native registration, permission bit for FFI gating.
-- `type_builder` fluent API: `.method()`, `.field()`, `.subscript()`,
-  `.iterable()`, operator overloads (`bin_add`, `bit_and`, `shl`...),
-  `.convert()`, `.property()`, `.finish()`.
-- Budget/GC/debug-hook knobs, hot reload, serialization, introspection,
-  exceptions-as-data (`exception_pending/value/type/clear`).
+- source and ThinIR ultimately execute as native machine code;
+- public IR-on-disk modules are validated and re-emitted to native code;
+- no bytecode interpreter fallback is planned;
+- native ABI lowering and W^X publication are central correctness boundaries.
 
-**From the docs (the language itself - this is the part we deliberately
-scope DOWN for v1):**
-- Primitives incl. `aint8/16/32/64` (atomic), `char`/`wchar`, `null`.
-- `const`/`constexpr`/`nullable`/`auto` inference.
-- Operators incl. ternary `?:`, `++`/`--`, `cast<T>()`, `sizeof`, `offsetof`.
-- Control flow: `if`/`else`, `while`, `do-while`, `for`, `for-each`,
-  `switch`, `match`, `break`/`continue`, `goto`, `defer`.
-- Functions: default args, reference (`&`), `out`, variadic, `extern`,
-  const methods, function references, lambdas `[caps](p)->T{}` + arrow
-  `(p)=>expr`.
-- Dynamic arrays (push/pop/sort/slice/...), maps, strings with
-  interpolation `f"v={x}"` + full method set.
-- Structs (ctors/dtors/methods/operator overloading/bitfields/packed) AND
-  classes (reference types, multi-inheritance w/ vtable thunks, RAII),
-  interfaces, mixins, properties, templates (monomorphization), enums,
-  typedefs, delegates, namespaces, coroutines + `yield`, exceptions
-  try/catch/throw w/ unwinding, heap `new`/`delete`, inline asm intrinsics,
-  `[[packed]]`/`[[align]]`/`[[reflect]]`/`[[serialize]]`/`[[noopt]]`/
-  `[[inline]]`/`[[dll(...)]]` annotations, modules w/ import, preprocessor
-  (#define/#ifdef/#include/#pragma), `static_assert`.
-- Lifecycle: `main()` entry returning int64 (>0 stay loaded, <=0 unload),
-  `register_routine(cast(fn), data)` for per-frame callbacks, `unregister`.
+The benchmark harness confirms the basic premise: compute-heavy Ember workloads
+outperform the AngelScript interpreter, although the baseline Ember tree walker
+still trails optimized C++ on spill-heavy paths. ThinIR, optimization passes,
+and register allocation address that second comparison.
 
-**Takeaway / scoping decision.** The surveyed language's *embedding API
-shape* (`engine/module/context`, `type_builder`, `register_native`, budget,
-annotations, hot reload, exceptions-as-data) is our north star for ergonomics
-and is mirrored in `spec/BINDING_API.md` / `spec/SAFETY_AND_SANDBOX.md` /
-`HOT_RELOAD.md`. Its *language feature surface* (templates, classes, vtables,
-coroutines, exceptions, heap, modules, preprocessor) is **deliberately not
-v1** - each is a large subsystem that would make v1 unshippable and none is
-required by the original request (which emphasized speed + bindings, not
-language completeness). The YAGNI stance holds; see `ROADMAP.md` for the
-per-feature deferral rationale and re-entry triggers. Several small C-style
-conveniences the surveyed language has that *are* cheap and expected in a
-C-style language (ternary, `++`/`--`, `switch`, `do-while`, `const`/`constexpr`,
-`defer`, `sizeof`/`offsetof`, string interpolation, compound-assign
-semantics) **are** added to v1 in this spec pass - see `planning/GAP_ANALYSIS.md` for
-the audit.
+## 2. Minimal owned x86-64 emitter
 
-The surveyed language's implementation is closed, so ember's internals
-(codegen, regalloc, IR) are our own design, informed by AngelScript (source
-available) and Mun (source available, AOT/ABI shape).
+A surveyed sibling binary-rewriting project used Zydis encoder requests to
+patch instructions in an already laid-out PE image. That architecture had no
+label graph, relocation ownership, or executable-memory lifecycle suitable for
+an in-process compiler.
 
-## AngelScript (`vacnetme_workspace/fvc/thirdparty/angelscript_sdk`)
-- `RegisterGlobalFunction(decl_string, funcptr, callConv, aux)`,
-  `RegisterObjectType/Method/Property(decl_string, ...)` - declaration
-  strings are parsed at registration time. Flexible but adds a mini-parser
-  and runtime string matching cost to every bind. We will bind by explicit
-  C++ descriptor structs instead (like the surveyed language's
-  `native_desc`), skip the
-  string-declaration parser - it's the single biggest source of AngelScript
-  registration-time complexity (`as_callfunc.cpp`, calling-convention
-  dispatch per-platform, ~thousands of lines) and we don't need it.
-- Execution model: bytecode VM (`as_context.cpp`), not JIT by default - this
-  is *why* AngelScript is slow relative to native code. JIT is an optional
-  add-on hook in AS, bytecode is the baseline. Confirms our differentiator:
-  make JIT the *only* mode, no bytecode interpreter fallback needed for v1.
-- `as_callfunc_x64_msvc.cpp` / `as_callfunc_x64_gcc.cpp`: hand-written
-  per-ABI native trampolines for calling arbitrary native function
-  signatures from the VM. We need the equivalent (native call thunk
-  generation) but can emit it as JIT'd code directly, i.e. the call site to
-  a native fn is just a `mov`+`call` with correctly placed args - no separate
-  trampoline layer needed since we're already emitting real x86-64.
+Decision: Ember owns the small encoder subset it emits, including labels,
+fixups, external relocations, Win64 call lowering, and RW-to-RX page
+publication. Zydis was not added as a JIT dependency.
 
-## Mun (`E:/DEVELOPER/PROJECTS/mun`)
-- Pipeline: `mun_syntax` (rowan-based parser) → `mun_hir` (name resolution,
-  type inference, salsa incremental queries) → `mun_codegen` (inkwell/LLVM IR)
-  → `mun_abi` (stable C ABI struct layout: `FunctionInfo`, `TypeInfo`,
-  `DispatchTable`) → `mun_runtime` (loads compiled `.munlib` shared object,
-  hot-swaps via dispatch table indirection on file change).
-- Key idea worth stealing: **dispatch table indirection**. Every external
-  call (script→host or script→script-function-that-may-be-hot-reloaded)
-  goes through a function-pointer slot, not a direct call, so reload just
-  overwrites the slot. Cheap enough (one extra indirect load) and gives us
-  hot-reload without invalidating/relinking all callers.
-- Mun's cost: full LLVM (inkwell) dependency, AOT-compiles to a `.dll`/`.so`
-  on disk, then dlopen's it. That's compile-latency-heavy (LLVM opt
-  pipeline) - wrong tradeoff for us. We want compile time in
-  microseconds-to-low-milliseconds for small scripts, in-process, no temp
-  files. So: borrow the *pipeline shape* (syntax→HIR→codegen→ABI) and the
-  *dispatch-table hot-reload trick*, skip LLVM entirely.
-- `mun_abi::type_id`/`TypeInfo`/`StructInfo` layout is a good template for
-  our own stable ABI struct definitions (size/alignment/field offsets
-  computed once, shared between host and script).
-- **Now implemented (v0.1):** the dispatch-table indirection is proven by
-  acceptance test 5 (recursive fib via `mov r11, [r11 + slot*8]; call r11`)
-  and test 7 (the `.em` round-trip - `load_em_file` repoints the
-  dispatch-table-base reloc at the loaded module's own table). The `.em`
-  reloc system (`AbsFixup` → `EmReloc`, `em_file.hpp`) is ember's own design
-  - informed by Mun's ABI shape but not copied; see `BUNDLING_AND_EM_MODULES.md`
-  Section 2 and `spec/CODEGEN_SPEC.md` Section 15.
+This decision remains current. A decoder/disassembler could still be useful as
+a debug verifier, but it is not required by the execution path.
 
-## Conclusion driving the design doc
-No new external dependency is needed. Own minimal x86-64 encoder (subset of
-ISA actually emitted - moves, arithmetic, compares, jumps, calls, SSE scalar
-ops), own label/patch/exec-mem layer, own tiny recursive-descent parser (no
-parser generator needed for a C-subset grammar), own dispatch-table-based
-native+hot-reload binding. AngelScript's decl-string parsing and Mun's LLVM
-backend are both explicitly skipped as overkill for the performance and
-compile-latency goals here. The v0.1 implementation (encoder, label/patch,
-exec-mem, IR data model, `.em` serializer/loader) is the first concrete
-realization of this conclusion; see `spec/CODEGEN_SPEC.md` Section 14 + Section 15 for the
-acceptance suite that proves it.
+## 3. Explicit binding descriptors
+
+AngelScript parses declaration strings such as registered global-function and
+object-method signatures. Ember instead uses typed C++ descriptors:
+
+- `BindingBuilder`
+- `NativeSig`
+- canonical Ember `Type` values
+- explicit permission bits
+- registered operator overload tables
+
+This avoids a second declaration parser at the host boundary and allows the
+same canonical signature machinery to validate JIT calls, public `.em` native
+bindings, self-hosted EMBM native relocations, and keyed dispatch domains.
+
+## 4. Dispatch-table indirection from Mun
+
+Mun demonstrated the value of stable function identity separated from current
+code address. Ember adopted the idea, not Mun's LLVM/AOT implementation:
+
+- ordinary script calls use stable dispatch slots;
+- hot reload replaces slot contents without rewriting callers;
+- cross-module calls add stable module identity through `ModuleRegistry`;
+- function handles carry logical slots rather than executable pointers;
+- keyed modules preserve logical identity while routing to versioned physical
+  layouts.
+
+Ember deliberately skipped LLVM as a required dependency to retain low compile
+latency and a small embedding footprint. Its ThinIR and emitter are native to
+this project.
+
+## 5. Public module format evolution
+
+The first public `.em` design serialized native x86 plus relocations because it
+maximized load-time savings and retained one execution path. Security research
+then made the trust boundary explicit:
+
+- raw x86 is native-code execution by construction;
+- build/ABI hashes provide compatibility, not authentication;
+- Ed25519 v4 authenticates raw content but does not sandbox it;
+- v5 ThinIR reduces the input surface by structural/semantic validation and
+  host-side re-emission before executable allocation;
+- v6 adds capability-negotiated keyed-dispatch metadata.
+
+The public format magic is `EMBL`. The self-hosted compiler later introduced a
+separate `EMBM` in-memory module image with v1/v2 layouts. The similar names do
+not imply format compatibility.
+
+See `BUNDLING_AND_EM_MODULES.md`, `MODULES.md`, and
+`../self_hosted/MODULE_IMAGE_FORMAT.md`.
+
+## 6. Polymorphic passes and keyed dispatch
+
+The pass system grew from simple named pass registration into configured,
+transactional factories with deterministic seed derivation. The current tree
+ships 18 optimization and 7 obfuscation passes. Named profiles are ordinary
+recipes expanded through the same registry; there is no hidden second pass
+manager.
+
+Environmental keyed dispatch follows a constrained design:
+
+- provider material is adapted into transient route words;
+- callables are grouped by exact ABI/visibility/calling-mode/domain identity;
+- versioned permutation chooses bounded physical routes;
+- immutable records are validated before publication;
+- artifacts and runtime state store no expected environmental key, key digest,
+  or verifier;
+- wrong/missing capabilities fail closed.
+
+This makes routing an input to dispatch layout and resolution rather than a
+secret-comparison branch embedded in module code.
+
+## 7. GC strategy
+
+Early design notes deferred a script-visible collector because the original
+language subset used values, slices, and host-owned opaque handles. Lambdas,
+managed allocation, extension-owned references, and concurrent execution later
+provided concrete re-entry triggers.
+
+Current decision:
+
+- tracing mark-sweep;
+- precise frame and global root maps, not conservative stack scanning;
+- extension trace callbacks for host stores;
+- GC-backed by-reference closure environments;
+- language-level managed `new`/`delete` pointers;
+- write-barrier bookkeeping;
+- cooperative stop-the-world coordination for concurrent participants.
+
+A concurrent or generational collector remains a performance option. It is no
+longer accurate to describe GC integration, by-reference capture, or managed
+allocation as unimplemented.
+
+## 8. Self-hosting
+
+The project first proved an Ember-written lexer/parser/sema/codegen subset and
+then used a differential matrix to drive full completion. The completed state
+is:
+
+- 188/188 parity tests;
+- no unsupported cases, mismatches, or hangs;
+- one-stage self-compilation proof;
+- two-generation bootstrap in which compiler A emits compiler B as EMBM v2 and
+  B compiles/runs tests correctly;
+- bundled self-hosted compiler preview built by the production executable
+  bundler.
+
+The self-hosted path validates several earlier architecture choices at once:
+strings and I/O, aggregate ABI, dispatch identity, native symbolic relocation,
+W^X loading, exceptions, closures, coroutines, and module ownership.
+
+## 9. VST3 as an integration stress case
+
+The VST3 wrapper was chosen because an audio callback stresses ABI correctness,
+f32/f64 throughput, allocation/lock restrictions, hot reload publication, state
+migration, and host integration. The implementation now includes 13 Ember DSP
+examples, realtime validation/stress tests, background reload, automation,
+MIDI, state/presets, and latency/tail handling.
+
+The Phase 9 node-graph work deliberately compiles a validated acyclic graph to
+Ember source instead of interpreting nodes on the audio thread. JSON
+persistence and deterministic source generation are shipped; a graphical
+VSTGUI editor remains a separate UI project.
+
+## 10. Decisions that remain in force
+
+- Native execution only; no bytecode interpreter.
+- No mandatory LLVM dependency.
+- Stable logical dispatch identity; no unguarded raw-pointer caching.
+- Typed binding descriptors rather than declaration strings.
+- C-style procedural language rather than class/vtable OOP.
+- No C preprocessor or `goto`.
+- Measured optimization work, not pass additions for their own sake.
+- Explicit trust and capability policy at every module-loader boundary.
