@@ -1,300 +1,206 @@
 # Types
 
-Ember is statically typed. Every value has exactly one type, decided at compile time, and there is no implicit
-conversion between unrelated types. This page covers every type category in the language: primitives, structs,
-fixed arrays, slices, string literals and the string handle, and the opaque handle types.
+Ember is statically typed. Every expression has a compile-time type, and implicit conversions are intentionally limited.
 
-For how these types are used in declarations (`fn`, `struct`, `let`, `auto`, `const`, `global`), see
-[Declarations](20-declarations.md). For the actual functions and operators available on the handle types
-(`vec2`, `vec3`, `vec4`, `quat`, `mat4`), see [Math and Vectors](../20-api/40-math-vectors.md).
+## Primitive types
 
-## Primitive Types
+| Type | Size | Notes |
+|---|---:|---|
+| `i8`, `i16`, `i32`, `i64` | 1, 2, 4, 8 bytes | signed integers |
+| `u8`, `u16`, `u32`, `u64` | 1, 2, 4, 8 bytes | unsigned integers |
+| `f32`, `f64` | 4, 8 bytes | IEEE-754 floating point |
+| `bool` | 1 byte | `true` or `false`; no integer truthiness |
+| `void` | — | function return type; no value |
 
-Ember has a fixed set of primitive scalar types: one boolean type, eight sized integer types, two floating-point
-types, and `void` as a return-type-only marker.
-
-| Type | Size | Signed | Range / Notes |
-|---|---|---|---|
-| `bool` | 1 byte | n/a | canonical values `0` or `1` |
-| `i8` | 1 byte | yes | -128 to 127 |
-| `i16` | 2 bytes | yes | -32768 to 32767 |
-| `i32` | 4 bytes | yes | -2147483648 to 2147483647 |
-| `i64` | 8 bytes | yes | -9223372036854775808 to 9223372036854775807 |
-| `u8` | 1 byte | no | 0 to 255 |
-| `u16` | 2 bytes | no | 0 to 65535 |
-| `u32` | 4 bytes | no | 0 to 4294967295 |
-| `u64` | 8 bytes | no | 0 to 18446744073709551615 |
-| `f32` | 4 bytes | n/a | IEEE 754 single precision |
-| `f64` | 8 bytes | n/a | IEEE 754 double precision |
-| `void` | n/a | n/a | valid only as a function return type |
-
-There is no `char` or `wchar` type. Text is represented as `u8` slices, or as the opaque `string` handle type
-described below. There is also no `usize` or other pointer-sized integer type, and no raw pointer type at all.
-Slices are the only form of indirection in the language.
+There are no `char`, `usize`, or raw-pointer types. A byte is `u8`; text normally uses `string` or `u8[]`.
 
 ```ember
-let flag: bool = true;
-let small: i8 = -12;
-let big: u64 = 18446744073709551615;
-let ratio: f64 = 3.14159;
+fn primitive_demo() -> i64 {
+    let a: i8 = (-12) as i8;
+    let b: u16 = 65000;
+    let c: i32 = 100000;
+    let d: u64 = 4000000000;
+    let x: f32 = 1.25f;
+    let y: f64 = 2.5;
+    let ok: bool = x < (y as f32);
+    return (a as i64) + (b as i64) + (c as i64) + (d as i64) + (ok ? 1 : 0);
+}
 ```
 
-### Widening and Narrowing
+### Conversion rules
 
-Safe widening conversions happen implicitly: `i8` to `i16` to `i32` to `i64`, `u8` to `u16` to `u32` to `u64`, and
-`f32` to `f64`. Signed and unsigned families do not implicitly widen into each other.
+Implicit widening is available within the same family:
 
-```ember
-let a: i16 = 10;
-let b: i64 = a;   // implicit widen, no cast needed
-```
+- `i8 -> i16 -> i32 -> i64`
+- `u8 -> u16 -> u32 -> u64`
+- `f32 -> f64`
 
-Narrowing, signed-unsigned conversion, and int-float conversion all require an explicit `as` cast. See
-[Expressions and Operators](40-expressions-operators.md) for the full cast rules.
+Narrowing, signedness changes, integer/float conversion, and integer/`bool` conversion require `as`.
 
 ```ember
-let x: i64 = 300;
-let y: i32 = x as i32;   // explicit narrowing cast required
+fn conversions(x: i32) -> f64 {
+    let wide: i64 = x;
+    let unsigned: u32 = x as u32;
+    return (wide as f64) + ((unsigned as i64) as f64);
+}
 ```
 
 ## Structs
 
-A struct is a script-declared aggregate of named fields, laid out using
-**Ember's tight-packed layout** — fields are placed in declaration order at
-consecutive offsets with **no alignment padding and no trailing padding**
-(the offset of each field is the sum of the previous fields' Ember sizes;
-`build_struct_layouts` in `src/sema.cpp`). This is **not** MSVC/C layout; a
-host that needs a C-layout struct uses an explicit host-mapped struct
-(`BINDING_API.md`). Fields are separated by semicolons, not commas.
+Structs are nominal value types. Fields are laid out in declaration order with Ember's tight-packed layout: no alignment or trailing padding is inserted.
 
 ```ember
-struct Vec2i {
+struct Point {
     x: i32;
     y: i32;
 }
-```
 
-Struct rules:
-
-- No self-referential cycles. A struct cannot contain itself, directly or through a chain of other struct fields;
-  this is a compile error.
-- Empty structs are allowed and have size 0, alignment 1.
-- Structs cannot declare methods directly. Any methods you see called with `obj.method(args)` syntax on a struct
-  come from host-registered operator overloads, not script-side struct declarations.
-- **Structs CAN be passed by value across a function call boundary** (shipped
-  2026-07-10). A struct ≤8 bytes is passed in one register; a struct >8 bytes
-  uses the Win64 hidden-pointer by-value path (caller allocates, passes a
-  pointer in the first arg slot, callee fills it). A native by-value arg is
-  rejected only if its registered struct size exceeds **128 bytes**. A fn can
-  also `return V3 { ... };` directly (a struct-literal return) and pass a
-  struct literal / struct-returning call as a by-value arg. The earlier
-  "structs cannot be passed by value in v1" claim in this guide is **false** —
-  see `docs/spec/TYPE_SYSTEM.md` §12 + `docs/spec/CODEGEN_SPEC.md` §16.
-
-```ember
-struct Rect {
-    width: f32;
-    height: f32;
-}
-
-// Cannot do: fn area(r: Rect) -> f32
-// Instead, pass the fields directly:
-fn area(width: f32, height: f32) -> f32 {
-    return width * height;
+fn translate(p: Point, dx: i32, dy: i32) -> Point {
+    let mut out: Point = p;
+    out.x += dx;
+    out.y += dy;
+    return out;
 }
 ```
 
-Struct values are read and written field by field with `.` access:
+Structs may contain other structs and fixed arrays but cannot form recursive by-value cycles. They can be passed and returned by value. `sizeof(Point)` and `offsetof(Point, y)` expose Ember layout, not C or MSVC layout. These are compile-time-valued `u64` expressions, though the current `static_assert` folder only accepts its documented integer/boolean expression subset; bind layout queries to `const` or use them in ordinary compile-time contexts.
+
+## Enums
+
+An untyped enum uses integer values. Variants auto-increment after the previous value; explicit values may be compile-time integer expressions.
 
 ```ember
-let mut r: Rect = Rect { width: 4.0, height: 2.0 };
-let a: f32 = area(r.width, r.height);
-// structs can also be passed by value now:
-fn rect_area(r: Rect) -> f32 { return r.width * r.height; }
-let a2: f32 = rect_area(r);
+enum State {
+    Idle,
+    Running = 10,
+    Stopped
+}
 ```
 
-See [Declarations](20-declarations.md) for full `struct` declaration syntax and field initialization.
-
-## Fixed Arrays
-
-A fixed array type is written `T[N]`, where `N` is a compile-time constant integer literal greater than 0. Fixed
-arrays are value types.
+A typed enum has an explicit integer backing type and remains nominally distinct:
 
 ```ember
-let mut scores: i32[4] = [10, 20, 30, 40];
-let first: i32 = scores[0u];
+enum Status : u8 {
+    Ok = 0,
+    Failed = 1
+}
+
+fn status_code(s: Status) -> i64 {
+    return s as i64;
+}
 ```
 
-An array index can be any integer type, signed or unsigned (`i8`...`i64`, `u8`...`u64`); sema only requires the
-index expression to be *some* integer type. Indexing **is bounds-checked at
-runtime**: an out-of-range index (including a negative signed index, which
-appears as a huge unsigned value under the single unsigned `cmp`/`jae`) traps
-via `TrapReason::BoundsCheck` — a recoverable non-local unwind to the host,
-not undefined behavior. A compile-time-constant index into a fixed array of
-known size is checked at **compile time** instead (zero runtime cost). Keeping
-indices in range is still good practice (the trap aborts the call), but the
-language no longer silently reads/writes past the end.
+Use `EnumName::Variant` to name a variant. Integer-to-enum conversion is deliberately not implicit.
+
+## Fixed arrays
+
+A fixed array is `T[N]`, where `N` is a positive compile-time integer. Storage is inline and the length is part of the type.
 
 ```ember
-let mut buf: u8[16];
-let i: u32 = 3u;
-buf[i] = 0xFFu8;
+fn array_demo() -> i64 {
+    let mut values: i32[4] = [10, 20, 30, 40];
+    values[2] = 99;
+    return values[2] as i64;
+}
 ```
+
+Array and slice indices may use any integer type. Literal out-of-range fixed-array indices are rejected at compile time; dynamic indices are checked at runtime and trap with `TrapReason::BoundsCheck` when out of range.
 
 ## Slices
 
-A slice type is written `T[]`. A slice is a two-word value: a pointer and a length. There is no slice-of-slice
-type, and no raw pointer type exists independently of slices; slices are the only indirection Ember has.
-
-Slices are created from fixed arrays with the view conversion syntax `arr[..]`, which is the only slicing syntax
-in v1 (there is no partial-range slicing yet).
+A slice is `T[]`, represented as a pointer-and-length pair. It is a borrowed view, not an owning growable collection. Convert a complete fixed array with `array[..]`:
 
 ```ember
-let mut buf: u8[16];
-let view: u8[] = buf[..];
-```
-
-Like fixed arrays, slice indexing accepts any integer index type and is
-**bounds-checked at runtime** (a slice's length is a runtime field, so the
-check is always a runtime `cmp idx, len; jae .trap`).
-
-```ember
-fn sum_all(values: u32[]) -> u64 {
-    let mut total: u64 = 0;
-    let mut i: u32 = 0u;
-    while (i < 4u) {
-        total += values[i] as u64;
-        i += 1u;
+fn sum(values: i64[]) -> i64 {
+    let mut total: i64 = 0;
+    for (value in values) {
+        total += value;
     }
     return total;
 }
+
+fn slice_demo() -> i64 {
+    let values: i64[4] = [1, 2, 3, 4];
+    return sum(values[..]);
+}
 ```
 
-Slices of `u8` are also the type that plain string literals convert into when a `u8[]`-typed context expects one.
-See below.
+Only whole-array view syntax is available; there is no `array[begin..end]` range syntax. Slice indexing is runtime bounds-checked. Borrow checking rejects local slice views that escape their backing storage through returns, globals, or retaining calls.
 
-## String Literals and the String Handle
+## Strings and byte slices
 
-Ember has two distinct string-related types: a plain string literal that can act as a `u8` slice, and the opaque
-`string` handle type backed by host-owned memory.
-
-A string literal is written `"..."`, or with interpolation as an f-string: `f"...{expr}..."`. A bare string
-literal implicitly converts to whichever type the surrounding context expects:
-
-- to `u8[]` when a byte slice is expected
-- to the `string` handle (an opaque `i64`) when the target is string-typed: a `let` with an explicit `string`
-  type, a `string`-typed function parameter, or either side of a `+` expression against a `string`
-
-There is no need to manually wrap a literal in a conversion call; the compiler resolves this at each use site
-based on the expected type.
+A plain literal can adapt to either `string` or `u8[]` according to context:
 
 ```ember
-let mut name: string = "PRISM";        // literal converts to a string handle
-let bytes: u8[] = "raw bytes";         // same literal syntax, converts to u8[] here instead
-
-let greeting: string = "Hello, " + name;   // literal + string handle, uses the string + overload
-
-let user_id: i32 = 42;
-let report: string = f"user {user_id} ready";  // f-string desugars to a string handle
+fn text_demo() -> i64 {
+    let text: string = "hello";
+    let bytes: u8[] = "hello";
+    return string_length(text) + (bytes[0] as i64);
+}
 ```
 
-### Multi-Line Strings: Continuation vs. Raw Strings
-
-A plain `"..."` (or f-string) literal is single-line by design: an un-escaped newline inside one is a compile
-error, not something that silently spans the literal across lines. This is deliberate - it means a stray or
-missing closing quote fails immediately, at the exact line the mistake is on, instead of the literal silently
-swallowing every line after it (including the rest of the file) as "content" until it happens to find some
-later `"` to close on.
-
-If a plain string needs to continue onto the next source line, end that line with a backslash: this is shorthand
-for an explicit `\n` - it inserts a real newline into the value, just spelled as a trailing backslash plus an
-actual source line break instead of the two characters `\` `n`.
+`string` is an opaque host-owned handle registered by the string extension. It supports content `==`, concatenation with `+`, conversion natives, search, and substring operations. An f-string evaluates to `string`:
 
 ```ember
-let s: string = "first line \
-second line continues here";   // value: "first line \nsecond line continues here"
+fn label(n: i64, ready: bool) -> string {
+    return f"item {n}, ready={ready}";
+}
 ```
 
-For multi-line text where writing a `\` at the end of every single line would be tedious - or for text that needs
-literal backslashes without doubling them, like a Windows path - use a raw string instead: `r"""..."""`. Everything
-between the triple quotes is taken completely literally, including newlines and backslashes; there is no escape
-processing at all inside one (so `r"""C:\Users\name"""` needs no `\\` doubling), and it closes only at the next
-literal `"""`.
+Raw multiline strings use `r"""..."""`; escapes are not processed within them.
+
+## Function types and handles
+
+A bare `fn` accepts any validated function handle. A parameterized function type records its signature:
 
 ```ember
-let block: string = r"""Hello there
-today is Tuesday.
-New line.
-""";
+fn add_one(x: i64) -> i64 { return x + 1; }
+
+fn apply(f: fn(i64) -> i64, value: i64) -> i64 {
+    return f(value);
+}
+
+fn handle_demo() -> i64 {
+    let h: fn(i64) -> i64 = &add_one;
+    return apply(h, 41);
+}
 ```
 
-The `string` type itself is one of the opaque handle types; see the next section for what that means, and see
-[Strings](../20-api/30-strings.md) for the full function and operator reference (`string_*` functions, `str_compare`,
-`str_length`, and the `+` / `==` overloads).
+`&name` produces a logical dispatch-slot handle, not a raw code address. Linked modules also support `&module::name`. Calls through typed handles are checked against the recorded signature and guarded by the runtime dispatch table.
 
-## Opaque Handle Types
+A lambda has a closure type represented by a function slot and environment. See [Expressions and Operators](40-expressions-operators.md#lambdas).
 
-Ember has a family of handle types that are all, under the hood, an opaque `i64` referring to host-owned memory:
-`vec2`, `vec3`, `vec4`, `quat`, `mat4`, `string`, and the generic array handle.
+## Managed pointers
 
-Key properties shared by every handle type:
-
-- A handle is a plain `i64` value as far as the ABI is concerned, but the script cannot read or write its bytes
-  directly. All access goes through registered accessor functions, methods, or operator overloads.
-- The script never manages a handle's lifetime; the host owns the underlying memory.
-- Operators on handle types (`+`, `-`, `==`, indexing, and so on) are resolved statically at compile time by sema
-  based on the operand types. There is no runtime virtual dispatch. If no matching overload is registered for a
-  given type pair, it is a compile error.
-- Method-call syntax on a handle, `obj.method(args)`, desugars at sema time to `method(obj, args)`, with the
-  receiver becoming the first argument.
+`new T` returns an opaque GC-managed pointer. Ember intentionally provides no dereference or pointer-arithmetic syntax; managed pointers are used for lifetime/rooting and host-native interoperability. `delete value` requests deterministic deletion.
 
 ```ember
-let a: vec3 = vec3_new(1.0, 2.0, 3.0);
-let b: vec3 = vec3_new(0.0, 1.0, 0.0);
-let c: vec3 = a + b;              // operator overload resolved at compile time
-let x: f32 = a.vec3_x();          // desugars to vec3_x(a)
+fn allocation_count() -> i64 {
+    let p = new i64;
+    let before: i64 = gc_live();
+    delete p;
+    return before;
+}
 ```
 
-> **NOTE:** This page only describes the handle types as *types*: what they are, how they behave under the type
-> system, and how they relate to structs, primitives, and each other. The actual constructor, accessor, and
-> operator functions for `vec2`, `vec3`, `vec4`, `quat`, and `mat4` are documented in
-> [Math and Vectors](../20-api/40-math-vectors.md). The array handle functions live in
-> [Arrays](../20-api/50-arrays.md), and the `string` handle functions live in [Strings](../20-api/30-strings.md).
+## Host-defined opaque handles
 
-### The array handle
+The standalone host registers named opaque handle types including `string`, `vec2`, `vec3`, `vec4`, `quat`, and `mat4`. Their ABI representation is host-owned; script code uses constructors, accessors, method-call sugar, and registered operator overloads.
 
-The array handle is a generic opaque `i64` representing a host-owned, dynamically sized array. It is distinct
-from the fixed array type `T[N]` and the slice type `T[]`: those are script-visible value types with direct
-indexing, while the array handle is manipulated exclusively through host-registered `array_*` functions and
-carries its element size (in bytes) rather than an element type known to the compiler. There is no `array<T>`
-generic syntax in the language; the handle is just an `i64` like every other handle type.
+The dynamic array, map, synchronization, thread, coroutine, lifecycle, module, and audio APIs primarily expose opaque `i64` handles. An `i64` handle is not interchangeable with a typed `string` or vector handle unless a native signature explicitly says so.
 
-```ember
-let list: i64 = array_new(8, 1);        // elem_size=8 bytes (i64-sized elements), 1 initial element
-array_set_i64(list, 0, 10);
-let v: i64 = array_get_i64(list, 0);
-```
+## Summary
 
-Exact constructor and accessor names are listed in [Arrays](../20-api/50-arrays.md).
+| Category | Examples | Representation |
+|---|---|---|
+| scalar | `i8`…`u64`, `f32`, `f64`, `bool` | value |
+| struct | `Point` | tightly packed value |
+| enum | `State`, `Status : u8` | nominal integer value |
+| fixed array | `i32[4]` | inline value storage |
+| slice | `i32[]` | borrowed pointer + length |
+| string/vector handles | `string`, `vec3`, `mat4` | typed host-owned handle |
+| function handle | `fn(i64) -> i64` | logical dispatch slot |
+| lambda | inferred closure type | slot + environment |
+| managed pointer | inferred from `new T` | opaque GC pointer |
 
-## Type Summary
-
-| Category | Examples | Value or Handle | Indirection |
-|---|---|---|---|
-| Boolean | `bool` | value | none |
-| Integer | `i8`...`i64`, `u8`...`u64` | value | none |
-| Floating point | `f32`, `f64` | value | none |
-| Struct | script-declared `struct Name { ... }` | value | none (tight-packed; passable by value — ≤8B in a register, >8B via hidden pointer) |
-| Fixed array | `T[N]` | value | none (contiguous inline storage) |
-| Slice | `T[]` | value (pointer + length) | one level, the only indirection in Ember |
-| String literal | `"..."`, `f"...{}..."` | converts to slice or handle by context | n/a |
-| String handle | `string` | opaque handle | host-owned |
-| Vector/matrix handles | `vec2`, `vec3`, `vec4`, `quat`, `mat4` | opaque handle | host-owned |
-| Array handle | generic array handle | opaque handle | host-owned |
-
----
-
-Continue to [Declarations](20-declarations.md) for how these types appear in `fn`, `struct`, `let`, `auto`, and
-`const` declarations, or jump straight to [Math and Vectors](../20-api/40-math-vectors.md) for the vector and
-matrix handle API.
+Continue with [Declarations](20-declarations.md).

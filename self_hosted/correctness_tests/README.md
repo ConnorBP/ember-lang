@@ -1,41 +1,77 @@
-# Self-hosted compiler correctness regression suite
+# Self-hosted compiler correctness and parity suites
 
-This directory contains the read-only audit corpus created on 2026-07-12. No C++ source is modified by the suite.
+These tests compare the Ember-written compiler with the native C++ compiler. The current completion baseline is **188/188 parity with 0 unsupported cases**.
 
-## Run
+## Full parity audit: 188 cases
 
-From the Ember repository root on Windows:
+Run from the repository root on Windows:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File self_hosted/correctness_tests/run_correctness_audit.ps1
-powershell -ExecutionPolicy Bypass -File self_hosted/correctness_tests/run_correctness_audit.ps1 -IncludeNegative
+powershell -ExecutionPolicy Bypass -File self_hosted/correctness_tests/run_parity_audit.ps1 -EmberCli build/ember_cli.exe
 ```
 
-The first command runs positive differential tests. Each `.ember` program is executed by:
+The 188 positive programs are assembled by the script from:
 
-1. the native compiler (`ember_cli.exe run <test> --fn main`), and
-2. the Ember-written pipeline through `file_pipeline_runner.ember` and `compile_file_and_run`.
+- **87** `tests/lang/valid_*.ember` files containing a `// expect: N` marker
+- **101** non-infrastructure, non-`reject_` programs in this directory containing `// expect: N`
 
-The runner compares both full process return values with the `// expect: N` comment. PowerShell/.NET process APIs are used because MSYS truncates Windows process return values to eight bits.
+For every positive program, the runner executes:
 
-`-IncludeNegative` also runs `reject_*.ember` and verifies stable self-hosted `-3xx` subset rejection (or any negative pipeline failure where no stable subset code exists).
+1. `ember_cli.exe run <program> --fn main` using the native compiler, and
+2. `ember_cli.exe run self_hosted/correctness_tests/file_pipeline_runner.ember --fn run_file --ffi`, with the target path on stdin.
 
-`diagnose_file.ember` is a utility for printing the self-hosted sema error for one path supplied on stdin.
+A passing result requires both implementations to equal the declared expectation. The completion baseline is:
 
-## Current expected audit result
+```text
+full parity:        188/188
+unsupported subset: 0
+real mismatches:    0
+hangs:              0
+```
 
-The suite intentionally preserves discovered regressions:
+The script also records the general invalid-language corpus and checks the permanent `reject_*.ember` contracts. Those categories validate diagnostics and deliberate rejections; they are not unsupported-feature counts.
 
-- Positive differential corpus: **24 pass / 6 fail**.
-- Negative/out-of-subset corpus: **14 pass / 3 fail**.
-- Combined: **38 pass / 9 fail**, no hangs.
+## Local differential audit: 101 cases
 
-The six positive failures all expose the same scope-stack defect: after the self-hosted sema exits an inner block, an enclosing local may disappear. This breaks block-partition invariance, for-loop bodies that use outer accumulators, nested loops, shadow restoration, and complex while bodies.
+```powershell
+powershell -ExecutionPolicy Bypass -File self_hosted/correctness_tests/run_correctness_audit.ps1 -EmberCli build/ember_cli.exe
+```
 
-The three rejection failures are silently accepted syntax:
+Current result:
 
-- `break` outside a loop,
-- `continue` outside a loop,
-- `@realtime` (indeed annotations generally, because Stage 2 consumes and discards them).
+```text
+pass=101 fail=0 hangs=0
+```
 
-See `docs/audit/SELF_HOSTED_CORRECTNESS_AUDIT_2026-07-12.md` for results and recommendations.
+Add `-IncludeNegative` to include the local permanent rejection tests:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File self_hosted/correctness_tests/run_correctness_audit.ps1 -EmberCli build/ember_cli.exe -IncludeNegative
+```
+
+## Why PowerShell?
+
+The CLI maps an Ember `i64` result into a 31-bit process result. The audit scripts decode negative values back into their signed form. PowerShell/.NET process APIs preserve the Windows result channel reliably; POSIX compatibility shells may truncate it to eight bits.
+
+## Infrastructure files
+
+- `file_pipeline_runner.ember` — reads a target path from stdin and invokes the self-hosted file pipeline
+- `diagnose_file.ember` — prints a self-hosted diagnostic for one stdin path
+- `run_correctness_audit.ps1` — focused 101-case local differential run
+- `run_parity_audit.ps1` — 188-case language + local parity run, plus invalid/rejection reporting
+
+## Adding a test
+
+1. Add `// expect: N` near the top.
+2. Make `main() -> i64` return that exact value on success.
+3. Avoid observing behavior only through stdout; the result code is the differential oracle.
+4. Add a `reject_*.ember` file only for a permanent semantic/diagnostic contract, with `// selfhost-reject: CODE` (or `negative`).
+5. Run both audit scripts and the bootstrap smoke test.
+
+## Bootstrap smoke test
+
+```console
+echo tests/lang/valid_try_catch.ember | build/ember_cli.exe run self_hosted/bootstrap.ember --fn main --ffi
+```
+
+Expected result: `42`, produced by the second-generation compiler.

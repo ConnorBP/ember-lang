@@ -1,343 +1,243 @@
 # Expressions and Operators
 
-This page covers every operator and expression form in Ember: arithmetic, comparison, logical, and bitwise operators, the ternary operator, assignment and compound assignment, increment and decrement, casts, indexing, field access, method-call sugar, the array-to-slice view syntax, `sizeof`/`offsetof`, operator overloading, string concatenation, and f-string interpolation.
+## Precedence
 
-> **NOTE:** Ember does not publish a single precise operator-precedence table in this guide. Operators are grouped by category below. When in doubt about how two different categories of operator combine in one expression, use parentheses to make the grouping explicit rather than relying on memorized precedence.
+From lowest to highest:
 
-## The Same-Type Rule
+1. assignment: `=`, `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=` (right-associative)
+2. ternary: `?:` (right-associative)
+3. logical OR: `||`
+4. logical AND: `&&`
+5. bitwise XOR: `^`
+6. bitwise OR: `|`
+7. bitwise AND: `&`
+8. equality: `==`, `!=`
+9. relational: `<`, `<=`, `>`, `>=`
+10. shifts: `<<`, `>>`
+11. additive: `+`, `-`
+12. multiplicative: `*`, `/`, `%`
+13. casts: `as`
+14. prefix: `-`, `!`, `~`, `++`, `--`, `&function`, `new`, `delete`
+15. postfix: calls, indexing/view, field access, `++`, `--`
 
-Most binary operators in Ember (arithmetic, comparison, bitwise) require both operands to be the exact same type. There is no implicit mixing of, for example, `i32` and `i64`, or `i32` and `f32`, inside a single operator expression. If you need to combine two different types, cast one of them explicitly with `as` (or rely on implicit widening where it applies; see below). This rule is checked by sema and a mismatch is a compile error, not a runtime conversion.
+Use parentheses when mixed operators would obscure intent.
 
-```ember
-let a: i32 = 10;
-let b: i64 = 20;
-// a + b is a compile error: i32 and i64 are different types
-let c: i64 = (a as i64) + b;
-```
+## Arithmetic and comparison
 
-## Arithmetic Operators
-
-`+`, `-`, `*`, `/`, `%`
-
-Both operands must be the exact same type. The result type equals the operand type. Arithmetic is checked for overflow in debug builds (an overflowing add, subtract, or multiply traps) and wraps silently in release builds.
-
-```ember
-fn add_two(a: i32, b: i32) -> i32 {
-    return a + b;
-}
-
-fn average(a: f64, b: f64) -> f64 {
-    return (a + b) / 2.0;
-}
-```
-
-`%` is integer remainder; it requires integer operands of the same type, same as the other arithmetic operators.
-
-## Comparison Operators
-
-`==`, `!=`, `<`, `<=`, `>`, `>=`
-
-Both operands must be the same type. The result is always `bool`. There is no "truthy" integer: Ember has no implicit conversion from an integer to `bool`, so you must write the comparison out explicitly.
+`+ - * / %` operate on compatible numeric types; `%` is integer remainder. Most binary operations require exactly matching operand types. Safe widening occurs at assignment/call boundaries but is not C-style mixed-expression promotion.
 
 ```ember
-let x: i32 = 0;
-// if (x) { ... }        // compile error: i32 is not bool
-if (x != 0) {             // correct
-    print_i32(x);
+fn arithmetic(a: i32, b: i64) -> i64 {
+    let total: i64 = (a as i64) + b;
+    return total / 2;
 }
 ```
 
-## Logical Operators
+`== != < <= > >=` return `bool`. Division or remainder by zero traps. Signed minimum divided by `-1` also traps. Integer overflow behavior follows the selected checked/release compilation mode.
 
-`&&`, `||`, `!`
+## Logical operators
 
-Logical operators take `bool` operands and produce a `bool` result. `&&` and `||` short-circuit: the right operand is not evaluated if the left operand already determines the result.
+`!`, `&&`, and `||` require `bool`. `&&` and `||` short-circuit.
 
 ```ember
-fn in_range(v: i32, lo: i32, hi: i32) -> bool {
-    return v >= lo && v <= hi;
-}
-
-fn should_skip(ready: bool, cancelled: bool) -> bool {
-    return !ready || cancelled;
+fn safe_check(index: i64, count: i64) -> bool {
+    return index >= 0 && index < count;
 }
 ```
 
-Because `&&` and `||` short-circuit, it is safe to guard a call behind a condition on the left side:
+## Bitwise and shift operators
+
+`& | ^ ~ << >>` operate on integers. Binary bitwise operands have matching types. The shift amount may be an unsigned integer type. Right shift is arithmetic for signed values and logical for unsigned values.
 
 ```ember
-fn is_positive_and_even(v: i32) -> bool {
-    return v > 0 && (v % 2) == 0;
+fn flags(value: u32, bit: u32) -> u32 {
+    return value | ((1 as u32) << bit);
 }
 ```
 
-## Bitwise Operators
+## Assignment and compound assignment
 
-`&`, `|`, `^`, `~`, `<<`, `>>`
+The complete compound family is:
 
-Bitwise operators only accept integer operands. The two operands of a binary bitwise operator (`&`, `|`, `^`) must be the same type, following the same-type rule. `~` is unary bitwise-not. For the shift operators `<<` and `>>`, the value being shifted and the shift amount do not need to match types: the shift amount can be any unsigned integer type.
-
-```ember
-fn set_flag(flags: u32, bit: u32) -> u32 {
-    return flags | (1u << bit);
-}
-
-fn clear_flag(flags: u32, bit: u32) -> u32 {
-    return flags & ~(1u << bit);
-}
-
-fn toggle_flag(flags: u32, bit: u32) -> u32 {
-    return flags ^ (1u << bit);
-}
+```text
++=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=
 ```
 
-## Ternary Operator
-
-`cond ? a : b`
-
-The condition must be `bool`. Both arms must be the same type, there is no implicit widening between the two arms even if one would normally widen to the other in isolation, and neither arm may be `void`. The ternary operator is right-associative.
+The target must be a mutable lvalue: a mutable local/global, mutable struct field, or indexed mutable array/slice element. Complex lvalue subexpressions are evaluated once.
 
 ```ember
-fn clamp_low(v: i32, lo: i32) -> i32 {
-    return v < lo ? lo : v;
-}
-
-let mut label: i64 = score > 100 ? label_win : label_lose;
-```
-
-## Assignment and Compound Assignment
-
-`=`, `+=`, `-=`, `*=`, `/=`, `%=`
-
-Plain assignment requires the right-hand side to match the left-hand side's type (subject to the same implicit-widening rules that apply everywhere else). Each compound assignment form follows the same-type rule of its underlying binary operator: `x += y` requires `x` and `y` to be the same type, exactly as `x + y` would.
-
-```ember
-let mut total: i64 = 0;
-total += 10;
-total -= 3;
-total *= 2;
-total /= 4;
-total %= 5;
-```
-
-## Increment and Decrement
-
-`++`, `--` (prefix and postfix)
-
-These apply only to integer lvalues: locals, struct fields, and indexed array/slice elements. Prefix returns the new (post-modification) value; postfix returns the old (pre-modification) value. Overflow is checked in debug builds.
-
-```ember
-let mut i: u32 = 0u;
-i++;        // i is now 1, expression value is 0 (old value)
-++i;        // i is now 2, expression value is 2 (new value)
-
-let mut arr: i32[4] = [0, 0, 0, 0];
-arr[0u]++;  // increments arr[0] in place
-```
-
-## Casts and Implicit Widening
-
-Ember distinguishes explicit narrowing casts from implicit safe widening.
-
-**Explicit casts** use the `as` keyword. Use `as` for:
-
-- Narrowing an integer type (`i64 as i32`, `u32 as u16`)
-- Converting between signed and unsigned, same or different width (`i32 as u32`, `u8 as i64`)
-- Converting between integer and float (`i32 as f64`, `f64 as i32`)
-- Converting integer to `bool` or `bool` to integer
-
-```ember
-let big: i64 = 300;
-let small: i32 = big as i32;
-
-let signed: i32 = -1;
-let unsigned: u32 = signed as u32;
-
-let flag: bool = (1 as bool);
-let as_int: i32 = flag as i32;
-```
-
-**Implicit widening** happens automatically, no `as` needed, for safe same-kind conversions that cannot lose information:
-
-- Signed integer widening: `i8` to `i16` to `i32` to `i64`
-- Unsigned integer widening: `u8` to `u16` to `u32` to `u64`
-- Float widening: `f32` to `f64`
-
-```ember
-fn takes_i64(v: i64) -> i64 {
-    return v;
-}
-
-let small: i32 = 5;
-// takes_i64(small) would be an error if i32->i64 were not implicit
-let result: i64 = takes_i64(small as i64); // explicit is always fine too
-```
-
-Never implicit: int-to-float or float-to-int in either direction, int-to-bool or bool-to-int in either direction, any narrowing conversion, and struct-to-struct conversion (Ember uses nominal typing; there is no structural coercion between different struct types).
-
-## Indexing
-
-`arr[i]`, `slice[i]`
-
-The index expression must be an integer type - signed or unsigned both work (`i32`, `u32`, `u64`, ...); sema only requires *some* integer type, not specifically an unsigned one.
-
-```ember
-let mut values: i32[8] = [1, 2, 3, 4, 5, 6, 7, 8];
-let idx: u32 = 2u;
-let v: i32 = values[idx];
-```
-
-> Indexing **is bounds-checked**. `arr[i]` compiles to a single unsigned `cmp idx, len; jae .oob_trap` before the address computation, and an out-of-range index (including a negative signed index, which appears as a huge unsigned value under the unsigned compare) traps via `TrapReason::BoundsCheck` — a recoverable non-local unwind to the host, not undefined behavior. A compile-time-constant *literal* index into a fixed array of known size is checked at **compile time** instead (a sema error, zero runtime cost). A `const`-named index (e.g. `const N: u64 = 4; arr[N]`) is not folded by sema and instead traps at runtime — still not UB. Keeping indices in range is still good practice (the trap aborts the call). See `docs/spec/CODEGEN_SPEC.md` §9 + `docs/spec/SAFETY_AND_SANDBOX.md` §5.
-
-```ember
-const N: u64 = 4;
-let arr: i32[4] = [10, 20, 30, 40];
-let bad: i32 = arr[N];   // N is a const, not folded -> traps at runtime with TrapReason::BoundsCheck (not UB)
-```
-
-## Field Access
-
-`struct_val.field`
-
-Plain dot access reads or writes a field on a struct value.
-
-```ember
-struct Point {
-    x: f32;
-    y: f32;
-}
-
-fn move_point(mut p: Point, dx: f32, dy: f32) -> f32 {
-    p.x += dx;
-    p.y += dy;
-    return p.x;
+fn assignments() -> i64 {
+    let mut x: i64 = 3;
+    x *= 4;
+    x <<= 1;
+    x |= 1;
+    return x;
 }
 ```
 
-> **NOTE:** Structs **can** be passed by value across a function call
-> boundary (shipped 2026-07-10): ≤8 bytes in one register, >8 bytes via the
-> Win64 hidden-pointer by-value path, native by-value args up to 128 bytes.
-> The earlier "Structs cannot be passed by value in this version" note in
-> this guide is **false** — see `docs/spec/TYPE_SYSTEM.md` §12 +
-> `docs/spec/CODEGEN_SPEC.md` §16.
+## Increment and decrement
 
-## Method-Call Sugar
-
-`obj.method(args)`
-
-Ember desugars method-call syntax at sema time into an ordinary function call, with the receiver inserted as the first argument:
+Prefix and postfix `++`/`--` work on mutable integer lvalues. Prefix returns the new value; postfix returns the old value.
 
 ```ember
-obj.method(args)
-// is exactly equivalent to:
-method(obj, args)
-```
-
-This is how handle types expose behavior. For example, a `string` handle's `string_length()` method call:
-
-```ember
-let report: string = "build finished";
-let len: u64 = report.string_length();
-// desugars to: string_length(report)
-```
-
-is really a call to the free function `string_length(report)`. There is no hidden `this` pointer or separate method-dispatch mechanism; it is purely a syntactic rewrite resolved at compile time.
-
-## View Syntax (Array to Slice)
-
-`arr[..]`
-
-`arr[..]` converts a whole fixed-size array (`T[N]`) into a slice (`T[]`) view over the same elements. This is the only slicing syntax in this version of Ember: there is no partial-range slicing (no `arr[1..3]`), only the full-array view conversion.
-
-```ember
-fn sum_slice(s: i32[]) -> i32 {
-    let mut total: i32 = 0;
-    let mut i: u32 = 0u;
-    while (i < s.slice_length()) {
-        total += s[i];
-        i++;
-    }
-    return total;
-}
-
-fn sum_array() -> i32 {
-    let values: i32[5] = [1, 2, 3, 4, 5];
-    return sum_slice(values[..]);
+fn increments() -> i64 {
+    let mut x: i64 = 5;
+    let old: i64 = x++;
+    let current: i64 = ++x;
+    return old * 100 + current;
 }
 ```
 
-## sizeof and offsetof
+## Ternary
 
-`sizeof(type)` and `offsetof(struct_type, field)` are both compile-time constants of type `u64`, folded by the compiler.
-
-```ember
-struct Entity {
-    id: u64;
-    health: f32;
-    flags: u32;
-}
-
-const ENTITY_SIZE: u64 = sizeof(Entity);
-const HEALTH_OFFSET: u64 = offsetof(Entity, health);
-```
-
-`offsetof` only works on struct types, and the named field must actually exist on that struct; referencing a nonexistent field is a compile error.
-
-## Operator Overloading
-
-Handle types and struct types can have operators registered against them on the host side (via `TypeBuilder`), covering the arithmetic, comparison, and bitwise operators, plus unary minus and unary `!`. From script code these overloads are used exactly like the built-in operators:
+`condition ? then_value : else_value` requires a `bool` condition and compatible non-void arms.
 
 ```ember
-let a: vec3 = vec3_new(1.0, 2.0, 3.0);
-let b: vec3 = vec3_new(4.0, 5.0, 6.0);
-let sum: vec3 = a + b;      // resolves to the registered vec3 + vec3 overload
-let eq: bool = a == b;      // resolves to the registered vec3 == vec3 overload
-```
-
-> **WARNING:** Operator overload resolution is static, decided by sema at compile time from the operand types, never a runtime virtual dispatch. There is no way for two different runtime "kinds" of the same handle type to resolve an operator differently; the overload used is fixed once the types are known at compile time. If no overload is registered for a given operator and pair of operand types, it is a compile error, not a fallback to some default behavior.
-
-## String Concatenation
-
-String literals and string handles both support `+` through the registered `plus` overload on the string type. You can mix literals and handles freely on either side.
-
-```ember
-let name: string = "PRISM";
-let greeting: string = "Hello, " + name + "!";
-let both_literals: string = "foo" + "bar";
-```
-
-A bare string literal implicitly converts to a string handle when used where a string handle is expected, such as either side of a `+` against a string, so you never need to manually construct a handle from a literal before concatenating.
-
-## F-String Interpolation
-
-`f"...{expr}..."`
-
-An f-prefixed string literal can contain `{expr}` placeholders. At compile time, an f-string desugars into a chain of formatting calls and evaluates to a `string` handle.
-
-```ember
-fn describe(name: string, hp: i32) -> string {
-    return f"{name} has {hp} HP remaining";
-}
-
-let count: u32 = 3u;
-let msg: string = f"retry {count} of {3u}";
-```
-
-Any expression valid in that scope can appear inside the braces, including field access, method calls, and arithmetic:
-
-```ember
-struct Vec2 {
-    x: f32;
-    y: f32;
-}
-
-fn report_position(p_x: f32, p_y: f32) -> string {
-    return f"position: ({p_x}, {p_y})";
+fn absolute(v: i64) -> i64 {
+    return v < 0 ? -v : v;
 }
 ```
 
-## See Also
+## Casts
 
-- [Types](10-types.md) for the primitive, struct, array, slice, and handle types that these operators act on.
-- [Declarations](20-declarations.md) for `let`, `auto`, `const`, and `mut`, which control what an lvalue's mutability rules are for assignment and increment/decrement.
-- [Gotchas](50-gotchas.md) for common mistakes with the same-type rule, unsigned indexing, and operator overload resolution.
+Explicit casts use `as`:
+
+```ember
+fn cast_demo(wide: i64, count: i64) -> i64 {
+    let narrow: i16 = wide as i16;
+    let real: f64 = count as f64;
+    let integer: i64 = real as i64;
+    let flag: bool = count != 0;
+    return (narrow as i64) + integer + (flag ? 1 : 0);
+}
+```
+
+Supported categories include integer width/signedness changes, `f32`/`f64`, signed-integer/float conversions, `bool`-to-integer conversion, and typed-enum-to-backing-integer conversion. Integer-to-`bool` (write `value != 0`), unsigned integer/float casts, and integer-to-enum casts are deliberately rejected in the current type matrix.
+
+## Literals
+
+- decimal/hex integer literals adapt to an expected integer type; integer width suffixes are rejected, so use `as`
+- floating literals default to `f64`; an `f` suffix selects `f32`
+- `true` and `false` are `bool`
+- `"text"` adapts to `string` or `u8[]`
+- `[a, b, c]` constructs an explicitly typed fixed array or slice
+- `Type { field: value }` constructs a struct
+- `Enum::Variant` names an enum value
+
+```ember
+struct Point { x: i64; y: i64; }
+
+fn literal_demo() -> i64 {
+    let bytes: u8[3] = [10, 20, 30];
+    let point: Point = Point { x: 1, y: 2 };
+    return (bytes[0] as i64) + point.x;
+}
+```
+
+Array literals require an explicit target type. Fixed-array literals must have exactly the declared element count.
+
+## Indexing and views
+
+`value[index]` indexes fixed arrays and slices. Every dynamic access is bounds-checked; an invalid index traps. `array[..]` creates a whole-array slice view.
+
+```ember
+fn first(values: i64[]) -> i64 {
+    return values[0];
+}
+```
+
+There is no partial range syntax. A slice view borrows backing storage and may not escape a local that would die first.
+
+## Field and method syntax
+
+`value.field` accesses a struct field. `receiver.method(args)` is compile-time sugar for `method(receiver, args)` and is commonly used for handle accessors:
+
+```ember
+fn method_demo() -> f32 {
+    let v: vec3 = vec3_new(1.0f, 2.0f, 3.0f);
+    let x: f32 = v.vec3_x();
+    return x;
+}
+```
+
+Script structs do not declare methods inside their definitions.
+
+## Function handles and indirect calls
+
+`&function_name` creates a logical dispatch handle. Typed handles use `fn(Args) -> Return`; bare `fn` is the backward-compatible untyped form.
+
+```ember
+fn double_it(x: i64) -> i64 { return x * 2; }
+
+fn invoke(f: fn(i64) -> i64) -> i64 {
+    return f(21);
+}
+
+fn handle_use() -> i64 {
+    return invoke(&double_it);
+}
+```
+
+`&module::function` creates a cross-module handle after a `link`. Handles are validated against dispatch tables; they are not arbitrary native addresses.
+
+## Lambdas
+
+A lambda uses function syntax in expression position. Unlisted outer locals are captured by value. An optional capture list marks explicit by-reference captures with `&`:
+
+```ember
+fn lambda_demo() -> i64 {
+    let base: i64 = 40;
+    let add = fn(x: i64) -> i64 { return base + x; };
+
+    let mut current: i64 = 1;
+    let read_current = fn[&current]() -> i64 { return current; };
+    current = 2;
+
+    return add(read_current());
+}
+```
+
+A closure is a slot/environment pair and can be called directly. Captures requiring lifetime beyond the creating frame use the GC environment execution mode; do not return a stack-backed closure from a host configuration that has not enabled GC environments.
+
+## F-strings
+
+`f"...{expression}..."` evaluates to `string`. Supported holes include integer, float, `bool`, and `string` expressions; each is lowered to the appropriate `string_from_*` conversion and concatenation.
+
+```ember
+fn description(name: string, hp: i64, alive: bool) -> string {
+    return f"{name}: hp={hp}, alive={alive}";
+}
+```
+
+Double braces represent literal braces. Plain/raw literal segments and interpolation expressions are parsed with source-location-aware diagnostics.
+
+## `sizeof` and `offsetof`
+
+Both are compile-time `u64` expressions:
+
+```ember
+struct Packet { tag: u8; value: i64; }
+
+fn packet_layout() -> i64 {
+    const PACKET_SIZE: u64 = sizeof(Packet);
+    const VALUE_OFFSET: u64 = offsetof(Packet, value);
+    return (PACKET_SIZE + VALUE_OFFSET) as i64;
+}
+```
+
+`offsetof` requires a struct type and an existing field.
+
+## `new` and `delete`
+
+`new T` allocates a GC-managed object and returns an opaque managed pointer. `delete expression` destroys a managed object and has `void` type. There is no dereference or pointer arithmetic.
+
+## Operator overloading
+
+Hosts may register operators for named handle types. Resolution is static and based on compile-time operand types. The standard extensions provide:
+
+- `string`: `+`, `==`
+- `vec2`/`vec3`/`vec4`: `+`, `-`, `*`, `==`
+- `quat`: `+`, `-`, Hamilton `*`, `==`
+- `mat4`: matrix `*`, `==`
+
+No script-defined operator declaration syntax exists.

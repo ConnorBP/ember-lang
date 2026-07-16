@@ -1,111 +1,84 @@
 # I/O and Debug
 
-> **STALENESS NOTICE (2026-07-11):** this page documents `print_i64`,
-> `print_f32`, and `print_str`. **Only `print_i64` is in the standard `io`
-> extension.** The actual `io` extension (`extensions/io/ext_io.cpp`) ships:
-> `print(s: string)`, `println(s: string)`, `print_i64(n: i64)`,
-> `print_f64(n: f64)`, `read_line() -> string`, `file_read_bytes(path) ->
-> array<u8>`, `file_write_bytes(path, buf) -> i64`, `file_exists(path) -> i64`,
-> `path_exists(p) -> i64`, `path_basename(p) -> string`, `path_dirname(p) ->
-> string` — **all `PERM_FFI`-gated** (the CLI grants the bit via `--ffi` /
-> `--allow-io`). `print_f32` and `print_str` are **prism-host** natives (per
-> `extensions/AUDIT.md`), not the standard extension. The examples below use
-> the prism naming and are not accurate against the standalone `ember` CLI;
-> see `extensions/README.md` + `docs/ROADMAP.md` (Family B) for the real
-> surface. A full rewrite of this page is tracked as a follow-up.
+The standalone `io` extension registers all functions on this page with `PERM_FFI`. Run CLI programs that use them with `--ffi`.
 
-These are the native functions Ember scripts use to get information out to the host: raw value printing. They are the first natives most scripts touch, since they are the only way to observe what a running script is doing without a debugger attached.
+## Console
 
-All functions on this page return `void`. They are one-way: value in, text out. None of them read anything back into the script.
-
-A host may expose additional printing natives on top of these (for example a string-handle printer or a prefixed log helper); see your host's documentation for those.
-
-## Overview
-
-| Function | Signature | Purpose |
+| Function | Signature | Behavior |
 |---|---|---|
-| `print` | `print(s: string) -> void` | Print a string handle (io extension, `PERM_FFI`-gated) |
-| `println` | `println(s: string) -> void` | Print a string handle + newline (io extension, `PERM_FFI`-gated) |
-| `print_i64` | `print_i64(v: i64) -> void` | Print a 64-bit integer (io extension, `PERM_FFI`-gated) |
-| `print_f64` | `print_f64(v: f64) -> void` | Print a 64-bit float (io extension, `PERM_FFI`-gated) |
-| `read_line` | `read_line() -> string` | Read a line from stdin into a string handle (io extension, `PERM_FFI`-gated) |
-| `file_read_bytes` | `file_read_bytes(path: string) -> array<u8>` | Read a file into a byte array handle (io extension, `PERM_FFI`-gated) |
-| `file_write_bytes` | `file_write_bytes(path: string, buf: array<u8>) -> i64` | Write a byte array to a file (io extension, `PERM_FFI`-gated) |
-| `file_exists` | `file_exists(path: string) -> i64` | 1 if the file exists, 0 otherwise (io extension, `PERM_FFI`-gated) |
-| `path_exists` | `path_exists(p: string) -> i64` | 1 if the path exists, 0 otherwise (io extension, `PERM_FFI`-gated) |
-| `path_basename` | `path_basename(p: string) -> string` | The basename of a path (io extension, `PERM_FFI`-gated) |
-| `path_dirname` | `path_dirname(p: string) -> string` | The dirname of a path (io extension, `PERM_FFI`-gated) |
+| `print` | `(text: string) -> void` | writes text without a newline |
+| `println` | `(text: string) -> void` | writes text followed by `\n` |
+| `print_i64` | `(value: i64) -> void` | decimal integer, no automatic newline |
+| `print_f64` | `(value: f64) -> void` | `%g`-style floating output, no automatic newline |
+| `read_line` | `() -> string` | reads one stdin line; strips LF and a preceding CR |
 
-> The `print_f32` and `print_str` entries in the original version of this page
-> are **prism-host** natives, not the standard `io` extension — they are not
-> registered by `ext_io::register_natives`.
-
-## print_i64
-
-```text
-print_i64(v: i64) -> void
-```
-
-Prints a 64-bit signed integer to the host's output, formatted as a plain decimal number. No prefix, no newline handling beyond what the host print sink does, no thousands separators.
-
-This is the function you reach for first when debugging a script: cheap, unambiguous, and works on anything that fits in an `i64` (which includes `bool` and pointer-sized values via a cast).
+`read_line` returns a valid empty string for a blank line and handle `0` for EOF before any bytes are read.
 
 ```ember
 fn main() -> i64 {
-    let total: i64 = 0;
-    for (let i: i64 = 1; i <= 5; i += 1) {
-        total += i;
+    print("value = ");
+    print_i64(42);
+    println("");
+    print_f64(3.5);
+    println("");
+    return 0;
+}
+```
+
+The standalone extension does **not** register `print_str`, `print_f32`, or `print_string`; those are host-specific names. Use `print`/`println` for `string`, and cast/format other values as needed.
+
+## File operations
+
+| Function | Signature | Behavior |
+|---|---|---|
+| `file_read_bytes` | `(path: string) -> i64` | whole file as an `array<u8>` handle; `0` on failure |
+| `file_read_text` | `(path: string) -> string` | whole file as a string, preserving UTF-8 bytes; `0` on failure |
+| `file_write_bytes` | `(path: string, data: i64) -> i64` | truncate/create and write an array handle; `1` success, `0` failure |
+| `file_exists` | `(path: string) -> i64` | `1` only for an existing regular file |
+
+A zero-byte file returns a valid empty handle from either read function; failure returns handle `0`.
+
+```ember
+fn read_source_length(path: string) -> i64 {
+    let text: string = file_read_text(path);
+    if (text == "") {
+        return file_exists(path) == 1 ? 0 : -1;
     }
-    print_i64(total);  // 15
-    return 0;
+    return string_length(text);
+}
+
+fn copy_bytes(input: string, output: string) -> i64 {
+    let bytes: i64 = file_read_bytes(input);
+    if (bytes == 0) { return 0; }
+    return file_write_bytes(output, bytes);
 }
 ```
 
-## print_f32
+`file_write_bytes` expects a dynamic array handle, normally from `file_read_bytes` or `array_new(1, count)`. It does not accept a language-level `u8[]` slice.
 
-```text
-print_f32(v: f32) -> void
-```
+## Path operations
 
-Prints a 32-bit float to the host's output. Formatting matches C's `%g`: the shortest representation that round-trips, switching to exponential notation for very large or very small magnitudes.
+| Function | Signature | Behavior |
+|---|---|---|
+| `path_exists` | `(path: string) -> i64` | `1` for an existing file or directory |
+| `path_basename` | `(path: string) -> string` | component after the final `/` or `\` |
+| `path_dirname` | `(path: string) -> string` | directory component; `"."` when absent |
+
+The basename/dirname functions are lexical string operations; they do not require the path to exist.
 
 ```ember
-fn main() -> i64 {
-    let a: f32 = 1.5;
-    let b: f32 = 2.5;
-    print_f32(a + b);   // 4
-    print_f32(b / a);   // 1.66667
-    return 0;
+fn path_demo() -> i64 {
+    let path: string = "docs/guide/00-index.md";
+    println(path_basename(path));
+    println(path_dirname(path));
+    return path_exists(path);
 }
 ```
 
-## print_str
+## Running examples
 
-```text
-print_str(s: u8[]) -> void
+```console
+build\ember_cli.exe run script.ember --fn main --ffi
 ```
 
-Prints a raw `u8[]` byte slice to the host's output, writing exactly the bytes in the slice with no null-termination assumptions and no handle lookup. A string literal passed directly as this argument converts to `u8[]`, because that is what `print_str`'s parameter is declared as; the same literal would convert to a `string` handle instead if passed somewhere a `string` is expected. See [Types](../10-language/10-types.md#string-literals-and-the-string-handle) for the full context-dependent conversion rule.
-
-```ember
-fn main() -> i64 {
-    print_str("still just a slice, not a string handle");
-    return 0;
-}
-```
-
-`print_str` also works on any `u8[]` you have constructed or sliced yourself, not just literals:
-
-```ember
-fn main() -> i64 {
-    let letters: u8[5] = [104, 101, 108, 108, 111];
-    print_str(letters[..]);  // hello
-    return 0;
-}
-```
-
-> **NOTE:** `print_str` takes a `u8[]` slice (a string literal, or any raw byte buffer). To print a `string` *handle*, the value you get back from `string_from_slice`, f-string interpolation, or the `+` concatenation overload, use your host's string-handle printing native (see [Strings](30-strings.md) for how `string` handles are created and combined). Passing a `string` handle where a `u8[]` is expected, or vice versa, is a compile error, not a runtime one.
-
----
-
-Related pages: [API Overview](00-overview.md), [Strings](30-strings.md), [Assertions](20-assertions.md).
+A host may omit the I/O extension or replace stdout/stdin behavior. The signatures above describe `extensions/io/ext_io.cpp` as registered by the standalone CLI.

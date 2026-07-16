@@ -1,157 +1,107 @@
 # Strings
 
-> **STALENESS NOTICE (2026-07-11):** the native table below lists
-> `str_compare` and `str_length`. Those are **prism-host** natives (raw-
-> pointer string ops), **not** the standard `string` extension — they are not
-> registered by `ext_string::register_natives`. The standard `string`
-> extension ships `string_new`/`string_from_slice`/`string_from_i64`/
-> `string_from_f32`/`string_from_f64`/`string_from_bool`/`string_length`/
-> `string_char_at`/`string_identity`/`string_find`/`string_substr` — the table
-> below **omits `string_find` and `string_substr`** (both shipped). Use `==`
-> for content comparison (the `str_compare` stub note is obsolete — the
-> standard extension never had a `str_compare`). The `print_string` calls in
-> the examples are also prism-host natives; the standard `io` extension uses
-> `print(s: string)` / `println(s: string)` instead. See
-> `extensions/string/ext_string.cpp` for the authoritative native list.
-
-String values in Ember are handles: opaque `i64` references to host-owned string memory. A script never sees the bytes directly. All string work goes through the native functions on this page, or through the `+` and `==` operator overloads registered for the string type. For the underlying type rules (handle types, string literals, byte slices), see [10-language/10-types.md](../10-language/10-types.md).
-
-## Implicit conversion from string literals
-
-A bare string literal converts automatically to whichever form the surrounding context expects. If the target is a `u8[]` slice, the literal becomes a byte slice. If the target is string-typed (an explicit `string` local, a string-typed parameter, or either side of a `+` against a string), the literal becomes a string handle. You almost never need to call `string_from_slice()` by hand; write the literal and let sema pick the conversion.
+`string` is a typed opaque handle to host-owned bytes. Plain literals adapt to `string` when a string is expected; a literal adapts to `u8[]` in a byte-slice context.
 
 ```ember
 fn greet(name: string) -> string {
     return "Hello, " + name + "!";
 }
-
-fn main() -> i64 {
-    let mut msg: string = greet("V");
-    print_string(msg);
-    return 0;
-}
 ```
-
-In `greet`, `"Hello, "` and `"!"` are bare literals next to a `+` on a string, so both become string handles before the concatenation runs. The call `greet("V")` passes a bare literal into a string-typed parameter, so it converts the same way at the call site. No explicit conversion function appears anywhere in this snippet.
-
-> **NOTE:** the implicit conversion is chosen by the expected type at that point in the expression, not by inspecting the literal itself. The same literal text can become a `u8[]` slice in one call and a string handle in another, depending on what the callee or the declared type expects.
 
 ## Native functions
 
 | Function | Signature | Description |
 |---|---|---|
-| `string_new` | `() -> i64` | Creates a new, empty string handle. |
-| `string_from_slice` | `(s: u8[]) -> i64` | Creates a string handle from a byte slice. Rarely called directly; bare literals convert implicitly instead. |
-| `string_length` | `(s: i64) -> i64` | Byte length of a string handle. Callable as `s.string_length()`. |
-| `string_char_at` | `(s: i64, i: i64) -> i64` | Byte at index `i`, returned as an `i64`. Returns `0` if `i` is out of bounds. |
-| `string_from_i64` | `(v: i64) -> i64` | Formats an `i64` value as a string handle. |
-| `string_from_f32` | `(v: f32) -> i64` | Formats an `f32` value as a string handle. |
-| `string_from_f64` | `(v: f64) -> i64` | Formats an `f64` value as a string handle. |
-| `string_from_bool` | `(v: bool) -> i64` | Formats a `bool` as `"true"` or `"false"`. |
-| `string_identity` | `(s: i64) -> i64` | Returns its input string handle unchanged. |
-| `string_find` | `(s: i64, sub: i64) -> i64` | Byte offset of the first occurrence of `sub` in `s`, or -1 if not found. |
-| `string_substr` | `(s: i64, start: i64, len: i64) -> i64` | A new string handle with the substring `[start, start+len)`. |
-| `str_compare` | *(prism-host native, not the standard extension)* | Not registered by `ext_string`. Use `==` for content comparison. |
-| `str_length` | *(prism-host native, not the standard extension)* | Not registered by `ext_string`. Use `string_length` for string handles. |
+| `string_new` | `() -> string` | new empty string |
+| `string_from_slice` | `(bytes: u8[]) -> string` | copy a byte slice into a string |
+| `string_length` | `(s: string) -> i64` | byte length; invalid handle returns `0` |
+| `string_char_at` | `(s: string, index: i64) -> i64` | byte value; invalid/out-of-range returns `0` |
+| `string_from_i64` | `(value: i64) -> string` | decimal conversion |
+| `string_from_f32` | `(value: f32) -> string` | `%g` conversion |
+| `string_from_f64` | `(value: f64) -> string` | `%g` conversion |
+| `string_from_bool` | `(value: bool) -> string` | `"true"` or `"false"` |
+| `string_identity` | `(s: string) -> string` | returns the same handle |
+| `string_find` | `(s: string, needle: string) -> i64` | first byte offset, or `-1` |
+| `string_substr` | `(s: string, start: i64, len: i64) -> string` | clamped substring |
+| `fmt1`…`fmt4` | `(format: string, i64...) -> string` | one to four printf-style word arguments |
 
-### string_new
+There are no separate `string_concat` or `string_compare` source-level natives: use `+` and `==`.
 
-```ember
-fn empty_report() -> i64 {
-    let s: i64 = string_new();
-    return s; // string_length(s) == 0
-}
-```
-
-### string_from_slice
-
-Most code never needs this; write a bare literal where a string handle is expected and let the implicit conversion handle it. It is useful when you already hold a `u8[]` from elsewhere (for example a slice view of a fixed array) and want a string handle from that same data.
+## Concatenation, length, and equality
 
 ```ember
-fn from_bytes(data: u8[]) -> i64 {
-    return string_from_slice(data);
-}
-```
-
-### string_length and string_char_at
-
-```ember
-fn first_byte_or_zero(s: i64) -> i64 {
-    if (s.string_length() == 0) {
-        return 0;
+fn string_demo(name: string) -> i64 {
+    let message: string = "name=" + name;
+    if (message == "name=ember") {
+        return message.string_length();
     }
-    return string_char_at(s, 0);
+    return -1;
 }
 ```
 
-`string_char_at` never traps on an out-of-bounds index; it returns `0` instead, so callers do not need a bounds check before calling it.
+`+` creates a new handle. `==` compares byte content, not handle identity. `!=` follows from equality semantics.
 
-### string_from_i64 / string_from_f32 / string_from_f64 / string_from_bool
-
-These build a string handle from a scalar value. They are the building blocks f-strings desugar into internally, and are also useful directly when you need a formatted value without the rest of an f-string around it.
+## Search and substring
 
 ```ember
-fn describe(count: i64, ratio: f64, ok: bool) -> string {
-    let mut out: string = "count=" + string_from_i64(count);
-    out = out + ", ratio=" + string_from_f64(ratio);
-    out = out + ", ok=" + string_from_bool(ok);
-    return out;
+fn extract() -> string {
+    let text: string = "compiler.ember";
+    let dot: i64 = string_find(text, ".");
+    return string_substr(text, dot + 1, -1);
 }
 ```
 
-### string_identity
+`string_find` returns `-1` when absent. `string_substr` behavior:
 
-Returns its argument unchanged. It exists mainly as a no-op handle pass-through, useful when a function pointer or a chained call needs something with a string-in, string-out shape but no actual transformation.
+- negative `start` or invalid handle -> empty string
+- `start` at/beyond the end -> empty string
+- negative `len` -> from `start` through the end
+- excessive positive `len` -> clamped to the end
 
-### str_compare and str_length
-
-`str_compare` is a stub in the current host build. It always returns `0` regardless of its arguments, so it cannot yet distinguish equal from unequal strings. Use the `==` operator overload for real content comparisons.
-
-`str_length` is unrelated to the string handle system: it walks a raw, null-terminated pointer and returns the byte count before the terminator, the way C's `strlen` does. Use `string_length` for string handles; reach for `str_length` only when interoperating with raw null-terminated memory.
-
-## Operator overloads
-
-The string handle type has two registered operator overloads.
-
-| Operator | Signature | Behavior |
-|---|---|---|
-| `+` | `string + string -> string` | Concatenation. Returns a new string handle. |
-| `==` | `string == string -> bool` | Content comparison, not identity comparison. |
-
-### Concatenation with +
-
-Either side of a `+` against a string can be a bare literal; it converts to a string handle first, then the registered `+` overload runs.
+## Scalar conversion and f-strings
 
 ```ember
-fn build_path(root: string, name: string) -> string {
-    return root + "/" + name + ".ember";
+fn describe(count: i64, ratio: f64, ready: bool) -> string {
+    let direct: string = "count=" + string_from_i64(count);
+    let interpolated: string = f"{direct}, ratio={ratio}, ready={ready}";
+    return interpolated;
 }
 ```
 
-Concatenation always produces a new handle. It does not mutate either operand.
+F-string interpolation lowers to `string_from_slice`, `string_from_i64`, `string_from_f32`, `string_from_f64`, `string_from_bool`, or `string_identity`, then concatenates the segments.
 
-### Content comparison with ==
+## `fmt1` through `fmt4`
 
-`==` on two string handles compares their contents, not their identity. Two separately constructed strings holding the same bytes compare equal, even though they are different handles pointing at different host-owned memory.
+These functions accept one to four ABI-word arguments. Supported specifiers are:
+
+| Specifier | Meaning |
+|---|---|
+| `%d` | signed decimal `i64` |
+| `%x`, `%X` | lowercase/uppercase hexadecimal |
+| `%c` | low byte as a character |
+| `%s` | argument interpreted as a string handle |
+| `%f` | argument bits reinterpreted as `f64` |
+| `%%` | literal percent; consumes no argument |
 
 ```ember
-fn matches_tag(input: string) -> bool {
-    let expected: string = "prism";
-    return input == expected;
+fn formatted(who: string) -> string {
+    return fmt3("%s: %d (0x%x)", who as i64, 42, 42);
 }
+```
 
+Because `fmt*` arguments after the format are declared `i64`, `%s` receives a string handle explicitly cast to its ABI word. `%f` expects the raw bits of a double in that word and is primarily an ABI-level facility; normal Ember code should prefer f-strings or `string_from_f64`.
+
+Unknown specifiers are preserved and do not consume an argument. Missing arguments leave the corresponding `%` sequence in the output; extra arguments are ignored.
+
+## Printing
+
+Use the I/O extension's `print(string)` or `println(string)` and run with `--ffi`:
+
+```ember
 fn main() -> i64 {
-    let mut a: string = string_from_i64(42);
-    let mut b: string = "42";
-    print_string(string_from_bool(a == b)); // true: same content, different handles
+    println(f"answer={42}");
     return 0;
 }
 ```
 
-> **WARNING:** `str_compare` does not participate in this overload and should not be used as a substitute for `==`. Since it always returns `0`, code that branches on its result will behave as if every pair of strings is equal.
-
-## See also
-
-- [10-language/10-types.md](../10-language/10-types.md) for how string handles fit into Ember's type system alongside slices and the other opaque handle types.
-- [20-api/40-math-vectors.md](40-math-vectors.md) for the vector and matrix handle types, which follow the same host-owned-handle pattern as string.
-- [30-examples/10-fibonacci.md](../30-examples/10-fibonacci.md) for a complete walkthrough script that combines control flow, globals, and `defer`.
+`print_string`, `str_compare`, and `str_length` are host-specific prism natives, not part of the standalone string extension.
