@@ -1,6 +1,20 @@
 # ember — composable pass architecture design (Stage C)
 
-**Status:** shipped (Steps 1-5, 2026-07-11, plus four additional IR optimization passes beyond the original plan — **eight** IR optimization passes + the `SubstitutionPass` obfuscation pass are all shipped; `EmberAnalysisManager` and the `FlatteningPass`/`MBAPass` obfuscation passes remain FUTURE, see §8). The research basis is `docs/LLVM_PASS_SYSTEM_RESEARCH.md` (LLVM 18.1.8 pass-manager patterns). The extension-pattern basis is `src/binding_builder.hpp` + the `register_natives` / `ember_add_extension` CMake pattern.
+**Status: IMPLEMENTED; re-audited 2026-07-15.** The infrastructure now includes
+strict/configured factories, transactional pipeline construction, checked
+one-shot/fixpoint execution with rollback and IR growth ceilings,
+instrumentation, shared mutation/effect utilities, deterministic seed
+derivation, and named pipeline profiles. `extensions/opt` registers **18**
+optimization passes and `extensions/obf` registers **seven** seeded
+obfuscation passes. `EmberAnalysisManager` is still intentionally an empty
+placeholder—passes compute CFG/dominance/loop facts directly—so selective
+analysis caching/invalidation remains future. Dynamic shared-library pass
+plugins and a dedicated classic flattening pass also remain future.
+
+The research basis is `docs/LLVM_PASS_SYSTEM_RESEARCH.md` (LLVM 18.1.8
+pass-manager patterns). The extension-pattern basis is
+`src/binding_builder.hpp` plus the `register_natives` / `ember_add_extension`
+CMake pattern.
 
 ## 0. What this is
 
@@ -190,18 +204,29 @@ namespace ember::ext_opt {
 void register_passes(EmberPassRegistry& reg) {
     reg.add<ConstPropPass>("constprop");
     reg.add<DeadCodeElimPass>("dce");
+    reg.add<SimplifyCFGPass>("simplifycfg");
     reg.add<CSEPass>("cse");
+    reg.add<GVNPass>("gvn");
     reg.add<LICMPass>("licm");
+    reg.add<LoopStrengthReductionPass>("lsr");
     reg.add<StoreToLoadForwardPass>("forward");
     reg.add<CopyPropPass>("copyprop");
     reg.add<InstCombinePass>("instcombine");
     reg.add<DeadStoreElimPass>("dse");
+    reg.add<BoundsCheckElimPass>("bounds-elim");
+    reg.add<SCCPPass>("sccp");
+    reg.add<LoopUnrollPass>("unroll");
+    reg.add<DeadSpillElimPass>("spill_elim");
+    reg.add<PeepholePass>("peephole");
+    reg.add<BranchFoldingPass>("branch_folding");
+    reg.add<TailCallPass>("tailcall");
 }
 
 } // namespace ember::ext_opt
 ```
 
-All eight are registered by name and exercised by `examples/ir_passes_test.cpp`
+All eighteen are registered by name and exercised by `examples/ir_passes_test.cpp`,
+`examples/opt_pass_coverage_test.cpp`, and focused CLI/pass CTests. The original eight-pass descriptions below remain useful history; `extensions/opt/ext_opt.hpp` is the authoritative current per-pass contract.
 (ctest `ir_passes`); see `extensions/opt/ext_opt.hpp` for the per-pass one-line
 descriptions (constprop/dce/cse/licm/forward/copyprop/instcombine/dse).
 
@@ -210,7 +235,9 @@ The host wires it the same way it wires `register_natives`:
 ```cpp
 EmberPassRegistry pass_reg;
 ext_opt::register_passes(pass_reg);
-ext_obf::register_passes(pass_reg);   // obfuscation passes (subst shipped; FlatteningPass/MBAPass still FUTURE)
+ext_obf::register_passes(pass_reg);   // seven seeded transforms: subst, mba_expand,
+                                      // const_encode, opaque_pred, deadcode,
+                                      // str_encrypt, block_split
 ```
 
 ### 4.3 The CMake pattern (mirrors `ember_add_extension`)
@@ -218,7 +245,7 @@ ext_obf::register_passes(pass_reg);   // obfuscation passes (subst shipped; Flat
 ```cmake
 # CMakeLists.txt — same shape as the existing ember_add_extension:
 ember_add_extension(opt extensions/opt/ext_opt.cpp)   # → ember_ext_opt
-ember_add_extension(obf  extensions/obf/ext_obf.cpp)   # → ember_ext_obf (subst shipped; FlatteningPass/MBAPass still FUTURE)
+ember_add_extension(obf  extensions/obf/ext_obf.cpp)   # → ember_ext_obf (seven shipped passes)
 ```
 
 The consumer links whichever pass extensions it wants:
@@ -324,8 +351,14 @@ The pass manager is an optional field on `CodeGenCtx` (default nullptr = no pass
   - `InstCombinePass` (`"instcombine"`): intra-block identity-fold of binary ops where one operand is a known constant (`x+0`→`x`, `x*1`→`x`, `x*0`→`0`, `x-x`→`0`, `x|x`→`x`, `x&-1`→`x`, `x^x`→`0`, `x<<0`→`x`, etc.). Replaces the `BinOp` with a `Move` (or `ConstInt 0`), preserving `meta.frame_off`.
   - `DeadStoreElimPass` (`"dse"`): intra-block dead store elimination — when a second `StoreFrame` to the same `frame_off` appears with no intervening `LoadFrame`, the first `StoreFrame` was overwritten before being read and is removed. Iterates to fixpoint within each block.
   All four are value-preserving (after the pass, `emit_x64` produces the same i64 result). `EmberAnalysisManager` (§6) remains FUTURE — all four work by direct IR traversal.
-- **Step 5 — SHIPPED (2026-07-11).** `SubstitutionPass` (MBA obfuscation), registered as `"subst"` in `extensions/obf/ext_obf.cpp` with `is_required = true`, exercised by `examples/ir_passes_test.cpp`. Replaces integer Add with `(a^b) + 2*(a&b)`. `FlatteningPass` and `MBAPass` remain FUTURE (Step 6).
-- **Step 6 — FUTURE.** More obfuscation passes: `FlatteningPass` (control-flow flattening), `MBAPass`, and bogus control flow.
+- **Step 5 — SHIPPED (2026-07-11).** `SubstitutionPass`, registered as
+  `"subst"`, replaces integer Add with `(a^b) + 2*(a&b)`. This was the first
+  obfuscation pass; the expanded MBA and CFG/data transforms listed in Step 6
+  subsequently shipped.
+- **Step 6 — MOSTLY DONE.** Expanded MBA (`mba_expand`), opaque predicates,
+  dead-code/bogus-block injection, constant encoding, string encryption, and
+  block splitting ship. A dedicated classic state-machine
+  control-flow-flattening pass remains future.
 
 Each step is independently testable: the gate is the benchmark (does the pass reduce instr count / runtime?) + a correctness test (the pass is value-preserving — the IR path still produces the same i64 return).
 

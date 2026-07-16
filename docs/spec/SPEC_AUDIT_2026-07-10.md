@@ -1,5 +1,15 @@
 # Ember Spec Audit — 2026-07-10 (spec errors & mis-scoped claims)
 
+> **Historical audit; resolution revalidated 2026-07-15.** All seven findings
+> are closed in current source/docs: F1 private exports; F2 signed v4 plus
+> secure-default validated-IR v5 and keyed v6; F3 typed aggregate globals; F4
+> slice-escape Stage 2 (`NativeSig::retains` plus script borrow/retain analysis);
+> F5 `auto` deprecation documented; F6 current test accounting moved to live
+> CMake/README status; F7 encrypted-string stack lifetime documented. The body
+> below preserves original evidence and post-audit correction notes. Any phrase
+> inside the historical finding text saying F4/C3/C5 or v5 IR is still deferred
+> is superseded by this resolution block.
+
 **Audited revision:** `8062195` (`Slice-escape safety stage 1: close C1/C2a (StringLit) + C2b (both classes)`), HEAD of `master`.
 **Audited tree state:** working tree had pre-existing uncommitted edits (a "REDSHELL" → "call-target-provenance" rename pass across several docs); this audit reads committed HEAD code and the committed doc text. The audit itself is read-only — no `src/`, `docs/`, or test file was modified.
 **Gate (confirmed green before AND after, unmodified):** `ctest` 22/22 in `buildt/`; `tests/run_lang_tests.sh buildt` → **255 passed, 0 failed, 0 skipped**.
@@ -22,7 +32,7 @@
 | F1 | High | `../BUNDLING_AND_EM_MODULES.md` §1.3 (:122), §4 (:517), `../MODULES.md` §6 (:296) | "No visibility / pub / export — everything included is visible" / "pub/priv is a language extension, not a bundling concern" — mis-scoped; pub/priv visibility IS a bundling concern. **DONE (implemented 2026-07-10; backward-compat: fn=public, priv=private).** |
 | F2 | High | `../BUNDLING_AND_EM_MODULES.md` §2 (Part 2), `CODEGEN_SPEC.md` §15, `SAFETY_AND_SANDBOX.md` §1 | `.em` is raw x86-64 native code (code-injection risk); the spec frames this as an acceptable "ABI/process-trusted" tradeoff with no in-scope fix. Should be in scope. |
 | F3 | High | `MEMORY_AND_GC.md` §4 (:88-90) | "v1 global storage supports scalar/handle globals only… Sema rejects slice, fixed-array, and by-value struct globals; a typed aggregate global layout remains deferred" — factually wrong; aggregate globals shipped 2026-07-10. |
-| F4 | Medium | `MEMORY_AND_GC.md` §3 (:74-77), `COMPILER_PIPELINE.md` §4 (:326-333) | Slice-escape provenance check is described as a single complete mechanism blocking "the two escape routes (return, global-store)"; call-arg passing is called "perfectly fine." C3 (native arg) and C5 (script-fn arg) are an unguarded open hole. |
+| F4 | Medium | `MEMORY_AND_GC.md` §3 (:74-77), `COMPILER_PIPELINE.md` §4 (:326-333) | Historical: C3/C5 were open at the audited revision. **DONE:** `NativeSig::retains` and fixed-point script borrow/retain analysis now guard them. |
 | F5 | Medium | `TYPE_SYSTEM.md` §9 (:258-268) | `auto` presented as the working "one type-inference rule" of v1 with no deprecation note; `auto` was deprecated 2026-07-10 (commit `d852160`). |
 | F6 | Medium | `../ROADMAP.md` (:43-44) | "The current tree configures 20 CTest tests when the AngelScript SDK is present and 19 when it is absent" — stale; the current tree configures 22 (the struct/aggregate pass added `array_lit` + `aggregate_global`). |
 | F7 | Low | `MEMORY_AND_GC.md` §6 (:159-168) vs `../ROADMAP.md` string-encryption entry | Memory doc's string-literal lifetime framing predates the 2026-07-10 inline-stack-XOR string-encryption lowering; the framing still holds but the "literal's rodata lives in the same code page" claim is now only one of two paths (the other is a transient stack temp). |
@@ -139,7 +149,12 @@ So MEMORY_AND_GC.md §4 is stale: it describes the pre-2026-07-10 scalar-only gl
 
 ---
 
-## F4 — Slice-escape provenance check under-states the open hole (C3/C5 unguarded)
+## F4 — Slice-escape provenance check under-stated the open hole — DONE
+
+**Current resolution:** `BindingBuilder::add(..., retains)` feeds
+`NativeSig::retains` for C3, while `compute_borrow_retain` computes direct and
+transitive script-function summaries for C5. Opaque callees are conservative.
+The remainder of this section is the original 2026-07-10 finding.
 
 **Severity:** Medium (under-states an open hole; the ROADMAP already tracks Stage 2 as deferred, but the spec presents the closed part as the whole mechanism).
 
@@ -231,7 +246,11 @@ This is not a safety regression — the slice-escape Stage-1 fix (F4) explicitly
 The following spec claims were checked against the source and found **accurate** (not recorded as findings):
 
 - `docs/spec/CODEGEN_SPEC.md` §5 / `docs/spec/COMPILER_PIPELINE.md` §5 — the SSA-lite IR + linear-scan regalloc is marked deferred; `src/codegen.hpp` line 1-2 confirms codegen is a tree-walking stack-spilling emitter with no `IrFunction`/`run_linear_scan`/`emit_x64`. ~~Accurate. (Relevant to F2's finding that no serializable IR exists today.)~~ **SUPERSEDED (2026-07-10): the thin three-address IR shipped as Stage A (`src/thin_ir.{hpp,cpp}` / `src/thin_lower.{hpp,cpp}` / `src/thin_emit.{hpp,cpp}`, behind `enable_ir_backend`); the v5 IR `.em` serialization shipped as Stage B (`src/em_file.hpp` `EM_VERSION_V5` + `src/thin_ir_ser.{hpp,cpp}`). A serializable IR now exists — see `BUNDLING_AND_EM_MODULES.md` §2.5.2 + the F2 correction note above. The full SSA-lite rename + linear-scan (the §5 target design) remains deferred (ROADMAP Stage 3); the thin IR is a deliberate subset.**
-- `docs/spec/SAFETY_AND_SANDBOX.md` §7a — the call-target-provenance guard (bitset allowlist, `emit_call_target_guard`, `BadCallTarget` trap) is implemented per `src/codegen.cpp` / `src/sema.cpp`; the bare-`fn` signature hole and cross-module-handles deferral are documented honestly in ROADMAP Tier 2. Accurate.
+- `docs/spec/SAFETY_AND_SANDBOX.md` §7a — the call-target-provenance guard
+  (bitset allowlist, `emit_call_target_guard`, `BadCallTarget` trap) was
+  accurate at the audited revision. **Current update:** parameterized function
+  types and cross-module handles have since closed its two historical open
+  items.
 - `docs/spec/BINDING_API.md` (the "v0.3 working binding API" block + the deferred `TypeBuilder`/`StructBuilder`/`EnumBuilder` surface) — the shipped API is `src/binding_builder.hpp`'s `BindingBuilder`; the fluent `TypeBuilder` surface is correctly labeled deferred. Accurate.
 - `docs/BUNDLING_AND_EM_MODULES.md` §1.4 (:136) "Single-function reload (`reload_function`): **changed in v1.0**" — the 07-10 scrutiny report's M-M3-1 found this was stale ("unchanged") and it was remediated; the current text correctly says "changed in v1.0" and gives the `HotReloadDomain&` migration recipe. Accurate. (F1 and F2 are the NEW bundling-doc findings the user asked about; the previously-remediated stale claims are not re-reported.)
 - `docs/MODULES.md` §5 / §8 v1/v2 signature text — the 07-10 scrutiny report's M-docs-1 found the v1/v2 signature text was stale and it was remediated; the current text correctly distinguishes v1 ABI-trusted `unknown_sig` from v2 canonical `Type` signatures + build/ABI identity. Accurate. (F2 is about the *missing* cryptographic content-authentication, which is a different gap than the v1/v2 type-signature text that was already fixed.)

@@ -1,5 +1,14 @@
 # ember - gap analysis & completeness audit
 
+**Status: RE-AUDITED 2026-07-15 — the original feature-gap table is largely
+closed.** Current source implements self-hosting (188/188 + two generations),
+GC/managed allocation, lambdas, coroutines, language exceptions,
+parameterized and cross-module function handles, namespaces, in-context worker
+threads, standalone bundles, 18 optimization passes, seven obfuscation passes,
+keyed v6 dispatch/hot reload, and the VST3 Phase-9 wrapper/editor. Rows below
+that still say these are deferred are historical and are corrected in the
+2026-07-15 delta following the tables. The configured build has 94 CTests.
+
 This pass re-audits the spec against (a) the original request and (b)
 the now-fully-known feature surface of the surveyed native-JIT language (../RESEARCH_NOTES.md updated).
 Goal: confirm nothing the user actually asked for is missing, and
@@ -20,7 +29,7 @@ oversight.
 | "AngelScript but MUCH faster" | ✓ expected | baseline JIT vs AS's bytecode interpreter (../RESEARCH_NOTES.md)  -  see Section 3 caveat |
 | "(sort of like a native-JIT scripting language)" | ✓ scoping | the surveyed native-JIT language's *embedding API* mirrored; its *language breadth* deliberately scoped down  -  `../ROADMAP.md` |
 | Hot reload | ✓ v1 (single fn) / v2 (whole-module workflow) | `../HOT_RELOAD.md` |
-| GC | deferred v1 (arena/host-owned), v2 plan | `../spec/MEMORY_AND_GC.md` Section 8, `../ROADMAP.md` |
+| GC | ✓ implemented | mark-sweep core, precise stack/global/extension roots, managed `new`/`delete`, shared-runtime cooperative STW (`../spec/MEMORY_AND_GC.md` §8) |
 
 No original-request requirement is unaddressed. The one ⚠
 (game-modding data structures) is the real gap and is addressed in
@@ -52,8 +61,8 @@ Section 3 below + `../ROADMAP.md`.
 | Reference `&` / `out` params | ✗ v1 (idiom instead) | pass `slice<T>` of len 1, `../spec/TYPE_SYSTEM.md` Section 5 |
 | Variadic fns | ✗ v1 | `../spec/BINDING_API.md` Section 2 (fixed arity; variadic via slice) |
 | `extern` | ✗ v1 | FFI via `PERM_FFI`-gated natives, not extern decls |
-| Function references | ✓ v1 | `&fn`, `fn` handles, guarded indirect calls, and recorded-signature checks; bare-`fn` parameter signatures and cross-module handles remain deferred |
-| Lambdas | ✗ v1 | `DESIGN.md` non-goal; v2+ with GC, `../ROADMAP.md` |
+| Function references | ✓ complete current surface | `&fn`, parameterized `fn(Args)->Ret`, guarded indirect calls, and cross-module handles |
+| Lambdas | ✓ implemented | by-value/by-reference capture, precise GC environments, nested and argument forms |
 | Dynamic arrays / maps / strings (rich) | ✗ v1 builtin | exposed as **native addons** on host-owned memory, Section 3 below |
 | Structs (ctors/dtor/methods/op-overload/bitfield/packed) | partial v1 | fields/methods/properties/op-overload ✓; ctor via named literal; dtor/bitfield/packed ✗, `../ROADMAP.md` |
 | Classes / inheritance / vtables | ✗ v1 | nominal structs + static dispatch; v2+, `../ROADMAP.md` |
@@ -62,14 +71,14 @@ Section 3 below + `../ROADMAP.md`.
 | Templates / monomorphization | ✗ v1 | `DESIGN.md` non-goal; v2+, `../ROADMAP.md` |
 | Enums | ✓ v1 (untyped + typed) | `enum E { ... }` (untyped, i32 variants) + `enum E : T` (typed, shipped 2026-07-11 — `E` is a real type backed by `T`, enum→int widens, int→enum rejected); variant values may be a `constexpr fn` call. Host `EnumBuilder` stays dropped (no host-side state needed) |
 | Typedefs / `using` | ✗ v1 | YAGNI |
-| Delegates | ✗ v1 | needs function refs (v2) |
-| Namespaces | ✗ v1 | flat module scope; v2+ |
-| Coroutines / `yield` | ✗ v1 | v2+, needs suspended-frame storage, `../ROADMAP.md` |
-| Exceptions try/catch/throw | ✗ v1 | `runtime_error`/`runtime_exception` host-signal instead, `../spec/SAFETY_AND_SANDBOX.md` Section 7; v2+ |
-| Heap `new`/`delete` | ✗ v1 | arena-only, `../spec/MEMORY_AND_GC.md`; GC v2+ |
+| Delegates/callback values | ✓ current equivalent | parameterized function handles and lambdas provide typed callable values; no separate `delegate` keyword |
+| Namespaces | ✓ implemented | flat qualified-name grouping and namespaced globals/functions |
+| Coroutines / `yield` | ✓ implemented | coroutine extension/runtime; Windows fibers for execution |
+| Exceptions try/catch/throw | ✓ implemented | per-context catch stack in tree walker and Thin IR; uncaught throw traps |
+| Heap `new`/`delete` | ✓ implemented | opaque managed pointers, deterministic delete, precise GC roots |
 | Inline asm intrinsics | ✗ v1 | `PERM_FFI`-gated native can wrap `__rdtsc` etc.; v2 if real need |
 | `[[annotations]]` | ✓ v1 (`@` syntax) | `../spec/TYPE_SYSTEM.md` Section 10 |
-| Modules / imports | ✓ v1 | textual `import`, `.em` bundles, and live `link`/`mod::fn`; bare-name search paths and cross-module function handles remain deferred |
+| Modules / imports | ✓ implemented | textual `import`, `.em` bundles, live `link`/`mod::fn`, cross-module handles, EMBM v2, and keyed v6 modules |
 | Preprocessor | ✗ v1 (deliberate) | `engine.define(name,value)` for compile-time defines instead, `DESIGN.md` Section 8 |
 | FFI `[[dll(...)]]` | ✓ v1 (different mechanism) | `PERM_FFI`-gated `NativeFn`, `../spec/SAFETY_AND_SANDBOX.md` Section 6 |
 | `static_assert` | ✓ v1 (shipped 2026-07-11) | `static_assert(cond, "msg");` compile-time assertion; cond may be a `constexpr fn` call; true elided, false is a compile error (`../spec/TYPE_SYSTEM.md` §11.5, `../ROADMAP.md` Tier 1) |
@@ -154,9 +163,11 @@ suite. See `../ROADMAP.md` (`.em` Finding C entry) + `../MAINTENANCE_LOG.md`.
 ## 4. Honest performance caveat ("MUCH faster than AngelScript")
 
 The original request says "AngelScript but MUCH faster (sort of like
-a native-JIT scripting language)." ember v1 is a **baseline** JIT with a
-tree-walking, stack-spilling emitter (no SSA IR, no linear-scan allocator, no
-inlining or loop optimization). SSA-lite/linear scan are deferred. AngelScript is a bytecode interpreter. Even baseline native
+a native-JIT scripting language)." The historical v1 baseline was a
+stack-spilling tree walker. Current Ember also ships Thin IR, linear-scan
+allocation, 18 optimization passes (including SCCP/GVN/LICM/LSR/unroll/bounds
+elimination/tail calls), and seven seeded obfuscation passes. The tree walker
+remains the complete fallback, not the only optimizer story. AngelScript is a bytecode interpreter. Even baseline native
 code beats a bytecode interpreter on tight loops by typically 5-50×
 (one dispatch-decode loop removed, real registers vs a virtual stack),
 which comfortably satisfies "MUCH faster" for the hot-game-logic target.

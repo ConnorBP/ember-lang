@@ -1,8 +1,19 @@
 # ember - x86-64 codegen spec
 
+**Status: IMPLEMENTED and re-audited 2026-07-15.** Windows x64 remains the
+normative ABI. Production compilation supports both the complete typed-AST
+emitter and the Thin IR path (`thin_lower` → 18 composable optimization passes
+and/or seven obfuscation passes → linear-scan allocation → `thin_emit`). The
+full `IrFunction`/formal SSA design in §5 remains aspirational; the shipped
+allocator is `run_regalloc(ThinFunction&)`. Language lowering now also includes
+parameterized/cross-module function handles, lambdas, language exceptions,
+managed `new`/`delete`, coroutines, struct match patterns/guards, and keyed
+logical-to-physical dispatch. Unsupported Thin-IR shapes fall back explicitly
+to the tree walker rather than silently disappearing.
+
 Detail doc for ../planning/DESIGN.md Section 3/Section 6. This is the "prove we can actually
 compile to native machine code" layer. Target: Windows x64 first
-(workspace is Windows-centric); SysV V1.1 port noted where it differs.
+(workspace is Windows-centric); SysV remains a portability target where noted.
 
 ## 1. Calling convention (host boundary): Win64 fastcall
 
@@ -231,9 +242,11 @@ struct RipFixup {
 
 ## 5. Deferred register allocation design: linear scan on SSA-lite IR
 
-> **Not implemented in v1.0.** The shipped backend walks the AST directly and
-> stack-spills expression intermediates. Everything in this section is a future,
-> benchmark-gated design, not a description of current codegen.
+> **Full-SSA design not implemented.** The complete typed-AST backend still
+> walks the AST directly and stack-spills expression intermediates, but it is no
+> longer the only backend. Thin IR, a linear-scan allocator over that IR, and
+> its emitter are shipped. The remainder of this section describes the richer
+> full-SSA target rather than denying the implemented Thin IR path.
 >
 > **Implementation note (Stage A, 2026-07-10):** a thin three-address IR — a
 > deliberate subset of this SSA-lite design (three-address `dst = op src1 src2`
@@ -820,9 +833,12 @@ dispatch-table base (kind 0) or globals base (kind 1). Call the
 loaded entry as `int64_t(*)(int64_t)` and assert fib(0,1,2,3,10) ==
 (0,1,1,2,55), matching the JIT'd fib.
 
-The format contract is `src/em_file.hpp` (magic `0x454D424C` "EMBL",
-version 1, 40-byte header, per-function records with code/rodata/relocs,
-globals block, name directory). `EmReloc{offset, kind}` mirrors
+This subsection is the historical v1 round-trip acceptance test. The current
+format family is defined in `src/em_file.hpp`: v1/v2/v3/v4 remain readable;
+v5 carries validated Thin IR (with an explicit raw-function compatibility
+form); v6 adds keyed-dispatch metadata and capability negotiation. Secure-load
+policy rejects raw x86 unless the host explicitly opts in. `EmReloc{offset,
+kind}` mirrors
 `AbsFixup::Kind` (Section 4) so a `static_cast<uint8_t>` round-trips
 losslessly through the file. v0.1 coverage is single-function (fib),
 no globals, no rodata; the GlobalsBase reloc path, multi-function
@@ -998,9 +1014,11 @@ records it on `ForEachStmt::array_elem_ty`; codegen reads that field):
   rejected, so `for (x in 42)` stays an error). `x` gets the inferred element
   type.
 
-Both lowerings run in the tree-walker only — the IR backend marks a function
-using for-each as `non_serializable` (falls back to the tree-walker), so this
-section describes the only shipped lowering(s).
+Both lowerings currently run in the complete tree-walker path. The IR pre-scan
+marks functions containing `ForEachStmt` or `MatchStmt` non-serializable and
+falls back explicitly, so this section describes the shipped lowering for those
+forms. This fallback is a backend-coverage limitation, not a missing language
+feature.
 
 ### 17a. slice for-each (the shipped path)
 

@@ -1,7 +1,14 @@
 # Plan — Composable polymorphic code engine for Ember
 
-> **Status: research and implementation plan only (2026-07-13).**
-> This document proposes changes; it does not claim they are implemented.
+> **Status: RED 1–9 DONE (2026-07-15).** Configured factories, strict
+> transactional pipelines, stable seed derivation, shared mutation/effect
+> utilities, checked execution/rollback/growth limits, migration of all seven
+> obfuscation passes, Thin-IR blob v2 string metadata, explicit profiles/CLI
+> `--pass-seed`, compile reports, and end-to-end integration are implemented.
+> Tests include `ember_pass`, `pass_registry_coverage`, `ir_passes`,
+> `polymorphic_pass_test`, and `polymorphic_cli`. Phase 5 composition with keyed
+> layout is implemented through keyed dispatch Red 1–10; broader future
+> emission-diversity/flattening transforms remain optional.
 >
 > **Reviewed baseline:** Ember `HEAD` was `2ac6a01`. The worktree was dirty and
 > the review intentionally included those local changes. In particular, the
@@ -1146,7 +1153,7 @@ Set explicit budgets before promoting any profile to default.
 
 ## 10. Implementation phases
 
-### Phase 0 — baseline and correctness blockers
+### Phase 0 — baseline and correctness blockers — DONE
 
 - Capture the current focused CTest baseline.
 - Add regressions for every known optimizer/frame/serialization finding listed
@@ -1157,7 +1164,7 @@ Set explicit budgets before promoting any profile to default.
 individually green on the named repros; a profile cannot be promoted on a
 merely generic suite pass.
 
-### Phase 1 — shared extension-registry API improvements
+### Phase 1 — shared extension-registry API improvements — DONE
 
 - One reusable `ExtensionResult`/`ExtensionError` contract.
 - Configured/collision-aware pass factories.
@@ -1172,7 +1179,7 @@ parallel error/factory machinery.
 
 **Gate:** `ember_pass` red-green cases green; existing callers unchanged.
 
-### Phase 2 — shared pass-authoring utilities
+### Phase 2 — shared pass-authoring utilities — DONE
 
 - Stable seed derivation and substreams.
 - `ThinIRMutation`.
@@ -1181,7 +1188,7 @@ parallel error/factory machinery.
 
 **Gate:** utility boundary/property tests green.
 
-### Phase 3 — migrate existing obfuscators
+### Phase 3 — migrate existing obfuscators — DONE
 
 Suggested order:
 
@@ -1195,7 +1202,7 @@ Suggested order:
 
 **Gate per pass:** semantic, seed, round-trip, regalloc, and limit matrices green.
 
-### Phase 4 — profile/CLI integration
+### Phase 4 — profile/CLI integration — DONE
 
 - Explicit profiles.
 - Seed modes and diagnostics.
@@ -1205,7 +1212,7 @@ Suggested order:
 
 **Gate:** CLI tests plus complete profile integration.
 
-### Phase 5 — module-layout composition
+### Phase 5 — module-layout composition — DONE through keyed dispatch Red 1–10
 
 Integrate optional module-layout seeds through the companion plan without
 making module layout a function pass. Module signatures/domains and the layout

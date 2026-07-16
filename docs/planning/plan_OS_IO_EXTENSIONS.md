@@ -1,15 +1,22 @@
 # Plan — OS IO extensions: file, console, process, path, directory
 
-> **⚠ SHIPPED v1.0** — the `io` extension landed in `extensions/io/` (see
-> `extensions/README.md` and `v1.0_INTEGRATION_NOTES.md`). The text below is
-> the historical planning record, left unchanged.
+> **DONE — core subset intentionally differs from the broad proposal.**
+> `extensions/io/` ships one `register_natives` entry point. Every shipped IO
+> native, including console output and pure path operations, is `PERM_FFI`-
+> gated. The implemented API is `print`, `println`, `print_i64`, `print_f64`,
+> `read_line`, `file_read_bytes`, `file_read_text`, `file_write_bytes`,
+> `file_exists`, `path_exists`, `path_basename`, and `path_dirname`. Directory
+> iterators, process execution/spawn, file handles, `path_join`, and granular
+> sub-registration did **not** ship and remain possible future capability
+> expansions. Current source/header is authoritative over the broader historical
+> proposal below.
 >
-> **Status: research / planning only.** This document reads the code
+> **Status of body: historical research/plan; the core subset is implemented.** This document read the code
 > firsthand (the extension pattern in `extensions/array/ext_array.cpp`,
 > the binding API in `src/binding_builder.hpp`, the permission gate in
-> `src/sema.cpp`, the `Family B` framing in `docs/ROADMAP.md`) and lays
-> out the design. **No source is changed.** The user is making a scoping
-> decision from this — be concrete about what these natives do, how they
+> `src/sema.cpp`, and the `Family B` framing in `docs/ROADMAP.md`) and laid
+> out the broader design. The implemented core subset is summarized above;
+> the remaining body records the original scoping options and rationale about what these natives do, how they
 > are gated, and how a host opts in per-capability.
 >
 > **This is the ROADMAP "Family B" entry, un-deferred.** The ROADMAP

@@ -1,13 +1,14 @@
 # Plan — sync-extensions addon: atomics, swap buffer, SPSC/MPSC/MPMC queues
 
-> **⚠ SHIPPED v1.0** — the `sync` extension (atomics, swap buffer,
-> SPSC/MPSC/MPMC queues) landed in `extensions/sync/`, pinned by
-> `examples/ext_sync_test.cpp` (ctest target `ext_sync`); see
-> `v1.0_INTEGRATION_NOTES.md` §3. The text below is the historical planning
-> record, left unchanged.
+> **DONE.** The `sync` extension (width-masked atomics, swap buffer,
+> SPSC/MPSC/MPMC queues) ships in `extensions/sync/`, with direct and
+> multithread coverage in `ext_sync` and `sync_thread_coverage`. Narrow CAS
+> masks both expected and desired values. The related `thread` extension now
+> also ships concurrent workers, each with its own per-call context and shared
+> GC-runtime participation; this does not permit two host entries to mutate the
+> same checkpoint record. The body is the historical design record.
 >
-> **Status: research / planning only.** This document reads the code
-> firsthand and lays out the design. No source is changed. The user is
+> **Status of body: historical research/plan; implementation is complete.** The user is
 > making a scoping decision from this — be concrete and honest about
 > what these primitives do vs. what they deliberately do **not** do.
 >

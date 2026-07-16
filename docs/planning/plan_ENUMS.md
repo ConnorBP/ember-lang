@@ -1,11 +1,16 @@
 # Implementation Plan — Tier 1: Script-Side `enum`
 
-> **⚠ SHIPPED v1.0** — script-side `enum` landed, pinned by
-> `tests/lang/{valid_enums,sema_valid_enums,sema_invalid_enum_unknown_enum,
-> sema_invalid_enum_unknown_variant}.ember`; see `v1.0_INTEGRATION_NOTES.md` §2.
-> The text below is the historical planning record, left unchanged.
+> **DONE — expanded beyond the original v1 plan.** Untyped enums shipped in
+> v1.0; typed `enum E : T` and constexpr-derived variant values subsequently
+> shipped. Typed enum names are real nominal integer-backed types, enum→integer
+> widening is allowed, raw integer→enum is rejected, and variants participate
+> in match. `typed_enum_test` and the enum language corpus pin the extension.
+> Host `EnumBuilder` remains intentionally absent because source enums require
+> no host-side state. The text below is the historical untyped-enum plan; any
+> “typed enums deferred” sentence is superseded by this status block.
 >
-> Research / planning document. **No source is written here.** Every claim
+> Historical research/planning document. Source has since been implemented.
+> Every original claim
 > below is anchored to a firsthand read of the current tree; the seam each
 > decision hangs on is quoted with a file:line so the implementer can verify
 > the plan against the code before touching it.

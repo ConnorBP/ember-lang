@@ -1,11 +1,15 @@
 # ember — Tier 2 first-class function references (implementation plan)
 
-**⚠ SHIPPED v1.0** — first-class function refs (`&fn` / `handle(args)` / the
-`fn` type) landed, pinned by `examples/function_refs_test.cpp` (ctest target
-`function_refs`); see `v1.0_INTEGRATION_NOTES.md` §4. The text below is the
-historical planning record, left unchanged.
+**DONE — expanded beyond the original Tier-2 plan.** First-class refs (`&fn`,
+`handle(args)`, and `fn`) shipped in v1.0. Parameterized
+`fn(Args)->Ret` types subsequently closed the bare-signature hole, and
+cross-module handles now carry tagged module/slot identity with target-module
+runtime validation. Lambdas reuse the guarded dispatch model with an env
+pointer. Focused CTests: `function_refs`, `fn_types`, and
+`cross_module_handles`. The text below is the historical implementation plan;
+its “two open items” and “plan only” statements are superseded by this block.
 
-**Status: plan only.** No source written. This document is the design for the
+**Status of body: historical plan; source is implemented.** This document is the design for the
 fork the user resolved: **first-class call syntax `handle(args)`** — the first
 indirect call through a *runtime* i64 value in ember. Every call today
 (`CallExpr` in `src/codegen.cpp` ~1463/1564) is to a *compile-time-known* slot
@@ -1041,7 +1045,7 @@ hosts today.
 
 ---
 
-**No source written. Plan only, as requested.** Every claim about the
+**Historical plan (source now implemented).** Every claim about the
 current code — `CallExpr` emission at `src/codegen.cpp` ~1463/1564, the
 kind-0 `DispatchTableBase` reloc at ~1573, the `emit_trap` stub at ~233,
 the `parse_postfix` throw at `src/parser.cpp` ~398, the `script_slots` /

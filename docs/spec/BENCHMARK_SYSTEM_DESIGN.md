@@ -1,5 +1,15 @@
 # Ember Codegen Per-Path Benchmark System — Design
 
+> **Status: IMPLEMENTED PROTOTYPE + EXPANDED PASS PROBES; re-audited
+> 2026-07-15.** `bench_codegen_paths` currently registers ten paths (the six
+> original category paths plus CSE/DCE/constprop/LICM probes), supports paired
+> no-pass/pass runs where `ir_safe`, records compile time/code bytes/IR counts,
+> writes separate result artifacts, and has a harness self-test. It is still
+> not the originally proposed full ~15-path matrix; the omitted float/native-
+> call/array/defer/switch/f-string paths remain legitimate benchmark expansion,
+> not compiler feature gaps. Historical 2026-07-10 timings below are provenance,
+> not current performance claims after the 18-pass/regalloc work.
+>
 > Evidence-gathering infrastructure for the codegen-optimization decision.
 > The v0.5/v0.6 gate (`docs/planning/DESIGN.md` §9: "no speculative
 > optimization before the bench proves it matters"; `docs/spec/COMPILER_PIPELINE.md`
@@ -10,10 +20,10 @@
 > language's speed" the gate quote names), in both **safety-off** and
 > **safety-on** modes so the guard cost is visible.
 
-This doc specifies the **full** system and documents the **prototype** that
-ships under `bench/` as the seed. The prototype lands 6 representative paths
-spanning the categories; the remaining ~9 paths are documented as "add per
-this pattern."
+This doc specifies the **full** system and documents the implementation under
+`bench/`. The first prototype landed six representative paths; four pass probes
+were subsequently added. The remaining full-matrix paths are documented as
+"add per this pattern."
 
 ---
 
@@ -384,18 +394,20 @@ runner's explicit-rc tests do this), or (b) assert correctness via `ember bench`
 full `result` line (which prints the untruncated i64). The §8.4 reproducer's
 600 is only visible correctly via (b); `ember run` would show 88.
 
-### 8.5 Caveat — the gate is NOT closed by the prototype alone
+### 8.5 Historical caveat and current interpretation
 
-The full codegen-optimization design (SSA-lite IR + linear-scan regalloc,
-`COMPILER_PIPELINE.md` §5) is **gated on running the FULL matrix** (all ~15
+At the time of this prototype, the full codegen-optimization design was stated
+to be **gated on running the FULL matrix** (all ~15
 paths × both safety modes × ember-vs-g++-O2, with a higher-resolution timer for
 the sub-µs paths), not on this 6-path prototype. The prototype is the seed that
 (a) proves the harness works end-to-end, (b) gives the first evidence that the
   call/loop/slice/string paths are 5-9x slow and int_div is adequate, and (c)
   surfaces the struct-local-reassignment segfault (§8.4, now fixed). The remaining ~9 paths (float
   arithmetic, float sqrt, local load/store, native call overhead, array
-  literals, defer, switch dispatch, f-string) must be added per the §5.1 pattern
-  and run before the IR refactor is started — the prototype's 5-9x on 4 paths is
+  literals, defer, switch dispatch, f-string) remain useful additions per the §5.1 pattern. The historical “before the IR
+refactor is started” gate has been overtaken by implementation: Thin IR,
+linear-scan allocation, and the pass system now ship, justified by the strong
+prototype evidence and subsequent focused probes — the prototype's 5-9x on 4 paths is
   strong evidence but not the complete picture the gate requires.
 
 ## 9. How to run

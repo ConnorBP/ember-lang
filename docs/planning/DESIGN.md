@@ -1,5 +1,16 @@
 # ember - design plan
 
+**Status: CURRENT ARCHITECTURE INDEX; re-audited 2026-07-15.** The original
+milestone narrative is retained as history, but Ember has moved well beyond the
+v1 scope described in several later paragraphs: self-hosting is complete
+(188/188 parity and two-generation bootstrap), Thin IR + linear-scan + 18 opt
+and seven obf passes ship, EMBM v2 and `.em` v6 keyed modules ship, GC and
+managed pointers are integrated, language exceptions/lambdas/coroutines/
+parameterized handles/namespaces ship, the standalone bundler ships, and the
+VST3 wrapper reached Phase 9 with 13 example plugins and the node graph editor.
+The configured build currently reports 94 CTests; test counts embedded in the
+historical milestones are snapshots, not current totals.
+
 C-style scripting language that JIT-compiles straight to native
 x86-64, for embedding in game engines. Goal: AngelScript's binding
 ergonomics, an optimizing native-JIT language's speed.
@@ -23,12 +34,12 @@ lexer ─► parser (recursive descent) ─► AST
 sema: struct layout pass ─► fn-signature/slot pass ─► per-fn body check
   │
   ▼
-codegen: tree-walk typed AST ─► stack-spilling x86-64 emitter
+codegen A: tree-walk typed AST ─► stack-spilling x86-64 emitter
+       OR
+codegen B: AST ─► ThinFunction ─► opt/obf passes ─► linear-scan ─► x86-64
   │
   ▼
 machine bytes ─► W^X executable pages
-
-(deferred: SSA-lite IR ─► linear-scan allocation)
   │
   ▼
 dispatch table slot[slot_index] = entry address   (../HOT_RELOAD.md)
@@ -172,13 +183,14 @@ Non-goals for v1:
   linear-scan regalloc refactor (../spec/COMPILER_PIPELINE.md §5) is deferred to
   — no speculative optimization before the bench proves it matters.
 - **v1.0** - stable native binding API (the fluent `TypeBuilder`/
-  `StructBuilder`/`engine_t` surface — see v0.3's deferred-binding
+  `StructBuilder`/`engine_t` surface (still deferred ergonomic wrappers;
+  `BindingBuilder` plus `register_struct` is the shipped API) — see v0.3's deferred-binding
   analysis `v0.3_DEFERRED_BINDING_ANALYSIS.md`), docs, example
   game-engine integration (event hooks via annotations).
 
   **Concurrency + Tier 2 batch shipped v1.0 (commit e5d1814 + follow-ons):**
-  four features, each verified in source/tests; the current tree has 42 CTest
-  tests (40 excluding the two benchmarks) —
+  four features, each verified in source/tests; the batch had 42 CTests at
+  that historical point (current configured total: 94) —
   - **Context thread-safety (Option D + B1)** — `context_t` restructured
     to a POD prefix; `CodeGenCtx::use_context_reg` makes the budget/depth/
     trap emits read `context_t` fields through `r14` (the per-call context
@@ -205,8 +217,9 @@ Non-goals for v1:
     validates the runtime i64 against a host-built bitset allowlist before
     dispatch (the call-target-provenance guard), `BadCallTarget` trap on a bad handle.
     Pinned by `examples/function_refs_test.cpp`. Two open items documented at
-    `../ROADMAP.md` Tier 2 (bare-`fn` signature hole → `fn(...)->...` typed fn
-    params v2+; cross-module handles → v2+). See `plan_FUNCTION_REFS.md`.
+    `../ROADMAP.md` Tier 2. **Both historical open items are now DONE:**
+    parameterized `fn(...)->...` types and cross-module handles ship. See
+    `plan_FUNCTION_REFS.md`.
 
   The four new syntax forms (`&fn`, `handle(args)`, the `fn` type keyword,
   `enum E { ... }` / `E::A`) are documented at `../spec/COMPILER_PIPELINE.md` Section 1.
@@ -234,12 +247,13 @@ detail docs, summarized here)
   (`../spec/CODEGEN_SPEC.md` Section 3, `../RESEARCH_NOTES.md` on binwrite/Zydis).
 - No declaration-string binding parser - descriptor structs are a
   one-line call site (`../spec/BINDING_API.md` Section 1-Section 2).
-- No tracing GC v1 - every reference category has a non-tracing
-  lifetime (`../spec/MEMORY_AND_GC.md` Section 1, Section 8).
-- No generics/closures v1 (script-side `enum` shipped v1.0; `switch` shipped
-  v0.2) - no game-scripting use case demands generics/closures yet
-  (`DESIGN.md` non-goals, `../spec/COMPILER_PIPELINE.md` Section 1); `enum` and `switch`
-  moved off the non-goal list when measured demand arrived (`../ROADMAP.md`).
+- The original v1 deliberately omitted tracing GC. **Superseded:** tracing
+  mark-sweep, precise roots, lambda environments, managed `new`/`delete`, and
+  cooperative shared-runtime collection now ship (`../spec/MEMORY_AND_GC.md` §8).
+- Generics remain absent. **Closures are no longer absent:** lambdas with
+  by-value/by-reference capture and GC-backed environments now ship. The
+  original v1 omitted both; measured demand moved closures, enum, and switch
+  off the non-goal list (`../ROADMAP.md`).
 - No bytecode interpreter fallback - JIT only, one execution path
   (`../RESEARCH_NOTES.md` on AngelScript's bytecode-VM-by-default being
   the differentiator).
@@ -252,10 +266,11 @@ detail docs, summarized here)
   — hard non-goals, never added (`../ROADMAP.md`). **Self-hosting is NOT a
   non-goal** (corrected from an earlier revision); it is the long-term north
   star — see `../ROADMAP.md`'s "Self-hosting" section.
-- No templates/classes/coroutines/exceptions/heap/lambdas in v1
-  - each is a tracked deferral with a re-entry trigger in `../ROADMAP.md`,
-  not a forgotten gap (`GAP_ANALYSIS.md` Section 2). (Live **modules** shipped
-  v0.5 — `link "foo.em" as foo;` + `foo::bar()`; namespaces remain Tier 6.)
+- No templates/classes remain hard/deferred language gaps. **Superseded for
+  the rest:** coroutines, language exceptions, managed heap allocation, and
+  lambdas now ship and are no longer deferred (`GAP_ANALYSIS.md` Section 2). (Live **modules** shipped
+  v0.5 — `link "foo.em" as foo;` + `foo::bar()`; namespaces now ship as
+  flat qualified-name grouping.)
 - Script-side first-class function references shipped **v1.0** (`&fn` /
   `handle(args)` / the `fn` type keyword, `../ROADMAP.md` Tier 2 ✓), with the
   the call-target-provenance guard invariant (`../spec/SAFETY_AND_SANDBOX.md`

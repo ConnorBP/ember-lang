@@ -1,14 +1,25 @@
 # ember JIT - Optimization Pass Implementation Plan
 
-**Status:** research/design only  
-**Scope:** future IR and code-generation work; no pass is implemented here  
+**Status: IMPLEMENTED FOR ALL EIGHT REQUESTED FAMILIES (2026-07-15).** This
+file remains the rationale and acceptance plan. The current registry contains
+18 passes. The specific work proposed here maps to shipped names as follows:
+SimplifyCFG=`simplifycfg`, SCCP=`sccp`, global CSE/GVN=`gvn`, loop strength
+reduction=`lsr`, bounds elimination=`bounds-elim`, forwarding/dead spills=
+`forward`+`dse`+`spill_elim`, small-loop unrolling=`unroll`, and call work=
+`tailcall` plus emitter leaf/frame improvements. Focused tests live in
+`ir_passes`, `opt_pass_coverage`, `regalloc`, and `ember_passes_*`; benchmark
+probes remain the enablement gate for default-profile choices.
+
+**Original scope:** future IR/code-generation work. All named pass families are
+now DONE; cached shared `EmberAnalysisManager` analyses remain a possible
+architectural improvement because current passes compute facts directly.
 **Research date:** 2026-07-12
 
 ## 1. Purpose and conclusions
 
 This plan maps the advisor's next eight priorities onto ember's current `ThinFunction` IR and pass framework. The passes should **not** be implemented as eight unrelated scans. SimplifyCFG, SCCP, GVN, loop transforms, bounds-check elimination, and cross-block spill elimination need the same CFG, dominance, loop, def-use, memory-effect, and range analyses. Building those analyses first is the shortest path and the main correctness safeguard.
 
-The highest expected near-term return is:
+The original expected-return ordering was:
 
 1. **cross-block forwarding plus dead spill elimination**, because lowering gives every scalar intermediate a frame home;
 2. **range-based bounds-check elimination and induction/strength reduction** on indexed loops;
@@ -494,7 +505,7 @@ A pass enters the default performance pipeline only when:
 - unrelated regressions are noise-level or profitability-gated;
 - alias/range uncertainty causes a missed optimization, never speculation.
 
-## 8. Final priority recommendation
+## 8. Historical priority recommendation and completion result
 
 If only three efforts are funded next:
 

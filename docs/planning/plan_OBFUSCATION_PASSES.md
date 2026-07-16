@@ -1,8 +1,16 @@
 # Plan — IR obfuscation passes and user-authored custom-pass examples
 
-> **Status: research / planning only (2026-07-12).** No pass is implemented by
-> this document. The implementation targets below are deliberately separated
-> from the current shipped behavior.
+> **Status: IMPLEMENTED (2026-07-15).** Seven production passes ship:
+> `subst`, `mba_expand`, `const_encode`, `opaque_pred`, `deadcode`,
+> `str_encrypt`, and `block_split`. They use configured factories,
+> `PolymorphicPassOptions`, domain-separated deterministic seed derivation,
+> shared `ThinIRMutation`/effect helpers, checked pass execution/validation,
+> and growth limits. `examples/custom_pass/`, `docs/PASS_AUTHORING.md`, strict
+> registry tests, profiles, and CLI `--pass-seed` are implemented. The original
+> proposed spellings (`opaque`, `deadinject`, `mba`, `split-redirect`,
+> `constenc`, `strenc`) were normalized to the shipped names above. A dedicated
+> indirect-jump/control-flow-flattening transform remains outside this seven-
+> pass set.
 >
 > **Scope:** `ThinFunction` IR transforms, pass registration, deterministic
 > seed handling, post-pass validation, and `examples/custom_pass/`.
@@ -748,7 +756,7 @@ Until `EmberPreserved` grows beyond a bool, every changed row returns `none()`.
 
 ## 9. Implementation phases and gates
 
-### Phase 0 — foundations
+### Phase 0 — foundations — DONE
 
 - shared effects and mutation/CFG helpers;
 - configured registry factory;
@@ -758,7 +766,7 @@ Until `EmberPreserved` grows beyond a bool, every changed row returns `none()`.
 
 **Gate:** infrastructure/factory/seed tests; no production behavior changed.
 
-### Phase 1 — executable custom examples
+### Phase 1 — executable custom examples — DONE
 
 - all three example passes;
 - registration and host/CLI docs;
@@ -766,7 +774,7 @@ Until `EmberPreserved` grows beyond a bool, every changed row returns `none()`.
 
 **Gate:** `custom_pass_test` passes and examples need no private opt helpers.
 
-### Phase 2 — local production transforms
+### Phase 2 — local production transforms — DONE
 
 - `constenc`, generalized `mba` with `subst` compatibility, and live-path
   `deadinject`.
@@ -774,7 +782,7 @@ Until `EmberPreserved` grows beyond a bool, every changed row returns `none()`.
 **Gate:** width edge tests, end-to-end equivalence, fixed-seed blob equality,
 and bounded one-shot growth.
 
-### Phase 3 — CFG transforms
+### Phase 3 — CFG transforms — DONE for block splitting and opaque rejoining CFG; constrained IndirectJmp remains deferred
 
 - split/trampolines, opaque predicates/rejoining bogus blocks, canonical IDs,
   constrained `IndirectJmp`, and small-CFG property/fuzz tests.
@@ -782,7 +790,7 @@ and bounded one-shot growth.
 **Gate:** round-trip/emission equivalence, malformed target rejection, and no
 arbitrary code-address target.
 
-### Phase 4 — format update and strings
+### Phase 4 — format update and strings — DONE
 
 - versioned `data_temp_off` plus new terminator support;
 - version-1 backward loading;
@@ -792,7 +800,7 @@ arbitrary code-address target.
 **Gate:** encrypted strings survive `.em` round trip and plaintext is absent
 from final rodata/blob.
 
-### Phase 5 — integration and measurement
+### Phase 5 — integration and measurement — DONE (profiles/CLI/tests; ongoing benchmark tuning)
 
 - register production names in `ext_obf`;
 - update CLI help/listing and design docs;

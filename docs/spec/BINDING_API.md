@@ -1,5 +1,14 @@
 # ember - native binding API spec
 
+**Status: IMPLEMENTED CORE API; re-audited 2026-07-15.** The authoritative
+host API remains `BindingBuilder`/`NativeSig`, now with slice-retention metadata
+(`retains`) and `register_struct`/`bind_struct` support for first-class
+C++-layout by-value structs. `PERM_FFI` is enforced by sema and by load-side
+native-policy checks. The fluent `TypeBuilder`/`StructBuilder`/`engine_t` and
+C-friendly descriptor sketches remain ergonomic proposals, not exported APIs.
+The current tree contains 15 runtime extension libraries (plus the opt/obf pass
+extensions), so old “ten standard extensions” counts are historical.
+
 Detail doc for ../planning/DESIGN.md Section 4. The shipped `BindingBuilder`/`NativeSig`
 API comes first; later fluent descriptor sketches are labeled deferred inline.
 Calling-convention mapping and boundary error responsibilities are normative.
@@ -12,9 +21,9 @@ Calling-convention mapping and boundary error responsibilities are normative.
 > the current implementation. v1.0 ships the **working binding API**:
 > `src/binding_builder.hpp`'s `BindingBuilder` + the existing
 > `NativeSig`/`OpOverload` map that `sema()` already consumes, used by
-> the ten standard extensions in `extensions/` (vec/quat/mat/string/array/
-> math/sync/lifecycle/map/io — `sync` + `lifecycle` were added in the v1.0 batch +
-> its follow-on; `map` + `io` added 2026-07-11). The spec text below is
+> the runtime extensions in `extensions/` (vec, quat, mat, string, array,
+> math, map, sync, thread, coroutine, gc, lifecycle, io, call_raw, and audio).
+> The opt/obf directories register compiler passes rather than natives. The spec text below is
 > the target design those extensions move toward; it is preserved
 > unchanged. The call-ABI mapping in Section 4 **IS implemented and
 > proven** in the v0.3 `binding_abi_test` suite (script→native
@@ -271,7 +280,7 @@ before the code.
 | `f64` | `double` | xmm reg/stack |
 | `slice<T>` | `T*, int64_t` (two consecutive slots) | GP+GP (or GP+stack / stack+stack once slot index exceeds 4, per CODEGEN_SPEC.md Section 1's slot-parallel rule) |
 | `struct` <=8 bytes, POD | the struct type, passed by value | packed into one GP reg (bitcast, matches MSVC's small-POD-by-value-in-register rule) |
-| `struct` >8 bytes argument (up to 128 bytes) | the struct type, passed by value | Win64 hidden-pointer by-value: caller allocates, passes ptr in first arg slot, callee fills (sema rejects a registered struct >128 bytes — `reject_large_native_aggregate`) |
+| `struct` >8 bytes argument (up to 128 bytes) | the struct type, passed by value | Win64 indirect-by-value: caller materializes a copy and passes its address in the argument's positional GP/stack slot (sema rejects a registered struct >128 bytes — `reject_large_native_aggregate`) |
 | `struct` return >8 bytes | the struct type, returned by value | hidden pointer as first arg (`rcx`), also returned in `rax` |
 
 This table is authoritative for both directions (script calling
@@ -319,9 +328,10 @@ YAGNI until a concrete binding asks for it.
   would trap per SAFETY_AND_SANDBOX.md Section 5, but simply passing it to a
   native function that, say, just checks `len == 0` and returns early
   is fine and common).
-- **Struct-by-value >8 bytes as a native param**: rejected in v1 regardless
-  of permissions. `PERM_FFI` gating is orthogonal and is checked before
-  codegen for otherwise supported calls.
+- **Struct-by-value >8 bytes as a native param**: implemented through the
+  Win64 indirect/by-value path up to the enforced 128-byte limit. Larger
+  registered aggregates are rejected by sema. `PERM_FFI` gating is orthogonal
+  and is checked before codegen for otherwise supported calls.
 - **Native function with zero params**: `params = nullptr,
   param_count = 0` - valid, ordinary case, no special encoding.
 

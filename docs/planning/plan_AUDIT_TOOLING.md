@@ -1,6 +1,15 @@
 # Audit Tooling + Coverage Gap Analysis
 
-**Date:** 2026-07-13
+**Status: IMPLEMENTED THROUGH PHASE 4; re-audited 2026-07-15.** The tree now
+has GitHub Actions build/test, sanitizer, cppcheck, clang-tidy, CodeQL, and
+libFuzzer jobs; local static-analysis, DrMemory, and gcov scripts; `.em`
+loader/lexer/parser fuzz harnesses plus a Windows corpus batch driver; binary
+hardening flags; and focused coverage tests. Current coverage is reported as
+approximately 85%+ by the project state; generated reports remain
+machine-specific and are not checked in. TSAN and commercial/cloud scanners
+remain optional future work.
+
+**Original date:** 2026-07-13
 **Author:** Investigation into (1) gaps in our current audit coverage and (2) static/dynamic analysis tools we could adopt.
 **Build env:** MinGW g++ 15.2.0, C++17, Windows-first, Ninja, x86-64 JIT compiler.
 
@@ -8,7 +17,7 @@
 
 ## Part 1 — Current coverage map
 
-We have **35 audit reports** in `docs/audit/` and **7 recurring schedules** (s8–s14). All audits are **LLM-based** (sub-agent reads source, reports findings, implements permitted fixes). No automated static or dynamic analysis tooling is in the build.
+We have **35 audit reports** in `docs/audit/` and **7 recurring schedules** (s8–s14). All audits are **LLM-based** (sub-agent reads source, reports findings, implements permitted fixes). At the original audit revision, no automated static or dynamic analysis tooling was in the build. This is now superseded by the status block above.
 
 ### What the recurring schedules cover
 
@@ -92,7 +101,7 @@ Ranked by severity. Our LLM audits are good at *finding* issues by reading code,
 
 ## Part 4 — Concrete adoption plan (prioritized, phased)
 
-### Phase 1 — Zero toolchain change (cheap, high value, do first)
+### Phase 1 — Zero toolchain change — DONE
 
 **1a. cppcheck** — static analysis, no compiler switch
 ```bash
@@ -136,7 +145,7 @@ semgrep --config=p/c --config=p/security-audit src/ extensions/
 ```
 Fast pattern-based security scan. **Adopt immediately.**
 
-### Phase 2 — GitHub Actions CI (medium effort, high value)
+### Phase 2 — GitHub Actions CI — DONE
 
 Create `.github/workflows/ci.yml`:
 - **Job 1 (Windows + MinGW g++):** the build we already do — `cmake -G Ninja`, build, `ctest -E bench -LE soak`. This catches regressions on every push.
@@ -147,7 +156,7 @@ Create `.github/workflows/ci.yml`:
 
 We have **no CI at all** right now — every audit is a manually-dispatched agent. CI on push is the single biggest process gap. **Adopt next.**
 
-### Phase 3 — Clang sanitizer builds (high value, medium effort)
+### Phase 3 — Sanitizer builds — DONE in Linux CI (the reliable supported configuration)
 
 Install **LLVM-MinGW** (Clang-based MinGW toolchain, ABI-compatible with GCC MinGW) from mingw-w64.org/downloads or MSYS2 (`pacman -S mingw-w64-x86_64-clang`). Add a second CMake build config:
 ```bash
@@ -165,7 +174,7 @@ This unlocks:
 
 Run this as a CI job (don't ship the sanitizer build — it's a test-only config). **This is the highest-value single change** — it catches the entire memory-safety + UB gap with one toolchain.
 
-### Phase 4 — Fuzzing (high value, high effort)
+### Phase 4 — Fuzzing — DONE for `.em` loader, lexer, and parser entry surfaces
 
 With Clang available, add **libFuzzer** harnesses for the untrusted-input surfaces:
 

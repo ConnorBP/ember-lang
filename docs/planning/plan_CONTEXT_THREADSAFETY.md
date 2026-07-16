@@ -1,12 +1,15 @@
 # Plan — making the ember `context_t` safe for concurrent host-thread calls
 
-> **⚠ SHIPPED v1.0** — context thread-safety (Option D + B1) landed, pinned by
-> `examples/thread_safety_test.cpp` (ctest target `thread_safety`); see
-> `v1.0_INTEGRATION_NOTES.md` §1. The text below is the historical planning
-> record, left unchanged.
+> **DONE and extended.** Option D+B1 ships: `r14` carries a per-call context,
+> concurrent host callers use distinct contexts, and globals metadata is
+> threaded through `CodeGenCtx`. `extensions/thread` now spawns concurrent
+> workers with private per-call contexts seeded from the host context—no legacy
+> `call_mutex` serialization—and integrates with shared GC-runtime participant
+> safepoints. `thread_safety`, `in_context_threads`, and
+> `sync_thread_coverage` pin the current model. The body is historical option
+> analysis.
 >
-> **Status: research / planning only.** This document reads the code
-> firsthand and lays out design options. No source is changed. The user is
+> **Status of body: historical research/plan; the recommended model is implemented.** The user is
 > making a scoping decision from this — be concrete and honest about which
 > option unblocks "two host threads call ember fns at once" vs which only
 > helps the narrower "script coordinates with host threads via queues on

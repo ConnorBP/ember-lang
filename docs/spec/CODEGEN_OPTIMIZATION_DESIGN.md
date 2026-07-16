@@ -1,16 +1,24 @@
 # ember - codegen optimization design (research + composable architecture)
 
-Detail doc for the **design/planning side** of the performance work. It is the
-companion to the parallel benchmark investigation (task **t109**,
-`BENCHMARK_SYSTEM_DESIGN.md`, in flight) which gathers the *evidence* that gates
-which optimization to build first. This doc produces (a) a research survey of what
-LLVM's optimization passes do, categorized by relevance to a JIT scripting
-language, (b) a mapping of each relevant technique to ember's actual codegen paths
-(with line numbers in `src/codegen.cpp` at HEAD `8062195`), and (c) a composable /
-extensible codegen architecture that lets optimization passes be added as passes
-rather than via a monolithic rewrite.
+**Status: DESIGN IMPLEMENTED THROUGH THE THIN-IR STAGES; re-audited
+2026-07-15.** This file preserves the original benchmark reasoning and staged
+proposal, but its old future-tense status is superseded. The benchmark harness
+ships under `bench/`; Thin IR, serialization/re-emission, linear-scan register
+allocation, checked pass execution, profiles, and extension registration all
+ship. `extensions/opt` currently registers **18** value-preserving passes:
+`constprop`, `dce`, `simplifycfg`, `cse`, `gvn`, `licm`, `lsr`, `forward`,
+`copyprop`, `instcombine`, `dse`, `bounds-elim`, `sccp`, `unroll`, `spill_elim`,
+`peephole`, `branch_folding`, and `tailcall`. `extensions/obf` registers seven
+seeded transforms. The remaining future boundary is a richer full-SSA IR and a
+cached analysis manager; current global/loop passes compute the analyses they
+need directly.
 
-**This is a design document, not an implementation.** No `src/` edits accompany it.
+Detail doc for the design and evidence behind the performance work. Historical
+line numbers and early test totals are provenance for the original experiment,
+not statements about current HEAD.
+
+**This began as a design document; the implementation status is recorded above
+and in §8.**
 It is explicitly framed as **gated, not speculative**: `docs/planning/DESIGN.md` §9
 ("no speculative optimization before the bench proves it matters") and
 `docs/spec/COMPILER_PIPELINE.md` §5 ("the formal IR + regalloc refactor is the
@@ -51,7 +59,7 @@ sections below do, in order.
 
 ### 1.1 The shape
 
-`src/codegen.cpp` (~3546 lines) is a single `CG` class with one `eval(const Expr&)`
+At the audited historical baseline, `src/codegen.cpp` (~3546 lines) was a single `CG` class with one `eval(const Expr&)`
 entry point (line 1542) that is a giant `if (auto* X = dynamic_cast<const X*>(&ex))`
 cascade over AST node types, emitting bytes directly into an `X64Emitter` (`src/x64_emitter.hpp`).
 There is no IR: the AST *is* the IR, and lowering and emission are fused into one
@@ -606,7 +614,10 @@ struct PeepholePipeline {
 };
 ```
 
-Stage 1 ships two passes: `SmartImmPass` (W4, W10) and `BranchShrinkPass` (rel32→rel8,
+The historical Stage-1 design proposed two byte passes. The shipped Stage-1
+pipeline contains `SmartImmPass` and an inert `SetccMovzxPass`; it does **not**
+claim a shipped `BranchShrinkPass`. The later Thin-IR pass set supplies local
+peephole and branch-folding transforms without rel8 branch shrinking. Historically proposed: `SmartImmPass` (W4) and `BranchShrinkPass` (rel32→rel8,
 the `CODEGEN_SPEC.md` §4 deferral). The redundancy-removal peepholes (W5, W6, W7) are
 a later pass added when the benchmark shows the guard cost; they need a small
 amount of predicate-proof info from sema (range propagation for W6, constant-handle
@@ -1007,8 +1018,11 @@ optimization passes shipped beyond the original Step plan: `forward`,
 closes the IR backend's 1.2-1.9× tree-walker gap + intra-block copy
 propagation + identity-fold inst combining + dead-store elimination). See
 `extensions/opt/ext_opt.hpp` for the per-pass one-line descriptions.
-`EmberAnalysisManager` (§6) and the remaining obfuscation passes
-(`FlatteningPass`, `MBAPass`, bogus control flow) remain FUTURE.
+`EmberAnalysisManager` remains a stub/cached-analysis future. The old claim
+that MBA and bogus-control-flow families remain future is superseded:
+`mba_expand`, `opaque_pred`, `deadcode`, `const_encode`, `str_encrypt`, and
+`block_split` ship alongside compatibility `subst`. A dedicated classic
+control-flow-flattening pass still does not ship.
 
 The design sections (§4 architecture, §5 pass interface, §6 representation, §7
 migration) are unchanged; §4.3/§4.6/§4.7 are the design as written pre-ship (the

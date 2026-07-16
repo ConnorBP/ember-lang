@@ -1,7 +1,23 @@
 # ember - compiler pipeline spec
 
-Detail doc for ../planning/DESIGN.md Section 3. Lexer tokens, grammar, AST, shipped sema
-and tree-walking lowering, plus explicitly deferred IR/regalloc design.
+**Status: IMPLEMENTED and re-audited 2026-07-15.** The production compiler has
+two backends: the complete typed-AST tree walker and the `ThinFunction` backend
+(`thin_lower` → optional pass pipeline → optional linear-scan `regalloc` →
+`thin_emit`). The tree walker remains the default/fallback when no IR pipeline
+is requested or a function is not representable in Thin IR. Thin IR
+serialization (v5), keyed v6 modules, 18 optimization passes, and seven
+obfuscation passes are implemented; the richer illustrative
+`IrFunction`/full-SSA design in §§5/8 is still future.
+
+The lexer/parser/AST/sema additionally implement `let`/`mut`, source-import
+preprocessing, namespaces, parameterized function types, lambdas and captures,
+`try`/`catch`/`throw`, `yield` coroutines, and managed `new`/`delete`. Match
+supports struct-destructure patterns and guards. Slice escape Stage 2 is
+complete. Historical Tier labels below describe when features landed, not open
+implementation state.
+
+Detail doc for ../planning/DESIGN.md Section 3. Lexer tokens, grammar, AST/sema,
+and both shipped lowering paths.
 
 ## 1. Lexer token set
 
@@ -16,7 +32,8 @@ Identifiers: IDENT
 Keywords:   fn struct global enum if else while do for switch case
             default break continue return as auto defer const
             link true false bool i8 i16 i32 i64 u8 u16 u32 u64
-            f32 f64 void sizeof offsetof in match
+            f32 f64 void sizeof offsetof in match namespace
+            try catch throw yield new delete let mut
             constexpr static_assert priv
             (v1.0: `enum` + `link`/`switch`/`case`/`default`/`do`/`defer`/
             `const`/`sizeof`/`offsetof`/`in`/`match` were all added as the frontend
@@ -48,7 +65,9 @@ Annotation: @ (starts an annotation, followed by IDENT and optional
             parenthesized literal-list, TYPE_SYSTEM.md Section 10)
 ```
 - No `class`, `goto`, `do`-while-top-level, `typedef`/`using`, `template`,
-  `namespace`, `#include`/preprocessor - none exist in v1 grammar (matches
+  `#include`/preprocessor - none exist in the grammar. `namespace` now ships
+  as a flat qualified-name grouping feature. (This supersedes the old v1
+  no-namespace claim and otherwise matches
   ../planning/DESIGN.md non-goals). (`switch`/`case`/`default`/`do` shipped v0.2–v0.5;
   `enum` shipped v1.0 — the original v0.1 spec's "no enum/switch" note is
   superseded, see ../planning/DESIGN.md non-goals.)
@@ -77,8 +96,10 @@ Annotation: @ (starts an annotation, followed by IDENT and optional
 
 ```
 program      := (annotation* func_decl | struct_decl | enum_decl
-               | global_decl | link_decl | import_decl
+               | global_decl | link_decl | namespace_decl
                | static_assert_decl)*
+// `import "path";` is resolved by src/import.cpp as a source pre-pass before
+// tokenization; it is intentionally not a lexer/parser token or AST declaration.
 
 annotation   := '@' IDENT ('(' (literal (',' literal)*)? ')')?
 
@@ -91,7 +112,9 @@ variant      := IDENT ('=' constexpr_int_expr | '=' constexpr_fn_call)?  // auto
 global_decl  := ('global'|'const') IDENT ':' type '=' expr ';'        // const = immutable global (Section 11.5)
 
 link_decl    := 'link' STRING_LIT ('as' IDENT)? ';'                   // v0.5 cross-module: link "foo.em" as foo; / link "foo" as foo;
-import_decl  := 'import' STRING_LIT ';'                               // parse-time textual inclusion (cycle-detected, deduped)
+namespace_decl := 'namespace' IDENT '{' (func_decl | struct_decl | enum_decl
+                  | global_decl | static_assert_decl | ';')* '}'
+                  // parser flattens members into Program with qualified names/ns metadata
 
 static_assert_decl := 'static_assert' '(' expr ',' STRING_LIT ')' ';'  // Tier 1 top-level compile-time assertion (Section 2a + TYPE_SYSTEM §11.5)
 
@@ -107,16 +130,17 @@ param        := IDENT ':' type ('=' literal)?      // optional trailing default 
 // has no keyword. This is a BUNDLING/linking concern (what the loader/linker
 // honors), distinct from in-module name scoping (namespaces, ROADMAP Tier 6).
 
-type         := prim_type | IDENT              // IDENT = struct name
+type         := prim_type | IDENT              // IDENT = struct/enum/host type
                | type '[' INT_LIT ']'          // fixed array
                | type '[' ']'                  // slice
-               | 'fn'                          // Tier 2: bare function-handle type (i64 with is_fn_handle=true)
+               | 'fn' ('(' type_list? ')' '->' type)?
+                  // bare erased handle or parameterized function-handle type
 prim_type    := 'bool'|'i8'|'i16'|'i32'|'i64'
                |'u8'|'u16'|'u32'|'u64'|'f32'|'f64'|'void'
 
 block        := '{' stmt* '}'
-stmt         := 'let' IDENT (':' type)? '=' expr ';'      // local decl
-               | 'const' IDENT ':' type '=' expr ';'       // immutable local
+stmt         := 'let' 'mut'? IDENT (':' type)? ('=' expr)? ';' // immutable by default; mut opts into writes
+               | 'const' IDENT (':' type)? '=' expr ';'          // immutable local
                | 'defer' expr ';'                          // lexical-block-exit LIFO cleanup (Section 6, CODEGEN_SPEC.md Section 13)
                | 'auto' IDENT '=' expr ';'                 // TYPE_SYSTEM.md Section 9 (deprecated)
                | 'static_assert' '(' expr ',' STRING_LIT ')' ';'  // Tier 1 in-body compile-time assertion (Section 2a + TYPE_SYSTEM §11.5)
@@ -129,6 +153,9 @@ stmt         := 'let' IDENT (':' type)? '=' expr ';'      // local decl
                | 'match' '(' expr ')' '{' match_arm* '}'       // Tier 1 pattern match (Section 2a + CODEGEN_SPEC.md Section 18)
                | 'break' ';' | 'continue' ';'
                | 'return' expr? ';'
+               | 'try' block 'catch' '(' IDENT ')' block
+               | 'throw' expr ';'
+               | 'yield' expr? ';'
                | expr ';'                                   // expr-statement (calls, assignments)
                | block                                      // nested scope
 case_clause  := 'case' literal ':' stmt* ('break' ';')?       // break required, no fallthrough (Section 2)
@@ -164,6 +191,9 @@ enum_access  := '::' IDENT                                   // Tier 1: E::A enu
 view_suffix  := '[' '.' '.' ']'                              // arr[..] whole-array view, MEMORY_AND_GC.md Section 3
 primary      := INT_LIT | FLOAT_LIT | STRING_LIT | RAW_STRING_LIT | BOOL_LIT
                | IDENT | '(' expr ')' | struct_literal | array_literal
+               | lambda_expr
+unary_expr   := ... | 'new' type | 'delete' unary_expr
+lambda_expr  := 'fn' ('[' capture_list? ']')? '(' param_list? ')' ('->' type)? block
 struct_literal := IDENT '{' (IDENT ':' expr (',' IDENT ':' expr)*)? '}'
 array_literal  := '[' (expr (',' expr)*)? ']'                  // Tier 1: fixed-array or slice literal at PRIMARY position (TYPE_SYSTEM.md Section 12.1)
 ```
@@ -468,17 +498,14 @@ succeeded)
      stopping at (and flagging) a `ViewExpr` whose base is a local (or a
      `StringLit` whose resolved type is `slice<u8>`), or passing cleanly
      if the value came from a call or a global/param instead.
-     **Stage 2 (deferred, see `../ROADMAP.md` "Slice-of-stack-local escape
-     safety — STAGE 1 DONE, STAGE 2 DEFERRED"): C3 (a stack-backed slice
-     passed to a native that may retain the ptr) and C5 (a stack-backed
-     slice passed to a script fn / fn-handle / cross-module call that may
-     retain it) are NOT yet guarded** at the call-arg sites - a retaining
-     callee dangles the ptr. Closing them needs a real borrow/escape
-     analysis (propagate the localview bit through a call's return value,
-     reject only at the actual escape point, and add a `borrows`/`retains`
-     annotation to `NativeSig` so C3 can distinguish copying natives from
-     retaining ones). See `../../demo/SLICE_ESCAPE_SAFETY_INVESTIGATION.md`
-     for the 5-category escape matrix.
+     **Stage 2 — DONE.** C3 is enforced through `NativeSig::retains`: a
+     stack-backed slice cannot be passed to a retaining native, while copying
+     natives remain legal. C5 is enforced for direct script calls through
+     fixed-point per-function `borrowed_params`/`retained_params` summaries;
+     retained arguments are rejected and borrowed results preserve provenance
+     to the caller's eventual escape point. Opaque indirect/cross-module calls
+     are handled conservatively. See `src/sema.cpp`'s
+     `compute_borrow_retain` paths.
    - Index-expression integer-type check (TYPE_SYSTEM.md Section 7 — the
      implementation accepts any signed or unsigned integer index, not
      unsigned-only; the spec's "unsigned index" claim is relaxed to match).
@@ -668,7 +695,10 @@ struct IrFunction {
   its expression to prevent a later fallthrough edge from running it twice.
   Cleanup runs while lexical locals remain live, so ordinary scope and
   declaration-before-use checks permit local references. Trap/longjmp remains
-  non-local and bypasses defer cleanup; no exception unwinding is implemented.
+  non-local host traps still bypass defer cleanup. In-language
+  `try`/`catch`/`throw` is implemented separately with the per-context catch
+  stack; it unwinds to the nearest language catch, while safety traps remain
+  uncatchable host-level aborts.
 - **`switch` statement**: scrutinee is a compile-time-known integer
   type (signed or unsigned, any width) - non-integer scrutinee is a
   compile error. Case labels must be compile-time-constant integer

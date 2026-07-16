@@ -1,5 +1,13 @@
 # ember - safety & sandbox spec
 
+**Status: IMPLEMENTED and re-audited 2026-07-15.** Beyond the original
+budget/depth/bounds/FFI model, current source has compiler recursion guards, an
+RSS failsafe, checked pass growth/rollback, binary-hardening flags,
+secure-default v5 IR loading, keyed v6 capability validation, parameterized and
+cross-module function-handle guards, language `try`/`catch`/`throw`, managed GC
+pointers, concurrent worker contexts, and cooperative stop-the-world GC root
+scanning. Safety traps remain distinct from catchable language throws.
+
 Detail doc for ../planning/DESIGN.md Section 5. Every "what happens when X goes wrong"
 case, the shipped safety boundary, and explicitly deferred mechanisms.
 
@@ -32,7 +40,7 @@ case, the shipped safety boundary, and explicitly deferred mechanisms.
   IDENTITY hash (FNV1a of compiler/ABI string literals) + a TYPE signature (sema
   arg-checking), NOT content authentication: a malicious `.em` from the same
   compiler/ABI with valid identity+type-sigs still injected arbitrary x86. **v4
-  closes this (implemented 2026-07-10):** a v4 `.em` is the v3 layout + an additive
+  added signed raw artifacts; v5 then added validated IR re-emission.** A v4 `.em` is the v3 layout + an additive
   Ed25519 signature block; the loader verifies the signature over the content
   (header → name directory) BEFORE `alloc_executable_rw` and rejects on mismatch
   (no exec page published — a tampered `.em` is rejected, not executed). The
@@ -48,6 +56,11 @@ case, the shipped safety boundary, and explicitly deferred mechanisms.
   loading a code-injection vector; a host that loads only signed `.em` with a
   trusted keyring gets cryptographic content authentication. This is the standard
   "signed native artifact" model (analogous to signed DLLs / signed firmware).
+  Current secure-load policy also rejects v1-v4 raw-x86 modules and raw fallback
+  functions in mixed v5 modules unless `allow_raw_x86` is an explicit
+  compatibility opt-in. All-IR v5 modules are deserialized, full-span validated,
+  and re-emitted before executable allocation. v6 adds validated keyed-dispatch
+  metadata and capability negotiation.
 
 ## 2. Execution entry point & non-local abort mechanism
 
@@ -118,9 +131,10 @@ is not recoverable.
   same non-local unwind as bounds/div-by-zero (Section 2). The host's
   checkpoint wrapper resumes and observes "budget exceeded" through
   `last_error`/`last_trap`.
-  Script does **not** get a chance to catch this - no in-language
-  exception handling exists (../planning/DESIGN.md Section 2), matches "abort, don't try
-  to let a runaway script gracefully handle its own runaway-ness."
+  Script does **not** get a chance to catch this. In-language
+  `try`/`catch` handles explicit `throw` values only; safety/resource traps
+  intentionally bypass language handlers so a runaway script cannot suppress
+  its own budget exhaustion.
 - **No budget set (default)**: `budget_remaining` starts at
   `INT64_MAX` (or budget checks are simply compiled out entirely if
   the module was compiled with budgeting disabled - a module-level
@@ -321,12 +335,11 @@ compiling. The guard is a **no-op (zero emitted)** when no allowlist is
 configured (`fn_slot_count == 0`), so every existing module that doesn't use
 function refs pays nothing. See `examples/function_refs_test.cpp` (ctest
 target `function_refs`) for the out-of-range and in-range-unregistered
-handle trap tests. Two open items are documented at `../ROADMAP.md` Tier 2:
-the **bare-`fn` signature hole** (a `fn`-typed param with no recorded sig
-does not type-check args — a type-soundness hole, not a sandbox violation;
-the guard still validates the handle, the called code still obeys all
-budgets/bounds) and **cross-module handles** (deferred to v2+; the allowlist
-is per-module).
+handle trap tests. The two historical open items are closed: parameterized
+`fn(Args)->Ret` types perform compile-time argument/return checking, and
+cross-module handles carry tagged `(module_id, slot)` identity validated
+against the target module's dispatch metadata. Bare `fn` remains an explicitly
+erased signature form where requested.
 
 ## 8. What is explicitly NOT checked (documented gaps, not oversights)
 
@@ -347,12 +360,11 @@ is per-module).
   (`../HOT_RELOAD.md` Section 5); that slot-swap's atomicity is the only
   thread-safety guarantee made on that shared state. Script-visible global
   mutable state shared across contexts is a host-design question, not
-  something ember arbitrates. There is no script-level primitive to create
-  a data race **between two threads on one context** — running two ember-
-  calling threads against a *single* `context_t` still races (a trap on one
-  could longjmp to the other's checkpoint — the generalized `--tick` bug);
-  the discipline is one-context-per-thread (Section 8a), not in-context
-  threading. The sync-queue primitives (`extensions/sync/`) let a script
+  something ember arbitrates. `extensions/thread` now lets scripts spawn
+  concurrent workers, but every worker receives its **own per-call
+  `context_t`** seeded from the host settings; workers do not share one
+  checkpoint/budget/depth record. The host-entry discipline remains one active
+  caller per context. The sync-queue primitives (`extensions/sync/`) let a script
   coordinate with host threads on host-owned shared state behind i64
   handles under the **U2 contract** (script side single-threaded per
   context; host producer/consumer threads touch only the queue HOST storage

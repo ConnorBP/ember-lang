@@ -1,7 +1,16 @@
 # Self-Hosting Plan — ember compiler written in ember
 
-**Status:** IN PROGRESS (foundation laid: demo/compiler/ is a µ-language lexer/parser/evaluator in ember)
-**Date:** 2026-07-11
+**Status: DONE (2026-07-15).** The self-hosted compiler reached **188/188
+feature parity**, with zero unsupported cases and zero mismatches in the parity
+gate. One-stage compilation works, the bundled self-host preview works, and the
+two-generation bootstrap works: compiler A (built by the C++ compiler) compiles
+the full self-hosted source into EMBM compiler B, initializes B's globals, then
+B compiles and runs test input correctly. `self_hosted/bootstrap.ember`,
+`bootstrap_compiler_source.ember`, `FULL_PARITY_MATRIX.md`, EMBM v2 dispatch,
+and the `self_hosted_*` CTests are the authoritative implementation artifacts.
+
+**Original planning date:** 2026-07-11. The stage plan below is preserved as the
+completed implementation path; every stage is DONE.
 
 ## The north star
 
@@ -10,7 +19,7 @@ non-goal (corrected from an earlier roadmap revision). The path is: port the
 ember frontend (lexer → parser → sema → codegen) to ember, one stage at a time,
 validating each against the C++ reference.
 
-## Foundation already laid
+## Foundation — DONE
 
 `demo/compiler/` is a complete µ-language lexer/parser/evaluator written entirely
 in ember source (`lex.ember`, `parse.ember`, `eval.ember`, `main.ember`). It
@@ -20,9 +29,9 @@ parens, and divide-by-zero detection. It stresses enum, struct, switch, slices,
 recursion, fn-ref handles, fixed arrays, and import — the pure-compute surface
 a real compiler needs.
 
-## The path (each stage is a TODO, validated against the C++ reference)
+## Completed path (each stage validated against the C++ reference)
 
-### Stage 1: Port the ember lexer to ember (most shovel-ready)
+### Stage 1: Port the ember lexer to ember — DONE
 
 The C++ lexer is `src/lexer.cpp` + `src/lexer.hpp` — a hand-rolled state machine
 that produces a token stream. The demo `lex.ember` already lexes a simple
@@ -37,7 +46,7 @@ to the C++ lexer's output. They must match.
 Dependencies: the `string` extension (for token text), the `array` extension
 (for the token array), the `map` extension (for the keyword lookup). All shipped.
 
-### Stage 2: Port the ember parser to ember
+### Stage 2: Port the ember parser to ember — DONE
 
 The C++ parser is `src/parser.cpp` — a recursive-descent parser that produces
 an AST. The demo `parse.ember` already parses a simple grammar. The task:
@@ -51,7 +60,7 @@ hierarchy. The output: an AST that the C++ parser produces identically.
 Dependencies: Stage 1 (the lexer). The `map` extension (for the operator
 precedence table). The struct + enum + fn-ref features (all shipped).
 
-### Stage 3: Port the ember sema to ember
+### Stage 3: Port the ember sema to ember — DONE
 
 The C++ sema is `src/sema.cpp` — a multi-pass type checker. The task: port the
 type-checking passes (resolve types, check exprs, check stmts, enum resolution,
@@ -60,7 +69,7 @@ constexpr folding, etc.) to ember.
 Dependencies: Stage 2 (the parser/AST). The `constexpr` feature (shipped) for
 compile-time evaluation. The type system (struct + enum + fn types — all shipped).
 
-### Stage 4: Port the ember codegen to ember
+### Stage 4: Port the ember codegen to ember — DONE
 
 The C++ codegen is `src/codegen.cpp` (tree-walker) + `src/thin_lower.cpp` +
 `src/thin_emit.cpp` (IR backend). The task: port the x64 emitter to ember —
@@ -76,7 +85,7 @@ executable.
 Dependencies: Stage 3 (sema). The `array` extension (for the byte buffer). The
 JIT memory natives (host-provided). The struct layout (for frame planning).
 
-### Stage 5: The self-hosting milestone
+### Stage 5: The self-hosting milestone — DONE
 
 Once all 4 stages are ported, the ember compiler written in ember can:
 1. Lex ember source → token stream
@@ -110,18 +119,19 @@ then the ember compiler can take over.
 - The constexpr interpreter (shipped) is needed for compile-time folding.
 - **No gaps — Stage 3 can start after Stage 2.**
 
-### Before Stage 4 (codegen port):
+### Before Stage 4 (codegen port) — gap closed:
 - ember needs to emit raw bytes: the array<u8> extension (shipped) + a way to
   cast an array<u8> to a function pointer + call it. The host provides
   `alloc_executable_rw` + `free_executable` natives (in the engine). ember
   needs a native to call a raw function pointer (the `fn` handle + the
   call-target guard could be extended to accept raw pointers, OR a new
   `call_raw(ptr, arg) -> i64` native).
-- **Gap: a `call_raw` native (call a raw x64 function pointer from ember).**
-  This is a small extension — register a native that takes an i64 (the ptr) +
-  an i64 (the arg) + calls the ptr as `int64_t(*)(int64_t)`.
+- **DONE:** `extensions/call_raw/` supplies the executable-memory and raw-call
+  bridge used by the first pipeline. The completed bootstrap now primarily
+  emits/loads EMBM v2 module images with dispatch/context/native relocation
+  infrastructure rather than relying on a single raw pointer call shape.
 
-## Estimated effort
+## Historical estimate (actual work complete)
 
 - Stage 1 (lexer port): ~1-2 days. The demo lex.ember is a start; extending to
   ember's full token set is mechanical.

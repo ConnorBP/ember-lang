@@ -1,7 +1,14 @@
 # ember - memory & ownership spec
 
+**Status: GC AND MANAGED-POINTER INTEGRATION DONE; re-audited 2026-07-15.**
+Precise shadow-stack and typed-global roots, extension trace callbacks,
+generated write barriers, managed `new`/`delete`, lambda environments, shared
+context-owned heaps, concurrent worker participation, coroutine integration,
+and cooperative stop-the-world collection are implemented. The bump-arena
+section remains a separate reserved alternative.
+
 Detail doc for ../planning/DESIGN.md Section 7. Frame ownership, host-object references,
-string/array representation, and explicitly deferred arena/GC designs.
+string/array representation, and the implemented GC plus reserved arena design.
 
 ## 1. Ownership taxonomy (every byte a script touches falls into
 exactly one of these)
@@ -27,10 +34,9 @@ exactly one of these)
    script-owned dynamic allocation - see Section 5; documented now so the
    plan has an answer ready, not because v0.x milestones need it).
 
-There is deliberately **no** category for "script-owned heap object
-with unknown lifetime" - that category is what a GC would exist to
-manage, and ../planning/DESIGN.md Section 1 excludes a **script-visible** GC
-heap from v1. A tracing GC **core** has shipped (`src/gc.{hpp,cpp}`) and is
+A script-owned managed-heap category now exists for lambda environments and
+`new T` allocations. It is opaque—there is no raw pointer arithmetic or
+dereference—and is managed by the tracing collector. A tracing GC **core** has shipped (`src/gc.{hpp,cpp}`) and is
 **wired into the engine** for lambda closure environments (#20): precise
 stack-frame root maps (the shadow stack) + precise typed-global root maps +
 extension trace-callback root providers + a stop-the-world write barrier
@@ -96,20 +102,13 @@ into the current frame. This is safe **only** because:
   - C1 (return), C2a (global-store), and C2b (global-rooted `FieldExpr`/
   `IndexExpr` store) - for both the `ViewExpr`-over-fixed-array class and
   the `StringLit`-derived-`slice<u8>` class (Stage 1, commit `8062195`, see
-  `../ROADMAP.md` "Slice-of-stack-local escape safety — STAGE 1 DONE,
-  STAGE 2 DEFERRED"). **C3** (a stack-backed slice passed to a native that
-  may retain the ptr) and **C5** (a stack-backed slice passed to a script
-  fn / fn-handle / cross-module call that may retain it) are an **open
-  hole** that is **not yet guarded** at the call-arg sites (Stage 2
-  deferred): a retaining callee dangles the ptr. Closing C3/C5 needs a real
-  borrow/escape analysis (propagate the localview bit through a call's
-  return value, reject only at the actual escape point, and add a
-  `borrows`/`retains` annotation to `NativeSig` so C3 can distinguish
-  copying natives like `string_from_slice` from retaining ones). No
-  shipped native retains a slice ptr today, so C3 is "accidentally safe";
-  C5 (a retaining script fn) is the residual live hole. See
-  `../../demo/SLICE_ESCAPE_SAFETY_INVESTIGATION.md` for the 5-category
-  escape matrix.
+  `../ROADMAP.md` slice-escape entry). **Stage 2 is DONE.** C3 uses
+  `NativeSig::retains` to reject stack-backed slices at retaining native call
+  sites while allowing copying natives. C5 uses fixed-point
+  `borrowed_params`/`retained_params` summaries for direct script calls;
+  retained arguments are rejected and borrowed return provenance flows to the
+  caller's eventual escape point. Opaque calls are conservative. See
+  `src/sema.cpp`'s `compute_borrow_retain` paths.
 - This is **not** general borrow-checking (TYPE_SYSTEM.md Section 4 already
   disclaims that) - it's one narrow, syntactically-decidable check
   covering the one case ember itself can introduce a dangling slice
@@ -366,14 +365,11 @@ the way down.
 > and `gc_full` (by-reference capture + new/delete + the cross-layer
 > one-collection-sequence covering all five behaviors on both backends).
 >
-> The residual deferral is now narrower: (1) the IR backend does not yet
-> lower `LambdaExpr` (a lambda-creating function falls back to the tree-
-> walker — the IR path's frame-record maintenance + frame-map emit are
-> implemented + tested via the `gc_new`/`delete` surface, ready for when it
-> does); (2) `new Type{...}` syntax with typed field access (a pointer-type
-> system; ember structs are value types today) — the `gc_new`/`gc_delete`
-> natives are the heap-management substrate it would build on; (3) coroutine
-> suspended-frame rooting (#21); (4) per-context shared heaps. See
+> Residual boundaries are narrower: the IR backend still falls back for
+> lambda creation, and managed pointers remain opaque (there is no
+> `new Type{...}` field-dereference pointer system). Coroutine and shared-heap
+> participation are implemented through the GC extension's context attachment,
+> participant registry, safepoints, and suspended-state integration. See
 > `extensions/gc/ext_gc.hpp` (the design + WHAT REMAINS) + `../ROADMAP.md`
 > Tier 3 (Tracing GC — ✓ core shipped + integration shipped).
 >
@@ -407,18 +403,13 @@ the way down.
 > `new`'d object survives in-frame `gc_collect()` while its managed-pointer
 > local is live).
 
-Recorded here so the reasoning isn't lost: a tracing GC would be
-needed only if script code could create heap references with
+Historical rationale, now satisfied by lambdas and managed `new`: a tracing GC is
+needed when script code can create heap references with
 lifetimes that (a) outlive the frame that created them, (b) aren't
 owned by the host, and (c) have statically-unknowable extent (so an
 arena reset point can't be chosen safely). No feature in the v1
 language surface (TYPE_SYSTEM.md, ../planning/DESIGN.md Section 2) creates that
-situation - every reference type is either host-owned, frame-scoped,
-or global/module-scoped. A GC becomes necessary only if a future
-feature explicitly wants script-side heap-allocated, reference-
-counted-or-traced object graphs (e.g. script-defined linked
-structures, closures capturing heap state) - at which point it's a
-deliberate, scoped addition with its own design pass, not a
-retrofit onto the current model. Until then, building GC
-infrastructure would be speculative complexity with no consumer
-(YAGNI, ../planning/DESIGN.md Section 10).
+situation. Lambdas with escaping environments and `new T` are precisely those
+consumers, so the collector and its root maps are now part of the shipped
+runtime rather than speculative infrastructure. Raw pointer graphs and typed
+managed-pointer dereference remain outside the language.

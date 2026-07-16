@@ -1,7 +1,17 @@
 # Plan — Composable implicit environmental keyed dispatch for Ember
 
-> **Status: research and implementation plan only (2026-07-13).**
-> This document proposes changes; it does not claim they are implemented.
+> **Status: RED 1–10 DONE (2026-07-15); RED 11 composition covered by the
+> integrated polymorphic/keyed path.** Versioned permutation math, ABI
+> classification, logical/physical module layout, runtime resolver, `r15`
+> keyed outer thunks, tree/Thin-IR same-module calls, atomic module-record and
+> cross-module calls, host/lifecycle/thread/coroutine integration, keyed `.em`
+> v6 capability metadata/loading, keyed single-function reload, and whole-
+> generation replacement all ship. Focused test executables include
+> `keyed_dispatch_math`, `module_layout`, `keyed_dispatch_runtime`,
+> `keyed_dispatch_outer_thunk`, `keyed_dispatch_codegen`,
+> `keyed_dispatch_modules`, `em_v6_keyed`, `keyed_dispatch_extensions`, and
+> `keyed_dispatch_hot_reload`; intentionally heavy gates are not all default
+> CTests. The body remains the design/security contract.
 >
 > **Reviewed baseline:** Ember `HEAD` was `2ac6a01`. The worktree was dirty and
 > the review intentionally included those local changes. The observed
@@ -1518,7 +1528,7 @@ Set an overhead budget before making keyed dispatch a default for any host.
 
 ## 15. Implementation phases
 
-### Phase 0 — contract and baseline
+### Phase 0 — contract and baseline — DONE
 
 - Freeze logical identity, exact ABI domains, key lifecycle, and wrong-key
   safety semantics.
@@ -1527,7 +1537,7 @@ Set an overhead budget before making keyed dispatch a default for any host.
 
 **Gate:** reviewed specification and unchanged legacy tests.
 
-### Phase 1 — core mathematical/runtime prototype
+### Phase 1 — core mathematical/runtime prototype — DONE
 
 - Stable ABI fingerprint.
 - Reference permutation.
@@ -1538,7 +1548,7 @@ Set an overhead budget before making keyed dispatch a default for any host.
 
 **Gate:** exhaustive/property tests for domains and wrong-key memory safety.
 
-### Phase 2 — module planning on the shared registry foundation
+### Phase 2 — module planning on the shared registry foundation — DONE
 
 Prerequisite: polymorphic-plan Phase 1 (`ExtensionResult`, configured factory,
 collision policy, deterministic descriptor listing).
@@ -1550,7 +1560,7 @@ collision policy, deterministic descriptor listing).
 
 **Gate:** identity/no-extension compatibility and two pinned keyed layouts.
 
-### Phase 3 — same-module JIT integration
+### Phase 3 — same-module JIT integration — DONE
 
 - Keyed outer thunks/provider.
 - `r15` reservation.
@@ -1560,7 +1570,7 @@ collision policy, deterministic descriptor listing).
 **Gate:** correct key semantics, wrong-key domain safety, legacy byte/behavior
 compatibility.
 
-### Phase 4 — atomic module registry and cross-module integration
+### Phase 4 — atomic module registry and cross-module integration — DONE
 
 - Immutable `ModuleDispatchRecord` publication.
 - Logical cross-module slots/handles.
@@ -1569,7 +1579,7 @@ compatibility.
 
 **Gate:** bidirectional JIT module and handle tests under correct/wrong keys.
 
-### Phase 5 — target-specific V6 modules
+### Phase 5 — target-specific V6 modules — DONE
 
 - New format/schema with a versioned capability matrix.
 - V5-compatible validated IR body where possible.
@@ -1581,7 +1591,7 @@ compatibility.
 
 **Gate:** V6 hardening suite and V1–V5 full compatibility.
 
-### Phase 6 — reload and runtime extensions
+### Phase 6 — reload and runtime extensions — DONE
 
 - Logical hot reload to target physical slot.
 - Lifecycle routines resolve at invocation.
@@ -1590,7 +1600,7 @@ compatibility.
 
 **Gate:** delayed-start/suspension/reload concurrency tests.
 
-### Phase 7 — inline hardened strategy
+### Phase 7 — inline hardened strategy — DONE for the shipped implicit-keyed-v1 helper/emitter contract
 
 - Registered `implicit-keyed-v2` PRP.
 - Inline x64 resolution.
@@ -1599,7 +1609,7 @@ compatibility.
 
 **Gate:** complete correctness plus measured overhead budget.
 
-### Phase 8 — polymorphic composition
+### Phase 8 — polymorphic composition — DONE
 
 - Domain-separated machine-derived pass seed.
 - Target-specific module code diversity.

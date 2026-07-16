@@ -1,7 +1,15 @@
 # ember - type system spec
 
-Detail doc for ../planning/DESIGN.md Section 2. Formalizes the shipped v1 types, Ember
-layout, conversions, and ABI limits; future extensions are labeled inline.
+**Status: IMPLEMENTED and re-audited 2026-07-15.** The current type surface
+extends the original v1 core with typed enums, parameterized function types,
+cross-module handles, two-word lambda values with capture metadata, and
+one-word managed-pointer types produced by `new`. Namespaces, language
+exceptions, coroutines, and struct-destructure match are also implemented.
+Slice escape Stage 2 is closed by native `retains` metadata plus
+script-function borrow/retain summaries.
+
+Detail doc for ../planning/DESIGN.md Section 2. Formalizes the shipped types,
+Ember layout, conversions, and ABI limits.
 
 ## 1. Primitive types
 
@@ -143,14 +151,15 @@ script-visible concept simply don't exist).
   which is a host layout decision, not something ember can assume).
   If needed later, it's an additive change (YAGNI).
 
-## 5. References
+## 5. References and managed pointers
 
-No standalone reference/pointer type beyond what's embedded in a
-slice. A script function parameter that needs "pass this struct by
-reference so the callee can mutate it" is expressed as a `slice<T>`
-of length 1 (idiomatic pattern, not a separate language feature) - no
-new type or syntax needed, matches YAGNI stance and keeps exactly one
-memory-indirection concept in the whole language.
+There is no raw script-visible pointer/reference type and no pointer arithmetic
+or dereference syntax. A script parameter that needs a mutable borrowed view
+still uses a `slice<T>` (often length 1). Separately, `new T` produces a
+compiler-recognized **managed pointer** (`Type::is_managed_ptr`) used only as
+an opaque GC identity: it cannot be cast to/from i64, indexed, dereferenced, or
+arithmetically modified, and only `delete` consumes it. This does not weaken
+the no-raw-pointer rule.
 
 ## 6. Type compatibility & implicit conversion
 
@@ -250,11 +259,12 @@ memory-indirection concept in the whole language.
   (or a trusted native like `register_routine`); i64↔fn assignment is forbidden
   either direction, and a runtime bitset-allowlist guard validates the handle
   before dispatch (`SAFETY_AND_SANDBOX.md` §7a). A bare `fn`-typed parameter
-  (`fn h` with no recorded signature) accepts any args at the call site — a
-  type-soundness hole, not a sandbox violation (the runtime guard still
-  validates the handle); parameterized `fn(i64)->i64` types are v2+. Closures
-  (lambdas with capture) remain a non-goal for v1 (need GC, `../ROADMAP.md`
-  Tier 3). (Callback-style native APIs are also handled via the annotation
+  (`fn h` with no recorded signature) is the explicitly erased form.
+  Parameterized `fn(Args)->Ret` types now perform signature checking, and
+  cross-module handles carry validated module/slot identity. Lambdas with
+  by-value and by-reference capture ship as two-word `{slot,env_ptr}` values;
+  escaping by-reference captures are rejected and GC-backed environments are
+  precisely rooted. (Callback-style native APIs are also handled via the annotation
   mechanism — `@on_tick`/`@event(...)` — discovered by name from the host
   side, `LIFECYCLE.md`.)
 - **Non-void function must return on every path**: sema performs a
@@ -270,10 +280,9 @@ memory-indirection concept in the whole language.
   expression on a void function). **`void` function with bare
   `return;`**: fine, early-exit, compiles to the normal per-return
   epilogue (CODEGEN_SPEC.md Section 6) with no value moved into `rax`/`xmm0`.
-- **Unreachable code after `return`/`break`/`continue`** in the same
-  block: not an error in v1 (a warning would be nice, not required  - 
-  YAGNI on a full unreachable-code diagnostic pass; codegen simply
-  never emits it since lowering stops at the terminator).
+- **Unreachable code after `return`/`break`/`continue`** in the same block is
+  rejected by the current structured block checker. This prevents accepted
+  source from silently relying on statements codegen cannot reach.
 
 ## 9. `auto` - the one type-inference rule
 

@@ -1,13 +1,13 @@
 # Plan — standalone EXE bundler: compile an ember script + runtime into one .exe
 
-> **Status: research / planning only.** This document reads the code
-> firsthand (the `.em` format in `src/em_file.hpp`, the loader in
-> `src/em_loader.{hpp,cpp}`, the writer in `src/em_writer.hpp`, the CLI
-> in `examples/ember_cli.cpp`, the v5 IR path in
-> `examples/em_v5_ir_test.cpp`) and lays out the design. **No source is
-> changed.** The user is making an architecture decision from this — be
-> concrete about which option is simplest, what the stub links, and what
-> the bundler tool does.
+> **Status: DONE.** Option A (prebuilt stub + appended `.em` + 12-byte EMBD
+> footer) ships as both `ember bundle` and `ember_bundle`; the runtime is
+> `ember_stub_main`. `load_em_bytes`, `write_em_bytes`, atomic temp-file
+> publication, permission policy, portable globals initialization,
+> native/coroutine registration, preview packaging, and
+> `bundler_test`/self-host preview gates are implemented. The body below is the
+> historical architecture decision; future-tense statements are superseded
+> where production code now exists.
 >
 > This is the natural companion to the existing `.em` pre-compile feature
 > (`docs/BUNDLING_AND_EM_MODULES.md`). The `.em` format already exists;
@@ -159,7 +159,11 @@ The `.em` format has two on-disk shapes (`src/em_file.hpp`):
   `alloc_executable_rw`, so a tampered v5 `.em` is rejected at IR
   validation with no exec page allocated.
 
-**For LAZY MODE, the stub uses v4.** v4 is simpler: the stub links
+**Historical recommendation:** for LAZY MODE, this plan selected v4. The
+shipped bundler writes the production byte module through `write_em_bytes`, and
+the trusted standalone stub explicitly opts into raw execution; untrusted
+external loaders retain secure-default validated-IR policy. **For LAZY MODE,
+the original design uses v4.** v4 is simpler: the stub links
 `em_loader` (which is in `ember_frontend`, §3) and does not exercise the
 IR re-emit path. The `.em` is raw x86 + relocs; load is `memcpy` + patch.
 The stub is smaller (no `thin_emit`/`thin_ir_ser`/`thin_lower` symbols
