@@ -59,6 +59,7 @@ int main(int argc, char** argv) { return ember_bundle::command(argc, argv); }
 #include "ext_io.hpp"
 #include "ext_call_raw.hpp"     // self-hosting Stage 4 gap: call_raw(fn_ptr,arg)->i64
 #include "ext_coroutine.hpp"   // #21 coroutines (set_coroutine_dispatch native)
+#include "ext_graphics.hpp"    // Win32 + D3D11 full-screen shader rendering
 
 #include <cstdio>
 #include <cstdint>
@@ -103,6 +104,7 @@ static void register_standard_bindings(
     ext_io::register_natives(natives);
     ext_call_raw::register_natives(natives);
     ext_coroutine::register_natives(natives);
+    ext_graphics::register_natives(natives);
     OpOverloadTable overloads;
     ext_vec::register_overloads(overloads); ext_quat::register_overloads(overloads);
     ext_mat::register_overloads(overloads); ext_string::register_overloads(overloads);
@@ -596,6 +598,7 @@ int command(int argc, char** argv) {
     ember::ext_string::reset(); ember::ext_array::reset();
     ember::ext_sync::reset(); ember::ext_lifecycle::reset();
     ember::ext_io::reset();
+    ember::ext_graphics::reset();
 
     std::error_code ec;
     // Validate all sizes before creating/replacing the output. Besides making

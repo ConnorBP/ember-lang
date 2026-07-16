@@ -75,6 +75,7 @@
 #include "ext_coroutine.hpp"     // #21 coroutines with yield (Windows fibers)
 #include "ext_call_raw.hpp"     // self-hosting Stage 4 gap: call_raw(fn_ptr,arg)->i64
 #include "ext_audio.hpp"        // realtime-safe raw f32/f64/i32 audio buffer access
+#include "ext_graphics.hpp"     // Win32 + D3D11 full-screen shader rendering
 #include "ext_gc.hpp"          // tracing GC runtime: lambda env heap management (#20)
 #include "../src/ember_pass.hpp"       // Stage C: EmberPassManager
 #include "../src/ember_pass_registry.hpp" // Stage C: EmberPassRegistry
@@ -235,6 +236,7 @@ static void register_standard_bindings(
     ember::ext_coroutine::register_natives(natives);
     ember::ext_call_raw::register_natives(natives);
     ember::ext_audio::register_natives(natives);
+    ember::ext_graphics::register_natives(natives);
     ember::ext_thread::register_natives(natives);
     ember::ext_gc::register_natives(natives);   // __ember_gc_alloc_env/collect/live (lambda env heap)
     OpOverloadTable overloads;
@@ -442,6 +444,7 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
         ember::ext_coroutine::coroutine_reset();
         ember::ext_thread::thread_reset();
         ember::ext_call_raw::reset();  // stateless (no-op), for symmetry
+        ember::ext_graphics::reset();
         ember::ext_gc::gc_reset();     // clear the GC heap + roots (lambda envs)
         // ext_math is stateless (no reset()).
     };
@@ -1923,9 +1926,9 @@ int main(int argc, char** argv) {
         register_standard_bindings(load_natives);
         LoadedModule loaded; std::string lerr;
         EmLoadPolicy em_policy{ffi_mode ? PERM_FFI : 0u, true};
-        if(!load_em_file(load_em_path.c_str(),loaded,&lerr,nullptr,&load_natives,nullptr,&em_policy)){std::fprintf(stderr,"ember: load failed: %s\n",lerr.c_str());return 2;}
+        if(!load_em_file(load_em_path.c_str(),loaded,&lerr,nullptr,&load_natives,nullptr,&em_policy)){std::fprintf(stderr,"ember: load failed: %s\n",lerr.c_str());ember::ext_graphics::reset();return 2;}
         void* entry=loaded.entry_by_name(fn_name.c_str()); if(!entry)entry=loaded.entry();
-        if(!entry){std::fprintf(stderr,"ember: loaded entry '%s' not found\n",fn_name.c_str());return 2;}
+        if(!entry){std::fprintf(stderr,"ember: loaded entry '%s' not found\n",fn_name.c_str());ember::ext_graphics::reset();return 2;}
         uint32_t selected_slot=loaded.entry_slot;
         for(const auto& item:loaded.name_table)if(item.first==fn_name){selected_slot=item.second;break;}
         bool is_void=selected_slot<loaded.signatures_by_slot.size()&&loaded.signatures_by_slot[selected_slot].ret.is_void();
@@ -1946,12 +1949,14 @@ int main(int argc, char** argv) {
         if (!ectx.has_checkpoint) {
             // We arrived here via a trap longjmp — recoverable exit.
             std::fprintf(stderr, "ember: loaded .em trapped: %s\n", ectx.last_error.c_str());
+            ember::ext_graphics::reset();
             return 70;
         }
         safety::check_memory_limit();  // pre-flight RSS check before executing untrusted .em
         int64_t result = is_void
             ? ember::ember_call_void(entry, &ectx)
             : ember::ember_call_i64(entry, &ectx, 0);
+        ember::ext_graphics::reset();
         return is_void ? 0 : int(result);
     }
 

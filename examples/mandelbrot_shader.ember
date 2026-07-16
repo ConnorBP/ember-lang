@@ -1,0 +1,133 @@
+// mandelbrot_shader.ember - animated D3D11 Mandelbrot explorer.
+// Run: build/ember_cli.exe run examples/mandelbrot_shader.ember --ffi
+
+fn main() -> i64 {
+    let window: i64 = window_create(1280, 720, "Ember Mandelbrot");
+    if (window == 0) { return 1; }
+    if (!window_show(window)) { window_destroy(window); return 2; }
+
+    // No vertex buffer or input layout: SV_VertexID synthesizes one triangle
+    // covering the complete render target.
+    let vs_hlsl: string = r"""
+float4 vs_main(uint id : SV_VertexID) : SV_Position {
+    float2 p = float2((id << 1) & 2, id & 2);
+    return float4(p * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+""";
+
+    // b0 is backed by shader_set_constants. The first eight floats are the
+    // phase-1 graphics convention: time, width, height, mouse x/y, zoom,
+    // center x/y. This demo animates zoom/center gently; mouse slots are ready
+    // for a future input extension.
+    let ps_hlsl: string = r"""
+cbuffer Constants : register(b0) {
+    float time;
+    float width;
+    float height;
+    float mouse_x;
+    float mouse_y;
+    float zoom;
+    float center_x;
+    float center_y;
+};
+
+float3 palette(float t) {
+    // Inigo Quilez-style cosine palette: deep violet shadows, electric blue,
+    // hot coral, and a gold-white edge around the set.
+    float3 a = float3(0.48, 0.42, 0.52);
+    float3 b = float3(0.52, 0.48, 0.48);
+    float3 c = float3(1.00, 1.00, 1.00);
+    float3 d = float3(0.00, 0.17, 0.42);
+    return a + b * cos(6.2831853 * (c * t + d));
+}
+
+float4 ps_main(float4 pos : SV_Position) : SV_Target {
+    float2 resolution = max(float2(width, height), 1.0.xx);
+    float2 uv = (pos.xy - 0.5 * resolution) / resolution.y;
+    float2 c = float2(center_x, center_y) + uv * zoom;
+
+    float2 z = 0.0.xx;
+    float radius2 = 0.0;
+    int iteration = 0;
+    const int MAX_ITER = 360;
+    [loop]
+    for (iteration = 0; iteration < MAX_ITER; ++iteration) {
+        z = float2(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + c;
+        radius2 = dot(z, z);
+        if (radius2 > 256.0) break;
+    }
+
+    if (iteration == MAX_ITER) {
+        // Not absolute black: a subtle breathing midnight interior lets the
+        // cardioid silhouette feel dimensional without losing contrast.
+        float glow = 0.012 + 0.008 * sin(time * 0.8 + length(c) * 12.0);
+        return float4(glow * float3(0.18, 0.30, 0.52), 1.0);
+    }
+
+    // Continuous iteration count removes banding at the escape boundary.
+    float smooth_i = iteration + 1.0 - log2(log2(max(radius2, 1.00001))) * 0.5;
+    float bands = 0.032 * smooth_i + 0.025 * time;
+    float3 color = palette(bands);
+    float edge = exp(-0.018 * smooth_i);
+    color *= 0.72 + 0.70 * edge;
+    color += 0.08 * float3(0.15, 0.35, 1.0) * sin(smooth_i * 0.32 + time);
+
+    // Gentle vignette keeps attention on the endlessly folding boundary.
+    float vignette = saturate(1.12 - 0.42 * dot(uv, uv));
+    return float4(max(color, 0.0.xxx) * vignette, 1.0);
+}
+""";
+
+    let program: i64 = shader_create(window, vs_hlsl, ps_hlsl);
+    if (program == 0) { window_destroy(window); return 3; }
+
+    let constants: i64 = array_new(4, 8);
+    if (constants == 0) {
+        shader_destroy(program);
+        window_destroy(window);
+        return 4;
+    }
+
+    let mut frame: i64 = 0;
+    let mut running: bool = true;
+    while (running) {
+        running = window_poll_events(window);
+        if (!running || window_should_close(window)) { break; }
+
+        let width: i64 = window_width(window);
+        let height: i64 = window_height(window);
+        let t: f32 = (frame as f32) / 60.0f;
+
+        // A slow cinematic dive toward Seahorse Valley, then a reset before
+        // f32 precision becomes visible. 0.985^900 is about 1.25e-6.
+        let cycle: i64 = frame % 900;
+        let mut zoom: f32 = 2.8f;
+        let mut step: i64 = 0;
+        while (step < cycle) {
+            zoom = zoom * 0.985f;
+            step = step + 1;
+        }
+        let blend: f32 = 1.0f - zoom / 2.8f;
+        let center_x: f32 = -0.5f + (-0.743643887f + 0.5f) * blend;
+        let center_y: f32 = 0.0f + 0.131825904f * blend;
+
+        array_set_f32(constants, 0, t);
+        array_set_f32(constants, 1, width as f32);
+        array_set_f32(constants, 2, height as f32);
+        array_set_f32(constants, 3, 0.0f); // mouse_x (reserved)
+        array_set_f32(constants, 4, 0.0f); // mouse_y (reserved)
+        array_set_f32(constants, 5, zoom);
+        array_set_f32(constants, 6, center_x);
+        array_set_f32(constants, 7, center_y);
+
+        if (!shader_set_constants(program, constants)) { running = false; }
+        if (running && !graphics_clear(window, 0.002f, 0.003f, 0.009f, 1.0f)) { running = false; }
+        if (running && !shader_draw_fullscreen(program)) { running = false; }
+        if (running && !graphics_present(window, 1)) { running = false; }
+        frame = frame + 1;
+    }
+
+    shader_destroy(program);
+    window_destroy(window);
+    return 0;
+}

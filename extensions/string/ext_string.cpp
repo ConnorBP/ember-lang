@@ -253,6 +253,14 @@ const std::string* slot(int64_t handle) {
     return str_slot(handle);
 }
 
+bool copy(int64_t handle, std::string& out) {
+    std::lock_guard<std::mutex> lock(g_store_mutex);
+    const std::string* value = str_slot(handle);
+    if (!value) return false;
+    out = *value;
+    return true;
+}
+
 int64_t alloc(std::string s) {
     std::lock_guard<std::mutex> lock(g_store_mutex);
     return str_new(std::move(s));

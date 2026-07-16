@@ -35,6 +35,14 @@ void reset();
 // an array<u8> handle and need its raw bytes.
 bool get_bytes(int64_t handle, uint8_t** out_data, int64_t* out_len);
 
+// Copy an array<f32> into caller-owned storage while holding the array store
+// lock. Returns false unless the handle's element size is exactly 4, the
+// destination is valid, and the element count is within max_count. This keeps
+// consumers such as the graphics constant-buffer upload from accepting a
+// same-byte-length array<u8> or retaining a pointer across concurrent resize.
+bool copy_f32(int64_t handle, float* out_data, int64_t max_count,
+              int64_t* out_count);
+
 // Allocate a new array<u8> (elem_size=1) handle owning a copy of [data, data+len).
 // Returns a 1-based opaque handle (0 on allocation failure or bad len). Exposed
 // so host-side natives that PRODUCE a byte buffer (e.g. ext_io::file_read_bytes)

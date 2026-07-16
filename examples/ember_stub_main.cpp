@@ -42,6 +42,7 @@
 #include "ext_io.hpp"
 #include "ext_call_raw.hpp"     // self-hosting Stage 4 gap: call_raw(fn_ptr,arg)->i64
 #include "ext_coroutine.hpp"   // #21 coroutines (set_coroutine_dispatch native)
+#include "ext_graphics.hpp"    // Win32 + D3D11 full-screen shader rendering
 
 #include <cstdio>
 #include <cstdint>
@@ -80,6 +81,7 @@ static void register_standard_bindings(
     ext_io::register_natives(natives);
     ext_call_raw::register_natives(natives);
     ext_coroutine::register_natives(natives);
+    ext_graphics::register_natives(natives);
     // Publish overload names into the allowlist (same as the CLI: the .em
     // loader resolves overloads by their sema-resolved fn_name).
     OpOverloadTable overloads;
@@ -264,5 +266,6 @@ int main(int argc, char** argv) {
     int64_t result = ember::call_i64_i64(entry);
     ember::ext_coroutine::coroutine_reset();
     ember::ext_call_raw::reset();
+    ember::ext_graphics::reset();
     return is_void ? 0 : int(result);
 }

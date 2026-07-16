@@ -319,6 +319,20 @@ target_link_libraries(ember_ext_call_raw PUBLIC ember_ext_array)
 # The six bindings are PERM_FFI-gated because scripts supply raw pointers.
 ember_add_extension(audio extensions/audio/ext_audio.cpp)
 
+# Graphics extension: one owner for Win32 windows, D3D11 devices/swap chains,
+# shaders, render targets, and constant buffers. Non-Windows builds publish the
+# identical PERM_FFI-gated signatures through a typed unsupported stub.
+if(WIN32)
+    ember_add_extension(graphics extensions/graphics/ext_graphics.cpp)
+    target_link_libraries(ember_ext_graphics PUBLIC
+        ember_frontend ember_ext_array ember_ext_string
+        d3d11 dxgi d3dcompiler user32 gdi32)
+else()
+    add_library(ember_ext_graphics STATIC extensions/graphics/ext_graphics_stub.cpp)
+    target_include_directories(ember_ext_graphics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/extensions/graphics)
+    target_link_libraries(ember_ext_graphics PUBLIC ember_frontend ember_ext_string)
+endif()
+
 # ---- optional VST3 SDK + Phase 3 Ember gain effect ----
 # The SDK is pinned as thirdparty/vst3sdk (git submodule, v3.8.0_build_66).
 # Keep its samples/GUI/host utilities out of Ember's normal build; only the SDK
@@ -816,7 +830,7 @@ target_link_libraries(ember_cli PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_opt ember_ext_obf ember_ext_map
-    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_audio ember_ext_thread ember_ext_gc)
+    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_audio ember_ext_graphics ember_ext_thread ember_ext_gc)
 
 # Self-hosted compiler stages. Each ember test returns 0 on success and a
 # stage-specific nonzero code on failure. Use absolute source paths so ctest
@@ -843,7 +857,7 @@ target_link_libraries(ember_stub_main PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_map
-    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_gc)
+    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_graphics ember_ext_gc)
 
 # Shared bundler implementation. Both `ember bundle` and ember_bundle.exe call
 # this one implementation, so compile/validation/footer policy cannot drift.
@@ -854,7 +868,7 @@ target_link_libraries(ember_bundler PUBLIC
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_map
-    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_gc)
+    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_graphics ember_ext_gc)
 target_link_libraries(ember_cli PRIVATE ember_bundler)
 
 # Thin compatibility front-end for scripts that invoke ember_bundle directly.

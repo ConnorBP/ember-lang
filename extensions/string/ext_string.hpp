@@ -31,6 +31,11 @@ void reset();
 // the host because it routes through the host print sink).
 const std::string* slot(int64_t handle);
 
+// Copy a handle's content while holding the store lock. Prefer this in native
+// extensions that may run alongside other contexts, because slot()'s borrowed
+// pointer can be invalidated by a concurrent string allocation/reset.
+bool copy(int64_t handle, std::string& out);
+
 // Allocate a new string handle owning `s`, returning a 1-based opaque handle
 // (0 on allocation failure). Exposed so host-side natives that produce a
 // path/id value the script then passes back to another host native (e.g.
