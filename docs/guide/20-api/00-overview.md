@@ -20,9 +20,11 @@ Ember's language core has no implicit operating-system access. Hosts choose whic
 | `io` | console, whole-file, and path operations | [I/O and Debug](10-io-debug.md) |
 | `call_raw` | executable memory, EMBM loading, dispatch/context queries | [`self_hosted/MODULE_IMAGE_FORMAT.md`](../../../self_hosted/MODULE_IMAGE_FORMAT.md) |
 | `audio` | audio block, parameter, transport, and event access | [`docs/VST3_PLUGIN_GUIDE.md`](../../VST3_PLUGIN_GUIDE.md), [`extensions/audio/`](../../../extensions/audio/) |
-| `graphics` | Win32 windows, D3D11 HLSL shaders, full-screen drawing, clear/present | [`docs/spec/GRAPHICS_AND_UI.md`](../../spec/GRAPHICS_AND_UI.md), [`extensions/graphics/`](../../../extensions/graphics/) |
-| `ui` | Dear ImGui windows, custom knob and standard controls, layout, draw-list canvas | [`docs/VST3_PLUGIN_GUIDE.md`](../../VST3_PLUGIN_GUIDE.md), [`extensions/ui/`](../../../extensions/ui/) |
-| `visualize` | waveform, radix-2 FFT spectrum, RMS/peak, and LLM-friendly text export | [`docs/VST3_PLUGIN_GUIDE.md`](../../VST3_PLUGIN_GUIDE.md), [`extensions/visualize/`](../../../extensions/visualize/) |
+| `graphics` | Win32 windows, D3D11 HLSL shaders, full-screen drawing, clear/present | [Graphics, UI Widgets, and Rendering](60-graphics-ui-render.md), [`extensions/graphics/`](../../../extensions/graphics/) |
+| `render` | stub-backed vertex/pixel shaders, layouts, buffers, pipeline binding, draw/clear/present command capture | [Graphics, UI Widgets, and Rendering](60-graphics-ui-render.md), [`extensions/render/`](../../../extensions/render/) |
+| `ui` | Dear ImGui windows, custom knob and standard controls, layout, draw-list canvas | [Graphics, UI Widgets, and Rendering](60-graphics-ui-render.md), [`extensions/ui/`](../../../extensions/ui/) |
+| `ui_widgets` | retained subtab/panel/control tree for host-owned rendering | [Graphics, UI Widgets, and Rendering](60-graphics-ui-render.md), [`extensions/ui_widgets/`](../../../extensions/ui_widgets/) |
+| `visualize` | waveform, radix-2 FFT spectrum, RMS/peak, and LLM-friendly text export | [Graphics, UI Widgets, and Rendering](60-graphics-ui-render.md), [`extensions/visualize/`](../../../extensions/visualize/) |
 | `gc` | managed allocation, deletion, collection, and live-count queries | `docs/spec/MEMORY_AND_GC.md` |
 
 `opt` and `obf` are pass extensions rather than script-native tables. `opt`
@@ -31,15 +33,18 @@ transforms. See `docs/spec/PASS_SYSTEM_DESIGN.md` and `extensions/README.md`.
 
 ## Permission model
 
-A native signature can require permission bits. The I/O, audio, graphics, UI,
-visualization/LLM export, executable/module-loader, and other host-bound
+A native signature can require permission bits. The I/O, audio, graphics,
+render, immediate UI, retained UI widgets, visualization/LLM export,
+executable/module-loader, and other host-bound
 operations use `PERM_FFI`. The CLI grants it with `--ffi`; without it, sema
 rejects the call before code generation. Embedding hosts can provide a narrower
 registration set even when permission is granted.
 
 Graphics is implemented with Win32/D3D11; non-Windows builds expose a typed
-fail-closed stub. UI requires an active Dear ImGui context (the VST3 editor owns
-one); outside a frame its calls safely no-op or return their input values.
+fail-closed stub. Immediate UI requires an active Dear ImGui context (the VST3
+editor owns one); outside a frame its calls safely no-op or return their input
+values. Retained `ui_widgets` and generic `render` are portable data-model/
+command-store extensions and do not render unless a host consumes them.
 Visualization analysis and text export belong on the UI/control thread—the
 VST3 audio thread only publishes a bounded atomic sample snapshot.
 

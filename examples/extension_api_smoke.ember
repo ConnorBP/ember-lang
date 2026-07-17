@@ -1,0 +1,26 @@
+// Smoke coverage for the retained widget and stub render APIs.
+fn main() -> i64 {
+    let subtab = ui_create_subtab(0, "Demo");
+    let panel = ui_panel_add(subtab, "Controls", false);
+    let checked = ui_checkbox(panel, "Enabled", true);
+    let slider = ui_slider_int(panel, "Count", "", 4, 0, 10, 1);
+    if (subtab == 0 || panel == 0 || !ui_widget_get_bool(checked)) { return 1; }
+    if (ui_widget_get_int(slider) != 4) { return 2; }
+
+    let vs = render_create_vertex_shader("float4 main() : SV_Position { return 0; }");
+    let ps = render_create_pixel_shader("float4 main() : SV_Target { return 1; }");
+    let layout = render_create_input_layout("POSITION:0:FLOAT3;COLOR:0:FLOAT4");
+    if (vs == 0 || ps == 0 || layout == 0) { return 3; }
+    if (TOPO_TRIANGLE_LIST != 0 || TOPO_LINE_LIST != 2) { return 4; }
+    render_set_vertex_shader(vs);
+    render_set_pixel_shader(ps);
+    render_set_input_layout(layout);
+    render_clear(0.1f, 0.2f, 0.3f, 1.0f);
+    render_draw(3);
+    render_present();
+    if (render_get_draw_calls() != 1) { return 5; }
+    render_destroy_resource(layout);
+    render_destroy_resource(ps);
+    render_destroy_resource(vs);
+    return 0;
+}

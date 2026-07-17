@@ -10,6 +10,8 @@ link/register them and grant `PERM_FFI` before a script can call them.
 |---|---|---|
 | Graphics extension | `extensions/graphics/` | Win32 + D3D11 implementation; typed fail-closed stub elsewhere |
 | ImGui extension | `extensions/ui/` | Dear ImGui context owned by a host such as the Windows VST3 editor |
+| Retained widget extension | `extensions/ui_widgets/` | Portable widget-tree model; rendering owned by the host |
+| Generic render extension | `extensions/render/` | Portable stub store plus optional host backend |
 | Visualization/export extension | `extensions/visualize/` | Portable analysis over a host-published atomic snapshot |
 | VST3 editor | `examples/vst3_wrapper/vst3_ember_editor.{h,cpp}` | Windows `IPlugView`, child `HWND`, D3D11, ImGui Win32/DX11 |
 | ImGui fork | `thirdparty/imgui/` | [`ConnorBP/ember-imgui`](https://github.com/ConnorBP/ember-imgui), Dear ImGui v1.91.9b |
@@ -235,7 +237,56 @@ edit by assigning the result to their own state.
 Canvas state is thread-local but singular. Nested canvases are unsupported.
 Drawing outside an active canvas no-ops.
 
-## 6. Visualization extension
+## 6. Retained widget-tree extension
+
+`ui_widgets` ports Prism's `Widget`/store pattern without carrying its renderer.
+Opaque one-based handles identify Subtab, Panel, Checkbox, Keybind, SliderInt,
+SliderDouble, SingleSelect, MultiSelect, RangeInt, RangeDouble, ColorPicker,
+and Input records. Records retain labels, units, values, limits/steps, options,
+selection state, colors, parent/child links, keybind mode, and pressed state.
+
+Every script native is `PERM_FFI`-gated. String arguments are Ember `string`
+handles. `ui_make_options` copies an `array<i64>` of string handles into a
+separate immutable option list and returns a high-range tagged handle, avoiding
+collisions with the independent array store; selection constructors also accept the source
+array directly. C++ hosts use `get_widget`, `roots`, and the `set_*` hooks in
+`ext_ui_widgets.hpp`; returned widgets are snapshots, not borrowed pointers.
+`reset()` clears widgets and options and is idempotent.
+
+The immediate `ui` and retained `ui_widgets` surfaces both contain
+`ui_checkbox` and `ui_slider_int` with different signatures. Registration maps
+are name-keyed, so hosts must choose one model or deliberately order
+registrations. The stock CLI/bundler registers `ui_widgets` after `ui`; the
+VST3 wrapper registers immediate `ui` only.
+
+## 7. Generic shader/render extension
+
+`render` is a backend-neutral command/data store. Creation calls copy HLSL,
+layout descriptors, `array<f32>` vertex/constant data, and four-byte index data
+into `Resource` records. Handles select resources; no raw GPU pointer crosses
+the script boundary. Constant-buffer sizes are positive, capped, and rounded
+to 16 bytes; uploads cannot exceed the allocated size. Set calls validate the
+resource kind, slot indices are limited to 0..63, destroy unbinds a resource,
+and negative draw counts are ignored.
+
+`ShaderStore` records the active vertex/pixel shader, input layout, vertex and
+index buffers, constant-buffer slots, clear color, and draw/indexed/clear/
+present counters. With no backend this is the complete deterministic stub.
+A host may install a non-owning `RenderBackend` to receive copied resource
+snapshots and state/draw/clear/present callbacks; callbacks occur after the
+store mutex is released.
+
+Source hosts call `inject_constants(program)` before sema to publish
+`TOPO_TRIANGLE_LIST`, `TOPO_TRIANGLE_STRIP`, `TOPO_LINE_LIST`,
+`TOPO_LINE_STRIP`, and `TOPO_POINT_LIST` as synthetic `global const i32`
+values. `.em` files preserve those values in their serialized globals, so load
+hosts only need the native registrations. `reset()` clears resources, bindings,
+and counters while retaining the installed backend pointer.
+
+The complete native tables are listed in the
+[script-facing API page](../guide/20-api/60-graphics-ui-render.md).
+
+## 8. Visualization extension
 
 ### 6.1 Audio-thread publication
 
@@ -268,7 +319,7 @@ new publication is in progress, but never race on non-atomic sample storage.
 The returned arrays are host-backed `ext_array` handles. Analysis allocates and
 must not be called from `@realtime` DSP.
 
-## 7. LLM-friendly export API
+## 9. LLM-friendly export API
 
 `set_parameter_metadata` is the C++ host input: a parameter-value snapshot,
 minimums, maximums, names, count, and source hash. The current wrapper seeds
@@ -295,7 +346,7 @@ it performs full JSON escaping for arbitrary parameter names/hashes. Export is
 a transport aid: Ember does not bundle an LLM client, send data, parse model
 responses, or mutate parameters automatically.
 
-## 8. Demo plugin
+## 10. Demo plugin
 
 `examples/vst3_wrapper/demo_ui_vst.ember` demonstrates the integrated path:
 

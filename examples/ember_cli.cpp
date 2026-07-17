@@ -78,6 +78,8 @@
 #include "ext_visualize.hpp"    // audio analysis and compact LLM exports
 #include "ext_ui.hpp"           // ImGui bindings (no-op without an editor frame)
 #include "ext_graphics.hpp"     // Win32 + D3D11 full-screen shader rendering
+#include "ext_ui_widgets.hpp"   // retained host-rendered widget tree
+#include "ext_render.hpp"       // stub-backed generic shader/render command API
 #include "ext_gc.hpp"          // tracing GC runtime: lambda env heap management (#20)
 #include "../src/ember_pass.hpp"       // Stage C: EmberPassManager
 #include "../src/ember_pass_registry.hpp" // Stage C: EmberPassRegistry
@@ -241,6 +243,8 @@ static void register_standard_bindings(
     ember::ext_visualize::register_natives(natives);
     ember::ext_ui::register_natives(natives);
     ember::ext_graphics::register_natives(natives);
+    ember::ext_ui_widgets::register_natives(natives);
+    ember::ext_render::register_natives(natives);
     ember::ext_thread::register_natives(natives);
     ember::ext_gc::register_natives(natives);   // __ember_gc_alloc_env/collect/live (lambda env heap)
     OpOverloadTable overloads;
@@ -449,6 +453,8 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
         ember::ext_thread::thread_reset();
         ember::ext_call_raw::reset();  // stateless (no-op), for symmetry
         ember::ext_graphics::reset();
+        ember::ext_ui_widgets::reset();
+        ember::ext_render::reset();
         ember::ext_gc::gc_reset();     // clear the GC heap + roots (lambda envs)
         // ext_math is stateless (no reset()).
     };
@@ -493,6 +499,9 @@ static RunResult run_ember_file(const std::string& file, const RunOptions& opts)
     if (pr.program.funcs.empty()) {
         std::fprintf(stderr, "ember: no functions in '%s'\n", file.c_str()); do_cleanup(); return {2};
     }
+    // Render topology names are host-provided global constants, matching the
+    // Prism API. Inject before sema/layout so source can use TOPO_* directly.
+    ember::ext_render::inject_constants(pr.program);
 
     // ---- parse-only mode: `ember test` parse-only classification ----
     // Stop after parse (no sema, no codegen). Return 0 (OK) if we got here
@@ -1306,6 +1315,7 @@ static std::unique_ptr<CompiledScript> compile_script(
     auto pr = parse(std::move(lr.toks));
     if (!pr.ok) { err = "parse error: " + pr.error; return nullptr; }
     if (pr.program.funcs.empty()) { err = "no functions in " + file_path; return nullptr; }
+    ember::ext_render::inject_constants(pr.program);
     cs->prog = std::move(pr.program);
 
     std::unordered_map<std::string, int> slots;
@@ -1930,9 +1940,9 @@ int main(int argc, char** argv) {
         register_standard_bindings(load_natives);
         LoadedModule loaded; std::string lerr;
         EmLoadPolicy em_policy{ffi_mode ? PERM_FFI : 0u, true};
-        if(!load_em_file(load_em_path.c_str(),loaded,&lerr,nullptr,&load_natives,nullptr,&em_policy)){std::fprintf(stderr,"ember: load failed: %s\n",lerr.c_str());ember::ext_graphics::reset();return 2;}
+        if(!load_em_file(load_em_path.c_str(),loaded,&lerr,nullptr,&load_natives,nullptr,&em_policy)){std::fprintf(stderr,"ember: load failed: %s\n",lerr.c_str());ember::ext_graphics::reset();ember::ext_ui_widgets::reset();ember::ext_render::reset();return 2;}
         void* entry=loaded.entry_by_name(fn_name.c_str()); if(!entry)entry=loaded.entry();
-        if(!entry){std::fprintf(stderr,"ember: loaded entry '%s' not found\n",fn_name.c_str());ember::ext_graphics::reset();return 2;}
+        if(!entry){std::fprintf(stderr,"ember: loaded entry '%s' not found\n",fn_name.c_str());ember::ext_graphics::reset();ember::ext_ui_widgets::reset();ember::ext_render::reset();return 2;}
         uint32_t selected_slot=loaded.entry_slot;
         for(const auto& item:loaded.name_table)if(item.first==fn_name){selected_slot=item.second;break;}
         bool is_void=selected_slot<loaded.signatures_by_slot.size()&&loaded.signatures_by_slot[selected_slot].ret.is_void();
@@ -1954,6 +1964,8 @@ int main(int argc, char** argv) {
             // We arrived here via a trap longjmp — recoverable exit.
             std::fprintf(stderr, "ember: loaded .em trapped: %s\n", ectx.last_error.c_str());
             ember::ext_graphics::reset();
+            ember::ext_ui_widgets::reset();
+            ember::ext_render::reset();
             return 70;
         }
         safety::check_memory_limit();  // pre-flight RSS check before executing untrusted .em
@@ -1961,6 +1973,8 @@ int main(int argc, char** argv) {
             ? ember::ember_call_void(entry, &ectx)
             : ember::ember_call_i64(entry, &ectx, 0);
         ember::ext_graphics::reset();
+        ember::ext_ui_widgets::reset();
+        ember::ext_render::reset();
         return is_void ? 0 : int(result);
     }
 

@@ -24,6 +24,7 @@ This guide describes the current language and the extensions shipped by this rep
 - [Strings](20-api/30-strings.md) — conversion, concatenation, search, substring, and formatting
 - [Math and Vectors](20-api/40-math-vectors.md) — scalar math and `vec2`/`vec3`/`vec4`/`quat`/`mat4`
 - [Arrays](20-api/50-arrays.md) — dynamically sized host-owned arrays
+- [Graphics, UI Widgets, and Rendering](20-api/60-graphics-ui-render.md) — D3D11 graphics, immediate and retained UI, generic render commands, and visualization
 
 The repository also ships map, synchronization, threading, coroutine, lifecycle, GC, audio, raw-call/module-loader, optimization-pass, and obfuscation-pass extensions. They are inventoried in the [API Overview](20-api/00-overview.md); their specialist references live under `docs/` and `extensions/`.
 

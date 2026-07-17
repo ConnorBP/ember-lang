@@ -7,7 +7,7 @@ This page uses the standalone CLI built by this repository. Commands are shown f
 A typical Windows build is:
 
 ```console
-cmake -S . -B build -G Ninja
+cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
 cmake --build build
 ```
 
@@ -80,9 +80,28 @@ build\ember_cli.exe run hello.ember --fn main --ffi --profile balanced
 
 An `.em` module records its required native bindings and permissions. The load host must register compatible natives and grant the required permissions.
 
+## Graphics, shaders, UI, and visualization
+
+The standard extension set includes Win32/D3D11 windows and runtime HLSL,
+a stub-backed generic shader/render command API, retained host-rendered widget
+trees, Dear ImGui controls for host-owned frames, and audio waveform/FFT/RMS/
+peak analysis. These host-bound calls require `--ffi`.
+
+Run the full-screen D3D11 Mandelbrot example on Windows with:
+
+```console
+build\ember_cli.exe run examples\mandelbrot_shader.ember --fn main --ffi
+```
+
+The generic `render` extension can instead record shaders, buffers, bindings,
+draws, clears, and presents without creating a D3D device; an embedding host
+may attach a real backend. The retained `ui_widgets` extension similarly builds
+a widget tree without drawing it. See [Graphics, UI Widgets, and Rendering](20-api/60-graphics-ui-render.md)
+and the [graphics/UI specification](../spec/GRAPHICS_AND_UI.md).
+
 ## Self-hosted compiler
 
-The Ember-written compiler can compile and run a source path through one stage:
+Self-hosting is complete. The Ember-written compiler can compile and run a source path through one stage:
 
 ```console
 echo tests/lang/valid_try_catch.ember | build/ember_cli.exe run self_hosted/correctness_tests/file_pipeline_runner.ember --fn run_file --ffi
@@ -100,4 +119,7 @@ Both commands return `42` for that test. See [`self_hosted/README.md`](../../sel
 
 - [Types](10-language/10-types.md)
 - [Declarations](10-language/20-declarations.md)
+- [API overview](20-api/00-overview.md)
+- [Graphics, UI Widgets, and Rendering](20-api/60-graphics-ui-render.md)
+- [VST3 plugin guide](../VST3_PLUGIN_GUIDE.md)
 - [Fibonacci example](30-examples/10-fibonacci.md)

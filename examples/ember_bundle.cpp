@@ -60,6 +60,8 @@ int main(int argc, char** argv) { return ember_bundle::command(argc, argv); }
 #include "ext_call_raw.hpp"     // self-hosting Stage 4 gap: call_raw(fn_ptr,arg)->i64
 #include "ext_coroutine.hpp"   // #21 coroutines (set_coroutine_dispatch native)
 #include "ext_graphics.hpp"    // Win32 + D3D11 full-screen shader rendering
+#include "ext_ui_widgets.hpp"  // retained host-rendered widget tree
+#include "ext_render.hpp"      // stub-backed generic shader/render command API
 
 #include <cstdio>
 #include <cstdint>
@@ -105,6 +107,8 @@ static void register_standard_bindings(
     ext_call_raw::register_natives(natives);
     ext_coroutine::register_natives(natives);
     ext_graphics::register_natives(natives);
+    ext_ui_widgets::register_natives(natives);
+    ext_render::register_natives(natives);
     OpOverloadTable overloads;
     ext_vec::register_overloads(overloads); ext_quat::register_overloads(overloads);
     ext_mat::register_overloads(overloads); ext_string::register_overloads(overloads);
@@ -336,6 +340,7 @@ static bool compile_to_em_module(const fs::path& file,
         err_out = "ember_bundle: no functions in '" + file.u8string() + "'";
         return false;
     }
+    ext_render::inject_constants(pr.program);
     if (!add_globals_init(pr.program, err_out)) return false;
 
     // ---- slot assignment ----
@@ -599,6 +604,8 @@ int command(int argc, char** argv) {
     ember::ext_sync::reset(); ember::ext_lifecycle::reset();
     ember::ext_io::reset();
     ember::ext_graphics::reset();
+    ember::ext_ui_widgets::reset();
+    ember::ext_render::reset();
 
     std::error_code ec;
     // Validate all sizes before creating/replacing the output. Besides making

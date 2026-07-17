@@ -43,6 +43,16 @@ bool get_bytes(int64_t handle, uint8_t** out_data, int64_t* out_len);
 bool copy_f32(int64_t handle, float* out_data, int64_t max_count,
               int64_t* out_count);
 
+// Copy four-byte or eight-byte array elements into caller-owned storage while
+// holding the store lock. Ember's host array handles retain element width, not
+// a nominal i32/f32 tag, so copy_i32 accepts a four-byte array and copy_i64 an
+// eight-byte array. These accessors are used by data-model/render extensions
+// that must not retain a pointer across a concurrent array resize.
+bool copy_i32(int64_t handle, int32_t* out_data, int64_t max_count,
+              int64_t* out_count);
+bool copy_i64(int64_t handle, int64_t* out_data, int64_t max_count,
+              int64_t* out_count);
+
 // Allocate a new array<u8> (elem_size=1) handle owning a copy of [data, data+len).
 // Returns a 1-based opaque handle (0 on allocation failure or bad len). Exposed
 // so host-side natives that PRODUCE a byte buffer (e.g. ext_io::file_read_bytes)

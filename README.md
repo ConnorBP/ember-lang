@@ -15,7 +15,7 @@ self-hosting, and has not received a new release version yet.
 
 **Current verification:**
 
-- **94 CTest tests are configured and the reported current run is 94/94** in
+- **95 CTest tests are configured and the reported current run is 95/95** in
   the supported MinGW configuration.
 - **The reported self-hosted parity run is 188/188**: 0 unsupported, 0
   mismatches, and 0 hangs.
@@ -63,18 +63,22 @@ self-hosting, and has not received a new release version yet.
   modules, and keyed-dispatch v6 artifacts. See
   [`docs/BUNDLING_AND_EM_MODULES.md`](docs/BUNDLING_AND_EM_MODULES.md).
 - A standalone executable bundler (`ember bundle` and `ember_bundle`).
-- **20 extension libraries:** 18 native/addon extensions plus the optimization
-  and obfuscation pass packages. The native set now includes Win32/D3D11
-  graphics, Dear ImGui UI bindings, and audio visualization/LLM export. See
+- **22 extension libraries:** 20 native/addon extensions plus the optimization
+  and obfuscation pass packages. The native set includes Win32/D3D11 graphics,
+  a stub-backed generic shader/render command API, retained host-rendered UI
+  widget trees, Dear ImGui bindings, and audio visualization/LLM export. See
   [`extensions/README.md`](extensions/README.md).
 - Concurrent script entry with per-call contexts and a shared, cooperatively
   collected GC heap.
 - A Windows graphics extension for Win32 window management, runtime HLSL
-  compilation, D3D11 full-screen shader drawing, clear, and present. The
+  compilation, D3D11 full-screen shader drawing, clear, and present, plus a
+  portable stub-backed render extension for vertex/pixel shaders, input
+  layouts, vertex/index/constant buffers, pipeline state, and draw capture. The
   animated [`examples/mandelbrot_shader.ember`](examples/mandelbrot_shader.ember)
   demo renders without a vertex buffer by using `SV_VertexID`.
 - VST3 wrapper with a raw-HWND Dear ImGui editor, script-defined `on_ui()`
-  frames, custom neon knobs, waveform/spectrum/meters, LLM-friendly audio-state
+  frames, custom neon knobs, retained host-rendered widget trees,
+  waveform/spectrum/meters, LLM-friendly audio-state
   export, 14 example plugin scripts, realtime validation/stress tests, hot
   reload, and an editor-side node-graph model with JSON persistence and
   deterministic Ember source generation.
@@ -171,7 +175,7 @@ cmake --build buildt -j 8
 ctest --test-dir buildt --output-on-failure
 ```
 
-A fully configured current tree contains **94 tests**. Optional dependency or
+A fully configured current tree contains **95 tests**. Optional dependency or
 platform conditions can change the configured count; use `ctest --test-dir
 buildt -N` to inspect the local inventory.
 

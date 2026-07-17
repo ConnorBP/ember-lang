@@ -1,6 +1,6 @@
 # Ember extensions
 
-Ember currently ships **20 extension libraries**: 18 native/addon extensions and
+Ember currently ships **22 extension libraries**: 20 native/addon extensions and
 2 ThinIR pass extensions. Extensions are host-side registration units; they do
 not add grammar. Native extensions register `NativeSig` entries (and sometimes
 operator overloads), while pass extensions register `ThinFunction` transforms.
@@ -26,13 +26,15 @@ operator overloads), while pass extensions register `ThinFunction` transforms.
 | `audio/` / `ember_ext_audio` | native | typed `AudioContext`, parameter/event access, f32/f64 sample I/O, and raw typed buffer helpers; all calls are `PERM_FFI`-gated |
 | `graphics/` / `ember_ext_graphics` | native | Win32 windows, D3D11 swap chains, runtime HLSL compilation, full-screen shader drawing, clear/present/error reporting; all calls are `PERM_FFI`-gated; non-Windows uses a fail-closed stub |
 | `ui/` / `ember_ext_ui` | native | Dear ImGui windows, custom knobs, controls/layout helpers, and clipped canvas primitives; all calls are `PERM_FFI`-gated; calls no-op when no ImGui frame is active |
+| `ui_widgets/` / `ember_ext_ui_widgets` | native | retained Subtab/Panel/control widget tree and host inspection/mutation hooks; data model only, with all script calls `PERM_FFI`-gated |
+| `render/` / `ember_ext_render` | native | stub-backed vertex/pixel shaders, input layouts, vertex/index/constant buffers, binding state, draw counters, clear/present, optional host backend, and injected `TOPO_*` constants; all calls are `PERM_FFI`-gated |
 | `visualize/` / `ember_ext_visualize` | native | lock-free audio snapshots, radix-2 FFT spectrum, waveform/RMS/peak analysis, and LLM-friendly text export; all calls are `PERM_FFI`-gated |
 | `opt/` / `ember_ext_opt` | pass | **18 optimization passes** (listed below) |
 | `obf/` / `ember_ext_obf` | pass | **7 obfuscation passes** (listed below) |
 
-The native/addon count is 18: vec, quat, mat, string, array, math, map, sync,
-thread, coroutine, lifecycle, io, call_raw, gc, audio, graphics, ui, and
-visualize. `opt` and `obf` are extension libraries too, but they use
+The native/addon count is 20: vec, quat, mat, string, array, math, map, sync,
+thread, coroutine, lifecycle, io, call_raw, gc, audio, graphics, ui,
+ui_widgets, render, and visualize. `opt` and `obf` are extension libraries too, but they use
 `register_passes`, not `register_natives`.
 
 ## Pass inventory (25 registered names)
@@ -116,6 +118,20 @@ This permits CLI/bundle validation of scripts that also define VST3 UI code.
 balanced and canvases are not nested. The implementation uses the custom
 `ember-imgui` v1.91.9b fork described in the top-level README.
 
+## Retained widget and generic render APIs
+
+`ui_widgets/` and `render/` are portable, stub/data-model extensions. The
+former creates a retained widget tree for host rendering; the latter copies
+shader source and typed array data into a `ShaderStore`, validates resource
+bindings, counts draw calls, and optionally forwards snapshots/commands to a
+host `RenderBackend`. They perform no D3D11 work themselves.
+
+The complete signatures, topology constants, registration collision note for
+the immediate and retained `ui_checkbox`/`ui_slider_int` names, and backend
+contract are documented in
+[`60-graphics-ui-render.md`](../docs/guide/20-api/60-graphics-ui-render.md) and
+[`GRAPHICS_AND_UI.md`](../docs/spec/GRAPHICS_AND_UI.md).
+
 ## Visualization and LLM export API (`visualize/`)
 
 The VST3 processor publishes at most 2048 recent mono-mixed output samples
@@ -166,6 +182,8 @@ ember::ext_gc::register_natives(natives);
 ember::ext_audio::register_natives(natives);
 ember::ext_graphics::register_natives(natives);
 ember::ext_ui::register_natives(natives);
+ember::ext_ui_widgets::register_natives(natives);
+ember::ext_render::register_natives(natives);
 ember::ext_visualize::register_natives(natives);
 ```
 
@@ -182,7 +200,7 @@ public `ext_*.hpp` files before exposing them. In particular:
   relocations are loaded.
 
 A host can omit any capability simply by not linking/registering it. `io`,
-`audio`, `graphics`, `ui`, `visualize`, and raw/module operations in `call_raw`
+`audio`, `graphics`, `ui`, `ui_widgets`, `render`, `visualize`, and raw/module operations in `call_raw`
 additionally require the `PERM_FFI` permission at sema time.
 
 Pass registration is separate:
@@ -199,7 +217,7 @@ authoring guide.
 ## Build integration
 
 The root `CMakeLists.txt` defines every `ember_ext_*` library. The stock
-`ember_cli` links and registers all 18 native/addon extensions and both pass
+`ember_cli` links and registers all 20 native/addon extensions and both pass
 extensions on Windows. `ember_ext_ui` is an interface/no-op build target on
 non-Windows, while graphics provides its typed unsupported stub. The standalone
 bundle/stub intentionally expose a smaller runtime surface than the CLI; do not

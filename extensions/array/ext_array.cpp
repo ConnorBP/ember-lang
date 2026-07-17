@@ -277,18 +277,34 @@ bool get_bytes(int64_t handle, uint8_t** out_data, int64_t* out_len) {
     return true;
 }
 
-bool copy_f32(int64_t handle, float* out_data, int64_t max_count,
-              int64_t* out_count) {
+template <typename T>
+static bool copy_typed(int64_t handle, T* out_data, int64_t max_count,
+                       int64_t* out_count) {
     std::lock_guard<std::mutex> lock(g_store_mutex);
     auto* s = arr_slot(handle);
-    if (!s || s->elem_size != int64_t(sizeof(float)) || max_count < 0 ||
+    if (!s || s->elem_size != int64_t(sizeof(T)) || max_count < 0 ||
         !out_count || (!out_data && !s->bytes.empty()))
         return false;
-    const int64_t count = int64_t(s->bytes.size() / sizeof(float));
+    const int64_t count = int64_t(s->bytes.size() / sizeof(T));
     if (count > max_count) return false;
     if (!s->bytes.empty()) std::memcpy(out_data, s->bytes.data(), s->bytes.size());
     *out_count = count;
     return true;
+}
+
+bool copy_f32(int64_t handle, float* out_data, int64_t max_count,
+              int64_t* out_count) {
+    return copy_typed(handle, out_data, max_count, out_count);
+}
+
+bool copy_i32(int64_t handle, int32_t* out_data, int64_t max_count,
+              int64_t* out_count) {
+    return copy_typed(handle, out_data, max_count, out_count);
+}
+
+bool copy_i64(int64_t handle, int64_t* out_data, int64_t max_count,
+              int64_t* out_count) {
+    return copy_typed(handle, out_data, max_count, out_count);
 }
 
 // Host-side alloc: mint an array<u8> handle owning a copy of [data, data+len).

@@ -320,6 +320,13 @@ target_link_libraries(ember_ext_call_raw PUBLIC ember_ext_array)
 ember_add_extension(audio extensions/audio/ext_audio.cpp)
 ember_add_extension(visualize extensions/visualize/ext_visualize.cpp)
 target_link_libraries(ember_ext_visualize PUBLIC ember_ext_array ember_ext_string)
+# Retained widget-tree model and stub-backed generic render command store.
+# Both are portable, PERM_FFI-gated extensions; hosts may inspect their C++
+# stores or install a render backend without changing the script ABI.
+ember_add_extension(ui_widgets extensions/ui_widgets/ext_ui_widgets.cpp)
+target_link_libraries(ember_ext_ui_widgets PUBLIC ember_ext_array ember_ext_string)
+ember_add_extension(render extensions/render/ext_render.cpp)
+target_link_libraries(ember_ext_render PUBLIC ember_ext_array ember_ext_string)
 
 # Dear ImGui core + Win32/D3D11 backend. The UI extension is available to the
 # CLI/stub for validation; calls no-op unless a VST editor owns an active frame.
@@ -627,6 +634,13 @@ target_link_libraries(ext_registration_test PRIVATE
     ember_ext_sync ember_ext_lifecycle ember ember_frontend)
 add_test(NAME ext_registration COMMAND ext_registration_test)
 
+# Retained widget-tree and generic render-store registration/runtime coverage.
+add_executable(ext_ui_render_test examples/ext_ui_render_test.cpp)
+target_link_libraries(ext_ui_render_test PRIVATE
+    ember_ext_ui_widgets ember_ext_render ember_ext_array ember_ext_string
+    ember ember_frontend)
+add_test(NAME ext_ui_render COMMAND ext_ui_render_test)
+
 # v0.4 hardening regression: pins the red-team V5 (W^X JIT memory) and
 # V6 (per-frame byte budget + int32 struct-sizing overflow) mitigations.
 # Self-contained (inlined payloads + a VirtualQuery W^X probe). Links the
@@ -853,7 +867,7 @@ target_link_libraries(ember_cli PRIVATE
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_opt ember_ext_obf ember_ext_map
-    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_audio ember_ext_visualize ember_ext_ui ember_ext_graphics ember_ext_thread ember_ext_gc)
+    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_audio ember_ext_visualize ember_ext_ui ember_ext_graphics ember_ext_ui_widgets ember_ext_render ember_ext_thread ember_ext_gc)
 
 # Self-hosted compiler stages. Each ember test returns 0 on success and a
 # stage-specific nonzero code on failure. Use absolute source paths so ctest
@@ -881,7 +895,7 @@ target_link_libraries(ember_stub_main PRIVATE
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_map
     ember_ext_io ember_ext_coroutine ember_ext_call_raw
-    ember_ext_visualize ember_ext_ui ember_ext_graphics ember_ext_gc)
+    ember_ext_visualize ember_ext_ui ember_ext_graphics ember_ext_ui_widgets ember_ext_render ember_ext_gc)
 
 # Shared bundler implementation. Both `ember bundle` and ember_bundle.exe call
 # this one implementation, so compile/validation/footer policy cannot drift.
@@ -892,7 +906,7 @@ target_link_libraries(ember_bundler PUBLIC
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math
     ember_ext_sync ember_ext_lifecycle ember_ext_map
-    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_graphics ember_ext_gc)
+    ember_ext_io ember_ext_coroutine ember_ext_call_raw ember_ext_graphics ember_ext_ui_widgets ember_ext_render ember_ext_gc)
 target_link_libraries(ember_cli PRIVATE ember_bundler)
 
 # Thin compatibility front-end for scripts that invoke ember_bundle directly.

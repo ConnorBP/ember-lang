@@ -10,7 +10,7 @@ authority for current status.
 - **Latest tagged release:** v1.3.0 (2026-07-14).
 - **Current branch:** `self-hosting-completion`, post-v1.3.0 and not yet
   version-bumped.
-- **CTest:** 94/94 in a fresh supported MinGW configuration.
+- **CTest:** 95/95 in a fresh supported MinGW configuration.
 - **Self-hosted parity:** 188/188, with 0 unsupported, 0 mismatches, and 0
   hangs.
 - **Coverage:** approximately 85%+ in the current coverage campaign.
@@ -121,6 +121,19 @@ the same API through a fail-closed unsupported stub.
 HLSL at runtime and animates a full-screen Mandelbrot zoom with an eight-float
 constant block.
 
+### Retained UI widgets and generic shader/render API
+
+**Status: complete.** `extensions/ui_widgets/` ports Prism's retained widget
+model: scripts build subtabs, panels, checkboxes, keybinds, integer/double
+sliders and ranges, single/multi selections, color pickers, and text inputs.
+The extension retains hierarchy, options, values, and pressed state while a
+host owns presentation. `extensions/render/` ports the stub-backed
+`ShaderStore` pattern for vertex/pixel shaders, input layouts, vertex/index/
+constant buffers, pipeline binding, draw accounting, clear, and present.
+`TOPO_*` values are injected as `global const i32`; hosts can install a real
+backend behind the unchanged command API. Both extensions are portable and
+`PERM_FFI`-gated.
+
 ### Audio visualization and LLM export
 
 **Status: complete.** `extensions/visualize/` publishes up to 2048 recent output
@@ -132,7 +145,7 @@ parameters.
 
 ### Test and coverage expansion
 
-**Status: shipped.** The current 94-test configuration adds direct coverage for
+**Status: shipped.** The current 95-test configuration adds direct coverage for
 low-level runtime helpers, extensions, the tree-walking code generator, ThinIR
 lowering/emission, optimization passes, pass factories, EMBM loading, node
 graphs, and keyed hot reload. The parity suite is a separate 188-case
@@ -291,7 +304,7 @@ observation, epoch-safe retirement, and failure atomicity.
 - [ ] Re-evaluate making an optimized pipeline the default only after it is
   value-equivalent and non-regressing on every supported path.
 
-Acceptance: 94/94 CTest, 188/188 self-host parity, no benchmark correctness
+Acceptance: 95/95 CTest, 188/188 self-host parity, no benchmark correctness
 mismatches, and measured wins rather than pass-count growth.
 
 ### 4. Platform ports
@@ -389,6 +402,7 @@ Remaining optional expansions:
 - VST3 node-graph model/source generation
 - Win32/D3D11 graphics extension and Mandelbrot shader demo
 - custom `ember-imgui` v1.91.9b fork with neon widgets/theme and Win32/DX11 backends
+- retained UI widget-tree extension and stub-backed generic shader/render API
 - direct-`IPlugView` ImGui VST3 editor with script `on_ui()` rendering
 - realtime-safe audio visualization and LLM-friendly state export
-- test inventory expanded to 94 passing CTest tests
+- test inventory expanded to 95 passing CTest tests

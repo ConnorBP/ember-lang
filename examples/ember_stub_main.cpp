@@ -43,6 +43,8 @@
 #include "ext_call_raw.hpp"     // self-hosting Stage 4 gap: call_raw(fn_ptr,arg)->i64
 #include "ext_coroutine.hpp"   // #21 coroutines (set_coroutine_dispatch native)
 #include "ext_graphics.hpp"    // Win32 + D3D11 full-screen shader rendering
+#include "ext_ui_widgets.hpp"  // retained host-rendered widget tree
+#include "ext_render.hpp"      // stub-backed generic shader/render command API
 #include "ext_visualize.hpp"   // audio analysis and compact LLM exports
 #include "ext_ui.hpp"          // ImGui bindings (no-op without an editor frame)
 
@@ -86,6 +88,8 @@ static void register_standard_bindings(
     ext_visualize::register_natives(natives);
     ext_ui::register_natives(natives);
     ext_graphics::register_natives(natives);
+    ext_ui_widgets::register_natives(natives);
+    ext_render::register_natives(natives);
     // Publish overload names into the allowlist (same as the CLI: the .em
     // loader resolves overloads by their sema-resolved fn_name).
     OpOverloadTable overloads;
@@ -271,5 +275,7 @@ int main(int argc, char** argv) {
     ember::ext_coroutine::coroutine_reset();
     ember::ext_call_raw::reset();
     ember::ext_graphics::reset();
+    ember::ext_ui_widgets::reset();
+    ember::ext_render::reset();
     return is_void ? 0 : int(result);
 }

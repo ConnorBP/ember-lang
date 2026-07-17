@@ -181,6 +181,15 @@ fn on_ui() -> void {
 }
 ```
 
+For hosts that do not want scripts to submit ImGui every frame, Ember also
+ships `extensions/ui_widgets/`. It builds a retained tree of subtabs, panels,
+checkboxes, keybinds, integer/double sliders and ranges, selection controls,
+color pickers, and inputs. The VST3 wrapper currently registers the immediate
+`ui` API for `on_ui()`; a custom wrapper may register `ui_widgets` instead and
+render the resulting tree through its own ImGui/DAW control layer. The two
+surfaces share `ui_checkbox` and `ui_slider_int` names, so a host deliberately
+chooses registration order rather than exposing ambiguous signatures.
+
 Script globals used by DSP must still obey the plugin's cross-thread state
 contract. The lock-free guarantee described below applies to visualization
 sample publication; do not add locks, allocation, formatting, or other
