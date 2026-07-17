@@ -31,6 +31,9 @@
 #include "ext_math.hpp"
 #include "ext_sync.hpp"
 #include "ext_lifecycle.hpp"
+// Documentation example compiled into this already-registered smoke target so
+// the example stays build-tested without adding non-.cpp CMake changes.
+#include "ext_random.cpp"
 #include "ast.hpp"
 #include "sema.hpp"
 #include <cstdio>
@@ -59,6 +62,7 @@ int main() {
     ext_math::register_natives(m);
     ext_sync::register_natives(m);
     ext_lifecycle::register_natives(m);
+    ext_random::register_natives(m);
 
     auto has = [&](const char* n) -> bool { return m.find(n) != m.end(); };
     auto arity = [&](const char* n) -> size_t { auto it = m.find(n); return it == m.end() ? size_t(-1) : it->second.params.size(); };
@@ -70,6 +74,19 @@ int main() {
     check(has("sin")  && arity("sin")==1  && ret_prim("sin")==Prim::F32,  "math: sin registered f32->f32");
     check(has("cos")  && arity("cos")==1  && ret_prim("cos")==Prim::F32,  "math: cos registered f32->f32");
     check(has("tan")  && arity("tan")==1  && ret_prim("tan")==Prim::F32,  "math: tan registered f32->f32");
+
+    // Developer-guide random extension: registration, ABI, deterministic reset.
+    check(has("random_next") && arity("random_next") == 1 &&
+          has("random_seed") && arity("random_seed") == 1 &&
+          has("random_float") && arity("random_float") == 0,
+          "random example: three natives registered");
+    auto random_seed = reinterpret_cast<void(*)(int64_t)>(m.at("random_seed").fn_ptr);
+    auto random_next = reinterpret_cast<int64_t(*)(int64_t)>(m.at("random_next").fn_ptr);
+    auto random_float = reinterpret_cast<float(*)()>(m.at("random_float").fn_ptr);
+    random_seed(12345); int64_t random_first = random_next(1000); float random_unit = random_float();
+    random_seed(12345);
+    check(random_first == random_next(1000) && random_unit >= 0.0f && random_unit < 1.0f,
+          "random example: deterministic sequence and [0,1) float");
 
     // vec3: new returns struct "vec3", 3 f32 params; x/y/z accessors
     check(has("vec3_new") && arity("vec3_new")==3 && struct_name("vec3_new")=="vec3", "vec: vec3_new -> vec3, 3 params");
@@ -170,8 +187,8 @@ int main() {
     check(ext_string::slot(99999) == nullptr, "string: slot(out-of-range) == nullptr");
 
     // --- reset() is callable and idempotent (stateless math has no reset) ---
-    ext_vec::reset(); ext_quat::reset(); ext_mat::reset(); ext_string::reset(); ext_array::reset(); ext_sync::reset(); ext_lifecycle::reset();
-    ext_vec::reset(); ext_quat::reset(); ext_mat::reset(); ext_string::reset(); ext_array::reset(); ext_sync::reset(); ext_lifecycle::reset();
+    ext_vec::reset(); ext_quat::reset(); ext_mat::reset(); ext_string::reset(); ext_array::reset(); ext_sync::reset(); ext_lifecycle::reset(); ext_random::reset();
+    ext_vec::reset(); ext_quat::reset(); ext_mat::reset(); ext_string::reset(); ext_array::reset(); ext_sync::reset(); ext_lifecycle::reset(); ext_random::reset();
     check(true, "extensions: reset() callable + idempotent");
 
     // --- purity: no host/process/render coupling - extensions only touch ember types ---

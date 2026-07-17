@@ -5,6 +5,8 @@
 #include "ext_opt.hpp"
 #include "ext_obf.hpp"
 #include "custom_passes.hpp"
+// Documentation example compiled into this existing CMake test target.
+#include "custom_pass/mov_substitute_pass.cpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -189,7 +191,9 @@ int main() {
     {
         EmberPassRegistry reg;
         ember::examples::custom_pass::register_passes(reg);
-        const char* names[] = {"example-minimal", "example-nop-injection", "example-block-merge"};
+        ember::examples::custom_pass::register_mov_substitute_pass(reg, 0x1234);
+        const char* names[] = {"example-minimal", "example-nop-injection", "example-block-merge",
+                               "example-mov-substitute"};
         EmberAnalysisManager am;
         for (const char* name : names) {
             CHECK(reg.has(name));
