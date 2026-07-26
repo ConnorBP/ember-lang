@@ -21,3 +21,6 @@ build_asan/
 /buildm
 tmp_*.ember
 tmp_*.cpp
+
+# VS Code extension build artifact
+editors/vscode/*.vsix
