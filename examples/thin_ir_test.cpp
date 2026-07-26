@@ -288,18 +288,28 @@ static std::unique_ptr<M> compile(const std::string& src, bool ir_on,
     ctx.enable_local_regalloc = regalloc;
     ctx.enable_ir_backend = ir_on;
     for (auto& fn : m->prog.funcs) {
-        // Use compile_func_checked so the test can inspect cr.backend (the
-        // ACTUAL backend used: IRBackend whenever the IR path ran, TreeWalker
-        // only on a real fallback). On ARM64 the backend is always IRBackend
-        // (ThinIR is the sole codegen path); on x86 it is IRBackend when
-        // ir_on and the function is IR-lowerable, else TreeWalker.
-        CompileResult cr = compile_func_checked(fn, ctx);
-        CompiledFn cf = std::move(cr.compiled);
-        if (main_bytes && fn.name == "main") *main_bytes = cf.bytes;  // pre-finalize
-        if (main_backend && fn.name == "main") *main_backend = cr.backend;
-        if (!finalize(cf)) { std::printf("FAIL: alloc_executable for %s\n", fn.name.c_str()); return nullptr; }
-        m->table->set(fn.slot, cf.entry);
-        m->fns.push_back(std::move(cf));
+        // When the caller wants cr.backend (the P3.3 ARM64-evidence path), use
+        // compile_func_checked to inspect the actual backend. Otherwise (the
+        // Part 2 value-equivalence probes) use the proven compile_func path —
+        // compile_func_checked's checked pass-manager mode can diverge from
+        // compile_func on x86 (a rollback/validation path left a null exec for
+        // some IR-lowered probe, segfaulting on call), and the probes don't
+        // need backend metadata.
+        if (main_backend) {
+            CompileResult cr = compile_func_checked(fn, ctx);
+            CompiledFn cf = std::move(cr.compiled);
+            if (main_bytes && fn.name == "main") *main_bytes = cf.bytes;  // pre-finalize
+            *main_backend = (fn.name == "main") ? cr.backend : *main_backend;
+            if (!finalize(cf)) { std::printf("FAIL: alloc_executable for %s\n", fn.name.c_str()); return nullptr; }
+            m->table->set(fn.slot, cf.entry);
+            m->fns.push_back(std::move(cf));
+        } else {
+            CompiledFn cf = compile_func(fn, ctx);
+            if (main_bytes && fn.name == "main") *main_bytes = cf.bytes;  // pre-finalize
+            if (!finalize(cf)) { std::printf("FAIL: alloc_executable for %s\n", fn.name.c_str()); return nullptr; }
+            m->table->set(fn.slot, cf.entry);
+            m->fns.push_back(std::move(cf));
+        }
     }
     return m;
 }

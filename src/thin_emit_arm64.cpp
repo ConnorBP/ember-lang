@@ -1004,8 +1004,10 @@ struct EmitCtx {
                 continue;
             }
             if (pt->is_slice || pt->is_lambda) {
-                // slice: 2 consecutive GP words (ptr, len)
-                if (gp_idx + 1 > 8) {
+                // slice: 2 consecutive GP words (ptr, len). Needs gp_idx AND
+                // gp_idx+1 < 8 (x0-x7); a +1>8 guard let gp_idx==7 slip through
+                // and access kGpArgRegs[8] out of bounds.
+                if (gp_idx + 2 > 8) {
                     throw std::runtime_error(
                         "emit_arm64: slice param beyond x0-x7 (stack args) not yet supported");
                 }
@@ -2454,14 +2456,16 @@ struct EmitCtx {
         } else {
             load_float_vreg_into(ArmVReg::v1, in.src2);          // v1 = divisor
         }
-        // x9 = &fmod (f64) or &fmodf (f32). Bake the host fn ptr directly —
-        // fmod/fmodf are libc symbols, always present on the host. (The
+        // x9 = &fmod (f64) or the float overload (f32). Bake the host fn ptr
+        // directly — fmod is a libc symbol, always present on the host. (The
         // mov_reg_imm64 bakes a JIT-time ptr; non-serializable but the whole
         // JIT is process-local.) std::fmod is overloaded (float/double/long
         // double), so take the address via a typed function-pointer variable
-        // to disambiguate; std::fmodf is not overloaded.
+        // to disambiguate the overload. NOTE: use std::fmod (overloaded) for
+        // BOTH widths — std::fmodf is not guaranteed by <cmath> on all libstdc++
+        // (g++ strict rejects it); std::fmod(float,float) is the portable float form.
         if (is_f32) {
-            float (*fp)(float, float) = &std::fmodf;
+            float (*fp)(float, float) = static_cast<float(*)(float, float)>(&std::fmod);
             e.mov_reg_imm64(XReg::x9, int64_t(reinterpret_cast<uintptr_t>(fp)));
         } else {
             double (*fp)(double, double) = &std::fmod;

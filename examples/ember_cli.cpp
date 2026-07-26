@@ -1133,12 +1133,21 @@ static TestClassifier classify_test(const fs::path& filepath) {
                         int n = std::stoi(trimmed.substr(num_start, num_end - num_start));
                         TestClassifier tc; tc.kind = TestClassifier::Kind::Run;
                         // ember_cli returns the i64 entry value AS the process
-                        // exit code, which POSIX truncates to 8 bits (0-255).
-                        // So a script whose `// expect: N` is > 255 (e.g.
-                        // import_diamond's 2003) exits N & 0xFF (211). Mirror
-                        // run_lang_tests.sh (exp_diamond=211): truncate the
-                        // expected exit to 8 bits so the comparison is correct.
+                        // exit code. POSIX truncates exit codes to 8 bits
+                        // (0-255), so a script whose `// expect: N` is > 255
+                        // (e.g. import_diamond's 2003) exits N & 0xFF (211) on
+                        // macOS/Linux. Windows process exit codes are 32-bit
+                        // (GetExitCodeProcess returns a DWORD), so ember_cli
+                        // run returns the FULL value (2003) on Windows. Mirror
+                        // run_lang_tests.sh (which is POSIX/bash, truncates to
+                        // 211): truncate ONLY on POSIX, keep the full value on
+                        // Windows so the comparison matches the platform's
+                        // actual exit code.
+#ifdef _WIN32
+                        tc.expected_exit = n;
+#else
                         tc.expected_exit = n & 0xFF;
+#endif
                         return tc;
                     } catch (...) { /* malformed — keep scanning */ }
                 }

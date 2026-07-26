@@ -837,8 +837,12 @@ inline void Arm64Emitter::resolve_fixups() {
             int64_t rel = int64_t(target) - int64_t(site);
             if (rel < -(1 << 20) || rel >= (1 << 20))
                 throw std::runtime_error("ember: arm64 ADR out of ±1MiB range");
-            uint32_t immlo = uint32_t(rel & 3);
-            uint32_t immhi = uint32_t((rel >> 2) & 0x7FFFF);
+            // Shift the UNSIGNED representation: right-shifting a negative
+            // signed value is implementation-defined (cppcheck portability).
+            // The two's-complement cast preserves sign-extension bits.
+            uint64_t urel = uint64_t(rel);
+            uint32_t immlo = uint32_t(urel & 3);
+            uint32_t immhi = uint32_t((urel >> 2) & 0x7FFFF);
             uint32_t enc = read32(site);
             enc = (enc & ~((3u << 29) | (0x7FFFFu << 5)))
                 | (immlo << 29) | (immhi << 5);
@@ -852,8 +856,11 @@ inline void Arm64Emitter::resolve_fixups() {
                 throw std::runtime_error(
                     "ember: arm64 adr_label out of ADR ±1MiB range; use adr/adrp "
                     "explicitly or relocate code");
-            uint32_t immlo = uint32_t(rel & 3);
-            uint32_t immhi = uint32_t((rel >> 2) & 0x7FFFF);
+            // Shift the UNSIGNED representation (see above): right-shifting a
+            // negative signed value is implementation-defined.
+            uint64_t urel = uint64_t(rel);
+            uint32_t immlo = uint32_t(urel & 3);
+            uint32_t immhi = uint32_t((urel >> 2) & 0x7FFFF);
             uint32_t enc = read32(site);
             enc = (enc & ~((3u << 29) | (0x7FFFFu << 5)))
                 | (immlo << 29) | (immhi << 5);
