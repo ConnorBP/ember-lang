@@ -33,6 +33,20 @@ bool protect_rw(void* ptr, size_t size);
 // Free an allocation from alloc_rw.
 void free_page(void* ptr, size_t size);
 
+// The system page size in bytes (sysconf(_SC_PAGESIZE) on POSIX,
+// dwPageSize on Windows). 16 KiB on Apple Silicon, 4 KiB elsewhere.
+// Callers that need to free an mmap'd region must pass the size rounded up
+// to this value (munmap requires the exact mapped length).
+long page_size();
+
+// Overflow-checked page-rounding: rounds `n` up to the next multiple of the
+// system page size. Returns false (leaving *out untouched) if `n` is 0 or the
+// rounded value would overflow size_t (e.g. `n + page_sz - 1` wrapping).
+// Callers should reject size 0 + treat an overflow as an allocation failure
+// rather than passing a wrapped/clamped length to mmap/munmap (which would
+// either fail with EINVAL or map the wrong length).
+bool round_up_to_page(size_t n, size_t& out);
+
 // ---- Executable path ----
 
 // Returns the path to the current executable (for the standalone bundler

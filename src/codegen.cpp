@@ -18,7 +18,7 @@
 
 #if defined(_MSC_VER)
 #include <intrin.h>
-#elif defined(__GNUC__)
+#elif defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include <cpuid.h>
 #endif
 
@@ -35,10 +35,15 @@ static int64_t bit_cast_i64(uint64_t u) {
 }
 
 // Read CPUID.1:EAX (the CPU signature the obfuscation pass keys on).
+// x86-only: ARM64 has no CPUID (MIDR_EL1 is kernel-only on Apple Silicon).
+// plan_MACOS_ARM64.md Phase 8 routes @obf_keyed through the host key-provider
+// abstraction instead of a hardware CPU identity; until then this returns 0 on
+// non-x86 so the tree-walker compiles, and @obf_keyed is diagnosed as
+// unsupported on arm64 (the ARM64 path uses ThinIR, not this tree-walker).
 int64_t current_cpuid_signature() {
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
     int regs[4] = {0}; __cpuid(regs, 1); return regs[0];
-#elif defined(__GNUC__)
+#elif defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
     unsigned a=0,b=0,c=0,d=0;
     if (__get_cpuid(1, &a,&b,&c,&d)) return a;
 #endif
@@ -5446,9 +5451,10 @@ static const char* ir_backend_unavailable_reason(const FuncDecl& f,
     // Tier 4: try/catch/throw are now lowered to the IR backend (TryCatch /
     // CatchCleanup / CatchEntry / Throw ThinOps + the same setjmp/longjmp emit
     // as the tree-walker), so they no longer force a tree-walker fallback.
-    // #21 coroutines: yield is tree-walker-only.
-    if (f.is_coroutine)
-        return "IR backend unavailable: function is a coroutine";
+    // #21 coroutines: YieldStmt is now lowered to ThinIR (a CallNative to
+    // __ember_coro_yield), so coroutines no longer force a tree-walker
+    // fallback. The Darwin ARM64 context switch (ember_ctx_switch) + the
+    // macOS coroutine lifecycle in ext_coroutine handle yield/resume.
     return nullptr;
 }
 
@@ -5884,7 +5890,15 @@ static CompileResult compile_impl_(const FuncDecl& f, const CodeGenCtx& ctx,
         // function — independent of whether a pass manager is present. A null
         // pass_manager simply means "lower -> (no passes) -> regalloc -> emit"
         // through the IR backend (backend == IRBackend).
-        if (ctx.enable_ir_backend &&
+        // On ARM64 the tree-walker is x86-only (it would emit unrunnable x86),
+        // so the IR backend is the SOLE codegen path: force it on regardless of
+        // ctx.enable_ir_backend. plan_MACOS_ARM64.md Phase 4.
+#if defined(__aarch64__) || defined(_M_ARM64)
+        const bool ir_enabled_eff = true;
+#else
+        const bool ir_enabled_eff = ctx.enable_ir_backend;
+#endif
+        if (ir_enabled_eff &&
             ir_backend_unavailable_reason(f, ctx) == nullptr) {
             ThinFunction thf = lower_function(f, ctx);
             const size_t lowered_blocks = thf.blocks.size();
@@ -5991,7 +6005,13 @@ static CompileResult compile_impl_(const FuncDecl& f, const CodeGenCtx& ctx,
                 thf.ra = RegAllocResult{};
                 stage(CompileStage::StaleRegallocClear, /*reached=*/true, /*ok=*/true,
                       "cleared (ra.enabled=false before allocation)");
-                if (ctx.enable_regalloc) {
+                if (ctx.enable_regalloc
+#if defined(__aarch64__) || defined(_M_ARM64)
+                    && false  // ARM64 emit is frame-only for now (plan_MACOS_ARM64.md
+                              // Phase 4): the x86-pool regalloc assigns x86 callee-
+                              // saved IDs emit_arm64 does not consume. Skip it.
+#endif
+                    ) {
                     // Red 5 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §6.4):
                     // when the keyed CodeGenCtx descriptor is present with
                     // runtime_key == R15, exclude r15 from the regalloc pool (the
@@ -6009,7 +6029,13 @@ static CompileResult compile_impl_(const FuncDecl& f, const CodeGenCtx& ctx,
                     stage(CompileStage::Regalloc, /*reached=*/false, /*ok=*/true,
                           "skipped: regalloc disabled (zero invocations)");
                 }
+                // Target dispatch: ARM64 uses emit_arm64 (the sole codegen path on
+                // arm64 — the tree-walker is x86-only). plan_MACOS_ARM64.md Phase 4.
+#if defined(__aarch64__) || defined(_M_ARM64)
+                cr.compiled = emit_arm64(thf, ctx);
+#else
                 cr.compiled = emit_x64(thf, ctx);
+#endif
                 // Empty/failed emission is a STRUCTURED compile failure, not a
                 // silent success: an emit that produced no bytes cannot be
                 // finalized or executed, so the boundary reports ok_=false + a
@@ -6043,6 +6069,24 @@ static CompileResult compile_impl_(const FuncDecl& f, const CodeGenCtx& ctx,
         // Fallback: the tree-walker (IR backend disabled, unavailable for this
         // function, or lowering produced no blocks). backend == TreeWalker.
         const char* fb = ctx.enable_ir_backend ? ir_backend_unavailable_reason(f, ctx) : nullptr;
+#if defined(__aarch64__) || defined(_M_ARM64)
+        // ARM64 has NO tree-walker fallback (it is x86-only). A function that
+        // the IR backend cannot lower (e.g. an obf @obf_keyed fn, or a
+        // construct the ARM64 emit doesn't support yet) is a HARD compile
+        // error on arm64 — never silently emit x86. plan_MACOS_ARM64.md.
+        if (cr.stage_trace.empty()) {
+            stage(CompileStage::Lowering, /*reached=*/false, /*ok=*/false,
+                  fb ? ("ARM64 IR backend unavailable: " + std::string(fb))
+                     : "ARM64 IR backend disabled/unavailable (no x86 tree-walker fallback)");
+        }
+        cr.ok_ = false;
+        cr.reason = fb ? ("ARM64: IR backend unavailable for this function: " + std::string(fb))
+                       : "ARM64: IR backend produced no blocks and there is no x86 tree-walker fallback";
+        cr.compiled = CompiledFn{};
+        stage(CompileStage::Emission, /*reached=*/false, /*ok=*/false, "skipped: no arm64 fallback");
+        stage(CompileStage::FinalizationEligible, /*reached=*/false, /*ok=*/false, "skipped");
+        return cr;
+#else
         // If we did not already record a Lowering stage above (the IR path was
         // not even attempted because the backend was disabled/unavailable),
         // record that the IR lowering stage was not reached.
@@ -6071,6 +6115,7 @@ static CompileResult compile_impl_(const FuncDecl& f, const CodeGenCtx& ctx,
         stage(CompileStage::FinalizationEligible, /*reached=*/true, /*ok=*/true,
               "eligible (tree-walker exec + bytes non-empty)");
         cr.ok_ = true;
+#endif
         if (fb) cr.reason = fb;
         else if (ctx.enable_ir_backend) cr.reason = "IR backend unavailable: lower_function produced no blocks";
         else cr.reason.clear();

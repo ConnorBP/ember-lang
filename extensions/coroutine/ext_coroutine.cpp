@@ -17,7 +17,13 @@
 #include "module_instance.hpp"
 #include "runtime_extension_state.hpp"
 
+#if defined(_WIN32)
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <sys/mman.h>       // mmap/munmap for the coroutine stack
+#include <unistd.h>         // sysconf
+#include <cstddef>
+#endif
 
 #include <atomic>
 #include <cstring>
@@ -38,7 +44,15 @@ static std::recursive_mutex g_setup_mutex;
 static context_t*           g_ctx           = nullptr;
 static void*                g_dispatch_base = nullptr;
 static int64_t              g_slot_count    = 0;
+#if defined(_WIN32)
 static void*                g_main_fiber    = nullptr;
+#elif defined(__APPLE__)
+// Phase 8: no fiber conversion on Darwin — the main thread's context is just
+// the callee-saved regs saved on the first resume. g_initialized gates the
+// natives (coroutine_init sets it). Default coroutine stack size (bytes).
+static bool                 g_initialized   = false;
+static constexpr size_t     CORO_STACK_SIZE = 1 << 20;  // 1 MiB
+#endif
 
 static thread_local Coroutine* g_current_coro = nullptr;
 
@@ -101,6 +115,62 @@ static void restore_state(context_t* ctx, const SavedState& s) {
     std::memcpy(ctx->checkpoint, s.checkpoint, sizeof(jmp_buf));
 }
 
+// ─── Phase 8: Darwin ARM64 cooperative context switch (declaration) ────────
+// Defined in src/darwin_arm64_ctx_switch.S. Saves `from`'s callee-saved GP
+// regs + SP + LR, loads `to`'s, and `ret`s into `to`'s saved LR (the resume
+// PC). See CoroCtx in runtime_extension_state.hpp for the layout.
+#if defined(__APPLE__)
+extern "C" void ember_ctx_switch(CoroCtx* from, CoroCtx* to) noexcept;
+
+// The first ember_ctx_switch into a fresh coroutine `ret`s into this C
+// trampoline (its LR was set to this address at create time). It runs the
+// JIT'd entry on the coroutine's private stack; on return it marks the
+// coroutine done and switches back to whoever resumed it. A trap inside the
+// entry longjmps to the setjmp checkpoint here (mirrors the Windows fiber
+// trampoline). `co` is reached via the thread-local g_current_coro (set by
+// n_coroutine_next before the switch) — the switch itself passes no args.
+extern "C" void coro_trampoline_darwin() {
+    Coroutine* co = g_current_coro;
+    context_t* ctx = co->ctx;
+
+    SavedState saved;
+    save_state(ctx, saved);
+
+    int64_t result  = 0;
+    bool    trapped = false;
+    int     reason  = 0;
+
+    ctx->has_checkpoint = true;
+    // EMBER_SETJMP resolves to setjmp on Darwin (context.hpp). The JIT'd trap
+    // stub longjmps here on a recoverable trap; the checkpoint frame lives on
+    // the coroutine's private stack, so the longjmp restores this frame's SP.
+    if (EMBER_SETJMP(ctx->checkpoint)) {
+        trapped = true;
+        reason  = int(ctx->last_trap);
+        ctx->has_checkpoint = false;
+    } else {
+        result = ember_call_i64(co->entry, ctx, co->arg);
+        ctx->has_checkpoint = false;
+    }
+
+    restore_state(ctx, saved);
+
+    co->yield_value  = trapped ? TRAP_SENTINEL : result;
+    co->trapped      = trapped;
+    co->trap_reason  = reason;
+    co->done         = true;
+
+    // Switch back to whoever resumed us (the main thread or an outer coroutine).
+    // caller_ctx was saved by the resume's ember_ctx_switch; restoring it lands
+    // back in n_coroutine_next right after its switch. After this we never
+    // resume the trampoline (co->done), so std::terminate guards the tail.
+    g_current_coro = co->caller_coro;
+    ember_ctx_switch(&co->coro_ctx, &co->caller_ctx);
+    std::terminate();
+}
+#endif
+
+#if defined(_WIN32)
 static void WINAPI coro_trampoline(PVOID lpParameter) {
     Coroutine* co = static_cast<Coroutine*>(lpParameter);
     context_t* ctx = co->ctx;
@@ -139,15 +209,22 @@ static void WINAPI coro_trampoline(PVOID lpParameter) {
     SwitchToFiber(caller);
     std::terminate();
 }
+#endif // _WIN32
 
 static void n_coro_yield(int64_t value) {
     Coroutine* co = g_current_coro;
     if (!co) return;
     co->yield_value = value;
-    void* caller = co->caller_fiber;
     Coroutine* prev = co->caller_coro;
     g_current_coro = prev;
-    SwitchToFiber(caller);
+#if defined(_WIN32)
+    SwitchToFiber(co->caller_fiber);
+#elif defined(__APPLE__)
+    // Save THIS coroutine's state into coro_ctx and restore whoever resumed us
+    // (caller_ctx) — `ret` lands back in the caller's n_coroutine_next. The
+    // saved LR in coro_ctx resumes right here on the next coroutine_next.
+    ember_ctx_switch(&co->coro_ctx, &co->caller_ctx);
+#endif
 }
 
 extern "C" {
@@ -164,7 +241,11 @@ static int64_t n_coroutine_start(int64_t handle, int64_t arg) {
     }
     std::lock_guard<std::recursive_mutex> guard(g_setup_mutex);
     if (!g_ctx || !g_dispatch_base || g_slot_count <= 0) return 0;
+#if defined(_WIN32)
     if (!g_main_fiber) return 0;
+#elif defined(__APPLE__)
+    if (!g_initialized) return 0;
+#endif
     void* entry = resolve_entry(handle);
     if (!entry) return 0;
 
@@ -193,6 +274,7 @@ static int64_t n_coroutine_start(int64_t handle, int64_t arg) {
     raw->caller_fiber = nullptr;
     raw->caller_coro  = nullptr;
 
+#if defined(_WIN32)
     raw->fiber = CreateFiberEx(0, 0, FIBER_FLAG_FLOAT_SWITCH,
                                coro_trampoline, raw);
     if (!raw->fiber) {
@@ -201,22 +283,61 @@ static int64_t n_coroutine_start(int64_t handle, int64_t arg) {
         g_coros_free.push_back(idx);
         return 0;
     }
+#elif defined(__APPLE__)
+    // Allocate a 16-byte-aligned private stack (mmap; a data stack, NOT MAP_JIT).
+    // The initial SP is the 16-aligned TOP (stack grows down). The initial
+    // ctx LR (regs[11]) = the trampoline, so the first ember_ctx_switch `ret`s
+    // into coro_trampoline_darwin with SP = stack top. All other regs start
+    // zero — the trampoline does not read callee-saved regs before it sets its
+    // own frame. x18 is intentionally left untouched (Apple platform reg).
+    size_t page = size_t(sysconf(_SC_PAGESIZE));
+    size_t sz = CORO_STACK_SIZE;
+    if (sz % page) sz = (sz / page + 1) * page;   // round up to a page
+    void* stk = mmap(nullptr, sz, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (stk == MAP_FAILED || !stk) {
+        raw->in_use = false;
+        g_coros[size_t(idx - 1)].reset();
+        g_coros_free.push_back(idx);
+        return 0;
+    }
+    raw->stack      = stk;
+    raw->stack_size = sz;
+    int64_t top = int64_t(static_cast<char*>(stk) + sz);
+    top &= ~int64_t(15);   // 16-byte align (AAPCS64 SP at the switch point)
+    std::memset(&raw->coro_ctx, 0, sizeof(CoroCtx));
+    std::memset(&raw->caller_ctx, 0, sizeof(CoroCtx));
+    raw->coro_ctx.regs[11] = reinterpret_cast<int64_t>(&coro_trampoline_darwin);
+    raw->coro_ctx.sp       = top;
+#endif
     return idx;
 }
 
 static int64_t n_coroutine_next(int64_t handle) {
     std::lock_guard<std::recursive_mutex> guard(g_setup_mutex);
+#if defined(_WIN32)
     if (!g_ctx || !g_main_fiber) return 0;
+#elif defined(__APPLE__)
+    if (!g_ctx || !g_initialized) return 0;
+#endif
     Coroutine* co = raw_slot(handle);
     if (!co) return 0;
     if (co->done) return co->yield_value;
 
-    co->caller_fiber = GetCurrentFiber();
     co->caller_coro  = g_current_coro;
     g_current_coro   = co;
     co->started      = true;
 
+#if defined(_WIN32)
+    co->caller_fiber = GetCurrentFiber();
     SwitchToFiber(co->fiber);
+#elif defined(__APPLE__)
+    // Save the CURRENT context (the main thread or an outer coroutine) into
+    // co->caller_ctx and switch into co->coro_ctx. On the first resume this
+    // `ret`s into coro_trampoline_darwin (its LR); on a later resume it
+    // `ret`s to the instruction right after the matching yield's switch.
+    ember_ctx_switch(&co->caller_ctx, &co->coro_ctx);
+#endif
 
     g_current_coro = co->caller_coro;
     return co->yield_value;
@@ -250,20 +371,37 @@ bool coroutine_init(ember::context_t* ctx, void* dispatch_base, int64_t slot_cou
     g_ctx           = ctx;
     g_dispatch_base = dispatch_base;
     g_slot_count    = slot_count;
+#if defined(_WIN32)
     if (!IsThreadAFiber()) {
         g_main_fiber = ConvertThreadToFiberEx(nullptr, FIBER_FLAG_FLOAT_SWITCH);
     } else {
         g_main_fiber = GetCurrentFiber();
     }
+#elif defined(__APPLE__)
+    // Phase 8: no fiber conversion on Darwin. The main thread's context is
+    // simply the callee-saved regs saved on the first ember_ctx_switch in
+    // n_coroutine_next (into co->caller_ctx). Just mark the store ready.
+    g_initialized = true;
+#endif
     return true;
 }
 
 void coroutine_reset() {
     std::lock_guard<std::recursive_mutex> guard(g_setup_mutex);
     for (auto& c : g_coros) {
-        if (c && c->in_use && c->fiber) {
-            DeleteFiber(c->fiber);
-            c->fiber = nullptr;
+        if (c && c->in_use) {
+#if defined(_WIN32)
+            if (c->fiber) {
+                DeleteFiber(c->fiber);
+                c->fiber = nullptr;
+            }
+#elif defined(__APPLE__)
+            if (c->stack && c->stack_size) {
+                munmap(c->stack, c->stack_size);
+                c->stack = nullptr;
+                c->stack_size = 0;
+            }
+#endif
         }
     }
     g_coros.clear();
@@ -279,11 +417,13 @@ bool coroutine_init_keyed(ember::ModuleInstance& inst) {
     s.dispatch_base = const_cast<void*>(static_cast<const void*>(
         inst.entry_table ? inst.entry_table->slots.data() : nullptr));
     s.slot_count    = int64_t(inst.logical_slot_count);
+#if defined(_WIN32)
     if (!IsThreadAFiber()) {
         s.main_fiber = ConvertThreadToFiberEx(nullptr, FIBER_FLAG_FLOAT_SWITCH);
     } else {
         s.main_fiber = GetCurrentFiber();
     }
+#endif
     s.last_start_status.ok = false;
     s.last_start_status.unsupported_mode = false;
     s.last_start_status.reason.clear();

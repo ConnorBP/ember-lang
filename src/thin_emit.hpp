@@ -79,4 +79,13 @@ namespace ember {
 // (Stage B) and the Stage 1 peephole compose with the IR path identically.
 CompiledFn emit_x64(const ThinFunction& thf, const CodeGenCtx& ctx);
 
+// Emit a ThinFunction to AArch64 (ARM64) bytes — the macOS/Apple-Silicon
+// backend (docs/planning/plan_MACOS_ARM64.md Phase 4). Value-equivalent to
+// emit_x64 for the supported subset; unsupported ThinOp variants throw a
+// clear std::runtime_error("emit_arm64: <op> not yet supported") so the host
+// never silently miscompiles. Frame-only (no regalloc): thf.ra is ignored
+// (ra.enabled treated as false). The host thunk installs x19 = context_t*
+// and calls the entry with the first script arg in x0 (AAPCS64).
+CompiledFn emit_arm64(const ThinFunction& thf, const CodeGenCtx& ctx);
+
 } // namespace ember

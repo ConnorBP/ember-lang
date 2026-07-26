@@ -105,6 +105,20 @@ static void n_free_executable_ptr(int64_t ptr) {
     free_executable(reinterpret_cast<void*>(ptr));
 }
 
+// native_target_arch() -> i64
+// Returns the host machine's architecture so the self-hosted codegen can
+// auto-target it: 0 = x86-64, 1 = aarch64. This lets self_hosted/codegen.ember
+// emit target-correct bytes (x64 vs ARM64) with NO test edits — the pipeline
+// detects the host at runtime and selects the emit path. PERM_FFI-gated
+// (same surface as the rest of this extension; runs under --ffi).
+static int64_t n_native_target_arch() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 // Register the three natives, all PERM_FFI-gated (raw execution is a security
 // surface — a script that can mint + call executable pages can branch to
 // arbitrary host code). Mirrors ext_io/ext_array's BindingBuilder shape.
@@ -116,6 +130,8 @@ void register_natives(std::unordered_map<std::string, NativeSig>& m) {
           (void*)&n_make_executable,     PERM_FFI);
     b.add("free_executable_ptr", type_void(), {type_i64()},
           (void*)&n_free_executable_ptr, PERM_FFI);
+    b.add("native_target_arch",    type_i64(), {},
+          (void*)&n_native_target_arch,    PERM_FFI);
     NativeTable t = b.build();
     for (auto& kv : t.natives) m[kv.first] = std::move(kv.second);
 }

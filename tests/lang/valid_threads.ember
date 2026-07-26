@@ -1,6 +1,8 @@
+// expect: 0
 // valid_threads.ember — in-context threads test (thread_spawn + thread_join).
 // A simple program that spawns a thread to compute a value + joins it.
 // The thread extension is linked into ember_cli, so ember test/run can exercise it.
+// main returns 0 on success (the worker summed 0..99 == 4950).
 fn worker(n: i64) -> i64 {
     let mut sum: i64 = 0;
     let mut i: i64 = 0;

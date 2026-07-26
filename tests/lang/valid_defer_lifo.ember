@@ -1,0 +1,73 @@
+// valid_defer_lifo.ember — defer execution-order regression (M4).
+//
+// Pins the lexical-block-exit LIFO defer contract
+// (docs/spec/CODEGEN_SPEC.md Section 13): multiple defers in the same block
+// run in REVERSE declaration order at block exit, and a defer declared inside
+// a loop body runs at that iteration's body-exit — including when the body is
+// exited early via `break`. Uses a global trace accumulator + mark(v) which
+// appends a digit (trace = trace*10 + v) so the RUN ORDER is directly
+// observable as the resulting decimal number.
+//
+// expect: 0  (main returns 0 when every LIFO sub-check passes; a non-zero
+//              return identifies the first failing check)
+
+global trace: i64 = 0;
+
+// mark appends one decimal digit to the shared trace. defer mark(v) records v
+// for deferred execution; the ORDER the marks fire is what the tests assert.
+fn mark(v: i64) -> i64 { trace = trace * 10 + v; return 0; }
+
+// 1. Plain LIFO: three defers in one function body run 3, 2, 1 -> trace == 321.
+fn lifo_plain() -> i64 {
+    trace = 0;
+    defer mark(1);
+    defer mark(2);
+    defer mark(3);
+    return 0;
+}
+
+// 2. Nested-block LIFO: inner block's defers fire before the outer block's
+//    when the inner block exits; outer fires at function return.
+//    inner: defer 2, defer 3 -> fires 3, 2 (trace 32 at inner exit)
+//    outer: defer 1          -> fires 1   (trace 321 at function return)
+fn lifo_nested() -> i64 {
+    trace = 0;
+    defer mark(1);
+    {
+        defer mark(2);
+        defer mark(3);
+    }
+    // inner block already exited: trace should be 32 here.
+    if (trace != 32) { return 100 + trace; }
+    return 0;  // outer defer 1 fires -> 321
+}
+
+// 3. Defer-in-loop-with-break: a while loop whose body defers mark(cur)
+//    each iteration, where `cur` is a fresh per-iteration local (the defer
+//    captures it by value at registration time). The body's defer fires at
+//    the END of each iteration's body (block exit), so over iterations i=1,2
+//    it fires 1 then 2 -> trace 12. A `break` mid-body exits the loop; the
+//    current iteration's already-registered defer still fires at the body's
+//    block exit (the break is a block-exit transfer), so on the breaking
+//    iteration (i=3) mark(3) fires too -> trace == 123.
+fn lifo_loop_break() -> i64 {
+    trace = 0;
+    let mut i: i64 = 1;
+    while (i < 10) {
+        let cur: i64 = i;
+        defer mark(cur);
+        if (i == 3) { break; }
+        i = i + 1;
+    }
+    return 0;  // trace should be 123
+}
+
+fn main() -> i64 {
+    // Check 1: plain LIFO -> 321
+    if (lifo_plain() != 0 || trace != 321) { return 1; }
+    // Check 2: nested LIFO -> 321 (and 32 at the inner-exit assertion)
+    if (lifo_nested() != 0 || trace != 321) { return 2; }
+    // Check 3: defer-in-loop-with-break -> 123
+    if (lifo_loop_break() != 0 || trace != 123) { return 3; }
+    return 0;
+}

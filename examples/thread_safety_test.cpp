@@ -49,8 +49,10 @@
 #include <unordered_set>
 #include <vector>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#endif
 
 using namespace ember;
 
@@ -82,6 +84,12 @@ struct B1Module {
     std::unordered_map<std::string,int> slots;
     void* main_entry = nullptr;
     std::unordered_map<std::string, NativeSig> natives;
+    // The globals backing store + block MUST outlive compile_b1 (they're
+    // baked into the JIT'd code as globals_base / index / types). Without
+    // this, gbs is freed when compile_b1 returns -> globals_base dangles ->
+    // the global-read probe loads freed memory (use-after-free, garbage).
+    std::vector<uint8_t> gbs;
+    GlobalsBlock gb;
 };
 
 // Compile once. The SAME entry is called from N threads with N contexts.
@@ -102,19 +110,21 @@ static bool compile_b1(const std::string& src, B1Module& m) {
 
     // globals block + the emit-time fix: thread the index/types through ctx and
     // NULL the process-wide pointer (proves codegen no longer reads it).
-    ember::GlobalsBlock gb; std::vector<uint8_t> gbs(pr.program.globals.size()*8, 0);
-    gb.base=int64_t(gbs.data());
-    { uint32_t gi=0; for (auto& g : pr.program.globals) { gb.index[g.name]=gi++; gb.types[g.name]=g.ty.get(); } }
+    // The backing store (m.gbs) + block (m.gb) live in the B1Module so they
+    // outlive compile_b1 + the JIT'd code (globals_base is baked into it).
+    m.gbs.assign(pr.program.globals.size()*8, 0);
+    m.gb.base=int64_t(m.gbs.data());
+    { uint32_t gi=0; for (auto& g : pr.program.globals) { m.gb.index[g.name]=gi++; m.gb.types[g.name]=g.ty.get(); } }
     // v1.0: seed const global initializers into the backing store.
-    eval_global_initializers(pr.program, GlobalInitCtx{gbs, gb.index, gb.types});
+    eval_global_initializers(pr.program, GlobalInitCtx{m.gbs, m.gb.index, m.gb.types});
     ember::g_globals_for_codegen = nullptr;   // MUST stay null through compile
     m.table = DispatchTable(pr.program.funcs.size());
     ember::CodeGenCtx ctx;
-    ctx.globals_base=gb.base; ctx.dispatch_base=int64_t(m.table.base());
+    ctx.globals_base=m.gb.base; ctx.dispatch_base=int64_t(m.table.base());
     ctx.natives=&m.natives; ctx.script_slots=&m.slots; ctx.structs=&layouts;
     // the emit-time globals fix:
-    ctx.globals_index = &gb.index;
-    ctx.globals_types = &gb.types;
+    ctx.globals_index = &m.gb.index;
+    ctx.globals_types = &m.gb.types;
 
     // B1: read context_t fields through r14 (the per-call context register).
     // budget_ptr/depth_ptr/trap_ctx are LEFT NULL in B1 mode -- the JIT reads

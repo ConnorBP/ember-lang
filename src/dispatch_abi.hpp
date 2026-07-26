@@ -107,7 +107,9 @@ namespace ember {
 
 // ─── Target architecture ───
 enum class TargetArch : uint8_t {
-    X64_Win64 = 0,   // Windows x86-64 calling convention
+    X64_Win64    = 0,   // Windows x86-64 calling convention
+    Arm64_Darwin = 1,   // Apple Silicon ARM64 (AAPCS64 + Apple platform rules)
+                        // — plan_MACOS_ARM64.md. Excludes arm64e (PAC) for now.
 };
 
 // ─── Calling mode (affects register reservation + entry sequence) ───
@@ -221,12 +223,26 @@ struct AbiParam {
     uint32_t start_position = 0;   // 0-based word index of the first word
 };
 
+// The active target's default arch + convention version (so a CallableDescriptor
+// built without an explicit arch matches the host codegen). plan_MACOS_ARM64.md.
+// Convention versions: bump when the calling sequence changes (invalidates old
+// fingerprints). X64_Win64 v1; Arm64_Darwin v1 (AAPCS64 + Apple platform rules).
+inline constexpr uint32_t kWin64ConventionVersion = 1;
+inline constexpr uint32_t kArm64DarwinConventionVersion = 1;
+#if defined(__aarch64__) || defined(_M_ARM64)
+inline constexpr TargetArch kDefaultTargetArch = TargetArch::Arm64_Darwin;
+inline constexpr uint32_t kDefaultConventionVersion = kArm64DarwinConventionVersion;
+#else
+inline constexpr TargetArch kDefaultTargetArch = TargetArch::X64_Win64;
+inline constexpr uint32_t kDefaultConventionVersion = kWin64ConventionVersion;
+#endif
+
 // A concrete callable descriptor — the input to the classifier. Self-contained
 // and constructable directly by tests (no dependency on ember::Type or
 // NativeSig). Every field that affects the calling sequence is explicit.
 struct CallableDescriptor {
-    TargetArch arch = TargetArch::X64_Win64;
-    uint32_t convention_version = 1;
+    TargetArch arch = kDefaultTargetArch;
+    uint32_t convention_version = kDefaultConventionVersion;
     CallingMode calling_mode = CallingMode::LegacyContext;
     Visibility visibility = Visibility::Public;
     ReturnKind return_kind = ReturnKind::Void;
@@ -349,10 +365,6 @@ WordClass word_class_for_type(const AbiType& t);
 // The fixed 20-byte domain header (ASCII "Ember.DispatchAbi.v1", no NUL).
 inline constexpr const char* kDispatchAbiDomain = "Ember.DispatchAbi.v1";
 inline constexpr size_t kDispatchAbiDomainLen = 20;
-
-// The current Win64 convention version. Bump when the calling convention
-// changes — this invalidates all old fingerprints (correctly).
-inline constexpr uint32_t kWin64ConventionVersion = 1;
 
 // Encode a callable descriptor to its canonical byte stream.
 std::string encode_callable(const CallableDescriptor& d);

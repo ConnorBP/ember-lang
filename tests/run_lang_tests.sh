@@ -25,9 +25,13 @@ set -u
 BUILD="${1:-./build}"
 cd "$(dirname "$0")/.." || exit 2
 
-PARSE="${BUILD}/ember_check.exe"
-SEMA="${BUILD}/sema_check.exe"
-CLI="${BUILD}/ember_cli.exe"
+# Binary suffix: .exe on Windows, empty on macOS/Linux (plan_MACOS_ARM64.md).
+EXE=""
+if [ "$(uname -s)" = "MINGW"* ] || [ "$(uname -s)" = "MSYS"* ] || [ "$(uname -s)" = "CYGWIN"* ]; then EXE=".exe"; fi
+
+PARSE="${BUILD}/ember_check${EXE}"
+SEMA="${BUILD}/sema_check${EXE}"
+CLI="${BUILD}/ember_cli${EXE}"
 
 pass=0; fail=0; skip=0
 
@@ -37,6 +41,31 @@ pass=0; fail=0; skip=0
 # a looping child that prints forever would grow the captured `out` buffer
 # without limit and exhaust RAM — the incident root cause for the test path.
 RUN_TIMEOUT=120   # seconds per child process
+
+# Portable `timeout SECONDS CMD...`: macOS has no GNU `timeout`/`gtimeout` by
+# default (plan_MACOS_ARM64.md). Use gtimeout if present, else GNU timeout if
+# present, else a background-child + watchdog-kill shell shim. The shim runs
+# the child in the background, sleeps, and kills it (SIGTERM) if still running
+# after SECONDS -> returns 124; otherwise returns the child's REAL exit code
+# (so a program that legitimately exits 142 is NOT misread as a SIGALRM
+# timeout — the earlier perl `alarm;exec` idiom conflated exit-142 with
+# SIGALRM+128 and broke valid_struct_destructure).
+if command -v gtimeout >/dev/null 2>&1; then
+    timeout() { gtimeout "$@"; }
+elif command -v timeout >/dev/null 2>&1; then
+    : # GNU timeout already on PATH
+else
+    timeout() {
+        local secs="$1"; shift
+        ( "$@" ) & local pid=$!
+        local i=0
+        while kill -0 "$pid" 2>/dev/null; do
+            [ "$i" -ge "$secs" ] && { kill -TERM "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return 124; }
+            sleep 1; i=$((i+1))
+        done
+        wait "$pid" 2>/dev/null; return $?
+    }
+fi
 
 run() {
     local tool="$1" file="$2" expect="$3"

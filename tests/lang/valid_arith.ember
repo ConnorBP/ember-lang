@@ -1,7 +1,12 @@
 // valid: arithmetic + return
+// expect: 13
 fn add(a: i64, b: i64) -> i64 {
     return a + b;
 }
 fn sub(a: i64, b: i64) -> i64 {
     return a - b * 2;
+}
+fn main() -> i64 {
+    // add(3,4)=7; sub(10,2)=10-4=6; sum=13
+    return add(3, 4) + sub(10, 2);
 }

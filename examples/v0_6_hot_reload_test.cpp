@@ -7,6 +7,9 @@
 #include "dispatch_table.hpp"
 #include "binding_builder.hpp"
 #include "hot_reload.hpp"
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include "arm64_emitter.hpp"   // Arm64Emitter for the ARM64 make_ret fixture
+#endif
 
 #include "ext_vec.hpp"
 #include "ext_math.hpp"
@@ -215,10 +218,22 @@ int main() {
     // page is uniquely bound to one (domain,table,slot) for retirement, so a
     // page still current in another slot is not reclaimed.
     {
+        // make_ret builds a tiny `return v` thunk. On x86 this is hand-
+        // assembled (mov eax, v; ret); on ARM64 it goes through Arm64Emitter
+        // (mov_reg_imm64 x0, v; ret) so it emits native AArch64, not x86
+        // opcodes that would SIGILL on an ARM64 host.
         auto make_ret = [](int v) -> void* {
+#if defined(__aarch64__) || defined(_M_ARM64)
+            ember::Arm64Emitter e;
+            e.mov_reg_imm64(ember::XReg::x0, int64_t(v));
+            e.ret();
+            e.resolve_fixups();
+            return ember::alloc_executable(e.code);
+#else
             std::vector<uint8_t> code{0xB8, uint8_t(v), uint8_t(v >> 8),
                                       uint8_t(v >> 16), uint8_t(v >> 24), 0xC3};
             return alloc_executable(code);
+#endif
         };
         auto call_entry = [](void* e) -> int {
             return reinterpret_cast<int(*)()>(e)();

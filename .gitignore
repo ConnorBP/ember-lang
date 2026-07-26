@@ -16,3 +16,8 @@ bench/results_codegen_paths.*
 analysis/
 build_cov/
 build_asan/
+
+# macOS ARM64 port build dir + temp debug files
+/buildm
+tmp_*.ember
+tmp_*.cpp

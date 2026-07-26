@@ -45,6 +45,24 @@ static int64_t bit_cast_i64(uint64_t u) {
 
 inline int32_t round16(int32_t n) { return (n + 15) & ~15; }
 
+// Maximum supported JIT stack frame size (64 MiB). Frame-extent arithmetic
+// is done in int64_t/size_t + checked against this ceiling before the
+// checked-cast back to int32_t, so a pathological/malformed IR that would
+// overflow int32 frame offsets (wrapping to a tiny frame with huge negative
+// offsets) is caught + rejected as a hard lowering error instead of
+// miscompiling. 64 MiB is far beyond any real ember frame (largest test
+// frames are a few KB) but small enough that int32 offsets stay valid.
+static constexpr int64_t MAX_FRAME_SIZE = (int64_t(1) << 26);
+
+// Checked cast: int64 -> int32, clamped to MAX_FRAME_SIZE. Returns false
+// (leaving *out = 0) if `v` exceeds the supported frame-size ceiling or the
+// int32 range, so the caller can flag a hard lowering error.
+inline bool checked_frame_cast(int64_t v, int32_t& out) {
+    if (v < 0 || v > MAX_FRAME_SIZE) return false;
+    out = static_cast<int32_t>(v);
+    return true;
+}
+
 // The value descriptor returned by lower_expr. See thin_lower.hpp.
 struct LoweredValue {
     enum Kind { Scalar, Slice, Aggregate } kind = Scalar;
@@ -101,6 +119,12 @@ struct ThinLowerer {
     int32_t temp_counter = 0;
     int32_t arr_temp_counter = 0;
     int32_t str_temp_counter = 0;
+    // for-each / match internal-slot unique-suffix counters (mirrors CG's
+    // fe_counter; match needs one too for the subject slot + struct-destructure
+    // capture locals). A nested for-each/match would otherwise overwrite the
+    // outer's locals-map entry.
+    int32_t fe_counter = 0;
+    int32_t match_counter = 0;
     std::vector<std::shared_ptr<Type>> arr_temp_types;
     std::vector<std::shared_ptr<Type>> str_temp_types;
 
@@ -130,6 +154,21 @@ struct ThinLowerer {
     ObfOptions obf;
     bool non_serializable = false;
     std::string non_serializable_reason;
+
+    // #20 lambda capture map (set when compiling a synthetic lambda fn body):
+    // capture name -> (byte offset within env, type, by_ref). The env_ptr is
+    // the __env param (params[0]), whose frame slot offset is lambda_env_off.
+    // The Ident lowering loads a capture as: load env_ptr from
+    // [frame + lambda_env_off], then load the value at [env_ptr + offset].
+    // A by_ref capture's env slot holds a POINTER to the captured variable's
+    // storage (not a copy), so the read is a DOUBLE dereference (load ptr from
+    // [env_ptr+offset], then load value from [ptr]) and a write stores THROUGH
+    // the pointer. Mirrors CG::compiling_lambda / lambda_captures /
+    // lambda_env_off (codegen.cpp:177-180).
+    bool compiling_lambda = false;
+    struct CaptureInfo { int32_t offset; const Type* ty; bool by_ref; };
+    std::unordered_map<std::string, CaptureInfo> lambda_captures;
+    int32_t lambda_env_off = 0;  // frame slot offset of the __env param
 
     ThinLowerer(const CodeGenCtx& c, const FuncDecl& fn) : ctx(c), f(fn) {
         obf = c.obf;
@@ -187,12 +226,32 @@ struct ThinLowerer {
         auto it = ctx.structs->find(t->struct_name);
         return it == ctx.structs->end() ? 0 : it->second.size;
     }
+    // Look up a native binding by name from ctx.natives (mirrors CG::native_named).
+    const NativeSig* native_named(const std::string& name) const {
+        if (!ctx.natives || name.empty()) return nullptr;
+        auto it = ctx.natives->find(name);
+        return it == ctx.natives->end() ? nullptr : &it->second;
+    }
 
     // ─────────────── locals + temp allocation (mirrors CG) ───────────────
 
     int32_t alloc_local(const std::string& n, const Type* t) {
         int32_t width = local_width_bytes(t, ctx.structs);
-        next_local_off += width;
+        // Accumulate in int64 + check against MAX_FRAME_SIZE before assigning
+        // back to the int32 next_local_off, so a pathological count of locals
+        // (or a malformed huge array type) overflows loudly instead of wrapping
+        // next_local_off to a small positive value (which would make `off`
+        // point into the caller's frame). On overflow, set non_serializable so
+        // the function bails to the tree-walker (x86) / hard error (arm64).
+        int64_t acc = int64_t(next_local_off) + int64_t(width);
+        if (acc > MAX_FRAME_SIZE) {
+            non_serializable = true;
+            if (non_serializable_reason.empty())
+                non_serializable_reason = "stack frame exceeds supported maximum (local/temp allocation overflow)";
+            next_local_off = int32_t(MAX_FRAME_SIZE);  // poison: any further alloc also fails
+            return -int32_t(MAX_FRAME_SIZE);
+        }
+        next_local_off = int32_t(acc);
         int32_t off = -next_local_off;
         locals[n] = off;
         local_types[n] = t;
@@ -230,6 +289,16 @@ struct ThinLowerer {
         Type t; t.prim = Prim::U8; t.array_len = uint32_t(baked_len); t.elem = bt;
         str_temp_types.push_back(std::make_shared<Type>(std::move(t)));
         return alloc_local(name, str_temp_types.back().get());
+    }
+    // #20: alloc a frame temp of `env_size` (rounded to 8) bytes for a lambda's
+    // stack env (a fixed-array-of-u8 backing, mirroring CG's __envtmp$N).
+    int32_t alloc_env_temp(int32_t env_size) {
+        std::string name = "__envtmp$" + std::to_string(temp_counter++);
+        int32_t rounded = (env_size + 7) & ~7;
+        auto bt = std::make_shared<Type>(make_prim(Prim::U8));
+        Type t; t.prim = Prim::U8; t.array_len = uint32_t(rounded); t.elem = bt;
+        arr_temp_types.push_back(std::make_shared<Type>(std::move(t)));
+        return alloc_local(name, arr_temp_types.back().get());
     }
 
     uint32_t append_rodata(const uint8_t* data, size_t size) {
@@ -318,6 +387,14 @@ struct ThinLowerer {
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { prescan_expr(*ws->cond); prescan_block(ws->body); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { prescan_block(ds->body); prescan_expr(*ds->cond); return; }
         if (auto* fe = dynamic_cast<const ForEachStmt*>(&s)) { prescan_expr(*fe->iter); prescan_block(fe->body); return; }
+        if (auto* ms = dynamic_cast<const MatchStmt*>(&s)) {
+            prescan_expr(*ms->subject);
+            for (auto& arm : ms->arms) {
+                if (arm.guard) prescan_expr(*arm.guard);
+                prescan_block(arm.body);
+            }
+            return;
+        }
         if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
             if (fs->init) prescan_stmt(*fs->init);
             if (fs->cond) prescan_expr(*fs->cond);
@@ -338,6 +415,14 @@ struct ThinLowerer {
         }
         if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) {
             if (th->value) prescan_expr(*th->value);
+            return;
+        }
+        // #21 coroutines (Phase 8): yield lowers to a 1-arg __ember_coro_yield
+        // native call, so it makes calls + needs a 1-word arg-spill area.
+        if (auto* ys = dynamic_cast<const YieldStmt*>(&s)) {
+            makes_calls = true;
+            max_args = std::max(max_args, 1);
+            if (ys->value) prescan_expr(*ys->value);
             return;
         }
     }
@@ -381,6 +466,16 @@ struct ThinLowerer {
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_struct_temps_expr(*ws->cond, total); count_struct_temps_block(ws->body, total); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_struct_temps_block(ds->body, total); count_struct_temps_expr(*ds->cond, total); return; }
+        if (auto* fe = dynamic_cast<const ForEachStmt*>(&s)) { count_struct_temps_expr(*fe->iter, total); count_struct_temps_block(fe->body, total); return; }
+        if (auto* ms = dynamic_cast<const MatchStmt*>(&s)) {
+            count_struct_temps_expr(*ms->subject, total);
+            for (auto& arm : ms->arms) {
+                if (arm.guard) count_struct_temps_expr(*arm.guard, total);
+                if (arm.pattern) count_struct_temps_expr(*arm.pattern, total);
+                count_struct_temps_block(arm.body, total);
+            }
+            return;
+        }
         if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
             if (fs->init) count_struct_temps_stmt(*fs->init, total);
             if (fs->cond) count_struct_temps_expr(*fs->cond, total);
@@ -399,6 +494,7 @@ struct ThinLowerer {
             return;
         }
         if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) { if (th->value) count_struct_temps_expr(*th->value, total); return; }
+        if (auto* ys = dynamic_cast<const YieldStmt*>(&s)) { if (ys->value) count_struct_temps_expr(*ys->value, total); return; }
     }
     void count_struct_temps_expr(const Expr& ex, int32_t& total) {
         safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_struct_temps_expr");
@@ -421,6 +517,17 @@ struct ThinLowerer {
         if (auto* fx = dynamic_cast<const FieldExpr*>(&ex)) { count_struct_temps_expr(*fx->base, total); return; }
         if (auto* v = dynamic_cast<const ViewExpr*>(&ex)) { count_struct_temps_expr(*v->base, total); return; }
         if (auto* sl = dynamic_cast<const StructLit*>(&ex)) { for (auto& kv : sl->fields) count_struct_temps_expr(*kv.second, total); return; }
+        // #20: a LambdaExpr allocs a __envtmp$N frame temp of env_size bytes
+        // (rounded up to 8). Count it so the frame is sized to hold the env.
+        // GC path (use_gc_env): the env itself lives on the GC heap; the frame
+        // only needs an 8-byte slot to hold the env_ptr returned by
+        // __ember_gc_alloc_env, so count 8 (not env_size). Mirrors CG
+        // (codegen.cpp:1110-1117).
+        if (auto* le = dynamic_cast<const LambdaExpr*>(&ex)) {
+            if (le->env_size > 0)
+                total += ctx.use_gc_env ? 8 : int32_t((le->env_size + 7) & ~7);
+            return;
+        }
     }
 
     void count_arr_temps_block(const Block& b, int32_t& total) {
@@ -440,6 +547,16 @@ struct ThinLowerer {
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_arr_temps_expr(*ws->cond, total); count_arr_temps_block(ws->body, total); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_arr_temps_block(ds->body, total); count_arr_temps_expr(*ds->cond, total); return; }
+        if (auto* fe = dynamic_cast<const ForEachStmt*>(&s)) { count_arr_temps_expr(*fe->iter, total); count_arr_temps_block(fe->body, total); return; }
+        if (auto* ms = dynamic_cast<const MatchStmt*>(&s)) {
+            count_arr_temps_expr(*ms->subject, total);
+            for (auto& arm : ms->arms) {
+                if (arm.guard) count_arr_temps_expr(*arm.guard, total);
+                if (arm.pattern) count_arr_temps_expr(*arm.pattern, total);
+                count_arr_temps_block(arm.body, total);
+            }
+            return;
+        }
         if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
             if (fs->init) count_arr_temps_stmt(*fs->init, total);
             if (fs->cond) count_arr_temps_expr(*fs->cond, total);
@@ -458,6 +575,7 @@ struct ThinLowerer {
             return;
         }
         if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) { if (th->value) count_arr_temps_expr(*th->value, total); return; }
+        if (auto* ys = dynamic_cast<const YieldStmt*>(&s)) { if (ys->value) count_arr_temps_expr(*ys->value, total); return; }
     }
     void count_arr_temps_expr(const Expr& ex, int32_t& total) {
         safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_arr_temps_expr");
@@ -501,6 +619,16 @@ struct ThinLowerer {
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_str_temps_expr(*ws->cond, total); count_str_temps_block(ws->body, total); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_str_temps_block(ds->body, total); count_str_temps_expr(*ds->cond, total); return; }
+        if (auto* fe = dynamic_cast<const ForEachStmt*>(&s)) { count_str_temps_expr(*fe->iter, total); count_str_temps_block(fe->body, total); return; }
+        if (auto* ms = dynamic_cast<const MatchStmt*>(&s)) {
+            count_str_temps_expr(*ms->subject, total);
+            for (auto& arm : ms->arms) {
+                if (arm.guard) count_str_temps_expr(*arm.guard, total);
+                if (arm.pattern) count_str_temps_expr(*arm.pattern, total);
+                count_str_temps_block(arm.body, total);
+            }
+            return;
+        }
         if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
             if (fs->init) count_str_temps_stmt(*fs->init, total);
             if (fs->cond) count_str_temps_expr(*fs->cond, total);
@@ -519,6 +647,7 @@ struct ThinLowerer {
             return;
         }
         if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) { if (th->value) count_str_temps_expr(*th->value, total); return; }
+        if (auto* ys = dynamic_cast<const YieldStmt*>(&s)) { if (ys->value) count_str_temps_expr(*ys->value, total); return; }
     }
     void count_str_temps_expr(const Expr& ex, int32_t& total) {
         safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_str_temps_expr");
@@ -580,6 +709,16 @@ struct ThinLowerer {
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_logical_temps_expr(*ws->cond, total); count_logical_temps_block(ws->body, total); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_logical_temps_block(ds->body, total); count_logical_temps_expr(*ds->cond, total); return; }
+        if (auto* fe = dynamic_cast<const ForEachStmt*>(&s)) { count_logical_temps_expr(*fe->iter, total); count_logical_temps_block(fe->body, total); return; }
+        if (auto* ms = dynamic_cast<const MatchStmt*>(&s)) {
+            count_logical_temps_expr(*ms->subject, total);
+            for (auto& arm : ms->arms) {
+                if (arm.guard) count_logical_temps_expr(*arm.guard, total);
+                if (arm.pattern) count_logical_temps_expr(*arm.pattern, total);
+                count_logical_temps_block(arm.body, total);
+            }
+            return;
+        }
         if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
             if (fs->init) count_logical_temps_stmt(*fs->init, total);
             if (fs->cond) count_logical_temps_expr(*fs->cond, total);
@@ -598,6 +737,7 @@ struct ThinLowerer {
             return;
         }
         if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) { if (th->value) count_logical_temps_expr(*th->value, total); return; }
+        if (auto* ys = dynamic_cast<const YieldStmt*>(&s)) { if (ys->value) count_logical_temps_expr(*ys->value, total); return; }
     }
     void count_logical_temps_expr(const Expr& ex, int32_t& total) {
         safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_logical_temps_expr");
@@ -631,9 +771,11 @@ struct ThinLowerer {
             if (auto* is = dynamic_cast<const IfStmt*>(s.get())) { collect_defers(is->then_b); if (is->has_else) collect_defers(is->else_b); }
             if (auto* ws = dynamic_cast<const WhileStmt*>(s.get())) collect_defers(ws->body);
             if (auto* ds = dynamic_cast<const DoWhileStmt*>(s.get())) collect_defers(ds->body);
+            if (auto* fe = dynamic_cast<const ForEachStmt*>(s.get())) collect_defers(fe->body);
             if (auto* bs = dynamic_cast<const BlockStmt*>(s.get())) collect_defers(bs->block);
             if (auto* fs = dynamic_cast<const ForStmt*>(s.get())) collect_defers(fs->body);
             if (auto* sw = dynamic_cast<const SwitchStmt*>(s.get())) for (auto& c : sw->cases) collect_defers(c.body);
+            if (auto* ms = dynamic_cast<const MatchStmt*>(s.get())) for (auto& arm : ms->arms) collect_defers(arm.body);
             if (auto* tc = dynamic_cast<const TryCatchStmt*>(s.get())) { collect_defers(tc->try_body); collect_defers(tc->catch_body); }
         }
     }
@@ -656,6 +798,16 @@ struct ThinLowerer {
         }
         if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) { count_pin_refs_expr(*ws->cond, counts); count_pin_refs_block(ws->body, counts); return; }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s)) { count_pin_refs_block(ds->body, counts); count_pin_refs_expr(*ds->cond, counts); return; }
+        if (auto* fe = dynamic_cast<const ForEachStmt*>(&s)) { count_pin_refs_expr(*fe->iter, counts); count_pin_refs_block(fe->body, counts); return; }
+        if (auto* ms = dynamic_cast<const MatchStmt*>(&s)) {
+            count_pin_refs_expr(*ms->subject, counts);
+            for (auto& arm : ms->arms) {
+                if (arm.guard) count_pin_refs_expr(*arm.guard, counts);
+                if (arm.pattern) count_pin_refs_expr(*arm.pattern, counts);
+                count_pin_refs_block(arm.body, counts);
+            }
+            return;
+        }
         if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
             if (fs->init) count_pin_refs_stmt(*fs->init, counts);
             if (fs->cond) count_pin_refs_expr(*fs->cond, counts);
@@ -674,6 +826,7 @@ struct ThinLowerer {
             return;
         }
         if (auto* th = dynamic_cast<const ThrowStmt*>(&s)) { if (th->value) count_pin_refs_expr(*th->value, counts); return; }
+        if (auto* ys = dynamic_cast<const YieldStmt*>(&s)) { if (ys->value) count_pin_refs_expr(*ys->value, counts); return; }
     }
     void count_pin_refs_expr(const Expr& ex, std::unordered_map<std::string,int>& counts) {
         safety::DepthGuard guard(lower_depth, MAX_COMPILE_DEPTH, "thin_lower::count_pin_refs_expr");
@@ -806,10 +959,22 @@ struct ThinLowerer {
         }
         if (auto* ds = dynamic_cast<const DoWhileStmt*>(&s))
             return cost_add(cost_add(1, ds->cond ? expr_cost(*ds->cond) : 0), block_cost(ds->body));
+        if (auto* fe = dynamic_cast<const ForEachStmt*>(&s))
+            return cost_add(cost_add(cost_add(1, fe->iter ? expr_cost(*fe->iter) : 0), 1), block_cost(fe->body));
         if (auto* sw = dynamic_cast<const SwitchStmt*>(&s)) {
             int64_t n = sw->subject ? expr_cost(*sw->subject) : 0;
             n = cost_add(n, int64_t(sw->cases.size()));
             for (auto& c : sw->cases) n = cost_add(n, block_cost(c.body));
+            return n;
+        }
+        if (auto* ms = dynamic_cast<const MatchStmt*>(&s)) {
+            int64_t n = ms->subject ? expr_cost(*ms->subject) : 0;
+            n = cost_add(n, int64_t(ms->arms.size()));  // compare chain
+            for (auto& arm : ms->arms) {
+                if (arm.guard) n = cost_add(n, expr_cost(*arm.guard));
+                if (arm.pattern) n = cost_add(n, expr_cost(*arm.pattern));
+                n = cost_add(n, block_cost(arm.body));
+            }
             return n;
         }
         if (auto* ls = dynamic_cast<const LetStmt*>(&s)) return ls->init ? cost_add(1, expr_cost(*ls->init)) : 1;
@@ -1088,46 +1253,35 @@ struct ThinLowerer {
             return out;
         }
 
-        // ForEachStmt fallback: for-each is not yet lowered to ThinFunction IR
-        // (it's a tree-walker-only feature for now). If the function uses for-each,
-        // fall back to the tree-walker.
-        // (A simple recursive check — the body is small.)
-        std::function<bool(const Block&)> has_for_each = [&](const Block& b) -> bool {
-            for (const auto& st : b.stmts) {
-                if (dynamic_cast<const ForEachStmt*>(st.get())) return true;
-                if (dynamic_cast<const MatchStmt*>(st.get())) return true;
-                if (auto* is = dynamic_cast<const IfStmt*>(st.get())) {
-                    if (has_for_each(is->then_b)) return true;
-                    if (is->has_else && has_for_each(is->else_b)) return true;
-                }
-                if (auto* ws = dynamic_cast<const WhileStmt*>(st.get())) { if (has_for_each(ws->body)) return true; }
-                if (auto* fs = dynamic_cast<const ForStmt*>(st.get())) { if (has_for_each(fs->body)) return true; }
-                if (auto* ds = dynamic_cast<const DoWhileStmt*>(st.get())) { if (has_for_each(ds->body)) return true; }
-                if (auto* sw = dynamic_cast<const SwitchStmt*>(st.get())) { for (auto& c : sw->cases) if (has_for_each(c.body)) return true; }
-            }
-            return false;
-        };
-        if (has_for_each(f.body)) {
-            out.non_serializable = true;
-            out.non_serializable_reason =
-                "for-each or match is not yet lowered to ThinFunction IR; "
-                "falling back to tree-walker";
-            out.blocks.clear();
-            return out;
-        }
+        // ForEachStmt + MatchStmt are now lowered to ThinFunction IR (Phase
+        // 6d). No non_serializable gate here — the prescan/count/lowering passes
+        // all handle them. struct-destructure match arms whose lowering is not
+        // yet implemented set non_serializable per-arm (see lower_stmt).
+        //
+        // #21 coroutines (plan_MACOS_ARM64.md Phase 8): `yield` IS lowered to
+        // ThinFunction IR here — as a 1-arg CallNative to __ember_coro_yield
+        // (see lower_stmt's YieldStmt case). On ARM64 (ThinIR-only, no tree-
+        // walker) this is the ONLY path, so the old "fall back to tree-walker"
+        // gate is removed. The native performs the cooperative context switch
+        // (ember_ctx_switch on Darwin / SwitchToFiber on Windows); the IR just
+        // emits the call + continues after the resume. prescan_stmt sets
+        // makes_calls/max_args for the yield native call so the frame's arg-
+        // spill area is sized.
 
-        // #21 coroutines: yield is lowered by the tree-walker (to a
-        // __ember_coro_yield native call). The IR path does not lower it yet,
-        // so a coroutine fn falls back to the tree-walker. compile_func's
-        // is_coroutine gate already prevents lower_function from being
-        // called, but this is a defensive guard for any direct caller.
-        if (f.is_coroutine) {
-            out.non_serializable = true;
-            out.non_serializable_reason =
-                "coroutine (yield) is not yet lowered to ThinFunction IR; "
-                "falling back to tree-walker";
-            out.blocks.clear();
-            return out;
+        // #20: if this is a synthetic lambda fn, set up the capture map so the
+        // Ident lowering loads captures from [env_ptr + offset]. The __env
+        // param is params[0]; its frame slot is assigned during the param-spill
+        // plan below (recorded into lambda_env_off). Mirrors compile_tree_walker_
+        // (codegen.cpp:5474-5481).
+        if (f.is_lambda) {
+            compiling_lambda = true;
+            for (size_t i = 0; i < f.lambda_captures.size(); ++i) {
+                lambda_captures[f.lambda_captures[i]] = {
+                    f.lambda_capture_offsets[i],
+                    f.lambda_capture_types[i].get(),
+                    i < f.lambda_capture_by_ref.size() && f.lambda_capture_by_ref[i]
+                };
+            }
         }
 
         // --- frame plan (mirror compile_func) ---
@@ -1162,6 +1316,19 @@ struct ThinLowerer {
                 if (auto* is = dynamic_cast<const IfStmt*>(s.get())) { sum_bytes(is->then_b); if(is->has_else) sum_bytes(is->else_b); }
                 if (auto* ws = dynamic_cast<const WhileStmt*>(s.get())) sum_bytes(ws->body);
                 if (auto* ds = dynamic_cast<const DoWhileStmt*>(s.get())) sum_bytes(ds->body);
+                if (auto* fe = dynamic_cast<const ForEachStmt*>(s.get())) {
+                    // for-each allocates: (handle|ptr)(8) + len(8) + idx(8) +
+                    // var(elem_width). 24 covers the three i64 internal slots;
+                    // the var slot width is local_width_bytes(elem_ty) (8 for a
+                    // scalar). Mirrors CG's sum_bytes ForEachStmt (array-handle +
+                    // slice both allocate 24 + var).
+                    const Type* et = fe->array_elem_ty
+                        ? fe->array_elem_ty
+                        : (fe->iter && fe->iter->ty && fe->iter->ty->elem ? fe->iter->ty->elem.get() : nullptr);
+                    locals_area += 24;  // (handle|ptr) + len + idx
+                    locals_area += local_width_bytes(et, ctx.structs);  // var
+                    sum_bytes(fe->body);
+                }
                 if (auto* bs = dynamic_cast<const BlockStmt*>(s.get())) sum_bytes(bs->block);
                 if (auto* fs = dynamic_cast<const ForStmt*>(s.get())) {
                     if (fs->init) locals_area += local_width_bytes(fs->init->init ? fs->init->init->ty : fs->init->ty.get(), ctx.structs);
@@ -1169,6 +1336,17 @@ struct ThinLowerer {
                 }
                 if (auto* sw = dynamic_cast<const SwitchStmt*>(s.get()))
                     for (auto& c : sw->cases) sum_bytes(c.body);
+                if (auto* ms = dynamic_cast<const MatchStmt*>(s.get())) {
+                    // match allocates a subject frame slot for the literal/enum
+                    // path (the IR holds the subject across the compare chain in
+                    // a frame slot, unlike the tree-walker which holds it in r10).
+                    // struct-destructure match uses the subject's existing local
+                    // slot, so the 8 bytes is a conservative over-reservation.
+                    // Recurse into each arm body for nested locals (a general
+                    // arm can contain LetStmts).
+                    locals_area += 8;  // subject slot
+                    for (auto& arm : ms->arms) sum_bytes(arm.body);
+                }
                 // Tier 4: each try/catch allocates one i64 catch-variable slot
                 // (alloc_local in lower_stmt's TryCatchStmt case). Recurse into
                 // both try + catch bodies for nested locals (mirrors CG's
@@ -1200,8 +1378,17 @@ struct ThinLowerer {
 
         int32_t arg_temps_area = max_args * 8;
         arg_temps_base = -(locals_area + 8);
-        int32_t total = locals_area + arg_temps_area + 16;
-        frame_size = round16(total);
+        // Frame-extent arithmetic in int64 + checked against MAX_FRAME_SIZE
+        // before the round16 + int32 assignment, so a pathological locals_area
+        // / arg_temps_area overflow wraps loudly instead of producing a tiny
+        // frame_size with huge negative offsets.
+        int64_t total64 = int64_t(locals_area) + int64_t(arg_temps_area) + 16;
+        int32_t total32 = 0;
+        if (!checked_frame_cast(total64, total32)) {
+            non_serializable = true;
+            non_serializable_reason = "stack frame exceeds supported maximum (locals + arg temps overflow)";
+        }
+        frame_size = round16(total32);
 
         // --- param-spill plan (mirror compile_func) ---
         int32_t total_words = returns_struct_by_ptr() ? 1 : 0;
@@ -1223,6 +1410,13 @@ struct ThinLowerer {
             int wcount = words_for_type(pt, ctx.structs);
             bool is_struct = is_registered_struct_ty(pt);
             int32_t off = alloc_local(f.params[i].name, pt);
+            if (f.is_lambda && i == 0) {
+                lambda_env_off = off;  // #20: record __env's frame slot
+                // Precise GC: the __env param holds the heap env pointer (a GC
+                // object pointer) for the lambda fn's whole frame. Record it
+                // (mirrors CG codegen.cpp:5710-5712).
+                if (ctx.use_gc_env) add_gc_ptr_slot(off);
+            }
             ThinFramePlan::ParamSpill ps;
             ps.name = f.params[i].name; ps.ty = pt; ps.off = off;
             ps.word0 = param_word; ps.nwords = wcount;
@@ -1317,10 +1511,30 @@ struct ThinLowerer {
         // consumed immediately by a following load/store). Spill slots go BELOW
         // the arg-temps area (which sits at -(locals_area+8) ..
         // -(locals_area+8+arg_temps_area)), so they never collide with a named
-        // local, a temp, or an arg temp. Base = locals_area + arg_temps_area;
+        // local, a temp, or an arg temp. Base = next_local_off + arg_temps_area;
         // each spill slot grows downward from there.
-        int32_t spill_base = locals_area + arg_temps_area;
-        int32_t spill_top = spill_base;
+        //
+        // gap 2j (aggregate_global): use the ACTUAL post-lowering next_local_off
+        // (not the pre-computed locals_area) as the base. locals_area is sized
+        // upfront from count_*_temps_block, but a few ad-hoc frame temps are
+        // allocated DURING lowering via alloc_local and are NOT counted there —
+        // notably the __gld$N 16-byte slot for a global slice/lambda Ident load
+        // (lower_expr's Ident case). With locals_area, the first spill slot
+        // could land on an ad-hoc temp's word (e.g. the __gld$ len half at
+        // tmp+8), so a later scalar spill overwrote the len and a slice bounds
+        // check read idx==len and trapped (SIGILL). Basing on next_local_off
+        // (which every alloc_local grows) places spill slots BELOW every actually-
+        // allocated local/temp, eliminating the collision. When no ad-hoc temps
+        // exist next_local_off == locals_area, so this is byte-identical to the
+        // prior formula for every function that already worked.
+        // Frame-extent arithmetic in int64 + checked against MAX_FRAME_SIZE
+        // (then checked-cast to int32 for the spill offsets / frame_size) so a
+        // pathological spill-slot count overflows loudly instead of wrapping
+        // spill_top to a small value (which would make `slot` point into the
+        // locals/arg-temps region, corrupting them). For normal functions the
+        // values are identical to the old int32 arithmetic.
+        int64_t spill_base = int64_t(next_local_off) + int64_t(arg_temps_area);
+        int64_t spill_top = spill_base;
         // Assign spill slots per-VREG (not per-instr): a vreg defined in multiple
         // blocks (a join — ternary/short-circuit result) MUST share one frame
         // slot across all its defs, or load_int_vreg would read the wrong slot at
@@ -1349,12 +1563,35 @@ struct ThinLowerer {
                 // Ordinary frame loads (src1 == 0) already have meta.frame_off.
                 if (in.src1 != 0 && !(in.meta.type && in.meta.type->is_slice)) return true;
                 return false;
+            case ThinOp::LoadGlobal:
+                // A global load leaves its result in rax/x9 (NOT frame-backed by
+                // default). If a subsequent instr clobbers rax/x9 before the
+                // global value is consumed (e.g. `trace = trace * 10 + v` loads
+                // the global trace, then loads the local v — the second load
+                // clobbers rax/x9 and the global is lost), the consumer reads a
+                // stale register. Frame-back the result so the emit spills it
+                // (both emit_x64's record_dst and emit_arm64's LoadGlobal honor
+                // meta.frame_off). Exclude slice/lambda (16-byte {ptr,len}, use
+                // dst+1 + their own pin_slice_dst path, NOT an 8-byte scalar slot).
+                if (in.meta.type && (in.meta.type->is_slice || in.meta.type->is_lambda)) return false;
+                return true;
             case ThinOp::CallNative: case ThinOp::CallScript:
             case ThinOp::CallIndirect: case ThinOp::CallCrossModule:
-                // only scalar/float returns (not slice/struct/void)
-                if (in.ret_type && !in.ret_type->is_slice &&
-                    in.ret_type->struct_name.empty() && !in.ret_type->is_void())
-                    return true;
+                // scalar/float returns + OPAQUE HANDLE returns (e.g. `string` =
+                // Prim::I64 with struct_name="string", an opaque host handle NOT
+                // a registered struct-by-value). Exclude slice (16-byte {ptr,len}),
+                // REGISTERED struct-by-value (in ctx.structs — those use the
+                // hidden-ptr / multi-word path, not an 8-byte scalar slot), and
+                // void. plan_MACOS_ARM64.md Phase 6e: this fixed chained string
+                // concat (a + b + c) — the intermediate `+` overload returns a
+                // string handle that wasn't frame-backed, so the 2nd `+` read a
+                // stale register.
+                if (in.ret_type && !in.ret_type->is_slice && !in.ret_type->is_void()) {
+                    if (in.ret_type->struct_name.empty()) return true;  // scalar/float
+                    // opaque handle (string, etc.): NOT a registered struct
+                    if (!ctx.structs || ctx.structs->count(in.ret_type->struct_name) == 0)
+                        return true;
+                }
                 return false;
             default:
                 return false;
@@ -1367,7 +1604,15 @@ struct ThinLowerer {
                     int32_t slot;
                     if (it == vreg_spill_slot.end()) {
                         spill_top += 8;
-                        slot = -spill_top;
+                        int32_t slot32 = 0;
+                        if (!checked_frame_cast(spill_top, slot32)) {
+                            non_serializable = true;
+                            if (non_serializable_reason.empty())
+                                non_serializable_reason = "stack frame exceeds supported maximum (spill slot overflow)";
+                            in.meta.frame_off = 0;  // poison; non_serializable bails below
+                            continue;
+                        }
+                        slot = -slot32;
                         vreg_spill_slot[in.dst] = slot;
                     } else {
                         slot = it->second;  // reuse the same slot for this vreg
@@ -1376,11 +1621,26 @@ struct ThinLowerer {
                 }
             }
         }
-        if (spill_top > spill_base) {
-            int32_t total = spill_top + 16;
-            frame_size = round16(total);
+        // Always reconcile the frame size with the ACTUAL post-lowering extent
+        // (next_local_off + arg_temps_area + spill slots). The pre-computed
+        // frame_size (round16(locals_area + arg_temps_area + 16)) does NOT
+        // account for ad-hoc alloc_local temps grown during body lowering (e.g.
+        // the __gld$N global-slice/lambda load slot), so without this a function
+        // that allocates such a temp but needs NO scalar spill slots would get a
+        // frame too small to hold it. Taking the max keeps the prior size when
+        // it is already large enough (no behavior change for functions that
+        // already worked) and grows it only when an ad-hoc temp + the spill
+        // region exceed the pre-computed estimate.
+        int64_t needed64 = spill_top + 16;  // spill_top = next_local_off + arg_temps_area + spill_slots
+        int32_t needed = 0;
+        if (checked_frame_cast(needed64, needed) && needed > frame_size) {
+            frame_size = round16(needed);
             out.frame.frame_size = frame_size;
-            out.frame.next_local_off = spill_top;
+        }
+        if (spill_top > spill_base) {
+            int32_t spill_top32 = 0;
+            if (checked_frame_cast(spill_top, spill_top32))
+                out.frame.next_local_off = spill_top32;
         }
 
         out.non_serializable = non_serializable;
@@ -1520,8 +1780,20 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
             in.args.push_back(len);
             in.arg_frame_offs.push_back(-1);
             in.arg_frame_offs.push_back(-1);
-            in.arg_types.push_back(&type_i64());   // ptr (carried as i64)
-            in.arg_types.push_back(&type_i64());   // len
+            // Binding signature (arg_types) MUST carry the CANONICAL NativeSig
+            // param types — one slice<u8> param — NOT the flattened {ptr,len}=
+            // {i64,i64} arg-placement words. The .em native-binding signature
+            // is checked against the live NativeSig at load time
+            // (em_loader.cpp: signature mismatch for native), so a flattened
+            // [i64,i64] (2 params) is rejected vs the canonical [slice<u8>]
+            // (1 param). The two args[] vregs (ptr,len) are the arg-PLACEMENT
+            // words; emit_native_call's placement loop consumes both via the
+            // is_slice ++i path when arg_types[0] is the slice type. Mirrors
+            // the tree-walker (codegen.cpp emit_counted_named_native), which
+            // stamps the binding from &sig->params directly.
+            if (const NativeSig* ssig = native_named(lit->to_string_native_name))
+                for (const Type& p : ssig->params) in.arg_types.push_back(&p);
+            else { in.arg_types.push_back(&type_i64()); in.arg_types.push_back(&type_i64()); }
             in.meta.native_name = lit->to_string_native_name;
             in.native_fn = lit->to_string_native_fn;
             in.ret_type = ret_ty;
@@ -1534,6 +1806,65 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
         return { LoweredValue::Slice, ptr, 0, ex.ty };
     }
     if (auto* id = dynamic_cast<const Ident*>(&ex)) {
+        // #20 lambda capture read: if compiling a lambda fn + this name is a
+        // capture, load env_ptr from [frame + lambda_env_off], then load the
+        // value at [env_ptr + offset]. A by_ref capture's env slot holds a
+        // POINTER to the captured variable's storage (double dereference);
+        // by-value holds the value directly (single dereference). Mirrors CG
+        // (codegen.cpp:2553-2580). v1: captures are scalars (int or float).
+        if (compiling_lambda) {
+            auto cit = lambda_captures.find(id->name);
+            if (cit != lambda_captures.end()) {
+                int32_t env_off = cit->second.offset;
+                const Type* ct = cit->second.ty;
+                bool by_ref = cit->second.by_ref;
+                // load env_ptr from [frame + lambda_env_off] into a vreg
+                VReg env_ptr = new_vreg(&type_i64());
+                ThinInstr& ep = emit(ThinOp::LoadFrame, env_ptr, 0, 0, loc);
+                ep.meta.frame_off = lambda_env_off; ep.meta.type = &type_i64();
+                ep.meta.width = 8;
+                if (ct && ct->is_float()) {
+                    // float capture: emit a computed-address LoadFrame (src1 =
+                    // env_ptr) into a float vreg. by-ref: double deref (load
+                    // the ptr, then the float at [ptr]). by-value: single deref.
+                    if (by_ref) {
+                        VReg ptr = new_vreg(&type_i64());
+                        ThinInstr& pp = emit(ThinOp::LoadFrame, ptr, env_ptr, 0, loc);
+                        pp.meta.field_off = env_off; pp.meta.type = &type_i64();
+                        pp.meta.width = 8;
+                        VReg fv = new_vreg(ct);
+                        ThinInstr& fv_in = emit(ThinOp::LoadFrame, fv, ptr, 0, loc);
+                        fv_in.meta.field_off = 0; fv_in.meta.type = ct;
+                        fv_in.meta.width = value_bytes(ct, ctx.structs);
+                        fv_in.meta.is_f32 = (ct->prim == Prim::F32) ? 1 : 0;
+                        return { LoweredValue::Scalar, fv, 0, ct };
+                    }
+                    VReg fv = new_vreg(ct);
+                    ThinInstr& fv_in = emit(ThinOp::LoadFrame, fv, env_ptr, 0, loc);
+                    fv_in.meta.field_off = env_off; fv_in.meta.type = ct;
+                    fv_in.meta.width = value_bytes(ct, ctx.structs);
+                    fv_in.meta.is_f32 = (ct->prim == Prim::F32) ? 1 : 0;
+                    return { LoweredValue::Scalar, fv, 0, ct };
+                }
+                // int capture
+                if (by_ref) {
+                    VReg ptr = new_vreg(&type_i64());
+                    ThinInstr& pp = emit(ThinOp::LoadFrame, ptr, env_ptr, 0, loc);
+                    pp.meta.field_off = env_off; pp.meta.type = &type_i64();
+                    pp.meta.width = 8;
+                    VReg v = new_vreg(ct ? ct : &type_i64());
+                    ThinInstr& vin = emit(ThinOp::LoadFrame, v, ptr, 0, loc);
+                    vin.meta.field_off = 0; vin.meta.type = ct ? ct : &type_i64();
+                    vin.meta.width = value_bytes(ct, ctx.structs);
+                    return { LoweredValue::Scalar, v, 0, ct ? ct : &type_i64() };
+                }
+                VReg v = new_vreg(ct ? ct : &type_i64());
+                ThinInstr& vin = emit(ThinOp::LoadFrame, v, env_ptr, 0, loc);
+                vin.meta.field_off = env_off; vin.meta.type = ct ? ct : &type_i64();
+                vin.meta.width = value_bytes(ct, ctx.structs);
+                return { LoweredValue::Scalar, v, 0, ct ? ct : &type_i64() };
+            }
+        }
         // Item E pin fast path: read from the pin slot (value-equivalent: the slot
         // is always write-through synced, so a LoadFrame from the pin offset is
         // identical to the tree-walker's register read).
@@ -1550,14 +1881,57 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
         int32_t goff = 0; const Type* gt = nullptr;
         if (resolve_global(id->name, goff, gt)) {
             if (gt && gt->is_slice) {
-                VReg ptr = new_slice_vregs(gt); VReg len = ptr + 1;
-                ThinInstr& p = emit(ThinOp::LoadGlobal, ptr, 0, 0, loc);
+                // slice global: 2 words {ptr,len}. The ptr is stored as a
+                // RELATIVE offset within the globals block (baked at load so the
+                // bytes round-trip through .em without loader fixup); the slice
+                // LoadGlobal emit (both emit_x64 + emit_arm64) absolute-izes it
+                // by adding globals_base, yielding {abs_ptr, len} in the slice
+                // ABI regs. Spill both words into a 16-byte temp via one slice
+                // StoreFrame (frame_backing both the ptr + companion-len vreg),
+                // then reload the slice from the temp so any consumer (IndexAddr
+                // slice base, slice arg marshal, slice return) reads durably
+                // frame-backed vregs. Mirrors CG::eval's global-slice Ident
+                // case (load relative ptr, add globals_base, yield {ptr,len}).
+                //
+                // gap 2j (aggregate_global): the prior form loaded the ptr word
+                // via a SCALAR LoadGlobal (type=i64), which loads the raw
+                // RELATIVE offset verbatim (NO globals_base add) — so an
+                // IndexAddr slice base computed ptr+idx*width from a junk
+                // near-zero address and the element load segfaulted. The slice
+                // LoadGlobal path absolute-izes, fixing `s[i]` on a global slice.
+                int32_t tmp = alloc_local("__gld$" + std::to_string(temp_counter++), gt);
+                VReg sv = new_slice_vregs(gt);  // sv = ptr vreg, sv+1 = len vreg
+                ThinInstr& lg = emit(ThinOp::LoadGlobal, sv, 0, 0, loc);
+                lg.meta.base_kind = AbsFixup::GlobalsBase; lg.meta.addend = uint32_t(goff);
+                lg.meta.type = gt; lg.meta.width = 8;
+                ThinInstr& ss = emit(ThinOp::StoreFrame, 0, sv, 0, loc);
+                ss.meta.frame_off = tmp; ss.meta.type = gt; ss.meta.width = 8;
+                return load_scalar_local(tmp, gt, loc);
+            }
+            if (gt && gt->is_lambda) {
+                // lambda global: 2 words {slot, env_ptr}. The env_ptr (second
+                // word) is an ABSOLUTE GC heap pointer (not a relative block
+                // offset like a slice ptr), rooted via the global-root
+                // descriptor. Load both words into a 16-byte temp via two scalar
+                // LoadGlobals (verbatim — NO globals_base add on either word),
+                // then load the lambda from the temp (load_scalar_local produces
+                // 2 frame-backed vregs). This avoids the slice-LoadGlobal emit
+                // (which absolute-izes word0) — wrong for a lambda whose slot is
+                // a raw value, not a relative ptr.
+                int32_t tmp = alloc_local("__gld$" + std::to_string(temp_counter++), gt);
+                VReg w0 = new_vreg(&type_i64());
+                ThinInstr& p = emit(ThinOp::LoadGlobal, w0, 0, 0, loc);
                 p.meta.base_kind = AbsFixup::GlobalsBase; p.meta.addend = uint32_t(goff);
-                p.meta.type = gt; p.meta.width = 8;  // slice-global ptr: relative -> absolute (c3 adds base)
-                ThinInstr& l = emit(ThinOp::LoadGlobal, len, 0, 0, loc);
+                p.meta.type = &type_i64(); p.meta.width = 8;
+                ThinInstr& ps = emit(ThinOp::StoreFrame, 0, w0, 0, loc);
+                ps.meta.frame_off = tmp; ps.meta.type = &type_i64(); ps.meta.width = 8;
+                VReg w1 = new_vreg(&type_i64());
+                ThinInstr& l = emit(ThinOp::LoadGlobal, w1, 0, 0, loc);
                 l.meta.base_kind = AbsFixup::GlobalsBase; l.meta.addend = uint32_t(goff + 8);
                 l.meta.type = &type_i64(); l.meta.width = 8;
-                return { LoweredValue::Slice, ptr, 0, gt };
+                ThinInstr& ls = emit(ThinOp::StoreFrame, 0, w1, 0, loc);
+                ls.meta.frame_off = tmp + 8; ls.meta.type = &type_i64(); ls.meta.width = 8;
+                return load_scalar_local(tmp, gt, loc);
             }
             VReg v = new_vreg(gt);
             ThinInstr& in = emit(ThinOp::LoadGlobal, v, 0, 0, loc);
@@ -1612,6 +1986,27 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
             add_arg(rhs, b->rhs->ty);
             in.meta.native_name = b->overload_name;
             in.native_fn = b->overload_fn;
+            // Stamp the BINDING signature from the canonical NativeSig (looked
+            // up by the overload name), NOT the AST operand types. The .em
+            // native-binding signature is checked against the live NativeSig at
+            // load time (em_loader.cpp signature mismatch), and the NativeSig
+            // params can differ from the AST operand types — e.g. a `string`
+            // handle operand is `i64`+struct_name "string" in the AST but plain
+            // `i64` (no struct_name) in the overload's NativeSig params
+            // (BindingBuilder::add_overload uses bind_prim(I64)). Mirrors the
+            // tree-walker (codegen.cpp emit_counted_named_native ->
+            // &sig->params). The args[]/arg_frame_offs[] (placement words) are
+            // untouched; arg_types now carries one canonical entry per logical
+            // param, which emit's placement loop consumes via the is_slice ++i /
+            // struct-sentinel paths. Skipped for struct-by-ptr returns (the
+            // hidden dest occupies args[0]/arg_types[0]; that ABI-experimental
+            // overload shape is not shipped through .em IR).
+            if (!is_registered_struct_ty(ret_ty)) {
+                if (const NativeSig* osig = native_named(b->overload_name)) {
+                    in.arg_types.clear();
+                    for (const Type& p : osig->params) in.arg_types.push_back(&p);
+                }
+            }
             emit_depth_check(loc);
             cur_block().instrs.push_back(std::move(in));
             if (ret_ty && ret_ty->is_slice)         return { LoweredValue::Slice, in.dst, 0, ret_ty };
@@ -1783,17 +2178,389 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
         in.meta.is_unsigned = is_unsigned ? 1 : 0;
         return { LoweredValue::Scalar, res, 0, lt };
     }
+    // #20 lambda expression: materialize the env (a frame temp / GC heap
+    // region holding the captured values copied from the enclosing scope) +
+    // emit the 16-byte lambda value {slot, env_ptr} as 2 consecutive vregs
+    // (the slice ABI: vreg=slot, vreg+1=env_ptr). Two env backends, mirroring
+    // the tree-walker (codegen.cpp:2252-2470):
+    //   * stack (default): a compiler-hidden frame temp of env_size bytes at
+    //     [frame+env_off]; env_ptr = the address of that region. v1 limitation:
+    //     the lambda must not outlive this frame (the env_ptr is a stack addr).
+    //   * GC heap (ctx.use_gc_env): __ember_gc_alloc_env(env_size) returns a
+    //     heap env ptr pinned by ext_gc; captures copy into [ptr+offset];
+    //     env_ptr = the heap ptr (so the lambda CAN outlive this frame). The
+    //     env_ptr frame slot is registered as a GC root (add_gc_ptr_slot).
+    // By-ref capture (`fn[&x]`): the env slot holds the ADDRESS of the captured
+    // variable's storage (so the lambda sees post-capture mutations + writes
+    // mutate the original). By-value: the env slot holds a copy.
+    if (auto* le = dynamic_cast<const LambdaExpr*>(&ex)) {
+        const bool gc_env = ctx.use_gc_env && le->env_size > 0;
+        const Type* lty = ex.ty ? ex.ty : &type_i64();
+        int32_t env_off = 0;      // stack path: env bytes at [frame+env_off]
+        int32_t envptr_off = 0;   // gc path: 8-byte slot holding the heap env ptr
+
+        // ---- materialize the env (only when there are captures) ----
+        if (gc_env) {
+            // Reserve an 8-byte frame slot to hold the heap env ptr returned by
+            // __ember_gc_alloc_env (the env itself lives on the GC heap).
+            std::string name = "__envptr$" + std::to_string(temp_counter++);
+            envptr_off = alloc_local(name, &type_i64());
+            // Precise GC: envptr_off holds the heap env pointer (a GC object
+            // pointer) for this lambda's whole frame lifetime. Record it so the
+            // collector marks it as a root while the frame is live.
+            add_gc_ptr_slot(envptr_off);
+            // Call __ember_gc_alloc_env(env_size) -> env_ptr vreg.
+            const NativeSig* gsig = native_named("__ember_gc_alloc_env");
+            VReg env_ptr = new_vreg(&type_i64());
+            int32_t env_ptr_slot = alloc_local("__envptrt$" + std::to_string(temp_counter++), &type_i64());
+            ThinInstr in;
+            in.op = ThinOp::CallNative;
+            in.loc = loc;
+            in.dst = env_ptr;
+            VReg sz = new_vreg(&type_i64());
+            ThinInstr& sz_in = emit(ThinOp::ConstInt, sz, 0, 0, loc);
+            sz_in.imm.i = int64_t(le->env_size); sz_in.meta.type = &type_i64(); sz_in.meta.width = 8;
+            in.args.push_back(sz);
+            in.arg_frame_offs.push_back(-1);
+            in.arg_types.push_back(&type_i64());   // arg 0 = env size
+            in.meta.native_name = "__ember_gc_alloc_env";
+            in.native_fn = gsig ? gsig->fn_ptr : nullptr;
+            in.ret_type = &type_i64();
+            in.meta.type = &type_i64(); in.meta.width = 8;
+            in.meta.frame_off = env_ptr_slot;  // pin_int_dst stores the result here
+            emit_depth_check(loc);
+            cur_block().instrs.push_back(std::move(in));
+            // spill env_ptr to its frame slot immediately (further capture
+            // loads clobber volatile regs).
+            ThinInstr& sp = emit(ThinOp::StoreFrame, 0, env_ptr, 0, loc);
+            sp.meta.frame_off = envptr_off; sp.meta.type = &type_i64(); sp.meta.width = 8;
+            // copy each capture from its enclosing scope into [envptr + offset]
+            for (size_t i = 0; i < le->captures.size(); ++i) {
+                int32_t coff = le->capture_offsets[i];
+                const std::string& cname = le->captures[i];
+                const Type* ct = le->capture_types[i].get();
+                const bool inner_by_ref = i < le->capture_by_ref.size() && le->capture_by_ref[i];
+                auto cit = locals.find(cname);
+                if (cit != locals.end()) {
+                    int32_t loff = cit->second;
+                    if (inner_by_ref) {
+                        // store the ADDRESS of the frame slot into [envptr+coff].
+                        // FieldAddr(frame_off=0, field_off=loff) computes
+                        // x29 + loff WITHOUT spilling back to loff (the emit's
+                        // spill-back is gated on frame_off != 0, so the local's
+                        // storage is NOT corrupted). The result is left in x9
+                        // (not frame-backed); StoreAddr loads src2 (env_ptr)
+                        // first, which would clobber the address in x9, so spill
+                        // the address to a temp slot first (frame-backs it), then
+                        // StoreAddr recovers it from the slot.
+                        int32_t addr_spill = alloc_local("__capaddr$" + std::to_string(temp_counter++), &type_i64());
+                        VReg addr = new_vreg(&type_i64());
+                        ThinInstr& a = emit(ThinOp::FieldAddr, addr, 0, 0, loc);
+                        a.meta.frame_off = 0; a.meta.field_off = loff;
+                        a.meta.type = &type_i64(); a.meta.width = 8;
+                        ThinInstr& as = emit(ThinOp::StoreFrame, 0, addr, 0, loc);
+                        as.meta.frame_off = addr_spill; as.meta.type = &type_i64(); as.meta.width = 8;
+                        VReg ep2 = new_vreg(&type_i64());
+                        ThinInstr& epl = emit(ThinOp::LoadFrame, ep2, 0, 0, loc);
+                        epl.meta.frame_off = envptr_off; epl.meta.type = &type_i64(); epl.meta.width = 8;
+                        ThinInstr& s = emit(ThinOp::StoreAddr, 0, addr, ep2, loc);
+                        s.meta.frame_off = coff; s.meta.type = &type_i64(); s.meta.width = 8;
+                    } else if (ct && ct->is_float()) {
+                        VReg fv = new_vreg(ct);
+                        ThinInstr& fl = emit(ThinOp::LoadFrame, fv, 0, 0, loc);
+                        fl.meta.frame_off = loff; fl.meta.type = ct; fl.meta.width = value_bytes(ct, ctx.structs);
+                        fl.meta.is_f32 = (ct->prim == Prim::F32) ? 1 : 0;
+                        VReg ep2 = new_vreg(&type_i64());
+                        ThinInstr& epl = emit(ThinOp::LoadFrame, ep2, 0, 0, loc);
+                        epl.meta.frame_off = envptr_off; epl.meta.type = &type_i64(); epl.meta.width = 8;
+                        ThinInstr& s = emit(ThinOp::StoreAddr, 0, fv, ep2, loc);
+                        s.meta.frame_off = coff; s.meta.type = ct; s.meta.width = value_bytes(ct, ctx.structs);
+                        s.meta.is_f32 = (ct->prim == Prim::F32) ? 1 : 0;
+                    } else {
+                        VReg vv = new_vreg(ct ? ct : &type_i64());
+                        ThinInstr& vl = emit(ThinOp::LoadFrame, vv, 0, 0, loc);
+                        vl.meta.frame_off = loff; vl.meta.type = ct ? ct : &type_i64();
+                        vl.meta.width = value_bytes(ct, ctx.structs);
+                        VReg ep2 = new_vreg(&type_i64());
+                        ThinInstr& epl = emit(ThinOp::LoadFrame, ep2, 0, 0, loc);
+                        epl.meta.frame_off = envptr_off; epl.meta.type = &type_i64(); epl.meta.width = 8;
+                        ThinInstr& s = emit(ThinOp::StoreAddr, 0, vv, ep2, loc);
+                        s.meta.frame_off = coff; s.meta.type = ct ? ct : &type_i64(); s.meta.width = 8;
+                    }
+                    continue;
+                }
+                // #20 nested-lambda transitive capture: the value lives in THIS
+                // lambda's env (one of its own captures). Load it from
+                // [enclosing_env_ptr + cap_env_off] (the enclosing env_ptr is in
+                // [frame + lambda_env_off]) and store it into the new heap env.
+                auto lcit = compiling_lambda ? lambda_captures.find(cname)
+                                             : lambda_captures.end();
+                if (lcit != lambda_captures.end()) {
+                    int32_t cap_env_off = lcit->second.offset;
+                    bool outer_by_ref = lcit->second.by_ref;
+                    bool store_ptr = inner_by_ref && outer_by_ref && !(ct && ct->is_float());
+                    // enclosing env_ptr -> vreg
+                    VReg oenv = new_vreg(&type_i64());
+                    ThinInstr& oel = emit(ThinOp::LoadFrame, oenv, 0, 0, loc);
+                    oel.meta.frame_off = lambda_env_off; oel.meta.type = &type_i64(); oel.meta.width = 8;
+                    // new env ptr -> vreg (store base)
+                    VReg nep = new_vreg(&type_i64());
+                    ThinInstr& nepl = emit(ThinOp::LoadFrame, nep, 0, 0, loc);
+                    nepl.meta.frame_off = envptr_off; nepl.meta.type = &type_i64(); nepl.meta.width = 8;
+                    if (store_ptr) {
+                        // copy the POINTER: load ptr from [oenv + cap_env_off]
+                        VReg ptr = new_vreg(&type_i64());
+                        ThinInstr& pl = emit(ThinOp::LoadFrame, ptr, oenv, 0, loc);
+                        pl.meta.field_off = cap_env_off; pl.meta.type = &type_i64(); pl.meta.width = 8;
+                        ThinInstr& s = emit(ThinOp::StoreAddr, 0, ptr, nep, loc);
+                        s.meta.frame_off = coff; s.meta.type = &type_i64(); s.meta.width = 8;
+                    } else if (outer_by_ref) {
+                        // load ptr from [oenv + cap_env_off], then value at [ptr]
+                        VReg ptr = new_vreg(&type_i64());
+                        ThinInstr& pl = emit(ThinOp::LoadFrame, ptr, oenv, 0, loc);
+                        pl.meta.field_off = cap_env_off; pl.meta.type = &type_i64(); pl.meta.width = 8;
+                        if (ct && ct->is_float()) {
+                            VReg fv = new_vreg(ct);
+                            ThinInstr& fl = emit(ThinOp::LoadFrame, fv, ptr, 0, loc);
+                            fl.meta.field_off = 0; fl.meta.type = ct; fl.meta.width = value_bytes(ct, ctx.structs);
+                            fl.meta.is_f32 = (ct->prim == Prim::F32) ? 1 : 0;
+                            ThinInstr& s = emit(ThinOp::StoreAddr, 0, fv, nep, loc);
+                            s.meta.frame_off = coff; s.meta.type = ct; s.meta.width = value_bytes(ct, ctx.structs);
+                            s.meta.is_f32 = (ct->prim == Prim::F32) ? 1 : 0;
+                        } else {
+                            VReg vv = new_vreg(ct ? ct : &type_i64());
+                            ThinInstr& vl = emit(ThinOp::LoadFrame, vv, ptr, 0, loc);
+                            vl.meta.field_off = 0; vl.meta.type = ct ? ct : &type_i64();
+                            vl.meta.width = value_bytes(ct, ctx.structs);
+                            ThinInstr& s = emit(ThinOp::StoreAddr, 0, vv, nep, loc);
+                            s.meta.frame_off = coff; s.meta.type = ct ? ct : &type_i64(); s.meta.width = 8;
+                        }
+                    } else {
+                        // outer by-value: load the value from [oenv + cap_env_off]
+                        if (ct && ct->is_float()) {
+                            VReg fv = new_vreg(ct);
+                            ThinInstr& fl = emit(ThinOp::LoadFrame, fv, oenv, 0, loc);
+                            fl.meta.field_off = cap_env_off; fl.meta.type = ct; fl.meta.width = value_bytes(ct, ctx.structs);
+                            fl.meta.is_f32 = (ct->prim == Prim::F32) ? 1 : 0;
+                            ThinInstr& s = emit(ThinOp::StoreAddr, 0, fv, nep, loc);
+                            s.meta.frame_off = coff; s.meta.type = ct; s.meta.width = value_bytes(ct, ctx.structs);
+                            s.meta.is_f32 = (ct->prim == Prim::F32) ? 1 : 0;
+                        } else {
+                            VReg vv = new_vreg(ct ? ct : &type_i64());
+                            ThinInstr& vl = emit(ThinOp::LoadFrame, vv, oenv, 0, loc);
+                            vl.meta.field_off = cap_env_off; vl.meta.type = ct ? ct : &type_i64();
+                            vl.meta.width = value_bytes(ct, ctx.structs);
+                            ThinInstr& s = emit(ThinOp::StoreAddr, 0, vv, nep, loc);
+                            s.meta.frame_off = coff; s.meta.type = ct ? ct : &type_i64(); s.meta.width = 8;
+                        }
+                    }
+                    continue;
+                }
+                // unresolvable capture: zero-fill the heap env slot
+                VReg zero = new_vreg(&type_i64());
+                ThinInstr& zi = emit(ThinOp::ConstInt, zero, 0, 0, loc);
+                zi.imm.i = 0; zi.meta.type = &type_i64(); zi.meta.width = 8;
+                VReg nep = new_vreg(&type_i64());
+                ThinInstr& nepl = emit(ThinOp::LoadFrame, nep, 0, 0, loc);
+                nepl.meta.frame_off = envptr_off; nepl.meta.type = &type_i64(); nepl.meta.width = 8;
+                ThinInstr& s = emit(ThinOp::StoreAddr, 0, zero, nep, loc);
+                s.meta.frame_off = coff; s.meta.type = &type_i64(); s.meta.width = 8;
+            }
+        } else if (le->env_size > 0) {
+            // ---- stack-env backend (default) ----
+            // alloc a frame temp sized to env_size (rounded up to 8)
+            env_off = alloc_env_temp(le->env_size);
+            for (size_t i = 0; i < le->captures.size(); ++i) {
+                int32_t dst = env_off + le->capture_offsets[i];
+                const std::string& cname = le->captures[i];
+                const Type* ct = le->capture_types[i].get();
+                const bool inner_by_ref = i < le->capture_by_ref.size() && le->capture_by_ref[i];
+                auto cit = locals.find(cname);
+                if (cit != locals.end()) {
+                    int32_t loff = cit->second;
+                    if (inner_by_ref) {
+                        // store the ADDRESS of the frame slot into [frame+dst].
+                        // FieldAddr(frame_off=0, field_off=loff) computes
+                        // x29 + loff WITHOUT spilling back to loff (preserves
+                        // the captured local's storage). Result in x9; the
+                        // following StoreFrame consumes it.
+                        VReg addr = new_vreg(&type_i64());
+                        ThinInstr& a = emit(ThinOp::FieldAddr, addr, 0, 0, loc);
+                        a.meta.frame_off = 0; a.meta.field_off = loff;
+                        a.meta.type = &type_i64(); a.meta.width = 8;
+                        ThinInstr& s = emit(ThinOp::StoreFrame, 0, addr, 0, loc);
+                        s.meta.frame_off = dst; s.meta.type = &type_i64(); s.meta.width = 8;
+                    } else if (ct && ct->is_float()) {
+                        VReg fv = new_vreg(ct);
+                        ThinInstr& fl = emit(ThinOp::LoadFrame, fv, 0, 0, loc);
+                        fl.meta.frame_off = loff; fl.meta.type = ct; fl.meta.width = value_bytes(ct, ctx.structs);
+                        fl.meta.is_f32 = (ct->prim == Prim::F32) ? 1 : 0;
+                        ThinInstr& s = emit(ThinOp::StoreFrame, 0, fv, 0, loc);
+                        s.meta.frame_off = dst; s.meta.type = ct; s.meta.width = value_bytes(ct, ctx.structs);
+                        s.meta.is_f32 = (ct->prim == Prim::F32) ? 1 : 0;
+                    } else {
+                        VReg vv = new_vreg(ct ? ct : &type_i64());
+                        ThinInstr& vl = emit(ThinOp::LoadFrame, vv, 0, 0, loc);
+                        vl.meta.frame_off = loff; vl.meta.type = ct ? ct : &type_i64();
+                        vl.meta.width = value_bytes(ct, ctx.structs);
+                        ThinInstr& s = emit(ThinOp::StoreFrame, 0, vv, 0, loc);
+                        s.meta.frame_off = dst; s.meta.type = ct ? ct : &type_i64(); s.meta.width = 8;
+                    }
+                    continue;
+                }
+                // #20 nested-lambda transitive capture (stack env)
+                auto lcit = compiling_lambda ? lambda_captures.find(cname)
+                                             : lambda_captures.end();
+                if (lcit != lambda_captures.end()) {
+                    int32_t cap_env_off = lcit->second.offset;
+                    bool outer_by_ref = lcit->second.by_ref;
+                    bool store_ptr = inner_by_ref && outer_by_ref && !(ct && ct->is_float());
+                    VReg oenv = new_vreg(&type_i64());
+                    ThinInstr& oel = emit(ThinOp::LoadFrame, oenv, 0, 0, loc);
+                    oel.meta.frame_off = lambda_env_off; oel.meta.type = &type_i64(); oel.meta.width = 8;
+                    if (store_ptr) {
+                        VReg ptr = new_vreg(&type_i64());
+                        ThinInstr& pl = emit(ThinOp::LoadFrame, ptr, oenv, 0, loc);
+                        pl.meta.field_off = cap_env_off; pl.meta.type = &type_i64(); pl.meta.width = 8;
+                        ThinInstr& s = emit(ThinOp::StoreFrame, 0, ptr, 0, loc);
+                        s.meta.frame_off = dst; s.meta.type = &type_i64(); s.meta.width = 8;
+                    } else if (outer_by_ref) {
+                        VReg ptr = new_vreg(&type_i64());
+                        ThinInstr& pl = emit(ThinOp::LoadFrame, ptr, oenv, 0, loc);
+                        pl.meta.field_off = cap_env_off; pl.meta.type = &type_i64(); pl.meta.width = 8;
+                        if (ct && ct->is_float()) {
+                            VReg fv = new_vreg(ct);
+                            ThinInstr& fl = emit(ThinOp::LoadFrame, fv, ptr, 0, loc);
+                            fl.meta.field_off = 0; fl.meta.type = ct; fl.meta.width = value_bytes(ct, ctx.structs);
+                            fl.meta.is_f32 = (ct->prim == Prim::F32) ? 1 : 0;
+                            ThinInstr& s = emit(ThinOp::StoreFrame, 0, fv, 0, loc);
+                            s.meta.frame_off = dst; s.meta.type = ct; s.meta.width = value_bytes(ct, ctx.structs);
+                            s.meta.is_f32 = (ct->prim == Prim::F32) ? 1 : 0;
+                        } else {
+                            VReg vv = new_vreg(ct ? ct : &type_i64());
+                            ThinInstr& vl = emit(ThinOp::LoadFrame, vv, ptr, 0, loc);
+                            vl.meta.field_off = 0; vl.meta.type = ct ? ct : &type_i64();
+                            vl.meta.width = value_bytes(ct, ctx.structs);
+                            ThinInstr& s = emit(ThinOp::StoreFrame, 0, vv, 0, loc);
+                            s.meta.frame_off = dst; s.meta.type = ct ? ct : &type_i64(); s.meta.width = 8;
+                        }
+                    } else {
+                        if (ct && ct->is_float()) {
+                            VReg fv = new_vreg(ct);
+                            ThinInstr& fl = emit(ThinOp::LoadFrame, fv, oenv, 0, loc);
+                            fl.meta.field_off = cap_env_off; fl.meta.type = ct; fl.meta.width = value_bytes(ct, ctx.structs);
+                            fl.meta.is_f32 = (ct->prim == Prim::F32) ? 1 : 0;
+                            ThinInstr& s = emit(ThinOp::StoreFrame, 0, fv, 0, loc);
+                            s.meta.frame_off = dst; s.meta.type = ct; s.meta.width = value_bytes(ct, ctx.structs);
+                            s.meta.is_f32 = (ct->prim == Prim::F32) ? 1 : 0;
+                        } else {
+                            VReg vv = new_vreg(ct ? ct : &type_i64());
+                            ThinInstr& vl = emit(ThinOp::LoadFrame, vv, oenv, 0, loc);
+                            vl.meta.field_off = cap_env_off; vl.meta.type = ct ? ct : &type_i64();
+                            vl.meta.width = value_bytes(ct, ctx.structs);
+                            ThinInstr& s = emit(ThinOp::StoreFrame, 0, vv, 0, loc);
+                            s.meta.frame_off = dst; s.meta.type = ct ? ct : &type_i64(); s.meta.width = 8;
+                        }
+                    }
+                    continue;
+                }
+                // unresolvable capture: zero-fill the env slot
+                VReg zero = new_vreg(&type_i64());
+                ThinInstr& zi = emit(ThinOp::ConstInt, zero, 0, 0, loc);
+                zi.imm.i = 0; zi.meta.type = &type_i64(); zi.meta.width = 8;
+                ThinInstr& s = emit(ThinOp::StoreFrame, 0, zero, 0, loc);
+                s.meta.frame_off = dst; s.meta.type = &type_i64(); s.meta.width = 8;
+            }
+        }
+        // Build the {slot, env_ptr} value as 2 consecutive vregs (slice ABI).
+        // Store both words into a 16-byte temp slot, then load the slice from
+        // it (load_scalar_local produces 2 frame-backed vregs). This avoids
+        // the FieldAddr op's result-spill-to-frame_off semantics (which would
+        // corrupt the env region) + ensures both words are durably frame-backed
+        // for any consumer (StoreFrame to a local, a lambda call, etc.).
+        int32_t lam_slot = alloc_local("__lamval$" + std::to_string(temp_counter++), lty);
+        // slot word. The slot is an i64 fn-handle value (the dispatch slot),
+        // NOT a 2-word lambda value — the env_ptr word is stored separately
+        // below. Store it as a SCALAR i64 (type=&type_i64()), NOT lty (the
+        // lambda type): a StoreFrame with meta.type = lty triggers the emit's
+        // slice/lambda 2-word store path, which loads src1 AND src1+1 (the
+        // not-yet-materialized env_ptr word) and writes garbage into the
+        // env_ptr half of the lambda value. That left the callee receiving
+        // env_ptr = the captured VALUE (e.g. 40) instead of the env region
+        // address, so the body's [env_ptr+offset] load dereferenced 40
+        // (EXC_BAD_ACCESS at 0x28). The 16-byte lam_slot is still allocated
+        // with lty (so the trailing load_scalar_local loads both words as a
+        // slice); only THIS word's store is scalar.
+        {
+            VReg sv = new_vreg(&type_i64());
+            ThinInstr& si = emit(ThinOp::ConstInt, sv, 0, 0, loc);
+            si.imm.i = int64_t(le->slot); si.meta.type = &type_i64(); si.meta.width = 8;
+            ThinInstr& ss = emit(ThinOp::StoreFrame, 0, sv, 0, loc);
+            ss.meta.frame_off = lam_slot; ss.meta.type = &type_i64(); ss.meta.width = 8;
+        }
+        // env_ptr word
+        if (gc_env) {
+            // env_ptr = load the heap ptr from its frame slot, store to lam_slot+8
+            VReg ep = new_vreg(&type_i64());
+            ThinInstr& el = emit(ThinOp::LoadFrame, ep, 0, 0, loc);
+            el.meta.frame_off = envptr_off; el.meta.type = &type_i64(); el.meta.width = 8;
+            ThinInstr& es = emit(ThinOp::StoreFrame, 0, ep, 0, loc);
+            es.meta.frame_off = lam_slot + 8; es.meta.type = &type_i64(); es.meta.width = 8;
+        } else if (le->env_size > 0) {
+            // env_ptr = address of the stack env region [frame + env_off].
+            // FieldAddr with frame_off=0 + field_off=env_off computes
+            // x29 + env_off WITHOUT spilling the result back to env_off (the
+            // emit's spill-back is gated on frame_off != 0). The result stays
+            // in x9; the immediately-following StoreFrame consumes it.
+            VReg addr = new_vreg(&type_i64());
+            ThinInstr& a = emit(ThinOp::FieldAddr, addr, 0, 0, loc);
+            a.meta.frame_off = 0; a.meta.field_off = env_off;
+            a.meta.type = &type_i64(); a.meta.width = 8;
+            ThinInstr& as = emit(ThinOp::StoreFrame, 0, addr, 0, loc);
+            as.meta.frame_off = lam_slot + 8; as.meta.type = &type_i64(); as.meta.width = 8;
+        } else {
+            VReg z = new_vreg(&type_i64());
+            ThinInstr& zi = emit(ThinOp::ConstInt, z, 0, 0, loc);
+            zi.imm.i = 0; zi.meta.type = &type_i64(); zi.meta.width = 8;
+            ThinInstr& zs = emit(ThinOp::StoreFrame, 0, z, 0, loc);
+            zs.meta.frame_off = lam_slot + 8; zs.meta.type = &type_i64(); zs.meta.width = 8;
+        }
+        if (non_serializable_reason.empty())
+            non_serializable_reason = gc_env
+                ? "lambda env is a GC heap allocation (process-local pin)"
+                : "lambda env is a stack-frame-local allocation";
+        // load the {slot, env_ptr} slice from the temp slot (2 frame-backed vregs)
+        return load_scalar_local(lam_slot, lty, loc);
+    }
     if (auto* h = dynamic_cast<const FnHandleExpr*>(&ex)) {
         if (h->is_cross_module) {
-            // ThinIR has no cross-module indirect-dispatch representation or
-            // bit-63-aware call-target guard. Never turn the sema sentinel
-            // h->slot == -1 into executable IR; force compile_func to use the
-            // tree backend, which emits and validates the full tagged handle.
-            non_serializable = true;
-            non_serializable_reason =
-                "cross-module function handle requires tree-walker dispatch";
-            return { LoweredValue::Scalar, 0, 0,
-                     ex.ty ? ex.ty : &type_i64() };
+            // v1.0 Tier 2 cross-module handles (plan_MACOS_ARM64.md Phase 8):
+            // sema stamped cross_module_id + cross_module_slot from the linked-
+            // module export table. Bake the packed handle as a ConstInt, exactly
+            // as the tree-walker does (codegen.cpp FnHandleExpr eval):
+            //   handle = (1<<63) | (module_id << 32) | slot
+            // Bit 63 is the cross-module flag (an intra-module handle is a bare
+            // slot, never bit 63 set, so the spaces never collide). The handle
+            // is an i64 (is_fn_handle type). The CALL through it lowers to a
+            // CallIndirect with this vreg as src1; emit_arm64's CallTargetGuard
+            // tests bit 63 to skip the intra-module allowlist, and
+            // emit_indirect_call tests bit 63 again to dispatch via the module
+            // registry (ModuleRegistryBase -> [mod_id*8] -> [slot*8] -> blr) +
+            // validate via the handle-records table. The process-local
+            // records/registry bases make this non-serializable to .em (the
+            // same constraint as the intra-module allowlist).
+            uint64_t handle = (uint64_t(1) << 63)
+                            | (uint64_t(h->cross_module_id) << 32)
+                            | uint64_t(uint32_t(h->cross_module_slot));
+            VReg v = new_vreg(ex.ty ? ex.ty : &type_i64());
+            ThinInstr& in = emit(ThinOp::ConstInt, v, 0, 0, loc);
+            in.imm.i = int64_t(handle);
+            in.meta.type = ex.ty ? ex.ty : &type_i64();
+            in.meta.width = 8;
+            if (non_serializable_reason.empty())
+                non_serializable_reason =
+                    "cross-module function handle requires process-local module-records storage";
+            return { LoweredValue::Scalar, v, 0, ex.ty ? ex.ty : &type_i64() };
         }
         VReg v = new_vreg(ex.ty ? ex.ty : &type_i64());
         ThinInstr& in = emit(ThinOp::ConstInt, v, 0, 0, loc);
@@ -2234,10 +3001,25 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
                 ia.src1 = 0;
                 ia.meta.frame_off = base_off;
             }
-            // LoadFrame from [element_addr + field_off] (src1=addr -> [r11+off]).
+            // LoadFrame from [element_addr + field_off]. The computed-address
+            // LoadFrame convention (shared by emit_x64 + emit_arm64, and by the
+            // lambda-capture LoadFrame sites above) is: src1 = the address vreg,
+            // meta.field_off = the within-base displacement (the field offset),
+            // meta.frame_off = a SEPARATE spill slot for the loaded RESULT (0 =
+            // none yet; the post-lowering spill pass assigns one below).
+            //
+            // gap 2j root cause: this previously set meta.frame_off = field_off,
+            // which (a) made emit read the wrong displacement (it uses field_off,
+            // which was left at 0, so `arr[1].b` read `arr[1].a`) and (b) made
+            // pin_int_dst spill the RESULT to [x29 + field_off] — overwriting
+            // the saved return address (x30 at [x29+8]) for field_off==8 and
+            // crashing the epilogue's `ret`. Setting frame_off=0 lets the spill
+            // pass assign a real result slot, and field_off carries the field
+            // displacement so the load reads [addr + field_off].
             VReg res = new_vreg(ft);
             ThinInstr& ld = emit(ThinOp::LoadFrame, res, 0, 0, loc);
-            ld.src1 = addr; ld.meta.frame_off = field_off; ld.meta.type = ft;
+            ld.src1 = addr; ld.meta.field_off = field_off; ld.meta.frame_off = 0;
+            ld.meta.type = ft;
             ld.meta.width = value_bytes(ft, ctx.structs);
             if (ft && ft->is_float()) ld.meta.is_f32 = (ft->prim == Prim::F32) ? 1 : 0;
             return { LoweredValue::Scalar, res, 0, ft };
@@ -2310,6 +3092,44 @@ LoweredValue ThinLowerer::lower_expr(const Expr& ex) {
 // store an rvalue (lv) into an assignment target (Ident / IndexExpr / FieldExpr)
 void ThinLowerer::store_to_target(const Expr& target, const LoweredValue& lv, Loc loc) {
     if (auto* id = dynamic_cast<const Ident*>(&target)) {
+        // #20 lambda capture write: if compiling a lambda fn + this name is a
+        // capture, store through the env slot. by_ref: the env slot holds a
+        // POINTER to the captured storage -> load the ptr, store the value
+        // through [ptr] (mutates the original). by-value: store into the env
+        // slot directly (defensive; sema marks by-value captures const).
+        // Mirrors CG (codegen.cpp:3170-3240). v1: captures are scalars.
+        if (compiling_lambda) {
+            auto cit = lambda_captures.find(id->name);
+            if (cit != lambda_captures.end()) {
+                int32_t env_off = cit->second.offset;
+                const Type* ct = cit->second.ty;
+                bool by_ref = cit->second.by_ref;
+                // load env_ptr from [frame + lambda_env_off]
+                VReg env_ptr = new_vreg(&type_i64());
+                ThinInstr& ep = emit(ThinOp::LoadFrame, env_ptr, 0, 0, loc);
+                ep.meta.frame_off = lambda_env_off; ep.meta.type = &type_i64();
+                ep.meta.width = 8;
+                if (by_ref) {
+                    // load the pointer from [env_ptr + env_off]
+                    VReg ptr = new_vreg(&type_i64());
+                    ThinInstr& pp = emit(ThinOp::LoadFrame, ptr, env_ptr, 0, loc);
+                    pp.meta.field_off = env_off; pp.meta.type = &type_i64();
+                    pp.meta.width = 8;
+                    // store the value through [ptr + 0]
+                    ThinInstr& s = emit(ThinOp::StoreAddr, 0, lv.vreg, ptr, loc);
+                    s.meta.frame_off = 0; s.meta.type = ct;
+                    s.meta.width = value_bytes(ct, ctx.structs);
+                    if (ct && ct->is_float()) s.meta.is_f32 = (ct->prim == Prim::F32) ? 1 : 0;
+                    return;
+                }
+                // by-value: store into [env_ptr + env_off]
+                ThinInstr& s = emit(ThinOp::StoreAddr, 0, lv.vreg, env_ptr, loc);
+                s.meta.frame_off = env_off; s.meta.type = ct;
+                s.meta.width = value_bytes(ct, ctx.structs);
+                if (ct && ct->is_float()) s.meta.is_f32 = (ct->prim == Prim::F32) ? 1 : 0;
+                return;
+            }
+        }
         auto it = locals.find(id->name);
         if (it != locals.end()) {
             store_scalar_local(lv, it->second, loc);
@@ -2580,6 +3400,27 @@ LoweredValue ThinLowerer::lower_call(const CallExpr& c, int32_t hidden_dest_off,
         in.op = ThinOp::CallNative;
         in.meta.native_name = c.native_binding_name;
         in.native_fn = c.native_fn;
+        // Stamp the BINDING signature from the canonical NativeSig (looked up
+        // by the binding name), NOT the AST operand types built above. The .em
+        // native-binding signature is checked against the live NativeSig at
+        // load time (em_loader.cpp signature mismatch), and the two can differ:
+        // a slice param is ONE NativeSig param (slice<u8>) but TWO placement
+        // words ({ptr,len}={i64,i64}) in args[], and a `string` handle operand
+        // is i64+struct_name in the AST but plain i64 in the NativeSig. So the
+        // binding must carry the canonical NativeSig params (one per logical
+        // param), while args[]/arg_frame_offs[] keep the flattened placement
+        // words. emit's placement loop consumes the slice's second vreg via the
+        // is_slice ++i path and the struct-by-value sentinel via the v==0 &&
+        // afo!=-1 path. Mirrors the tree-walker (codegen.cpp
+        // emit_counted_named_native -> &sig->params). Skipped for struct-by-
+        // ptr returns (the hidden dest occupies args[0]/arg_types[0]; that
+        // ABI-experimental native shape is not shipped through .em IR).
+        if (!ret_struct) {
+            if (const NativeSig* nsig = native_named(c.native_binding_name)) {
+                in.arg_types.clear();
+                for (const Type& p : nsig->params) in.arg_types.push_back(&p);
+            }
+        }
         emit_depth_check(loc);
     } else if (!c.module_alias.empty()) {
         in.op = ThinOp::CallCrossModule;
@@ -2635,7 +3476,16 @@ void ThinLowerer::lower_block(const Block& b) {
         }
     }
     for (auto& s : b.stmts) lower_stmt(*s);
-    emit_cleanup_scope(cleanup_scopes.size() - 1, b.stmts.empty() ? Loc{} : b.stmts.back()->loc);
+    // The trailing cleanup runs on normal block fallthrough ONLY. If the block
+    // already terminated (Return/Break/Continue/Trap), the terminator path ran
+    // the cleanups via emit_cleanups_to — emitting again would overwrite the
+    // block's terminator (emit_defer_site sets a Branch term) and re-run the
+    // defer (the defer double-fire bug). The tree-walker emits this trailing
+    // cleanup as dead code after a `ret` (unreachable); the IR cannot, because
+    // a Block term is a single structured terminator, not a linear `ret`.
+    // Skip when the current block already has a terminator.
+    if (cur_block().term.kind == TermKind::None)
+        emit_cleanup_scope(cleanup_scopes.size() - 1, b.stmts.empty() ? Loc{} : b.stmts.back()->loc);
     cleanup_scopes.pop_back();
     locals = std::move(saved_locals);
     local_types = std::move(saved_types);
@@ -2747,6 +3597,50 @@ void ThinLowerer::lower_stmt(const Stmt& s) {
         return;
     }
     if (auto* es = dynamic_cast<const ExprStmt*>(&s)) { lower_expr(*es->expr); return; }
+    // #21 coroutines (plan_MACOS_ARM64.md Phase 8): yield lowers to a 1-arg
+    // CallNative to __ember_coro_yield(i64) -> i64. The native performs the
+    // cooperative context switch (ember_ctx_switch on Darwin / SwitchToFiber
+    // on Windows); on resume it returns and the fn continues after this stmt.
+    // Sema guarantees the enclosing fn is a coroutine + the yield value type
+    // matches coroutine_yield_type (i64 for v1). A void yield (`yield;`)
+    // passes 0. The native's i64 return is discarded (the value is stashed on
+    // the coroutine, not returned through x0) — mirrors the tree-walker.
+    if (auto* ys = dynamic_cast<const YieldStmt*>(&s)) {
+        VReg arg;
+        if (ys->value) {
+            LoweredValue vv = lower_expr(*ys->value);
+            arg = vv.vreg;
+        } else {
+            arg = new_vreg(&type_i64());
+            ThinInstr& z = emit(ThinOp::ConstInt, arg, 0, 0, loc);
+            z.imm.i = 0; z.meta.type = &type_i64(); z.meta.width = 8;
+        }
+        // Resolve the __ember_coro_yield native (sema registered it via
+        // ext_coroutine::register_natives). emit resolves by name too, so a
+        // null fn_ptr is tolerable; stamping it avoids the emit-time lookup.
+        void* yield_fn = nullptr;
+        if (ctx.natives) {
+            auto it = ctx.natives->find("__ember_coro_yield");
+            if (it != ctx.natives->end()) yield_fn = it->second.fn_ptr;
+        }
+        VReg res = new_vreg(&type_i64());
+        ThinInstr in;
+        in.op = ThinOp::CallNative;
+        in.loc = loc;
+        in.dst = res;
+        in.args.push_back(arg);
+        in.arg_frame_offs.push_back(-1);
+        in.arg_types.push_back(&type_i64());
+        in.meta.native_name = "__ember_coro_yield";
+        in.native_fn = yield_fn;
+        in.ret_type = &type_i64();
+        in.meta.type = &type_i64(); in.meta.width = 8;
+        emit_depth_check(loc);
+        cur_block().instrs.push_back(std::move(in));
+        // res (the native's discarded i64 return) is left unused — the value
+        // was stashed on the coroutine by the native. Continue to the next stmt.
+        return;
+    }
     if (auto* ds = dynamic_cast<const DeferStmt*>(&s)) {
         auto it = defer_site_indices.find(ds);
         if (it != defer_site_indices.end()) {
@@ -2789,6 +3683,12 @@ void ThinLowerer::lower_stmt(const Stmt& s) {
                     copy_frame_vptr(hptr, temp_off, struct_size(f.ret.get()), loc);
                 }
             }
+            // If the return-value expression already terminated this block
+            // (e.g. an unresolved cross-module call baked a Trap term), the
+            // block is unreachable — the trap longjmps past defer cleanups,
+            // matching the tree-walker's inline-trap semantics. Do not emit
+            // cleanups or a Return term over the Trap.
+            if (cur_block().term.kind != TermKind::None) return;
             if (has_defers) emit_cleanups_to(0, loc);
             emit_catch_unwind(0, loc);
             VReg ret = new_vreg(&type_i64());
@@ -2801,21 +3701,34 @@ void ThinLowerer::lower_stmt(const Stmt& s) {
         bool is_slice_ret = f.ret && f.ret->is_slice;
         LoweredValue rv;
         if (rs->value) rv = lower_expr(*rs->value);
+        // If the return-value expression already terminated this block (e.g. an
+        // unresolved cross-module call baked a Trap term), the block is
+        // unreachable — skip the defer cleanups + Return term (the trap
+        // longjmps past the cleanups, matching the tree-walker inline-trap).
+        if (cur_block().term.kind != TermKind::None) return;
         if (has_defers && rs->value) {
             // The tree-walker stashes the return value(s) across defer cleanup (a defer's
             // expression may clobber rax/xmm0/rdx). In the IR we Move the return vregs into
             // fresh stable vregs BEFORE cleanups, run cleanups, then Return the saved ones.
+            // CRITICAL: the save vregs MUST be frame-backed (a Move dst with no frame_off
+            // is lost — emit_arm64's Move stores to meta.frame_off). Allocate a frame
+            // slot for the saved value + set the Move's frame_off so it persists across
+            // the cleanup calls (which clobber the return registers). plan_MACOS_ARM64.md
+            // Phase 6e: this fixed return_slice_defer (slice return + defer SIGSEGV).
             VReg save_v = 0;
             if (is_slice_ret) {
+                int32_t slot = alloc_local("__retsave$slice", rv.ty ? rv.ty : &type_i64());
                 save_v = new_vreg(rv.ty);
                 VReg save_len = new_vreg(&type_i64());
-                ThinInstr& m1 = emit(ThinOp::Move, save_v, rv.vreg, 0, loc); m1.meta.type = rv.ty; m1.meta.width = 8;
-                ThinInstr& m2 = emit(ThinOp::Move, save_len, rv.vreg + 1, 0, loc); m2.meta.type = &type_i64(); m2.meta.width = 8;
+                ThinInstr& m1 = emit(ThinOp::Move, save_v, rv.vreg, 0, loc); m1.meta.type = rv.ty; m1.meta.width = 8; m1.meta.frame_off = slot;
+                ThinInstr& m2 = emit(ThinOp::Move, save_len, rv.vreg + 1, 0, loc); m2.meta.type = &type_i64(); m2.meta.width = 8; m2.meta.frame_off = slot + 8;
                 (void)save_len;  // slice len = save_v+1 (consecutive vregs, slice convention)
             } else {
+                int32_t slot = alloc_local("__retsave$scalar", rv.ty ? rv.ty : &type_i64());
                 save_v = new_vreg(rv.ty);
                 ThinInstr& m = emit(ThinOp::Move, save_v, rv.vreg, 0, loc);
                 m.meta.type = rv.ty; m.meta.width = value_bytes(rv.ty, ctx.structs);
+                m.meta.frame_off = slot;
                 if (is_float_ret) m.meta.is_f32 = (rv.ty && rv.ty->prim == Prim::F32) ? 1 : 0;
             }
             emit_cleanups_to(0, loc);
@@ -2976,6 +3889,241 @@ void ThinLowerer::lower_stmt(const Stmt& s) {
         local_types = std::move(saved_types);
         return;
     }
+    if (auto* fe = dynamic_cast<const ForEachStmt*>(&s)) {
+        // for (x in iter) { body } — desugars to a while loop (mirrors CG::exec_stmt
+        // ForEachStmt at line ~4668). Two iterable kinds:
+        //   - array<T> handle (fe->array_elem_ty set): array_length(h) +
+        //     array_get_*(h, i) natives.
+        //   - slice T[] (no array_elem_ty): ptr+len indexing via IndexAddr.
+        // Both share the loop shape: alloc (handle|ptr)/len/idx/var frame slots,
+        // eval the iterable, i=0; while (i < len) { x = elem[i]; body; i++; }.
+        if (fe->array_elem_ty) {
+            // ---- array-handle for-each ----
+            const Type* elem_ty = fe->array_elem_ty;
+            const char* get_name =
+                (elem_ty->prim == Prim::U8)  ? "array_get_u8"  :
+                (elem_ty->prim == Prim::F32) ? "array_get_f32" :
+                /* I64 default */              "array_get_i64";
+            // Look up the native fn ptrs from ctx.natives (the array extension
+            // registers array_length + array_get_* together). The emit resolves
+            // by name too (resolve_native_ptr), so a null fn_ptr is tolerable;
+            // stamping it avoids a name lookup at emit time.
+            void* len_fn = nullptr; void* get_fn = nullptr;
+            if (ctx.natives) {
+                auto lk = ctx.natives->find("array_length");
+                if (lk != ctx.natives->end()) len_fn = lk->second.fn_ptr;
+                auto gk = ctx.natives->find(get_name);
+                if (gk != ctx.natives->end()) get_fn = gk->second.fn_ptr;
+            }
+            int fe_id = fe_counter++;
+            int32_t h_off   = alloc_local("__fe_h$"   + std::to_string(fe_id), &type_i64());
+            int32_t len_off = alloc_local("__fe_len$" + std::to_string(fe_id), &type_i64());
+            int32_t idx_off = alloc_local("__fe_idx$" + std::to_string(fe_id), &type_i64());
+            int32_t var_off = alloc_local(fe->var, elem_ty);
+            // Evaluate the iterable -> the i64 array handle; store to h_off.
+            LoweredValue iter_v = lower_expr(*fe->iter);
+            store_scalar_local(iter_v, h_off, loc);
+            // len = array_length(h). CallNative(h) -> i64.
+            {
+                VReg h = new_vreg(&type_i64());
+                ThinInstr& ld = emit(ThinOp::LoadFrame, h, 0, 0, loc);
+                ld.meta.frame_off = h_off; ld.meta.type = &type_i64(); ld.meta.width = 8;
+                VReg len_res = new_vreg(&type_i64());
+                ThinInstr in;
+                in.op = ThinOp::CallNative;
+                in.loc = loc;
+                in.dst = len_res;
+                in.args.push_back(h);
+                in.arg_frame_offs.push_back(-1);
+                in.arg_types.push_back(&type_i64());
+                in.meta.native_name = "array_length";
+                in.native_fn = len_fn;
+                in.ret_type = &type_i64();
+                in.meta.type = &type_i64(); in.meta.width = 8;
+                emit_depth_check(loc);
+                cur_block().instrs.push_back(std::move(in));
+                ThinInstr& st = emit(ThinOp::StoreFrame, 0, len_res, 0, loc);
+                st.meta.frame_off = len_off; st.meta.type = &type_i64(); st.meta.width = 8;
+            }
+            // i = 0.
+            {
+                VReg zero = new_vreg(&type_i64());
+                ThinInstr& z = emit(ThinOp::ConstInt, zero, 0, 0, loc); z.imm.i = 0; z.meta.type = &type_i64(); z.meta.width = 8;
+                ThinInstr& st = emit(ThinOp::StoreFrame, 0, zero, 0, loc);
+                st.meta.frame_off = idx_off; st.meta.type = &type_i64(); st.meta.width = 8;
+            }
+            uint32_t top = new_block(), body_bb = new_block(), latch = new_block(), exit_bb = new_block();
+            if (cur_block().term.kind == TermKind::None) set_term_jmp(top);
+            // top: while (i < len)
+            enter_block(top);
+            {
+                VReg idx = new_vreg(&type_i64());
+                ThinInstr& li = emit(ThinOp::LoadFrame, idx, 0, 0, loc);
+                li.meta.frame_off = idx_off; li.meta.type = &type_i64(); li.meta.width = 8;
+                VReg len = new_vreg(&type_i64());
+                ThinInstr& ll = emit(ThinOp::LoadFrame, len, 0, 0, loc);
+                ll.meta.frame_off = len_off; ll.meta.type = &type_i64(); ll.meta.width = 8;
+                VReg cond = new_vreg(&type_bool());
+                ThinInstr& c = emit(ThinOp::Cmp, cond, idx, len, loc);
+                c.meta.cmp = 2;  // Lt
+                c.meta.type = &type_i64(); c.meta.width = 8;
+                c.meta.is_unsigned = 1;  // idx/len are non-negative; unsigned lt
+                set_term_branch(cond, body_bb, exit_bb);  // i<len -> body, else exit
+            }
+            // body_bb: x = array_get_*(h, i); lower body
+            enter_block(body_bb);
+            {
+                VReg h = new_vreg(&type_i64());
+                ThinInstr& ld = emit(ThinOp::LoadFrame, h, 0, 0, loc);
+                ld.meta.frame_off = h_off; ld.meta.type = &type_i64(); ld.meta.width = 8;
+                VReg idx = new_vreg(&type_i64());
+                ThinInstr& li = emit(ThinOp::LoadFrame, idx, 0, 0, loc);
+                li.meta.frame_off = idx_off; li.meta.type = &type_i64(); li.meta.width = 8;
+                const Type* ret_ty = elem_ty;
+                VReg res = new_vreg(ret_ty);
+                ThinInstr in;
+                in.op = ThinOp::CallNative;
+                in.loc = loc;
+                in.dst = res;
+                in.args.push_back(h);
+                in.args.push_back(idx);
+                in.arg_frame_offs.push_back(-1);
+                in.arg_frame_offs.push_back(-1);
+                in.arg_types.push_back(&type_i64());
+                in.arg_types.push_back(&type_i64());
+                in.meta.native_name = get_name;
+                in.native_fn = get_fn;
+                in.ret_type = ret_ty;
+                in.meta.type = ret_ty; in.meta.width = value_bytes(ret_ty, ctx.structs);
+                if (ret_ty->is_float()) in.meta.is_f32 = (ret_ty->prim == Prim::F32) ? 1 : 0;
+                emit_depth_check(loc);
+                cur_block().instrs.push_back(std::move(in));
+                LoweredValue elem_lv{ LoweredValue::Scalar, res, 0, ret_ty };
+                store_scalar_local(elem_lv, var_off, loc);
+                loops.push_back({latch, exit_bb, false, cleanup_scopes.size(), active_try_depth});
+                lower_block(fe->body);
+                loops.pop_back();
+                if (cur_block().term.kind == TermKind::None) set_term_jmp(latch);
+            }
+            // latch: i = i + 1; budget back-edge; jmp top
+            enter_block(latch);
+            {
+                VReg idx = new_vreg(&type_i64());
+                ThinInstr& li = emit(ThinOp::LoadFrame, idx, 0, 0, loc);
+                li.meta.frame_off = idx_off; li.meta.type = &type_i64(); li.meta.width = 8;
+                VReg one = new_vreg(&type_i64());
+                ThinInstr& o = emit(ThinOp::ConstInt, one, 0, 0, loc); o.imm.i = 1; o.meta.type = &type_i64(); o.meta.width = 8;
+                VReg inc = new_vreg(&type_i64());
+                ThinInstr& a = emit(ThinOp::Add, inc, idx, one, loc);
+                a.meta.type = &type_i64(); a.meta.width = 8;
+                ThinInstr& st = emit(ThinOp::StoreFrame, 0, inc, 0, loc);
+                st.meta.frame_off = idx_off; st.meta.type = &type_i64(); st.meta.width = 8;
+                emit_budget_check(block_cost(fe->body), loc);
+                set_term_jmp(top);
+            }
+            enter_block(exit_bb);
+            return;
+        }
+        // ---- slice for-each ----
+        // The iter is a slice {ptr, len}; x gets the element at [ptr + idx*esz].
+        // The slice is stored as a contiguous 16-byte {ptr,len} frame slot so the
+        // StoreFrame/LoadFrame slice path (meta.type = slice) is used — the
+        // MakeSlice/ViewExpr result lives in {x0,x1} and is NOT frame-backed, so
+        // storing it requires the slice-aware StoreFrame (a no-op load_slice_vreg
+        // that trusts {x0,x1}), not a plain i64 StoreFrame (which would try to
+        // reload ptr from x9 = garbage).
+        const Type* iter_ty = fe->iter->ty;
+        const Type* elem_ty = iter_ty && iter_ty->elem ? iter_ty->elem.get() : nullptr;
+        int32_t esz = value_bytes(elem_ty, ctx.structs);
+        if (esz <= 0) esz = 8;
+        int fe_id = fe_counter++;
+        int32_t slice_off = alloc_local("__fe_slice$" + std::to_string(fe_id),
+                                        iter_ty ? iter_ty : &type_i64());  // 16-byte {ptr,len}
+        int32_t idx_off = alloc_local("__fe_idx$" + std::to_string(fe_id), &type_i64());
+        int32_t var_off = alloc_local(fe->var, elem_ty ? elem_ty : &type_i64());
+        // Evaluate the iterable -> {ptr, len}; store the slice to slice_off.
+        LoweredValue iter_v = lower_expr(*fe->iter);
+        if (iter_v.kind == LoweredValue::Slice) {
+            store_scalar_local(iter_v, slice_off, loc);  // stores {ptr@off, len@off+8}
+        } else {
+            // non-slice iterable (defensive): store the scalar as ptr, 0 len.
+            store_scalar_local(iter_v, slice_off, loc);
+            VReg zero = new_vreg(&type_i64());
+            ThinInstr& z = emit(ThinOp::ConstInt, zero, 0, 0, loc); z.imm.i = 0; z.meta.type = &type_i64(); z.meta.width = 8;
+            ThinInstr& sl = emit(ThinOp::StoreFrame, 0, zero, 0, loc);
+            sl.meta.frame_off = slice_off + 8; sl.meta.type = &type_i64(); sl.meta.width = 8;
+        }
+        // i = 0.
+        {
+            VReg zero = new_vreg(&type_i64());
+            ThinInstr& z = emit(ThinOp::ConstInt, zero, 0, 0, loc); z.imm.i = 0; z.meta.type = &type_i64(); z.meta.width = 8;
+            ThinInstr& st = emit(ThinOp::StoreFrame, 0, zero, 0, loc);
+            st.meta.frame_off = idx_off; st.meta.type = &type_i64(); st.meta.width = 8;
+        }
+        uint32_t top = new_block(), body_bb = new_block(), latch = new_block(), exit_bb = new_block();
+        if (cur_block().term.kind == TermKind::None) set_term_jmp(top);
+        // top: while (i < len)
+        enter_block(top);
+        {
+            VReg idx = new_vreg(&type_i64());
+            ThinInstr& li = emit(ThinOp::LoadFrame, idx, 0, 0, loc);
+            li.meta.frame_off = idx_off; li.meta.type = &type_i64(); li.meta.width = 8;
+            VReg len = new_vreg(&type_i64());
+            ThinInstr& ll = emit(ThinOp::LoadFrame, len, 0, 0, loc);
+            ll.meta.frame_off = slice_off + 8; ll.meta.type = &type_i64(); ll.meta.width = 8;
+            VReg cond = new_vreg(&type_bool());
+            ThinInstr& c = emit(ThinOp::Cmp, cond, idx, len, loc);
+            c.meta.cmp = 2;  // Lt
+            c.meta.type = &type_i64(); c.meta.width = 8;
+            c.meta.is_unsigned = 1;
+            set_term_branch(cond, body_bb, exit_bb);
+        }
+        // body_bb: x = [ptr + idx*esz]; lower body
+        enter_block(body_bb);
+        {
+            VReg ptr = new_vreg(&type_i64());
+            ThinInstr& lp = emit(ThinOp::LoadFrame, ptr, 0, 0, loc);
+            lp.meta.frame_off = slice_off; lp.meta.type = &type_i64(); lp.meta.width = 8;
+            VReg idx = new_vreg(&type_i64());
+            ThinInstr& li = emit(ThinOp::LoadFrame, idx, 0, 0, loc);
+            li.meta.frame_off = idx_off; li.meta.type = &type_i64(); li.meta.width = 8;
+            // element address = ptr + idx*esz
+            VReg addr = new_vreg(&type_i64());
+            ThinInstr& ia = emit(ThinOp::IndexAddr, addr, ptr, idx, loc);
+            ia.meta.width = esz;
+            ia.meta.type = elem_ty;
+            ia.meta.frame_off = 0;  // base is the ptr vreg (src1)
+            // load element from [addr + 0]
+            VReg res = new_vreg(elem_ty);
+            ThinInstr& ld = emit(ThinOp::LoadFrame, res, 0, 0, loc);
+            ld.src1 = addr; ld.meta.frame_off = 0; ld.meta.type = elem_ty; ld.meta.width = esz;
+            if (elem_ty && elem_ty->is_float()) ld.meta.is_f32 = (elem_ty->prim == Prim::F32) ? 1 : 0;
+            LoweredValue elem_lv{ LoweredValue::Scalar, res, 0, elem_ty };
+            store_scalar_local(elem_lv, var_off, loc);
+            loops.push_back({latch, exit_bb, false, cleanup_scopes.size(), active_try_depth});
+            lower_block(fe->body);
+            loops.pop_back();
+            if (cur_block().term.kind == TermKind::None) set_term_jmp(latch);
+        }
+        // latch: i = i + 1; budget back-edge; jmp top
+        enter_block(latch);
+        {
+            VReg idx = new_vreg(&type_i64());
+            ThinInstr& li = emit(ThinOp::LoadFrame, idx, 0, 0, loc);
+            li.meta.frame_off = idx_off; li.meta.type = &type_i64(); li.meta.width = 8;
+            VReg one = new_vreg(&type_i64());
+            ThinInstr& o = emit(ThinOp::ConstInt, one, 0, 0, loc); o.imm.i = 1; o.meta.type = &type_i64(); o.meta.width = 8;
+            VReg inc = new_vreg(&type_i64());
+            ThinInstr& a = emit(ThinOp::Add, inc, idx, one, loc);
+            a.meta.type = &type_i64(); a.meta.width = 8;
+            ThinInstr& st = emit(ThinOp::StoreFrame, 0, inc, 0, loc);
+            st.meta.frame_off = idx_off; st.meta.type = &type_i64(); st.meta.width = 8;
+            emit_budget_check(block_cost(fe->body), loc);
+            set_term_jmp(top);
+        }
+        enter_block(exit_bb);
+        return;
+    }
     if (auto* sw = dynamic_cast<const SwitchStmt*>(&s)) {
         // compare chain + per-case bodies + join (mirrors tree-walker's switch lowering)
         LoweredValue subj = lower_expr(*sw->subject);
@@ -3008,6 +4156,176 @@ void ThinLowerer::lower_stmt(const Stmt& s) {
                 // safe default (the tree-walker falls through; both are unreachable).
                 set_term_jmp(end_label);
             }
+        }
+        enter_block(end_label);
+        return;
+    }
+    if (auto* ms = dynamic_cast<const MatchStmt*>(&s)) {
+        // match (subject) { pattern => body, ... _ => default } — mirrors
+        // CG::exec_stmt MatchStmt (line ~4898). Two forms:
+        //   (1) literal/enum patterns on an int/bool/enum subject (the common
+        //       path; valid_typed_enum_match / valid_match / valid_type_stress).
+        //   (2) struct-destructure patterns on a struct subject (Tier 1;
+        //       valid_struct_destructure / valid_match_guards).
+        // Each arm is a separate branch (no fallthrough): compare the subject
+        // against the pattern, branch to the arm body or the next arm's check;
+        // the arm body runs then jumps to the end. The last arm is typically
+        // the wildcard/default.
+        bool has_struct_pat = false;
+        for (auto& arm : ms->arms) if (arm.has_struct_pat) { has_struct_pat = true; break; }
+        if (has_struct_pat) {
+            // ---- struct-destructure match ----
+            // The subject must be a local struct variable (mirrors the
+            // tree-walker's requirement). Get its frame offset + type.
+            int32_t subj_off = 0; const Type* subj_ty = nullptr;
+            if (!local_value_offset(*ms->subject, subj_off, subj_ty) ||
+                !subj_ty || subj_ty->struct_name.empty() || !ctx.structs ||
+                !ctx.structs->count(subj_ty->struct_name)) {
+                // subject is not a local struct: defer this match (the
+                // tree-walker emits a loud trap; fall back rather than
+                // miscompile).
+                non_serializable = true;
+                non_serializable_reason =
+                    "struct-destructure match subject must be a local struct "
+                    "variable; falling back to tree-walker";
+                return;
+            }
+            const StructLayout& layout = ctx.structs->at(subj_ty->struct_name);
+            std::vector<uint32_t> arm_labels;
+            for (size_t i = 0; i < ms->arms.size(); ++i) arm_labels.push_back(new_block());
+            uint32_t end_label = new_block();
+            int wildcard_idx = -1;
+            // For each arm: compare literal-matched fields + eval guard.
+            for (size_t i = 0; i < ms->arms.size(); ++i) {
+                if (ms->arms[i].is_wildcard) { wildcard_idx = int(i); continue; }
+                if (!ms->arms[i].has_struct_pat) continue;  // mixed not supported in v1
+                uint32_t arm_bb = arm_labels[i];
+                uint32_t next_arm = new_block();  // fail -> next arm's check
+                bool matched = true;  // tracks whether any compare was emitted
+                for (auto& spf : ms->arms[i].struct_pat.fields) {
+                    if (!spf.literal) continue;  // capture-only, no comparison
+                    auto fit = layout.fields.find(spf.name);
+                    if (fit == layout.fields.end()) continue;
+                    const Type* ft = fit->second.ty;
+                    int32_t field_off = subj_off + fit->second.offset;
+                    // load the subject's field value
+                    LoweredValue fv = load_scalar_local(field_off, ft, loc);
+                    // load the literal pattern value
+                    LoweredValue pv = lower_expr(*spf.literal);
+                    VReg cbool = new_vreg(&type_bool());
+                    ThinInstr& cb = emit(ThinOp::Cmp, cbool, fv.vreg, pv.vreg, loc);
+                    cb.meta.cmp = 0;  // Eq
+                    cb.meta.type = ft; cb.meta.width = value_bytes(ft, ctx.structs);
+                    cb.meta.is_unsigned = (ft && ft->is_uint()) ? 1 : 0;
+                    // mismatch -> next arm; match -> continue to next field/guard
+                    uint32_t cont_bb = new_block();
+                    set_term_branch(cbool, cont_bb, next_arm);
+                    enter_block(cont_bb);
+                    matched = true;
+                }
+                // Guard check (if present): eval the guard, fail if false.
+                if (ms->arms[i].guard) {
+                    // Bind the arm's capture fields as locals BEFORE the guard
+                    // (the guard references them). The captures are the
+                    // non-literal fields.
+                    auto saved_locals = locals;
+                    auto saved_types = local_types;
+                    for (auto& spf : ms->arms[i].struct_pat.fields) {
+                        if (spf.literal) continue;  // capture-only
+                        auto fit = layout.fields.find(spf.name);
+                        if (fit == layout.fields.end()) continue;
+                        const Type* ft = fit->second.ty;
+                        int32_t cap_off = alloc_local(spf.name, ft);
+                        copy_frame_frame(cap_off, subj_off + fit->second.offset,
+                                         value_bytes(ft, ctx.structs), loc);
+                    }
+                    LoweredValue gv = lower_expr(*ms->arms[i].guard);
+                    VReg zero = new_vreg(gv.ty ? gv.ty : &type_bool());
+                    ThinInstr& z = emit(ThinOp::ConstInt, zero, 0, 0, loc);
+                    z.imm.i = 0; z.meta.type = gv.ty ? gv.ty : &type_bool();
+                    z.meta.width = value_bytes(gv.ty ? gv.ty : &type_bool(), ctx.structs);
+                    VReg gbool = new_vreg(&type_bool());
+                    ThinInstr& cb = emit(ThinOp::Cmp, gbool, gv.vreg, zero, loc);
+                    cb.meta.cmp = 0; cb.meta.type = gv.ty ? gv.ty : &type_bool();
+                    cb.meta.width = value_bytes(gv.ty ? gv.ty : &type_bool(), ctx.structs);
+                    cb.meta.is_unsigned = (gv.ty && gv.ty->is_uint()) ? 1 : 0;
+                    // guard==0 -> next arm; else arm body
+                    set_term_branch(gbool, next_arm, arm_bb);
+                    // restore scope (captures were only for the guard eval)
+                    locals = std::move(saved_locals);
+                    local_types = std::move(saved_types);
+                    (void)matched;
+                } else {
+                    // no guard: all literal fields matched -> arm body
+                    if (cur_block().term.kind == TermKind::None) set_term_jmp(arm_bb);
+                }
+                enter_block(next_arm);
+            }
+            // after the chain: wildcard or end
+            set_term_jmp(wildcard_idx >= 0 ? arm_labels[size_t(wildcard_idx)] : end_label);
+            // Arm bodies: bind captures (for arms WITHOUT a guard, the captures
+            // are bound here; for arms WITH a guard, the guard already bound
+            // them in its own scope, so rebind here for the body).
+            for (size_t i = 0; i < ms->arms.size(); ++i) {
+                enter_block(arm_labels[i]);
+                auto saved_locals = locals;
+                auto saved_types = local_types;
+                if (ms->arms[i].has_struct_pat) {
+                    for (auto& spf : ms->arms[i].struct_pat.fields) {
+                        if (spf.literal) continue;  // capture-only
+                        auto fit = layout.fields.find(spf.name);
+                        if (fit == layout.fields.end()) continue;
+                        const Type* ft = fit->second.ty;
+                        int32_t cap_off = alloc_local(spf.name, ft);
+                        copy_frame_frame(cap_off, subj_off + fit->second.offset,
+                                         value_bytes(ft, ctx.structs), loc);
+                    }
+                }
+                loops.push_back({0, end_label, true, cleanup_scopes.size(), active_try_depth});  // break-only
+                lower_block(ms->arms[i].body);
+                loops.pop_back();
+                locals = std::move(saved_locals);
+                local_types = std::move(saved_types);
+                if (cur_block().term.kind == TermKind::None) set_term_jmp(end_label);
+            }
+            enter_block(end_label);
+            return;
+        }
+        // ---- literal/enum pattern match ----
+        // eval the subject -> a Scalar; store to a subject frame slot (the IR
+        // holds the subject across the compare chain in a frame slot, unlike
+        // the tree-walker which holds it in a volatile register).
+        LoweredValue subj = lower_expr(*ms->subject);
+        int32_t subj_off = alloc_local("__match_subj$" + std::to_string(match_counter++),
+                                       ms->subject->ty ? ms->subject->ty : &type_i64());
+        store_scalar_local(subj, subj_off, loc);
+        std::vector<uint32_t> arm_labels;
+        for (size_t i = 0; i < ms->arms.size(); ++i) arm_labels.push_back(new_block());
+        uint32_t end_label = new_block();
+        int wildcard_idx = -1;
+        for (size_t i = 0; i < ms->arms.size(); ++i) {
+            if (ms->arms[i].is_wildcard) { wildcard_idx = int(i); continue; }
+            // reload subject + load pattern, compare Eq
+            LoweredValue sv = load_scalar_local(subj_off, ms->subject->ty, loc);
+            LoweredValue pv = lower_expr(*ms->arms[i].pattern);
+            VReg cbool = new_vreg(&type_bool());
+            ThinInstr& cb = emit(ThinOp::Cmp, cbool, sv.vreg, pv.vreg, loc);
+            cb.meta.cmp = 0;  // Eq
+            cb.meta.type = ms->subject->ty; cb.meta.width = value_bytes(ms->subject->ty, ctx.structs);
+            cb.meta.is_unsigned = (ms->subject->ty && ms->subject->ty->is_uint()) ? 1 : 0;
+            // equal -> arm body; else next arm's check in a new block
+            uint32_t next_cmp = new_block();
+            set_term_branch(cbool, arm_labels[i], next_cmp);
+            enter_block(next_cmp);
+        }
+        // after the chain: wildcard arm or end
+        set_term_jmp(wildcard_idx >= 0 ? arm_labels[size_t(wildcard_idx)] : end_label);
+        for (size_t i = 0; i < ms->arms.size(); ++i) {
+            enter_block(arm_labels[i]);
+            loops.push_back({0, end_label, true, cleanup_scopes.size(), active_try_depth});  // break-only
+            lower_block(ms->arms[i].body);
+            loops.pop_back();
+            if (cur_block().term.kind == TermKind::None) set_term_jmp(end_label);
         }
         enter_block(end_label);
         return;
@@ -3133,7 +4451,7 @@ void ThinLowerer::lower_stmt(const Stmt& s) {
         return;
     }
     // Defensive: any statement type not handled above (a future node, or a
-    // ForEachStmt/MatchStmt that escaped the has_for_each pre-scan) must NOT
+    // ForEachStmt/MatchStmt arm with an unsupported sub-feature) must NOT
     // silently lower to nothing. Flag non_serializable so the function falls
     // back to the tree-walker (the post-lowering check honors it).
     non_serializable = true;

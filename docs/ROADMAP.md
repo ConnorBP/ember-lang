@@ -930,29 +930,50 @@ here so the decision and its evidence have a tracked home.
 
 ## Platform support (current + TODO)
 
-**Current:** Windows x64 only. The JIT emits x86-64 machine code (MinGW g++ +
-Ninja build, Win64 calling convention). The .em format, the codegen, the
-frame layout, and the ABI are all x64-specific.
+**Current:** Windows x64 + macOS Apple Silicon (ARM64). The JIT emits native
+machine code — x86-64 (MinGW g++ + Ninja, Win64 calling convention) and
+AArch64 (Apple Clang + Ninja, AAPCS64). The tree-walker codegen is x64-only;
+the ThinIR backend serves both targets (`emit_x64` / `emit_arm64`). See
+`docs/spec/CODEGEN_SPEC.md` (x86-64) + `docs/spec/CODEGEN_SPEC_ARM64.md` (ARM64).
+
+**Shipped platform ports:**
+- **Windows x64 (Win64)** — the original target. Tree-walker + ThinIR
+  backends; Win64 ABI, shadow space, `r14 = context_t*`.
+- **macOS ARM64 (Apple Silicon)** — ThinIR-only, AAPCS64, `MAP_JIT` W^X
+  (`pthread_jit_write_protect_np` + mandatory `mprotect(PROT_READ|PROT_EXEC)`
+  + `sys_icache_invalidate`, 16 KiB pages). Frame-only (no regalloc yet);
+  `x19 = context_t*`, never `x18`. Host thunks in `darwin_arm64_thunks.S`;
+  coroutines via a hand-written AAPCS64 context switch
+  (`darwin_arm64_ctx_switch.S`, no `ucontext`). Self-hosted codegen emits
+  AArch64 via `cg_target`/`CG_TARGET_ARM64`. **56/56 CTest, 471/471 lang_suite**
+  — full language parity + self-hosted ARM64 codegen + coroutines.
+  Implementation record: `docs/planning/MACOS_ARM64_PROGRESS.md`; plan:
+  `docs/planning/plan_MACOS_ARM64.md`.
 
 **TODO (platform ports):**
 - **Linux x64** — port the JIT memory (alloc_executable_rw / seal_executable
   uses VirtualProtect on Windows; needs mmap/mprotect on Linux), the ABI
   (System V vs Win64 calling convention differences: arg registers, struct
-  passing, shadow space), and the OS-specific bits (fibers → ucontext,
-  GetModuleFileName → /proc/self/exe, etc.).
-- **macOS x64 / ARM64** — same as Linux + the Apple-specific differences
-  (Mach-O, Apple's hardened runtime, JIT page permissions).
+  passing, shadow space), and the OS-specific bits (fibers → a portable
+  context switch, GetModuleFileName → /proc/self/exe, etc.). The ThinIR
+  backend makes this cheaper than it once looked: `emit_x64` already exists;
+  the SysV ABI differences (no shadow space, 6 GP/8 FP arg regs, struct-by-
+  value in regs) are the real work.
+- **Intel macOS (`x86_64-apple-darwin`, SysV ABI)** — different ABI (SysV, not
+  Win64) on a same-ish ISA; YAGNI for now. Add later if ever needed.
+- **Windows ARM64 (`arm64-windows`)** — different ABI again from AAPCS64; not
+  yet targeted.
+- **`arm64e` (Apple pointer authentication)** — PAC adds signing/signing-key
+  concerns; a later target, not this effort.
 - **32-bit x86 (x86)** — the codegen emits 64-bit instructions (REX.W prefixes);
   a 32-bit port needs a separate emitter (32-bit calling convention, 32-bit
   registers, no REX prefixes).
-- **ARM64 (AArch64)** — a full backend port: the emitter, the calling
-  convention, the register file, the instruction encoding. The thin-IR
-  (ThinFunction) is backend-agnostic in its IR; a new emit_arm64.cpp would
-  consume the same IR.
 
 The thin-IR backend (Stage A/B/C) is designed to be backend-agnostic — the
-ThinOp IR can be lowered to any target. A new backend (emit_arm64, emit_x86)
-consumes the same ThinFunction. The tree-walker codegen is x64-specific.
+ThinOp IR can be lowered to any target. The ARM64 port proved this:
+`emit_arm64` consumes the same `ThinFunction` as `emit_x64`, and the
+optimization passes are arch-neutral (they transform the IR, not the emit).
+The tree-walker codegen is x64-specific and is a hard compile error on ARM64.
 
 ## Re-evaluation cadence
 

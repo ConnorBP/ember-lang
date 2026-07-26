@@ -23,6 +23,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#if !defined(_WIN32)
+#include <sys/wait.h>   // WIFEXITED / WEXITSTATUS (POSIX std::system status decode)
+#endif
 
 int main(int argc, char** argv) {
     if (argc != 5) {
@@ -46,17 +49,32 @@ int main(int argc, char** argv) {
     }
     const char* passes_spec = argv[4];
 
-    // cmd.exe strips one enclosing quote pair before parsing a command whose
-    // executable path is itself quoted — wrap the whole command in an extra
-    // "" pair (same trick as em_cli_emit_test). The passes spec contains only
-    // commas (no spaces), so it needs no quoting.
+    // Build the shell command for std::system. The quoting is platform-
+    // specific: on Windows, cmd.exe strips one enclosing quote pair before
+    // parsing a command whose executable path is itself quoted, so the whole
+    // command is wrapped in an extra "" pair (the same trick as
+    // em_cli_emit_test). On POSIX /bin/sh that "" wrapping is harmful — it
+    // concatenates adjacent quoted strings + swallows spaces into quotes,
+    // turning the command into one giant word — so POSIX uses plain quoting
+    // ("ember_cli" run "source" --fn main --passes spec). The passes spec
+    // contains only commas (no spaces), so it needs no quoting on either.
+#if defined(_WIN32)
     const std::string command = std::string("\"\"") + ember_cli + "\" run \"" +
-                                source + "\" --fn main --passes " + passes_spec + "\"";
+                                source + "\" --fn main --passes " + passes_spec + "\"\"";
+#else
+    const std::string command = std::string("\"") + ember_cli + "\" run \"" +
+                                source + "\" --fn main --passes " + passes_spec;
+#endif
     const int rc = std::system(command.c_str());
 
-    // std::system returns the child exit code on this MinGW build (mirrors
-    // em_cli_emit_test, which compares run_rc == 42 and passes under ctest).
+    // std::system returns the child exit code directly on MinGW/Windows, but
+    // on POSIX it returns a wait() status that must be decoded with
+    // WEXITSTATUS. Decode here so the comparison works on both platforms.
+#if defined(_WIN32)
     const int actual_exit = rc;
+#else
+    const int actual_exit = (rc != -1 && WIFEXITED(rc)) ? WEXITSTATUS(rc) : -1;
+#endif
 
     if (actual_exit != expected_exit) {
         std::fprintf(stderr,

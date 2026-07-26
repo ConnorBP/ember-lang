@@ -45,6 +45,9 @@
 #include "../src/parser.hpp"
 #include "../src/sema.hpp"
 #include "../src/codegen.hpp"
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include "../src/arm64_emitter.hpp"   // Arm64Emitter for the ARM64 caller
+#endif
 
 #include <cstdio>
 #include <cstdint>
@@ -183,6 +186,68 @@ static CallerModule build_caller_cross_module(uint32_t module_id, uint32_t slot,
     using namespace ember;
     CallerModule m{ {}, {}, DispatchTable(1) };
 
+    std::vector<uint8_t> code;
+    std::vector<AbsFixup> abs_fixups;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // ---- ARM64 caller via Arm64Emitter (native AArch64, not x86) ----
+    // AAPCS64: the arg (x) arrives in x0 and the callee (double_it) consumes
+    // it from x0 and returns in x0, so no argument movement is needed — pass
+    // x0 straight through. The cross-module call sequence mirrors the x86
+    // path (docs/MODULES.md Section 3) and thin_emit_arm64.cpp's
+    // emit_cross_module_call: ldr_literal_ptr loads the registry base (kind-2
+    // ModuleRegistryBase reloc, an 8-byte pointer cell in the literal pool);
+    // two ldr64s hop registry[mod_id*8] -> target DispatchTable* ->
+    // slots[slot*8] -> entry; blr calls it.
+    Arm64Emitter e;
+    // ---- AAPCS64 prologue: stp x29, x30, [sp, -16]! ; mov x29, sp ----
+    // STP pre-indexed 64-bit: 0xA9800000 | (imm7=-2)<<15 | Rt2=x30<<10 |
+    // Rn=sp<<5 | Rt=x29  (mirrors thin_emit_arm64.cpp emit_prologue).
+    e.insn(0xA9800000u | (uint32_t(-2 & 0x7F) << 15)
+           | (uint8_t(XReg::x30) << 10) | (uint8_t(XReg::sp) << 5)
+           | uint8_t(XReg::x29));
+    e.add_reg_imm(XReg::x29, XReg::sp, 0);     // mov x29, sp
+
+    // ---- cross-module call sequence (docs/MODULES.md Section 3) ----
+    // ldr x11, <registry_base> — relocatable literal-ptr load (kind 2).
+    // resolve_fixups appends the 8-byte pointer cell to the literal pool and
+    // records an AbsFixup{cell_off, ModuleRegistryBase} — same shape as the
+    // x86 mov_reg_imm64_external placeholder, so the JIT fill + .em loader
+    // kind-2 patch work unchanged.
+    e.ldr_literal_ptr(XReg::x11, AbsFixup::ModuleRegistryBase);
+    // ldr x11, [x11 + module_id*8] — target module's DispatchTable*. ldr64's
+    // imm12 is offset/8, so pass module_id directly (module_id*8 bytes).
+    if (module_id <= 0xFFF) {
+        e.ldr64(XReg::x11, XReg::x11, module_id);
+    } else {
+        e.mov_reg_imm64(XReg::x10, int64_t(module_id) * 8);
+        e.add_reg(XReg::x11, XReg::x11, XReg::x10);
+        e.ldr64(XReg::x11, XReg::x11, 0);
+    }
+    // ldr x11, [x11 + slot*8] — slots[slot], the callee's entry.
+    if (slot <= 0xFFF) {
+        e.ldr64(XReg::x11, XReg::x11, slot);
+    } else {
+        e.mov_reg_imm64(XReg::x10, int64_t(slot) * 8);
+        e.add_reg(XReg::x11, XReg::x11, XReg::x10);
+        e.ldr64(XReg::x11, XReg::x11, 0);
+    }
+    // blr x11 — call the callee. x0 (= the arg) is passed straight through;
+    // the callee's result comes back in x0 and we return it directly.
+    e.blr(XReg::x11);                          // x0 = double_it(x)
+
+    // ---- AAPCS64 epilogue: mov sp, x29 ; ldp x29, x30, [sp], 16 ; ret ----
+    e.add_reg_imm(XReg::sp, XReg::x29, 0);     // mov sp, x29
+    // LDP post-index 64-bit: 0xA8C00000 | (imm7=2)<<15 | Rt2=x30<<10 |
+    // Rn=sp<<5 | Rt=x29  (mirrors thin_emit_arm64.cpp emit_epilogue).
+    e.insn(0xA8C00000u | (uint32_t(2 & 0x7F) << 15)
+           | (uint8_t(XReg::x30) << 10) | (uint8_t(XReg::sp) << 5)
+           | uint8_t(XReg::x29));
+    e.ret();
+
+    e.resolve_fixups();
+    code = e.code;
+    abs_fixups = e.abs_fixups();
+#else
     X64Emitter e;
     // ---- minimal Win64 prologue (no callee-saved, 32-byte shadow frame) ----
     e.push(Reg::rbp);
@@ -211,12 +276,17 @@ static CallerModule build_caller_cross_module(uint32_t module_id, uint32_t slot,
     e.ret();
 
     e.resolve_fixups();
+    code = e.code;
+    abs_fixups = e.abs_fixups();
+#endif
 
     // JIT fill: resolve_fixups does NOT touch AbsFixups, so the driver writes
     // the real registry_base into the kind-2 placeholder here. Same fill-the-
-    // placeholder pattern as codegen.cpp's DispatchTableBase JIT fill.
-    std::vector<uint8_t> code = e.code;
-    for (const auto& af : e.abs_fixups()) {
+    // placeholder pattern as codegen.cpp's DispatchTableBase JIT fill. This
+    // is arch-independent: both emitters expose abs_fixups() whose
+    // code_offset points at the 8-byte pointer cell (inline on x86, in the
+    // literal pool on ARM64).
+    for (const auto& af : abs_fixups) {
         if (af.code_offset + 8 > code.size()) continue; // sanity
         uint64_t addr = (af.kind == AbsFixup::ModuleRegistryBase)
             ? reinterpret_cast<uint64_t>(registry_base) : 0;
@@ -226,7 +296,7 @@ static CallerModule build_caller_cross_module(uint32_t module_id, uint32_t slot,
 
     m.bytes = code; // captured BEFORE finalize (clean copy for the serializer)
     m.fn.name = "caller";
-    m.fn.abs_fixups = e.abs_fixups(); // capture for .em serialization (the kind-2 reloc)
+    m.fn.abs_fixups = abs_fixups; // capture for .em serialization (the kind-2 reloc)
     if (!finalize_from_bytes(m.fn, code)) { std::printf("FAIL caller: alloc_executable\n"); std::exit(1); }
     m.table.set(0, m.fn.entry);
     return m;

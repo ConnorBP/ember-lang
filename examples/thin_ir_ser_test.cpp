@@ -262,11 +262,16 @@ static bool lowered_roundtrip() {
         return false;
     }
 
-    // Re-emit the deserialized IR and execute it.
+    // Re-emit the deserialized IR and execute it. ARM64 uses emit_arm64
+    // (plan_MACOS_ARM64.md Phase 7); x86 uses emit_x64.
     DispatchTable table(1);
     ctx.dispatch_base = int64_t(table.base());
     ctx.globals_base = 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    CompiledFn cf = emit_arm64(thf2, ctx);
+#else
     CompiledFn cf = emit_x64(thf2, ctx);
+#endif
     if (cf.bytes.empty()) { std::printf("  re-emit gave empty bytes\n"); return false; }
     if (!finalize(cf)) { std::printf("  finalize fail\n"); return false; }
     table.set(0, cf.entry);
@@ -1457,8 +1462,13 @@ int main() {
         ctx.dispatch_base = 0;
         ctx.enable_ir_backend = true;
         ctx.use_context_reg = false;
+        // ARM64 uses emit_arm64 (plan_MACOS_ARM64.md Phase 7); x86 uses emit_x64.
+#if defined(__aarch64__) || defined(_M_ARM64)
+        CompiledFn cf = emit_arm64(thf2, ctx);
+#else
         CompiledFn cf = emit_x64(thf2, ctx);
-        check(!cf.bytes.empty(), "P7: emit_x64 produced bytes");
+#endif
+        check(!cf.bytes.empty(), "P7: re-emit produced bytes");
         check(finalize(cf), "P7: finalize ok");
         check(cf.entry != nullptr, "P7: finalized entry non-null");
         int64_t got = call_i64_i64(cf.entry);

@@ -44,6 +44,25 @@
 
 using namespace ember;
 
+// Architecture detection: on ARM64 (Apple Silicon, etc.) the IR optimization
+// passes are ARCHITECTURE-NEUTRAL (they transform the ThinFunction IR, which is
+// arch-independent). The execution path, however, must use emit_arm64 (frame-
+// only) on ARM64 instead of emit_x64 — emit_x64 produces x86 bytes that SIGILL
+// on ARM64. The compile_with / compile_tail helpers below dispatch to emit_arm64
+// on ARM64 + emit_x64 on x86 so the value-preservation execution tests run on
+// both arches. The x86-specific byte-pattern checks (TC-EMIT, TC-SER: dispatch
+// CALL/JMP, epilogue/RET x86 opcodes) + the tail-call deep-recursion runtime
+// (TC-DEEP, TC-DEPTH: emit_arm64 does not do tail calls) are guarded under
+// `if (!kIsArm64)`; on ARM64 the replacement assertion is cr.backend ==
+// IRBackend + correct value + pass-report non-empty (via compile_func_checked).
+static constexpr bool kIsArm64 =
+#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
+    true
+#else
+    false
+#endif
+    ;
+
 // ─── The four IR-pass workload sources (%N = 100 for a fast deterministic test) ───
 
 static const char* SRC_CONSTPROP_FOLD =
@@ -151,10 +170,11 @@ static std::unique_ptr<M> compile_with(const std::string& src,
             *instr_after = 0;
             for (const auto& blk : thf.blocks) *instr_after += blk.instrs.size();
         }
-        // Emit + finalize.
-        CompiledFn cf = emit_x64(thf, ctx);
+        // Emit + finalize. Arch-aware: emit_arm64 on ARM64 (frame-only),
+        // emit_x64 on x86. The IR passes are arch-neutral; only emit differs.
+        CompiledFn cf = kIsArm64 ? emit_arm64(thf, ctx) : emit_x64(thf, ctx);
         if (cf.bytes.empty()) {
-            std::printf("FAIL: emit_x64 gave empty bytes for %s\n", fn.name.c_str());
+            std::printf("FAIL: emit gave empty bytes for %s\n", fn.name.c_str());
             return nullptr;
         }
         if (!finalize(cf)) {
@@ -430,9 +450,10 @@ static std::unique_ptr<M> compile_tail(const std::string& src,
             return nullptr;
         }
         if (pm) pm->run(thf, am);
-        CompiledFn cf = emit_x64(thf, ctx);
+        // Arch-aware emit: emit_arm64 on ARM64 (frame-only), emit_x64 on x86.
+        CompiledFn cf = kIsArm64 ? emit_arm64(thf, ctx) : emit_x64(thf, ctx);
         if (cf.bytes.empty()) {
-            std::printf("FAIL: emit_x64 gave empty bytes for %s\n", fn.name.c_str());
+            std::printf("FAIL: emit gave empty bytes for %s\n", fn.name.c_str());
             return nullptr;
         }
         if (!finalize(cf)) {
@@ -578,6 +599,94 @@ int main() {
             ck(after > before, msg);
         } else {
             ck(false, "subst target compile failed");
+        }
+    }
+
+    // ─── ARM64 pass-report assertion: on ARM64, use compile_func_checked to ───
+    // prove the IR optimization passes actually RAN (pass report non-empty) +
+    // produced the correct value via emit_arm64. The compile_with/compile_tail
+    // helpers above run the pass manually (pm->run) + use emit_arm64 directly,
+    // so they prove value-preservation but NOT the pass-report evidence. This
+    // block uses compile_func_checked (which runs the pass in checked mode +
+    // populates cr.pass_reports) for a representative pass (constprop) on a
+    // representative workload, asserting:
+    //   (a) cr.backend == CompileBackend::IRBackend (the IR backend ran),
+    //   (b) cr.pass_reports is non-empty (the pass pipeline ran + reported),
+    //   (c) the value is correct via emit_arm64 (call0_i64 == expected).
+    // On x86 this block is skipped (the x86 evidence is the value-preservation
+    // + instr-count-reduction checks above; compile_func_checked on x86 with
+    // enable_ir_backend=false would fall back to the tree-walker, which is
+    // not the point of this test).
+    if (kIsArm64) {
+        std::printf("\n--- ARM64 pass-report assertion (compile_func_checked) ---\n");
+        // Use constprop on the constprop_fold workload (expected 700: 100
+        // iterations of (3+4)=7 -> 700).
+        const char* src = SRC_CONSTPROP_FOLD;
+        auto m = std::make_unique<M>();
+        auto lr = tokenize(src, "<ir_passes_arm64>");
+        ck(lr.ok, "ARM64 pass-report: lex ok");
+        if (lr.ok) {
+            auto pr = parse(std::move(lr.toks));
+            ck(pr.ok, "ARM64 pass-report: parse ok");
+            if (pr.ok) {
+                m->prog = std::move(pr.program);
+                int si = 0;
+                for (auto& fn : m->prog.funcs) { m->slots[fn.name] = si++; fn.slot = si - 1; }
+                std::unordered_map<std::string, NativeSig> natives;
+                OpOverloadTable overloads;
+                m->layouts = build_struct_layouts(m->prog);
+                m->prog.string_xor_key = 0;
+                auto sr = sema(m->prog, natives, m->slots, 0, &overloads, &m->layouts);
+                ck(sr.ok, "ARM64 pass-report: sema ok");
+                if (sr.ok) {
+                    m->gbs.assign(0, 0);
+                    m->gb.base = 0;
+                    g_globals_for_codegen = &m->gb;
+                    m->table = std::make_unique<DispatchTable>(m->prog.funcs.size());
+                    CodeGenCtx ctx;
+                    ctx.globals_base = 0;
+                    ctx.dispatch_base = int64_t(m->table->base());
+                    ctx.natives = &natives;
+                    ctx.script_slots = &m->slots;
+                    ctx.structs = &m->layouts;
+                    ctx.use_context_reg = true;
+                    ctx.enable_ir_backend = true;  // ARM64: IR backend is the sole path
+                    // Build a pass manager with constprop + wire it through
+                    // compile_func_checked (checked mode -> cr.pass_reports).
+                    EmberPassManager pm;
+                    pm.add_pass_concept(reg.create("constprop"));
+                    ctx.pass_manager = &pm;
+                    for (auto& fn : m->prog.funcs) {
+                        CompileResult cr = compile_func_checked(fn, ctx);
+                        CompiledFn cf = std::move(cr.compiled);
+                        if (fn.name == "main") {
+                            // (a) IR backend ran.
+                            ck(cr.backend == CompileBackend::IRBackend,
+                               "ARM64 pass-report: cr.backend == IRBackend (IR backend ran)");
+                            // (b) pass report non-empty: the checked pipeline
+                            //     ran + reported. constprop is registered, so
+                            //     pass_reports should have >=1 entry.
+                            ck(!cr.pass_reports.empty(),
+                               "ARM64 pass-report: cr.pass_reports non-empty (pass pipeline ran)");
+                            if (!cr.pass_reports.empty()) {
+                                ck(cr.pass_reports.back().stop_reason == PassStopReason::Completed,
+                                   "ARM64 pass-report: pass pipeline completed (not a failure)");
+                            }
+                        }
+                        ck(!cf.bytes.empty(), "ARM64 pass-report: emit produced bytes");
+                        ck(finalize(cf), "ARM64 pass-report: alloc_executable ok");
+                        m->table->set(fn.slot, cf.entry);
+                        m->fns.push_back(std::move(cf));
+                    }
+                    // (c) correct value via emit_arm64.
+                    int64_t r = call0_i64(*m, "main");
+                    char msg[160];
+                    std::snprintf(msg, sizeof msg,
+                        "ARM64 pass-report: constprop_fold correct via emit_arm64 (=%lld)",
+                        (long long)r);
+                    ck(r == 700, msg);  // 100 * (3+4) = 700
+                }
+            }
         }
     }
 
@@ -3421,12 +3530,20 @@ int main() {
     // target's bytes). Without the pass: dispatch CALL (41 FF 93 <slot*8>) +
     // epilogue/RET (48 89 EC 5D C3). With the pass: dispatch JMP (41 FF A3
     // <slot*8>), no dispatch CALL for the target slot, no epilogue/RET.
+    //
+    // ARCH-AWARE: the byte-pattern checks (x86 dispatch CALL/JMP + epilogue/RET
+    // opcodes) are x86-specific. On ARM64 emit_arm64 produces different bytes
+    // + does NOT do tail calls (the is_tail_call annotation is an x86 emit-time
+    // concern; emit_arm64 emits a regular call). The x86 byte checks are guarded
+    // under `!kIsArm64`; on ARM64 the replacement is: the pass compile succeeds
+    // + wrapper(5) returns the correct value (the tail-call pass is value-
+    // preserving even when the emit path is a regular call).
     {
         static const char* SRC_TAIL_WRAPPER =
             "fn target(x: i64) -> i64 { return x + 1; }\n"
             "fn wrapper(x: i64) -> i64 { return target(x); }\n";
 
-        // Baseline (no pass): wrapper keeps the CALL + epilogue/RET.
+        // Baseline (no pass): wrapper keeps the CALL + epilogue/RET (x86).
         auto mb = compile_tail(SRC_TAIL_WRAPPER, nullptr);
         ck(mb != nullptr, "TC-EMIT: baseline compiles");
         if (mb) {
@@ -3434,16 +3551,24 @@ int main() {
             ck(wfn != nullptr, "TC-EMIT: wrapper CompiledFn found by name (baseline)");
             if (wfn) {
                 int32_t target_slot = mb->slots["target"];
-                ck(has_dispatch_call(wfn->bytes, target_slot),
-                   "TC-EMIT: baseline wrapper has dispatch CALL to target slot");
-                ck(has_epilogue_ret(wfn->bytes),
-                   "TC-EMIT: baseline wrapper ends in epilogue + RET");
-                ck(!has_dispatch_jmp(wfn->bytes, target_slot),
-                   "TC-EMIT: baseline wrapper has NO dispatch JMP (no tail-call yet)");
+                if (!kIsArm64) {
+                    ck(has_dispatch_call(wfn->bytes, target_slot),
+                       "TC-EMIT: baseline wrapper has dispatch CALL to target slot");
+                    ck(has_epilogue_ret(wfn->bytes),
+                       "TC-EMIT: baseline wrapper ends in epilogue + RET");
+                    ck(!has_dispatch_jmp(wfn->bytes, target_slot),
+                       "TC-EMIT: baseline wrapper has NO dispatch JMP (no tail-call yet)");
+                } else {
+                    // ARM64: bytes are ARM64, not x86 — just verify non-empty
+                    // + the baseline value is correct (the call works).
+                    ck(!wfn->bytes.empty(), "TC-EMIT: baseline wrapper has non-empty ARM64 bytes");
+                    ck(call1_i64(*mb, "wrapper", 5) == 6,
+                       "TC-EMIT: baseline wrapper(5) == 6 (ARM64 regular call)");
+                }
             }
         }
 
-        // With pass: wrapper tail-JMPs to target; CALL + epilogue/RET gone.
+        // With pass: wrapper tail-JMPs to target; CALL + epilogue/RET gone (x86).
         EmberPassManager pm;
         auto pc = reg.create("tailcall");
         ck(pc != nullptr, "TC-EMIT: tailcall pass registered");
@@ -3455,12 +3580,22 @@ int main() {
             ck(wfn != nullptr, "TC-EMIT: wrapper CompiledFn found by name (pass)");
             if (wfn) {
                 int32_t target_slot = mp->slots["target"];
-                ck(has_dispatch_jmp(wfn->bytes, target_slot),
-                   "TC-EMIT: pass wrapper has dispatch JMP to target slot (tail-call)");
-                ck(!has_dispatch_call(wfn->bytes, target_slot),
-                   "TC-EMIT: pass wrapper has NO dispatch CALL to target slot");
-                ck(!has_epilogue_ret(wfn->bytes),
-                   "TC-EMIT: pass wrapper has NO epilogue + RET (callee returns directly)");
+                if (!kIsArm64) {
+                    ck(has_dispatch_jmp(wfn->bytes, target_slot),
+                       "TC-EMIT: pass wrapper has dispatch JMP to target slot (tail-call)");
+                    ck(!has_dispatch_call(wfn->bytes, target_slot),
+                       "TC-EMIT: pass wrapper has NO dispatch CALL to target slot");
+                    ck(!has_epilogue_ret(wfn->bytes),
+                       "TC-EMIT: pass wrapper has NO epilogue + RET (callee returns directly)");
+                } else {
+                    // ARM64: emit_arm64 does not do tail calls — the pass ran
+                    // (the is_tail_call annotation was set on the IR) but the
+                    // emit is a regular call. Verify value correctness (the
+                    // pass is value-preserving) + non-empty bytes.
+                    ck(!wfn->bytes.empty(), "TC-EMIT: pass wrapper has non-empty ARM64 bytes");
+                    ck(call1_i64(*mp, "wrapper", 5) == 6,
+                       "TC-EMIT: pass wrapper(5) == 6 (ARM64: tail-call annotation is x86 emit-time; value preserved)");
+                }
             }
         }
     }
@@ -3519,11 +3654,13 @@ int main() {
             "TC-DEEP: loop_sum(100,0) value-preserving (baseline=%lld pass=%lld)",
             (long long)rb, (long long)rp_small);
         ck(rb == rp_small && rb == 5050, msg);
-        // Deep run ONLY when the pass is actually registered (GREEN). With the
-        // pass the tail recursion is a JMP, so a large N completes without stack
-        // growth. In RED pass_registered is false -> this block is skipped (no
-        // overflow). Uses the pre-move boolean, NOT the moved-from pc.
-        if (pass_registered && mp) {
+        // Deep run ONLY when the pass is actually registered (GREEN) AND on
+        // x86 (emit_arm64 does NOT do tail calls — the is_tail_call annotation
+        // is an x86 emit-time concern; on ARM64 deep recursion is a real CALL
+        // chain that would stack-overflow at 100000). On ARM64 the small-N
+        // value preservation (above) is the evidence the pass is value-
+        // preserving; the deep-run stack-growth proof is x86-only.
+        if (pass_registered && mp && !kIsArm64) {
             int64_t rp_deep = call2_i64(*mp, "loop_sum", 100000, 0);
             std::snprintf(msg, sizeof msg,
                 "TC-DEEP: deep loop_sum(100000,0) completes with pass (=%lld)",
@@ -3555,35 +3692,47 @@ int main() {
         // is marked is_tail_call, and the tail-eligible block's Return ret is
         // preserved (== call dst, not cleared).
         // Lower manually (mirroring compile_tail) so we can inspect the IR.
+        // IMPORTANT: the Program (and its type_store) MUST outlive the thf
+        // inspection — the lowered ThinFunction's arg_types/ret_type are raw
+        // `const Type*` pointers into prog.type_store (set by sema's intern()).
+        // If prog is destroyed before the pass runs, those pointers dangle +
+        // the tailcall pass reads freed memory (UB; on ARM64 the freed memory
+        // reads as prim=Void so arg_is_register_word rejects the call + the
+        // pass doesn't mark it). Keep prog + its supporting structs alive for
+        // the whole TC-DEPTH block by declaring them in the outer scope.
+        Program tc_depth_prog;
+        StructLayoutTable tc_depth_layouts;
+        std::unordered_map<std::string, int> tc_depth_slots;
+        std::unordered_map<std::string, NativeSig> tc_depth_natives;
+        OpOverloadTable tc_depth_overloads;
         auto lower_with_depth = [&](ThinFunction& thf) -> bool {
             auto lr = tokenize(SRC_TAIL_RECUR, "<tc_depth>");
             if (!lr.ok) return false;
             auto pr = parse(std::move(lr.toks));
             if (!pr.ok) return false;
-            Program prog = std::move(pr.program);
-            std::unordered_map<std::string, int> slots;
+            tc_depth_prog = std::move(pr.program);
             int si = 0;
-            for (auto& fn : prog.funcs) { slots[fn.name] = si++; fn.slot = si - 1; }
-            std::unordered_map<std::string, NativeSig> natives;
-            OpOverloadTable overloads;
-            StructLayoutTable layouts = build_struct_layouts(prog);
-            prog.string_xor_key = 0;
-            auto sr = sema(prog, natives, slots, 0, &overloads, &layouts);
+            for (auto& fn : tc_depth_prog.funcs) { tc_depth_slots[fn.name] = si++; fn.slot = si - 1; }
+            tc_depth_layouts = build_struct_layouts(tc_depth_prog);
+            tc_depth_prog.string_xor_key = 0;
+            auto sr = sema(tc_depth_prog, tc_depth_natives, tc_depth_slots, 0, &tc_depth_overloads, &tc_depth_layouts);
             if (!sr.ok) return false;
             GlobalsBlock gb; gb.base = 0;
             g_globals_for_codegen = &gb;
+            auto table = std::make_unique<DispatchTable>(tc_depth_prog.funcs.size());
             CodeGenCtx ctx;
             ctx.globals_base = 0;
-            ctx.natives = &natives;
-            ctx.script_slots = &slots;
-            ctx.structs = &layouts;
+            ctx.dispatch_base = int64_t(table->base());
+            ctx.natives = &tc_depth_natives;
+            ctx.script_slots = &tc_depth_slots;
+            ctx.structs = &tc_depth_layouts;
             ctx.use_context_reg = false;  // baked depth_ptr mode (no r14)
             ctx.enable_ir_backend = false;
             ctx.emit_depth_checks = true;
             int32_t dummy_depth = 0;
             ctx.depth_ptr = &dummy_depth;
             ctx.max_call_depth = 4096;
-            for (auto& fn : prog.funcs) {
+            for (auto& fn : tc_depth_prog.funcs) {
                 if (fn.name == "loop_sum") {
                     thf = lower_function(fn, ctx);
                     return !thf.blocks.empty();
@@ -3652,13 +3801,18 @@ int main() {
             ck(preserved_ret >= 1, msg);
         }
 
-        // Runtime (guarded on the pass): with a tiny max_call_depth (16), a
-        // deep tail recursion completes ONLY if the tail path does not bump
-        // depth. Without the pass the real CALL chain would overflow depth at
-        // 16 and trap; with the pass the JMP keeps depth flat. Skipped in RED.
+        // Runtime (guarded on the pass AND x86): with a tiny max_call_depth
+        // (16), a deep tail recursion completes ONLY if the tail path does not
+        // bump depth. Without the pass the real CALL chain would overflow
+        // depth at 16 and trap; with the pass the JMP keeps depth flat. On
+        // ARM64 emit_arm64 does NOT do tail calls (the is_tail_call annotation
+        // is an x86 emit-time concern), so the deep recursion would overflow
+        // depth at 16 — guard under !kIsArm64. Skipped in RED (pass not
+        // registered). The IR-level checks above are arch-neutral + run on
+        // both arches.
         auto pc2 = reg.create("tailcall");
         ck(pc2 != nullptr, "TC-DEPTH: tailcall pass registered (runtime)");
-        if (pc2) {
+        if (pc2 && !kIsArm64) {
             EmberPassManager pm;
             pm.add_pass_concept(std::move(pc2));
             int32_t depth_counter = 0;
@@ -3741,8 +3895,9 @@ int main() {
             ck(!thf.blocks.empty(), "TC-SER: lower_function gave non-empty blocks");
             if (fn.name == "wrapper") { wrapper_thf = std::move(thf); have_wrapper = true; continue; }
             // Compile + install every other fn (target) into the table.
-            CompiledFn cf = emit_x64(thf, ctx);
-            ck(!cf.bytes.empty(), "TC-SER: emit_x64 gave non-empty bytes");
+            // Arch-aware emit: emit_arm64 on ARM64, emit_x64 on x86.
+            CompiledFn cf = kIsArm64 ? emit_arm64(thf, ctx) : emit_x64(thf, ctx);
+            ck(!cf.bytes.empty(), "TC-SER: emit gave non-empty bytes");
             ck(finalize(cf), "TC-SER: alloc_executable ok");
             table->set(fn.slot, cf.entry);
             if (fn.name == "target") have_target = true;
@@ -3793,20 +3948,24 @@ int main() {
 
             // (c) ordinary CALL+RET value preservation: emit the DESERIALIZED
             // function WITHOUT re-running the pass. is_tail_call is false, so
-            // emit_x64 takes the ordinary call path (CALL + result spill +
-            // epilogue + RET) and returns the call result. Install it in the
-            // dispatch table at wrapper's slot and call wrapper(5) -> 6.
-            CompiledFn wcf = emit_x64(loaded, ctx);
+            // the emit takes the ordinary call path (CALL + result spill +
+            // epilogue + RET on x86; a regular BL on ARM64) and returns the
+            // call result. Install it in the dispatch table at wrapper's slot
+            // and call wrapper(5) -> 6.
+            CompiledFn wcf = kIsArm64 ? emit_arm64(loaded, ctx) : emit_x64(loaded, ctx);
             ck(!wcf.bytes.empty(), "TC-SER: emit deserialized wrapper (no pass) ok");
             // The ordinary path must still have a dispatch CALL + epilogue/RET
-            // (the annotation is absent), proving byte-compatibility.
+            // (the annotation is absent), proving byte-compatibility (x86).
+            // On ARM64 the bytes are ARM64 — just verify value correctness.
             int32_t target_slot = slots["target"];
-            ck(has_dispatch_call(wcf.bytes, target_slot),
-               "TC-SER: deserialized wrapper (no pass) has ordinary dispatch CALL");
-            ck(has_epilogue_ret(wcf.bytes),
-               "TC-SER: deserialized wrapper (no pass) has epilogue + RET");
-            ck(!has_dispatch_jmp(wcf.bytes, target_slot),
-               "TC-SER: deserialized wrapper (no pass) has NO tail JMP (annotation absent)");
+            if (!kIsArm64) {
+                ck(has_dispatch_call(wcf.bytes, target_slot),
+                   "TC-SER: deserialized wrapper (no pass) has ordinary dispatch CALL");
+                ck(has_epilogue_ret(wcf.bytes),
+                   "TC-SER: deserialized wrapper (no pass) has epilogue + RET");
+                ck(!has_dispatch_jmp(wcf.bytes, target_slot),
+                   "TC-SER: deserialized wrapper (no pass) has NO tail JMP (annotation absent)");
+            }
             ck(finalize(wcf), "TC-SER: alloc_executable for deserialized wrapper ok");
             table->set(wrapper_thf.slot, wcf.entry);
             int64_t r_no_pass = call1_i64_impl(*table, slots["wrapper"], 5);
@@ -3836,16 +3995,21 @@ int main() {
                "TC-SER: still one marked call after idempotent third run");
 
             // The re-annotated deserialized function, when emitted, takes the
-            // tail path (dispatch JMP, no CALL/RET) — proving the round-tripped
-            // annotation drives tail emission just like the JIT-time one.
-            CompiledFn wcf2 = emit_x64(loaded, ctx);
+            // tail path (dispatch JMP, no CALL/RET on x86) — proving the round-
+            // tripped annotation drives tail emission just like the JIT-time
+            // one. On ARM64 emit_arm64 does NOT do tail calls (the annotation
+            // is an x86 emit-time concern), so the bytes are a regular BL —
+            // verify value correctness instead of x86 byte patterns.
+            CompiledFn wcf2 = kIsArm64 ? emit_arm64(loaded, ctx) : emit_x64(loaded, ctx);
             ck(!wcf2.bytes.empty(), "TC-SER: emit re-annotated wrapper ok");
-            ck(has_dispatch_jmp(wcf2.bytes, target_slot),
-               "TC-SER: re-annotated wrapper has dispatch JMP (tail-call)");
-            ck(!has_dispatch_call(wcf2.bytes, target_slot),
-               "TC-SER: re-annotated wrapper has NO dispatch CALL");
-            ck(!has_epilogue_ret(wcf2.bytes),
-               "TC-SER: re-annotated wrapper has NO epilogue + RET");
+            if (!kIsArm64) {
+                ck(has_dispatch_jmp(wcf2.bytes, target_slot),
+                   "TC-SER: re-annotated wrapper has dispatch JMP (tail-call)");
+                ck(!has_dispatch_call(wcf2.bytes, target_slot),
+                   "TC-SER: re-annotated wrapper has NO dispatch CALL");
+                ck(!has_epilogue_ret(wcf2.bytes),
+                   "TC-SER: re-annotated wrapper has NO epilogue + RET");
+            }
             ck(finalize(wcf2), "TC-SER: alloc_executable for re-annotated wrapper ok");
             table->set(wrapper_thf.slot, wcf2.entry);
             int64_t r_tail = call1_i64_impl(*table, slots["wrapper"], 5);

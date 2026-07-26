@@ -1,3 +1,4 @@
+// expect: 250
 // valid_fn_types — parameterized function types `fn(Args)->Ret` (Tier 2).
 // Closes the bare-fn signature hole: a fn-typed parameter WITH a signature
 // type-checks its args at the call site. A bare `fn` (no signature) stays the

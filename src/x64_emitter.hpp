@@ -11,6 +11,14 @@
 #include <stdexcept>
 #include <unordered_map>
 
+// Sentinel: set once x64_emitter.hpp is included, so arm64_emitter.hpp (which
+// may be included alongside it in the ARM64 ThinIR emit path) can reuse the
+// identical Label/AbsFixup/NativeFixup types and avoid redefining the shared
+// Cond/VReg names. The ARM64 emitter keeps its own ArmCond/ArmVReg enums
+// (different encodings) but exposes Cond/VReg aliases ONLY when x64 is absent
+// (the standalone arm64_emitter_test shape).
+#define EMBER_X64_EMITTER_DEFINED 1
+
 namespace ember {
 
 // x86-64 register encoding numbers (0-15), shared by GP and XMM

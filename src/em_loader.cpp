@@ -1173,8 +1173,13 @@ bool load_em_bytes_impl(const std::vector<uint8_t>& file, LoadedModule& out,
                                pf.name + "\": " + verr);
                 return false;
             }
-            // Re-emit the deserialized IR to x64.
+            // Re-emit the deserialized IR to native code. ARM64 uses emit_arm64
+            // (plan_MACOS_ARM64.md Phase 7); x86 uses emit_x64.
+#if defined(__aarch64__) || defined(_M_ARM64)
+            CompiledFn cf = emit_arm64(thf, ictx);
+#else
             CompiledFn cf = emit_x64(thf, ictx);
+#endif
             if (cf.bytes.empty()) {
                 set_error(err, "em_loader: v5 IR: re-emit produced empty code for \"" +
                                pf.name + "\"");

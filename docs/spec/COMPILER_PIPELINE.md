@@ -300,9 +300,11 @@ v1.0 batch and the 2026-07-11 Tier 1 follow-ons, all verified in
   `T[]` **or** an `array<T>` handle (the `iterable()` hook, array case —
   `TYPE_SYSTEM.md` §13.2); `var` gets the element type. Lowers to a
   while-loop-with-indexing over the slice's `{ptr, len}` or the array's
-  `array_length` + typed `array_get_*` (`CODEGEN_SPEC.md` §17). The IR backend
-  marks a function using for-each as `non_serializable` (falls back to the
-  tree-walker). See `TYPE_SYSTEM.md` §13 + `ROADMAP.md` Tier 1.
+  `array_length` + typed `array_get_*` (`CODEGEN_SPEC.md` §17). **for-each +
+  match lower to ThinIR (Phase 6d); no tree-walker fallback on either arch** —
+  the old `has_for_each` `non_serializable` gate was removed, so the IR backend
+  handles for-each on x86 (`emit_x64`) AND ARM64 (`emit_arm64`) alike. See
+  `TYPE_SYSTEM.md` §13 + `ROADMAP.md` Tier 1.
 - **`match`** (`parse_stmt` `Kw_match` case, Tier 1, 2026-07-11):
   `match (expr) '{' (pattern | '_') '=>' (block | stmt) (',')? '}'` — builds a
   `MatchStmt { subject, arms }` where each `MatchArm` is `{ pattern, is_wildcard,
@@ -311,8 +313,11 @@ v1.0 batch and the 2026-07-11 Tier 1 follow-ons, all verified in
   is a separate branch with no fallthrough and no `break` (the body jumps to the
   exit). `=>` is the `FatArrow` token. Lowers to a per-arm compare-and-branch
   cascade (`CODEGEN_SPEC.md` §18). The subject must be an integer or bool
-  (`TYPE_SYSTEM.md` §13). The IR backend marks a function using match as
-  `non_serializable` (falls back to the tree-walker). See `ROADMAP.md` Tier 1.
+  (`TYPE_SYSTEM.md` §13). **for-each + match lower to ThinIR (Phase 6d); no
+  tree-walker fallback on either arch** — the old `non_serializable` gate for
+  match was removed; the IR backend handles match (literal/enum patterns AND
+  struct-destructure + guards) on x86 (`emit_x64`) AND ARM64 (`emit_arm64`)
+  alike. See `ROADMAP.md` Tier 1.
 - **Array literals** (`parse_primary` `[` case, Tier 1): `[` at **primary**
   position constructs an `ArrayLit` (distinct from the postfix `[` index/view
   operator); `[a, b, c]` is a fixed-array or slice literal depending on the

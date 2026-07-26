@@ -95,6 +95,22 @@
 
 using namespace ember;
 
+// Architecture detection: on ARM64 (Apple Silicon, etc.) ThinIR is the ONLY
+// backend — the tree-walker is x86-only and hard-errors on ARM64 (codegen.cpp
+// forces ir_enabled_eff=true). So tests that asserted "ir-on bytes DIFFER from
+// flags-off" (byte-inequality as evidence the IR path ran) are WRONG on ARM64:
+// both paths use emit_arm64 → identical bytes. On ARM64 the evidence that the
+// IR path ran is cr.backend == CompileBackend::IRBackend + non-empty ThinIR
+// + correct value, NOT byte-inequality. The x86 byte-inequality assertion is
+// retained under `if (!kIsArm64)`.
+static constexpr bool kIsArm64 =
+#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
+    true
+#else
+    false
+#endif
+    ;
+
 struct M {
     std::vector<CompiledFn> fns;
     std::unique_ptr<DispatchTable> table;
@@ -210,7 +226,8 @@ static void build_natives(NativeTable& nt) {
 // type-checks and runs identically to the lang suite.
 static std::unique_ptr<M> compile(const std::string& src, bool ir_on,
                                   bool peephole, bool regalloc,
-                                  std::vector<uint8_t>* main_bytes = nullptr) {
+                                  std::vector<uint8_t>* main_bytes = nullptr,
+                                  CompileBackend* main_backend = nullptr) {
     auto m = std::make_unique<M>();
     auto lr = tokenize(src, "<thin_ir>");
     if (!lr.ok) { std::printf("FAIL: lex: %s\n", lr.error.c_str()); return nullptr; }
@@ -271,8 +288,15 @@ static std::unique_ptr<M> compile(const std::string& src, bool ir_on,
     ctx.enable_local_regalloc = regalloc;
     ctx.enable_ir_backend = ir_on;
     for (auto& fn : m->prog.funcs) {
-        auto cf = compile_func(fn, ctx);
+        // Use compile_func_checked so the test can inspect cr.backend (the
+        // ACTUAL backend used: IRBackend whenever the IR path ran, TreeWalker
+        // only on a real fallback). On ARM64 the backend is always IRBackend
+        // (ThinIR is the sole codegen path); on x86 it is IRBackend when
+        // ir_on and the function is IR-lowerable, else TreeWalker.
+        CompileResult cr = compile_func_checked(fn, ctx);
+        CompiledFn cf = std::move(cr.compiled);
         if (main_bytes && fn.name == "main") *main_bytes = cf.bytes;  // pre-finalize
+        if (main_backend && fn.name == "main") *main_backend = cr.backend;
         if (!finalize(cf)) { std::printf("FAIL: alloc_executable for %s\n", fn.name.c_str()); return nullptr; }
         m->table->set(fn.slot, cf.entry);
         m->fns.push_back(std::move(cf));
@@ -576,27 +600,40 @@ int main() {
     {
         const char* src = "fn main() -> i64 { let a: i64 = 100; let b: i64 = 23; return a + b; }\n";
         std::vector<uint8_t> bo, bn;
-        auto mo = compile(src, false, false, false, &bo);
-        auto mn = compile(src, true,  false, false, &bn);
+        CompileBackend bo_be = CompileBackend::TreeWalker, bn_be = CompileBackend::TreeWalker;
+        auto mo = compile(src, false, false, false, &bo, &bo_be);
+        auto mn = compile(src, true,  false, false, &bn, &bn_be);
         ck(mo.get() && mn.get(), "[P3.0] BinExpr source compiles (off + ir-on)");
         if (mo && mn) {
             ck(call0_i64(*mo, "main") == 123, "[P3.1] flags-off value: 100+23 == 123");
             ck(call0_i64(*mn, "main") == 123, "[P3.2] ir-on value: 100+23 == 123");
-            // Raw byte comparison is confounded by baked dispatch/globals bases
-            // (each compile() makes fresh tables at different addresses). So we
-            // compare the BYTE LENGTHS + a structural fingerprint instead: a
-            // silent no-op fallback would make bn == bo byte-for-byte (same
-            // path, same length). Differing length proves the IR path ran.
-            bool differs = (bo.size() != bn.size());
-            if (!differs) {
-                // same length: compare byte-by-byte (a no-op fallback would be
-                // identical even at the same length, modulo baked addresses —
-                // but baked addresses differ, so even a no-op would "differ" by
-                // a few reloc bytes; the REAL test is the lower_function probe
-                // below). Use length as the primary witness.
-                for (size_t i = 0; i < bo.size(); ++i) if (bo[i] != bn[i]) { differs = true; break; }
+            // ARCH-AWARE: on x86 the evidence that the IR path ran (not a
+            // silent no-op fallback) is byte-inequality — the IR path's
+            // push/pop across the RHS differs from the tree-walker's r10
+            // holding-reg sequence. On ARM64 ThinIR is the SOLE backend (the
+            // tree-walker is x86-only + hard-errors), so BOTH flags-off and
+            // flags-on use emit_arm64 → identical bytes. The ARM64 evidence
+            // is cr.backend == IRBackend (the IR path ran) + correct value.
+            if (!kIsArm64) {
+                // Raw byte comparison is confounded by baked dispatch/globals
+                // bases (each compile() makes fresh tables at different
+                // addresses). So we compare the BYTE LENGTHS + a structural
+                // fingerprint instead: a silent no-op fallback would make
+                // bn == bo byte-for-byte (same path, same length). Differing
+                // length proves the IR path ran.
+                bool differs = (bo.size() != bn.size());
+                if (!differs) {
+                    for (size_t i = 0; i < bo.size(); ++i) if (bo[i] != bn[i]) { differs = true; break; }
+                }
+                ck(differs, "[P3.3] ir-on bytes DIFFER from flags-off (IR path ran — not a silent no-op)");
+            } else {
+                // ARM64: both paths use emit_arm64 (ThinIR is the sole
+                // backend), so bytes are identical. The evidence the IR path
+                // ran is that the ir-on compile used CompileBackend::IRBackend
+                // (not a tree-walker fallback — there is none on ARM64).
+                ck(bn_be == CompileBackend::IRBackend,
+                   "[P3.3] ir-on used CompileBackend::IRBackend (IR path ran — ARM64 frame-only emit)");
             }
-            ck(differs, "[P3.3] ir-on bytes DIFFER from flags-off (IR path ran — not a silent no-op)");
         }
     }
     {
@@ -644,15 +681,17 @@ int main() {
     }
 
     // -----------------------------------------------------------------
-    // Part 4: D9 — for-each / match IR-backend fallback to tree-walker.
-    // When enable_ir_backend=true, lower_function marks functions using
-    // ForEachStmt or MatchStmt as non_serializable (blocks cleared), so
-    // compile_func falls through to the tree-walker. This test asserts the
-    // fallback EXECUTES CORRECTLY (right result) and does not crash or
-    // miscompile. Also probes lower_function directly to confirm the
-    // non_serializable flag is set (the fallback trigger).
+    // Part 4: D9 — for-each / match ARE lowered to ThinIR (Phase 6d).
+    // Previously lower_function marked functions using ForEachStmt or
+    // MatchStmt as non_serializable (blocks cleared) + fell back to the
+    // tree-walker. As of Phase 6d, for-each and match ARE lowered to ThinIR:
+    // lower_function produces NON-empty blocks + the non_serializable flag is
+    // NOT set. This is universal (true on BOTH x86 and ARM64 — for-each/match
+    // are in ThinIR everywhere now). This test asserts the IR path EXECUTES
+    // CORRECTLY (right result) + probes lower_function directly to confirm
+    // non-empty blocks + serializable (the IR path ran, not a fallback).
     // -----------------------------------------------------------------
-    std::printf("\nPart 4: D9 for-each/match IR-backend fallback\n");
+    std::printf("\nPart 4: D9 for-each/match lowered to ThinIR (Phase 6d)\n");
     {
         // for-each: sum a slice. Tree-walker result = 150.
         const char* src =
@@ -667,9 +706,11 @@ int main() {
         ck(m != nullptr, "[D9.1] for-each compile with ir_on=true succeeded");
         if (m) {
             int64_t r = call0_i64(*m, "main");
-            ck(r == 150, "[D9.2] for-each fallback result == 150 (tree-walker correct)");
+            ck(r == 150, "[D9.2] for-each IR-path result == 150 (correct)");
         }
-        // Probe lower_function directly: the ThinFunction must be non_serializable.
+        // Probe lower_function directly: for-each IS lowered to ThinIR now
+        // (Phase 6d) — the ThinFunction must have NON-empty blocks + the
+        // non_serializable flag must NOT be set (serializable, not a fallback).
         {
             auto lr = tokenize(src, "<d9fe>");
             if (lr.ok) {
@@ -689,8 +730,12 @@ int main() {
                             CodeGenCtx ctx; ctx.natives=&nt.natives; ctx.script_slots=&slots;
                             ctx.structs=&layouts; ctx.enable_ir_backend=true;
                             ThinFunction thf = lower_function(*mf, ctx);
-                            ck(thf.blocks.empty(), "[D9.3] for-each lower_function blocks empty (fallback triggered)");
-                            ck(thf.non_serializable, "[D9.4] for-each lower_function non_serializable flag set");
+                            char buf[128];
+                            std::snprintf(buf, sizeof buf,
+                                "[D9.3] for-each lower_function blocks non-empty (lowered to ThinIR, blocks=%zu)",
+                                thf.blocks.size());
+                            ck(!thf.blocks.empty(), buf);
+                            ck(!thf.non_serializable, "[D9.4] for-each lower_function serializable (non_serializable NOT set — ThinIR path)");
                         }
                     }
                 }
@@ -714,9 +759,11 @@ int main() {
         ck(m != nullptr, "[D9.5] match compile with ir_on=true succeeded");
         if (m) {
             int64_t r = call0_i64(*m, "main");
-            ck(r == 20, "[D9.6] match fallback result == 20 (tree-walker correct)");
+            ck(r == 20, "[D9.6] match IR-path result == 20 (correct)");
         }
-        // Probe lower_function directly: the match function must be non_serializable.
+        // Probe lower_function directly: match IS lowered to ThinIR now
+        // (Phase 6d) — the ThinFunction must have NON-empty blocks + the
+        // non_serializable flag must NOT be set (serializable, not a fallback).
         {
             auto lr = tokenize(src, "<d9mt>");
             if (lr.ok) {
@@ -736,8 +783,12 @@ int main() {
                             CodeGenCtx ctx; ctx.natives=&nt.natives; ctx.script_slots=&slots;
                             ctx.structs=&layouts; ctx.enable_ir_backend=true;
                             ThinFunction thf = lower_function(*mf, ctx);
-                            ck(thf.blocks.empty(), "[D9.7] match lower_function blocks empty (fallback triggered)");
-                            ck(thf.non_serializable, "[D9.8] match lower_function non_serializable flag set");
+                            char buf[128];
+                            std::snprintf(buf, sizeof buf,
+                                "[D9.7] match lower_function blocks non-empty (lowered to ThinIR, blocks=%zu)",
+                                thf.blocks.size());
+                            ck(!thf.blocks.empty(), buf);
+                            ck(!thf.non_serializable, "[D9.8] match lower_function serializable (non_serializable NOT set — ThinIR path)");
                         }
                     }
                 }

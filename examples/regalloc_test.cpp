@@ -31,6 +31,23 @@
 
 using namespace ember;
 
+// Architecture detection: on ARM64 (Apple Silicon, etc.) the linear-scan
+// regalloc is x86-specific — it assigns x86 callee-saved register IDs (rbx=3,
+// rsi=6, rdi=7, r12=12, r13=13, r15=15) that emit_arm64 does NOT consume
+// (ARM64 uses frame-only emit with NO regalloc; compile_func_checked skips
+// run_regalloc on ARM64 via a `&& false` guard). So the x86 regalloc-execution
+// cases (which run_regalloc + emit_x64 + execute the regalloc'd x86 code) SIGILL
+// on ARM64. The x86 cases are retained under `if (!kIsArm64)`; the ARM64 branch
+// uses compile_func_checked to assert frame-only emission (cr.backend ==
+// IRBackend) + correct value + no x86 register IDs in the post-pass IR.
+static constexpr bool kIsArm64 =
+#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
+    true
+#else
+    false
+#endif
+    ;
+
 // ─── Workloads ───
 // Each exercises a pattern that benefits from register allocation: multiple
 // live values, recursion, loop accumulators, register pressure.
@@ -234,6 +251,74 @@ static int64_t call0_i64(M& m, const std::string& fn) {
     return ember::ember_call_void(e, &m.ctx);
 }
 
+// ─── ARM64 path: frame-only emission via compile_func_checked ───
+// On ARM64 the linear-scan regalloc is architecturally N/A (it assigns x86
+// callee-saved register IDs emit_arm64 does not consume). compile_func_checked
+// skips run_regalloc on ARM64 (a `&& false` guard in codegen.cpp) and uses
+// emit_arm64 (frame-only). This helper compiles each workload through
+// compile_func_checked with enable_ir_backend=true + enable_regalloc=true +
+// request_transformed_ir=true, so the ARM64 branch can assert:
+//   (a) frame-only emission is selected (cr.backend == CompileBackend::IRBackend)
+//   (b) no x86 register IDs reached emit_arm64 (cr.transformed->ra.enabled ==
+//       false + ra.map empty + ra.used_reg_ids empty — regalloc was skipped)
+//   (c) the correct value is produced (call0_i64 == expected)
+// Returns the module + (via out_cr) the main fn's CompileResult for ra inspection.
+static std::unique_ptr<M> compile_arm64(const std::string& src,
+                                        CompileResult* out_cr = nullptr) {
+    auto m = std::make_unique<M>();
+    auto lr = tokenize(src, "<regalloc_test>");
+    if (!lr.ok) { std::printf("FAIL: lex: %s\n", lr.error.c_str()); return nullptr; }
+    auto pr = parse(std::move(lr.toks));
+    if (!pr.ok) { std::printf("FAIL: parse: %s\n", pr.error.c_str()); return nullptr; }
+    m->prog = std::move(pr.program);
+    int si = 0;
+    for (auto& fn : m->prog.funcs) { m->slots[fn.name] = si++; fn.slot = si - 1; }
+
+    std::unordered_map<std::string, NativeSig> natives;
+    OpOverloadTable overloads;
+    m->layouts = build_struct_layouts(m->prog);
+    m->prog.string_xor_key = 0;
+    auto sr = sema(m->prog, natives, m->slots, 0, &overloads, &m->layouts);
+    if (!sr.ok) {
+        std::printf("FAIL: sema: %s\n", sr.errors.empty() ? "<unknown>" : sr.errors[0].msg.c_str());
+        return nullptr;
+    }
+
+    m->gbs.assign(0, 0);
+    m->gb.base = 0;
+    g_globals_for_codegen = &m->gb;
+    m->table = std::make_unique<DispatchTable>(m->prog.funcs.size());
+
+    CodeGenCtx ctx;
+    ctx.globals_base = 0;
+    ctx.dispatch_base = int64_t(m->table->base());
+    ctx.natives = &natives;
+    ctx.script_slots = &m->slots;
+    ctx.structs = &m->layouts;
+    ctx.use_context_reg = true;
+    ctx.enable_ir_backend = true;   // ARM64: IR backend is the sole codegen path
+    ctx.enable_regalloc = true;     // requested — but compile_func_checked skips it on ARM64
+    ctx.emit_depth_checks = true;
+    ctx.request_transformed_ir = true;  // so cr.transformed has the post-pass IR for ra inspection
+
+    for (auto& fn : m->prog.funcs) {
+        CompileResult cr = compile_func_checked(fn, ctx);
+        if (fn.name == "main" && out_cr) *out_cr = cr;  // save main's result for ra checks
+        CompiledFn cf = std::move(cr.compiled);
+        if (cf.bytes.empty()) {
+            std::printf("FAIL: compile_func_checked gave empty bytes for %s\n", fn.name.c_str());
+            return nullptr;
+        }
+        if (!finalize(cf)) {
+            std::printf("FAIL: alloc_executable for %s\n", fn.name.c_str());
+            return nullptr;
+        }
+        m->table->set(fn.slot, cf.entry);
+        m->fns.push_back(std::move(cf));
+    }
+    return m;
+}
+
 int main() {
     std::printf("=== regalloc_test: Stage 3 linear-scan register allocation ===\n\n");
     std::fflush(stdout);
@@ -249,6 +334,21 @@ int main() {
         {"int_ops",       SRC_INT_OPS,      834,     true},
     };
     int NW = int(sizeof(workloads) / sizeof(workloads[0]));
+
+    // ─── Architecture split ───
+    // On x86 (!kIsArm64): run the full Stage 3 linear-scan regalloc suite —
+    //   value-preservation (regalloc ON vs OFF), register assignment, regalloc
+    //   result sanity (valid x86 callee-saved register IDs), forced spilling,
+    //   + regalloc-off no-op. These exercise run_regalloc + emit_x64 + execute
+    //   the regalloc'd x86 code, which is architecturally x86-specific.
+    // On ARM64 (kIsArm64): the linear-scan regalloc is N/A (it assigns x86
+    //   callee-saved register IDs emit_arm64 does not consume; compile_func_
+    //   checked skips run_regalloc on ARM64). Assert the ARM64 invariants:
+    //   (a) frame-only emission is selected (cr.backend == IRBackend),
+    //   (b) no x86 register IDs reached emit_arm64 (ra.enabled == false,
+    //       ra.map + ra.used_reg_ids empty — regalloc was skipped),
+    //   (c) the correct value is produced via emit_arm64.
+    if (!kIsArm64) {
 
     // Compute the expected value for "branches" by running it without regalloc
     // first (it's a complex accumulator; we verify regalloc matches, not a
@@ -416,6 +516,7 @@ int main() {
 
     // (5) Regalloc OFF is byte-identical to the existing path (regalloc is
     // a no-op when ra.enabled is false — the emit falls back to all-frame).
+    // (x86-only: inspects the lowered ThinFunction's ra field directly.)
     std::printf("\n(5) Regalloc-off is a no-op (ra.enabled stays false)\n");
     {
         auto lr = tokenize(SRC_REG_PRESSURE, "<regalloc_test>");
@@ -440,6 +541,106 @@ int main() {
             ck(!thf.ra.enabled, "regalloc off by default (ra.enabled=false)");
         }
     }
+
+    }  // end if (!kIsArm64) — x86 regalloc suite
+    else {
+    // ─── ARM64: frame-only emission invariants (regalloc is N/A) ───
+    std::printf("(ARM64) Frame-only emission invariants (regalloc N/A on ARM64)\n");
+    std::fflush(stdout);
+
+    // (A) For each workload: compile via compile_func_checked (enable_ir_backend
+    //     + enable_regalloc + request_transformed_ir), assert:
+    //       (a) cr.backend == CompileBackend::IRBackend (frame-only emit selected)
+    //       (b) no x86 register IDs reached emit_arm64: the post-pass IR's
+    //           ra.enabled == false + ra.map empty + ra.used_reg_ids empty
+    //           (compile_func_checked skips run_regalloc on ARM64)
+    //       (c) call0_i64 == expected (the correct value via emit_arm64)
+    for (int wi = 0; wi < NW; ++wi) {
+        const auto& wl = workloads[wi];
+        std::printf("  [%d] %s ...\n", wi, wl.name); std::fflush(stdout);
+
+        CompileResult cr;
+        auto m = compile_arm64(wl.src, &cr);
+        if (!m) { ck(false, wl.name); continue; }
+
+        // (a) frame-only emission: the IR backend was used (not a tree-walker
+        //     fallback — there is none on ARM64). emit_arm64 is frame-only.
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "%s: cr.backend == IRBackend (frame-only emit)", wl.name);
+        ck(cr.backend == CompileBackend::IRBackend, buf);
+        ck(cr.ok(), "compile_func_checked succeeded (executable produced)");
+
+        // (b) no x86 register IDs reached emit_arm64: regalloc was skipped on
+        //     ARM64, so the post-pass IR has ra.enabled == false + empty maps.
+        //     cr.transformed holds the post-pass ThinFunction (request_
+        //     transformed_ir was set). If absent, the compile still succeeded
+        //     but we cannot inspect ra — assert via the stage trace instead.
+        if (cr.transformed) {
+            std::snprintf(buf, sizeof(buf), "%s: ra.enabled == false (regalloc skipped on ARM64)", wl.name);
+            ck(!cr.transformed->ra.enabled, buf);
+            std::snprintf(buf, sizeof(buf), "%s: ra.map empty (no x86 reg assignments)", wl.name);
+            ck(cr.transformed->ra.map.empty(), buf);
+            std::snprintf(buf, sizeof(buf), "%s: ra.used_reg_ids empty (no x86 callee-saved IDs)", wl.name);
+            ck(cr.transformed->ra.used_reg_ids.empty(), buf);
+        } else {
+            // Fallback: the Regalloc stage trace should report "skipped".
+            const CompileStageTrace* rt = cr.stage(CompileStage::Regalloc);
+            std::snprintf(buf, sizeof(buf), "%s: regalloc stage skipped on ARM64", wl.name);
+            ck(rt != nullptr && !rt->reached, buf);
+        }
+
+        // (c) correct value via emit_arm64 (frame-only execution).
+        //     For "branches" the expected value is computed by the no-regalloc
+        //     baseline; on ARM64 there is no regalloc, so the frame-only path
+        //     IS the baseline — use the hardcoded expected values (branches
+        //     is recomputed below from the first compile).
+        int64_t rc = call0_i64(*m, "main");
+        if (wl.name != std::string("branches")) {
+            std::snprintf(buf, sizeof(buf), "%s: expected=%lld got=%lld (ARM64 frame-only)",
+                          wl.name, (long long)wl.expected, (long long)rc);
+            ck(rc == wl.expected, buf);
+        } else {
+            // branches: store the ARM64 result as the expected (it IS the
+            // baseline — no regalloc to compare against).
+            workloads[wi].expected = rc;
+            std::snprintf(buf, sizeof(buf), "%s: ARM64 frame-only result=%lld (baseline)",
+                          wl.name, (long long)rc);
+            ck(rc >= 0, buf);  // sanity: non-negative accumulator
+        }
+    }
+
+    // (B) Explicitly verify enable_regalloc=true is ignored on ARM64: compile
+    //     a register-heavy workload with regalloc REQUESTED + inspect the
+    //     post-pass IR. The regalloc stage must be skipped (not reached) +
+    //     ra must be clear. This proves the x86 regalloc output never reaches
+    //     emit_arm64 even when the host requests it.
+    {
+        CompileResult cr;
+        auto m = compile_arm64(SRC_REG_PRESSURE, &cr);
+        ck(m != nullptr, "ARM64 regalloc-requested compile succeeds");
+        if (m) {
+            ck(cr.backend == CompileBackend::IRBackend,
+               "ARM64: enable_regalloc=true still uses IRBackend (regalloc skipped)");
+            const CompileStageTrace* rt = cr.stage(CompileStage::Regalloc);
+            ck(rt != nullptr, "ARM64: Regalloc stage trace present");
+            if (rt) {
+                ck(!rt->reached, "ARM64: Regalloc stage NOT reached (skipped despite enable_regalloc=true)");
+            }
+            if (cr.transformed) {
+                ck(!cr.transformed->ra.enabled,
+                   "ARM64: post-pass ra.enabled == false (no x86 regalloc ran)");
+                ck(cr.transformed->ra.used_reg_ids.empty(),
+                   "ARM64: post-pass ra.used_reg_ids empty (no x86 callee-saved IDs)");
+            }
+            // Value is still correct (frame-only emit is value-equivalent).
+            int64_t rc = call0_i64(*m, "main");
+            char buf[256];
+            std::snprintf(buf, sizeof(buf), "ARM64: reg_pressure correct under frame-only (=%lld)", (long long)rc);
+            ck(rc == 1704, buf);
+        }
+    }
+
+    }  // end else (ARM64 invariants)
 
     if (g_fail) {
         std::printf("\n*** regalloc_test: FAILURES ***\n");

@@ -106,16 +106,25 @@ fn compile_and_run(source: string) -> i64 {
     let nbytes: i64 = codegen_byte_count();
     if (nbytes <= 0) { return -402; }
 
-    // sanity: the buffer starts with the x64 function prologue
+    // sanity: the buffer starts with the function prologue. x64:
     //   0x55           push rbp
     //   0x48 0x89 0xE5 mov rbp, rsp
+    // arm64 (AAPCS64):
+    //   stp x29,x30,[sp,-16]!  = FD 7B BF A9 (LE)
     // (the first function's entry is at offset 0 — not necessarily `main`,
     // since the codegen lays fns out in declaration order; the actual entry
     // we invoke is resolved by name below via codegen_fn_entry_offset)
-    if (codegen_byte_at(0) != 0x55) { return -403; }
-    if (codegen_byte_at(1) != 0x48) { return -404; }
-    if (codegen_byte_at(2) != 0x89) { return -405; }
-    if (codegen_byte_at(3) != 0xE5) { return -406; }
+    if (cg_target == CG_TARGET_ARM64) {
+        if (codegen_byte_at(0) != 0xFD) { return -403; }
+        if (codegen_byte_at(1) != 0x7B) { return -404; }
+        if (codegen_byte_at(2) != 0xBF) { return -405; }
+        if (codegen_byte_at(3) != 0xA9) { return -406; }
+    } else {
+        if (codegen_byte_at(0) != 0x55) { return -403; }
+        if (codegen_byte_at(1) != 0x48) { return -404; }
+        if (codegen_byte_at(2) != 0x89) { return -405; }
+        if (codegen_byte_at(3) != 0xE5) { return -406; }
+    }
 
     // locate `main`'s entry offset within the buffer. The codegen binds an
     // entry label per fn at its prologue offset; codegen_fn_entry_offset

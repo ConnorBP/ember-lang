@@ -268,13 +268,24 @@ constexpr uint64_t EM_BUILD_ID = em_fnv1a64("ember-em-v2;compiler=unknown");
 #else
 #define EMBER_EM_CC "cc=unknown;"
 #endif
+// The codegen tag: x64-v1 for the x86-64 tree-walker/ThinIR emit, arm64-v1 for
+// the ARM64 ThinIR emit (plan_MACOS_ARM64.md). A .em written on one codegen
+// carries a distinct tag so a cross-codegen load is rejected by the ABI hash.
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#define EMBER_EM_CODE "code=x64-v1;"
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#define EMBER_EM_CODE "code=arm64-v1;"
+#else
+#define EMBER_EM_CODE "code=unknown;"
+#endif
 constexpr uint32_t EM_TARGET_ABI_HASH = static_cast<uint32_t>(em_fnv1a64(
-    EMBER_EM_ARCH EMBER_EM_PTR EMBER_EM_OS EMBER_EM_CC
-    "code=x64-v1;type=ember-type-v1;reloc=em-v2"));
+    EMBER_EM_ARCH EMBER_EM_PTR EMBER_EM_OS EMBER_EM_CC EMBER_EM_CODE
+    "type=ember-type-v1;reloc=em-v2"));
 #undef EMBER_EM_ARCH
 #undef EMBER_EM_PTR
 #undef EMBER_EM_OS
 #undef EMBER_EM_CC
+#undef EMBER_EM_CODE
 #undef EMBER_EM_STR
 #undef EMBER_EM_STR2
 

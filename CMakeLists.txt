@@ -12,6 +12,9 @@ project(ember VERSION 1.0.0 LANGUAGES CXX)
 # The vendored ed25519 (thirdparty/ed25519) is C99; enable the C language so
 # CMake links it correctly (F2 .em content authentication). ember itself stays C++17.
 enable_language(C)
+# Enable the assembler so the Darwin ARM64 host->JIT thunks (.S) compile
+# (plan_MACOS_ARM64.md Phase 4). Harmless on platforms that don't use it.
+enable_language(ASM)
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
     set(CMAKE_C_STANDARD 99)
     set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -148,6 +151,13 @@ target_link_libraries(ember PUBLIC ember_ed25519)  # F2 .em content authenticati
 if(WIN32)
     target_link_libraries(ember PUBLIC psapi)
 endif()
+# Darwin ARM64 host->JIT ABI thunks (out-of-line AAPCS64 assembly). Installs
+# x19 = context_t* + marshals the script arg + blr the entry. plan_MACOS_ARM64.md
+# Phase 4 — replaces the engine.cpp inline-asm approach (which is x86-only).
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+    target_sources(ember PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/darwin_arm64_thunks.S)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/darwin_arm64_thunks.S PROPERTIES LANGUAGE ASM)
+endif()
 
 # ---- frontend lib: lexer, types, parser, sema, codegen ----
 add_library(ember_frontend STATIC
@@ -159,6 +169,11 @@ add_library(ember_frontend STATIC
     src/thin_lower.cpp
     src/peephole.cpp
     src/thin_emit.cpp
+    # Phase 4 (plan_MACOS_ARM64.md): the ARM64 ThinIR emit pass. Mirrors
+    # thin_emit.cpp's emit_x64 over the supported subset; unsupported ThinOps
+    # throw a clear runtime_error so the host never silently miscompiles.
+    # Frame-only (no regalloc) for the first milestone.
+    src/thin_emit_arm64.cpp
     # Stage B c2: em_loader.cpp moved here from the core `ember` lib because the
     # v5 IR re-emit path (deserialize_thin_function + emit_x64) needs frontend
     # symbols (emit_x64 from thin_emit.cpp, CodeGenCtx from codegen.hpp). The
@@ -187,6 +202,10 @@ add_library(ember_frontend STATIC
     # Lives in ember_frontend (a compile-time/layout concern) and depends only
     # on the C++ standard library.
     src/dispatch_abi.cpp
+    # Phase 6c (plan_MACOS_ARM64.md): the shared AAPCS64 aggregate classifier —
+    # a tested, emit-independent module emit_arm64's call marshaling consumes.
+    # Self-contained: touches Type only via public members + Prim + StructLayout.
+    src/aapcs64_classify.cpp
     # Red 3 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §5, §9.2, §14.3): the
     # logical/physical module layout planner, identity layout, and the configured
     # KeyedDispatchRegistry for implicit-keyed-v1. A compile-time/layout concern
@@ -269,11 +288,21 @@ target_link_libraries(ember_ext_vec   PRIVATE ember_ext_gc)
 target_link_libraries(ember_ext_string PRIVATE ember_ext_gc)
 ember_add_extension(sync     extensions/sync/ext_sync.cpp)
 ember_add_extension(thread   extensions/thread/ext_thread.cpp)   # Tier 4: in-context threads (thread_spawn/join + call_mutex serialization)
-# coroutine extension is Windows-only (uses CreateFiber/SwitchToFiber). On
-# non-Windows we create an empty stub so link targets that reference
-# ember_ext_coroutine still resolve. A ucontext port is a TODO (ROADMAP).
+# coroutine extension: Windows uses fibers (CreateFiber/SwitchToFiber);
+# Apple Silicon (plan_MACOS_ARM64.md Phase 8) uses a hand-written AAPCS64
+# context switch (src/darwin_arm64_ctx_switch.S) — NOT ucontext (deprecated/
+# problematic on Apple). Other platforms get the empty stub so link targets
+# that reference ember_ext_coroutine still resolve. The same ext_coroutine.cpp
+# source serves Windows + Apple (guarded internally with #if/_WIN32 / #elif
+# __APPLE__); the Darwin ctx-switch .S is compiled into the extension lib.
 if(WIN32)
     ember_add_extension(coroutine extensions/coroutine/ext_coroutine.cpp) # #21 coroutines with yield (Windows fibers)
+elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+    add_library(ember_ext_coroutine STATIC extensions/coroutine/ext_coroutine.cpp)
+    target_include_directories(ember_ext_coroutine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/extensions/coroutine)
+    target_link_libraries(ember_ext_coroutine PUBLIC ember_frontend)
+    target_sources(ember_ext_coroutine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/darwin_arm64_ctx_switch.S)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/darwin_arm64_ctx_switch.S PROPERTIES LANGUAGE ASM)
 else()
     add_library(ember_ext_coroutine STATIC extensions/coroutine/ext_coroutine_stub.cpp)
     target_include_directories(ember_ext_coroutine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/extensions/coroutine)
@@ -347,6 +376,78 @@ add_test(NAME import_roundtrip COMMAND import_roundtrip_test)
 add_executable(em_loader_hardening_test examples/em_loader_hardening_test.cpp)
 target_link_libraries(em_loader_hardening_test PRIVATE ember ember_frontend)
 add_test(NAME em_loader_hardening COMMAND em_loader_hardening_test)
+
+# Phase 1 (plan_MACOS_ARM64.md): Darwin W^X JIT memory end-to-end proof —
+# allocates an RX MAP_JIT page, writes a hand-coded ARM64 fn (mov x0,#42; ret),
+# seals it (pthread_jit_write_protect_np + mprotect EXEC + sys_icache_invalidate),
+# executes it, and frees it. Also exercises the two-phase alloc_rw->patch->seal
+# path. Apple-only (the W^X mechanism is Apple-Silicon-specific).
+if(APPLE)
+    add_executable(jit_memory_darwin_test tests/jit_memory_darwin_test.cpp)
+    target_link_libraries(jit_memory_darwin_test PRIVATE ember ember_ed25519)
+    add_test(NAME jit_memory_darwin COMMAND jit_memory_darwin_test)
+    set_tests_properties(jit_memory_darwin PROPERTIES TIMEOUT 30)
+    # Phase 3: the ARM64 assembler byte-exact unit tests (arm64_emitter.hpp).
+    # Header-only emitter; the test is standalone (links no ember libs).
+    add_executable(arm64_emitter_test tests/arm64_emitter_test.cpp)
+    add_test(NAME arm64_emitter COMMAND arm64_emitter_test)
+    set_tests_properties(arm64_emitter PROPERTIES TIMEOUT 30)
+    # Phase 4: the ARM64 ThinIR emit end-to-end gate (emit_arm64). Lowers real
+    # ember sources to ThinFunction, emits ARM64, finalizes (alloc_executable),
+    # installs a dispatch table, and CALLS the JIT'd ARM64 code via a C fn ptr —
+    # asserting the correct i64 return. Integer + control-flow + scalar
+    # native/script calls; frame-only (no regalloc); safety OFF (no x19 access)
+    # so a raw AAPCS64 C call works. Links ember + ember_frontend (emit_arm64
+    # + lower_function + jit_memory) + ember_ed25519 (transitive ember dep).
+    add_executable(emit_arm64_test tests/emit_arm64_test.cpp)
+    target_link_libraries(emit_arm64_test PRIVATE ember ember_frontend ember_ed25519
+        ember_ext_string ember_ext_array ember_ext_gc)
+    add_test(NAME emit_arm64 COMMAND emit_arm64_test)
+    add_executable(dbg_lambda_test tests/dbg_lambda_test.cpp)
+    target_link_libraries(dbg_lambda_test PRIVATE ember ember_frontend ember_ed25519
+        ember_ext_string ember_ext_array ember_ext_gc)
+    set_tests_properties(emit_arm64 PROPERTIES TIMEOUT 30)
+    # Phase 6c: the AAPCS64 aggregate classifier unit tests (pure logic, no JIT).
+    add_executable(aapcs64_classify_test tests/aapcs64_classify_test.cpp src/aapcs64_classify.cpp)
+    target_link_libraries(aapcs64_classify_test PRIVATE ember_frontend ember ember_ed25519)
+    add_test(NAME aapcs64_classify COMMAND aapcs64_classify_test)
+    set_tests_properties(aapcs64_classify PROPERTIES TIMEOUT 30)
+    # Phase 8: Darwin ARM64 cooperative coroutines (yield/resume) via the
+    # hand-written AAPCS64 ember_ctx_switch (src/darwin_arm64_ctx_switch.S) —
+    # NOT ucontext (deprecated/problematic on Apple; plan §8). Drives a
+    # generator from C++ (resume 4x -> 1,2,3,0) + JIT'd-main integration cases
+    # mirroring the tests/lang/valid_coroutine_*.ember scripts. Links the
+    # coroutine extension (which carries the .S) + ember (ember_call_i64 thunk)
+    # + ember_frontend (emit_arm64/lower_function) + ember_ed25519 (transitive).
+    add_executable(coroutine_darwin_test tests/coroutine_darwin_test.cpp)
+    target_link_libraries(coroutine_darwin_test PRIVATE
+        ember ember_frontend ember_ed25519 ember_ext_coroutine)
+    add_test(NAME coroutine_darwin COMMAND coroutine_darwin_test)
+    set_tests_properties(coroutine_darwin PROPERTIES TIMEOUT 30)
+    # Audit H1: ARM64 keyed-dispatch codegen REJECTION gate. Pins that a
+    # keyed cross-module call, a legacy->keyed cross-module call, and an
+    # @obf_keyed function are all REJECTED at ARM64 codegen (not silently
+    # miscompiled / not crashed): @obf_keyed -> compile_func_checked hard
+    # fails with the IR-backend-unavailable reason; keyed/legacy->keyed
+    # cross-module calls record the rejection in non_serializable_reason.
+    # Mirrors the keyed CodeGenCtx setup from examples/keyed_dispatch_*_test
+    # (WIN32-gated) but asserts the REJECTION on ARM64. Apple-only.
+    add_executable(keyed_dispatch_arm64_reject_test tests/keyed_dispatch_arm64_reject_test.cpp)
+    target_link_libraries(keyed_dispatch_arm64_reject_test PRIVATE
+        ember ember_frontend ember_ed25519)
+    add_test(NAME keyed_dispatch_arm64_reject COMMAND keyed_dispatch_arm64_reject_test)
+    set_tests_properties(keyed_dispatch_arm64_reject PROPERTIES TIMEOUT 30)
+    # Audit M3: x18-avoidance scan. Verifies the ARM64 JIT (emit_arm64) + the
+    # Darwin coroutine ctx_switch NEVER reference x18 (Apple's platform
+    # register). Compiles a representative JIT'd fn through the full pipeline
+    # + scans every instruction's register fields for register 18; also
+    # assembles darwin_arm64_ctx_switch.S + scans it. Apple-only.
+    add_executable(x18_avoidance_test tests/x18_avoidance_test.cpp)
+    target_link_libraries(x18_avoidance_test PRIVATE
+        ember ember_frontend ember_ed25519 ember_ext_string ember_ext_array)
+    add_test(NAME x18_avoidance COMMAND x18_avoidance_test)
+    set_tests_properties(x18_avoidance PROPERTIES TIMEOUT 30)
+endif()
 
 # ext_runtime_test: runtime coverage for the relocated extensions (RESTRUCTURE_PLAN.md Section 6).
 # em_roundtrip/import_roundtrip call NO relocated native; this one calls the math
@@ -511,15 +612,18 @@ add_test(NAME ext_registration COMMAND ext_registration_test)
 # Self-contained (inlined payloads + a VirtualQuery W^X probe). Links the
 # core vec/quat/mat/string/array/math extension libs + ember
 # (for alloc_executable/VirtualQuery).
+# v0_4_hardening_test uses Win32 VirtualQuery/MEMORY_BASIC_INFORMATION to verify
+# W^X page protection — a Windows-only harness. plan_MACOS_ARM64.md: a macOS
+# W^X verification harness (mach_vm_region/sys_icache_invalidate) is a later task.
+if(WIN32)
 add_executable(v0_4_hardening_test examples/v0_4_hardening_test.cpp)
 target_link_libraries(v0_4_hardening_test PRIVATE
     ember ember_frontend ember_import
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math)
-if(WIN32)
     target_link_libraries(v0_4_hardening_test PRIVATE kernel32)
-endif()
 add_test(NAME v0_4_hardening COMMAND v0_4_hardening_test)
+endif()
 
 # v1.0 context thread-safety (Option D + B1): pins the per-call context-register
 # (r14) indirection so one compiled body serves N per-thread context_t's, each
@@ -555,9 +659,14 @@ set_tests_properties(in_context_threads PROPERTIES TIMEOUT 60)
 
 # Win64 ABI regressions: switch volatile scratch, raw B1 thunk r14
 # preservation, and an aligned-SSE trap stub called from both stack parities.
+# win64_abi_test is the Win64 calling-convention proof (MinGW GNU asm x64
+# thunks + aligned_trap). Windows-only: no arm64 equivalent yet
+# (plan_MACOS_ARM64.md — an arm64 ABI proof test is a later parity task).
+if(WIN32)
 add_executable(win64_abi_test examples/win64_abi_test.cpp)
 target_link_libraries(win64_abi_test PRIVATE ember ember_frontend)
 add_test(NAME win64_abi COMMAND win64_abi_test)
+endif()
 
 # v1.0 Tier 2 first-class function references: `&fn` handles + `handle(args)`
 # indirect call, with the REDSHELL guard #6 (validate the runtime i64 against a
@@ -699,7 +808,16 @@ find_program(BASH_EXE bash REQUIRED)
 add_test(NAME lang_suite
     COMMAND "${BASH_EXE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_lang_tests.sh"
             "${CMAKE_CURRENT_BINARY_DIR}")
-set_tests_properties(lang_suite PROPERTIES TIMEOUT 120)
+# Direct `bash tests/run_lang_tests.sh <build>` is deterministic 471/471 but
+# SLOW on macOS ARM64: measured ~477s wall (Release) for the full parse+sema+
+# run corpus — each of the ~471 checks spawns a fresh ember_check/sema_check/
+# ember_cli process (parse + JIT compile + run). The old 120s CTest TIMEOUT
+# was far too low; 600s was still too tight (CTest killed it at 600s with the
+# bash script unfinished — the real run is ~477s + CTest orchestration overhead
+# on a loaded CI host). 900s gives honest margin over the measured 477s direct
+# run. The script has its own per-test RUN_TIMEOUT=120s watchdogs, so this
+# only bounds the outer CTest harness.
+set_tests_properties(lang_suite PROPERTIES TIMEOUT 1500)
 
 # ---- standalone ember CLI: prism-decoupled runner ----
 # A minimal host that exercises the full parse->sema->codegen->finalize->call
@@ -763,6 +881,10 @@ target_link_libraries(ember_bundle PRIVATE ember_bundler)
 # Bundle the Ember-written compiler as a runnable preview artifact. The custom
 # command uses the same production bundler/stub as `ember bundle`; FFI is
 # explicit because emberc reads a source file and allocates executable memory.
+# Windows/x86-only for now: the self-hosted codegen (self_hosted/codegen.ember)
+# emits x86-64 bytes executed via call_raw — on arm64 that executes unrunnable
+# x86. plan_MACOS_ARM64.md Phase 7 (self-hosted ARM64 target) re-enables this.
+if(NOT APPLE)
 set(EMBER_SELFHOST_PREVIEW ${CMAKE_CURRENT_BINARY_DIR}/ember_selfhost_preview.exe)
 add_custom_command(
     OUTPUT ${EMBER_SELFHOST_PREVIEW}
@@ -791,15 +913,21 @@ add_test(NAME self_hosted_preview_smoke
             -DINPUT_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/self_hosted/preview_smoke_input.ember
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/selfhost_preview_smoke.cmake)
 set_tests_properties(self_hosted_preview_smoke PROPERTIES TIMEOUT 60)
+endif()
 
 # End-to-end bundler test: bundle .ember scripts into standalone exes, run
 # them, assert exit codes. Covers simple scripts, multi-function, imports,
 # globals, natives, and malformed-bundle rejection. Receives the bundler +
 # stub exe paths via $<TARGET_FILE:...>.
+# bundler_test spawns bundled exes via CreateProcess/WaitForSingleObject — a
+# Windows-only harness. plan_MACOS_ARM64.md Phase 7 ports the bundler to macOS
+# (executable_path is already portable; the harness needs posix_spawn).
+if(WIN32)
 add_executable(bundler_test examples/bundler_test.cpp)
 add_test(NAME bundler_test COMMAND bundler_test
     $<TARGET_FILE:ember_bundle> $<TARGET_FILE:ember_stub_main> $<TARGET_FILE:ember_cli>)
 set_tests_properties(bundler_test PROPERTIES TIMEOUT 60)
+endif()
 
 # Family A: `ember test` — native test runner (classify + compile + run/sema-check
 # every .ember file in tests/lang/). The CLI's built-in test command replaces
@@ -850,10 +978,14 @@ set_tests_properties(ember_passes_unroll ember_passes_lsr ember_passes_sccp
 # pipe configs live in tests/features/ (not tests/lang/, so `ember test` does
 # not scan them). The harness takes <ember_cli> <source_dir> so it can resolve
 # tests/features/ paths.
+# ember_cli_pipe_live_test drives the CLI as a subprocess via CreateProcess — a
+# Windows-only harness. plan_MACOS_ARM64.md: port to posix_spawn/popen later.
+if(WIN32)
 add_executable(ember_cli_pipe_live_test examples/ember_cli_pipe_live_test.cpp)
 add_test(NAME ember_cli_pipe_live COMMAND ember_cli_pipe_live_test
     $<TARGET_FILE:ember_cli> ${CMAKE_CURRENT_SOURCE_DIR})
 set_tests_properties(ember_cli_pipe_live PROPERTIES TIMEOUT 60)
+endif()
 
 # ---- binding ABI correctness suite (BINDING_API.md Sec 4) ----
 # Pins the script->native Win64 call ABI (struct-by-value arg <=8B,
@@ -866,12 +998,17 @@ set_tests_properties(ember_cli_pipe_live PROPERTIES TIMEOUT 60)
 # struct-return-path comparison in test [2b], and the math extension's sqrt
 # as a second f32 pin in test [4b]). Independent of the parallel extension
 # refactor: ABI-under-test natives are registered here, not in extension .cpp.
+# binding_abi_test pins the script->native Win64 call ABI via MinGW GNU-asm x64
+# thunks + aligned_trap — Windows-only. plan_MACOS_ARM64.md: an AAPCS64 binding
+# ABI proof test is a later parity task (Phase 2/6).
+if(WIN32)
 add_executable(binding_abi_test examples/binding_abi_test.cpp)
 target_link_libraries(binding_abi_test PRIVATE
     ember ember_frontend ember_import
     ember_ext_vec ember_ext_quat ember_ext_mat
     ember_ext_string ember_ext_array ember_ext_math)
 add_test(NAME binding_abi COMMAND binding_abi_test)
+endif()
 # No add_test here: a smoke test needs a script asset, coordinated separately
 # (the lang_suite worker owns the script-driven tests). The target building
 # cleanly + `ember_cli run <file> --fn main` working IS the validation gate
@@ -890,7 +1027,7 @@ endif()
 # workload in both and reports the ratio. The categorical difference under test:
 # ember compiles to native x86-64 (no dispatch-decode loop), AngelScript interprets
 # bytecode. SSA-lite IR + linear-scan allocation remain a benchmark-gated future refactor.
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/sdk/angelscript/source/as_atomic.cpp)
+if(WIN32 AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/sdk/angelscript/source/as_atomic.cpp)
     file(GLOB AS_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/sdk/angelscript/source/*.cpp)
     add_library(angelscript STATIC ${AS_SOURCES})
@@ -933,6 +1070,9 @@ endif()
 # a ratio — fails only on a compile/run/IO error. TIMEOUT 600 covers the g++ -O2
 # baseline compile + the 24 timed cells. See bench/run_bench.sh.
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/bench_codegen_paths.cpp)
+    # bench_codegen_paths includes <windows.h> (Win32 timing/process) — Windows-only
+    # harness. plan_MACOS_ARM64.md: bench parity on macOS is a later task.
+    if(WIN32)
     add_executable(bench_codegen_paths bench/bench_codegen_paths.cpp)
     target_include_directories(bench_codegen_paths PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/bench)  # bench_output_names.hpp (deterministic results naming)
@@ -940,7 +1080,6 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/bench_codegen_paths.cpp)
         ember ember_frontend ember_import
         ember_ext_vec ember_ext_quat ember_ext_mat
         ember_ext_string ember_ext_array ember_ext_math ember_ext_opt)
-    if(WIN32)
         target_link_libraries(bench_codegen_paths PRIVATE kernel32)
     endif()
     # Build the g++ -O2 baseline DLL from source at BUILD time (stale-probe
@@ -948,6 +1087,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/bench_codegen_paths.cpp)
     # same MinGW g++ CMake selected as CMAKE_CXX_COMPILER, with the anti-fold
     # flags (-fno-tree-vectorize / -fno-tree-loop-distribute-patterns) so the
     # baseline measures the scalar codegen path, not vectorization.
+    # Windows/MinGW-only: the baseline is a .dll built with GCC anti-fold flags;
+    # on macOS/clang (.dylib, no -fno-tree-loop-distribute-patterns) this bench
+    # baseline is not built (plan_MACOS_ARM64.md: bench parity is a later task).
+    if(WIN32)
     add_custom_command(
         OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/baseline_paths.dll
         COMMAND ${CMAKE_CXX_COMPILER} -O2 -std=c++17 -shared -fPIC
@@ -967,6 +1110,7 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/bench_codegen_paths.cpp)
         "${CMAKE_CURRENT_BINARY_DIR}/baseline_paths.dll")
     set_tests_properties(bench_codegen_paths PROPERTIES TIMEOUT 600
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    endif()
 endif()
 
 # bench_codegen_paths_selftest — focused CTest for the F-irsafe-contradiction
@@ -976,8 +1120,13 @@ endif()
 # calls make_paths() and asserts the flags WITHOUT loading the baseline DLL
 # or timing anything — sub-second, independent of the 60-second harness and
 # the g++ -O2 baseline DLL. Reuses the same executable (no new target).
+# bench_codegen_paths_selftest reuses the bench_codegen_paths executable, which is
+# Windows-only (gated above), so the selftest is Windows-only too.
+# plan_MACOS_ARM64.md: bench parity on macOS is a later task.
+if(WIN32)
 add_test(NAME bench_codegen_paths_selftest COMMAND bench_codegen_paths --selftest)
 set_tests_properties(bench_codegen_paths_selftest PROPERTIES TIMEOUT 30)
+endif()
 
 # bench_output_names_test — focused coverage for the benchmark results-artifact
 # naming fix (bench/bench_output_names.hpp). A manual --passes run and the
@@ -1276,9 +1425,12 @@ endif()
 # codegen.* — the keyed CodeGenCtx, thin_lower.*, thin_emit.*, dispatch_abi.*).
 # NOT a CTest entry: the filtered suite count must stay 67 (§14.1); the target
 # building cleanly + the executable passing IS the gate.
+# keyed_dispatch_codegen_test uses Win32 SEH (AddVectoredExceptionHandler) for
+# crash-detection — Windows-only harness. plan_MACOS_ARM64.md Phase 5/8: port to
+# sigaction (SIGSEGV/SIGBUS) when keyed dispatch runs on arm64.
+if(WIN32)
 add_executable(keyed_dispatch_codegen examples/keyed_dispatch_codegen_test.cpp)
 target_link_libraries(keyed_dispatch_codegen PRIVATE ember ember_frontend ember_import)
-if(WIN32)
     target_link_libraries(keyed_dispatch_codegen PRIVATE kernel32)
 endif()
 
@@ -1299,9 +1451,11 @@ endif()
 # thin_lower.*, thin_emit.*, dispatch_abi.*, module_linker.hpp). NOT a CTest
 # entry: the filtered suite count must stay 67 (§14.1); the target building
 # cleanly + the executable passing IS the gate.
+# keyed_dispatch_modules_test uses Win32 SEH for crash-detection — Windows-only
+# harness (see keyed_dispatch_codegen above). plan_MACOS_ARM64.md Phase 5/8.
+if(WIN32)
 add_executable(keyed_dispatch_modules examples/keyed_dispatch_modules_test.cpp)
 target_link_libraries(keyed_dispatch_modules PRIVATE ember ember_frontend ember_import)
-if(WIN32)
     target_link_libraries(keyed_dispatch_modules PRIVATE kernel32)
 endif()
 
@@ -1381,9 +1535,12 @@ add_test(NAME ember_pass COMMAND ember_pass_test)
 # run explicitly: ./buildt/polymorphic_pass_test. Links ember + ember_frontend +
 # ember_ext_obf (the configured obf factories) + ember_ext_opt (the optimization
 # prefix) + ember_ext_string (string_length for the module's string site).
+# polymorphic_pass_test uses Win32 CreateProcess + SEH for child-process
+# crash-detection — Windows-only harness. plan_MACOS_ARM64.md Phase 6/8: port
+# to posix_spawn + sigaction when polymorphic passes run on arm64.
+if(WIN32)
 add_executable(polymorphic_pass_test examples/polymorphic_pass_test.cpp)
 target_link_libraries(polymorphic_pass_test PRIVATE ember ember_frontend ember_ext_obf ember_ext_opt ember_ext_string)
-if(WIN32)
     target_link_libraries(polymorphic_pass_test PRIVATE kernel32)
 endif()
 
@@ -1396,8 +1553,10 @@ endif()
 # unchanged (run explicitly: ./buildt/polymorphic_cli_test <ember_cli> <src>).
 # Does NOT link ember — it only invokes the CLI as a subprocess, like
 # ember_cli_pipe_live_test / em_cli_emit_test.
-add_executable(polymorphic_cli_test examples/polymorphic_cli_test.cpp)
+# polymorphic_cli_test drives ember_cli as a subprocess via CreateProcess —
+# Windows-only harness. plan_MACOS_ARM64.md Phase 6/8: port to posix_spawn.
 if(WIN32)
+add_executable(polymorphic_cli_test examples/polymorphic_cli_test.cpp)
     # No ember linkage: the harness only invokes ember_cli as a subprocess
     # (CreateProcess + std::filesystem). It needs only the C++ stdlib + the
     # Windows API, both available by default on MinGW/MSVC.
@@ -1510,19 +1669,26 @@ endif()
 # whole-generation replacement). NOT a CTest entry: the filtered suite count
 # must stay 67 (§14.1); the target building cleanly + the executable passing
 # IS the gate.
+# keyed_dispatch_hot_reload_test uses Win32 SEH for crash-detection — Windows-only
+# harness (see keyed_dispatch_codegen above). plan_MACOS_ARM64.md Phase 5/8.
+if(WIN32)
 add_executable(keyed_dispatch_hot_reload examples/keyed_dispatch_hot_reload_test.cpp)
 target_link_libraries(keyed_dispatch_hot_reload PRIVATE
     ember ember_frontend ember_import)
-if(WIN32)
     target_link_libraries(keyed_dispatch_hot_reload PRIVATE kernel32)
 endif()
 
-set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip binding_abi
+set_tests_properties(em_roundtrip em_loader_hardening import_roundtrip
     v0_6_lifecycle v0_6_hot_reload game_host_integration float_global_regression
     array_lit aggregate_global em_signed codegen_opt thin_ir_struct thin_ir
     thin_ir_ser em_redteam_audit em_v5_ir em_v5_mixed ember_pass ir_passes ext_map ext_bounds
     regalloc
     PROPERTIES TIMEOUT 30)
+# binding_abi is Windows-only (Win64 GNU-asm ABI proof); gated above. Apply its
+# TIMEOUT only where the test exists.
+if(WIN32)
+    set_tests_properties(binding_abi PROPERTIES TIMEOUT 30)
+endif()
 
 # ---- Fuzz harnesses (Phase 4 audit tooling) ----
 # libFuzzer harnesses for the untrusted-input surfaces: .em loader (#1 security

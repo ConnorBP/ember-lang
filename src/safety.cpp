@@ -10,6 +10,9 @@
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
 #  include <psapi.h>
+#elif defined(__APPLE__)
+#  include <mach/mach.h>
+#  include <unistd.h>
 #else
 #  include <fstream>
 #  include <string>
@@ -29,6 +32,17 @@ size_t process_rss_kb() {
     if (GetProcessMemoryInfo(GetCurrentProcess(),
             reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
         return static_cast<size_t>(pmc.WorkingSetSize) / 1024;
+    }
+    return 0;
+#elif defined(__APPLE__)
+    // macOS: mach_task_basic_info.resident_size is the resident set in bytes.
+    // (task_info with TASK_BASIC_INFO is deprecated; MACH_TASK_BASIC_INFO is the
+    // modern flavor.) plan_MACOS_ARM64.md Phase 0.
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS) {
+        return static_cast<size_t>(info.resident_size) / 1024;
     }
     return 0;
 #else

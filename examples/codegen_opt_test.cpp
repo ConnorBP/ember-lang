@@ -47,6 +47,23 @@
 
 using namespace ember;
 
+// Architecture detection: on ARM64 (Apple Silicon, etc.) ThinIR is the ONLY
+// backend — the tree-walker is x86-only and hard-errors on ARM64 (codegen.cpp
+// forces ir_enabled_eff=true). The Stage-1 peephole (SmartImm) + local regalloc
+// are x86 tree-walker transforms; they do NOT run on the ARM64 IR path
+// (emit_arm64). So tests that asserted "flags-on bytes DIFFER from flags-off"
+// (byte-inequality as evidence the pass ran) are WRONG on ARM64: both paths use
+// emit_arm64 → identical bytes. On ARM64 the evidence is cr.backend ==
+// CompileBackend::IRBackend + correct value; the x86 byte-inequality assertion
+// is retained under `if (!kIsArm64)`.
+static constexpr bool kIsArm64 =
+#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
+    true
+#else
+    false
+#endif
+    ;
+
 struct M {
     std::vector<CompiledFn> fns;
     std::unique_ptr<DispatchTable> table;
@@ -68,7 +85,8 @@ static void ck(bool c, const char* m) {
 // finalize (so the test can diff bytes between flag configurations — finalize
 // makes the bytes executable, which mprotects the page but leaves the bytes).
 static std::unique_ptr<M> compile(const std::string& src, bool peephole, bool regalloc,
-                                   std::vector<uint8_t>* main_bytes = nullptr) {
+                                   std::vector<uint8_t>* main_bytes = nullptr,
+                                   CompileBackend* main_backend = nullptr) {
     auto m = std::make_unique<M>();
     auto lr = tokenize(src, "<codegen_opt>");
     if (!lr.ok) { std::printf("FAIL: lex: %s\n", lr.error.c_str()); return nullptr; }
@@ -100,8 +118,15 @@ static std::unique_ptr<M> compile(const std::string& src, bool peephole, bool re
     ctx.enable_peephole = peephole;
     ctx.enable_local_regalloc = regalloc;
     for (auto& fn : m->prog.funcs) {
-        auto cf = compile_func(fn, ctx);
+        // Use compile_func_checked so the test can inspect cr.backend (the
+        // ACTUAL backend used). On ARM64 the backend is always IRBackend
+        // (ThinIR is the sole codegen path); on x86 it is TreeWalker for these
+        // probes (enable_ir_backend is never set here — these are Stage-1
+        // peephole/regalloc tests, not IR-backend tests).
+        CompileResult cr = compile_func_checked(fn, ctx);
+        CompiledFn cf = std::move(cr.compiled);
         if (main_bytes && fn.name == "main") *main_bytes = cf.bytes;  // capture pre-finalize bytes
+        if (main_backend && fn.name == "main") *main_backend = cr.backend;
         if (!finalize(cf)) { std::printf("FAIL: alloc_executable for %s\n", fn.name.c_str()); return nullptr; }
         m->table->set(fn.slot, cf.entry);
         m->fns.push_back(std::move(cf));
@@ -155,27 +180,44 @@ int main() {
     {
         const char* src = "fn main() -> i64 { return 42; }\n";
         std::vector<uint8_t> bo, bn;
+        CompileBackend bn_be = CompileBackend::TreeWalker;
         auto mo = compile(src, false, false, &bo);
-        auto mn = compile(src, true,  false, &bn);
+        auto mn = compile(src, true,  false, &bn, &bn_be);
         ck(mo.get() && mn.get(), "[B1] u32-fit literal compiles (off + on)");
         if (mo && mn) {
             ck(call0_i64(*mo, "main") == 42, "[B1] flags-off value: 42");
             ck(call0_i64(*mn, "main") == 42, "[B1] flags-on  value: 42 (mov eax,imm32 zero-extends)");
-            ck(bo != bn, "[B1] flags-on bytes DIFFER (peephole ran — not a silent no-op gate)");
-            // The on-bytes may be shorter or NOP-padded; either way they are not
-            // byte-identical to off (the rewrite fired).
+            // ARCH-AWARE: on x86 byte-inequality proves the peephole ran. On
+            // ARM64 the peephole is an x86 tree-walker transform that does NOT
+            // run on the IR path (emit_arm64) — both paths produce identical
+            // ARM64 bytes. The ARM64 evidence is cr.backend == IRBackend + the
+            // correct value (asserted above).
+            if (!kIsArm64) {
+                ck(bo != bn, "[B1] flags-on bytes DIFFER (peephole ran — not a silent no-op gate)");
+                // The on-bytes may be shorter or NOP-padded; either way they are not
+                // byte-identical to off (the rewrite fired).
+            } else {
+                ck(bn_be == CompileBackend::IRBackend,
+                   "[B1] flags-on used CompileBackend::IRBackend (ARM64: peephole is x86-only, IR backend is the path)");
+            }
         }
     }
     {
         const char* src = "fn main() -> i64 { return -100; }\n";
         std::vector<uint8_t> bo, bn;
+        CompileBackend bn_be = CompileBackend::TreeWalker;
         auto mo = compile(src, false, false, &bo);
-        auto mn = compile(src, true,  false, &bn);
+        auto mn = compile(src, true,  false, &bn, &bn_be);
         ck(mo.get() && mn.get(), "[B2] s32-fit negative literal compiles (off + on)");
         if (mo && mn) {
             ck(call0_i64(*mo, "main") == -100, "[B2] flags-off value: -100");
             ck(call0_i64(*mn, "main") == -100, "[B2] flags-on  value: -100 (mov rax,imm32 sign-extends)");
-            ck(bo != bn, "[B2] flags-on bytes DIFFER");
+            if (!kIsArm64) {
+                ck(bo != bn, "[B2] flags-on bytes DIFFER");
+            } else {
+                ck(bn_be == CompileBackend::IRBackend,
+                   "[B2] flags-on used CompileBackend::IRBackend (ARM64: peephole is x86-only, IR backend is the path)");
+            }
         }
     }
     {
@@ -224,13 +266,24 @@ int main() {
     {
         const char* src = "fn main() -> i64 { let a: i64 = 100; let b: i64 = 23; return a + b; }\n";
         std::vector<uint8_t> bo, bn;
+        CompileBackend bn_be = CompileBackend::TreeWalker;
         auto mo = compile(src, false, false, &bo);
-        auto mn = compile(src, false, true,  &bn);
+        auto mn = compile(src, false, true,  &bn, &bn_be);
         ck(mo.get() && mn.get(), "[C1] simple a+b compiles (off + regalloc)");
         if (mo && mn) {
             ck(call0_i64(*mo, "main") == 123, "[C1] flags-off value: 100+23 == 123");
             ck(call0_i64(*mn, "main") == 123, "[C1] regalloc  value: 100+23 == 123 (lhs in r12 across rhs)");
-            ck(bo != bn, "[C1] regalloc bytes DIFFER (push/pop -> mov r12/rax)");
+            // ARCH-AWARE: on x86 byte-inequality proves the regalloc ran
+            // (push/pop -> mov r12/rax). On ARM64 the regalloc is an x86
+            // tree-walker transform that does NOT run on the IR path
+            // (emit_arm64) — both paths produce identical ARM64 bytes. The
+            // ARM64 evidence is cr.backend == IRBackend + the correct value.
+            if (!kIsArm64) {
+                ck(bo != bn, "[C1] regalloc bytes DIFFER (push/pop -> mov r12/rax)");
+            } else {
+                ck(bn_be == CompileBackend::IRBackend,
+                   "[C1] regalloc-on used CompileBackend::IRBackend (ARM64: regalloc is x86-only, IR backend is the path)");
+            }
         }
     }
     {

@@ -1,16 +1,22 @@
 // valid: control flow
+// expect: 132
 fn classify(n: i64) -> i64 {
     if (n <= 1) {
         return n;
     } else if (n > 100) {
         return 100;
     } else {
-        let sum: i64 = 0;
-        let i: i64 = 0;
+        let mut sum: i64 = 0;
+        let mut i: i64 = 0;
         while (i < n) {
             sum = sum + i;
             i = i + 1;
         }
         return sum;
     }
+}
+fn main() -> i64 {
+    // classify(0)=0; classify(5)=10; classify(200)=100; classify(1)=1; classify(7)=21
+    // = 0 + 10 + 100 + 1 + 21 = 132
+    return classify(0) + classify(5) + classify(200) + classify(1) + classify(7);
 }

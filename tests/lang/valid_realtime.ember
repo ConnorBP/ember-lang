@@ -1,5 +1,12 @@
+// expect: 0
 // Safe realtime arithmetic and math native use.
 @realtime
 fn process(sample: f32) -> f32 {
     return sqrt(sample * sample);
+}
+
+fn main() -> i64 {
+    // A non-realtime entry may call a @realtime fn. sqrt(3*3)=3.0 exactly.
+    if (process(3.0) == 3.0) { return 0; }
+    return 1;
 }

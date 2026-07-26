@@ -874,7 +874,136 @@ CallResult ember_call_keyed_i64_i64_by_slot(ModuleInstance& inst, uint32_t logic
     return keyed_call_driver(inst, logical_slot, ctx, a, b, 2, adapter);
 }
 #else
-#error "B1 context thunks require MinGW GNU assembly on x64; MSVC x64 not yet supported; use MinGW"
+// ─── Non-x86 target stub (Phase 0 of plan_MACOS_ARM64.md) ────────────────
+// The x86 path above defines the GNU-asm B1/keyed thunks + the keyed-dispatch
+// driver logic. On a non-x86 target (arm64-apple-darwin today) the asm thunks
+// do not exist yet. To let the core lib COMPILE + LINK on macOS-ARM64 we provide
+// stub definitions of every engine.hpp/module_instance.hpp symbol that the x86
+// block defines. The pure-execution stubs throw "arm64 execution not yet
+// implemented"; the no-throw/bool/noexcept stubs return a safe empty value so
+// module LOADING (which is platform-independent) is not broken. Phase 4 replaces
+// the execution stubs with real Darwin ARM64 thunks (in a .S file) + the real
+// keyed driver wiring. The pure-C++ keyed logic (resolvers, record assembly,
+// route derivation) currently lives inside the x86 #if above; Phase 4 factors it
+// out so it compiles on all targets instead of being duplicated here as stubs.
+namespace {
+[[noreturn]] void arm64_exec_unimplemented(const char* what) {
+    throw std::runtime_error(std::string("ember: ") + what +
+        " not yet implemented on this target (arm64 port in progress)");
+}
+} // namespace
+
+// ─── B1 host->JIT thunks (raw, no checkpoint) ───
+// On Apple ARM64 the thunks are out-of-line AAPCS64 assembly in
+// src/darwin_arm64_thunks.S (install x19 = context_t*, marshal the script arg
+// into x0, blr the entry, restore x19, return x0). plan_MACOS_ARM64.md Phase 4.
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(_M_ARM64))
+extern "C" int64_t ember_call_void_thunk(void*, context_t*);
+extern "C" int64_t ember_call_i64_thunk(void*, context_t*, int64_t);
+extern "C" int64_t ember_call_i64_i64_thunk(void*, context_t*, int64_t, int64_t);
+int64_t ember_call_void(void* entry, context_t* ctx) {
+    return ember_call_void_thunk(entry, ctx);
+}
+int64_t ember_call_i64(void* entry, context_t* ctx, int64_t a) {
+    return ember_call_i64_thunk(entry, ctx, a);
+}
+int64_t ember_call_i64_i64(void* entry, context_t* ctx, int64_t a, int64_t b) {
+    return ember_call_i64_i64_thunk(entry, ctx, a, b);
+}
+#else
+int64_t ember_call_void(void* /*entry*/, context_t* /*ctx*/) {
+    arm64_exec_unimplemented("ember_call_void (B1 thunk)");
+}
+int64_t ember_call_i64(void* /*entry*/, context_t* /*ctx*/, int64_t /*a*/) {
+    arm64_exec_unimplemented("ember_call_i64 (B1 thunk)");
+}
+int64_t ember_call_i64_i64(void* /*entry*/, context_t* /*ctx*/, int64_t /*a*/, int64_t /*b*/) {
+    arm64_exec_unimplemented("ember_call_i64_i64 (B1 thunk)");
+}
+#endif
+
+int64_t ember_keyed_reentry_void(void* /*entry*/, context_t* /*ctx*/, uint64_t /*route_word*/) {
+    arm64_exec_unimplemented("ember_keyed_reentry_void (keyed re-entry thunk)");
+}
+int64_t ember_keyed_reentry_i64(void* /*entry*/, context_t* /*ctx*/, int64_t /*a*/, uint64_t /*route_word*/) {
+    arm64_exec_unimplemented("ember_keyed_reentry_i64 (keyed re-entry thunk)");
+}
+int64_t ember_keyed_reentry_i64_i64(void* /*entry*/, context_t* /*ctx*/, int64_t /*a*/, int64_t /*b*/,
+                                    uint64_t /*route_word*/) {
+    arm64_exec_unimplemented("ember_keyed_reentry_i64_i64 (keyed re-entry thunk)");
+}
+
+uint64_t ember_read_r15() { arm64_exec_unimplemented("ember_read_r15 (x86 r15 test helper)"); }
+void ember_set_r15(uint64_t /*v*/) { arm64_exec_unimplemented("ember_set_r15 (x86 r15 test helper)"); }
+
+CallResult ember_call_keyed_void(ModuleInstance& /*inst*/, const std::string& /*name*/,
+                                 context_t& /*ctx*/, const DispatchKeyAdapter& /*adapter*/) {
+    CallResult out; out.ok = false;
+    out.reason = "ember_call_keyed_void: arm64 keyed execution not yet implemented";
+    return out;
+}
+CallResult ember_call_keyed_i64(ModuleInstance& /*inst*/, const std::string& /*name*/,
+                                context_t& /*ctx*/, int64_t /*a*/,
+                                const DispatchKeyAdapter& /*adapter*/) {
+    CallResult out; out.ok = false;
+    out.reason = "ember_call_keyed_i64: arm64 keyed execution not yet implemented";
+    return out;
+}
+CallResult ember_call_keyed_i64_i64(ModuleInstance& /*inst*/, const std::string& /*name*/,
+                                    context_t& /*ctx*/, int64_t /*a*/, int64_t /*b*/,
+                                    const DispatchKeyAdapter& /*adapter*/) {
+    CallResult out; out.ok = false;
+    out.reason = "ember_call_keyed_i64_i64: arm64 keyed execution not yet implemented";
+    return out;
+}
+CallResult ember_call_keyed_void_by_slot(ModuleInstance& /*inst*/, uint32_t /*logical_slot*/,
+                                         context_t& /*ctx*/,
+                                         const DispatchKeyAdapter& /*adapter*/) {
+    CallResult out; out.ok = false;
+    out.reason = "ember_call_keyed_void_by_slot: arm64 keyed execution not yet implemented";
+    return out;
+}
+CallResult ember_call_keyed_i64_by_slot(ModuleInstance& /*inst*/, uint32_t /*logical_slot*/,
+                                        context_t& /*ctx*/, int64_t /*a*/,
+                                        const DispatchKeyAdapter& /*adapter*/) {
+    CallResult out; out.ok = false;
+    out.reason = "ember_call_keyed_i64_by_slot: arm64 keyed execution not yet implemented";
+    return out;
+}
+CallResult ember_call_keyed_i64_i64_by_slot(ModuleInstance& /*inst*/, uint32_t /*logical_slot*/,
+                                            context_t& /*ctx*/, int64_t /*a*/, int64_t /*b*/,
+                                            const DispatchKeyAdapter& /*adapter*/) {
+    CallResult out; out.ok = false;
+    out.reason = "ember_call_keyed_i64_i64_by_slot: arm64 keyed execution not yet implemented";
+    return out;
+}
+
+ExtensionResult<void*> resolve_entry_keyed(ModuleInstance& /*inst*/,
+                                           const LogicalCallableId& /*id*/,
+                                           const DispatchKeyAdapter& /*adapter*/) {
+    return make_extension_result_error<void*>("ember-keyed-dispatch", "resolve",
+        "resolve_entry_keyed: arm64 keyed execution not yet implemented");
+}
+ExtensionResult<void*> resolve_entry_by_name_keyed(ModuleInstance& /*inst*/,
+                                                   std::string_view /*name*/,
+                                                   const DispatchKeyAdapter& /*adapter*/) {
+    return make_extension_result_error<void*>("ember-keyed-dispatch", "resolve",
+        "resolve_entry_by_name_keyed: arm64 keyed execution not yet implemented");
+}
+LeaseResult resolve_entry_keyed_leased(ModuleInstance& /*inst*/,
+                                       const LogicalCallableId& /*id*/,
+                                       context_t& /*ctx*/, int64_t /*arg*/,
+                                       KeyedLeaseBody /*body*/,
+                                       const DispatchKeyAdapter& /*adapter*/) {
+    LeaseResult out; out.ok = false;
+    out.reason = "resolve_entry_keyed_leased: arm64 keyed execution not yet implemented";
+    return out;
+}
+
+// Safe no-throw stubs for the platform-independent pieces so module LOADING is
+// not broken on arm64 before Phase 4 factors the real logic out of the x86 #if.
+struct ModuleInstance* ember_current_keyed_runtime() noexcept { return nullptr; }
+bool assemble_identity_dispatch_record(ModuleInstance& /*inst*/) { return false; }
 #endif
 
 } // namespace ember

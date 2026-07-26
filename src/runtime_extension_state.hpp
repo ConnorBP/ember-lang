@@ -190,6 +190,28 @@ struct ThreadRuntimeState {
     }
 };
 
+// ─── Darwin ARM64 coroutine context-switch save area (Phase 8) ────────────
+// plan_MACOS_ARM64.md Phase 8: a small hand-written AAPCS64 context switch
+// (src/darwin_arm64_ctx_switch.S) replaces Windows fibers on Apple Silicon —
+// `ucontext` is deprecated/problematic on Apple and is NOT used. This struct
+// is the callee-saved register + SP/LR save area the switch loads/stores.
+//
+// LAYOUT (must match src/darwin_arm64_ctx_switch.S exactly):
+//   regs[0..9]  = x19, x20, x21, x22, x23, x24, x25, x26, x27, x28  (callee-saved)
+//   regs[10]    = x29 (FP)
+//   regs[11]    = x30 (LR) — also the resume PC (the switch `ret`s to it)
+//   sp          = saved SP (kept 16-byte aligned; the switch preserves it)
+// x18 is Apple's platform register — it is deliberately NOT saved/restored
+// (the coroutine does not own it). The switch passes no arguments; yield/
+// resume values flow through Coroutine::yield_value (mirrors the Windows
+// fiber path, which also passes the value out-of-band).
+#if defined(__APPLE__)
+struct CoroCtx {
+    int64_t regs[12];   // x19..x28 (10), x29 (FP), x30 (LR)
+    int64_t sp;         // saved stack pointer
+};
+#endif
+
 // ─── Per-runtime coroutine state (§6.7, replaces ext_coroutine globals) ────
 // Mirrors the file-static g_coros / g_coros_free / g_setup_mutex +
 // g_ctx/g_dispatch_base/g_slot_count/g_main_fiber shape. §6.7: a suspended
@@ -218,6 +240,18 @@ struct CoroutineRuntimeState {
         void*     caller_fiber = nullptr;
         Coroutine* caller_coro = nullptr;
         bool      in_use       = false;
+#if defined(__APPLE__)
+        // Phase 8 (plan_MACOS_ARM64.md): Darwin ARM64 cooperative context switch.
+        // `coro_ctx` is THIS coroutine's saved callee-saved regs + SP/LR (the
+        // point to resume on the next coroutine_next). `caller_ctx` is whoever
+        // resumed us (the main thread or an outer coroutine) — saved by the
+        // resume's ember_ctx_switch and restored by yield/return. `stack`/
+        // `stack_size` are the mmap'd private stack (16-aligned top = initial SP).
+        CoroCtx   coro_ctx     {};
+        CoroCtx   caller_ctx   {};
+        void*     stack        = nullptr;
+        size_t    stack_size   = 0;
+#endif
     };
     std::vector<std::unique_ptr<Coroutine>> coros;
     std::vector<int64_t>                     free_ids;

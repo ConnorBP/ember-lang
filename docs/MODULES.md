@@ -404,14 +404,18 @@ compatibility contract, not a live gap.
 - **Version negotiation.** v2 `.em` carries build/ABI identity (`EM_BUILD_ID`
   / `EM_TARGET_ABI_HASH`, `em_file.hpp`) and canonical `Type` signature records;
   the loader rejects identity mismatch before page publication and sema verifies
-  the signatures. v1 `.em` exports are `unknown_sig` and ABI-trusted (no metadata,
+  the signatures. **`EM_TARGET_ABI_HASH` is arch-specific:** the `EMBER_EM_CODE`
+  component is `code=x64-v1` on x86-64 and `code=arm64-v1` on AArch64 (macOS
+  Apple Silicon), so a macOS `.em` carries a distinct codegen tag and a
+  cross-codegen load (Windows↔macOS) is rejected by the ABI hash. v1 `.em` exports are `unknown_sig` and ABI-trusted (no metadata,
   no identity check) — the v1 compatibility contract, retained for backward
   compat. Portable, verified `.em` linking is therefore a shipped v2 guarantee,
   not a future redesign. **v5 IR `.em` (Stage B, IL-`.em`)** is a separate,
   additive format version that carries the thin three-address IR on disk
-  instead of raw x86 (the per-function `is_ir` byte + the `ir_blob` record);
-  the loader deserializes + validates + re-emits the IR to x64 via `emit_x64`
-  BEFORE `alloc_executable_rw` (the re-emit-at-load security model). v5 is
+  instead of raw native code (the per-function `is_ir` byte + the `ir_blob` record);
+  the loader deserializes + validates + re-emits the IR to native machine code
+  via `emit_x64` (x86-64) or `emit_arm64` (AArch64) — selected by the build
+  target — BEFORE `alloc_executable_rw` (the re-emit-at-load security model). v5 is
   unsigned for Stage B and shares the v3/v4 header + globals block + name
   directory; a v5 module may mix IR and raw-x86 functions per-function (mixed
   mode). The full v5 format + security model is documented in
@@ -419,6 +423,9 @@ compatibility contract, not a live gap.
   `src/thin_ir_ser.{hpp,cpp}` for the codec). v5 does not change the
   cross-module call mechanism this doc specifies — it changes only what a
   per-function record carries on disk, not the registry/linker/slot model.
+  The AArch64 backend reference (the `emit_arm64` consumer of the same IR) is
+  `docs/spec/CODEGEN_SPEC_ARM64.md`; the macOS ARM64 implementation record is
+  `docs/planning/MACOS_ARM64_PROGRESS.md` (56/56 CTest, 471/471 lang_suite).
 
 ---
 

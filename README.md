@@ -2,8 +2,9 @@
 
 ![calcifer in a prism](./img/calcifer_prism.png)
 
-**A native-JIT embedded scripting language.** Ember compiles scripts to x86-64
-machine code at runtime — no interpreter dispatch loop, no bytecode VM. A hot
+**A native-JIT embedded scripting language.** Ember compiles scripts to
+native machine code (x86-64 on Windows/MinGW, AArch64 on macOS Apple Silicon)
+at runtime — no interpreter dispatch loop, no bytecode VM. A hot
 loop runs as real native instructions, not a switch-on-opcode interpreter, so
 it posts **6-7x faster than AngelScript's bytecode interpreter** on compute-
 heavy workloads (`fib`, `tight_loop`, `nested_calls`) and **within 1.04x of
@@ -127,13 +128,35 @@ fn main() -> i64 {
 - **Slice views** (`arr[..]` — zero-copy {ptr, len} pair)
 - **Native calls** (`string_from_i64`, `string_length`, `sqrt` — registered via `BindingBuilder`)
 
-All of this compiles to native x86-64 machine code at runtime — no interpreter, no bytecode.
+All of this compiles to native machine code (x86-64 on Windows, AArch64 on
+macOS Apple Silicon) at runtime — no interpreter, no bytecode.
+
+## Platforms
+
+ember ships **two native backends**:
+
+- **x86-64 / Win64** (the original, MinGW g++ + Ninja) — the tree-walker
+  codegen (`codegen.cpp`) **and** the ThinIR backend (`emit_x64`). Win64 ABI
+  (shadow space, `rcx/rdx/r8/r9`, `r14 = context_t*`).
+- **AArch64 / AAPCS64** (macOS Apple Silicon) — the **ThinIR-only** backend
+  (`emit_arm64`). The tree-walker is a **hard compile error** here (x86-only);
+  ThinIR is forced on (`--passes` is a no-op, the optimization passes are
+  arch-neutral). Frame-only, no register allocator (yet). Apple Clang + Ninja.
+  W^X JIT via `MAP_JIT` + `pthread_jit_write_protect_np` + a mandatory
+  `mprotect(PROT_READ|PROT_EXEC)` + `sys_icache_invalidate` (16 KiB pages).
+  Full language parity: **56/56 CTest, 471/471 lang_suite.** See
+  `docs/spec/CODEGEN_SPEC_ARM64.md` for the backend reference.
+
+> **macOS distribution note:** a hardened-runtime build needs the
+> `com.apple.security.cs.allow-jit` entitlement for the W^X `MAP_JIT` path
+> (a plain `clang++` dev build is adhoc/linker-signed and does not require it).
 
 ## Getting started
 
-C++17, no external deps beyond `Windows.h`. Builds clean on **MinGW g++ 15.2.0 +
-Ninja** (the supported path). MSVC x64 is unsupported — CMake fails loudly
-because no working MSVC B1 thunk exists.
+C++17, no external deps beyond `Windows.h` (Windows) / POSIX + Mach APIs
+(macOS). Builds clean on **MinGW g++ 15.2.0 + Ninja** (the supported Windows
+path) and on **Apple Clang + Ninja** (macOS Apple Silicon). MSVC x64 is
+unsupported — CMake fails loudly because no working MSVC B1 thunk exists.
 
 ```bash
 cd ember
@@ -329,6 +352,7 @@ run with `--passes str_encrypt` / `--passes block_split`).
 - `TYPE_SYSTEM.md` — primitives, struct layout, slices, the no-raw-pointer rule, conversion matrix
 - `COMPILER_PIPELINE.md` — lexer/BNF/AST, sema passes, the shipped tree-walking lowering, deferred SSA-lite
 - `CODEGEN_SPEC.md` — the x86-64 backend: calling convention, encodings, regalloc, traps
+- `CODEGEN_SPEC_ARM64.md` — the AArch64 (macOS Apple Silicon) backend: ThinIR-only selection, AAPCS64, register reservations, frame model, W^X MAP_JIT, host thunks + coroutines, traps, pitfalls, self-hosted ARM64 codegen
 - `SAFETY_AND_SANDBOX.md` — threat model, budgets, depth guard, bounds checks, `PERM_FFI`, trap surface, thread-safety
 - `BINDING_API.md` — the shipped `BindingBuilder`/`NativeSig` API, Win64 slot mapping, slice convention
 - `MEMORY_AND_GC.md` — ownership taxonomy, slice-escape check, globals, the v2-GC deferral rationale

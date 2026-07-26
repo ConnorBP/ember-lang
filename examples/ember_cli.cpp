@@ -91,8 +91,16 @@
 #if defined(_WIN32)
 #  include <conio.h>     // v0.6 --tick keybind (Windows _kbhit/_getch)
 #else
-// Linux stubs for the --tick keybind (no conio.h). Keyboard termination is
-// Windows-only; on Linux the tick count / timeout stops the loop instead.
+// POSIX: fork/waitpid for `ember test` child-process isolation (each .ember
+// file runs in a forked child so the parent never executes a test and every
+// child inherits pristine state — see run_test_command). Mirrors the fork+
+// _exit+waitpid pattern proven in em_cli_emit_test.cpp.
+#  include <unistd.h>
+#  include <sys/wait.h>
+#  include <sys/types.h>
+#  include <cerrno>
+// Linux/macOS stubs for the --tick keybind (no conio.h). Keyboard termination
+// is Windows-only; on Linux the tick count / timeout stops the loop instead.
 static inline int _kbhit() { return 0; }
 static inline int _getch() { return 0; }
 #endif
@@ -265,7 +273,10 @@ static void usage(FILE* out) {
         "               [--output-permissions stub|preserve]\n"
         "  ember run --load-em <input.em> [--fn NAME]\n"
         "  ember bench <input.ember> [--fn NAME] [--iters N] [--warmup N]\n"
-        "  ember test [dir]     run every .ember file in <dir> (default tests/lang/)\n"
+        "  ember test [dir] [--in-process]\n"
+        "                       run every .ember file in <dir> (default tests/lang/);\n"
+        "                       each file runs in a forked child for state isolation\n"
+        "                       (--in-process runs them in one process for debugging)\n"
         "  ember pipe <config>  run a dataflow pipeline (Family C)\n"
         "  ember live <file.ember> [--tick [--tick-count N] [--tick-interval MS]\n"
         "                       [--poll-ms MS]]  live-coding reload runner (Family C)\n"
@@ -1120,7 +1131,14 @@ static TestClassifier classify_test(const fs::path& filepath) {
                     while (num_end < trimmed.size() && (trimmed[num_end] >= '0' && trimmed[num_end] <= '9')) num_end++;
                     try {
                         int n = std::stoi(trimmed.substr(num_start, num_end - num_start));
-                        TestClassifier tc; tc.kind = TestClassifier::Kind::Run; tc.expected_exit = n;
+                        TestClassifier tc; tc.kind = TestClassifier::Kind::Run;
+                        // ember_cli returns the i64 entry value AS the process
+                        // exit code, which POSIX truncates to 8 bits (0-255).
+                        // So a script whose `// expect: N` is > 255 (e.g.
+                        // import_diamond's 2003) exits N & 0xFF (211). Mirror
+                        // run_lang_tests.sh (exp_diamond=211): truncate the
+                        // expected exit to 8 bits so the comparison is correct.
+                        tc.expected_exit = n & 0xFF;
                         return tc;
                     } catch (...) { /* malformed — keep scanning */ }
                 }
@@ -1157,7 +1175,7 @@ static TestClassifier classify_test(const fs::path& filepath) {
     return tc;
 }
 
-static int run_test_command(const std::string& dir) {
+static int run_test_command(const std::string& dir, bool in_process = false) {
     if (!fs::exists(dir) || !fs::is_directory(dir)) {
         std::fprintf(stderr, "ember test: no such directory: %s\n", dir.c_str());
         return 2;
@@ -1187,6 +1205,11 @@ static int run_test_command(const std::string& dir) {
     for (const auto& filepath : files) {
         std::string name = filepath.filename().string();
         std::string path_str = filepath.string();
+        // The PARENT classifies every file (never the child): classification
+        // determines opts.sema_only / opts.parse_only, which travel into the
+        // child's run_ember_file. Keeping classification in the parent means a
+        // fresh child never touches the natives table until run_ember_file
+        // re-registers it (register_standard_bindings at the top of the call).
         TestClassifier tc = classify_test(filepath);
         ++test_num;
 
@@ -1195,9 +1218,77 @@ static int run_test_command(const std::string& dir) {
         opts.sema_only = (tc.kind == TestClassifier::Kind::SemaOk || tc.kind == TestClassifier::Kind::SemaFail);
         opts.parse_only = (tc.kind == TestClassifier::Kind::ParseOk || tc.kind == TestClassifier::Kind::ParseFail);
 
-        RunResult result = run_ember_file(path_str, opts);
-        int actual = result.exit_code;
         int expected = tc.expected_exit;
+        int actual = -1;
+
+#if defined(_WIN32)
+        // Windows has no fork(); coroutines use fibers here and the cross-test
+        // state-leak SegFault is macOS/ucontext-specific, so in-process is safe.
+        // The --in-process flag also selects this path on POSIX for debugging.
+        RunResult result = run_ember_file(path_str, opts);
+        actual = result.exit_code;
+#else
+        if (in_process) {
+            // Debug path (--in-process): the old single-process loop. Reproduces
+            // the cross-test state leak on macOS (a coroutine test can SegFault
+            // on a dangling pointer from an earlier test). Use only for triage.
+            RunResult result = run_ember_file(path_str, opts);
+            actual = result.exit_code;
+        } else {
+            // Isolate each file in a CHILD PROCESS so the parent NEVER executes
+            // a test — every child inherits the parent's pristine state. This
+            // fixes a SegFault where a coroutine test was the victim of a
+            // dangling pointer leaked by an earlier in-process test: the ~185-
+            // file run_ember_file loop leaked state across tests even though
+            // do_cleanup resets the extension stores each call. A fresh child
+            // starts from clean parent state; run_ember_file re-registers the
+            // natives table per call; and the child _exit()s (NOT exit()) so
+            // atexit handlers / static destructors can't re-trigger the leak.
+            std::fflush(stdout);  // flush prior TAP lines so the child doesn't
+                                  // inherit + re-flush them on its own _exit.
+            pid_t pid = fork();
+            if (pid < 0) {
+                std::printf("not ok %d - %s (fork failed: %s)\n",
+                            test_num, name.c_str(), std::strerror(errno));
+                ++failed;
+                continue;
+            }
+            if (pid == 0) {
+                // Child: run exactly ONE file, then _exit. _exit (not exit)
+                // skips atexit handlers and static destructors, so a child that
+                // hit bad state can't re-corrupt during teardown. The child
+                // inherits the parent's pristine memory (natives table empty,
+                // extension stores reset) — run_ember_file registers everything
+                // fresh and do_cleanup() resets it before we get here.
+                RunResult result = run_ember_file(path_str, opts);
+                std::fflush(stdout);  // surface any child stdout before _exit
+                                       // (which does NOT flush stdio buffers).
+                _exit(result.exit_code);
+            }
+            // Parent: reap the child and decode its termination status.
+            int status = 0;
+            bool wait_ok = true;
+            while (waitpid(pid, &status, 0) < 0) {
+                if (errno != EINTR) { wait_ok = false; break; }
+            }
+            if (!wait_ok) {
+                std::printf("not ok %d - %s (waitpid failed: %s)\n",
+                            test_num, name.c_str(), std::strerror(errno));
+                ++failed;
+                continue;
+            }
+            if (WIFEXITED(status)) {
+                actual = WEXITSTATUS(status);
+            } else if (WIFSIGNALED(status)) {
+                // Crash (e.g. SIGSEGV=11 -> 139): encode as 128+signo, the
+                // conventional shell encoding, so it never matches a real
+                // expected exit and surfaces clearly in the TAP `got` field.
+                actual = 128 + WTERMSIG(status);
+            } else {
+                actual = -1;  // unknown termination — fails the compare below
+            }
+        }
+#endif
 
         if (actual == expected) {
             std::printf("ok %d - %s\n", test_num, name.c_str());
@@ -1774,6 +1865,7 @@ int main(int argc, char** argv) {
     bool ffi_mode = false;      // --ffi: grant PERM_FFI to sema so I/O natives (print/file/path) are callable
     bool gc_env = false;        // --gc-env: allocate lambda envs on the tracing GC heap (#20)
     std::string test_dir;        // Family A: `ember test [dir]` (default tests/lang)
+    bool in_process = false;     // Family A: `ember test --in-process` (debug: no fork-per-file)
     int poll_ms = 500;           // Family C: `ember live` file-content poll interval (default 500ms)
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -1851,6 +1943,13 @@ int main(int argc, char** argv) {
             // call site is rejected at compile time (security by default -- the
             // ext_io natives are registered but not callable).
             ffi_mode = true;
+        } else if (a == "--in-process") {
+            // `ember test` debug: run every file in ONE process instead of
+            // forking a child per file. The default (no flag) forks so each
+            // test inherits pristine parent state — fixes a cross-test SegFault
+            // on macOS where a coroutine test hit a dangling pointer leaked by
+            // an earlier test. Windows has no fork() so it is always in-process.
+            in_process = true;
         } else if (a == "-h" || a == "--help") {
             usage(stdout); return 0;
         } else if (a.size() > 0 && a[0] == '-') {
@@ -1872,7 +1971,7 @@ int main(int argc, char** argv) {
         }
     }
     if (action == "test") {
-        return run_test_command(test_dir.empty() ? "tests/lang" : test_dir);
+        return run_test_command(test_dir.empty() ? "tests/lang" : test_dir, in_process);
     }
     if (action == "pipe") {
         // `ember pipe <config>` — dataflow pipeline runner (Family C).

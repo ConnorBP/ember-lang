@@ -156,10 +156,15 @@ int main() {
     check(result == 55, "loaded fib(10) == 55 (value-equivalent re-emit)");
 
     // ---- JIT ground-truth comparison (compile via IR path, call directly) ----
+    // ARM64 uses emit_arm64 (plan_MACOS_ARM64.md Phase 7); x86 uses emit_x64.
     DispatchTable table(1);
     ctx.dispatch_base = int64_t(table.base());
     ctx.globals_base = 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    CompiledFn cf = emit_arm64(thfs[0], ctx);
+#else
     CompiledFn cf = emit_x64(thfs[0], ctx);
+#endif
     finalize(cf);
     table.set(0, cf.entry);
     int64_t jit_result = call_i64_i64(table.get(0), 10);
