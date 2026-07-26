@@ -2434,3 +2434,14 @@ test-gap additions that close those gaps. Edits were confined to `tests/` +
    runtime); the test asserts the runtime trap instead of the reason string.
    A one-line `non_serializable_reason = "..."` addition would make the two
    rejection paths symmetric.
+
+## WASM W0 — ThinIR interpreter
+
+The WASM port's W0 milestone (the ThinIR interpreter, plan_WASM.md) is COMPLETE.
+Full write-up in `docs/planning/WASM_PROGRESS.md`. Summary: a C++ interpreter
+that walks a lowered `ThinFunction` (the WASM backend — WASM has no JIT), built
+natively alongside the JIT + validated against `emit_arm64`. Files:
+`src/thin_interp.hpp` + `src/thin_interp.cpp` + `tests/thin_interp_test.cpp`
+(89 assertions, 34 probes) + CMake (`thin_interp` CTest). ADDITIVE — no existing
+`src/` file modified. Acceptance: `thin_interp_test` PASS, lang_suite 472/472,
+ctest 68/68. Emscripten/wasi-sdk is W1.

@@ -174,6 +174,17 @@ add_library(ember_frontend STATIC
     # throw a clear runtime_error so the host never silently miscompiles.
     # Frame-only (no regalloc) for the first milestone.
     src/thin_emit_arm64.cpp
+    # WASM W0 (plan_WASM.md): the ThinIR interpreter — the WASM backend. WASM
+    # has no JIT (no user-allocated executable memory), so the WASM backend is
+    # a C++ interpreter that walks a lowered ThinFunction instead of emitting
+    # native code. This is "emit_arm64 but in C++" (strictly easier: no ABI
+    # marshaling, no regalloc, no relocations, no encodings). Built natively
+    # first (alongside the JIT, macOS ARM64) + validated against emit_arm64;
+    # Emscripten/wasi-sdk comes in W1. ADDITIVE: the interpreter does not
+    # touch the JIT path (no existing src/ files are modified to add it).
+    # Portable C++17 (no macOS-specific APIs; compiles under Emscripten/wasi-sdk
+    # later). Uses std::fmod (overloaded), NOT std::fmodf.
+    src/thin_interp.cpp
     # Stage B c2: em_loader.cpp moved here from the core `ember` lib because the
     # v5 IR re-emit path (deserialize_thin_function + emit_x64) needs frontend
     # symbols (emit_x64 from thin_emit.cpp, CodeGenCtx from codegen.hpp). The
@@ -407,6 +418,21 @@ if(APPLE)
     target_link_libraries(dbg_lambda_test PRIVATE ember ember_frontend ember_ed25519
         ember_ext_string ember_ext_array ember_ext_gc)
     set_tests_properties(emit_arm64 PROPERTIES TIMEOUT 30)
+    # WASM W0 (plan_WASM.md): the ThinIR interpreter end-to-end gate. Lowers
+    # real ember sources to ThinFunction (via lower_function) then runs them
+    # through interpret_thin (the C++ interpreter) + asserts the correct i64/
+    # f64/struct/slice/try-catch/GC results, matching emit_arm64. Covers: int
+    # arithmetic, control flow (if/while/for), calls + recursion, floats, casts,
+    # structs (by-value arg/return), slices, for-each, match, try/catch/throw,
+    # lambdas + GC (gc_full-style), coroutines (STUB), cross-module handles.
+    # Apple-gated for now (native validation; Emscripten/wasi-sdk is W1).
+    # Links ember_frontend (lower_function + thin_interp) + the string/array/gc
+    # extensions (for the slice/string/GC test probes).
+    add_executable(thin_interp_test tests/thin_interp_test.cpp)
+    target_link_libraries(thin_interp_test PRIVATE ember ember_frontend ember_ed25519
+        ember_ext_string ember_ext_array ember_ext_gc)
+    add_test(NAME thin_interp COMMAND thin_interp_test)
+    set_tests_properties(thin_interp PROPERTIES TIMEOUT 60)
     # Phase 6c: the AAPCS64 aggregate classifier unit tests (pure logic, no JIT).
     add_executable(aapcs64_classify_test tests/aapcs64_classify_test.cpp src/aapcs64_classify.cpp)
     target_link_libraries(aapcs64_classify_test PRIVATE ember_frontend ember ember_ed25519)
