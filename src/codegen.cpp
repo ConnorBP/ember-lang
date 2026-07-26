@@ -5440,6 +5440,49 @@ std::vector<uint8_t> build_fn_allowlist(
 // fallback policy is identical. Mirrors the original inline obf / coroutine
 // detection. Tier 4 try/catch/throw no longer force a fallback (they lower to
 // TryCatch/CatchCleanup/CatchEntry/Throw ThinOps through the IR backend).
+
+// On x86 the IR backend (emit_x64 of ThinIR) cannot yet emit for-each / match
+// / defer — those were lowered to ThinIR in Phase 6d (for the ARM64 emit_arm64
+// path), but emit_x64 has gaps for them (the optimization_validation --passes
+// gate segfaults on Windows/x86 when these reach the IR backend). On ARM64
+// emit_arm64 handles all three, so the gate is x86-only. This restores the
+// pre-Phase-6d x86 behavior (tree-walker fallback for these constructs) while
+// keeping the ARM64 ThinIR path. Recursively walks the function body.
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+static bool x86_ir_cannot_emit_stmt(const Stmt& s);
+static bool x86_ir_cannot_emit_block(const Block& b) {
+    for (auto& s : b.stmts) if (x86_ir_cannot_emit_stmt(*s)) return true;
+    return false;
+}
+static bool x86_ir_cannot_emit_stmt(const Stmt& s) {
+    if (dynamic_cast<const ForEachStmt*>(&s)) return true;
+    if (dynamic_cast<const MatchStmt*>(&s))    return true;
+    if (dynamic_cast<const DeferStmt*>(&s))    return true;
+    if (auto* is = dynamic_cast<const IfStmt*>(&s)) {
+        if (x86_ir_cannot_emit_block(is->then_b)) return true;
+        if (is->has_else && x86_ir_cannot_emit_block(is->else_b)) return true;
+    } else if (auto* ws = dynamic_cast<const WhileStmt*>(&s)) {
+        if (x86_ir_cannot_emit_block(ws->body)) return true;
+    } else if (auto* dw = dynamic_cast<const DoWhileStmt*>(&s)) {
+        if (x86_ir_cannot_emit_block(dw->body)) return true;
+    } else if (auto* fs = dynamic_cast<const ForStmt*>(&s)) {
+        if (x86_ir_cannot_emit_block(fs->body)) return true;
+    } else if (auto* bs = dynamic_cast<const BlockStmt*>(&s)) {
+        if (x86_ir_cannot_emit_block(bs->block)) return true;
+    } else if (auto* sw = dynamic_cast<const SwitchStmt*>(&s)) {
+        for (auto& c : sw->cases) if (x86_ir_cannot_emit_block(c.body)) return true;
+    } else if (auto* ms = dynamic_cast<const MatchStmt*>(&s)) {
+        // (MatchStmt itself is caught above, but a nested match inside an arm
+        // body is detected by the arm-body walk here.)
+        for (auto& arm : ms->arms) if (x86_ir_cannot_emit_block(arm.body)) return true;
+    }
+    return false;
+}
+static bool x86_ir_cannot_emit_func(const FuncDecl& f) {
+    for (auto& b : f.body.stmts) if (x86_ir_cannot_emit_stmt(*b)) return true;
+    return false;
+}
+#endif
 static const char* ir_backend_unavailable_reason(const FuncDecl& f,
                                                   const CodeGenCtx& ctx) {
     for (auto& ann : f.annotations) {
@@ -5448,6 +5491,16 @@ static const char* ir_backend_unavailable_reason(const FuncDecl& f,
     }
     if (ctx.obf.mba || ctx.obf.opaque || ctx.obf.keyed)
         return "IR backend unavailable: ctx obf flags set";
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    // x86 IR backend (emit_x64) cannot yet emit for-each / match / defer
+    // (lowered to ThinIR in Phase 6d for ARM64 emit_arm64; emit_x64 has gaps
+    // — the optimization_validation --passes gate segfaults on Windows). Fall
+    // back to the tree-walker on x86; ARM64 emit_arm64 handles all three.
+    if (x86_ir_cannot_emit_func(f))
+        return "IR backend unavailable (x86): function uses for-each/match/defer, "
+               "which emit_x64 does not yet support (use the tree-walker; ARM64 "
+               "emit_arm64 handles them)";
+#endif
     // Tier 4: try/catch/throw are now lowered to the IR backend (TryCatch /
     // CatchCleanup / CatchEntry / Throw ThinOps + the same setjmp/longjmp emit
     // as the tree-walker), so they no longer force a tree-walker fallback.
