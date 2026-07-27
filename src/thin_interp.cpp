@@ -28,6 +28,8 @@
 #include <cmath>            // std::fmod, std::isnan
 #include <cstring>          // memcpy, memmove
 #include <cstdint>
+#include <cstdio>          // std::fprintf, std::getenv (debug trace)
+#include <cstdlib>         // std::getenv
 #include <unordered_map>
 #include <vector>
 #include <string>
@@ -79,12 +81,19 @@ static int32_t value_bytes(const Type* t, const StructLayoutTable* structs) {
 }
 
 // Sign-extend a value of `bits` width to int64_t (mirrors normalize_x9 signed).
+// The input may have garbage in the high bits (e.g. a frame load that read 8
+// bytes but the field is only 4 wide), so we MUST mask to `bits` first, then
+// sign-extend — exactly what emit_arm64's normalize_x9 does via
+// (lsl (64-bits); asr (64-bits)).
 static int64_t sign_extend(int64_t v, int bits) {
     if (bits >= 64) return v;
+    uint64_t mask = (uint64_t(1) << bits) - 1;
+    int64_t masked = int64_t(uint64_t(v) & mask);
     int64_t m = int64_t(1) << (bits - 1);
-    return (v ^ m) - m;
+    return (masked ^ m) - m;
 }
 // Zero-extend a value of `bits` width to uint64_t (mirrors normalize_x9 unsigned).
+// Masks to `bits` first (the high bits may be non-zero from a wide frame read).
 static uint64_t zero_extend(int64_t v, int bits) {
     if (bits >= 64) return uint64_t(v);
     return uint64_t(v) & ((uint64_t(1) << bits) - 1);
@@ -131,6 +140,8 @@ struct InterpFrame {
         uint8_t* p = addr(off);
         uint64_t u = uint64_t(val);
         for (int i = 0; i < width; ++i) p[i] = uint8_t(u >> (8 * i));
+        if (std::getenv("EMBER_INTERP_TRACE") && (off == -16 || off == -12 || off == -20))
+            std::fprintf(stderr, "    [store_int] off=%d w=%d val=%lld\n", off, width, (long long)val);
     }
     // 8-byte load/store (the scalar slot width; mirrors frame_load64/store64).
     int64_t load64(int32_t off) const { return load_int(off, 8, false); }
@@ -829,10 +840,28 @@ static InterpResult interpret_thin_impl(InterpCtx& ic) {
                     ic.write_slice_dst(in.dst, in.meta, ty, ptr, len);
                     break;
                 }
-                int64_t v = ic.frame.load64(in.meta.frame_off);
-                v = normalize_int(v, ty);
-                ic.write_int_dst(in.dst, in.meta, ty, v);
-                if (in.dst != 0 && in.meta.frame_off != 0) ic.vregs[in.dst] = {in.meta.frame_off, ty};
+                int64_t raw = ic.frame.load64(in.meta.frame_off);
+                int64_t v = normalize_int(raw, ty);
+                // Mirrors emit_arm64's LoadFrame ordinary path: record_dst_x9
+                // (NO frame store back). The value is left "in x9"; the vreg
+                // is marked frame-backed at meta.frame_off so a later read
+                // reloads from there. Crucially we must NOT store64 the result
+                // back to meta.frame_off — for a packed aggregate field (e.g.
+                // an i32 field at off=-20 with the next field at off=-16) an
+                // 8-byte store would clobber the adjacent field. The frame bytes
+                // already hold the field; a reload + normalize reproduces `v`.
+                if (in.dst != 0) {
+                    int32_t off = in.meta.frame_off;
+                    if (off != 0) {
+                        ic.vregs[in.dst] = {off, ty};
+                        // don't leave a stale val_vals entry (frame-backed wins)
+                        ic.val_vals.erase(in.dst);
+                    } else {
+                        ic.vregs[in.dst] = {0, ty};
+                        ic.val_vals[in.dst].kind = VRegValue::K::Int;
+                        ic.val_vals[in.dst].i = v;
+                    }
+                }
                 break;
             }
             case ThinOp::StoreFrame: {
@@ -878,6 +907,7 @@ static InterpResult interpret_thin_impl(InterpCtx& ic) {
                     // exact-width store (aggregate field). Mirrors emit_arm64's
                     // StoreFrame field_off!=0 path (store_x9_elem at frame_off).
                     ic.frame.store_int(in.meta.frame_off, in.meta.width, val);
+                    if (std::getenv("EMBER_INTERP_TRACE")) std::fprintf(stderr, "    [store-field] off=%d w=%d val=%lld\n", in.meta.frame_off, in.meta.width, (long long)val);
                 } else {
                     ic.frame.store64(in.meta.frame_off, val);
                 }

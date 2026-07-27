@@ -74,12 +74,71 @@ struct WasmModule {
     InterpDispatch dispatch;            // slot -> ThinFunction*
     std::unordered_map<std::string, int> slots;
     GlobalsBlock gb;
+    std::vector<uint8_t> gb_store;      // the typed globals block (outlives the run)
     StructLayoutTable layouts;
     Program prog;
     std::unordered_map<std::string, NativeSig> natives;
     OpOverloadTable overloads;
     CodeGenCtx ctx;
 };
+
+// host_value_bytes — the byte size of a value type for the typed globals
+// block layout (mirrors ember_cli's host_value_bytes / thin_interp's
+// value_bytes). Used by compute_typed_globals_layout below.
+static uint32_t host_value_bytes(const Type* t, const StructLayoutTable* structs) {
+    if (!t) return 8;
+    if (t->is_slice) return 16;
+    if (t->is_lambda) return 16;   // {fn_slot, env_ptr} — same 16-byte ABI as a slice
+    if (t->array_len > 0)
+        return uint32_t(t->array_len) * host_value_bytes(t->elem.get(), structs);
+    if (!t->struct_name.empty() && structs) {
+        auto it = structs->find(t->struct_name);
+        if (it != structs->end()) return uint32_t(it->second.size);
+    }
+    switch (t->prim) {
+    case Prim::Bool: case Prim::I8: case Prim::U8: return 1;
+    case Prim::I16: case Prim::U16: return 2;
+    case Prim::I32: case Prim::U32: case Prim::F32: return 4;
+    default: return 8;
+    }
+}
+
+// Typed globals-block layout (mirrors ember_cli's compute_typed_globals_layout).
+// Primary slots are 8-aligned; slice-global backing regions are appended after.
+struct TypedGlobalsLayout {
+    uint32_t total_size = 0;
+    std::unordered_map<std::string, uint32_t> offsets;
+    std::unordered_map<std::string, uint32_t> sizes;
+    std::unordered_map<std::string, uint32_t> backing_offsets; // slice globals only
+};
+
+static TypedGlobalsLayout compute_typed_globals_layout(const Program& prog,
+                                                       const StructLayoutTable& structs) {
+    TypedGlobalsLayout L;
+    uint32_t cur = 0;
+    auto align8 = [](uint32_t v) -> uint32_t { return (v + 7u) & ~7u; };
+    for (const auto& g : prog.globals) {
+        uint32_t sz = host_value_bytes(g.ty.get(), &structs);
+        cur = align8(cur);
+        L.offsets[g.name] = cur;
+        L.sizes[g.name] = sz;
+        cur += sz;
+    }
+    for (const auto& g : prog.globals) {
+        if (!g.ty || !g.ty->is_slice) continue;
+        if (!g.init) continue;
+        auto* al = dynamic_cast<const ArrayLit*>(g.init.get());
+        if (!al) continue;
+        uint32_t elem_sz = host_value_bytes(g.ty->elem.get(), &structs);
+        if (elem_sz == 0) elem_sz = 8;
+        uint32_t count = uint32_t(al->elements.size());
+        cur = align8(cur);
+        L.backing_offsets[g.name] = cur;
+        cur += count * elem_sz;
+    }
+    L.total_size = cur;
+    return L;
+}
 
 // Read a file's full contents via plain C stdio (no std::filesystem in the CLI
 // itself — the task's portability guidance). Returns "" on failure.
@@ -193,12 +252,54 @@ static std::unique_ptr<WasmModule> compile_source(const std::string& src,
         return nullptr;
     }
 
-    m->gb.base = 0;
+    // ---- globals block (TYPED layout; mirrors ember_cli's setup) ----
+    // The interpreter reads globals via ctx.globals_base + per-global addend
+    // (LoadGlobal/StoreGlobal). Without this, a script that reads a global
+    // (e.g. `global g = square(6) + 100;` or `namespace Math { global val=42; }`)
+    // sees zero — the loaded bytes never get their const initializer folded
+    // in. We size a typed block, fold const initializers into it, then set
+    // gb.base + ctx.globals_base to the block's address.
+    TypedGlobalsLayout tgl = compute_typed_globals_layout(m->prog, m->layouts);
+    {
+        uint32_t gi = 0;
+        for (auto& g : m->prog.globals) {
+            m->gb.index[g.name] = gi++;
+            m->gb.types[g.name] = g.ty.get();
+            m->gb.offsets[g.name] = tgl.offsets[g.name];
+            m->gb.sizes[g.name] = tgl.sizes[g.name];
+            // Tier 1 namespaces: also register the qualified name.
+            if (!g.ns.empty()) {
+                std::string qn = g.ns + "::" + g.name;
+                m->gb.index[qn] = m->gb.index[g.name];
+                m->gb.types[qn] = m->gb.types[g.name];
+                m->gb.offsets[qn] = m->gb.offsets[g.name];
+                m->gb.sizes[qn] = m->gb.sizes[g.name];
+            }
+        }
+    }
+    m->gb_store.assign(size_t(tgl.total_size), 0);
+    m->gb.base = int64_t(m->gb_store.data());
     g_globals_for_codegen = &m->gb;
+    {
+        auto string_alloc_thunk = [](const char* bytes, int64_t len) -> int64_t {
+            return ember::ext_string::alloc(std::string(bytes, size_t(len > 0 ? len : 0)));
+        };
+        GlobalInitCtx gic{m->gb_store, m->gb.index, m->gb.types};
+        gic.string_alloc_fn = string_alloc_thunk;
+        gic.offsets = &m->gb.offsets;
+        gic.sizes = &m->gb.sizes;
+        gic.backing_offsets = &tgl.backing_offsets;
+        gic.structs = &m->layouts;
+        eval_global_initializers(m->prog, gic);
+    }
+
     m->thfs.reserve(m->prog.funcs.size());  // stable addresses for dispatch ptrs
     m->dispatch.resize(m->prog.funcs.size(), nullptr);
 
-    m->ctx.globals_base = 0;
+    m->ctx.globals_base = m->gb.base;
+    m->ctx.globals_index = &m->gb.index;
+    m->ctx.globals_types = &m->gb.types;
+    m->ctx.globals_offsets = &m->gb.offsets;
     m->ctx.dispatch_base = 0;  // the interpreter doesn't use dispatch_base
     m->ctx.natives = &m->natives;
     m->ctx.script_slots = &m->slots;
@@ -288,6 +389,15 @@ int main(int argc, char** argv) {
 
     auto m = compile_source(src, file);
     if (!m) return 2;
+
+    // --dump-ir: print the lowered ThinIR for every fn (debug aid).
+    if (std::getenv("EMBER_WASM_DUMP_IR")) {
+        for (size_t i = 0; i < m->thfs.size(); ++i) {
+            std::fprintf(stderr, "===== fn[%zu] %s =====\n%s\n",
+                         i, m->prog.funcs[i].name.c_str(),
+                         dump(m->thfs[i]).c_str());
+        }
+    }
 
     // locate the entry fn
     auto it = m->slots.find(entry);
