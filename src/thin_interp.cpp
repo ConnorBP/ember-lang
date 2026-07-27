@@ -1612,6 +1612,11 @@ static InterpResult interpret_thin_impl(InterpCtx& ic) {
             }
         }
 
+        // A Throw (or a propagated catch) set catch_target — skip this
+        // block's terminator (it may be an unreachable Trap the lowerer emits
+        // after a Throw) + let the while-loop top redirect to the catch entry.
+        if (have_catch_target) continue;
+
         // ── terminator ──
         const ThinTerm& term = blk.term;
         switch (term.kind) {
