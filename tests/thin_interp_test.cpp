@@ -697,6 +697,77 @@ int main() {
         }
     }
 
+    // ── 18b. full string-native chain (mirrors valid_ir_string.ember) ──
+    // string_from_slice + string_length + string_find + string_substr across
+    // multiple literals + a handle stored in a `string` local. Expected 24
+    // (12 + 5 + 7). Exercises the slice→handle→i64 paths the WASM runner hits.
+    {
+        const char* src =
+            "fn main() -> i64 {\n"
+            "    let a: i64 = string_length(\"hello world!\");\n"
+            "    let b: i64 = string_length(\"ember\");\n"
+            "    let h: string = \"testing\";\n"
+            "    let c: i64 = string_length(h);\n"
+            "    return a + b + c;\n"
+            "}\n";
+        auto m = compile(src);
+        ck(m.get() != nullptr, "[18b] string-native chain (valid_ir_string): compiles");
+        if (m) {
+            int64_t r = call0(*m, "main");
+            char b[128];
+            std::snprintf(b, sizeof b, "[18b] string-native chain == 24 (got %lld)", (long long)r);
+            ck(r == 24, b);
+        }
+    }
+
+    // ── 18c. string_find missing + positions (valid_string_find_*) ──
+    {
+        const char* src =
+            "fn main() -> i64 {\n"
+            "    let h: string = string_from_slice(\"abcabc\");\n"
+            "    let p0: i64 = string_find(h, string_from_slice(\"abc\"));\n"
+            "    let p1: i64 = string_find(h, string_from_slice(\"bca\"));\n"
+            "    let p2: i64 = string_find(h, string_from_slice(\"cab\"));\n"
+            "    let pn: i64 = string_find(h, string_from_slice(\"xyz\"));\n"
+            "    if (p0 != 0) { return 0; }\n"
+            "    if (p1 != 1) { return 0; }\n"
+            "    if (p2 != 2) { return 0; }\n"
+            "    if (pn != -1) { return 0; }\n"
+            "    return 1;\n"
+            "}\n";
+        auto m = compile(src);
+        ck(m.get() != nullptr, "[18c] string_find positions: compiles");
+        if (m) {
+            int64_t r = call0(*m, "main");
+            char b[128];
+            std::snprintf(b, sizeof b, "[18c] string_find positions == 1 (got %lld)", (long long)r);
+            ck(r == 1, b);
+        }
+    }
+
+    // ── 18d. string_substr negative len + start beyond length ──
+    {
+        const char* src =
+            "fn main() -> i64 {\n"
+            "    let h: string = string_from_slice(\"hello world\");\n"
+            "    let s1: string = string_substr(h, 6, -1);\n"
+            "    let l1: i64 = string_length(s1);\n"
+            "    let s2: string = string_substr(h, 0, -1);\n"
+            "    let l2: i64 = string_length(s2);\n"
+            "    if (l1 != 5) { return 0; }\n"
+            "    if (l2 != 11) { return 0; }\n"
+            "    return 1;\n"
+            "}\n";
+        auto m = compile(src);
+        ck(m.get() != nullptr, "[18d] string_substr neg-len: compiles");
+        if (m) {
+            int64_t r = call0(*m, "main");
+            char b[128];
+            std::snprintf(b, sizeof b, "[18d] string_substr neg-len == 1 (got %lld)", (long long)r);
+            ck(r == 1, b);
+        }
+    }
+
     // ── 19. struct-by-value arg + field access ──
     {
         const char* src =

@@ -377,7 +377,16 @@ struct NativeCallResult {
 };
 
 // Arg kind classification (for the typed dispatch).
-enum class NArgK { I, D, F };  // int64_t, double, float
+//   I = int64_t (handles, lengths), D = double, F = float,
+//   P = a raw C pointer word (a slice's {ptr} word — e.g. the `uint8_t* p`
+//   of string_from_slice(p, len)). A pointer MUST be dispatched through a
+//   pointer-typed C signature (int64_t(*)(void*, int64_t)), NOT the all-int
+//   int64_t(*)(int64_t, int64_t) path: in WASM a C pointer is 32-bit (i32)
+//   while int64_t is i64, so the all-int cast produces a WASM call-signature
+//   mismatch ((i64,i64)->i64 vs the callee's (i32,i64)->i64) -> trap. Native
+//   (64-bit pointers) is unaffected (void* == int64_t in size). See the
+//   pointer-first-arg path in call_native_typed.
+enum class NArgK { I, D, F, P };  // int64_t, double, float, raw pointer
 struct NativeArgVal {
     NArgK kind = NArgK::I;
     int64_t i = 0;
@@ -397,6 +406,11 @@ static NativeArgVal classify_native_arg(const Type* ty, int64_t word) {
             uint64_t bits = uint64_t(word);
             std::memcpy(&v.d, &bits, 8);
         }
+    } else if (ty && ty->is_slice) {
+        // The slice's first word is a raw C pointer (e.g. string_from_slice's
+        // `uint8_t* p`). Mark it P so the dispatch uses a pointer-typed call.
+        v.kind = NArgK::P;
+        v.i = word;
     } else {
         v.kind = NArgK::I;
         v.i = word;
@@ -433,6 +447,31 @@ static NativeCallResult call_native_typed(void* fn_ptr, const NativeSig& sig,
         if (ret_is_double()){using F=double(*)();  r.kind=NativeCallResult::K::Float; r.f=((F)fn_ptr)(); return r; }
         if (ret_is_float()) {using F=float(*)();   r.kind=NativeCallResult::K::Float; r.f=double(((F)fn_ptr)()); return r; }
         if (ret_is_void())  { using F=void(*)();   ((F)fn_ptr)(); r.kind=NativeCallResult::K::None; return r; }
+    }
+    // Pointer-first-arg path: a native whose first param is a raw C pointer
+    // (a slice's {ptr} word). The ONLY such native in the standard set is
+    // string_from_slice(uint8_t* p, int64_t len) -> int64_t, but this handles
+    // the general (ptr, len) + optional trailing int64_t pattern. The pointer
+    // MUST be passed through a pointer-typed C signature (void*/uint8_t*),
+    // NOT int64_t: in WASM a pointer is i32 while int64_t is i64, so the
+    // all-int cast ((i64,i64)->i64) mismatches the callee's real WASM sig
+    // ((i32,i64)->i64) and traps. Native (64-bit ptr) is unaffected.
+    if (nargs >= 1 && args[0].kind == NArgK::P) {
+        void* p0 = reinterpret_cast<void*>(static_cast<uintptr_t>(args[0].i));
+        if (nargs == 2 && args[1].kind == NArgK::I) {
+            // string_from_slice(uint8_t* p, int64_t len) -> int64_t handle
+            if (ret_is_int())  { using F=int64_t(*)(void*, int64_t); r.kind=NativeCallResult::K::Int; r.i=((F)fn_ptr)(p0, ARG_I(1)); return r; }
+            if (ret_is_void())  { using F=void(*)(void*, int64_t);   ((F)fn_ptr)(p0, ARG_I(1)); r.kind=NativeCallResult::K::None; return r; }
+        }
+        if (nargs == 1) {
+            // (void*) -> int64_t  (no standard native uses this; kept for safety)
+            if (ret_is_int())  { using F=int64_t(*)(void*); r.kind=NativeCallResult::K::Int; r.i=((F)fn_ptr)(p0); return r; }
+        }
+        if (nargs == 3 && args[1].kind == NArgK::I && args[2].kind == NArgK::I) {
+            // (void*, int64_t, int64_t) -> int64_t
+            if (ret_is_int())  { using F=int64_t(*)(void*, int64_t, int64_t); r.kind=NativeCallResult::K::Int; r.i=((F)fn_ptr)(p0, ARG_I(1), ARG_I(2)); return r; }
+            if (ret_is_void())  { using F=void(*)(void*, int64_t, int64_t);   ((F)fn_ptr)(p0, ARG_I(1), ARG_I(2)); r.kind=NativeCallResult::K::None; return r; }
+        }
     }
     // For nargs 1-4, dispatch on the arg-kind pattern. All-int (the most
     // common) uses a typed int64_t call; float/double/mixed use explicit cases.
