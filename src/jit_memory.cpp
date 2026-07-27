@@ -7,6 +7,26 @@
 
 namespace ember {
 
+#if defined(EMBER_WASM_INTERP)
+// ---- WebAssembly: the interpreter backend has no executable memory ----
+// WASM (plan_WASM.md) has no user-allocated executable memory (no PROT_EXEC,
+// no JIT). The ThinIR interpreter (src/thin_interp.cpp) never calls these —
+// it walks a lowered ThinFunction in pure C++. These stubs exist only so the
+// `ember` core lib LINKS (engine.cpp's dead finalize() + any .em loader path
+// reference them). They are never called by the interpreter. Return nullptr /
+// no-op so a dead caller fails cleanly rather than allocating a meaningless
+// page. The platform layer (platform.cpp's EMBER_WASM_INTERP branch) provides
+// the underlying alloc_rw/protect_rx stubs; we do NOT call them here (no point
+// allocating a buffer that can never be executable).
+void* alloc_executable(const std::vector<uint8_t>& /*code*/) { return nullptr; }
+void* alloc_executable_rw(const std::vector<uint8_t>& /*code*/) { return nullptr; }
+bool seal_executable(void* /*ptr*/, size_t /*size*/) { return false; }
+void free_executable(void* /*ptr*/) { /* no-op (never allocated) */ }
+
+} // namespace ember
+
+#else // !EMBER_WASM_INTERP — the native JIT memory path
+
 // Track the rounded allocation size for each executable page so free_executable
 // can munmap the exact mapped length (POSIX munmap with size 0 is a no-op — a
 // JIT-memory leak that this fixes, plan_MACOS_ARM64.md Phase 1). Windows
@@ -102,3 +122,5 @@ void free_executable(void* ptr) {
 }
 
 } // namespace ember
+
+#endif // EMBER_WASM_INTERP (native JIT memory path)

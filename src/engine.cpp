@@ -873,6 +873,110 @@ CallResult ember_call_keyed_i64_i64_by_slot(ModuleInstance& inst, uint32_t logic
                                             const DispatchKeyAdapter& adapter) {
     return keyed_call_driver(inst, logical_slot, ctx, a, b, 2, adapter);
 }
+#elif defined(EMBER_WASM_INTERP)
+// ─── WebAssembly stub (plan_WASM.md W1) ────────────────────────────────────
+// WASM has NO JIT (no user-allocated executable memory, no native thunks). The
+// WASM backend is the ThinIR interpreter (src/thin_interp.cpp), which is called
+// DIRECTLY as a C++ function (interpret_thin_i64) — NOT via a JIT'd-entry
+// thunk. So the ember_call_* / keyed thunk / keyed-driver surface is UNUSED in
+// WASM. These stubs exist only so the `ember` core lib LINKS (module loading +
+// any host code references them). They are never called by the interpreter.
+// The pure-execution stubs return 0 (the interpreter path never reaches them);
+// the no-throw/bool/noexcept stubs return a safe empty value so module LOADING
+// (platform-independent) is not broken. Coroutines/threads/call_raw/keyed
+// dispatch are NOT supported in WASM (see docs/planning/WASM_PROGRESS.md W1).
+//
+// NOTE: the top-of-file C++ helpers (X64Emitter::resolve_fixups, compile_*
+// bench fns, finalize, call_i64_*) are dead code in WASM but compile as pure
+// C++ byte-vector emission (no inline asm — the asm is ONLY in the x86 #if
+// block above, which is skipped under EMBER_WASM_INTERP). finalize() calls the
+// stubbed alloc_executable/seal_executable (jit_memory.cpp's WASM branch) and
+// returns false — never called by the interpreter.
+
+// ─── B1 host->JIT thunks — never called (interpreter is called directly) ───
+int64_t ember_call_void(void* /*entry*/, context_t* /*ctx*/) { return 0; }
+int64_t ember_call_i64(void* /*entry*/, context_t* /*ctx*/, int64_t /*a*/) { return 0; }
+int64_t ember_call_i64_i64(void* /*entry*/, context_t* /*ctx*/, int64_t /*a*/, int64_t /*b*/) { return 0; }
+
+// ─── keyed re-entry thunks — not supported in WASM (no JIT'd entries) ───
+int64_t ember_keyed_reentry_void(void* /*entry*/, context_t* /*ctx*/, uint64_t /*route_word*/) { return 0; }
+int64_t ember_keyed_reentry_i64(void* /*entry*/, context_t* /*ctx*/, int64_t /*a*/, uint64_t /*route_word*/) { return 0; }
+int64_t ember_keyed_reentry_i64_i64(void* /*entry*/, context_t* /*ctx*/, int64_t /*a*/, int64_t /*b*/,
+                                    uint64_t /*route_word*/) { return 0; }
+
+// ─── x86 r15 test helpers — N/A in WASM (no r15, no keyed route register) ───
+uint64_t ember_read_r15() { return 0; }
+void ember_set_r15(uint64_t /*v*/) { /* no-op */ }
+
+// ─── keyed host->script call APIs — not supported in WASM (no JIT dispatch) ───
+CallResult ember_call_keyed_void(ModuleInstance& /*inst*/, const std::string& /*name*/,
+                                 context_t& /*ctx*/, const DispatchKeyAdapter& /*adapter*/) {
+    CallResult out; out.ok = false;
+    out.reason = "ember_call_keyed_void: keyed dispatch not supported in WASM (interpreter backend)";
+    return out;
+}
+CallResult ember_call_keyed_i64(ModuleInstance& /*inst*/, const std::string& /*name*/,
+                                context_t& /*ctx*/, int64_t /*a*/,
+                                const DispatchKeyAdapter& /*adapter*/) {
+    CallResult out; out.ok = false;
+    out.reason = "ember_call_keyed_i64: keyed dispatch not supported in WASM (interpreter backend)";
+    return out;
+}
+CallResult ember_call_keyed_i64_i64(ModuleInstance& /*inst*/, const std::string& /*name*/,
+                                    context_t& /*ctx*/, int64_t /*a*/, int64_t /*b*/,
+                                    const DispatchKeyAdapter& /*adapter*/) {
+    CallResult out; out.ok = false;
+    out.reason = "ember_call_keyed_i64_i64: keyed dispatch not supported in WASM (interpreter backend)";
+    return out;
+}
+CallResult ember_call_keyed_void_by_slot(ModuleInstance& /*inst*/, uint32_t /*logical_slot*/,
+                                         context_t& /*ctx*/,
+                                         const DispatchKeyAdapter& /*adapter*/) {
+    CallResult out; out.ok = false;
+    out.reason = "ember_call_keyed_void_by_slot: keyed dispatch not supported in WASM (interpreter backend)";
+    return out;
+}
+CallResult ember_call_keyed_i64_by_slot(ModuleInstance& /*inst*/, uint32_t /*logical_slot*/,
+                                        context_t& /*ctx*/, int64_t /*a*/,
+                                        const DispatchKeyAdapter& /*adapter*/) {
+    CallResult out; out.ok = false;
+    out.reason = "ember_call_keyed_i64_by_slot: keyed dispatch not supported in WASM (interpreter backend)";
+    return out;
+}
+CallResult ember_call_keyed_i64_i64_by_slot(ModuleInstance& /*inst*/, uint32_t /*logical_slot*/,
+                                            context_t& /*ctx*/, int64_t /*a*/, int64_t /*b*/,
+                                            const DispatchKeyAdapter& /*adapter*/) {
+    CallResult out; out.ok = false;
+    out.reason = "ember_call_keyed_i64_i64_by_slot: keyed dispatch not supported in WASM (interpreter backend)";
+    return out;
+}
+
+ExtensionResult<void*> resolve_entry_keyed(ModuleInstance& /*inst*/,
+                                           const LogicalCallableId& /*id*/,
+                                           const DispatchKeyAdapter& /*adapter*/) {
+    return make_extension_result_error<void*>("ember-keyed-dispatch", "resolve",
+        "resolve_entry_keyed: keyed dispatch not supported in WASM (interpreter backend)");
+}
+ExtensionResult<void*> resolve_entry_by_name_keyed(ModuleInstance& /*inst*/,
+                                                   std::string_view /*name*/,
+                                                   const DispatchKeyAdapter& /*adapter*/) {
+    return make_extension_result_error<void*>("ember-keyed-dispatch", "resolve",
+        "resolve_entry_by_name_keyed: keyed dispatch not supported in WASM (interpreter backend)");
+}
+LeaseResult resolve_entry_keyed_leased(ModuleInstance& /*inst*/,
+                                       const LogicalCallableId& /*id*/,
+                                       context_t& /*ctx*/, int64_t /*arg*/,
+                                       KeyedLeaseBody /*body*/,
+                                       const DispatchKeyAdapter& /*adapter*/) {
+    LeaseResult out; out.ok = false;
+    out.reason = "resolve_entry_keyed_leased: keyed dispatch not supported in WASM (interpreter backend)";
+    return out;
+}
+
+// Safe no-throw stubs for the platform-independent pieces so module LOADING is
+// not broken in WASM (keyed runtime is never active; no identity record built).
+struct ModuleInstance* ember_current_keyed_runtime() noexcept { return nullptr; }
+bool assemble_identity_dispatch_record(ModuleInstance& /*inst*/) { return false; }
 #else
 // ─── Non-x86 target stub (Phase 0 of plan_MACOS_ARM64.md) ────────────────
 // The x86 path above defines the GNU-asm B1/keyed thunks + the keyed-dispatch

@@ -211,3 +211,232 @@ extension attached.
   native + `alloc_executable`; ~200-400 lines).
 - Full coroutine support (the paused-frame design).
 - Full GC stress testing (W2).
+
+## WASM W1 — EMBER_WASM_INTERP gating + Emscripten build
+
+**Status:** COMPLETE. The ThinIR interpreter compiles to WebAssembly via
+Emscripten 6.0.4 and runs `.ember` scripts in Node through the interpreter
+(no JIT, no executable memory). Native build unaffected (472/472 lang suite).
+
+### What W1 delivered
+
+The `EMBER_WASM_INTERP` macro is defined ONLY in the Emscripten build
+(`-DEMBER_WASM_INTERP=ON`), so every `#ifdef` branch below is INACTIVE
+natively — the native build is byte-identical (verified: `cd buildm && ninja`
+clean, `bash tests/run_lang_tests.sh buildm` → 472/472). The macro gates the
+platform/engine/jit-memory stubs + the WASM CLI; it is NOT defined on the
+native targets.
+
+### The gating (src/ changes — all `#ifdef EMBER_WASM_INTERP` branches)
+
+- **`src/platform.cpp`** — added an `#elif defined(EMBER_WASM_INTERP)` branch
+  before the `#else #error`. WASM has no executable memory: `alloc_rw` =
+  plain `malloc` (RW, never PROT_EXEC); `protect_rx`/`protect_rw` = no-ops
+  returning `true` (no `mprotect`, nothing to seal — the interpreter never
+  calls them); `free_page` = `free`; `page_size` = 65536 (the WASM page; the
+  value is irrelevant since no executable pages are allocated);
+  `executable_path` = empty; `round_up_to_page` = standard. No MAP_JIT, no
+  `pthread_jit_write_protect_np`, no `sys_icache_invalidate` (Apple-only).
+- **`src/engine.cpp`** — added an `#elif defined(EMBER_WASM_INTERP)` branch
+  between the x86-asm `#if defined(__GNUC__) && defined(__x86_64__)` block
+  and the non-x86 `#else` stubs. WASM has no thunks (the interpreter is
+  called DIRECTLY as `interpret_thin_i64`, not via a JIT'd-entry thunk). The
+  `ember_call_*` / keyed-thunk / keyed-driver symbols are stubbed: pure-
+  execution stubs return 0; keyed `CallResult`/`ExtensionResult`/`LeaseResult`
+  stubs return `ok=false` + "not supported in WASM (interpreter backend)";
+  `ember_current_keyed_runtime` = nullptr; `assemble_identity_dispatch_record`
+  = false. The top-of-file C++ helpers (`X64Emitter::resolve_fixups`,
+  `compile_add_i64`, `finalize`, etc.) are dead code in WASM but compile as
+  pure C++ byte-vector emission (the inline asm is ONLY in the x86 `#if`
+  block, which is skipped) + link against the stubbed `alloc_executable`.
+- **`src/jit_memory.cpp`** — wrapped the native JIT-memory path in
+  `#if !defined(EMBER_WASM_INTERP)` and added a WASM stub block:
+  `alloc_executable`/`alloc_executable_rw` return `nullptr`;
+  `seal_executable` returns `false`; `free_executable` is a no-op. The
+  interpreter never calls them; they exist only so the `ember` core lib
+  links. No `std::mutex`/`safety::check_memory_limit` in the WASM path.
+- **Extensions** (coroutine/thread/call_raw) — NOT built under
+  `EMBER_WASM_INTERP` (gated in CMake). coroutines use Windows fibers /
+  Apple ARM64 asm context switch; threads use `std::thread` (needs
+  `-pthread`); call_raw uses `alloc_executable` + a fn-ptr cast (no
+  executable memory in WASM). All three are impossible in WASM. The WASM
+  CLI does NOT register their natives → scripts using `yield`/
+  `coroutine_start`, `thread_spawn`/`join`, or `make_executable`/`call_raw`
+  fail at sema with "unknown native". The arch-neutral extensions
+  (vec/quat/mat/string/array/math/map/sync/lifecycle/io/gc/opt/obf/audio)
+  build + link + register cleanly (verified: zero std::thread/pthread/asm/
+  platform-header references).
+- **`src/thin_interp.*`** — UNTOUCHED (W0 is done + validated, 88 assertions).
+  The gating is AROUND the interpreter, not in it.
+
+### The WASM build config (CMakeLists.txt)
+
+- `option(EMBER_WASM_INTERP "Build the WebAssembly ThinIR-interpreter target (Emscripten)" OFF)`
+  near the top. The native build defaults to OFF.
+- The `ember_frontend` source list is a variable (`EMBER_FRONTEND_SOURCES`);
+  under WASM it includes ALL frontend sources (the JIT emit passes
+  `thin_emit.cpp`/`thin_emit_arm64.cpp`, the `.em` re-emit loader
+  `em_loader.cpp`, and the host-boundary drivers `module_build.cpp`/
+  `keyed_hot_reload.cpp` are pure C++ — no inline asm, no MAP_JIT — and
+  compile under Emscripten as dead code, keeping `emit_x64`/`emit_arm64`/
+  `finalize`/`alloc_executable` symbols resolved without gating `codegen.cpp`'s
+  `compile_func`). The `.S` thunk/ctx-switch files are arch-gated
+  (`APPLE AND arm64`) and never selected for WASM.
+- The VST3 block + the entire native test/exec target section (from the VST3
+  `option` to end of file) is wrapped in `if(NOT EMBER_WASM_INTERP)`, so under
+  WASM ONLY `ember_wasm` (+ its lib/extension deps) builds.
+- The `if(EMBER_WASM_INTERP)` block at the end defines `EMBER_WASM_INTERP`
+  on `ember`/`ember_frontend`/`ember_import`/`ember_ed25519` + the arch-
+  neutral extensions + the CLI, enables `-fexceptions` on every TU (the
+  interpreter throws `InterpTrap` for traps + catches it; the frontend throws
+  compile errors — Emscripten defaults to `-fno-exceptions`, so this is
+  explicit; the audit's Shape-B-on-Emscripten recommendation, avoiding the
+  `-fno-exceptions` frontend refactor), and links `ember_wasm` with
+  `-sENVIRONMENT=node -sALLOW_MEMORY_GROWTH=1 -sNODERAWFS=1 -sEXIT_RUNTIME=1
+  -fexceptions -sEXCEPTION_CATCHING_ALLOWED=['*']`. The
+  `EXCEPTION_CATCHING_ALLOWED=['*']` is CRITICAL: Emscripten strips catch
+  handlers by default even with `-fexceptions`, so without it an
+  `InterpTrap` escapes `interpret_thin_i64_safe`'s `catch` → wasm trap →
+  node promise rejection. `NODERAWFS` backs `fopen`/`fread` with node's fs
+  so the CLI reads `.ember` files via plain C stdio.
+
+### The WASM CLI (examples/ember_wasm.cpp)
+
+A minimal runner modeled on `tests/thin_interp_test.cpp`'s harness. It:
+1. reads a `.ember` file (argv[1], or `-` for stdin) via plain C `fopen`/
+   `fread` (no `std::filesystem` in the CLI itself — portability);
+2. resolves `import "path";` inlining via `resolve_imports` (arch-neutral;
+   Emscripten has `std::filesystem`), falling back to raw source on error;
+3. lexes / parses / sema-checks / lowers every fn to a `ThinFunction` via
+   `lower_function`, building an `InterpDispatch` (`ThinFunction*` table);
+4. registers the arch-neutral extension natives + operator overloads + a
+   minimal `assert_eq_i64`/`assert_eq_f32`/`assert_eq_f64`/`assert_true`
+   test-helper set;
+5. runs the entry fn (default `main`, or `--fn NAME`) via
+   `interpret_thin_i64_safe` with a `context_t` (budget = INT64_MAX,
+   max_call_depth = 4096 — generous, no false traps);
+6. prints `RESULT <i64>` (or `TRAP <reason>: <detail>` on an unhandled
+   throw) + exits with `(result & 0xFF)`.
+
+Key CodeGenCtx settings: `use_context_reg = true` (thin_lower requires it
+for try/catch + throw to lower — the interpreter ignores the reg but the
+lowerer gates on it), `emit_budget_checks = false`, `emit_depth_checks =
+false` (no false budget/depth traps on deep recursion / long loops; the
+interpreter's entry budget check + DepthCheck instrs are gated by these).
+`use_gc_env = false` (lambdas-as-stack-env; the interpreter handles it).
+
+The CLI does NOT use `compile_func`, `emit_x64`, `emit_arm64`,
+`alloc_executable`, or any JIT path — it goes straight AST → `lower_function`
+→ `interpret_thin` (Shape B: full compiler-in-WASM, backend = interpreter).
+
+### Build + run
+
+```
+emcmake cmake -G Ninja -DCMAKE_CXX_COMPILER=em++ -DEMBER_WASM_INTERP=ON -S . -B buildwasm
+cmake --build buildwasm
+node buildwasm/ember_wasm.js tests/lang/valid_arith.ember   # -> RESULT 13
+(cd buildwasm && ctest)                                       # wasm_interp_acceptance: 15/15
+```
+
+### Test results (WASM interpreter acceptance — 15/15 pass)
+
+`tests/run_wasm_tests.sh` runs a curated set through `ember_wasm.js` +
+asserts the result. All pass:
+
+| script | expected | got |
+|---|---|---|
+| valid_arith | 13 | RESULT 13 |
+| valid_control | 132 | RESULT 132 |
+| wasm_fib (fib(20)) | 6765 | RESULT 6765 |
+| valid_for_each | 150 | RESULT 150 |
+| valid_match | 20 | RESULT 20 |
+| valid_struct_destructure | 142 | RESULT 142 |
+| valid_throw_nested | 99 | RESULT 99 |
+| valid_lambda_no_capture | 84 | RESULT 84 |
+| valid_lambda | 42 | RESULT 42 |
+| runtime_division_forms | 78 | RESULT 78 |
+| valid_constexpr_recursive | 55 | RESULT 55 |
+| valid_namespaces_intra_call | 30 | RESULT 30 |
+| valid_array_push_pop_i64 | 1 | RESULT 1 |
+| runtime_struct_reassign_single | 42 | RESULT 42 |
+| runtime_trap_throw_uncaught | TRAP | TRAP unhandled throw |
+
+Coverage: i64 arithmetic, control flow (if/else/while/for), recursion
+(fib(20)=6765), for-each, match, structs (i64 fields) + destructuring,
+simple try/catch (single handler, throw caught), lambdas (capture + no
+capture), i64 division/modulo forms, constexpr recursive fold, namespaced
+calls, the array extension, + the recoverable-trap path (uncaught throw).
+
+### Stubbed / not supported in WASM (W1 scope — by design)
+
+- **Coroutines** (`yield`/`coroutine_start`/`coroutine_next`) — impossible in
+  WASM (no fibers, no asm context switch). The extension is not built; the
+  natives are not registered. The interpreter already stubs coroutines (W0).
+  An interpreter-native cooperative-coroutine design (paused frame
+  {ThinFunction*, pc, frame copy, call_depth}) is noted for a later phase —
+  do NOT attempt the fiber/asm-switch path.
+- **Threads** (`thread_spawn`/`thread_join`) — `std::thread` needs `-pthread`
+  + SharedArrayBuffer (opt-in); no core feature needs threads. The extension
+  is not built; the natives are not registered.
+- **call_raw** (`make_executable`/`call_raw`/`free_executable_ptr`) —
+  impossible in WASM (no executable memory to copy bytes to + no fn-ptr-to-
+  native-bytes to invoke). The extension is not built; the natives are not
+  registered. This means the self-hosted compiler (emits x86 via call_raw)
+  cannot run its output in WASM (x86-locked by design).
+- **Keyed dispatch** (`@obf_keyed`, keyed cross-module calls) — the keyed
+  thunks/driver are stubbed (no JIT dispatch in WASM). The keyed *lowering*
+  is not exercised by the WASM CLI.
+
+### Known interpreter coverage gaps (W2 — NOT W1 regressions; pre-existing)
+
+The interpreter (W0) was validated natively on its 88-assertion subset
+(`thin_interp_test`). These scripts exercise features BEYOND that subset and
+reveal W2 coverage gaps (the interpreter, NOT the gating/build — left
+untouched per the W1 constraint). The JIT (`ember_cli`) handles them; the
+interpreter does not yet:
+
+- **Narrow integer widths** (i8/u8/i16/u16/i32/u32 arithmetic, casts, struct
+  fields): `runtime_integer_boundaries` (expect 79, got 5 — i8 boundary),
+  `valid_ir_struct` (expect 123, got 201 — i32 struct fields). The W0 test
+  covers only int↔float casts, not narrow-width element loads/stores.
+  (`meta.width`-keyed sized reads/writes are the W2 fix.)
+- **Nested try/catch** (a try inside a try): `valid_nested_try_catch`
+  (expect 44, got "TRAP none: trap terminator"). The W0 test covers only a
+  single try/catch ([27]); the catch_stack + `catch_depth` interaction for
+  nested handlers needs the W2 fix.
+
+These are tracked for W2 ("full ThinOp coverage"). W1's job was the gating +
+the Emscripten build + proving the interpreter runs in WASM on its validated
+subset — DONE.
+
+### Constraints honored
+
+- The native build + CI are unaffected: `cd buildm && ninja` clean;
+  `bash tests/run_lang_tests.sh buildm` → 472/472. Every `#ifdef
+  EMBER_WASM_INTERP` branch is inactive natively (the macro is undefined).
+- The `EMBER_WASM_INTERP` macro is defined ONLY on the WASM targets (CMake
+  `target_compile_definitions` under `if(EMBER_WASM_INTERP)`, NOT global).
+- The interpreter (`src/thin_interp.*`) is untouched.
+- The gating + the WASM CLI are portable C++17 (the CLI uses plain C
+  `fopen`/`fread`, no `std::filesystem` in the CLI itself; `resolve_imports`
+  in `ember_import` uses `std::filesystem`, which Emscripten provides).
+- Exceptions are enabled (`-fexceptions` + `-sEXCEPTION_CATCHING_ALLOWED
+  =['*']`) so the interpreter's `InterpTrap` + the frontend's compile-error
+  throws work without a `-fno-exceptions` refactor (the audit's Shape-B-on-
+  Emscripten path).
+
+### Next (W2+)
+
+- Full ThinOp coverage: narrow integer widths (i8/i16/i32/u8/u16/u32 sized
+  loads/stores + arithmetic + casts) + nested try/catch (the catch_stack/
+  catch_depth interaction). The two known gaps above.
+- GC shadow-stack linkage stress (the hook is built; full GC during deep
+  interpreted call chains with escaping lambdas is W2).
+- The `.em` v5 IR loader's deserialize-only fork (the audit's R1: feed
+  deserialized `ThinFunction`s to the interpreter instead of re-emitting to
+  native + `alloc_executable`; ~200-400 lines) — Shape A (interpret-only
+  deployment).
+- Interpreter-native cooperative coroutines (the paused-frame design).
+- Performance: the interpreter is ~10–50x slower than the JIT (acceptable
+  for scripting/embedding; `@realtime` audio is the known casualty — defer
+  in WASM v1). Direct-threaded-dispatch is a future ~2–3x optimization.

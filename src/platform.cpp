@@ -249,6 +249,74 @@ bool round_up_to_page(size_t n, size_t& out) {
 
 } // namespace ember::platform
 
+#elif defined(EMBER_WASM_INTERP)
+// ---- WebAssembly (Emscripten) — the interpreter backend ----
+// WASM (plan_WASM.md) has NO user-allocated executable memory: there is no
+// mmap(PROT_EXEC), no W^X page, no JIT. The WASM backend is the ThinIR
+// INTERPRETER (src/thin_interp.cpp), which walks a lowered ThinFunction in
+// pure C++ — it never calls alloc_rw/protect_rx/free_page (no executable
+// pages to allocate). These stubs exist only so the `ember` core lib LINKS
+// (jit_memory.cpp + engine.cpp reference them); they are never called by the
+// interpreter. alloc_rw returns a plain malloc'd RW buffer (in case a future
+// path needs a writable buffer that is NOT executable — e.g. a global table);
+// protect_rx is a no-op (WASM has no mprotect + no PROT_EXEC — there is nothing
+// to seal); free_page frees the malloc'd buffer; page_size returns the WASM
+// page size (65536) — the value is irrelevant since no executable pages are
+// allocated. MAP_JIT / pthread_jit_write_protect_np / sys_icache_invalidate
+// are Apple-only and absent here.
+#  include <cstdlib>
+#  include <string>
+
+namespace ember::platform {
+
+void* alloc_rw(size_t size) {
+    // plain heap allocation (RW, never executable). The interpreter does not
+    // call this; it is a link stub. malloc(0) may return null or a unique ptr —
+    // either is fine for a never-called stub, but match the other platforms'
+    // reject-zero discipline for safety.
+    if (size == 0) return nullptr;
+    return std::malloc(size);
+}
+
+bool protect_rx(void* /*ptr*/, size_t /*size*/) {
+    // No-op: WASM has no mprotect + no executable pages. The interpreter never
+    // calls this. Return true so any (dead) caller that checks the result does
+    // not misinterpret a stub failure.
+    return true;
+}
+
+bool protect_rw(void* /*ptr*/, size_t /*size*/) {
+    // No-op (same rationale as protect_rx).
+    return true;
+}
+
+void free_page(void* ptr, size_t /*size*/) {
+    // free the malloc'd buffer (size ignored — malloc tracks its own size).
+    if (ptr) std::free(ptr);
+}
+
+long page_size() {
+    // The WASM page size is 65536 bytes. Irrelevant for the interpreter (no
+    // executable pages); returned for API completeness.
+    return 65536;
+}
+
+std::string executable_path() {
+    // WASM has no filesystem exe path (the module is loaded by the host JS).
+    // Return empty (mirrors the other platforms' failure path).
+    return {};
+}
+
+bool round_up_to_page(size_t n, size_t& out) {
+    if (n == 0) return false;
+    size_t p = size_t(page_size());
+    if (n > SIZE_MAX - (p - 1)) return false;
+    out = ((n + p - 1) / p) * p;
+    return true;
+}
+
+} // namespace ember::platform
+
 #else
 #  error "unsupported platform: add a platform.cpp implementation for this target"
-#endif // _WIN32 / __APPLE__ / __linux__
+#endif // _WIN32 / __APPLE__ / __linux__ / EMBER_WASM_INTERP

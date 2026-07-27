@@ -24,3 +24,6 @@ tmp_*.cpp
 
 # VS Code extension build artifact
 editors/vscode/*.vsix
+
+# WASM Emscripten build dir
+/buildwasm

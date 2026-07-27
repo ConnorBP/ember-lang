@@ -33,6 +33,14 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# ---- WASM W1: the Emscripten ThinIR-interpreter target (plan_WASM.md) ----
+# When ON, the build targets WebAssembly via Emscripten (em++). The backend is
+# the ThinIR INTERPRETER (src/thin_interp.cpp) — no JIT, no executable memory.
+# The EMBER_WASM_INTERP macro is defined ONLY on the WASM targets (not global),
+# so the native build is byte-identical (the #ifdef branches are inactive).
+# Build: emcmake cmake -G Ninja -DCMAKE_CXX_COMPILER=em++ -DEMBER_WASM_INTERP=ON -B buildwasm ..
+option(EMBER_WASM_INTERP "Build the WebAssembly ThinIR-interpreter target (Emscripten)" OFF)
+
 if(MSVC)
     add_compile_options(/W4)
 else()
@@ -160,7 +168,16 @@ if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
 endif()
 
 # ---- frontend lib: lexer, types, parser, sema, codegen ----
-add_library(ember_frontend STATIC
+# ---- frontend lib: lexer, types, parser, sema, codegen ----
+# The source list is conditional on EMBER_WASM_INTERP: the WASM target excludes
+# the native JIT emit passes (thin_emit.cpp's emit_x64, thin_emit_arm64.cpp's
+# emit_arm64) + the .em v5 IR re-emit loader (em_loader.cpp: re-emits to native
+# + alloc_executable) + the host-boundary JIT compile/reload drivers
+# (module_build.cpp, keyed_hot_reload.cpp: finalize/alloc_executable). The WASM
+# backend is the ThinIR interpreter (thin_interp.cpp) — it goes AST ->
+# lower_function -> interpret_thin, never emit_x64/emit_arm64/alloc_executable.
+# aapcs64_classify.cpp is ARM64-emit-only (unused by the interpreter).
+set(EMBER_FRONTEND_SOURCES
     src/lexer.cpp
     src/types.cpp
     src/parser.cpp
@@ -168,12 +185,6 @@ add_library(ember_frontend STATIC
     src/codegen.cpp
     src/thin_lower.cpp
     src/peephole.cpp
-    src/thin_emit.cpp
-    # Phase 4 (plan_MACOS_ARM64.md): the ARM64 ThinIR emit pass. Mirrors
-    # thin_emit.cpp's emit_x64 over the supported subset; unsupported ThinOps
-    # throw a clear runtime_error so the host never silently miscompiles.
-    # Frame-only (no regalloc) for the first milestone.
-    src/thin_emit_arm64.cpp
     # WASM W0 (plan_WASM.md): the ThinIR interpreter — the WASM backend. WASM
     # has no JIT (no user-allocated executable memory), so the WASM backend is
     # a C++ interpreter that walks a lowered ThinFunction instead of emitting
@@ -213,10 +224,6 @@ add_library(ember_frontend STATIC
     # Lives in ember_frontend (a compile-time/layout concern) and depends only
     # on the C++ standard library.
     src/dispatch_abi.cpp
-    # Phase 6c (plan_MACOS_ARM64.md): the shared AAPCS64 aggregate classifier —
-    # a tested, emit-independent module emit_arm64's call marshaling consumes.
-    # Self-contained: touches Type only via public members + Prim + StructLayout.
-    src/aapcs64_classify.cpp
     # Red 3 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §5, §9.2, §14.3): the
     # logical/physical module layout planner, identity layout, and the configured
     # KeyedDispatchRegistry for implicit-keyed-v1. A compile-time/layout concern
@@ -230,27 +237,30 @@ add_library(ember_frontend STATIC
     # thin_ir_mutation.hpp (header-only types) + the C++ standard library. Lives
     # in ember_frontend alongside seed_derivation.cpp / ember_pass.cpp.
     src/polymorphic_options.cpp
-    # The required host boundary for profile/pass compilation: the production
-    # compile_func_checked + staged-ownership + atomic-publication primitive
-    # shared by the JIT host (ember_cli --profile/--passes) and the integration
-    # gate (polymorphic_pass_test PUB/LIFE). Depends on codegen.hpp
-    # (compile_func_checked/CompileResult), engine.hpp (finalize),
-    # dispatch_table.hpp (publish_batch), module_registry.hpp (preflight/register),
-    # ember_pass.hpp (PassRunReport). Lives in ember_frontend (a compile-time /
-    # host-boundary concern) and adds no new link direction.
-    src/module_build.cpp
-    # Red 10 (plan_IMPLICIT_ENVIRONMENTAL_KEYED_DISPATCH.md §12, §10, §14.2,
-    # §14.3 Red 10): keyed single-function hot reload + whole-module keyed-
-    # generation replacement. Depends on codegen.hpp (compile_func_checked),
-    # engine.hpp (finalize/free_executable), sema.hpp/parser (ast.hpp)/lexer,
-    # module_layout.* (ModuleDispatchRecord + validate_dispatch_record +
-    # derive_route_word), keyed_dispatch.* (the Red 1 permutation helper),
-    # key_provider.hpp (the transient provider route), hot_reload_domain.hpp
-    # (publish_keyed_slot + guard-enrolled reclamation), module_registry.*
-    # (atomic record publication). Lives in ember_frontend (a compile-time /
-    # reload concern); no new link direction.
-    src/keyed_hot_reload.cpp
 )
+# Native-JIT-only frontend sources: under EMBER_WASM_INTERP the interpreter
+# backend replaces the native emit, so the JIT emit passes (thin_emit.cpp's
+# emit_x64, thin_emit_arm64.cpp's emit_arm64) are NOT needed. They are pure C++
+# byte-vector emitters (no inline asm — the asm is in engine.cpp, gated) and
+# WOULD compile under Emscripten, but they are dead code in WASM (the
+# interpreter never calls emit_x64/emit_arm64). They are kept IN the WASM build
+# so codegen.cpp's compile_func/compile_func_checked (which reference emit_x64)
+# resolve without gating codegen.cpp — the simpler, lower-risk path. The .em
+# v5 IR re-emit loader (em_loader.cpp) + the host-boundary JIT compile/reload
+# drivers (module_build.cpp, keyed_hot_reload.cpp) likewise compile as dead C++
+# under Emscripten (they reference finalize/alloc_executable, stubbed under
+# WASM) and are kept in so no transitive symbol goes unresolved.
+list(APPEND EMBER_FRONTEND_SOURCES
+    src/thin_emit.cpp
+    src/thin_emit_arm64.cpp
+    src/module_build.cpp
+    src/keyed_hot_reload.cpp
+    src/aapcs64_classify.cpp
+)
+# (No sources are excluded under EMBER_WASM_INTERP — see comment above. The
+# EMBER_WASM_INTERP macro gates the platform/engine/jit_memory stubs, not the
+# frontend source list.)
+add_library(ember_frontend STATIC ${EMBER_FRONTEND_SOURCES})
 target_include_directories(ember_frontend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ember_frontend PUBLIC ember)
 
@@ -298,6 +308,13 @@ target_link_libraries(ember_ext_map   PRIVATE ember_ext_gc)
 target_link_libraries(ember_ext_vec   PRIVATE ember_ext_gc)
 target_link_libraries(ember_ext_string PRIVATE ember_ext_gc)
 ember_add_extension(sync     extensions/sync/ext_sync.cpp)
+# WASM W1: thread/coroutine/call_raw are IMPOSSIBLE in WASM (no pthreads w/o
+# -pthread, no asm context switch, no executable memory to call_raw into) and
+# are NOT built under EMBER_WASM_INTERP. Scripts using thread_spawn/join,
+# yield/coroutine_start, or make_executable/call_raw fail at sema with
+# "unknown native" in the WASM CLI (the natives are not registered). See
+# docs/planning/WASM_PROGRESS.md W1.
+if(NOT EMBER_WASM_INTERP)
 ember_add_extension(thread   extensions/thread/ext_thread.cpp)   # Tier 4: in-context threads (thread_spawn/join + call_mutex serialization)
 # coroutine extension: Windows uses fibers (CreateFiber/SwitchToFiber);
 # Apple Silicon (plan_MACOS_ARM64.md Phase 8) uses a hand-written AAPCS64
@@ -319,6 +336,7 @@ else()
     target_include_directories(ember_ext_coroutine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/extensions/coroutine)
     target_link_libraries(ember_ext_coroutine PUBLIC ember_frontend)
 endif()
+endif() # NOT EMBER_WASM_INTERP (thread + coroutine)
 ember_add_extension(gc extensions/gc/ext_gc.cpp)            # tracing GC runtime: wires ember::gc::GcHeap into the engine for lambda env heap management (#20)
 ember_add_extension(lifecycle extensions/lifecycle/ext_lifecycle.cpp)
 ember_add_extension(opt extensions/opt/ext_opt.cpp)         # Stage C: IR optimization passes
@@ -341,11 +359,22 @@ target_link_libraries(ember_ext_io PUBLIC ember_ext_array ember_ext_string)
 # executable pages are caller-owned via free_executable_ptr). PERM_FFI-gated
 # at the sema call site (minting + calling executable pages is a security
 # surface — gated the same way ext_io is).
+# WASM W1: NOT built under EMBER_WASM_INTERP (no executable memory in WASM;
+# call_raw cannot invoke native bytes). See the thread/coroutine gate above.
+if(NOT EMBER_WASM_INTERP)
 ember_add_extension(call_raw extensions/call_raw/ext_call_raw.cpp)
 target_link_libraries(ember_ext_call_raw PUBLIC ember_ext_array)
+endif() # NOT EMBER_WASM_INTERP (call_raw)
 # ext_audio: allocation-free raw access to host-owned f32/f64/i32 DSP buffers.
 # The six bindings are PERM_FFI-gated because scripts supply raw pointers.
 ember_add_extension(audio extensions/audio/ext_audio.cpp)
+
+# ---- WASM W1: under EMBER_WASM_INTERP, skip the native-only VST3 + test/exec
+# targets (they use the JIT, Win32/macOS APIs, std::thread, CreateProcess,
+# SEH, fibers, or the 3 stubbed extensions). The WASM build produces ONLY the
+# ember_wasm CLI (defined in the EMBER_WASM_INTERP block at the end of this
+# file). Natively (EMBER_WASM_INTERP OFF) everything below builds unchanged.
+if(NOT EMBER_WASM_INTERP)
 
 # ---- optional VST3 SDK + Phase 3 Ember gain effect ----
 # The SDK is pinned as thirdparty/vst3sdk (git submodule, v3.8.0_build_66).
@@ -1751,3 +1780,102 @@ endif()
 # ctest: fuzz batch driver — verify no crash on the lang test corpus.
 add_test(NAME fuzz_batch COMMAND fuzz_batch_driver ${CMAKE_CURRENT_SOURCE_DIR}/tests/lang)
 set_tests_properties(fuzz_batch PROPERTIES TIMEOUT 30)
+
+endif() # NOT EMBER_WASM_INTERP (native VST3 + test/exec targets)
+
+# ===========================================================================
+# ---- WASM W1: the Emscripten ThinIR-interpreter CLI (plan_WASM.md) --------
+# ===========================================================================
+# Built ONLY under EMBER_WASM_INTERP (the Emscripten target). The backend is
+# the ThinIR interpreter (src/thin_interp.cpp): the CLI lexes/parses/semas/
+# lowers a .ember to ThinFunction, builds an InterpDispatch (ThinFunction*
+# table), and runs the entry fn via interpret_thin_i64 — NO emit_x64/
+# emit_arm64/alloc_executable/JIT. See examples/ember_wasm.cpp.
+#
+# Build:
+#   emcmake cmake -G Ninja -DCMAKE_CXX_COMPILER=em++ -DEMBER_WASM_INTERP=ON -B buildwasm ..
+#   cmake --build buildwasm
+#   node buildwasm/ember_wasm.js tests/lang/valid_arith.ember
+#
+# The EMBER_WASM_INTERP macro is defined on these targets ONLY (not global) so
+# the native build is byte-identical (the #ifdef branches in platform.cpp /
+# engine.cpp / jit_memory.cpp are inactive natively). Exceptions are ENABLED
+# (-fexceptions) so the interpreter's InterpTrap + the frontend's compile-error
+# throws work (the audit's Shape-B-on-Emscripten recommendation; avoids the
+# -fno-exceptions frontend refactor). ALLOW_MEMORY_GROWTH + the node environment
+# + NODERAWFS let the CLI read files via plain fopen/fread.
+if(EMBER_WASM_INTERP)
+    # The macro is defined on the core libs + the arch-neutral extensions + the
+    # CLI so every TU sees the WASM stubs (platform/engine/jit_memory).
+    target_compile_definitions(ember PUBLIC EMBER_WASM_INTERP)
+    target_compile_definitions(ember_frontend PUBLIC EMBER_WASM_INTERP)
+    target_compile_definitions(ember_import PUBLIC EMBER_WASM_INTERP)
+    target_compile_definitions(ember_ed25519 PUBLIC EMBER_WASM_INTERP)
+    foreach(ext vec quat mat string array math map sync lifecycle io gc opt obf audio)
+        if(TARGET ember_ext_${ext})
+            target_compile_definitions(ember_ext_${ext} PUBLIC EMBER_WASM_INTERP)
+        endif()
+    endforeach()
+    # Enable C++ exceptions on every TU under WASM: the interpreter (thin_interp)
+    # throws InterpTrap for traps + catches it in interpret_thin_i64_safe / the
+    # CallScript propagation; the frontend (sema/parser/lexer/lower) throws
+    # compile errors. Emscripten defaults to -fno-exceptions, so enable it
+    # explicitly on the libs + the CLI (the audit's Shape-B-on-Emscripten
+    # recommendation — avoids the -fno-exceptions frontend refactor).
+    target_compile_options(ember PRIVATE -fexceptions)
+    target_compile_options(ember_frontend PRIVATE -fexceptions)
+    target_compile_options(ember_import PRIVATE -fexceptions)
+    foreach(ext vec quat mat string array math map sync lifecycle io gc opt obf audio)
+        if(TARGET ember_ext_${ext})
+            target_compile_options(ember_ext_${ext} PRIVATE -fexceptions)
+        endif()
+    endforeach()
+
+    add_executable(ember_wasm examples/ember_wasm.cpp)
+    target_compile_definitions(ember_wasm PRIVATE EMBER_WASM_INTERP)
+    target_link_libraries(ember_wasm PRIVATE
+        ember ember_frontend ember_import ember_ed25519
+        ember_ext_vec ember_ext_quat ember_ext_mat ember_ext_string
+        ember_ext_array ember_ext_math ember_ext_map ember_ext_sync
+        ember_ext_lifecycle ember_ext_io ember_ext_gc)
+    # Emscripten link flags: a node-targeted WASM module that runs the CLI.
+    #   - sENVIRONMENT=node            -> node.js host (the CLI reads argv + files)
+    #   - sALLOW_MEMORY_GROWTH=1       -> grow the heap as the interpreter allocs
+    #   - sNODERAWFS=1                 -> node fs backing for fopen/fread (the CLI
+    #                                    reads the .ember via plain C stdio)
+    #   - fexceptions                  -> the interpreter's InterpTrap + the
+    #                                    frontend's compile-error throws work
+    #   - sEXCEPTION_CATCHING_ALLOWED=['*'] -> Emscripten strips catch handlers
+    #        by default even with -fexceptions; this enables catching EVERYWHERE
+    #        so interpret_thin_i64_safe's catch(InterpTrap) + the in-language
+    #        try/catch propagation (CallScript's catch) actually catch. Without
+    #        it an InterpTrap escapes -> wasm trap -> node promise rejection.
+    #   - sEXIT_RUNTIME=1              -> the CLI's return code reaches node
+    # The output is ember_wasm.js (+ ember_wasm.wasm); node runs the .js glue.
+    target_link_options(ember_wasm PRIVATE
+        "-sENVIRONMENT=node"
+        "-sALLOW_MEMORY_GROWTH=1"
+        "-sNODERAWFS=1"
+        "-sEXIT_RUNTIME=1"
+        "-fexceptions"
+        "-sEXCEPTION_CATCHING_ALLOWED=['*']"
+        "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','callMain']"
+    )
+    target_compile_options(ember_wasm PRIVATE -fexceptions)
+
+    # WASM W1 acceptance: run a curated set of .ember scripts through the
+    # interpreter CLI + assert correct results (tests/run_wasm_tests.sh).
+    # enable_testing() lives in the native-only block above, so enable it here
+    # too so the WASM CTest target registers. The test runner is bash (run on
+    # the HOST, not in WASM); /bin/bash is universal on the macOS/Linux hosts
+    # where ctest runs (the Emscripten cross-compile's find_program(bash) can
+    # miss it via sysroot search, so inline the absolute path). The node path
+    # comes from CMAKE_CROSSCOMPILING_EMULATOR (emcmake sets it).
+    enable_testing()
+    add_test(NAME wasm_interp_acceptance
+        COMMAND "/bin/bash"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_wasm_tests.sh"
+                "${CMAKE_CURRENT_BINARY_DIR}"
+                "${CMAKE_CROSSCOMPILING_EMULATOR}")
+    set_tests_properties(wasm_interp_acceptance PROPERTIES TIMEOUT 120)
+endif() # EMBER_WASM_INTERP (the WASM CLI)
